@@ -158,6 +158,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     moved: boolean;
   } | null>(null);
   const wheelSeekTimerRef = useRef<number | null>(null);
+  const pendingWheelPlayheadRef = useRef<number | null>(null);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -339,15 +340,19 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       const nextWinEnd = Math.min(nowSec, winEnd + dir * stepSec);
       setCustomWinEnd(nextWinEnd >= nowSec - 2 ? null : nextWinEnd);
 
-      const basePlayhead = currentTs ?? winEnd;
+      const basePlayhead =
+        pendingWheelPlayheadRef.current ?? currentTs ?? winEnd;
       const nextPlayhead = Math.min(nowSec, basePlayhead + dir * stepSec);
+      pendingWheelPlayheadRef.current = nextPlayhead;
       setHoverTs(nextPlayhead);
 
       if (wheelSeekTimerRef.current) {
         window.clearTimeout(wheelSeekTimerRef.current);
       }
       wheelSeekTimerRef.current = window.setTimeout(() => {
-        onSeek(nextPlayhead >= nowSec - 3 ? null : nextPlayhead);
+        const finalTarget = pendingWheelPlayheadRef.current ?? nextPlayhead;
+        pendingWheelPlayheadRef.current = null;
+        onSeek(finalTarget >= nowSec - 3 ? null : finalTarget);
       }, 140);
     };
 
