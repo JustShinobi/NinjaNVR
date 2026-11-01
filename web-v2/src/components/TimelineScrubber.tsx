@@ -159,6 +159,17 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   const windowSpanSec = zoomMin * 60;
   const winEnd = customWinEnd ?? nowSec;
   const winStart = winEnd - windowSpanSec;
+  const fetchBucketStart = Math.floor((winStart - 1800) / 15) * 15;
+  const fetchBucketEnd = Math.ceil((winEnd + 1800) / 15) * 15;
+
+  // Re-center timeline window when parent seeks to a timestamp outside the current window
+  useEffect(() => {
+    if (currentTs === null) return;
+    setSelectedDay(toLocalDateInputValue(currentTs));
+    if (currentTs < winStart || currentTs > winEnd) {
+      setCustomWinEnd(Math.min(nowSec, currentTs + Math.round(windowSpanSec * 0.5)));
+    }
+  }, [currentTs]);
 
   // Fetch 30-day recording summary for the active camera
   useEffect(() => {
@@ -170,29 +181,26 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       .then((arr: RecordingDaySummary[]) => {
         if (Array.isArray(arr) && arr.length > 0) {
           setDaysSummary(arr);
-          if (!arr.some((d) => d.day === selectedDay)) {
-            setSelectedDay(arr[0].day);
-          }
         }
       })
       .catch(() => {});
-  }, [camera, selectedDay]);
+  }, [camera]);
 
-  // Fetch exact recording segments and review items covering `[winStart - 1800, winEnd + 1800]`
+  // Fetch exact recording segments and review items covering `[fetchBucketStart, fetchBucketEnd]`
   // so historical days from 2, 5, or 12 days ago always have full segment & event data!
   useEffect(() => {
     if (!camera) return;
-    const after = Math.floor(winStart - 1800);
-    const before = Math.ceil(winEnd + 1800);
     let cancelled = false;
 
     Promise.all([
       fetch(
-        `/api/${encodeURIComponent(camera)}/recordings?after=${after}&before=${before}`,
+        `/api/${encodeURIComponent(camera)}/recordings?after=${fetchBucketStart}&before=${fetchBucketEnd}`,
         { credentials: "include" }
       ).then((r) => (r.ok ? r.json() : [])),
       fetch(
-        `/api/review?cameras=${encodeURIComponent(camera)}&after=${after}&before=${before}&limit=250`,
+        `/api/review?cameras=${encodeURIComponent(
+          camera
+        )}&after=${fetchBucketStart}&before=${fetchBucketEnd}&limit=250`,
         { credentials: "include" }
       ).then((r) => (r.ok ? r.json() : [])),
     ])
@@ -206,7 +214,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [camera, winStart, winEnd]);
+  }, [camera, fetchBucketStart, fetchBucketEnd]);
 
   const clientXToTs = useCallback(
     (clientX: number): number => {
@@ -353,18 +361,20 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       }
     } else {
       const next = candidates.find((t) => t > anchor + 8);
-      if (next && next < nowSec - 3) {
-        if (next > winEnd) {
-          setCustomWinEnd(Math.min(nowSec, next + Math.round(windowSpanSec * 0.5)));
-        }
-        onSeek(next);
-        if (rangeMode) {
-          setRangeStart(next);
-          setRangeEnd(Math.min(nowSec, next + 45));
-        }
-      } else {
+      const fallbackNext = Math.min(nowSec, anchor + 300);
+      const target = next ?? fallbackNext;
+      if (target >= nowSec - 3) {
         setCustomWinEnd(null);
         onSeek(null);
+      } else {
+        if (target > winEnd) {
+          setCustomWinEnd(Math.min(nowSec, target + Math.round(windowSpanSec * 0.5)));
+        }
+        onSeek(target);
+        if (rangeMode) {
+          setRangeStart(target);
+          setRangeEnd(Math.min(nowSec, target + 45));
+        }
       }
     }
   };
