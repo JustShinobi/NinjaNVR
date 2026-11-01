@@ -1,0 +1,158 @@
+name: Release & Container Publish
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: 'Optional explicit tag (e.g. v0.9.0) to build & publish manually'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release Please (Version & Changelog)
+    if: >-
+      (
+        github.event_name == 'push' ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish_tag == '')
+      ) && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.PLATFORM_GITOPS_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish-ghcr:
+    name: Build & Publish Container (ghcr.io)
+    needs: [release-please]
+    if: >-
+      always() &&
+      (
+        needs.release-please.outputs.release_created == 'true' ||
+        startsWith(github.ref, 'refs/tags/v') ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish_tag != '')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      image_tag: ${{ steps.resolve.outputs.tag }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Resolve target release tag
+        id: resolve
+        run: |
+          if [ -n "${{ needs.release-please.outputs.tag_name }}" ]; then
+            TAG="${{ needs.release-please.outputs.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="${{ inputs.publish_tag }}"
+          fi
+          echo "Resolved release tag: ${TAG}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract container metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/justshinobi/ninjanvr
+          tags: |
+            type=raw,value=${{ steps.resolve.outputs.tag }}
+            type=semver,pattern={{version}},value=${{ steps.resolve.outputs.tag }}
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and push container image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+  gitops-bump:
+    name: Promote Release Tag to GitOps
+    needs: [publish-ghcr]
+    if: needs.publish-ghcr.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      GITOPS_TOKEN: ${{ secrets.PLATFORM_GITOPS_TOKEN }}
+      GITOPS_REPO: ${{ vars.GITOPS_REPO || 'JustShinobi/k3s-gitops-prod' }}
+      GITOPS_MANIFEST_PATH: ${{ vars.GITOPS_MANIFEST_PATH || 'clusters/prod/workloads/frigate/frigate.yaml' }}
+      IMAGE_TAG: ${{ needs.publish-ghcr.outputs.image_tag }}
+    steps:
+      - name: Check GitOps token availability
+        id: check_token
+        run: |
+          if [ -z "${GITOPS_TOKEN}" ]; then
+            echo "PLATFORM_GITOPS_TOKEN not configured; skipping GitOps promotion."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout GitOps repository
+        if: steps.check_token.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ env.GITOPS_TOKEN }}
+          path: gitops
+
+      - name: Bump NinjaNVR image tag in GitOps manifest
+        if: steps.check_token.outputs.enabled == 'true'
+        working-directory: gitops
+        run: |
+          sed -i -E "s|(image:[[:space:]]*ghcr\.io/justshinobi/ninjanvr:)[^[:space:]]+|\1${IMAGE_TAG}|g" "${GITOPS_MANIFEST_PATH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- "${GITOPS_MANIFEST_PATH}"; then
+            echo "GitOps manifest already at ${IMAGE_TAG}; nothing to commit."
+          else
+            git add "${GITOPS_MANIFEST_PATH}"
+            git commit -m "chore(gitops): bump ninjanvr to ${IMAGE_TAG}"
+            git push origin HEAD:main
+          fi

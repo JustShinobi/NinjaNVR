@@ -19,11 +19,12 @@ NinjaNVR is an ultra-low-footprint, 10-crate Rust NVR workspace and Dual-UI cons
 ## Build, Test, and Deployment Commands
 Run all commands from `/srv/workspaces/NinjaNVR`:
 
-- `make verify` (or `./scripts/ci/verify`): Runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 build`.
-- `make build-ui`: Type-checks and builds `web-v2/dist` (`< 2s`).
+- `make verify` (or `./scripts/ci/verify`): Runs `./scripts/ci/check-privacy`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 build`.
+- `make build-ui`: Type-checks and builds `web-v2/dist` (`< 2s`). Note: `web-v2/dist` is gitignored and built in CI / `Dockerfile`.
 - `make fast-ui`: Builds `web-v2/dist` and hot-syncs `/opt/ninjanvr/web-v2` into the running K3s pod via `kubectl cp` for instant visual verification.
 - `make build`: Builds both `web-v2/dist` and the release Rust binary (`target/release/ninjanvr`).
-- `make deploy`: Builds release binary + UI, packages the container image, imports it into K3s containerd, and restarts the deployment.
+- `make build-desktop`: Builds the Tauri v2 native desktop shell (`ninjanvr-desktop`).
+- `make image`: Builds the multi-stage container image (`Dockerfile`) tagged with the current workspace version (`v0.9.0`). Production releases are published via `.github/workflows/release.yml` (`release-please` -> `ghcr.io` -> GitOps bump).
 - `make status` / `make logs`: Inspects the live K3s pod health, resource usage (`kubectl top pod`), and logs.
 
 ## Public Repository Privacy Guardrail

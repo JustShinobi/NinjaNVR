@@ -1,4 +1,12 @@
 # syntax=docker/dockerfile:1.6
+FROM oven/bun:1-slim AS ui-builder
+
+WORKDIR /src/web-v2
+COPY web-v2/package.json web-v2/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY web-v2 ./
+RUN bun run typecheck && bun run build
+
 FROM rust:1-bookworm AS builder
 
 WORKDIR /src
@@ -8,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --locked --release --bin ninjanvr
+RUN cargo build --release --bin ninjanvr
 
 FROM ghcr.io/blakeblackshear/frigate:0.18.2 AS upstream-assets
 
@@ -29,7 +37,7 @@ COPY --from=upstream-assets /usr/local/lib/python3.11/dist-packages/openvino/lib
 COPY --from=upstream-assets /usr/local/lib/python3.11/dist-packages/openvino/libs/libhwloc.so.15 /usr/local/lib/ninjanvr/openvino/
 COPY --from=builder /src/target/release/ninjanvr /usr/local/bin/ninjanvr
 COPY web /opt/ninjanvr/web
-COPY web-v2/dist /opt/ninjanvr/web-v2
+COPY --from=ui-builder /src/web-v2/dist /opt/ninjanvr/web-v2
 
 ENV CONFIG_FILE=/config/config.yml
 ENV NINJANVR_WEB_DIR=/opt/ninjanvr/web
