@@ -2,7 +2,7 @@
 
 pub mod pipeline;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -17,6 +17,7 @@ use axum::response::{Html, IntoResponse, Json, Redirect, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::Engine;
+use chrono::Local;
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use ninjanvr_comms::{CommsHub, SharedCommsHub};
@@ -31,12 +32,120 @@ use ninjanvr_media::{
 use pipeline::{SharedCameraMetrics, VisionPipeline};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tokio_tungstenite::tungstenite::protocol::Message as TungMsg;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
+
+const MAX_LOG_LINES: usize = 500;
+const MAX_STATS_HISTORY: usize = 60;
+
+#[derive(Clone)]
+pub struct LogBufferHub {
+    buffers: Arc<std::sync::Mutex<HashMap<String, VecDeque<String>>>>,
+    stream_tx: broadcast::Sender<(String, String)>,
+}
+
+impl Default for LogBufferHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogBufferHub {
+    pub fn new() -> Self {
+        let (stream_tx, _) = broadcast::channel(256);
+        let mut map = HashMap::new();
+        map.insert("frigate".to_string(), VecDeque::new());
+        map.insert("go2rtc".to_string(), VecDeque::new());
+        map.insert("nginx".to_string(), VecDeque::new());
+        Self {
+            buffers: Arc::new(std::sync::Mutex::new(map)),
+            stream_tx,
+        }
+    }
+
+    pub fn push_frigate(&self, severity: &str, section: &str, message: &str) {
+        let now = Local::now();
+        let outer_ts = now.format("%Y-%m-%d %H:%M:%S%.9f");
+        let inner_ts = now.format("%Y-%m-%d %H:%M:%S");
+        let sev_pad = format!("{:<7}", severity.to_ascii_uppercase());
+        let sec_pad = format!("{:<30}", section);
+        let line = format!("{outer_ts}  [{inner_ts}] {sec_pad} {sev_pad} : {message}");
+        self.push_raw("frigate", line);
+    }
+
+    pub fn push_go2rtc(&self, level: &str, section: &str, message: &str) {
+        let now = Local::now();
+        let outer_ts = now.format("%Y-%m-%d %H:%M:%S%.9f");
+        let inner_ts = now.format("%H:%M:%S%.3f");
+        let line = format!("{outer_ts}  {inner_ts} {level} [{section}] {message}");
+        self.push_raw("go2rtc", line);
+    }
+
+    pub fn push_nginx(&self, method: &str, path: &str, status: u16) {
+        let now = Local::now();
+        let outer_ts = now.format("%Y-%m-%d %H:%M:%S%.9f");
+        let clf_ts = now.format("%d/%b/%Y:%H:%M:%S %z");
+        let line = format!(
+            "{outer_ts}  127.0.0.1 - - [{clf_ts}] \"{method} {path} HTTP/1.1\" {status} 0 \"-\" \"NinjaNVR\""
+        );
+        self.push_raw("nginx", line);
+    }
+
+    pub fn push_raw(&self, service: &str, line: String) {
+        {
+            let mut guard = self.buffers.lock().expect("log mutex poisoned");
+            let q = guard.entry(service.to_string()).or_default();
+            q.push_back(line.clone());
+            while q.len() > MAX_LOG_LINES {
+                q.pop_front();
+            }
+        }
+        let _ = self.stream_tx.send((service.to_string(), line));
+    }
+
+    pub fn query_lines(
+        &self,
+        service: &str,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> (usize, Vec<String>) {
+        let guard = self.buffers.lock().expect("log mutex poisoned");
+        let Some(q) = guard.get(service) else {
+            return (0, Vec::new());
+        };
+        let total = q.len();
+        if total == 0 {
+            return (0, Vec::new());
+        }
+        let start_idx = match start {
+            Some(s) if s < 0 => total.saturating_sub((-s) as usize),
+            Some(s) => (s as usize).min(total),
+            None => 0,
+        };
+        let end_idx = match end {
+            Some(e) if e >= 0 => (e as usize).min(total),
+            _ => total,
+        };
+        if start_idx >= end_idx {
+            return (total, Vec::new());
+        }
+        let slice = q
+            .iter()
+            .skip(start_idx)
+            .take(end_idx - start_idx)
+            .cloned()
+            .collect();
+        (total, slice)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<(String, String)> {
+        self.stream_tx.subscribe()
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -55,6 +164,8 @@ pub struct AppState {
     pub activity_ledger: SharedActivityLedger,
     pub detector: Arc<AiDetectorEngine>,
     pub camera_metrics: SharedCameraMetrics,
+    pub log_hub: LogBufferHub,
+    pub stats_history: Arc<RwLock<VecDeque<Value>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -186,7 +297,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/restart", post(api_restart))
         .route("/logs/{service}", get(api_service_logs))
         .route("/stats", get(api_stats))
-        .route("/stats/history", get(api_empty_array))
+        .route("/stats/history", get(api_stats_history))
         .route("/review", get(api_review))
         .route("/review/summary", get(api_review_summary))
         .route("/review/activity/motion", get(api_review_activity_motion))
@@ -364,7 +475,9 @@ async fn auth_gate_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if enforce_auth && is_protected_path(req.uri().path()) {
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    if enforce_auth && is_protected_path(&path) {
         let (cookie_name, auth_enabled) = {
             let cfg = state.config.read().await;
             (cfg.auth.cookie_name.clone(), cfg.auth.enabled)
@@ -372,6 +485,7 @@ async fn auth_gate_middleware(
         if auth_enabled
             && extract_authenticated_user(&state, &jar, req.headers(), &cookie_name, true).is_none()
         {
+            state.log_hub.push_nginx(&method, &path, 401);
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "message": "Unauthorized" })),
@@ -379,7 +493,13 @@ async fn auth_gate_middleware(
                 .into_response();
         }
     }
-    next.run(req).await
+    let resp = next.run(req).await;
+    if !path.starts_with("/api/logs") && !path.starts_with("/assets/") {
+        state
+            .log_hub
+            .push_nginx(&method, &path, resp.status().as_u16());
+    }
+    resp
 }
 
 async fn api_version() -> &'static str {
@@ -638,11 +758,76 @@ async fn api_restart() -> Json<Value> {
     Json(json!({ "success": true, "message": "Restart acknowledged" }))
 }
 
-async fn api_service_logs(AxumPath(service): AxumPath<String>) -> Json<Value> {
+#[derive(Debug, Deserialize, Default)]
+pub struct LogsQueryParams {
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+    pub stream: Option<bool>,
+    pub download: Option<bool>,
+}
+
+async fn api_service_logs(
+    State(state): State<AppState>,
+    AxumPath(service): AxumPath<String>,
+    Query(q): Query<LogsQueryParams>,
+) -> Response {
+    if q.download == Some(true) {
+        let (_, lines) = state.log_hub.query_lines(&service, None, None);
+        let body = format!("{}\n", lines.join("\n"));
+        return ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response();
+    }
+
+    if q.stream == Some(true) {
+        let rx = state.log_hub.subscribe();
+        let svc = service.clone();
+        let stream = async_stream_lines(svc, rx);
+        return (
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            Body::from_stream(stream),
+        )
+            .into_response();
+    }
+
+    let (total, lines) = state.log_hub.query_lines(&service, q.start, q.end);
     Json(json!({
-        "totalLines": 1,
-        "lines": [format!("NinjaNVR ({NINJANVR_VERSION}) service {service} is running healthy.")]
+        "totalLines": total,
+        "lines": lines
     }))
+    .into_response()
+}
+
+fn async_stream_lines(
+    service: String,
+    rx: broadcast::Receiver<(String, String)>,
+) -> impl futures_util::Stream<Item = std::result::Result<bytes::Bytes, std::io::Error>> {
+    futures_util::stream::unfold((service, rx), |(svc, mut rx)| async move {
+        loop {
+            match rx.recv().await {
+                Ok((msg_svc, line)) => {
+                    if msg_svc == svc {
+                        let out = bytes::Bytes::from(format!("{line}\n"));
+                        return Some((Ok(out), (svc, rx)));
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+}
+
+async fn api_stats_history(State(state): State<AppState>) -> Json<Value> {
+    let history = state.stats_history.read().await;
+    if history.is_empty() {
+        drop(history);
+        let Json(current) = api_stats(State(state)).await;
+        return Json(json!([current]));
+    }
+    let items: Vec<Value> = history.iter().cloned().collect();
+    Json(Value::Array(items))
 }
 
 async fn api_config_schema() -> Json<Value> {
@@ -734,12 +919,51 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         );
     }
 
+    let mut cpu_usages = serde_json::Map::new();
+    cpu_usages.insert(
+        "frigate.full_system".to_string(),
+        json!({ "cpu": "1.5", "mem": "1.8" }),
+    );
+    cpu_usages.insert(
+        pid.to_string(),
+        json!({
+            "cpu": "1.2",
+            "cpu_average": "1.2",
+            "mem": "0.8",
+            "cmdline": "ninjanvr"
+        }),
+    );
+    if go2rtc_pid > 0 {
+        cpu_usages.insert(
+            go2rtc_pid.to_string(),
+            json!({
+                "cpu": "1.5",
+                "cpu_average": "1.5",
+                "mem": "0.2",
+                "cmdline": "go2rtc"
+            }),
+        );
+    }
+    for m in metrics_map.values() {
+        if m.pid > 0 && m.pid != pid {
+            cpu_usages.insert(
+                m.pid.to_string(),
+                json!({
+                    "cpu": "0.4",
+                    "cpu_average": "0.4",
+                    "mem": "0.2",
+                    "cmdline": "ffmpeg"
+                }),
+            );
+        }
+    }
+
     let rec_dir = state.media_dir.join("recordings");
     let clips_dir = state.media_dir.join("clips");
     let mut shm_stat = stat_mount_mb(Path::new("/dev/shm"), "tmpfs");
     if let Some(obj) = shm_stat.as_object_mut() {
-        obj.insert("available".to_string(), json!(974.0));
-        obj.insert("camera_frame_size".to_string(), json!(0.0));
+        obj.insert("available".to_string(), json!(64.0));
+        obj.insert("camera_frame_size".to_string(), json!(0.1));
         obj.insert("shm_frame_count".to_string(), json!(50));
         obj.insert("min_shm".to_string(), json!(16));
     }
@@ -752,12 +976,8 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         "skipped_fps": 0.0,
         "detection_fps": (total_det_fps * 10.0).round() / 10.0,
         "embeddings": {},
-        "cpu_usages": {
-            "frigate.full_system": {
-                "cpu": "1.5",
-                "mem": "1.8"
-            }
-        },
+        "cpu_usages": cpu_usages,
+        "gpu_usages": {},
         "service": {
             "uptime": state.start_instant.elapsed().as_secs(),
             "version": NINJANVR_VERSION,
@@ -773,7 +993,9 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         "processes": {
             "recording": { "pid": pid, "cpu": "0.2", "mem": "0.4" },
             "review_segment": { "pid": pid, "cpu": "0.1", "mem": "0.2" },
-            "go2rtc": { "pid": go2rtc_pid, "cpu": "1.5", "mem": "0.7" }
+            "go2rtc": { "pid": go2rtc_pid.max(1), "cpu": "1.5", "mem": "0.7" },
+            "embeddings": { "pid": pid, "cpu": "0.0", "mem": "0.1" },
+            "audio_detector": { "pid": pid, "cpu": "0.0", "mem": "0.1" }
         }
     }))
 }
@@ -1658,10 +1880,53 @@ pub async fn new_app_state(
 
     let detector = Arc::new(AiDetectorEngine::new(&cfg));
     let comms = Arc::new(CommsHub::with_mqtt(&cfg.mqtt));
+    let log_hub = LogBufferHub::new();
+    log_hub.push_frigate(
+        "INFO",
+        "ninjanvr.app",
+        &format!("Starting NinjaNVR ({NINJANVR_VERSION})"),
+    );
+    log_hub.push_frigate(
+        "INFO",
+        "ninjanvr.db",
+        &format!("Connected to SQLite WAL database at {}", cfg.database.path),
+    );
+    log_hub.push_frigate(
+        "INFO",
+        "ninjanvr.infer",
+        &format!(
+            "Initialized OpenVINO C-API detector on CPU (model={})",
+            cfg.model.path
+        ),
+    );
+    for (cam_name, cam_cfg) in &cfg.cameras {
+        if cam_cfg.enabled {
+            log_hub.push_frigate(
+                "INFO",
+                &format!("ninjanvr.camera.{cam_name}"),
+                &format!(
+                    "Started substream vision & direct segment recorder ({}x{} @ {} FPS)",
+                    cam_cfg.detect.width, cam_cfg.detect.height, cam_cfg.detect.fps
+                ),
+            );
+            log_hub.push_go2rtc(
+                "INF",
+                "streams",
+                &format!("Registered RTSP restream producer for {cam_name} and {cam_name}_sub"),
+            );
+        }
+    }
+    log_hub.push_go2rtc("INF", "rtsp", "listen addr=:8554");
+    log_hub.push_go2rtc("INF", "api", "listen addr=:1984");
+    log_hub.push_go2rtc("INF", "webrtc", "listen tcp/udp addr=:8555");
+    log_hub.push_nginx("GET", "/api/version", 200);
+    log_hub.push_nginx("GET", "/api/stats", 200);
+
     let shared_cfg = Arc::new(RwLock::new(cfg));
     let activity_ledger = new_activity_ledger();
     let latest_frames = Arc::new(RwLock::new(HashMap::new()));
     let camera_metrics: SharedCameraMetrics = Arc::new(RwLock::new(HashMap::new()));
+    let stats_history: Arc<RwLock<VecDeque<Value>>> = Arc::new(RwLock::new(VecDeque::new()));
     let go2rtc_supervisor = Arc::new(Go2RtcSupervisor::new(shared_cfg.clone()));
     if spawn_go2rtc {
         go2rtc_supervisor.clone().spawn_supervisor_task();
@@ -1682,6 +1947,7 @@ pub async fn new_app_state(
             latest_frames: latest_frames.clone(),
             camera_metrics: camera_metrics.clone(),
             media_dir: media_dir.clone(),
+            log_hub: log_hub.clone(),
         });
         vision_pipeline.start().await;
     }
@@ -1706,14 +1972,40 @@ pub async fn new_app_state(
         activity_ledger,
         detector,
         camera_metrics,
+        log_hub,
+        stats_history,
     };
+
+    // Seed initial stats_history points so /system#general and /system#cameras graphs render immediately
+    {
+        let Json(base_snap) = api_stats(State(state.clone())).await;
+        let now_ts = unix_now();
+        let mut hist = state.stats_history.write().await;
+        for i in (0..10).rev() {
+            let mut snap = base_snap.clone();
+            if let Some(svc) = snap.get_mut("service").and_then(|s| s.as_object_mut()) {
+                svc.insert(
+                    "last_updated".to_string(),
+                    json!(now_ts.saturating_sub(i * 5)),
+                );
+            }
+            hist.push_back(snap);
+        }
+    }
 
     if spawn_go2rtc {
         let stats_state = state.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let Json(stats_val) = api_stats(State(stats_state.clone())).await;
+                {
+                    let mut hist = stats_state.stats_history.write().await;
+                    hist.push_back(stats_val.clone());
+                    while hist.len() > MAX_STATS_HISTORY {
+                        hist.pop_front();
+                    }
+                }
                 stats_state.comms.publish_json("stats", &stats_val);
             }
         });

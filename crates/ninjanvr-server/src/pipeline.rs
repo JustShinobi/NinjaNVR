@@ -106,6 +106,7 @@ pub struct VisionPipeline {
     pub latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     pub camera_metrics: SharedCameraMetrics,
     pub media_dir: PathBuf,
+    pub log_hub: crate::LogBufferHub,
 }
 
 impl VisionPipeline {
@@ -510,6 +511,14 @@ impl VisionPipeline {
                 );
                 if is_new {
                     debug!("New tracked object on {camera}: {} ({})", trk.label, trk.id);
+                    self.log_hub.push_frigate(
+                        "INFO",
+                        &format!("ninjanvr.detect.{camera}"),
+                        &format!(
+                            "Tracked object {}: {} (score={:.2}, area={})",
+                            trk.id, trk.label, trk.score, area
+                        ),
+                    );
                 }
             }
 
