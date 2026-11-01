@@ -45,7 +45,7 @@ import {
   CanvasSparkline,
   LiveMsePlayer,
   VodHlsPlayer,
-  parsePolygonPoints,
+  extractMaskPolygons,
 } from "./components/VideoPlayers";
 
 type WorkspaceTab =
@@ -169,8 +169,8 @@ export const App: React.FC = () => {
   const [zonesSubTab, setZonesSubTab] = useState<"visual" | "yaml">("visual");
   const [inspectorCam, setInspectorCam] = useState<string>("escritorio");
   const [rawYaml, setRawYaml] = useState<string>("");
-  const [yamlFilter, setYamlFilter] = useState<string>("");
-  const [ffprobeInfo, setFfprobeInfo] = useState< unknown[] | null>(null);
+  const [draftPoints, setDraftPoints] = useState<Array<[number, number]>>([]);
+  const [ffprobeInfo, setFfprobeInfo] = useState<unknown[] | null>(null);
 
   // System & Logs state
   const [logService, setLogService] = useState<"frigate" | "go2rtc" | "nginx">("frigate");
@@ -2231,14 +2231,100 @@ export const App: React.FC = () => {
                       style={{
                         fontSize: 11,
                         fontWeight: 700,
+                        color: "#fbbf24",
+                        marginBottom: 6,
+                      }}
+                    >
+                      INTERACTIVE POLYGON BUILDER ({draftPoints.length} vertices)
+                    </div>
+                    <div
+                      style={{
+                        padding: 8,
+                        background: "var(--bg-canvas)",
+                        border: "1px solid rgba(245, 158, 11, 0.4)",
+                        borderRadius: 3,
+                        marginBottom: 12,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 6,
+                      }}
+                    >
+                      <div style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+                        Click anywhere on the camera preview to plot normalized polygon vertices.
+                      </div>
+                      <div
+                        className="mono"
+                        style={{
+                          fontSize: 10.5,
+                          color: "#fcd34d",
+                          wordBreak: "break-all",
+                          padding: "4px 6px",
+                          background: "#050608",
+                          borderRadius: 2,
+                        }}
+                      >
+                        {draftPoints.length > 0
+                          ? draftPoints
+                              .map(([x, y]) => `${x.toFixed(3)},${y.toFixed(3)}`)
+                              .join(",")
+                          : "0.010,0.010,0.340,0.010,0.340,0.080,0.010,0.080"}
+                      </div>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        <button
+                          className="nvr-btn"
+                          style={{ height: 22, fontSize: 10 }}
+                          onClick={() =>
+                            setDraftPoints([
+                              [0.01, 0.01],
+                              [0.34, 0.01],
+                              [0.34, 0.08],
+                              [0.01, 0.08],
+                            ])
+                          }
+                        >
+                          Preset: OSD Clock Mask
+                        </button>
+                        <button
+                          className="nvr-btn primary"
+                          style={{ height: 22, fontSize: 10 }}
+                          onClick={() => {
+                            const coords =
+                              draftPoints.length > 0
+                                ? draftPoints
+                                    .map(([x, y]) => `${x.toFixed(3)},${y.toFixed(3)}`)
+                                    .join(",")
+                                : "0.010,0.010,0.340,0.010,0.340,0.080,0.010,0.080";
+                            navigator.clipboard?.writeText(coords);
+                            notify("Copied normalized polygon coordinates to clipboard");
+                          }}
+                        >
+                          <Copy size={10} />
+                          Copy Coords
+                        </button>
+                        <button
+                          className="nvr-btn danger"
+                          style={{ height: 22, fontSize: 10 }}
+                          onClick={() => setDraftPoints([])}
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    </div>
+
+                    <div
+                      className="mono"
+                      style={{
+                        fontSize: 11,
+                        fontWeight: 700,
                         color: "#fca5a5",
                         marginBottom: 6,
                       }}
                     >
                       {t.zones.motionMasks} (
-                      {config?.cameras?.[inspectorCam]?.motion?.mask?.length || 0})
+                      {extractMaskPolygons(config?.cameras?.[inspectorCam]?.motion?.mask).length})
                     </div>
-                    {(config?.cameras?.[inspectorCam]?.motion?.mask || []).map((m, idx) => (
+                    {extractMaskPolygons(config?.cameras?.[inspectorCam]?.motion?.mask).map(
+                      (m, idx) => (
                       <div
                         key={idx}
                         className="mono"
@@ -2318,19 +2404,68 @@ export const App: React.FC = () => {
                 </div>
 
                 <div className="nvr-focus-stage">
-                  <div className="nvr-cam-tile" style={{ flex: 1 }}>
+                  <div
+                    className="nvr-cam-tile"
+                    style={{ flex: 1, cursor: "crosshair" }}
+                    onClick={(e) => {
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      const nx = Math.max(
+                        0,
+                        Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width))
+                      );
+                      const ny = Math.max(
+                        0,
+                        Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height))
+                      );
+                      setDraftPoints((prev) => [...prev, [nx, ny]]);
+                    }}
+                  >
                     <LiveMsePlayer
                       camera={inspectorCam}
                       useMainStream={false}
                       cameraConfig={config?.cameras?.[inspectorCam]}
                       showVectors={true}
                     />
+                    {draftPoints.length > 0 && (
+                      <svg
+                        viewBox="0 0 1000 1000"
+                        preserveAspectRatio="none"
+                        style={{
+                          position: "absolute",
+                          inset: 0,
+                          width: "100%",
+                          height: "100%",
+                          pointerEvents: "none",
+                          zIndex: 6,
+                        }}
+                      >
+                        <polygon
+                          points={draftPoints
+                            .map(([x, y]) => `${Math.round(x * 1000)},${Math.round(y * 1000)}`)
+                            .join(" ")}
+                          fill="rgba(245, 158, 11, 0.25)"
+                          stroke="#f59e0b"
+                          strokeWidth="3"
+                        />
+                        {draftPoints.map(([x, y], idx) => (
+                          <circle
+                            key={idx}
+                            cx={Math.round(x * 1000)}
+                            cy={Math.round(y * 1000)}
+                            r="7"
+                            fill="#fbbf24"
+                            stroke="#000"
+                            strokeWidth="2"
+                          />
+                        ))}
+                      </svg>
+                    )}
                     <div className="nvr-cam-hud-top">
                       <span className="nvr-badge live">
-                        {inspectorCam.toUpperCase()} // VECTOR OVERLAY ACTIVE
+                        {inspectorCam.toUpperCase()} // VECTOR OVERLAY & DRAWER ACTIVE
                       </span>
                       <span className="nvr-badge">
-                        RED DASHED = MOTION MASK · CYAN = DETECTION ZONE
+                        CLICK VIDEO TO PLOT VERTICES · RED = MASK · CYAN = ZONE · AMBER = DRAFT
                       </span>
                     </div>
                   </div>

@@ -12,6 +12,40 @@ interface LiveMsePlayerProps {
 }
 
 /**
+ * Safely extracts an array of polygon coordinate strings from Frigate's `motion.mask`
+ * (which may be a string, string[], or Record<string, { coordinates: string } | string>).
+ */
+export function extractMaskPolygons(mask: unknown): string[] {
+  if (!mask) return [];
+  if (typeof mask === "string") return mask.trim() ? [mask.trim()] : [];
+  if (Array.isArray(mask)) {
+    return mask
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object" && "coordinates" in item) {
+          const c = (item as { coordinates?: unknown }).coordinates;
+          return typeof c === "string" ? c : "";
+        }
+        return "";
+      })
+      .filter(Boolean);
+  }
+  if (typeof mask === "object") {
+    return Object.values(mask as Record<string, unknown>)
+      .map((val) => {
+        if (typeof val === "string") return val;
+        if (val && typeof val === "object" && "coordinates" in val) {
+          const c = (val as { coordinates?: unknown }).coordinates;
+          return typeof c === "string" ? c : "";
+        }
+        return "";
+      })
+      .filter(Boolean);
+  }
+  return [];
+}
+
+/**
  * Parses a Frigate normalized or pixel polygon string ("x1,y1,x2,y2,...") into SVG points ("0..1000" coordinate space).
  */
 export function parsePolygonPoints(
@@ -188,7 +222,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
 
   const detW = cameraConfig?.detect?.width || 1280;
   const detH = cameraConfig?.detect?.height || 720;
-  const masks = cameraConfig?.motion?.mask || [];
+  const masks = extractMaskPolygons(cameraConfig?.motion?.mask);
   const zones = cameraConfig?.zones || {};
 
   return (

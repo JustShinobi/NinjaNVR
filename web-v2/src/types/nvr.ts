@@ -9,7 +9,7 @@ export interface CameraMotionConfig {
   enabled: boolean;
   threshold: number;
   contour_area: number;
-  mask: string[];
+  mask: unknown;
 }
 
 export interface ZoneConfig {
