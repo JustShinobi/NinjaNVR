@@ -141,6 +141,7 @@ export const App: React.FC = () => {
   const [reviewCameraFilter, setReviewCameraFilter] = useState<string>("all");
   const [reviewSeverityFilter, setReviewSeverityFilter] = useState<string>("all");
   const [reviewObjectFilter, setReviewObjectFilter] = useState<string>("all");
+  const [reviewDateFilter, setReviewDateFilter] = useState<string>("");
   const [reviewStatusFilter, setReviewStatusFilter] = useState<"unreviewed" | "reviewed" | "all">(
     "unreviewed"
   );
@@ -215,11 +216,22 @@ export const App: React.FC = () => {
   // Fetch core bootstrap data
   const fetchCoreData = useCallback(async () => {
     try {
+      let revUrl = "/api/review?limit=200";
+      if (reviewDateFilter) {
+        const parts = reviewDateFilter.split("-").map(Number);
+        if (parts.length === 3) {
+          const dayStart = Math.floor(
+            new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000
+          );
+          const dayEnd = dayStart + 86400;
+          revUrl = `/api/review?after=${dayStart}&before=${dayEnd}&limit=300`;
+        }
+      }
       const [cfgRes, statsRes, histRes, revRes] = await Promise.all([
         fetch("/api/config", { credentials: "include" }),
         fetch("/api/stats", { credentials: "include" }),
         fetch("/api/stats/history", { credentials: "include" }),
-        fetch("/api/review?limit=120", { credentials: "include" }),
+        fetch(revUrl, { credentials: "include" }),
       ]);
 
       if (cfgRes.status === 401 || statsRes.status === 401) {
@@ -256,7 +268,7 @@ export const App: React.FC = () => {
     } catch {
       // network retry on next tick
     }
-  }, [selectedCamera, activeReview]);
+  }, [selectedCamera, activeReview, reviewDateFilter]);
 
   useEffect(() => {
     fetchCoreData();
@@ -324,7 +336,18 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (authNeeded) return;
     if (activeTab === "explore") {
-      fetch("/api/events?limit=80", { credentials: "include" })
+      let evUrl = "/api/events?limit=120";
+      if (reviewDateFilter) {
+        const parts = reviewDateFilter.split("-").map(Number);
+        if (parts.length === 3) {
+          const dayStart = Math.floor(
+            new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000
+          );
+          const dayEnd = dayStart + 86400;
+          evUrl = `/api/events?after=${dayStart}&before=${dayEnd}&limit=250`;
+        }
+      }
+      fetch(evUrl, { credentials: "include" })
         .then((r) => (r.ok ? r.json() : []))
         .then((arr: EventItem[]) => {
           if (Array.isArray(arr)) {
@@ -384,6 +407,7 @@ export const App: React.FC = () => {
     rawYaml,
     selectedEvent,
     activeExportPreview,
+    reviewDateFilter,
     stats?.service?.last_updated,
   ]);
 
@@ -1512,6 +1536,26 @@ export const App: React.FC = () => {
                   <option value="reviewed">{t.review.reviewedOnly}</option>
                   <option value="all">{t.review.allStatuses}</option>
                 </select>
+                <input
+                  type="date"
+                  className="nvr-input mono"
+                  style={{ height: 28, fontSize: 11.5 }}
+                  value={reviewDateFilter}
+                  onChange={(e) => {
+                    setReviewDateFilter(e.target.value);
+                    if (e.target.value) setReviewStatusFilter("all");
+                  }}
+                  title="Filter reviews by specific historical date"
+                />
+                {reviewDateFilter && (
+                  <button
+                    className="nvr-btn mono"
+                    style={{ height: 28, fontSize: 10.5 }}
+                    onClick={() => setReviewDateFilter("")}
+                  >
+                    All Dates
+                  </button>
+                )}
                 <span className="mono" style={{ color: "var(--text-muted)", fontSize: 11 }}>
                   {filteredReviews.length} matching (showing top 40)
                 </span>
@@ -1816,6 +1860,23 @@ export const App: React.FC = () => {
                   <Star size={12} />
                   {t.explore.favoritesOnly}
                 </button>
+                <input
+                  type="date"
+                  className="nvr-input mono"
+                  style={{ height: 28, fontSize: 11.5 }}
+                  value={reviewDateFilter}
+                  onChange={(e) => setReviewDateFilter(e.target.value)}
+                  title="Filter tracked objects by specific historical date"
+                />
+                {reviewDateFilter && (
+                  <button
+                    className="nvr-btn mono"
+                    style={{ height: 28, fontSize: 10.5 }}
+                    onClick={() => setReviewDateFilter("")}
+                  >
+                    All Dates
+                  </button>
+                )}
               </div>
               <span className="mono" style={{ fontSize: 11, color: "var(--text-secondary)" }}>
                 {filteredEvents.length} tracked object events

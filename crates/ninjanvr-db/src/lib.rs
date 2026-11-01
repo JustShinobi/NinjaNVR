@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
 use rand::Rng;
@@ -1318,18 +1318,27 @@ impl NinjaDatabase {
             motion: i64,
             objects: i64,
             events: i64,
+            start_ts: i64,
+            end_ts: i64,
         }
         let mut day_hours: BTreeMap<String, BTreeMap<String, HourAgg>> = BTreeMap::new();
 
         for r in rows {
             let (ts, dur, motion, objs) = r?;
-            if let Some(dt) = Utc.timestamp_opt(ts as i64, 0).single() {
+            if let Some(dt) = Local.timestamp_opt(ts as i64, 0).single() {
                 let day = dt.format("%Y-%m-%d").to_string();
                 let hour = dt.format("%H").to_string();
+                let hour_start = ((ts as i64) / 3600) * 3600;
                 let h = day_hours.entry(day).or_default().entry(hour).or_default();
                 h.duration += dur;
                 h.motion += motion;
                 h.objects += objs;
+                if h.start_ts == 0 || hour_start < h.start_ts {
+                    h.start_ts = hour_start;
+                }
+                if hour_start + 3600 > h.end_ts {
+                    h.end_ts = hour_start + 3600;
+                }
             }
         }
 
@@ -1343,7 +1352,7 @@ impl NinjaDatabase {
         })?;
         for r in ev_rows {
             let ts = r?;
-            if let Some(dt) = Utc.timestamp_opt(ts as i64, 0).single() {
+            if let Some(dt) = Local.timestamp_opt(ts as i64, 0).single() {
                 let day = dt.format("%Y-%m-%d").to_string();
                 let hour = dt.format("%H").to_string();
                 if let Some(hours_map) = day_hours.get_mut(&day)
@@ -1357,20 +1366,39 @@ impl NinjaDatabase {
         let mut summary = Vec::new();
         for (day, hours_map) in day_hours.into_iter().rev() {
             let mut total_events = 0i64;
+            let mut total_motion = 0i64;
+            let mut total_duration = 0i64;
+            let mut day_start = i64::MAX;
+            let mut day_end = 0i64;
             let mut hours_vec = Vec::new();
             for (hour, agg) in hours_map.into_iter().rev() {
                 total_events += agg.events;
+                total_motion += agg.motion;
+                let dur_i64 = agg.duration.round() as i64;
+                total_duration += dur_i64;
+                if agg.start_ts > 0 && agg.start_ts < day_start {
+                    day_start = agg.start_ts;
+                }
+                if agg.end_ts > day_end {
+                    day_end = agg.end_ts;
+                }
                 hours_vec.push(json!({
                     "hour": hour,
                     "events": agg.events,
                     "motion": agg.motion,
                     "objects": agg.objects,
-                    "duration": agg.duration.round() as i64
+                    "duration": dur_i64,
+                    "start_ts": agg.start_ts,
+                    "end_ts": agg.end_ts
                 }));
             }
             summary.push(json!({
                 "day": day,
                 "events": total_events,
+                "motion": total_motion,
+                "duration": total_duration,
+                "start_ts": if day_start == i64::MAX { 0 } else { day_start },
+                "end_ts": day_end,
                 "hours": hours_vec
             }));
         }

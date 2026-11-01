@@ -147,6 +147,26 @@ export interface RecordingSegment {
   segment_size: number;
 }
 
+export interface RecordingHourSummary {
+  hour: string;
+  events: number;
+  motion: number;
+  objects: number;
+  duration: number;
+  start_ts?: number;
+  end_ts?: number;
+}
+
+export interface RecordingDaySummary {
+  day: string;
+  events: number;
+  motion?: number;
+  duration?: number;
+  start_ts?: number;
+  end_ts?: number;
+  hours: RecordingHourSummary[];
+}
+
 export interface ExportItem {
   id: string;
   camera: string;
