@@ -154,6 +154,10 @@ pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    build_router_with_auth(state, false)
+}
+
+pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
     let web_dir = state.web_dir.clone();
     let index_html = web_dir.join("index.html");
     let login_html = web_dir.join("login.html");
@@ -328,9 +332,54 @@ pub fn build_router(state: AppState) -> Router {
         .nest_service("/recordings", ServeDir::new(recordings_dir))
         .nest_service("/exports", ServeDir::new(exports_dir))
         .fallback_service(ServeDir::new(web_dir).fallback(ServeFile::new(index_html)))
+        .layer(axum::middleware::from_fn_with_state(
+            (state.clone(), enforce_auth),
+            auth_gate_middleware,
+        ))
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+fn is_protected_path(path: &str) -> bool {
+    if matches!(
+        path,
+        "/api/login" | "/api/logout" | "/api/auth/first_time_login" | "/logout" | "/login"
+    ) {
+        return false;
+    }
+    path.starts_with("/api/")
+        || path == "/api"
+        || path.starts_with("/vod/")
+        || path.starts_with("/live/")
+        || path == "/ws"
+        || path.starts_with("/clips/")
+        || path.starts_with("/recordings/")
+        || path.starts_with("/exports/")
+}
+
+async fn auth_gate_middleware(
+    State((state, enforce_auth)): State<(AppState, bool)>,
+    jar: CookieJar,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if enforce_auth && is_protected_path(req.uri().path()) {
+        let (cookie_name, auth_enabled) = {
+            let cfg = state.config.read().await;
+            (cfg.auth.cookie_name.clone(), cfg.auth.enabled)
+        };
+        if auth_enabled
+            && extract_authenticated_user(&state, &jar, req.headers(), &cookie_name, true).is_none()
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "message": "Unauthorized" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 async fn api_version() -> &'static str {
@@ -1722,7 +1771,7 @@ version: 0.18-0
         let state = new_app_state(&cfg_path, web_dir, tmp_dir.clone(), false)
             .await
             .unwrap();
-        let app = build_router(state);
+        let app = build_router(state.clone());
 
         // 1. Test /api/version
         let resp = app
@@ -1773,6 +1822,7 @@ version: 0.18-0
 
         // 4. Test SPA index fallback
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/review")
@@ -1784,6 +1834,32 @@ version: 0.18-0
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 4096).await.unwrap();
         assert!(std::str::from_utf8(&body).unwrap().contains("NinjaNVR UI"));
+
+        // 5. Test enforce_auth=true router blocks unauthenticated /api/config with 401
+        let auth_app = build_router_with_auth(state, true);
+        let resp = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Public bootstrap endpoint /api/auth/first_time_login remains accessible
+        let resp = auth_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/first_time_login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
