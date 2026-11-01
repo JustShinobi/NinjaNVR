@@ -73,9 +73,18 @@ pub struct EventDto {
     pub sub_label: Option<String>,
     pub top_score: Option<f64>,
     pub false_positive: Option<bool>,
+    #[serde(rename = "box")]
     pub box_coords: Option<Value>,
     pub data: Value,
     pub thumbnail: Option<String>,
+    #[serde(default)]
+    pub area: Option<u32>,
+    #[serde(default)]
+    pub ratio: Option<f32>,
+    #[serde(default)]
+    pub score: Option<f32>,
+    #[serde(default)]
+    pub stationary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1082,8 +1091,8 @@ impl NinjaDatabase {
             INSERT INTO event (
                 id, label, camera, start_time, end_time, top_score, false_positive,
                 zones, thumbnail, has_clip, has_snapshot, box, retain_indefinitely,
-                sub_label, plus_id, data
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                sub_label, plus_id, data, area, ratio, score
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
             ON CONFLICT(id) DO UPDATE SET
                 end_time = excluded.end_time,
                 top_score = excluded.top_score,
@@ -1092,7 +1101,10 @@ impl NinjaDatabase {
                 has_clip = excluded.has_clip,
                 has_snapshot = excluded.has_snapshot,
                 box = excluded.box,
-                data = excluded.data
+                data = excluded.data,
+                area = COALESCE(excluded.area, event.area),
+                ratio = COALESCE(excluded.ratio, event.ratio),
+                score = COALESCE(excluded.score, event.score)
             "#,
             params![
                 ev.id,
@@ -1110,7 +1122,10 @@ impl NinjaDatabase {
                 if ev.retain_indefinitely { 1 } else { 0 },
                 ev.sub_label,
                 ev.plus_id,
-                data_str
+                data_str,
+                ev.area,
+                ev.ratio.map(|r| r as f64),
+                ev.score.map(|s| s as f64)
             ],
         )?;
         Ok(())
@@ -1638,6 +1653,148 @@ impl NinjaDatabase {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn insert_preview(
+        &self,
+        id: &str,
+        camera: &str,
+        path: &str,
+        start_time: f64,
+        end_time: f64,
+        duration: f64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO previews (id, camera, path, start_time, end_time, duration)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+                path = excluded.path,
+                start_time = excluded.start_time,
+                end_time = excluded.end_time,
+                duration = excluded.duration
+            "#,
+            params![id, camera, path, start_time, end_time, duration],
+        )?;
+        Ok(())
+    }
+
+    pub fn last_preview_end_time(&self, camera: &str) -> Result<Option<f64>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let val: Option<f64> = conn
+            .query_row(
+                "SELECT MAX(end_time) FROM previews WHERE camera = ?1",
+                params![camera],
+                |r| Ok(value_to_f64(&r.get_ref(0)?)),
+            )
+            .optional()?
+            .flatten();
+        Ok(val)
+    }
+
+    pub fn cleanup_expired_events_and_reviews(
+        &self,
+        camera: &str,
+        alerts_before_ts: f64,
+        detections_before_ts: f64,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut files_to_remove = Vec::new();
+
+        // 1. Expired review segments
+        {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id, thumb_path
+                FROM reviewsegment
+                WHERE camera = ?1
+                  AND end_time IS NOT NULL
+                  AND (
+                    (severity = 'alert' AND end_time < ?2)
+                    OR (severity != 'alert' AND end_time < ?3)
+                  )
+                LIMIT 500
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![camera, alerts_before_ts, detections_before_ts],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            let mut ids = Vec::new();
+            for r in rows {
+                let (id, thumb) = r?;
+                ids.push(id);
+                if !thumb.is_empty() {
+                    files_to_remove.push(thumb);
+                }
+            }
+            drop(stmt);
+            for id in ids {
+                let _ = conn.execute(
+                    "DELETE FROM userreviewstatus WHERE review_segment_id = ?1",
+                    params![id],
+                );
+                let _ = conn.execute("DELETE FROM reviewsegment WHERE id = ?1", params![id]);
+            }
+        }
+
+        // 2. Expired events (excluding retain_indefinitely = 1), respecting alert vs detection cutoffs
+        let min_cutoff = alerts_before_ts.min(detections_before_ts);
+        {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id
+                FROM event
+                WHERE camera = ?1
+                  AND retain_indefinitely = 0
+                  AND end_time IS NOT NULL
+                  AND (
+                    (COALESCE(json_extract(data, '$.max_severity'), 'alert') = 'alert' AND end_time < ?2)
+                    OR (COALESCE(json_extract(data, '$.max_severity'), 'alert') != 'alert' AND end_time < ?3)
+                  )
+                LIMIT 500
+                "#,
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map(
+                    params![camera, alerts_before_ts, detections_before_ts],
+                    |r| r.get(0),
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for id in ids {
+                files_to_remove.push(format!("/media/frigate/clips/{id}.jpg"));
+                files_to_remove.push(format!("/media/frigate/clips/{camera}-{id}.webp"));
+                let _ = conn.execute("DELETE FROM event WHERE id = ?1", params![id]);
+            }
+        }
+
+        // 3. Expired timeline & previews
+        let _ = conn.execute(
+            "DELETE FROM timeline WHERE camera = ?1 AND timestamp < ?2",
+            params![camera, min_cutoff],
+        );
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, path FROM previews WHERE camera = ?1 AND end_time < ?2 LIMIT 200",
+            )?;
+            let rows = stmt.query_map(params![camera, min_cutoff], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            let mut pids = Vec::new();
+            for r in rows {
+                let (pid, ppath) = r?;
+                pids.push(pid);
+                files_to_remove.push(ppath);
+            }
+            drop(stmt);
+            for pid in pids {
+                let _ = conn.execute("DELETE FROM previews WHERE id = ?1", params![pid]);
+            }
+        }
+
+        Ok(files_to_remove)
     }
 }
 

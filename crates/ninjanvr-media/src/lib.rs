@@ -336,6 +336,11 @@ impl RecordingEngine {
         tokio::spawn(async move {
             cleanup_engine.run_retention_cleanup_loop().await;
         });
+
+        let preview_engine = self.clone();
+        tokio::spawn(async move {
+            preview_engine.run_preview_generator_loop().await;
+        });
     }
 
     async fn sweep_staging_dir(
@@ -563,7 +568,7 @@ impl RecordingEngine {
     async fn run_retention_cleanup_loop(&self) {
         let recordings_root = self.media_dir.join("recordings");
         loop {
-            let (expire_interval, camera_retentions): (u64, Vec<(String, f64, f64)>) = {
+            let (expire_interval, camera_retentions): (u64, Vec<(String, f64, f64, f64)>) = {
                 let cfg = self.config.read().await;
                 let interval = cfg.record.expire_interval.max(30);
                 let cams = cfg
@@ -571,28 +576,26 @@ impl RecordingEngine {
                     .iter()
                     .map(|(name, c)| {
                         let continuous_days = c.record.continuous.days.max(0.1);
-                        let event_days = c
-                            .record
-                            .continuous
-                            .days
-                            .max(c.record.alerts.retain.days)
-                            .max(c.record.detections.retain.days)
-                            .max(continuous_days);
-                        (name.clone(), continuous_days, event_days)
+                        let alerts_days = c.record.alerts.retain.days.max(0.1);
+                        let detections_days = c.record.detections.retain.days.max(0.1);
+                        (name.clone(), continuous_days, alerts_days, detections_days)
                     })
                     .collect();
                 (interval, cams)
             };
 
             let now = unix_now_f64();
-            for (camera, continuous_days, event_days) in camera_retentions {
+            for (camera, continuous_days, alerts_days, detections_days) in camera_retentions {
                 let continuous_cutoff = now - continuous_days * 86400.0;
-                let event_cutoff = now - event_days * 86400.0;
+                let alerts_cutoff = now - alerts_days * 86400.0;
+                let detections_cutoff = now - detections_days * 86400.0;
+                let event_recording_cutoff = alerts_cutoff.min(detections_cutoff);
                 loop {
-                    let Ok(expired_paths) =
-                        self.db
-                            .delete_expired_recordings(&camera, continuous_cutoff, event_cutoff)
-                    else {
+                    let Ok(expired_paths) = self.db.delete_expired_recordings(
+                        &camera,
+                        continuous_cutoff,
+                        event_recording_cutoff,
+                    ) else {
                         break;
                     };
                     if expired_paths.is_empty() {
@@ -618,9 +621,137 @@ impl RecordingEngine {
                         break;
                     }
                 }
+
+                if let Ok(clip_paths) = self.db.cleanup_expired_events_and_reviews(
+                    &camera,
+                    alerts_cutoff,
+                    detections_cutoff,
+                ) {
+                    for cp in clip_paths {
+                        let disk_path = if let Some(rel) = cp.strip_prefix("/media/frigate/") {
+                            self.media_dir.join(rel)
+                        } else {
+                            PathBuf::from(cp)
+                        };
+                        let _ = std::fs::remove_file(disk_path);
+                    }
+                }
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(expire_interval)).await;
+        }
+    }
+
+    async fn run_preview_generator_loop(&self) {
+        let ffmpeg_bin = resolve_ffmpeg_bin();
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+        loop {
+            let cameras: Vec<String> = {
+                let cfg = self.config.read().await;
+                cfg.cameras
+                    .iter()
+                    .filter(|(_, c)| c.enabled && c.record.enabled)
+                    .map(|(n, _)| n.clone())
+                    .collect()
+            };
+
+            let now = unix_now_f64();
+            let current_hour_start = ((now as i64) / 3600) * 3600;
+            let prev_hour_start = current_hour_start - 3600;
+
+            for camera in cameras {
+                for hour_start_i64 in [prev_hour_start, current_hour_start] {
+                    let hour_start = hour_start_i64 as f64;
+                    let hour_end = (hour_start_i64 + 3600) as f64;
+
+                    let Ok(segs) = self.db.query_recordings(&camera, hour_start, hour_end) else {
+                        continue;
+                    };
+                    if segs.len() < 2 {
+                        continue;
+                    }
+                    let start_ts = segs
+                        .first()
+                        .map(|s| s.start_time.max(hour_start))
+                        .unwrap_or(hour_start);
+                    let end_ts = segs
+                        .last()
+                        .map(|s| s.end_time.min(hour_end))
+                        .unwrap_or(hour_end.min(now));
+                    let duration = (end_ts - start_ts).max(1.0);
+
+                    let preview_dir = self.media_dir.join("clips").join("previews").join(&camera);
+                    if std::fs::create_dir_all(&preview_dir).is_err() {
+                        continue;
+                    }
+                    let file_name = format!("{hour_start_i64}-{}.mp4", hour_start_i64 + 3600);
+                    let out_file = preview_dir.join(&file_name);
+                    let list_file = std::env::temp_dir()
+                        .join(format!("ninjanvr-prev-{camera}-{hour_start_i64}.txt"));
+
+                    let mut list_content = String::new();
+                    for seg in &segs {
+                        let local_path = if let Some(rel) = seg.path.strip_prefix("/media/frigate/")
+                        {
+                            self.media_dir.join(rel)
+                        } else {
+                            PathBuf::from(&seg.path)
+                        };
+                        if local_path.exists() {
+                            let escaped = local_path.to_string_lossy().replace('\'', "'\\''");
+                            list_content.push_str(&format!("file '{escaped}'\n"));
+                        }
+                    }
+                    if list_content.is_empty() || std::fs::write(&list_file, &list_content).is_err()
+                    {
+                        continue;
+                    }
+
+                    let status = Command::new(&ffmpeg_bin)
+                        .args([
+                            "-y",
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-skip_frame",
+                            "nokey",
+                            "-f",
+                            "concat",
+                            "-safe",
+                            "0",
+                            "-i",
+                        ])
+                        .arg(&list_file)
+                        .args([
+                            "-vf",
+                            "fps=1,scale=-2:180",
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "ultrafast",
+                            "-crf",
+                            "32",
+                            "-an",
+                            "-movflags",
+                            "+faststart",
+                        ])
+                        .arg(&out_file)
+                        .status()
+                        .await;
+                    let _ = std::fs::remove_file(&list_file);
+
+                    if status.map(|s| s.success()).unwrap_or(false) && out_file.exists() {
+                        let id = format!("{camera}_{hour_start_i64}");
+                        let db_path = format!("/media/frigate/clips/previews/{camera}/{file_name}");
+                        let _ = self
+                            .db
+                            .insert_preview(&id, &camera, &db_path, start_ts, end_ts, duration);
+                    }
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         }
     }
 }

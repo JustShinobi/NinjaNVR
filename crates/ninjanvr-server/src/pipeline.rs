@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use ninjanvr_vision::{
     BoundingBox, SimdMotionDetector, compute_inference_regions, crop_yuv420p_to_tensor_nhwc,
     encode_image_jpeg, encode_image_webp, yuv420p_to_rgb_image,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -50,17 +50,51 @@ struct FrameLifecycleCtx<'a> {
     now: f64,
 }
 
+#[derive(Clone)]
+struct TrackPersistSnapshot {
+    best_score: f32,
+    zones: Vec<String>,
+    stationary: bool,
+}
+
 struct ActiveReviewState {
     id: String,
     start_time: f64,
     last_activity_time: f64,
     severity: String,
     thumb_path: String,
+    thumb_time: f64,
+    best_score: f32,
     detections: Vec<String>,
     objects: Vec<String>,
     zones: Vec<String>,
-    thumb_written: bool,
+    is_new: bool,
     dirty: bool,
+    prev_dto: Option<ReviewItemDto>,
+}
+
+impl ActiveReviewState {
+    fn to_dto(&self, camera: &str, end_time: Option<f64>) -> ReviewItemDto {
+        ReviewItemDto {
+            id: self.id.clone(),
+            camera: camera.to_string(),
+            start_time: self.start_time,
+            end_time,
+            severity: self.severity.clone(),
+            thumb_path: self.thumb_path.clone(),
+            data: json!({
+                "detections": self.detections,
+                "objects": self.objects,
+                "verified_objects": [],
+                "sub_labels": [],
+                "zones": self.zones,
+                "audio": [],
+                "thumb_time": self.thumb_time,
+                "metadata": null
+            }),
+            has_been_reviewed: false,
+        }
+    }
 }
 
 pub struct VisionPipeline {
@@ -109,6 +143,7 @@ impl VisionPipeline {
         let (model_w, model_h, bgr_order) = self.detector.model_dimensions();
         let mut tensor_buf = vec![0u8; (model_w * model_h * 3) as usize];
         let mut active_review: Option<ActiveReviewState> = None;
+        let mut track_snapshots: HashMap<String, TrackPersistSnapshot> = HashMap::new();
 
         let ffmpeg_bin = resolve_ffmpeg_bin();
         let cam_arc: Arc<str> = Arc::from(camera.as_str());
@@ -156,11 +191,16 @@ impl VisionPipeline {
             );
 
             if let Some(mut stdout) = child.stdout.take() {
-                // Zero-allocation reusable frame buffer via Arc::make_mut
                 let mut frame_data: Arc<Vec<u8>> = Arc::new(vec![0u8; frame_byte_len]);
                 let mut frame_count = 0u64;
                 let mut detect_calls = 0u64;
                 let mut window_start = unix_now_f64();
+                let mut prev_motion_on = false;
+                let mut prev_label_counts: BTreeMap<String, usize> = BTreeMap::new();
+                for lbl in &cam_cfg.objects.track {
+                    prev_label_counts.insert(lbl.clone(), 0);
+                }
+                let mut prev_total_objs = 0usize;
 
                 while stdout
                     .read_exact(Arc::<Vec<u8>>::make_mut(&mut frame_data))
@@ -213,7 +253,65 @@ impl VisionPipeline {
                     let (active_tracks, ended_tracks) =
                         tracker.update(now, &raw_detections, &regions, &cam_cfg);
 
-                    // 4. Record activity into in-memory ring buffer for RecordingEngine
+                    // 4. Publish real-time motion, per-label MQTT counts, and WS camera_activity
+                    let motion_on = !motion_boxes.is_empty();
+                    let mut cur_label_counts: BTreeMap<String, usize> = BTreeMap::new();
+                    for lbl in prev_label_counts.keys() {
+                        cur_label_counts.insert(lbl.clone(), 0);
+                    }
+                    for t in &active_tracks {
+                        *cur_label_counts.entry(t.label.clone()).or_default() += 1;
+                    }
+
+                    let mut activity_changed = false;
+                    if motion_on != prev_motion_on {
+                        prev_motion_on = motion_on;
+                        activity_changed = true;
+                        self.comms.publish_topic(
+                            &format!("{camera}/motion"),
+                            if motion_on { "ON" } else { "OFF" },
+                        );
+                    }
+
+                    for (lbl, &cnt) in &cur_label_counts {
+                        if prev_label_counts.get(lbl).copied().unwrap_or(0) != cnt {
+                            activity_changed = true;
+                            self.comms
+                                .publish_topic(&format!("{camera}/{lbl}"), cnt.to_string());
+                        }
+                    }
+                    prev_label_counts = cur_label_counts;
+
+                    if active_tracks.len() != prev_total_objs {
+                        prev_total_objs = active_tracks.len();
+                        activity_changed = true;
+                        self.comms
+                            .publish_topic(&format!("{camera}/all"), prev_total_objs.to_string());
+                    }
+
+                    if activity_changed || !active_tracks.is_empty() {
+                        let max_area = motion_boxes.iter().map(|b| b.area()).max().unwrap_or(0);
+                        let objs_json: Vec<Value> = active_tracks
+                            .iter()
+                            .map(|t| {
+                                let ratio =
+                                    (t.bbox.width() as f32) / (t.bbox.height().max(1) as f32);
+                                json!({
+                                    "id": t.id,
+                                    "label": t.label,
+                                    "stationary": t.stationary,
+                                    "area": t.bbox.area(),
+                                    "ratio": ratio,
+                                    "score": t.score,
+                                    "sub_label": null
+                                })
+                            })
+                            .collect();
+                        self.comms
+                            .update_camera_activity(&camera, motion_on, objs_json, max_area);
+                    }
+
+                    // 5. Record activity into in-memory ring buffer for RecordingEngine
                     {
                         let mut ledger = self.activity_ledger.write().await;
                         ledger.entry(camera.clone()).or_default().record_sample(
@@ -224,7 +322,7 @@ impl VisionPipeline {
                         );
                     }
 
-                    // 5. Update latest frame JPEG cache every 5 frames (~1s) or when objects are active
+                    // 6. Update latest frame JPEG cache every 5 frames (~1s) or when objects are active
                     if frame_count.is_multiple_of(5) || !active_tracks.is_empty() {
                         let annotated: Vec<(BoundingBox, [u8; 3])> = active_tracks
                             .iter()
@@ -239,7 +337,7 @@ impl VisionPipeline {
                         }
                     }
 
-                    // 6. Persist Events, Timeline entries, and ReviewSegments
+                    // 7. Persist Events, Timeline entries, and ReviewSegments
                     let ctx = FrameLifecycleCtx {
                         camera: &camera,
                         cam_cfg: &cam_cfg,
@@ -251,10 +349,11 @@ impl VisionPipeline {
                         &active_tracks,
                         &ended_tracks,
                         &mut active_review,
+                        &mut track_snapshots,
                     )
                     .await;
 
-                    // 7. Update rolling FPS metrics every 5 seconds
+                    // 8. Update rolling FPS metrics every 5 seconds
                     let elapsed = (now - window_start).max(0.1);
                     if elapsed >= 5.0 {
                         let c_fps = ((frame_count as f64 / elapsed) * 10.0).round() / 10.0;
@@ -286,6 +385,7 @@ impl VisionPipeline {
         active_tracks: &[TrackedObject],
         ended_tracks: &[TrackedObject],
         active_review: &mut Option<ActiveReviewState>,
+        track_snapshots: &mut HashMap<String, TrackPersistSnapshot>,
     ) {
         let camera = ctx.camera;
         let cam_cfg = ctx.cam_cfg;
@@ -295,32 +395,56 @@ impl VisionPipeline {
         let clips_dir = self.media_dir.join("clips");
 
         for trk in active_tracks {
-            let is_new = trk.frames_tracked == cam_cfg.detect.min_initialized.max(1);
-            let is_best_score = trk.score >= trk.top_score;
+            let prev = track_snapshots.get(&trk.id);
+            let is_new = prev.is_none();
+            let is_better_score = prev
+                .map(|p| trk.score > p.best_score + 0.01)
+                .unwrap_or(true);
+            let state_changed = prev
+                .map(|p| p.zones != trk.entered_zones || p.stationary != trk.stationary)
+                .unwrap_or(false);
 
-            if is_new || is_best_score {
-                let _ = std::fs::create_dir_all(&clips_dir);
-                let crop_img = yuv420p_to_rgb_image(frame, Some(trk.region), &[]);
-                let thumb_b64 = encode_image_webp(&crop_img)
-                    .ok()
-                    .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
+            if is_new || is_better_score || state_changed {
+                let best_score = prev
+                    .map(|p| p.best_score.max(trk.score))
+                    .unwrap_or(trk.score);
+                track_snapshots.insert(
+                    trk.id.clone(),
+                    TrackPersistSnapshot {
+                        best_score,
+                        zones: trk.entered_zones.clone(),
+                        stationary: trk.stationary,
+                    },
+                );
 
-                if cam_cfg.snapshots.enabled {
-                    let full_img = yuv420p_to_rgb_image(frame, None, &[(trk.bbox, [31, 119, 180])]);
-                    if let Ok(jpg) = encode_image_jpeg(&full_img) {
-                        let _ = std::fs::write(clips_dir.join(format!("{}.jpg", trk.id)), jpg);
-                    }
-                    if let Ok(webp) = encode_image_webp(&full_img) {
-                        let _ = std::fs::write(
-                            clips_dir.join(format!("{camera}-{}.webp", trk.id)),
-                            webp,
-                        );
+                let mut thumb_b64 = None;
+                if is_new || is_better_score {
+                    let _ = std::fs::create_dir_all(&clips_dir);
+                    let crop_img = yuv420p_to_rgb_image(frame, Some(trk.region), &[]);
+                    thumb_b64 = encode_image_webp(&crop_img)
+                        .ok()
+                        .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
+
+                    if cam_cfg.snapshots.enabled {
+                        let full_img =
+                            yuv420p_to_rgb_image(frame, None, &[(trk.bbox, [31, 119, 180])]);
+                        if let Ok(jpg) = encode_image_jpeg(&full_img) {
+                            let _ = std::fs::write(clips_dir.join(format!("{}.jpg", trk.id)), jpg);
+                        }
+                        if let Ok(webp) = encode_image_webp(&full_img) {
+                            let _ = std::fs::write(
+                                clips_dir.join(format!("{camera}-{}.webp", trk.id)),
+                                webp,
+                            );
+                        }
                     }
                 }
 
                 let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
                 let norm_reg = trk.region.to_normalized(frame.width, frame.height);
                 let severity = compute_track_severity(cam_cfg, trk);
+                let area = trk.bbox.area();
+                let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
 
                 let ev_dto = EventDto {
                     id: trk.id.clone(),
@@ -334,19 +458,23 @@ impl VisionPipeline {
                     plus_id: None,
                     retain_indefinitely: false,
                     sub_label: None,
-                    top_score: Some(trk.top_score as f64),
+                    top_score: Some(best_score as f64),
                     false_positive: Some(false),
                     box_coords: Some(json!(norm_box)),
                     data: json!({
                         "box": norm_box,
                         "region": norm_reg,
                         "score": trk.score,
-                        "top_score": trk.top_score,
+                        "top_score": best_score,
                         "attributes": [],
                         "type": "object",
                         "max_severity": severity
                     }),
                     thumbnail: thumb_b64,
+                    area: Some(area),
+                    ratio: Some(ratio),
+                    score: Some(trk.score),
+                    stationary: trk.stationary,
                 };
                 let _ = self.db.upsert_event(&ev_dto);
                 if is_new {
@@ -361,7 +489,7 @@ impl VisionPipeline {
                             "label": trk.label,
                             "region": norm_reg,
                             "score": trk.score,
-                            "top_score": trk.top_score
+                            "top_score": best_score
                         }),
                     );
                 }
@@ -379,8 +507,13 @@ impl VisionPipeline {
                 }
             }
 
-            // Update or open ReviewSegment
-            let is_alert = compute_track_severity(cam_cfg, trk) == "alert";
+            // Update or open ReviewSegment if enabled
+            let track_sev = compute_track_severity(cam_cfg, trk);
+            let is_alert = track_sev == "alert";
+            if !is_alert && !cam_cfg.review.detections.enabled {
+                continue;
+            }
+
             let rev = active_review.get_or_insert_with(|| {
                 let rev_id = format!("{now:.6}-{}", random_suffix());
                 let thumb_rel = format!("/media/frigate/clips/review/thumb-{camera}-{rev_id}.webp");
@@ -388,22 +521,22 @@ impl VisionPipeline {
                     id: rev_id,
                     start_time: now,
                     last_activity_time: now,
-                    severity: if is_alert {
-                        "alert".to_string()
-                    } else {
-                        "detection".to_string()
-                    },
+                    severity: track_sev.to_string(),
                     thumb_path: thumb_rel,
+                    thumb_time: now,
+                    best_score: 0.0,
                     detections: Vec::new(),
                     objects: Vec::new(),
                     zones: Vec::new(),
-                    thumb_written: false,
+                    is_new: true,
                     dirty: true,
+                    prev_dto: None,
                 }
             });
 
             rev.last_activity_time = now;
-            if is_alert && rev.severity != "alert" {
+            let promoted_to_alert = is_alert && rev.severity != "alert";
+            if promoted_to_alert {
                 rev.severity = "alert".to_string();
                 rev.dirty = true;
             }
@@ -421,22 +554,29 @@ impl VisionPipeline {
                     rev.dirty = true;
                 }
             }
-            if !rev.thumb_written {
+            if trk.score > rev.best_score || promoted_to_alert {
+                rev.best_score = trk.score;
+                rev.thumb_time = now;
                 let _ = std::fs::create_dir_all(&review_dir);
                 let full_img = yuv420p_to_rgb_image(frame, None, &[(trk.bbox, [31, 119, 180])]);
                 if let Ok(webp) = encode_image_webp(&full_img) {
                     let fname = format!("thumb-{camera}-{}.webp", rev.id);
                     let _ = std::fs::write(review_dir.join(fname), webp);
-                    rev.thumb_written = true;
                 }
             }
         }
 
         // Finalize ended tracks
         for trk in ended_tracks {
+            let best_score = track_snapshots
+                .remove(&trk.id)
+                .map(|s| s.best_score.max(trk.top_score))
+                .unwrap_or(trk.top_score);
             let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
             let norm_reg = trk.region.to_normalized(frame.width, frame.height);
             let severity = compute_track_severity(cam_cfg, trk);
+            let area = trk.bbox.area();
+            let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
             let ev_dto = EventDto {
                 id: trk.id.clone(),
                 camera: camera.to_string(),
@@ -449,19 +589,23 @@ impl VisionPipeline {
                 plus_id: None,
                 retain_indefinitely: false,
                 sub_label: None,
-                top_score: Some(trk.top_score as f64),
+                top_score: Some(best_score as f64),
                 false_positive: Some(false),
                 box_coords: Some(json!(norm_box)),
                 data: json!({
                     "box": norm_box,
                     "region": norm_reg,
                     "score": trk.score,
-                    "top_score": trk.top_score,
+                    "top_score": best_score,
                     "attributes": [],
                     "type": "object",
                     "max_severity": severity
                 }),
                 thumbnail: None,
+                area: Some(area),
+                ratio: Some(ratio),
+                score: Some(trk.score),
+                stationary: trk.stationary,
             };
             let _ = self.db.upsert_event(&ev_dto);
             let _ = self.db.insert_timeline_entry(
@@ -475,7 +619,7 @@ impl VisionPipeline {
                     "label": trk.label,
                     "region": norm_reg,
                     "score": trk.score,
-                    "top_score": trk.top_score
+                    "top_score": best_score
                 }),
             );
             self.comms.publish_json(
@@ -488,39 +632,48 @@ impl VisionPipeline {
             );
         }
 
-        // Flush or close active review segment only when dirty or expired
+        // Flush or close active review segment with Frigate-compatible {type, before, after} schema
         if let Some(rev) = active_review {
-            let cutoff = cam_cfg.review.detections.cutoff_time.max(15) as f64;
-            let is_expired = active_tracks.is_empty() && (now - rev.last_activity_time) >= cutoff;
+            let cutoff_secs = if rev.severity == "alert" {
+                cam_cfg.review.alerts.cutoff_time.max(15) as f64
+            } else {
+                cam_cfg.review.detections.cutoff_time.max(15) as f64
+            };
+            let is_expired =
+                active_tracks.is_empty() && (now - rev.last_activity_time) >= cutoff_secs;
+
             if rev.dirty || is_expired {
-                let dto = ReviewItemDto {
-                    id: rev.id.clone(),
-                    camera: camera.to_string(),
-                    start_time: rev.start_time,
-                    end_time: if is_expired {
-                        Some(rev.last_activity_time)
-                    } else {
-                        None
-                    },
-                    severity: rev.severity.clone(),
-                    thumb_path: rev.thumb_path.clone(),
-                    data: json!({
-                        "detections": rev.detections,
-                        "objects": rev.objects,
-                        "verified_objects": [],
-                        "sub_labels": [],
-                        "zones": rev.zones,
-                        "audio": [],
-                        "thumb_time": rev.start_time,
-                        "metadata": null
-                    }),
-                    has_been_reviewed: false,
+                let end_time = if is_expired {
+                    Some(rev.last_activity_time)
+                } else {
+                    None
                 };
+                let dto = rev.to_dto(camera, end_time);
                 let _ = self.db.insert_review_segment(&dto);
+
+                let before_dto = rev.prev_dto.clone().unwrap_or_else(|| dto.clone());
+                let msg_type = if is_expired {
+                    "end"
+                } else if rev.is_new {
+                    "new"
+                } else {
+                    "update"
+                };
+
+                self.comms.publish_json(
+                    "reviews",
+                    &json!({
+                        "type": msg_type,
+                        "before": before_dto,
+                        "after": dto
+                    }),
+                );
+
+                rev.is_new = false;
                 rev.dirty = false;
+                rev.prev_dto = Some(dto);
+
                 if is_expired {
-                    self.comms
-                        .publish_json("reviews", &json!({ "type": "end", "review": dto }));
                     *active_review = None;
                 }
             }
@@ -529,7 +682,8 @@ impl VisionPipeline {
 }
 
 fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'static str {
-    if cam_cfg.review.alerts.labels.contains(&trk.label)
+    if cam_cfg.review.alerts.enabled
+        && cam_cfg.review.alerts.labels.contains(&trk.label)
         && (cam_cfg.review.alerts.required_zones.is_empty()
             || trk
                 .entered_zones

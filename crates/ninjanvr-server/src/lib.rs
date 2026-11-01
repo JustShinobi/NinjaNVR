@@ -1380,6 +1380,14 @@ async fn handle_state_ws(mut socket: WebSocket, state: AppState) {
                                     return;
                                 }
                             }
+                        } else if let Ok(parsed) = serde_json::from_str::<Value>(&text)
+                            && let (Some(topic), Some(payload)) = (
+                                parsed.get("topic").and_then(|v| v.as_str()),
+                                parsed.get("payload").and_then(|v| v.as_str()),
+                            )
+                            && topic.ends_with("/set")
+                        {
+                            state.comms.apply_set_command(topic, payload);
                         }
                     }
                     Some(Ok(AxumWsMsg::Close(_))) | None => break,
@@ -1600,11 +1608,11 @@ pub async fn new_app_state(
     let jwt_secret = load_or_create_jwt_secret(config_dir);
 
     let detector = Arc::new(AiDetectorEngine::new(&cfg));
+    let comms = Arc::new(CommsHub::with_mqtt(&cfg.mqtt));
     let shared_cfg = Arc::new(RwLock::new(cfg));
     let activity_ledger = new_activity_ledger();
     let latest_frames = Arc::new(RwLock::new(HashMap::new()));
     let camera_metrics: SharedCameraMetrics = Arc::new(RwLock::new(HashMap::new()));
-    let comms = Arc::new(CommsHub::new());
     let go2rtc_supervisor = Arc::new(Go2RtcSupervisor::new(shared_cfg.clone()));
     if spawn_go2rtc {
         go2rtc_supervisor.clone().spawn_supervisor_task();
@@ -1633,7 +1641,7 @@ pub async fn new_app_state(
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    Ok(AppState {
+    let state = AppState {
         config: shared_cfg,
         db,
         comms,
@@ -1649,7 +1657,20 @@ pub async fn new_app_state(
         activity_ledger,
         detector,
         camera_metrics,
-    })
+    };
+
+    if spawn_go2rtc {
+        let stats_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let Json(stats_val) = api_stats(State(stats_state.clone())).await;
+                stats_state.comms.publish_json("stats", &stats_val);
+            }
+        });
+    }
+
+    Ok(state)
 }
 
 #[cfg(test)]
