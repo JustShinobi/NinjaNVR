@@ -1328,16 +1328,17 @@ impl NinjaDatabase {
             if let Some(dt) = Local.timestamp_opt(ts as i64, 0).single() {
                 let day = dt.format("%Y-%m-%d").to_string();
                 let hour = dt.format("%H").to_string();
-                let hour_start = ((ts as i64) / 3600) * 3600;
+                let seg_start = ts as i64;
+                let seg_end = (ts + dur).ceil() as i64;
                 let h = day_hours.entry(day).or_default().entry(hour).or_default();
                 h.duration += dur;
                 h.motion += motion;
                 h.objects += objs;
-                if h.start_ts == 0 || hour_start < h.start_ts {
-                    h.start_ts = hour_start;
+                if h.start_ts == 0 || seg_start < h.start_ts {
+                    h.start_ts = seg_start;
                 }
-                if hour_start + 3600 > h.end_ts {
-                    h.end_ts = hour_start + 3600;
+                if seg_end > h.end_ts {
+                    h.end_ts = seg_end;
                 }
             }
         }
