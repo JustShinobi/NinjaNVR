@@ -22,7 +22,9 @@ import {
 } from "../types/nvr";
 import { RecordingCalendarPopover } from "./RecordingCalendarPopover";
 
-export type TimelineZoomMinutes = 15 | 60 | 360 | 1440;
+export type TimelineZoomMinutes = 5 | 15 | 60 | 360 | 1440;
+
+const ZOOM_LEVELS: TimelineZoomMinutes[] = [5, 15, 60, 360, 1440];
 
 interface TimelineScrubberProps {
   camera: string;
@@ -147,8 +149,15 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   const [exportBusy, setExportBusy] = useState<boolean>(false);
   const [readyDownloadUrl, setReadyDownloadUrl] = useState<string | null>(null);
   const [draggingTarget, setDraggingTarget] = useState<
-    "playhead" | "in" | "out" | null
+    "track" | "in" | "out" | null
   >(null);
+  const dragOriginRef = useRef<{
+    startX: number;
+    startWinEnd: number;
+    startPlayhead: number;
+    moved: boolean;
+  } | null>(null);
+  const wheelSeekTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -228,14 +237,33 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     [winStart, winEnd, windowSpanSec]
   );
 
-  // Global pointer move / up when dragging playhead or IN/OUT handles
+  // Global pointer move / up when dragging timeline track (touch/mouse pan) or IN/OUT handles
   useEffect(() => {
     if (!draggingTarget) return;
     const onMove = (e: PointerEvent) => {
+      if (draggingTarget === "track" && dragOriginRef.current) {
+        const el = trackRef.current;
+        const width = el?.clientWidth || 800;
+        const dx = e.clientX - dragOriginRef.current.startX;
+        if (Math.abs(dx) >= 5) {
+          dragOriginRef.current.moved = true;
+        }
+        if (dragOriginRef.current.moved) {
+          const deltaSec = -Math.round((dx / Math.max(1, width)) * windowSpanSec);
+          const nextWinEnd = Math.min(
+            nowSec,
+            dragOriginRef.current.startWinEnd + deltaSec
+          );
+          setCustomWinEnd(nextWinEnd >= nowSec - 2 ? null : nextWinEnd);
+          setHoverTs(
+            Math.min(nowSec, dragOriginRef.current.startPlayhead + deltaSec)
+          );
+        }
+        return;
+      }
+
       const ts = clientXToTs(e.clientX);
-      if (draggingTarget === "playhead") {
-        onSeek(ts >= nowSec - 3 ? null : ts);
-      } else if (draggingTarget === "in") {
+      if (draggingTarget === "in") {
         setRangeStart(Math.min(ts, rangeEnd - 5));
         setReadyDownloadUrl(null);
       } else if (draggingTarget === "out") {
@@ -243,16 +271,91 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         setReadyDownloadUrl(null);
       }
     };
-    const onUp = () => {
+    const onUp = (e: PointerEvent) => {
+      if (draggingTarget === "track" && dragOriginRef.current) {
+        const origin = dragOriginRef.current;
+        dragOriginRef.current = null;
+        setDraggingTarget(null);
+        if (!origin.moved) {
+          const ts = clientXToTs(e.clientX);
+          onSeek(ts >= nowSec - 3 ? null : ts);
+        } else {
+          const el = trackRef.current;
+          const width = el?.clientWidth || 800;
+          const dx = e.clientX - origin.startX;
+          const deltaSec = -Math.round((dx / Math.max(1, width)) * windowSpanSec);
+          const targetTs = Math.min(nowSec, origin.startPlayhead + deltaSec);
+          onSeek(targetTs >= nowSec - 3 ? null : targetTs);
+        }
+        return;
+      }
       setDraggingTarget(null);
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
     return () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
     };
-  }, [draggingTarget, clientXToTs, nowSec, onSeek, rangeEnd, rangeStart]);
+  }, [draggingTarget, clientXToTs, nowSec, onSeek, rangeEnd, rangeStart, windowSpanSec]);
+
+  // Native non-passive wheel listener on the timeline track for PC mouse-wheel scrubbing & Ctrl+wheel zoom
+  useEffect(() => {
+    const el = trackRef.current;
+    if (!el) return;
+
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rawDelta =
+        Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+      if (rawDelta === 0) return;
+
+      // Ctrl + Wheel or Alt + Wheel = Zoom In / Out around hovered timestamp
+      if (e.ctrlKey || e.altKey) {
+        const curIdx = ZOOM_LEVELS.indexOf(zoomMin);
+        const nextIdx =
+          rawDelta < 0
+            ? Math.max(0, curIdx - 1)
+            : Math.min(ZOOM_LEVELS.length - 1, curIdx + 1);
+        const nextZoom = ZOOM_LEVELS[nextIdx];
+        if (nextZoom !== zoomMin) {
+          const anchor = clientXToTs(e.clientX);
+          setZoomMin(nextZoom);
+          const nextSpan = nextZoom * 60;
+          const nextEnd = Math.min(nowSec, anchor + Math.round(nextSpan * 0.5));
+          setCustomWinEnd(nextEnd >= nowSec - 2 ? null : nextEnd);
+        }
+        return;
+      }
+
+      // Normal Wheel = Scrub / Pan through time (Shift = fine 10s step)
+      const dir = rawDelta > 0 ? 1 : -1;
+      const stepSec = e.shiftKey
+        ? 10
+        : Math.max(15, Math.round(windowSpanSec * 0.08));
+
+      const nextWinEnd = Math.min(nowSec, winEnd + dir * stepSec);
+      setCustomWinEnd(nextWinEnd >= nowSec - 2 ? null : nextWinEnd);
+
+      const basePlayhead = currentTs ?? winEnd;
+      const nextPlayhead = Math.min(nowSec, basePlayhead + dir * stepSec);
+      setHoverTs(nextPlayhead);
+
+      if (wheelSeekTimerRef.current) {
+        window.clearTimeout(wheelSeekTimerRef.current);
+      }
+      wheelSeekTimerRef.current = window.setTimeout(() => {
+        onSeek(nextPlayhead >= nowSec - 3 ? null : nextPlayhead);
+      }, 140);
+    };
+
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+    };
+  }, [zoomMin, windowSpanSec, winEnd, currentTs, nowSec, clientXToTs, onSeek]);
 
   // Jump to a specific Day from the Multi-Day Calendar
   const handleSelectDay = (dayObj: RecordingDaySummary) => {
@@ -967,6 +1070,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             <ZoomIn size={12} color="var(--text-muted)" />
             {(
               [
+                { min: 5, label: "5m" },
                 { min: 15, label: "15m" },
                 { min: 60, label: "1h" },
                 { min: 360, label: "6h" },
@@ -1224,26 +1328,41 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       <div
         ref={trackRef}
         className="nvr-timeline-track"
+        title="Scroll mouse wheel to scrub time (Shift+Wheel = 10s fine step, Ctrl+Wheel = Zoom) · Drag to pan · Click/Tap to seek"
         style={{
           position: "relative",
           height: 44,
           background: "#06080c",
           border: "1px solid var(--border-strong)",
           borderRadius: 3,
-          cursor: "pointer",
-          overflow: " visible",
+          cursor: draggingTarget === "track" ? "grabbing" : "grab",
+          touchAction: "none",
+          overflow: "visible",
         }}
-        onMouseMove={(e) => {
+        onPointerMove={(e) => {
           const rect = e.currentTarget.getBoundingClientRect();
           setHoverX(e.clientX - rect.left);
-          setHoverTs(clientXToTs(e.clientX));
+          if (draggingTarget !== "track") {
+            setHoverTs(clientXToTs(e.clientX));
+          }
         }}
-        onMouseLeave={() => setHoverTs(null)}
+        onPointerLeave={() => {
+          if (!draggingTarget) setHoverTs(null);
+        }}
         onPointerDown={(e) => {
           if ((e.target as HTMLElement).dataset.handle) return;
-          const ts = clientXToTs(e.clientX);
-          onSeek(ts >= nowSec - 3 ? null : ts);
-          setDraggingTarget("playhead");
+          try {
+            e.currentTarget.setPointerCapture(e.pointerId);
+          } catch {
+            // ignore
+          }
+          dragOriginRef.current = {
+            startX: e.clientX,
+            startWinEnd: winEnd,
+            startPlayhead: currentTs ?? winEnd,
+            moved: false,
+          };
+          setDraggingTarget("track");
         }}
       >
         {/* Inner clipped layer for bars */}
@@ -1373,12 +1492,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               title="Drag IN handle to adjust export start time"
               style={{
                 position: "absolute",
-                left: -6,
+                left: -8,
                 top: 0,
                 bottom: 0,
-                width: 12,
+                width: 16,
                 background: "#0ea5e9",
                 cursor: "ew-resize",
+                touchAction: "none",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
@@ -1402,12 +1522,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               title="Drag OUT handle to adjust export end time"
               style={{
                 position: "absolute",
-                right: -6,
+                right: -8,
                 top: 0,
                 bottom: 0,
-                width: 14,
+                width: 16,
                 background: "#0ea5e9",
                 cursor: "ew-resize",
+                touchAction: "none",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
