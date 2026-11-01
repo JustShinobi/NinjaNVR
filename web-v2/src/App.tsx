@@ -111,6 +111,7 @@ function formatUptime(sec: number): string {
 export const App: React.FC = () => {
   const { t } = useI18n();
   const [activeTab, setActiveTab] = useState<WorkspaceTab>(resolveInitialTab);
+  const [authChecked, setAuthChecked] = useState(false);
   const [authNeeded, setAuthNeeded] = useState(false);
   const [username, setUsername] = useState("admin");
   const [loginUser, setLoginUser] = useState("admin");
@@ -223,10 +224,12 @@ export const App: React.FC = () => {
 
       if (cfgRes.status === 401 || statsRes.status === 401) {
         setAuthNeeded(true);
+        setAuthChecked(true);
         return;
       }
 
       setAuthNeeded(false);
+      setAuthChecked(true);
       if (cfgRes.ok) {
         const cfgJson: NinjaConfigResponse = await cfgRes.json();
         setConfig(cfgJson);
@@ -257,13 +260,14 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     fetchCoreData();
+    if (authNeeded) return;
     const timer = window.setInterval(fetchCoreData, 5000);
     return () => window.clearInterval(timer);
-  }, [fetchCoreData]);
+  }, [fetchCoreData, authNeeded]);
 
   // Connect to /ws for real-time camera_activity and stats
   useEffect(() => {
-    if (authNeeded) return;
+    if (!authChecked || authNeeded) return;
     let closed = false;
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
@@ -303,7 +307,7 @@ export const App: React.FC = () => {
       : selectedCamera;
 
   useEffect(() => {
-    if (authNeeded || !timelineCam) return;
+    if (!authChecked || authNeeded || !timelineCam) return;
     const now = Math.floor(Date.now() / 1000);
     fetch(
       `/api/${encodeURIComponent(timelineCam)}/recordings?after=${now - 86400}&before=${now + 10}`,
@@ -611,6 +615,10 @@ export const App: React.FC = () => {
   const inferMs = stats?.detectors?.detector01?.inference_speed?.toFixed(1) || "7.0";
   const totalFps = stats?.camera_fps?.toFixed(1) || "20.0";
 
+  if (!authChecked) {
+    return <div className="nvr-shell" />;
+  }
+
   if (authNeeded) {
     return (
       <div
@@ -653,10 +661,16 @@ export const App: React.FC = () => {
             </div>
           )}
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-            <label className="mono" style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+            <label
+              htmlFor="nvr-username"
+              className="mono"
+              style={{ fontSize: 11, color: "var(--text-secondary)" }}
+            >
               {t.auth.username}
             </label>
             <input
+              id="nvr-username"
+              name="username"
               className="nvr-input"
               value={loginUser}
               onChange={(e) => setLoginUser(e.target.value)}
@@ -665,10 +679,16 @@ export const App: React.FC = () => {
             />
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-            <label className="mono" style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+            <label
+              htmlFor="nvr-password"
+              className="mono"
+              style={{ fontSize: 11, color: "var(--text-secondary)" }}
+            >
               {t.auth.password}
             </label>
             <input
+              id="nvr-password"
+              name="password"
               type="password"
               className="nvr-input"
               value={loginPass}
