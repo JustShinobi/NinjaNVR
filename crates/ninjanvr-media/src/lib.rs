@@ -691,6 +691,20 @@ impl RecordingEngine {
                     }
                     let file_name = format!("{hour_start_i64}-{}.mp4", hour_start_i64 + 3600);
                     let out_file = preview_dir.join(&file_name);
+                    if let Ok(meta) = std::fs::metadata(&out_file)
+                        && meta.len() > 1024
+                    {
+                        if hour_start_i64 == prev_hour_start {
+                            // Previous hour preview already exists on disk; never regenerate
+                            continue;
+                        }
+                        if let Ok(mtime) = meta.modified()
+                            && mtime.elapsed().map(|d| d.as_secs() < 900).unwrap_or(false)
+                        {
+                            // Active hour preview was updated less than 15m ago
+                            continue;
+                        }
+                    }
                     let list_file = std::env::temp_dir()
                         .join(format!("ninjanvr-prev-{camera}-{hour_start_i64}.txt"));
 
