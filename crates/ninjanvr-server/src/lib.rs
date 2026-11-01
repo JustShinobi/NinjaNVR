@@ -396,6 +396,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/review/activity/motion", get(api_review_activity_motion))
         .route("/review/event/{event_id}", get(api_review_by_event_id))
         .route("/review/{id}", get(api_review_by_id))
+        .route("/review/{id}/preview", get(api_review_preview))
         .route("/review/{id}/viewed", delete(api_review_unview_one))
         .route("/review_ids", get(api_review_ids))
         .route("/reviews", delete(api_reviews_delete))
@@ -447,6 +448,14 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route(
             "/preview/{camera}/start/{start}/end/{end}/frames",
             get(api_empty_array),
+        )
+        .route(
+            "/preview/{preview_name}/thumbnail.webp",
+            get(api_preview_thumbnail),
+        )
+        .route(
+            "/preview/{preview_name}/thumbnail.jpg",
+            get(api_preview_thumbnail),
         )
         .route("/go2rtc/streams", get(api_go2rtc_streams))
         .route("/go2rtc/streams/{stream}", get(api_go2rtc_stream_one))
@@ -1178,6 +1187,53 @@ async fn api_review_by_id(
     }
 }
 
+async fn api_review_preview(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Ok(Some(item)) = state.db.get_review_by_id(&id) {
+        let cam = &item.camera;
+        let start = item.start_time;
+        let end = item.end_time.unwrap_or(start + 15.0);
+
+        // 1. Exact recording segment overlapping the review window
+        if let Ok(recs) = state.db.query_recordings(cam, start - 10.0, end + 10.0) {
+            for rec in recs {
+                let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+                if let Ok(bytes) = tokio::fs::read(&disk_path).await {
+                    return (
+                        [
+                            (header::CONTENT_TYPE, "video/mp4"),
+                            (header::ACCEPT_RANGES, "bytes"),
+                        ],
+                        bytes,
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        // 2. Fallback to the latest closed segment for this camera if the active segment is still being written
+        let now = unix_now() as f64;
+        if let Ok(recs) = state.db.query_recordings(cam, now - 600.0, now + 10.0) {
+            for rec in recs.into_iter().rev() {
+                let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+                if let Ok(bytes) = tokio::fs::read(&disk_path).await {
+                    return (
+                        [
+                            (header::CONTENT_TYPE, "video/mp4"),
+                            (header::ACCEPT_RANGES, "bytes"),
+                        ],
+                        bytes,
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
 async fn api_review_by_event_id(
     State(state): State<AppState>,
     AxumPath(event_id): AxumPath<String>,
@@ -1704,6 +1760,18 @@ async fn api_previews(
         .query_previews(&camera, start, end)
         .unwrap_or_default();
     Json(Value::Array(previews))
+}
+
+async fn api_preview_thumbnail(
+    State(state): State<AppState>,
+    AxumPath(preview_name): AxumPath<String>,
+) -> Response {
+    let camera = preview_name
+        .strip_prefix("preview_")
+        .and_then(|s| s.split('-').next())
+        .unwrap_or("sala")
+        .to_string();
+    api_camera_latest_frame(State(state), AxumPath(camera)).await
 }
 
 async fn api_labels(State(state): State<AppState>) -> Json<Value> {
