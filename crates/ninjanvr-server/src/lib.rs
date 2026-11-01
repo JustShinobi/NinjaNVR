@@ -551,7 +551,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .with_state(state)
 }
 
-fn should_serve_ui_v2(headers: &HeaderMap, jar: &CookieJar) -> bool {
+fn should_serve_ui_v2(headers: &HeaderMap, jar: &CookieJar, uri: Option<&Uri>) -> bool {
     if let Some(cookie) = jar.get("ninjanvr_ui") {
         let val = cookie.value().trim();
         if val.eq_ignore_ascii_case("v2") {
@@ -561,8 +561,16 @@ fn should_serve_ui_v2(headers: &HeaderMap, jar: &CookieJar) -> bool {
             return false;
         }
     }
-    if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
-        let lower = host.to_ascii_lowercase();
+    for hdr_name in ["x-forwarded-host", "host"] {
+        if let Some(host) = headers.get(hdr_name).and_then(|v| v.to_str().ok()) {
+            let lower = host.to_ascii_lowercase();
+            if lower.contains("beta") || lower.contains("v2") {
+                return true;
+            }
+        }
+    }
+    if let Some(auth) = uri.and_then(|u| u.authority()).map(|a| a.as_str()) {
+        let lower = auth.to_ascii_lowercase();
         if lower.contains("beta") || lower.contains("v2") {
             return true;
         }
@@ -597,8 +605,8 @@ async fn api_ui_switch(Query(q): Query<UiSwitchParams>) -> Response {
         .into_response()
 }
 
-async fn api_ui_version(headers: HeaderMap, jar: CookieJar) -> Json<Value> {
-    let active = if should_serve_ui_v2(&headers, &jar) {
+async fn api_ui_version(headers: HeaderMap, jar: CookieJar, uri: Uri) -> Json<Value> {
+    let active = if should_serve_ui_v2(&headers, &jar, Some(&uri)) {
         "v2"
     } else {
         "v1"
@@ -613,8 +621,9 @@ async fn serve_login_page(
     State(state): State<AppState>,
     headers: HeaderMap,
     jar: CookieJar,
+    uri: Uri,
 ) -> Response {
-    if should_serve_ui_v2(&headers, &jar) {
+    if should_serve_ui_v2(&headers, &jar, Some(&uri)) {
         let v2_index = state.web_v2_dir.join("index.html");
         if let Ok(html) = tokio::fs::read_to_string(&v2_index).await {
             return Html(html).into_response();
@@ -634,7 +643,7 @@ async fn serve_spa_fallback(
     uri: axum::http::Uri,
 ) -> Response {
     let rel_path = uri.path().trim_start_matches('/');
-    let use_v2 = should_serve_ui_v2(&headers, &jar);
+    let use_v2 = should_serve_ui_v2(&headers, &jar, Some(&uri));
     let primary_dir = if use_v2 && state.web_v2_dir.join("index.html").exists() {
         &state.web_v2_dir
     } else {
