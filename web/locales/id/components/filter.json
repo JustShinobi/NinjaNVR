@@ -1,0 +1,88 @@
+{
+  "filter": "Saring",
+  "labels": {
+    "label": "Label",
+    "all": {
+      "title": "Semua Label",
+      "short": "Label"
+    },
+    "count_one": "{{count}} Label",
+    "count_other": "{{count}} Label"
+  },
+  "zones": {
+    "label": "Zona",
+    "all": {
+      "title": "Semua Zona",
+      "short": "Zona"
+    }
+  },
+  "classes": {
+    "label": "Kelas",
+    "all": {
+      "title": "Semua Kelas"
+    },
+    "count_one": "{{count}} Kelas",
+    "count_other": "{{count}} Kelas"
+  },
+  "dates": {
+    "selectPreset": "Pilih preset…",
+    "all": {
+      "title": "Semua Tanggal",
+      "short": "Tanggal"
+    }
+  },
+  "more": "Lebih Banyak",
+  "reset": {
+    "label": "Atur ulang filter ke default"
+  },
+  "timeRange": "Rentang Waktu",
+  "subLabels": {
+    "label": "Sublabel",
+    "all": "Semua Sublabel"
+  },
+  "attributes": {
+    "label": "Klasifikasi Atribut",
+    "all": "Semua Atribut"
+  },
+  "score": "Skor",
+  "estimatedSpeed": "Perkiraan Kecepatan {{unit}}",
+  "features": {
+    "label": "Fitur",
+    "hasSnapshot": "Memiliki Cuplikan",
+    "hasVideoClip": "Memiliki Klip Video",
+    "submittedToFrigatePlus": {
+      "label": "Dikirim ke Frigate+"
+    }
+  },
+  "cameras": {
+    "all": {
+      "short": "Kamera",
+      "title": "Semua Kamera"
+    },
+    "label": "Filter Kamera"
+  },
+  "sort": {
+    "label": "Urutkan",
+    "dateAsc": "Tanggal (Terlama)",
+    "dateDesc": "Tanggal (Terbaru)",
+    "scoreAsc": "Skor Objek (Terendah)",
+    "scoreDesc": "Skor Objek (Tertinggi)",
+    "speedAsc": "Estimasi Kecepatan (Terendah)",
+    "speedDesc": "Estimasi Kecepatan (Tercepat)",
+    "relevance": "Relevansi"
+  },
+  "review": {
+    "showReviewed": "Tunjukan Pratinjau"
+  },
+  "motion": {
+    "showMotionOnly": "Hanya Tampilkan Gerakan"
+  },
+  "explore": {
+    "settings": {
+      "title": "Pengaturan",
+      "defaultView": {
+        "title": "Tampilan Default"
+      }
+    }
+  }
+}

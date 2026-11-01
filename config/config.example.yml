@@ -1,0 +1,64 @@
+mqtt:
+  enabled: false
+  host: 127.0.0.1
+  port: 1883
+
+auth:
+  enabled: true
+
+detectors:
+  detector01:
+    type: openvino
+    device: CPU
+
+model:
+  width: 300
+  height: 300
+  input_tensor: nhwc
+  input_pixel_format: bgr
+  path: /openvino-model/ssdlite_mobilenet_v2.xml
+  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
+
+go2rtc:
+  streams:
+    front_door:
+      - rtsp://user:password@192.0.2.10:554/stream1
+    front_door_sub:
+      - rtsp://user:password@192.0.2.10:554/stream2
+
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/front_door_sub
+          input_args: preset-rtsp-restream
+          roles:
+            - detect
+        - path: rtsp://127.0.0.1:8554/front_door
+          input_args: preset-rtsp-restream
+          roles:
+            - record
+    detect:
+      enabled: true
+      width: 1280
+      height: 720
+      fps: 5
+    record:
+      enabled: true
+      continuous:
+        days: 7
+      alerts:
+        pre_capture: 5
+        post_capture: 5
+        retain:
+          days: 14
+          mode: motion
+      detections:
+        pre_capture: 5
+        post_capture: 5
+        retain:
+          days: 14
+          mode: motion
+
+version: 0.18-0

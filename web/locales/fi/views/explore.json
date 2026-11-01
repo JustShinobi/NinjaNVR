@@ -1,0 +1,155 @@
+{
+  "documentTitle": "Etsi",
+  "details": {
+    "timestamp": "Aikaleima",
+    "item": {
+      "title": "Tarkastele kohteen tietoja",
+      "desc": "Tarkastele kohteen tietoja",
+      "button": {
+        "share": "Jaa tämä tarkasteltu kohde"
+      },
+      "toast": {
+        "error": {
+          "updatedSublabelFailed": "Alatunnisteen päivitys epäonnistui",
+          "updatedLPRFailed": "Rekisterikilven päivitys epäonnistui"
+        }
+      }
+    },
+    "recognizedLicensePlate": "Tunnistettu rekisterikilpi",
+    "estimatedSpeed": "Arvioitu nopeus",
+    "objects": "Objektit",
+    "camera": "Kamera",
+    "zones": "Alueet",
+    "label": "Tunniste",
+    "editSubLabel": {
+      "title": "Editoi alitunnistetta",
+      "desc": "Syötä uusi alitunniste tähän",
+      "descNoLabel": "Lisää uusi alatunniste tähän seurattuun kohteeseen"
+    },
+    "editLPR": {
+      "title": "Muokkaa rekisterikilpeä",
+      "desc": "Syötä uusi rekisterikilven arvo tähän",
+      "descNoLabel": "Syötä uusi rekisterikilven arvo tähän seurattuun objektiin"
+    },
+    "snapshotScore": {
+      "label": "Tilannekuvan arvosana"
+    },
+    "topScore": {
+      "label": "Huippuarvosana",
+      "info": "Ylin pistemäärä on seurattavan kohteen korkein mediaani, joten tämä voi erota hakutuloksen esikatselukuvassa näkyvästä pistemäärästä."
+    },
+    "button": {
+      "findSimilar": "Etsi samankaltaisia"
+    },
+    "description": {
+      "label": "Kuvaus"
+    },
+    "score": {
+      "label": "Pisteet"
+    }
+  },
+  "exploreIsUnavailable": {
+    "title": "Selaus on tavoittamattomissa",
+    "embeddingsReindexing": {
+      "startingUp": "Käynnistytään…",
+      "estimatedTime": "Arvioitu aika jäljellä:",
+      "finishingShortly": "Valmista pian",
+      "step": {
+        "trackedObjectsProcessed": "Käsitellyt seuratut objektit: ",
+        "thumbnailsEmbedded": "Kuvakkeet sisällytetty: ",
+        "descriptionsEmbedded": "Kuvaukset sisällytetty: "
+      },
+      "context": "Selausta voidaan käyttää sen jälkeen kun seurattavien kohteiden uudelleenindeksöinti on valmistunut."
+    },
+    "downloadingModels": {
+      "context": "Frigate lataa semanttista hakua varten vaadittavat upotusmallit. Tämä saattaa viedä useamman minuutin, riippuen yhteytesi nopeudesta.",
+      "setup": {
+        "visionModel": "Vision-malli",
+        "textModel": "Tekstimalli",
+        "textTokenizer": "Tekstin osioija",
+        "visionModelFeatureExtractor": "Näkömallin piirreluokkain"
+      },
+      "tips": {
+        "documentation": "Lue dokumentaatio",
+        "context": "Saatat haluta uudelleenindeksoida seurattavien kohteiden upotukset, kun mallit on ladattu."
+      },
+      "error": "Tapahtui virhe. Tarkista Frigaten lokit."
+    }
+  },
+  "exploreMore": "Selaa lisää {{label}}-tyyppisiä kohteita",
+  "generativeAI": "Generatiivinen AI",
+  "objectLifecycle": {
+    "annotationSettings": {
+      "offset": {
+        "documentation": "Lue dokumentaatio "
+      },
+      "showAllZones": {
+        "title": "Näytä kaikki vyöhykkeet"
+      }
+    },
+    "lifecycleItemDesc": {
+      "header": {
+        "zones": "Vyöhykkeet",
+        "ratio": "Suhde",
+        "area": "Alue"
+      },
+      "active": "{{label}} aktivoitui",
+      "stationary": "{{label}} pysähtyi",
+      "attribute": {
+        "faceOrLicense_plate": "{{attribute}} havaittiin nimikkeelle {{label}}",
+        "other": "{{label}} tunnistettu {{attribute}}:na"
+      },
+      "gone": "{{label}} poistui",
+      "entered_zone": "{{label}} ilmestyi vyöhykkeelle {{zones}}",
+      "visible": "{{label}} havaittu",
+      "heard": "{{label}} kuului",
+      "external": "{{label}} havaittiin"
+    },
+    "trackedPoint": "Seurattu piste",
+    "carousel": {
+      "previous": "Edellinen",
+      "next": "Seuraava"
+    },
+    "count": "{{first}} / {{second}}",
+    "title": "Kohteen elinkaari",
+    "noImageFound": "Tältä aikaleimalta ei löytynyt kuvia.",
+    "createObjectMask": "Luo kohdemaski",
+    "scrollViewTips": "Vieritä katsoaksesi merkittäviä hetkiä kohteen elinkaarelta.",
+    "autoTrackingTips": "Kohteen rajojen sijainti on epätarkka automaattisesti seuraaville kameroille.",
+    "adjustAnnotationSettings": "Säädä merkintäasetuksia"
+  },
+  "trackedObjectDetails": "Seurattavien kohteiden tiedot",
+  "type": {
+    "details": "tiedot",
+    "snapshot": "kuvankaappaus",
+    "video": "video",
+    "object_lifecycle": "kohteen elinkaari"
+  },
+  "itemMenu": {
+    "downloadSnapshot": {
+      "label": "Lataa kuvankaappaus",
+      "aria": "Lataa kuvankaappaus"
+    },
+    "addTrigger": {
+      "label": "Lisää laukaisin",
+      "aria": "Lisää laukaisin tälle seurattavalle kohteelle"
+    },
+    "submitToPlus": {
+      "label": "Lähetä Frigate+:lle"
+    },
+    "downloadVideo": {
+      "label": "Lataa video",
+      "aria": "Lataa video"
+    },
+    "viewObjectLifecycle": {
+      "label": "Tarkastele objektin elinkaarta",
+      "aria": "Näytä objektin elinkaari"
+    },
+    "findSimilar": {
+      "label": "Etsi samankaltaisia"
+    }
+  },
+  "aiAnalysis": {
+    "title": "AI-analyysi"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "search": "Arama",
+  "documentTitle": "Dışa Aktar - Frigate",
+  "deleteExport": {
+    "label": "Dışa Aktarımı Sil"
+  },
+  "deleteExport.desc": "{{exportName}} adlı dışa aktarımı silmek istediğinize emin misiniz?",
+  "editExport": {
+    "saveExport": "Dışa Aktarımı Kaydet",
+    "desc": "Bu dışa aktarım için yeni bir isim girin.",
+    "title": "Dışa Aktarımı Yeniden Adlandır"
+  },
+  "toast": {
+    "error": {
+      "renameExportFailed": "Dışa aktarım adlandırılamadı: {{errorMessage}}"
+    }
+  },
+  "noExports": "Dışa aktarım bulunamadı",
+  "tooltip": {
+    "shareExport": "Dışa aktarmayı paylaş",
+    "downloadVideo": "Videoyu İndir",
+    "editName": "İsmi Düzenle",
+    "deleteExport": "Dışa Aktarmayı Sil"
+  },
+  "headings": {
+    "uncategorizedExports": "Kategorize Edilmemiş Dışa Aktarım",
+    "cases": "Durumlar"
+  }
+}

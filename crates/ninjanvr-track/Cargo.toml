@@ -1,0 +1,12 @@
+[package]
+name = "ninjanvr-track"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+ninjanvr-vision = { path = "../ninjanvr-vision" }
+ninjanvr-infer = { path = "../ninjanvr-infer" }
+ninjanvr-config = { path = "../ninjanvr-config" }

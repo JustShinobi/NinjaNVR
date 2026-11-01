@@ -1,0 +1,1 @@
+const R=4;var N=(E=>(E[E.NORMAL=0]="NORMAL",E[E.NEEDS_REVIEW=1]="NEEDS_REVIEW",E[E.SECURITY_CONCERN=2]="SECURITY_CONCERN",E))(N||{});const _={0:"Normal",1:"Needs review",2:"Security concern"};export{R,N as T,_ as a};

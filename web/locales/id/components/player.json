@@ -1,0 +1,51 @@
+{
+  "noPreviewFound": "Pratinjau Tidak Ditemukan",
+  "noPreviewFoundFor": "Tidak ada Pratinjau untuk {{cameraName}}",
+  "submitFrigatePlus": {
+    "submit": "Kirim",
+    "title": "Kirim frame ini ke Frigate+?"
+  },
+  "noRecordingsFoundForThisTime": "Tidak ada rekaman ditemukan pada waktu ini",
+  "livePlayerRequiredIOSVersion": "iOS 17.1 atau yang lebih tinggi diperlukan untuk tipe siaran langsung ini.",
+  "streamOffline": {
+    "title": "Stream Tidak Aktif",
+    "desc": "Tidak ada gambar yang diterima dari strim <code>detect</code> {{cameraName}}, mohon lihat log error"
+  },
+  "cameraDisabled": "Kamera dinonaktifkan",
+  "stats": {
+    "streamType": {
+      "title": "Tipe stream:",
+      "short": "Jenis"
+    },
+    "bandwidth": {
+      "title": "Bandwith:",
+      "short": "Bandwith"
+    },
+    "latency": {
+      "title": "Latensi:",
+      "value": "{{seconds}} detik",
+      "short": {
+        "title": "Latensi",
+        "value": "{{seconds}} detik"
+      }
+    },
+    "totalFrames": "Total Frame:",
+    "droppedFrames": {
+      "title": "Frame Terbuang:",
+      "short": {
+        "title": "Terbuang",
+        "value": "{{droppedFrames}} frame"
+      }
+    },
+    "decodedFrames": "Decoded Frames:",
+    "droppedFrameRate": "Frame Rate Terbuang:"
+  },
+  "toast": {
+    "success": {
+      "submittedFrigatePlus": "Berhasil mengirim frame ke Frigate+"
+    },
+    "error": {
+      "submitFrigatePlusFailed": "Gagal mengirim frame ke Frigate+"
+    }
+  }
+}

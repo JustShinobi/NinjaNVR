@@ -1,0 +1,276 @@
+{
+  "documentTitle": {
+    "storage": "Statistici Stocare - Frigate",
+    "cameras": "Statistici Camere - Frigate",
+    "general": "Statistici Generale - Frigate",
+    "logs": {
+      "go2rtc": "Jurnale Go2RTC - Frigate",
+      "nginx": "Jurnale Nginx - Frigate",
+      "frigate": "Jurnale Frigate - Frigate",
+      "websocket": "Jurnale de mesaje - Frigate"
+    },
+    "enrichments": "Statistici Procesări Avansate - Frigate"
+  },
+  "general": {
+    "hardwareInfo": {
+      "npuUsage": "Utilizare NPU",
+      "npuMemory": "Memorie NPU",
+      "gpuUsage": "Utilizare GPU",
+      "gpuMemory": "Memorie GPU",
+      "title": "Informații Hardware",
+      "gpuEncoder": "Encoder GPU",
+      "gpuDecoder": "Decoder GPU",
+      "gpuInfo": {
+        "vainfoOutput": {
+          "returnCode": "Cod de retur: {{code}}",
+          "processOutput": "Ieșire proces:",
+          "title": "Ieșire Vainfo",
+          "processError": "Eroare proces:"
+        },
+        "nvidiaSMIOutput": {
+          "title": "Ieșire Nvidia SMI",
+          "name": "Nume: {{name}}",
+          "driver": "Driver: {{driver}}",
+          "cudaComputerCapability": "Capacitate calcul CUDA: {{cuda_compute}}",
+          "vbios": "Info VBios: {{vbios}}"
+        },
+        "copyInfo": {
+          "label": "Copiază info GPU"
+        },
+        "toast": {
+          "success": "Am copiat informațiile GPU în clipboard"
+        },
+        "closeInfo": {
+          "label": "Închide info GPU"
+        }
+      },
+      "intelGpuWarning": {
+        "title": "Avertisment statistici GPU Intel",
+        "message": "Statisticile GPU sunt indisponibile",
+        "description": "Acesta este un bug cunoscut în instrumentele de raportare GPU Intel (intel_gpu_top), unde acestea se blochează și returnează repetat o utilizare GPU de 0% chiar și atunci când accelerarea hardware și detecția obiectelor rulează corect pe (i)GPU. Aceasta nu este o problemă Frigate. Poți reporni host-ul pentru a remedia temporar problema și a confirma că GPU-ul funcționează corect. Performanța nu este afectată."
+      },
+      "gpuTemperature": "Temperatură GPU",
+      "npuTemperature": "Temperatură NPU",
+      "gpuCompute": "Calcul / Codare GPU"
+    },
+    "detector": {
+      "temperature": "Temperatură detector",
+      "title": "Detectoare",
+      "cpuUsage": "Utilizare CPU detector",
+      "inferenceSpeed": "Viteză inferență detector",
+      "memoryUsage": "Utilizare memorie detector",
+      "cpuUsageInformation": "CPU utilizat pentru pregătirea datelor de intrare și ieșire către/dinspre modelele de detecție. Această valoare nu măsoară utilizarea inferenței, chiar dacă se folosește un GPU sau un accelerator."
+    },
+    "otherProcesses": {
+      "title": "Alte procese",
+      "processCpuUsage": "Utilizare CPU procese",
+      "processMemoryUsage": "Utilizare memorie procese",
+      "series": {
+        "go2rtc": "go2rtc",
+        "recording": "înregistrare",
+        "review_segment": "segment revizuire",
+        "embeddings": "înglobări",
+        "audio_detector": "detector audio"
+      }
+    },
+    "title": "General"
+  },
+  "storage": {
+    "recordings": {
+      "title": "Înregistrări",
+      "earliestRecording": "Cea mai veche înregistrare disponibilă:",
+      "tips": "Această valoare reprezintă stocarea totală folosită de înregistrări în baza de date Frigate. Frigate nu monitorizează utilizarea stocării pentru toate fișierele de pe disc."
+    },
+    "title": "Stocare",
+    "cameraStorage": {
+      "title": "Stocare Cameră",
+      "camera": "Cameră",
+      "unusedStorageInformation": "Informații stocare neutilizată",
+      "storageUsed": "Stocare",
+      "percentageOfTotalUsed": "Procent din total",
+      "unused": {
+        "title": "Neutilizat",
+        "tips": "Este posibil ca această valoare să nu reprezinte cu precizie spațiul liber disponibil pentru Frigate dacă ai și alte fișiere pe disc în afara înregistrărilor Frigate. Frigate nu urmărește utilizarea stocării în afara propriilor înregistrări."
+      },
+      "bandwidth": "Lățime de bandă"
+    },
+    "overview": "Prezentare generală",
+    "shm": {
+      "title": "Alocare SHM (shared memory)",
+      "warning": "Dimensiunea actuală SHM de {{total}}MB este prea mică. Crește-o la cel puțin {{min_shm}}MB.",
+      "readTheDocumentation": "Citește documentația",
+      "frameLifetime": {
+        "title": "Durata de viață a cadrului",
+        "description": "Fiecare cameră are {{frames}} sloturi de cadre în memoria partajată. La rata de cadre a celei mai rapide camere, fiecare cadru este disponibil pentru aproximativ {{lifetime}}s înainte de a fi suprascris."
+      }
+    }
+  },
+  "title": "Sistem",
+  "logs": {
+    "download": {
+      "label": "Descarcă jurnalele"
+    },
+    "copy": {
+      "label": "Copiază în clipboard",
+      "success": "Am copiat jurnalele în clipboard",
+      "error": "Nu am putut copia jurnalele în clipboard"
+    },
+    "type": {
+      "label": "Tip",
+      "timestamp": "Ștampilă de timp",
+      "tag": "Etichetă",
+      "message": "Mesaj"
+    },
+    "tips": "Jurnalele sunt transmise în timp real de la server",
+    "toast": {
+      "error": {
+        "fetchingLogsFailed": "Eroare la preluarea jurnalelor: {{errorMessage}}",
+        "whileStreamingLogs": "Eroare în timpul transmiterii jurnalelor: {{errorMessage}}"
+      }
+    },
+    "websocket": {
+      "label": "Mesaje",
+      "pause": "Pauză",
+      "resume": "Reluare",
+      "clear": "Șterge",
+      "filter": {
+        "all": "Toate subiectele",
+        "topics": "Subiecte",
+        "events": "Evenimente",
+        "reviews": "Revizuiri",
+        "classification": "Clasificare",
+        "face_recognition": "Recunoaștere facială",
+        "lpr": "Recunoașterea numerelor de înmatriculare (LPR)",
+        "camera_activity": "Activitate cameră",
+        "system": "Sistem",
+        "camera": "Cameră",
+        "all_cameras": "Toate camerele",
+        "cameras_count_one": "{{count}} Cameră",
+        "cameras_count_other": "{{count}} Camere"
+      },
+      "empty": "Niciun mesaj capturat încă",
+      "count": "{{count}} mesaje",
+      "expanded": {
+        "payload": "Conținut"
+      },
+      "count_one": "{{count}} mesaj",
+      "count_other": "{{count}} mesaje"
+    }
+  },
+  "metrics": "Metrici sistem",
+  "enrichments": {
+    "title": "Procesări Avansate",
+    "embeddings": {
+      "image_embedding": "Înglobări de imagini",
+      "text_embedding": "Înglobări de text",
+      "plate_recognition": "Recunoaștere Numere Înmatriculare",
+      "image_embedding_speed": "Viteză înglobări de imagini",
+      "face_recognition": "Recunoaștere Facială",
+      "face_recognition_speed": "Viteză Recunoaștere Facială",
+      "plate_recognition_speed": "Viteză Recunoaștere Numere",
+      "face_embedding_speed": "Viteză înglobări faciale",
+      "yolov9_plate_detection_speed": "Viteză Detecție Numere YOLOv9",
+      "text_embedding_speed": "Viteză înglobări de text",
+      "yolov9_plate_detection": "Detecție Numere YOLOv9",
+      "review_description": "Descriere revizuire",
+      "review_description_speed": "Viteză descriere revizuire",
+      "review_description_events_per_second": "Descriere revizuire",
+      "object_description": "Descriere Obiect",
+      "object_description_speed": "Viteză Descriere Obiect",
+      "object_description_events_per_second": "Descriere Obiect",
+      "classification": "Clasificare {{name}}",
+      "classification_speed": "Viteză Clasificare {{name}}",
+      "classification_events_per_second": "Evenimente Clasificare {{name}} pe secundă"
+    },
+    "infPerSecond": "Inferențe pe secundă",
+    "averageInf": "Timp mediu de inferență"
+  },
+  "cameras": {
+    "info": {
+      "codec": "Codec:",
+      "resolution": "Rezoluție:",
+      "cameraProbeInfo": "Info Sondă Cameră {{camera}}",
+      "streamDataFromFFPROBE": "Datele stream-ului sunt obținute cu <code>ffprobe</code>.",
+      "aspectRatio": "raport aspect",
+      "fetching": "Se preiau datele camerei",
+      "stream": "Stream {{idx}}",
+      "video": "Video:",
+      "audio": "Audio:",
+      "error": "Eroare: {{error}}",
+      "tips": {
+        "title": "Info Sondă Cameră"
+      },
+      "fps": "FPS:",
+      "unknown": "Necunoscut",
+      "keyframes": {
+        "title": "Analiză keyframe",
+        "analyzing": "Se analizează keyframe-urile... {{seconds}} secunde rămase",
+        "stillAnalyzing": "Încă se analizează keyframe-urile...",
+        "keyframeCount": "Keyframe-uri observate:",
+        "recordStream": "Stream de înregistrare:",
+        "observedDuration": "Durată observată:",
+        "gap": "Interval keyframe (min / med / max):",
+        "ok": "Keyframe-uri la fiecare ~{{seconds}}s, bune pentru înregistrare și redare.",
+        "segmentLength": "Lungime segment de înregistrare:",
+        "warning": "Keyframe-uri rare sau variabile (cel mai lung interval ~{{seconds}}s), probabil un codec smart (H.264+/H.265+), acest lucru nu este recomandat.",
+        "error": "Intervalul keyframe (~{{seconds}}s) depășește lungimea segmentului de înregistrare ({{segmentTime}}s). Unele segmente pot să nu aibă niciun keyframe, ceea ce întrerupe redarea. Dezactivează codecul smart/+ de pe cameră sau scurtează intervalul keyframe.",
+        "unknown": "Nu s-a putut determina distanțarea keyframe-urilor.",
+        "recordDisabled": "Înregistrarea este dezactivată pentru această cameră."
+      }
+    },
+    "label": {
+      "capture": "captură",
+      "skipped": "sărit",
+      "overallSkippedDetectionsPerSecond": "detecții sărite pe secundă total",
+      "cameraCapture": "captură {{camName}}",
+      "cameraDetect": "detecție {{camName}}",
+      "cameraFramesPerSecond": "cadre pe secundă {{camName}}",
+      "cameraDetectionsPerSecond": "detecții pe secundă {{camName}}",
+      "cameraSkippedDetectionsPerSecond": "detecții sărite pe secundă {{camName}}",
+      "overallFramesPerSecond": "cadre pe secundă total",
+      "overallDetectionsPerSecond": "detecții pe secundă total",
+      "detect": "detectează",
+      "cameraFfmpeg": "FFmpeg {{camName}}",
+      "camera": "cameră",
+      "ffmpeg": "FFmpeg",
+      "cameraGpu": "{{camName}} GPU"
+    },
+    "title": "Camere",
+    "overview": "Prezentare generală",
+    "framesAndDetections": "Cadre / Detecții",
+    "toast": {
+      "success": {
+        "copyToClipboard": "Am copiat datele sondei în clipboard."
+      },
+      "error": {
+        "unableToProbeCamera": "Nu s-a putut sonda camera: {{errorMessage}}"
+      }
+    },
+    "connectionQuality": {
+      "title": "Calitate Conexiune",
+      "excellent": "Excelentă",
+      "fair": "Acceptabilă",
+      "poor": "Slabă",
+      "unusable": "Inutilizabilă",
+      "fps": "FPS",
+      "expectedFps": "FPS așteptat",
+      "reconnectsLastHour": "Reconectări (ultima oră)",
+      "stallsLastHour": "Blocaje (ultima oră)"
+    },
+    "noCameras": {
+      "title": "Nicio cameră găsită"
+    }
+  },
+  "stats": {
+    "reindexingEmbeddings": "Se reindexează înglobările ({{processed}}% gata)",
+    "detectIsVerySlow": "{{detect}} este foarte lent ({{speed}} ms)",
+    "detectIsSlow": "{{detect}} este lent ({{speed}} ms)",
+    "detectHighCpuUsage": "{{camera}} are o utilizare ridicată CPU detecție ({{detectAvg}}%)",
+    "ffmpegHighCpuUsage": "{{camera}} are o utilizare ridicată CPU FFmpeg ({{ffmpegAvg}}%)",
+    "cameraIsOffline": "{{camera}} este offline",
+    "healthy": "Sistemul este sănătos",
+    "shmTooLow": "Alocarea /dev/shm ({{total}} MB) ar trebui mărită la cel puțin {{min}} MB.",
+    "debugReplayActive": "Sesiunea de reluare de depanare este activă"
+  },
+  "lastRefreshed": "Ultima actualizare: "
+}

@@ -1,0 +1,1218 @@
+{
+  "documentTitle": {
+    "default": "Ayarlar - Frigate",
+    "classification": "Sınıflandırma Ayarları - Frigate",
+    "camera": "Kamera Ayarları - Frigate",
+    "masksAndZones": "Maske ve Alan Düzenleyici - Frigate",
+    "authentication": "Kimlik Doğrulama Ayarları - Frigate",
+    "motionTuner": "Hareket Algılama Ayarları - Frigate",
+    "frigatePlus": "Frigate+ Ayarları - Frigate",
+    "object": "Hata Ayıklama - Frigate",
+    "general": "Kullanıcı Arayüzü Ayarları – Frigate",
+    "notifications": "Bildirim Ayarları - Frigate",
+    "enrichments": "Zenginleştirme Ayarları - Frigate",
+    "cameraManagement": "Kameraları Yönet - Frigate",
+    "cameraReview": "Kamera İnceleme Ayarları - Frigate"
+  },
+  "menu": {
+    "masksAndZones": "Maskeler / Alanlar",
+    "users": "Kullanıcılar",
+    "frigateplus": "Frigate+",
+    "ui": "Arayüz",
+    "notifications": "Bildirimler",
+    "motionTuner": "Hareket Algılama",
+    "classification": "Sınıflandırma",
+    "debug": "Hata Ayıklama",
+    "cameras": "Kamera Ayarları",
+    "enrichments": "Zenginleştirmeler",
+    "triggers": "Tetikler",
+    "cameraManagement": "Yönetim",
+    "cameraReview": "İncele",
+    "roles": "Roller",
+    "profiles": "Profiller"
+  },
+  "general": {
+    "title": "Kullanıcı Arayüzü Ayarları",
+    "liveDashboard": {
+      "automaticLiveView": {
+        "label": "Otomatik Canlı Görünüm",
+        "desc": "Aktivite tespit edildiğinde otomatik olarak kameranın canlı akışına geç. Bu seçeneği devre dışı bırakmak canlı görüntü panelinde dakikada bir güncellenen sabit resim gösterilmesine sebep olur."
+      },
+      "playAlertVideos": {
+        "label": "Alarm Videolarını Oynat",
+        "desc": "Varsayılan olarak canlı görüntü panelinde gösterilen son uyarılar ufak videolar olarak oynatılır. Bu tarayıcı/cihazda video yerine sabit resim göstermek için bu seçeneği kapatın."
+      },
+      "title": "Canlı Görüntü Paneli",
+      "displayCameraNames": {
+        "label": "Kamera Adlarını Daima Göster",
+        "desc": "Çok kameralı canlı izleme panelinde, kamera adlarını her zaman bir etiket içinde göster."
+      },
+      "liveFallbackTimeout": {
+        "label": "Canlı Oynatıcı Yedeğe Geçiş Zaman Aşımı",
+        "desc": "Bir kameranın yüksek kaliteli canlı akışı kullanılamadığında, belirtilen saniye kadar sonra düşük bant genişliği moduna geç. Varsayılan: 3."
+      }
+    },
+    "storedLayouts": {
+      "desc": "Kamera grubundaki kameraların düzenini kameraları sürükleyerek ve büyüterek/küçülterek değiştirebilirsiniz. Düzen bilgisi tarayıcınızda depolanır.",
+      "clearAll": "Tüm Düzenleri Temizle",
+      "title": "Kayıtlı Düzenler"
+    },
+    "cameraGroupStreaming": {
+      "title": "Kamera Grubu Yayın Ayarları",
+      "desc": "Kamera gruplarının ilgili yayın ayarları tarayıcınızda depolanır.",
+      "clearAll": "Tüm Yayın Ayarlarını Temizle"
+    },
+    "recordingsViewer": {
+      "defaultPlaybackRate": {
+        "label": "Varsayılan Oynatma Hızı",
+        "desc": "Kayıt oynatılırken kullanılan varsayılan oynatma hızı."
+      },
+      "title": "Kayıt Görüntüleyicisi"
+    },
+    "calendar": {
+      "firstWeekday": {
+        "sunday": "Pazar",
+        "desc": "Arayüzdeki takvimde gösterilecek haftanın ilk günü.",
+        "label": "Haftanın ilk günü",
+        "monday": "Pazartesi"
+      },
+      "title": "Takvim"
+    },
+    "toast": {
+      "success": {
+        "clearStreamingSettings": "Tüm kamera grupları için yayın ayarları temizlendi.",
+        "clearStoredLayout": "{{cameraName}} için kayıtlı düzenler temizlendi"
+      },
+      "error": {
+        "clearStreamingSettingsFailed": "Yayın ayarları temizlenemedi: {{errorMessage}}",
+        "clearStoredLayoutFailed": "Kayıtlı düzen temizlenemedi: {{errorMessage}}"
+      }
+    }
+  },
+  "classification": {
+    "title": "Sınıflandırma Ayarları",
+    "semanticSearch": {
+      "title": "Anlamsal Arama",
+      "readTheDocumentation": "Dökümantasyonu Oku",
+      "reindexNow": {
+        "confirmButton": "Yeniden Dizinle",
+        "label": "Şimdi Yeniden Dizinle",
+        "desc": "Yeniden dizinleme bütün takip edilen nesneler için gömüleri tekrar oluşturur. Bu işlem arka planda çalışacak olsa da nesne sayısına göre işlemcinizi tamamen kullanabilir ve tamamlanması biraz zaman alabilir.",
+        "alreadyInProgress": "Yeniden dizinleme zaten devam ediyor.",
+        "confirmTitle": "Yenden Dizinlemeyi onayla",
+        "success": "Yeniden dizinleme başladı.",
+        "confirmDesc": "Takip edilen bütün objelerin gömülerini yeniden dizinlemek istediğinze emin misiniz? Bu işlem arka planda çalışacak fakat işlemcinizi tamamen kullanabilir ve tamamlanması biraz zaman alabilir. İlerlemeyi Keşfet sayfasından takip edebilirsiniz.",
+        "error": "Yeniden dizinlemeye başlanamadı: {{errorMessage}}"
+      },
+      "modelSize": {
+        "label": "Model boyutu",
+        "large": {
+          "title": "büyük",
+          "desc": "<em>Büyük</em> modeli kullandığınızda tam boyutlu Jina modeli kullanılacaktır ve uygunsa otomatik olarak grafik işlemcisinde çalıştırılacaktır."
+        },
+        "small": {
+          "desc": "<em>Küçük</em> modeli kullandığınızda modelin kuantize edilmiş bir sürümü kullanılır. Bu model daha az RAM kullanır, işlemcilerde daha hızlı çalışır ve gömü kalitesinde neredeyse hiç kalite farkı yoktur.",
+          "title": "küçük"
+        },
+        "desc": "Anlamsal arama için kullanılan dil modelinin büyüklüğü."
+      },
+      "desc": "Frigate'daki Anlamsal Arama özelliği inceleme öğelerinizde takip edilen nesneleri bizzat nesnenin resmi ile aratarak ya da otomatik olarak veya kullanıcı tarafından yazılmış bir metin açıklaması içinde aratarak bulmanıza imkan sağlar."
+    },
+    "faceRecognition": {
+      "modelSize": {
+        "large": {
+          "desc": "<em>Büyük</em> modeli kullandığınızda tam boyutlu ArcFace yüz gömü modeli kullanılacaktır ve uygunsa otomatik olarak grafik işlemcisinde çalıştırılacaktır.",
+          "title": "büyük"
+        },
+        "small": {
+          "title": "küçük",
+          "desc": "<em>Küçük</em> modeli kullandığınızda çoğu işlemcide verimli bir şekilde çalışan bir FaceNet yüz gömme modeli kullanılır."
+        },
+        "label": "Model Boyutu",
+        "desc": "Yüz tanıma için kullanılan modelin boyutu."
+      },
+      "title": "Yüz Tanıma",
+      "desc": "Yüz tanıma, tanınan insanlara isim vermenize olanak tanır ve bu yüzler tanındığında Frigate, kişinin adını alt etiket olarak ekler. Bu bilgi; kullanıcı arayüzü, filtreler ve bildirimlerde gösterilir.",
+      "readTheDocumentation": "Dökümantasyonu Oku"
+    },
+    "toast": {
+      "error": "Yapılandırma değişiklikleri kaydedilemedi: {{errorMessage}}",
+      "success": "Sınıflandırma ayarları kaydedildi. Değişikliklerinizi uygulamak için Frigate'i yeniden başlatın."
+    },
+    "licensePlateRecognition": {
+      "desc": "Frigate araç plakalarını tanıyabilir ve algılanan karakterleri otomatik olarak recognized_license_plate alanına veya belirli bir plaka için tanımladığınız bir takma ismi alt etiket olarak ilgili aracın tanımlanan nesnesine ekleyebilir. Bu sistem, garajınıza giren veya caddeden geçen araçların plakalarını okumak için kullanılabilir.",
+      "title": "Plaka Tanıma",
+      "readTheDocumentation": "Dökümantasyonu Oku"
+    },
+    "birdClassification": {
+      "title": "Kuş Sınıflandırma",
+      "desc": "Kuş Sınıflandırma özelliği, bilinen kuş türlerini kuantize edilmiş bir Tensorflow modeli kullanarak teşhis etmenizi sağlar. Model bir kuş türünü teşhis ettiğinde, Frigate, bu türün adını alt etiket olarak ekler. Bu bilgi; kullanıcı arayüzü, filtreler ve bildirimlerde gösterilir."
+    },
+    "restart_required": "Yeniden Başlatma Gerekli (Sınıflandırma ayarları değiştirildi)"
+  },
+  "cameraSetting": {
+    "camera": "Kamera",
+    "noCamera": "Kamera Yok"
+  },
+  "dialog": {
+    "unsavedChanges": {
+      "title": "Kaydedilmemiş değişiklikleriniz var.",
+      "desc": "Devam etmeden önce değişiklikleri kaydetmek ister misiniz?"
+    }
+  },
+  "camera": {
+    "title": "Kamera Ayarları",
+    "review": {
+      "title": "İncele",
+      "alerts": "Alarmlar ",
+      "detections": "Tespitler ",
+      "desc": "Bu kamera için uyarıları ve algılamaları geçici olarak etkinleştirin/devre dışı bırakın. Frigate yeniden başlatıldığında yapılandırmanızdaki tercihlere geri dönülür. Devre dışı bırakıldığında, yeni inceleme öğeleri oluşturulamaz. "
+    },
+    "reviewClassification": {
+      "readTheDocumentation": "Dökümantasyonu Oku",
+      "selectAlertsZones": "Alarmlar için alanları seçin",
+      "zoneObjectDetectionsTips": {
+        "regardlessOfZoneObjectDetectionsTips": "{{cameraName}} kamerasındaki kategorize edilmemiş bütün {{detectionsLabels}} nesneleri hangi alanda olduklarına bakılmaksızın Algılama olarak sınıflandırılacaktır.",
+        "notSelectDetections": "{{cameraName}} kamerasındaki {{zone}} alanı içinde algılanan ve Alarm olarak kategorize edilmeyen bütün {{detectionsLabels}} nesneleri hangi alanda olduklarına bakılmaksızın Algılama olarak sınıflandırılacaktır.",
+        "text": "{{cameraName}} kamerasındaki {{zone}} alanındaki kategorize edilmemiş bütün {{detectionsLabels}} nesneleri Algılama olarak sınıflandırılacaktır."
+      },
+      "zoneObjectAlertsTips": "{{cameraName}} kamerasındaki {{zone}} alanında algılanan bütün {{alertsLabels}} nesneleri Alarm olarak sınıflandırılacaktır.",
+      "desc": "Frigate tespit edilen İnceleme öğelerini Alarmlar ve Tespitler olarak kategorize eder. Varsayılan olarak bütün <em>kişi</em> ve <em>araba</em> nesneleri Alarm olarak sınıflandırılır. İnceleme öğelerinizin sınıflandırmasını tespit sınırlandırma sayfasında gerekli alanlar seçerek sınırlandırabilirsiniz.",
+      "objectDetectionsTips": "{{cameraName}} kamerasında kategorize edilmemiş bütün {{detectionsLabels}} nesneleri, hangi alanda olduklarına bakılmaksızın Algılama olarak sınıflandırılacaktır.",
+      "selectDetectionsZones": "Algılamalar için alanları seçin",
+      "title": "Tespit Sınıflandırmaları",
+      "noDefinedZones": "Bu kamera için tanımlanmış alan yok.",
+      "objectAlertsTips": "{{cameraName}} kamerasındaki bütün {{alertsLabels}} nesneleri Alarm olarak sınıflandırılacaktır.",
+      "limitDetections": "Algılamaları belirli alanlara sınırla",
+      "toast": {
+        "success": "İnceleme Sınıflandırma ayarları kaydedildi. Değişiklikleri uygulamak için Frigate'i yeniden başlatın."
+      },
+      "unsavedChanges": "{{camera}} için Kaydedilmemiş Sınıflandırma Ayarları"
+    },
+    "streams": {
+      "desc": "Frigate yeniden başlataılana kadar bir kamerayı devre dışı bırakın. Bir kameranın devre dışı bırakılması, Frigate'in bu kamerayı işlemesini tamamen durdurur. Algılama, kayıt ve hata ayıklama özellikleri kullanılamaz.<br /> <em>Not: Bu eylem, go2rtc'deki yeniden akışları devre dışı bırakmaz.</em>",
+      "title": "Akışlar"
+    },
+    "object_descriptions": {
+      "title": "Üretken AI Nesne Açıklamaları",
+      "desc": "Bu kamera için Üretken Yapay Zeka kullanarak nesne açıklamaları oluşturmayı geçici olarak etkinleştirin/devre dışı bırakın. Devre dışı bırakıldığında, bu kamerada takip edilen nesneler için yapay zekadan nesne açıklamaları talep edilmeyecektir."
+    },
+    "review_descriptions": {
+      "title": "Üretken AI İnceleme Öğesi Açıklamaları",
+      "desc": "Bu kamera için Üretken Yapay Zeka kullanarak inceleme öğelerinin açıklamalarını oluşturmayı geçici olarak etkinleştirin/devre dışı bırakın. Devre dışı bırakıldığında, bu kameraya bağlı inceleme öğeleri için yapay zekadan açıklama metni talep edilmeyecektir."
+    },
+    "addCamera": "Yeni Kamera Ekle",
+    "editCamera": "Kamerayı Düzenle:",
+    "selectCamera": "Kamera Seç",
+    "backToSettings": "Kamera Ayarlarına Dön",
+    "cameraConfig": {
+      "add": "Kamera Ekle",
+      "edit": "Kamerayı Düzenle",
+      "description": "Kameranızın ayarlarını, kameraların akışları ve roller de dahil olacak şekilde yapılandırın.",
+      "name": "Kamera İsmi",
+      "nameRequired": "Kamera adı gereklidir",
+      "nameInvalid": "Kamera adı yalnızca harf, rakam, alt çizgi veya tire içerebilir",
+      "namePlaceholder": "örn: onkapi",
+      "enabled": "Açık",
+      "ffmpeg": {
+        "inputs": "Kamera Girdi Akışları",
+        "path": "Akış Yolu",
+        "pathRequired": "Akış yolu gereklidir",
+        "pathPlaceholder": "rtsp://...",
+        "roles": "Roller",
+        "rolesRequired": "En az bir rol gereklidir",
+        "rolesUnique": "Her rol (ses, tespit, kayıt) yalnızca bir adet yayına atanabilir. Her rol aynı akışı kullanabilir, lakin bir rol birden fazla akışa atanamaz.",
+        "addInput": "Girdi Akışı Ekle",
+        "removeInput": "Girdi Akışını Kaldır",
+        "inputsRequired": "En az bir girdi akışı gereklidir"
+      },
+      "toast": {
+        "success": "Kamera {{cameraName}} başarıyla kaydedildi"
+      },
+      "nameLength": "Kamera ismi 24 karakterden kısa olmalıdır."
+    }
+  },
+  "masksAndZones": {
+    "filter": {
+      "all": "Bütün Maskeler ve Alanlar"
+    },
+    "toast": {
+      "success": {
+        "copyCoordinates": "{{polyName}} için koordinatlar panoya kopyalandı."
+      },
+      "error": {
+        "copyCoordinatesFailed": "Koordinatlar panoya kopyalanamadı."
+      }
+    },
+    "form": {
+      "zoneName": {
+        "error": {
+          "mustBeAtLeastTwoCharacters": "Alan adı en az 2 karakter olmalıdır.",
+          "hasIllegalCharacter": "Alan adı geçersiz karakterler içeriyor.",
+          "mustNotBeSameWithCamera": "Alan adı kamera adıyla aynı olmamalıdır.",
+          "alreadyExists": "Bu kamera için bu ada sahip bir alan zaten mevcut.",
+          "mustNotContainPeriod": "Alan adı nokta içermemelidir.",
+          "mustHaveAtLeastOneLetter": "Bölge ismi en az bir harf içermelidir."
+        }
+      },
+      "distance": {
+        "error": {
+          "text": "Mesafe 0.1'den büyük veya eşit olmalıdır.",
+          "mustBeFilled": "Hız tahmini özelliğini kullanabilmek için bütün mesafe alanları doldurulmalıdır."
+        }
+      },
+      "loiteringTime": {
+        "error": {
+          "mustBeGreaterOrEqualZero": "Oyalanma süresi 0'dan büyük veya eşit olmalıdır."
+        }
+      },
+      "polygonDrawing": {
+        "snapPoints": {
+          "false": "Noktaları hizalama",
+          "true": "Noktaları hizala"
+        },
+        "removeLastPoint": "Son noktayı kaldır",
+        "reset": {
+          "label": "Bütün noktaları temizle"
+        },
+        "delete": {
+          "desc": "{{type}} <em>{{name}}</em>'i silmek istediğinizden emin misiniz?",
+          "title": "Silmeyi Onayla",
+          "success": "{{name}} silindi."
+        },
+        "error": {
+          "mustBeFinished": "Kaydetmeden önce çokgen çizimi bitirilmelidir."
+        }
+      },
+      "inertia": {
+        "error": {
+          "mustBeAboveZero": "Eylemsizlik sıfırın üzerinde olmalıdır."
+        }
+      },
+      "speed": {
+        "error": {
+          "mustBeGreaterOrEqualTo": "Hız eşiği 0.1'e eşit veya daha yüksek olmalıdır."
+        }
+      }
+    },
+    "zones": {
+      "label": "Alanlar",
+      "documentTitle": "Alanı Düzenle - Frigate",
+      "desc": {
+        "documentation": "Dökümantasyon",
+        "title": "Alanlar, görüntüde belirli bir alanını tanımlamanıza olanak tanır. Böylece bir nesnenin belirli bir alanda olup olmadığını tespit edebilirsiniz."
+      },
+      "add": "Alan Ekle",
+      "point_one": "{{count}} nokta",
+      "point_other": "{{count}} nokta",
+      "name": {
+        "inputPlaceHolder": "Bir isim girin…",
+        "title": "İsim",
+        "tips": "İsim 2 karakter veya daha uzun olmalı, en az bir harf içermeli ve bu kameradaki bir kamera ismi veya başka bir bölge ismiyle çakışmamalıdır."
+      },
+      "inertia": {
+        "title": "Eylemsizlik",
+        "desc": "Bir nesnenin alanda kabul edilmesi için kaç kare boyunca alanda kalması gerektiğini belirtir. <em>Varsayılan: 3</em>"
+      },
+      "objects": {
+        "title": "Nesneler",
+        "desc": "Bu alana uygulanan nesnelerin listesi."
+      },
+      "speedEstimation": {
+        "title": "Hız Tahmini",
+        "desc": "Bu alandaki nesneler için hız tahminini etkinleştirin. Alan tam olarak 4 noktaya belirlenmiş olmalıdır.",
+        "docs": "Dökümantasyonu oku",
+        "lineADistance": "Çizgi A mesafesi ({{unit}})",
+        "lineBDistance": "Çizgi B mesafesi ({{unit}})",
+        "lineCDistance": "Çizgi C mesafesi ({{unit}})",
+        "lineDDistance": "Çizgi D mesafesi ({{unit}})"
+      },
+      "clickDrawPolygon": "Görüntü üzerinde bir çokgen çizmek için tıklayın.",
+      "edit": "Alanı Düzenle",
+      "loiteringTime": {
+        "title": "Oyalanma Süresi",
+        "desc": "Nesnenin etkinleşmesi için alanda kalması gereken minimum süreyi saniye cinsinden ayarlar. <em>Varsayılan: 0</em>"
+      },
+      "speedThreshold": {
+        "desc": "Nesnelerin bu alanda kabul edilmesi için minimum hızı belirtir.",
+        "toast": {
+          "error": {
+            "pointLengthError": "Bu alan için hız tahmini devre dışı bırakıldı. Hız tahmini olan alanlar tam olarak 4 noktaya sahip olmak zorundadır.",
+            "loiteringTimeError": "Oyalanma süreleri 0'dan büyük olan alanlar hız tahmini ile birlikte kullanılmamalıdır."
+          }
+        },
+        "title": "Hız Alt Sınırı ({{unit}})"
+      },
+      "toast": {
+        "success": "Bölge ({{zoneName}}) kaydedildi."
+      },
+      "allObjects": "Bütün Nesneler"
+    },
+    "motionMasks": {
+      "add": "Yeni Hareket Maskesi",
+      "context": {
+        "documentation": "Dökümantasyonu okuyun",
+        "title": "Hareket maskeleri, istenmeyen hareketli nesnelerin (örneğin: ağaç dalları, kamera yayınına gömülü tarih saat, vb.) algılamayı tetiklemesini önlemek için kullanılır. Hareket maskeleri <em>çok dikkatli</em> kullanılmalıdır, zira gereğinden fazla maskeleme nesnelerin tespitini zorlaştıracaktır."
+      },
+      "point_one": "{{count}} nokta",
+      "point_other": "{{count}} nokta",
+      "clickDrawPolygon": "Görüntü üzerinde bir çokgen çizmek için tıklayın.",
+      "polygonAreaTooLarge": {
+        "title": "Bu hareket maskesi, kamera görüntüsünün %{{polygonArea}}'sını kaplıyor. Büyük hareket maskeleri kullanmanız önerilmez.",
+        "documentation": "Dökümantasyonu oku",
+        "tips": "Hareket maskeleri nesnelerin algılanmasını kesin olarak engellemez. Bunun yerine tespit sınıflandırma sayfasında gerekli alan kısıtlaması ayarlamalısınız."
+      },
+      "toast": {
+        "success": {
+          "title": "{{polygonName}} kaydedildi.",
+          "noName": "Hareket Maskesi kaydedildi."
+        }
+      },
+      "desc": {
+        "title": "Hareket maskeleri, istenmeyen hareketlerin algılamayı tetiklemesini önlemek için kullanılır. Gereğinden fazla maskeleme nesnelerin tespitini zorlaştıracaktır.",
+        "documentation": "Dökümantasyon"
+      },
+      "label": "Hareket Maskesi",
+      "edit": "Hareket Maskesini Düzenle",
+      "documentTitle": "Hareket Maskesini Düzenle - Frigate"
+    },
+    "objectMasks": {
+      "desc": {
+        "documentation": "Dökümantasyon",
+        "title": "Nesne filtresi maskeleri, belirli bir nesne türü için konum bazında yanlış pozitifleri filtrelemek için kullanılır."
+      },
+      "point_one": "{{count}} nokta",
+      "point_other": "{{count}} nokta",
+      "context": "Nesne filtresi maskeleri, belirli bir nesne türü için konum bazında yanlış pozitifleri filtrelemek için kullanılır.",
+      "objects": {
+        "allObjectTypes": "Bütün nesne türleri",
+        "desc": "Bu nesne maskesinin uygulanacağı nesne türü.",
+        "title": "Nesneler"
+      },
+      "add": "Nesne Maskesi Ekle",
+      "edit": "Nesne Maskesini Düzenle",
+      "toast": {
+        "success": {
+          "noName": "Nesne Maskesi kaydedildi.",
+          "title": "{{polygonName}} kaydedildi."
+        }
+      },
+      "documentTitle": "Nesne Maskesini Düzenle - Frigate",
+      "label": "Nesne Maskeleri",
+      "clickDrawPolygon": "Görüntü üzerinde bir çokgen çizmek için tıklayın."
+    },
+    "restart_required": "Yeniden Başlatma Gerekli (maskeler/alanlar değiştirildi)",
+    "motionMaskLabel": "Hareket Maskesi {{number}}",
+    "objectMaskLabel": "Nesne maskesi {{number}} ({{label}})"
+  },
+  "motionDetectionTuner": {
+    "title": "Hareket Algılama Ayarlayıcı",
+    "Threshold": {
+      "desc": "Eşik değeri, bir pikselin parlaklığındaki ne kadar değişikliğin hareket olarak kabul edileceğini belirler. <em>Varsayılan: 30</em>",
+      "title": "Eşik"
+    },
+    "contourArea": {
+      "desc": "Kontur alanı değeri, hangi değişen piksel gruplarının hareket olarak nitelendirileceğine karar vermek için kullanılır. <em>Varsayılan: 10</em>",
+      "title": "Kontur Alanı"
+    },
+    "toast": {
+      "success": "Hareket ayarları kaydedildi."
+    },
+    "desc": {
+      "title": "Frigate, kamera görüntüsünde nesne tespiti ile kontrol etmeye değer bir şey olup olmadığını görmek için ilk olarak hareket algılamayı kullanır.",
+      "documentation": "Hareket Algılama İnce Ayar Kılavuzunu Okuyun"
+    },
+    "improveContrast": {
+      "desc": "Daha karanlık sahneler için kontrastı iyileştirin. <em>Varsayılan: AÇIK</em>",
+      "title": "Kontrastı İyileştir"
+    },
+    "unsavedChanges": "Kaydedilmemiş Hareket Alıglama ayarları ({{camera}})"
+  },
+  "debug": {
+    "title": "Hata Ayıklama",
+    "boundingBoxes": {
+      "colors": {
+        "label": "Nesne Çerçeve Renkleri",
+        "info": "<li>Başlangıçta, her nesne etiketi için farklı renkler atanacaktır</li><li>Koyu mavi ince bir çizgi, nesnenin şu anda algılanamadığını gösterir</li><li>Gri ince bir çizgi, nesnenin sabit olduğunun algılandığını gösterir</li><li>Kalın bir çizgi, nesnenin otomatik izlemeye (eğer açıksa) tabi olduğunu gösterir</li>"
+      },
+      "title": "Çerçeveler",
+      "desc": "İzlenen nesnelerin etrafında çerçeve göster"
+    },
+    "timestamp": {
+      "title": "Zaman Damgası",
+      "desc": "Görüntüye bir zaman damgası ekle"
+    },
+    "motion": {
+      "title": "Hareket kutuları",
+      "desc": "Hareketin algılandığı alanların etrafında çerçeve göster",
+      "tips": "<p><strong>Hareket Kutuları</strong></p><br><p>Hareketin algılandığı alanlar kırmızı çerçeve ile gösterilecektir.</p>"
+    },
+    "regions": {
+      "title": "Tespit Bölgeleri",
+      "desc": "Nesne algılayıcıya gönderilen tespit alanlarını göster",
+      "tips": "<p><strong>Bölge Kutuları</strong></p><br><p>Nesne dedektörüne gönderilen tespit alanları görüntüde parlak yeşil renk çerçeve ile gösterilir.</p>"
+    },
+    "objectShapeFilterDrawing": {
+      "title": "Nesne Şekil Filtresi Çizimi",
+      "desc": "Alan ve oran ayrıntılarını görüntülemek için görüntü üzerinde bir dikdörtgen çizin",
+      "score": "Puan",
+      "ratio": "Oran",
+      "area": "Alan",
+      "document": "Dökümantasyonu oku ",
+      "tips": "Alanını ve oranını göstermek için kamera görüntüsü üzerinde bir dikdörtgen çizmek için bu seçeneği etkinleştirin. Bu değerler daha sonra yapılandırmanızda nesne şekil filtresi parametrelerini ayarlamak için kullanılabilir."
+    },
+    "debugging": "Hata Ayıklama",
+    "detectorDesc": "Frigate, kamera video akışınızdaki nesneleri algılamak için algılayıcılar ({{detectors}}) kullanır.",
+    "noObjects": "Nesne Yok",
+    "mask": {
+      "title": "Hareket maskeleri",
+      "desc": "Tanımlanmış hareket maskelerinin sınırlarını göster"
+    },
+    "zones": {
+      "title": "Alanlar",
+      "desc": "Tanımlanmış alanların sınırlarını göster"
+    },
+    "objectList": "Nesne Listesi",
+    "desc": "Hata ayıklama görünümü, izlenen nesnelerin ve istatistiklerinin gerçek zamanlı bir görünümünü gösterir. Nesne listesi algılanan nesnelerin zaman gecikmeli bir özetini gösterir.",
+    "paths": {
+      "title": "Hareket İzi",
+      "desc": "Takip edilen nesnenin hareket izi üzerindeki önemli noktaları göster",
+      "tips": "<p><strong>Hareket İzi</strong></p><br><p>Çizgiler ve daireler, takip edilen nesnenin yaşam döngüsü boyunca hareket ettiği önemli noktaları gösterir.</p>"
+    },
+    "openCameraWebUI": "{{camera}}'nın Web Arayüzünü Aç",
+    "audio": {
+      "title": "Ses",
+      "noAudioDetections": "Ses tespiti yok",
+      "score": "skor",
+      "currentRMS": "Şu Anki RMS",
+      "currentdbFS": "Şu Anki dbFS"
+    }
+  },
+  "users": {
+    "title": "Kullanıcılar",
+    "management": {
+      "title": "Kullanıcı Yönetimi",
+      "desc": "Bu Frigate kurulumundaki kullanıcı hesaplarını yönetin."
+    },
+    "addUser": "Kullanıcı Ekle",
+    "toast": {
+      "success": {
+        "deleteUser": "{{user}} kullanıcısı başarıyla silindi",
+        "roleUpdated": "{{user}} için rol güncellendi",
+        "createUser": "{{user}} kullanıcısı başarıyla oluşturuldu",
+        "updatePassword": "Parola başarıyla güncellendi."
+      },
+      "error": {
+        "setPasswordFailed": "Parola kaydedilemedi: {{errorMessage}}",
+        "createUserFailed": "Kullanıcı oluşturulamadı: {{errorMessage}}",
+        "deleteUserFailed": "Kullanıcı silinemedi: {{errorMessage}}",
+        "roleUpdateFailed": "Rol güncellenemedi: {{errorMessage}}"
+      }
+    },
+    "table": {
+      "username": "Kullanıcı Adı",
+      "actions": "Eylemler",
+      "noUsers": "Kullanıcı bulunamadı.",
+      "changeRole": "Kullanıcı rolünü değiştir",
+      "deleteUser": "Kullanıcıyı sil",
+      "role": "Rol",
+      "password": "Parola Sıfırla"
+    },
+    "dialog": {
+      "form": {
+        "user": {
+          "placeholder": "Kullanıcı adı girin",
+          "title": "Kullanıcı Adı",
+          "desc": "Yalnızca harfler, sayılar, noktalar ve alt çizgiler kullanabilirsiniz."
+        },
+        "password": {
+          "title": "Parola",
+          "placeholder": "Parola girin",
+          "confirm": {
+            "title": "Parolayı Onayla",
+            "placeholder": "Parolayı Onayla"
+          },
+          "strength": {
+            "title": "Parola kuvveti: ",
+            "weak": "Zayıf",
+            "medium": "Orta",
+            "strong": "Güçlü",
+            "veryStrong": "Çok Güçlü"
+          },
+          "notMatch": "Parolalar eşleşmiyor",
+          "match": "Parolalar eşleşiyor",
+          "show": "Parolay⁸ göster",
+          "hide": "Parolayı gizle",
+          "requirements": {
+            "title": "Parola gereksinimleri:",
+            "length": "En az 8 karakter",
+            "uppercase": "En az bir büyük harf",
+            "digit": "En az bir rakam",
+            "special": "En az bir özel karakter (!@#$%^&*(),.?\":{}|<>)"
+          }
+        },
+        "newPassword": {
+          "placeholder": "Yeni parola girin",
+          "confirm": {
+            "placeholder": "Yeni parolayı tekrar girin"
+          },
+          "title": "Yeni Parola"
+        },
+        "usernameIsRequired": "Kullanıcı adı gereklidir",
+        "passwordIsRequired": "Parola gereklidir",
+        "currentPassword": {
+          "title": "Mevcut Parola",
+          "placeholder": "Mevcut parolanızı girin"
+        }
+      },
+      "createUser": {
+        "title": "Yeni Kullanıcı Oluştur",
+        "desc": "Yeni bir kullanıcı hesabı ekleyin ve Frigate'deki erişim düzeylerini sınırlandırmak için bir rol belirtin.",
+        "usernameOnlyInclude": "Kullanıcı adı yalnızca harfler, sayılar, nokta veya alt çizgi (_) içerebilir",
+        "confirmPassword": "Lütfen parolanızı onaylayın"
+      },
+      "deleteUser": {
+        "title": "Kullanıcıyı Sil",
+        "warn": "<strong>{{username}}</strong>'i silmek istediğinizden emin misiniz?",
+        "desc": "Bu işlem geri alınamaz. Bu, kullanıcı hesabını kalıcı olarak silecek ve tüm ilişkili verileri kaldıracaktır."
+      },
+      "passwordSetting": {
+        "updatePassword": "{{username}} için Parola Belirle",
+        "setPassword": "Parola Belirle",
+        "desc": "Bu hesabı güvenli hale getirmek güçlü bir parola belirleyin.",
+        "cannotBeEmpty": "Parola boş olamaz",
+        "doNotMatch": "Parolalar eşleşmiyor",
+        "currentPasswordRequired": "Mevcut parola gereklidir",
+        "incorrectCurrentPassword": "Mevcut parola yanlış",
+        "passwordVerificationFailed": "Parola doğrulanamadı",
+        "multiDeviceWarning": "Oturum açtığınız diğer tüm cihazların {{refresh_time}} süresi içinde yeniden oturum açması gerekecektir.",
+        "multiDeviceAdmin": "JWT gizli anahtarınızı yenileyerek tüm kullanıcıları derhal yeniden doğrulama yapmaya zorlayabilirsiniz."
+      },
+      "changeRole": {
+        "title": "Kullanıcı Rolünü Değiştir",
+        "desc": "<strong>{{username}}</strong> için izinleri güncelle",
+        "roleInfo": {
+          "adminDesc": "Tüm özelliklere tam erişim.",
+          "intro": "Bu kullanıcı için bir rol seçin:",
+          "admin": "Yönetici",
+          "viewer": "Görüntüleyici",
+          "viewerDesc": "Yalnızca Canlı, İncele, Keşfet ve Dışa Aktar'a girebilir.",
+          "customDesc": "Belirli kamera erişimine sahip özel rol."
+        },
+        "select": "Bir rol seçin"
+      }
+    },
+    "updatePassword": "Parola Sıfırla"
+  },
+  "notification": {
+    "title": "Bildirimler",
+    "notificationSettings": {
+      "title": "Bildirim Ayarları",
+      "documentation": "Dökümantasyonu Oku",
+      "desc": "Frigate, tarayıcıdan veya web uygulaması (PWA) olarak kullanıyor olmanız fark etmeksizin, tarayıcınızın bildirimler özelliği aracılığıyla bildirimler gönderebilir."
+    },
+    "notificationUnavailable": {
+      "title": "Bildirimler Kullanılamıyor",
+      "documentation": "Dökümantasyonu Oku",
+      "desc": "Web push bildirimleri güvenli bir bağlam gerektirir (<code>https://…</code>). Bu, tarayıcı sınırlamasıdır. Bildirimleri kullanmak için Frigate'e güvenli bir şekilde (https) erişin."
+    },
+    "globalSettings": {
+      "title": "Genel Ayarlar",
+      "desc": "Kayıtlı tüm cihazlarda belirli kameralar için bildirimleri geçici olarak askıya alın."
+    },
+    "email": {
+      "title": "E-posta",
+      "desc": "Geçerli bir e-posta adresi gereklidir ve push hizmetiyle ilgili herhangi bir sorun olması durumunda sizi bilgilendirmek için kullanılacaktır.",
+      "placeholder": "örn. ornek@eposta.com"
+    },
+    "cameras": {
+      "desc": "Bildirimlerin etkinleştirileceği kameraları seçin.",
+      "title": "Kameralar",
+      "noCameras": "Kullanılabilir kamera yok"
+    },
+    "deviceSpecific": "Cihaza Özel Ayarlar",
+    "suspended": "Bildirimler askıya alındı {{time}}",
+    "suspendTime": {
+      "1hour": "1 saat süreyle askıya al",
+      "12hours": "12 saat süreyle askıya al",
+      "24hours": "24 saat süreyle askıya al",
+      "30minutes": "30 dakika süreyle askıya al",
+      "untilRestart": "Yeniden başlatılana kadar askıya al",
+      "10minutes": "10 dakika süreyle askıya al",
+      "5minutes": "5 dakika süreyle askıya al",
+      "suspend": "Askıya Al"
+    },
+    "toast": {
+      "success": {
+        "registered": "Bildirimlere başarıyla kaydolundu. Herhangi bir bildirimin (test bildirimi dahil) gönderilebilmesi için Frigate'in yeniden başlatılması gereklidir.",
+        "settingSaved": "Bildirim ayarları kaydedildi."
+      },
+      "error": {
+        "registerFailed": "Bildirimlere kaydolunurken hata oluştu."
+      }
+    },
+    "registerDevice": "Bu Cihazı Kaydet",
+    "sendTestNotification": "Bir test bildirimi gönder",
+    "cancelSuspension": "Askıya Almayı İptal Et",
+    "unregisterDevice": "Bu Cihazın Kaydını Sil",
+    "active": "Bildirimler Aktif",
+    "unsavedChanges": "Kaydedilmemiş bildirim ayar değişiklikleri",
+    "unsavedRegistrations": "Kaydedilmemiş bildirim ayar değişiklikleri"
+  },
+  "frigatePlus": {
+    "title": "Frigate+ Ayarları",
+    "apiKey": {
+      "title": "Frigate+ API Anahtarı",
+      "validated": "Frigate+ API anahtarınız doğrulandı",
+      "plusLink": "Frigate+ hakkında daha fazla bilgi edinin",
+      "notValidated": "Frigate+ API anahtarı bulunamadı veya doğrulanamadı",
+      "desc": "Frigate+ API anahtarı, Frigate+ hizmetiyle entegrasyonu sağlar."
+    },
+    "snapshotConfig": {
+      "title": "Fotoğraf Yapılandırması",
+      "documentation": "Dökümantasyonu oku",
+      "table": {
+        "camera": "Kamera",
+        "snapshots": "Fotoğraflar",
+        "cleanCopySnapshots": "<code>clean_copy</code> Fotoğraflar"
+      },
+      "desc": "Frigate+'a göndermek için yapılandırmanızda hem fotoğrafların hem de <code>clean_copy</code> fotoğraflarının etkinleştirilmesi gerekir.",
+      "cleanCopyWarning": "Bazı kameralarda fotoğraflar etkin ancak temiz kopya özelliği devre dışı. Bu kameralardan Frigate+'a görüntü gönderebilmek için fotoğraf(snapshots) yapılandırmanızda <code>clean_copy</code>'yi etkinleştirmeniz gerekiyor."
+    },
+    "modelInfo": {
+      "error": "Model bilgileri yüklenemedi",
+      "loadingAvailableModels": "Kullanılabilir modeller yükleniyor…",
+      "loading": "Model bilgileri yükleniyor…",
+      "modelType": "Model Türü",
+      "dimensions": "Boyutlar",
+      "availableModels": "Kullanılabilir Modeller",
+      "modelSelect": "Frigate+'daki kullanılabilir modelleriniz buradan seçilebilir. Yalnızca mevcut algılayıcı yapılandırmanızla uyumlu modellerin seçilebileceğini unutmayın.",
+      "baseModel": "Temel Model",
+      "title": "Model Bilgileri",
+      "trainDate": "Eğitim Tarihi",
+      "supportedDetectors": "Desteklenen Algılayıcılar",
+      "cameras": "Kameralar",
+      "plusModelType": {
+        "userModel": "İnce Ayarlı",
+        "baseModel": "Baz Model"
+      }
+    },
+    "toast": {
+      "success": "Frigate+ ayarları kaydedildi. Değişiklikleri uygulamak için Frigate'i yeniden başlatın.",
+      "error": "Yapılandırma değişiklikleri kaydedilemedi: {{errorMessage}}"
+    },
+    "restart_required": "Yeniden Başlatma Gerekli (Frigate+ modeli değiştirildi)",
+    "unsavedChanges": "Kaydedilmemiş Frigate+ ayar değişiklikleri"
+  },
+  "enrichments": {
+    "birdClassification": {
+      "title": "Kuş Sınıflandırma",
+      "desc": "Kuş sınıflandırma, kuantize edilmiş bir Tensorflow modeli aracılığıyla bilinen kuş türlerini tespit eder. Bilinen bir kuş türü tespit edildiğinde, bu türün bilinen adı bir alt etiket olarak ilgili öğeye iliştirilir. Bu bilgi; arayüzde ve bildirimlerde gösterilir ve filtre olarak kullanılabilir."
+    },
+    "unsavedChanges": "Değişitirilen zenginleştirme ayarları kaydedilmedi",
+    "semanticSearch": {
+      "reindexNow": {
+        "desc": "Yeniden dizinleme işlemi, bütün takip edilen nesneler için gömüleri tekrar üretecektir. Bu işlem arka planda gerçekleşir, fakat nesne sayısına bağlı olarak çok işlemci kullanabilir veya tamamlanması makul bir süre alabilir.",
+        "label": "Şimdi Yeniden Dizinle",
+        "confirmTitle": "Yeniden Dizinlemeyi Onayla",
+        "confirmDesc": "Bütün takip edilen nesnelerin gömülerini yeniden dizinlemek istediğinize emin misiniz? Bu işlem arka planda gerçekleşecektir fakat nesne sayısına bağlı olarak çok işlemci kullanabilir ve biraz süre alabilir. İlerlemesini Keşfet sayfasından görüntüleyebilirsiniz.",
+        "confirmButton": "Yeniden Dizinle",
+        "success": "Yeniden dizinleme başarıyla başlatıldı.",
+        "alreadyInProgress": "Yeniden dizinleme zaten sürüyor.",
+        "error": "Yeniden dizinleme başlatılamadı: {{errorMessage}}"
+      },
+      "title": "Anlamsal Arama",
+      "desc": "Anlamsal arama, takip edilen nesneleri; ya görselin kendisini kullanarak ya da görsel öğelere ait açıklamalar üzerinden (kullanıcı tarafından yazılmış ya da otomatik oluşturulmuş) metinle arama yaparak bulmanıza olanak tanır.",
+      "readTheDocumentation": "Dökümantasyonu Oku",
+      "modelSize": {
+        "label": "Model Boyutu",
+        "desc": "Anlamsal aramadaki gömüler için kullanılan modelin büyüklüğü.",
+        "small": {
+          "title": "küçük",
+          "desc": "Modelin <em>küçük</em> sürümü, gömme kalitesinde fark edilmesi zor bir değişikliğe karşılık daha az RAM kullanan ve CPU’da daha hızlı çalışan kuantize bir model kullanır."
+        },
+        "large": {
+          "title": "büyük",
+          "desc": "Modelin <em>büyük</em> sürümü tam boyutlu Jina modelini kullanır ve uygunsa GPU'da çalışacaktır."
+        }
+      }
+    },
+    "title": "Zenginleştirme Ayarları",
+    "faceRecognition": {
+      "title": "Yüz Tanıma",
+      "desc": "Yüz tanıma, tespit edilen insanların yüzleri tanındığında onlara isim atamanıza olanak sağlar ve bu isim bilgisi alt etiket olarak iliştirilir. Bu bilgi; arayüzde ve bildirimlerde gösterilir ve filtre olarak kullanılabilir.",
+      "readTheDocumentation": "Dökümantasyonu Oku",
+      "modelSize": {
+        "label": "Model Boyutu",
+        "desc": "Yüz tanıma için kullanılan modelin büyüklüğü.",
+        "small": {
+          "title": "küçük",
+          "desc": "Modelin <em>küçük</em> sürümü olarak çoğu işlemcide verimli çalışabilen bir FaceNet yüz gömü modeli kullanılır."
+        },
+        "large": {
+          "title": "büyük",
+          "desc": "Modelin <em>büyük</em> sürümü olarak ArcFace yüz gömü modeli kullanılır ve uygunsa GPU'da çalışır."
+        }
+      }
+    },
+    "licensePlateRecognition": {
+      "title": "Plaka Tanıma",
+      "desc": "Frigate tespit edilen araçların tescil plakalarındaki karakterleri okuyabilir ve ilgili araba türündeki nesnenin recognized_license_plate bölümüne, varsa bilindik bir adını da sub_label bölümüne ekleyebilir. Bu özelliği bir yoldan geçen yahut evin önüne park eden araçların plakalarını okumak için kullanabilirsiniz.",
+      "readTheDocumentation": "Dökümantasyonu Oku"
+    },
+    "restart_required": "Yeniden başlatma gerekli (zenginleştirme ayarları değişti)",
+    "toast": {
+      "success": "Zenginleştirme ayarları kaydedildi. Değişiklikleri uygulamak için Frigate'i yeniden başlatın.",
+      "error": "Yapılandırma değişiklikleri kaydedilemedi: {{errorMessage}}"
+    }
+  },
+  "triggers": {
+    "dialog": {
+      "form": {
+        "name": {
+          "error": {
+            "invalidCharacters": "Girdi yalnızca harf, rakam, alt çizgi ve tire içerebilir.",
+            "minLength": "Girdi en az 2 karakter uzunluğunda olmalıdır.",
+            "alreadyExists": "Bu kamerada aynı isimle bir tetik zaten mevcut."
+          },
+          "title": "İsim",
+          "placeholder": "Bu tetikleyiciye isim verin",
+          "description": "Bu tetikleyiciyi tanımlamak için benzersiz bir isim veya açıklama girin"
+        },
+        "enabled": {
+          "description": "Bu tetiği açın veya kapatın"
+        },
+        "type": {
+          "title": "Tetik Türü",
+          "placeholder": "Tetik türünü seçin",
+          "description": "Benzer izlenen nesne açıklaması algılandığında tetiklenir",
+          "thumbnail": "Benzer izlenen nesne küçük resmi algılandığında tetiklenir"
+        },
+        "content": {
+          "title": "İçerik",
+          "imagePlaceholder": "Bir küçük resim seçin",
+          "textPlaceholder": "Metin içeriği girin",
+          "imageDesc": "Yalnızca en son 100 küçük resim görüntülenir. İstediğiniz küçük resmi bulamazsanız, lütfen Keşfet bölümündeki önceki nesneleri inceleyin ve oradaki menüden bir tetikleyici ayarlayın.",
+          "textDesc": "Benzer bir takip edilen nesne açıklaması algılandığında bu eylemi tetiklemek için metin girin.",
+          "error": {
+            "required": "İçerik gereklidir."
+          }
+        },
+        "threshold": {
+          "title": "Tetik Eşiği",
+          "error": {
+            "min": "Tetik eşiği 0 ile 1 arasında olmalıdır",
+            "max": "Tetik eşiği 0 ile 1 arasında olmalıdır"
+          },
+          "desc": "Bu tetikleyici için benzerlik eşiğini ayarlayın. Daha yüksek bir eşik, tetiği tetiklemek için daha yakın bir eşleşme gerektiği anlamına gelir."
+        },
+        "actions": {
+          "title": "Eylemler",
+          "desc": "Varsayılan olarak, Frigate tüm tetikleyici isimlerini bir MQTT mesajı olarak gönderir. Alt etiketler, tetikleyici ismini nesne etiketine ekler. Nitelikler, izlenen nesne meta verilerinde ayrı olarak depolanan aranabilir meta verilerdir.",
+          "error": {
+            "min": "En az bir eylem seçilmelidir."
+          }
+        }
+      },
+      "createTrigger": {
+        "title": "Tetik Oluştur",
+        "desc": "{{camera}} kamerası için tetik oluşturun"
+      },
+      "editTrigger": {
+        "title": "Tetiği Düzenle",
+        "desc": "{{camera}} kamerasındaki tetiğin ayarlarını düzenleyin"
+      },
+      "deleteTrigger": {
+        "title": "Tetiği Sil",
+        "desc": "<strong>{{triggerName}}</strong> isimli tetiği silmek istediğinizden emin misiniz? Bu işlem geri alınamaz."
+      }
+    },
+    "documentTitle": "Tetikler",
+    "management": {
+      "title": "Tetikleyiciler",
+      "desc": "{{camera}} için tetikleri yönetin. Seçtiğiniz takip edilen nesneye benzer küçük resimlerde tetiklemek için küçük resmi kullanın veya belirlediğiniz metne benzer açıklamalar çıkması durumunda tetiklemek için ise açıklama seçeneğini kullanın."
+    },
+    "addTrigger": "Tetik Ekle",
+    "table": {
+      "name": "İsim",
+      "type": "Tetik Türü",
+      "content": "İçerik",
+      "threshold": "Tetik Eşiği",
+      "actions": "Eylemler",
+      "noTriggers": "Bu kamera için hiç bir tetik ayarlanmadı.",
+      "edit": "Düzenle",
+      "deleteTrigger": "Tetiği Sil",
+      "lastTriggered": "En son tetikleme"
+    },
+    "type": {
+      "thumbnail": "Küçük Resim",
+      "description": "Açıklama"
+    },
+    "actions": {
+      "alert": "Alarm Olarak İşaretle",
+      "notification": "Bildirim Gönder",
+      "sub_label": "Alt Etiket Ekle",
+      "attribute": "Özellik Ekle"
+    },
+    "toast": {
+      "success": {
+        "createTrigger": "Tetik {{name}} başarıyla oluşturuldu.",
+        "updateTrigger": "Tetik {{name}} başarıyla güncellendi.",
+        "deleteTrigger": "Tetik {{name}} başarıyla silindi."
+      },
+      "error": {
+        "createTriggerFailed": "Tetik oluşturulamadı: {{errorMessage}}",
+        "updateTriggerFailed": "Tetik güncellenemedi: {{errorMessage}}",
+        "deleteTriggerFailed": "Tetik silinemedi: {{errorMessage}}"
+      }
+    },
+    "semanticSearch": {
+      "title": "Anlamsal Arama devre dışı bırakıldı",
+      "desc": "Tetikleyicileri kullanmak için Anlamsal Arama'nın etkinleştirilmesi gerekir."
+    },
+    "wizard": {
+      "title": "Tetikleyici Oluştur",
+      "step1": {
+        "description": "Tetikleyiciniz için temel ayarları yapılandırın."
+      },
+      "step2": {
+        "description": "Bu eylemi tetikleyecek içeriği ayarlayın."
+      },
+      "step3": {
+        "description": "Bu tetikleyici için eşik değerini ve eylemleri yapılandırın."
+      },
+      "steps": {
+        "nameAndType": "İsim ve Tür",
+        "configureData": "Verileri Yapılandır",
+        "thresholdAndActions": "Eşik ve Eylemler"
+      }
+    }
+  },
+  "cameraWizard": {
+    "title": "Kamera Ekle",
+    "description": "Aşağıdaki adımları izleyerek Frigate kurulumunuza yeni bir kamera ekleyin.",
+    "steps": {
+      "nameAndConnection": "İsim & Bağlantı",
+      "probeOrSnapshot": "Probe veya Anlık Görüntü",
+      "streamConfiguration": "Akış Yapılandırması",
+      "validationAndTesting": "Doğrulama ve Test"
+    },
+    "save": {
+      "success": "Yeni kamera {{cameraName}} başarıyla kaydedildi.",
+      "failure": "{{cameraName}} kaydedilirken hata oluştu."
+    },
+    "testResultLabels": {
+      "resolution": "Çözünürlük",
+      "video": "Video",
+      "audio": "Ses",
+      "fps": "FPS"
+    },
+    "commonErrors": {
+      "noUrl": "Lütfen geçerli bir akış URL'si sağlayın",
+      "testFailed": "Akış testi başarısız oldu: {{error}}"
+    },
+    "step1": {
+      "description": "Kamera bilgilerinizi girin ve kamerayı taramayı (probe) ya da markayı manuel olarak seçmeyi tercih edin.",
+      "cameraName": "Kamera İsmi",
+      "cameraNamePlaceholder": "örn. onkapi, veya Arka Bahçe Genel Görünümü",
+      "host": "Ana makine adı veya IP Adresi",
+      "port": "Port",
+      "username": "Kullanıcı adı",
+      "usernamePlaceholder": "İsteğe bağlı",
+      "password": "Parola",
+      "passwordPlaceholder": "İsteğe bağlı",
+      "selectTransport": "İletişim protokolünü seçin",
+      "cameraBrand": "Kamera Markası",
+      "selectBrand": "URL şablonu için kamera markasını seçin",
+      "customUrl": "Özel Akış URL’si",
+      "brandInformation": "Marka Bilgileri",
+      "brandUrlFormat": "RTSP URL formatı şu şekilde olan kameralar için: {{exampleUrl}}",
+      "customUrlPlaceholder": "rtsp://kullanıcıadı:parola@host:port/path",
+      "connectionSettings": "Bağlantı Ayarları",
+      "detectionMethod": "Akış Algılama Yöntemi",
+      "onvifPort": "ONVIF Portu",
+      "probeMode": "Kamerayı tara",
+      "manualMode": "Manuel seçim",
+      "detectionMethodDescription": "Kamera akış URL’lerini bulmak için kamerayı ONVIF ile tarayın (destekleniyorsa) veya ön tanımlı URL’leri kullanmak için kamera markasını manuel olarak seçin. Özel bir RTSP URL’si girmek için manuel yöntemi seçin ve “Diğer”i işaretleyin.",
+      "onvifPortDescription": "ONVIF'i destekleyen kameralarda bu genellikle 80 veya 8080'dir.",
+      "useDigestAuth": "Digest kimlik doğrulamasını kullan",
+      "errors": {
+        "nameRequired": "Kamera ismi gereklidir",
+        "nameLength": "Kamera ismi en fazla 64 karakter olmalıdır",
+        "invalidCharacters": "Kamera ismi geçersiz karakterler içeriyor",
+        "nameExists": "Kamera ismi zaten mevcut",
+        "customUrlRtspRequired": "Özel URL'ler \"rtsp://\" ile başlamalıdır. RTSP olmayan kamera akışları için manuel yapılandırma gereklidir.",
+        "brandOrCustomUrlRequired": "Bir kamera markası seçip host/IP adresi girin ya da özel bir URL kullanmak için ‘Diğer’ seçeneğini tercih edin"
+      },
+      "useDigestAuthDescription": "ONVIF için HTTP digest kimlik doğrulamasını kullanın. Bazı kameralar, standart yönetici kullanıcısı yerine özel bir ONVIF kullanıcı adı/parola kullanılmasını gerektirebilir."
+    },
+    "step2": {
+      "description": "Mevcut akışları bulmak için kamerayı tarayın veya seçtiğiniz algılama yöntemine göre manuel ayarları yapılandırın.",
+      "testSuccess": "Bağlantı testi başarılı!",
+      "testFailed": "Bağlantı testi başarısız oldu. Lütfen bilgileri kontrol edip tekrar deneyin.",
+      "testFailedTitle": "Test Başarısız",
+      "streamDetails": "Akış Ayrıntıları",
+      "probing": "Kamera taranıyor...",
+      "retry": "Yeniden dene",
+      "testing": {
+        "probingMetadata": "Kamera meta verileri inceleniyor...",
+        "fetchingSnapshot": "Kamera anlık görüntüsü alınıyor..."
+      },
+      "probeFailed": "Kamerayı tarama başarısız oldu: {{error}}",
+      "probingDevice": "Cihaz taranıyor…",
+      "probeSuccessful": "Tarama başarılı",
+      "probeError": "Tarama hatası",
+      "probeNoSuccess": "Tarama başarısız",
+      "deviceInfo": "Cihaz Bilgileri",
+      "manufacturer": "Üretici",
+      "model": "Modeli",
+      "firmware": "Donanım yazılımı",
+      "profiles": "Profiller",
+      "ptzSupport": "PTZ Desteği",
+      "autotrackingSupport": "Otomatik Takip Desteği",
+      "presets": "Ön ayarlar",
+      "rtspCandidates": "RTSP Yayınları",
+      "rtspCandidatesDescription": "Kamera taramasından aşağıdaki RTSP URL'leri bulundu. Akış meta verilerini görüntülemek için bağlantıyı test edin.",
+      "noRtspCandidates": "Kameradan RTSP URL'si bulunamadı. Kimlik bilgileriniz yanlış olabilir veya kamera ONVIF'i veya RTSP URL'lerini almak için kullanılan yöntemi desteklemiyor olabilir. Geri dönün ve RTSP URL'sini manuel olarak girin.",
+      "candidateStreamTitle": "Yayın {{number}}",
+      "useCandidate": "Kullan",
+      "uriCopy": "Kopyala",
+      "uriCopied": "URI panoya kopyalandı",
+      "testConnection": "Bağlantıyı Test Et",
+      "toggleUriView": "Tam URI görünümünü değiştirmek için tıklayın",
+      "connected": "Bağlandı",
+      "notConnected": "Bağlı Değil",
+      "errors": {
+        "hostRequired": "Host/IP adresi gereklidir"
+      }
+    },
+    "step3": {
+      "description": "Akış rollerini yapılandırın ve kameranız için ek akışlar ekleyin.",
+      "streamsTitle": "Kamera Akışları",
+      "addStream": "Akış Ekle",
+      "addAnotherStream": "Başka Bir Akış Ekle",
+      "streamTitle": "Akış {{number}}",
+      "streamUrl": "Akış URL'si",
+      "streamUrlPlaceholder": "rtsp://kullanıcıadı:parola@host:port/path",
+      "selectStream": "Bir akış seçin",
+      "searchCandidates": "Yayınları arayın...",
+      "noStreamFound": "Akış bulunamadı",
+      "url": "URL",
+      "resolution": "Çözünürlük",
+      "selectResolution": "Çözünürlüğü seçin",
+      "quality": "Kalite",
+      "selectQuality": "Kaliteyi seçin",
+      "roles": "Roller",
+      "roleLabels": {
+        "detect": "Nesne Algılama",
+        "record": "Kayıt",
+        "audio": "Ses"
+      },
+      "testStream": "Bağlantıyı Test Et",
+      "testSuccess": "Yayın testi başarılı!",
+      "testFailed": "Yayın testi başarısız oldu",
+      "testFailedTitle": "Test Başarısız",
+      "connected": "Bağlı",
+      "notConnected": "Bağlı Değil",
+      "featuresTitle": "Özellikler",
+      "go2rtc": "Kameraya olan bağlantıları azaltın",
+      "detectRoleWarning": "Devam edebilmek için en az bir akışın algılama (detect) rolüne sahip olması gerekir.",
+      "rolesPopover": {
+        "title": "Akış Rolleri",
+        "detect": "Nesne algılama için ana besleme.",
+        "record": "Yapılandırma ayarlarına göre video akışının bölümlerini kaydeder.",
+        "audio": "Ses tabanlı algılama için besleme."
+      },
+      "featuresPopover": {
+        "title": "Yayın Özellikleri",
+        "description": "Kameranıza olan bağlantıları azaltmak için go2rtc yeniden akışını kullanın."
+      }
+    },
+    "step4": {
+      "disconnectStream": "Bağlantıyı kes",
+      "estimatedBandwidth": "Tahmini Bant Genişliği",
+      "roles": "Roller",
+      "ffmpegModule": "Yayın uyumluluk modunu kullan",
+      "ffmpegModuleDescription": "Yayın birkaç denemeden sonra yüklenmezse, bunu etkinleştirmeyi deneyin. Etkinleştirildiğinde, Frigate go2rtc ile ffmpeg modülünü kullanacaktır. Bu, bazı kamera yayınları ile daha iyi uyumluluk sağlayabilir.",
+      "none": "Hiçbiri",
+      "error": "Hata",
+      "description": "Yeni kameranızı kaydetmeden önce son doğrulama ve analiz. Kaydetmeden önce her akışı bağlayın.",
+      "validationTitle": "Akış Doğrulaması",
+      "connectAllStreams": "Tüm Akışlara Bağlan",
+      "reconnectionSuccess": "Yeniden bağlantı başarılı.",
+      "reconnectionPartial": "Bazı Akışlara yeniden bağlanılamadı.",
+      "streamUnavailable": "Akış önizlemesi kullanılamıyor",
+      "reload": "Yeniden yükle",
+      "connecting": "Bağlanıyor...",
+      "streamTitle": "Akış {{number}}",
+      "valid": "Geçerli",
+      "failed": "Başarısız",
+      "notTested": "Test edilmedi",
+      "connectStream": "Bağlan",
+      "connectingStream": "Bağlanıyor",
+      "streamValidated": "{{number}} nolu akış başarıyla doğrulandı",
+      "streamValidationFailed": "{{number}} nolu akış doğrulanamadı",
+      "saveAndApply": "Yeni Kamerayı Kaydet",
+      "saveError": "Geçersiz yapılandırma. Lütfen ayarlarınızı kontrol edin.",
+      "issues": {
+        "title": "Akış Doğrulaması",
+        "videoCodecGood": "Video kodeği {{codec}}.",
+        "audioCodecGood": "Ses kodeği {{codec}}.",
+        "resolutionHigh": "{{resolution}} çözünürlüğü kaynak kullanımının artmasına neden olabilir.",
+        "resolutionLow": "{{resolution}} çözünürlüğü, küçük nesnelerin güvenilir bir şekilde algılanması için çok düşük olabilir.",
+        "noAudioWarning": "Bu yayın için ses algılanmadı, kayıtlarda ses bulunmayacak.",
+        "audioCodecRecordError": "Kayıtlarda sesi desteklemek için AAC ses kodeği gereklidir.",
+        "audioCodecRequired": "Ses algılamayı desteklemek için bir ses akışı gereklidir.",
+        "restreamingWarning": "Kayıt akışı için kameraya olan bağlantıları azaltmak CPU kullanımını bir miktar artırabilir.",
+        "brands": {
+          "reolink-rtsp": "Reolink RTSP önerilmez. Kameranın ayarlarında HTTP'yi etkinleştirin ve sihirbazı baştan başlatın.",
+          "reolink-http": "Reolink HTTP akışları daha iyi uyumluluk için FFmpeg kullanmalıdır. Bu akış için 'Akış uyumluluk modunu kullan' seçeneğini etkinleştirin."
+        },
+        "dahua": {
+          "substreamWarning": "Alt akış 1 düşük çözünürlüğe kilitlenmiştir. Birçok Dahua / Amcrest / EmpireTech kamera, kamera ayarlarında etkinleştirilmesi gereken ek alt akışları destekler. Mevcutsa, bu akışları kontrol edip kullanmanız önerilir."
+        },
+        "hikvision": {
+          "substreamWarning": "Alt akış 1 düşük çözünürlüğe kilitlendi. Birçok Hikvision kamera, kamera ayarlarında etkinleştirilmesi gereken ek alt akışları destekler. Mevcutsa, bu akışları kontrol edip kullanmanız önerilir."
+        }
+      }
+    }
+  },
+  "cameraManagement": {
+    "title": "Kameraları Yönet",
+    "addCamera": "Yeni Kamera Ekle",
+    "editCamera": "Kamerayı Düzenle:",
+    "selectCamera": "Bir Kamera Seçin",
+    "backToSettings": "Kamera Ayarlarına Dön",
+    "streams": {
+      "title": "Kameraları Etkinleştir / Devre Dışı Bırak",
+      "desc": "Frigate yeniden başlatılana kadar bir kamerayı geçici olarak devre dışı bırakın. Bir kamerayı devre dışı bırakmak, Frigate'in bu kameranın akışlarını işlemesini tamamen durdurur. Algılama, kayıt ve hata ayıklama kullanılamaz.<br /> <em>Not: Bu, go2rtc yeniden akışlarını devre dışı bırakmaz.</em>"
+    },
+    "cameraConfig": {
+      "add": "Kamera Ekle",
+      "edit": "Kamerayı Düzenle",
+      "description": "Yayınlar ve roller dahil olmak üzere kamera ayarlarını yapılandırın.",
+      "name": "Kamera İsmi",
+      "nameRequired": "Kamera ismi gereklidir",
+      "nameLength": "Kamera ismi 64 karakterden az olmalıdır.",
+      "namePlaceholder": "örneğin, ön_kapı veya Arka Bahçe Genel Bakışı",
+      "enabled": "Etkin",
+      "ffmpeg": {
+        "inputs": "Giriş Akışları",
+        "path": "Akış Yolu",
+        "pathRequired": "Akış yolu gereklidir",
+        "pathPlaceholder": "rtsp://...",
+        "roles": "Roller",
+        "rolesRequired": "En az bir rol gereklidir",
+        "rolesUnique": "Her rol (ses, algılama, kayıt) yalnızca bir akışa atanabilir",
+        "addInput": "Akış Ekle",
+        "removeInput": "Akış Kaldır",
+        "inputsRequired": "En az bir akış gereklidir"
+      },
+      "go2rtcStreams": "go2rtc Akışları",
+      "streamUrls": "Akış URL'leri",
+      "addUrl": "URL ekle",
+      "addGo2rtcStream": "go2rtc Akışı Ekle",
+      "toast": {
+        "success": "Kamera {{cameraName}} başarıyla kaydedildi"
+      }
+    }
+  },
+  "cameraReview": {
+    "title": "Kamera İnceleme Ayarları",
+    "object_descriptions": {
+      "title": "Üretken Yapay Zeka Nesne Açıklamaları",
+      "desc": "Frigate yeniden başlatılana kadar bu kamera için Üretken Yapay Zeka nesne açıklamalarını geçici olarak etkinleştirin/devre dışı bırakın. Devre dışı bırakıldığında, bu kameradaki izlenen nesneler için yapay zeka tarafından oluşturulan açıklamalar istenmeyecektir."
+    },
+    "review_descriptions": {
+      "title": "Üretken Yapay Zeka İnceleme Açıklamaları",
+      "desc": "Bu kamera için yapay zekadan incele öğelerini açıklama taleplerini geçici olarak etkinleştirin/devre dışı bırakın. Devre dışı bırakıldığında, bu kameradaki inceleme öğeleri için yapay zekadan açıklama istenmeyecektir."
+    },
+    "review": {
+      "title": "İncele",
+      "desc": "Frigate yeniden başlatılana kadar bu kamera için uyarıları ve algılamaları geçici olarak etkinleştirin/devre dışı bırakın. Devre dışı bırakıldığında, yeni inceleme öğeleri oluşturulmaz. ",
+      "alerts": "Uyarılar ",
+      "detections": "Tespitler "
+    },
+    "reviewClassification": {
+      "title": "Sınıflandırmayı İncele",
+      "desc": "Frigate, inceleme öğelerini Uyarılar ve Algılamalar olarak kategorilere ayırır. Varsayılan olarak, tüm <em>kişi</em> ve <em>araba</em> nesneleri Uyarı olarak kabul edilir. İnceleme öğelerinizin kategorilendirmesini, bunlar için gerekli bölgeleri yapılandırarak iyileştirebilirsiniz.",
+      "noDefinedZones": "Bu kamera için herhangi bir bölge tanımlanmamıştır.",
+      "objectAlertsTips": "{{cameraName}} üzerindeki tüm {{alertsLabels}} nesneleri Uyarı olarak gösterilecektir.",
+      "zoneObjectAlertsTips": "{{cameraName}} üzerinde, {{zone}} bölgesinde tespit edilen tüm {{alertsLabels}} nesneleri Uyarı olarak gösterilecektir.",
+      "objectDetectionsTips": "{{cameraName}} üzerinde kategorize edilmemiş tüm {{detectionsLabels}} nesneleri, bölgeden bağımsız olarak Tespit olarak gösterilecektir.",
+      "zoneObjectDetectionsTips": {
+        "text": "{{cameraName}} üzerindeki {{zone}} bölgesinde kategorize edilmemiş tüm {{detectionsLabels}} nesneleri, Tespit olarak gösterilecektir.",
+        "notSelectDetections": "{{cameraName}} üzerinde {{zone}} bölgesinde tespit edilen ve Uyarı olarak kategorize edilmemiş tüm {{detectionsLabels}} nesneleri, bölgeden bağımsız olarak Tespitler olarak gösterilecektir.",
+        "regardlessOfZoneObjectDetectionsTips": "{{cameraName}} üzerinde kategorize edilmemiş tüm {{detectionsLabels}} nesneleri, bulundukları bölgeden bağımsız olarak Tespit olarak gösterilecektir."
+      },
+      "unsavedChanges": "{{camera}} için Kaydedilmemiş İnceleme Sınıflandırması ayarları",
+      "selectAlertsZones": "Uyarılar için bölgeleri seçin",
+      "selectDetectionsZones": "Tespitler için bölgeleri seçin",
+      "limitDetections": "Tespitleri belirli bölgelerle sınırlayın",
+      "toast": {
+        "success": "Sınıflandırma yapılandırması kaydedildi. Değişiklikleri uygulamak için Frigate'i yeniden başlatın."
+      }
+    }
+  },
+  "roles": {
+    "management": {
+      "title": "İzleyici Rol Yönetimi",
+      "desc": "Bu Frigate örneği için özel görüntüleyici rollerini ve kamera erişim izinlerini yönetin."
+    },
+    "addRole": "Rol Ekle",
+    "table": {
+      "role": "Rol",
+      "cameras": "Kameralar",
+      "actions": "Eylemler",
+      "noRoles": "Özel rol bulunamadı.",
+      "editCameras": "Kameraları Düzenle",
+      "deleteRole": "Rolü Sil"
+    },
+    "toast": {
+      "success": {
+        "createRole": "{{role}} rolü başarıyla oluşturuldu",
+        "updateCameras": "{{role}} rolü için kameralar güncellendi",
+        "deleteRole": "{{role}} rolü başarıyla silindi",
+        "userRolesUpdated_one": "Bu role atanan {{count}} kullanıcı, tüm kameralara erişimi olan 'görüntüleyici' olarak güncellendi.",
+        "userRolesUpdated_other": "Bu role atanan {{count}} kullanıcı, tüm kameralara erişimi olan 'görüntüleyici' olarak güncellendi."
+      },
+      "error": {
+        "createRoleFailed": "Rol oluşturulamadı: {{errorMessage}}",
+        "updateCamerasFailed": "Kameralar güncellenemedi: {{errorMessage}}",
+        "deleteRoleFailed": "Rol silinemedi: {{errorMessage}}",
+        "userUpdateFailed": "Kullanıcı rolleri güncellenemedi: {{errorMessage}}"
+      }
+    },
+    "dialog": {
+      "createRole": {
+        "title": "Yeni Rol Oluştur",
+        "desc": "Yeni bir rol ekleyin ve kamera erişim izinlerini belirtin."
+      },
+      "editCameras": {
+        "title": "Rol Kameralarını Düzenle",
+        "desc": "<strong>{{role}}</strong> rolü için kamera erişimini güncelleyin."
+      },
+      "deleteRole": {
+        "title": "Rolü Sil",
+        "desc": "Bu işlem geri alınamaz. Bu işlem, rolü kalıcı olarak siler ve bu role sahip tüm kullanıcılara 'izleyici' rolü atar; bu da izleyiciye tüm kameralara erişim sağlar.",
+        "warn": "<strong>{{role}}</strong> rolünü silmek istediğinizden emin misiniz?",
+        "deleting": "Siliniyor..."
+      },
+      "form": {
+        "role": {
+          "title": "Rol İsmi",
+          "placeholder": "Rol ismini girin",
+          "desc": "Sadece harf, rakam, nokta ve alt çizgi kullanılabilir.",
+          "roleIsRequired": "Rol ismi gereklidir",
+          "roleOnlyInclude": "Rol ismi yalnızca harf, sayı veya alt çizgi (_) içerebilir",
+          "roleExists": "Bu isimde bir rol zaten mevcut."
+        },
+        "cameras": {
+          "title": "Kameralar",
+          "desc": "Bu rolün erişebileceği kameraları seçin. En az bir kamera gereklidir.",
+          "required": "En az bir kamera seçilmelidir."
+        }
+      }
+    }
+  }
+}

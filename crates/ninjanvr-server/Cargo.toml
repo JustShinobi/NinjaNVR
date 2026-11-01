@@ -1,0 +1,46 @@
+[package]
+name = "ninjanvr-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ninjanvr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+axum.workspace = true
+axum-extra.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+jsonwebtoken.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+chrono.workspace = true
+rand.workspace = true
+bytes.workspace = true
+base64.workspace = true
+image.workspace = true
+nix.workspace = true
+
+ninjanvr-config = { path = "../ninjanvr-config" }
+ninjanvr-db = { path = "../ninjanvr-db" }
+ninjanvr-comms = { path = "../ninjanvr-comms" }
+ninjanvr-vod = { path = "../ninjanvr-vod" }
+ninjanvr-media = { path = "../ninjanvr-media" }
+ninjanvr-vision = { path = "../ninjanvr-vision" }
+ninjanvr-infer = { path = "../ninjanvr-infer" }
+ninjanvr-track = { path = "../ninjanvr-track" }

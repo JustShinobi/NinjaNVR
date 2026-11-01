@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ninjanvr-config",
+    "crates/ninjanvr-db",
+    "crates/ninjanvr-media",
+    "crates/ninjanvr-vision",
+    "crates/ninjanvr-infer",
+    "crates/ninjanvr-track",
+    "crates/ninjanvr-vod",
+    "crates/ninjanvr-comms",
+    "crates/ninjanvr-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/JustShinobi/NinjaNVR"
+authors = ["NinjaNVR Contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.44", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+rusqlite = { version = "0.34", features = ["bundled"] }
+axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
+axum-extra = { version = "0.10", features = ["cookie"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "compression-gzip", "compression-br", "trace"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+base64 = "0.22"
+jsonwebtoken = "9.3"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
+hyper = { version = "1.6", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+bytes = "1.10"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+rumqttc = "0.24"
+nix = { version = "0.29", features = ["fs", "process", "signal"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
