@@ -29,14 +29,16 @@ COPY --from=upstream-assets /usr/local/lib/python3.11/dist-packages/openvino/lib
 COPY --from=upstream-assets /usr/local/lib/python3.11/dist-packages/openvino/libs/libhwloc.so.15 /usr/local/lib/ninjanvr/openvino/
 COPY --from=builder /src/target/release/ninjanvr /usr/local/bin/ninjanvr
 COPY web /opt/ninjanvr/web
+COPY web-v2/dist /opt/ninjanvr/web-v2
 
 ENV CONFIG_FILE=/config/config.yml
 ENV NINJANVR_WEB_DIR=/opt/ninjanvr/web
+ENV NINJANVR_WEB_V2_DIR=/opt/ninjanvr/web-v2
 ENV NINJANVR_MEDIA_DIR=/media/frigate
 ENV NINJANVR_OPENVINO_LIB_DIR=/usr/local/lib/ninjanvr/openvino
 ENV LD_LIBRARY_PATH=/usr/local/lib/ninjanvr/openvino
-ENV OMP_NUM_THREADS=2
-ENV OV_CPU_THREADS_NUM=2
+ENV OMP_NUM_THREADS=1
+ENV OV_CPU_THREADS_NUM=1
 
 EXPOSE 5000 8971 8554 8555/tcp 8555/udp
 

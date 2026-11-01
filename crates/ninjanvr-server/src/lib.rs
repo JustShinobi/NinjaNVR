@@ -36,7 +36,7 @@ use tokio::sync::{RwLock, broadcast};
 use tokio_tungstenite::tungstenite::protocol::Message as TungMsg;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 use tracing::{error, info, warn};
 
 const MAX_LOG_LINES: usize = 500;
@@ -249,6 +249,7 @@ pub struct AppState {
     pub jwt_secret: String,
     pub start_instant: Instant,
     pub web_dir: PathBuf,
+    pub web_v2_dir: PathBuf,
     pub media_dir: PathBuf,
     pub latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     pub activity_ledger: SharedActivityLedger,
@@ -361,8 +362,7 @@ pub fn build_router(state: AppState) -> Router {
 
 pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
     let web_dir = state.web_dir.clone();
-    let index_html = web_dir.join("index.html");
-    let login_html = web_dir.join("login.html");
+    let web_v2_dir = state.web_v2_dir.clone();
 
     let clips_dir = state.media_dir.join("clips");
     let recordings_dir = state.media_dir.join("recordings");
@@ -370,6 +370,8 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
 
     let api_router = Router::new()
         .route("/version", get(api_version))
+        .route("/ui/switch", get(api_ui_switch))
+        .route("/ui/version", get(api_ui_version))
         .route("/auth", get(api_auth_verify))
         .route("/auth/first_time_login", get(api_first_time_login))
         .route("/login", post(api_login))
@@ -532,19 +534,14 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
             "/vod/clip/{camera}/start/{start}/end/{end}/{segment}",
             get(vod_segment_m4s),
         )
-        .route(
-            "/login",
-            get(move || async move {
-                match tokio::fs::read_to_string(&login_html).await {
-                    Ok(html) => Html(html).into_response(),
-                    Err(_) => StatusCode::NOT_FOUND.into_response(),
-                }
-            }),
-        )
+        .route("/login", get(serve_login_page))
+        .nest_service("/assets", ServeDir::new(web_dir.join("assets")))
+        .nest_service("/locales", ServeDir::new(web_dir.join("locales")))
+        .nest_service("/assets-v2", ServeDir::new(web_v2_dir.join("assets-v2")))
         .nest_service("/clips", ServeDir::new(clips_dir))
         .nest_service("/recordings", ServeDir::new(recordings_dir))
         .nest_service("/exports", ServeDir::new(exports_dir))
-        .fallback_service(ServeDir::new(web_dir).fallback(ServeFile::new(index_html)))
+        .fallback(get(serve_spa_fallback))
         .layer(axum::middleware::from_fn_with_state(
             (state.clone(), enforce_auth),
             auth_gate_middleware,
@@ -554,10 +551,133 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .with_state(state)
 }
 
+fn should_serve_ui_v2(headers: &HeaderMap, jar: &CookieJar) -> bool {
+    if let Some(cookie) = jar.get("ninjanvr_ui") {
+        let val = cookie.value().trim();
+        if val.eq_ignore_ascii_case("v2") {
+            return true;
+        }
+        if val.eq_ignore_ascii_case("v1") {
+            return false;
+        }
+    }
+    if let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        let lower = host.to_ascii_lowercase();
+        if lower.contains("beta") || lower.contains("v2") {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UiSwitchParams {
+    pub target: Option<String>,
+    pub redirect: Option<String>,
+}
+
+async fn api_ui_switch(Query(q): Query<UiSwitchParams>) -> Response {
+    let target = match q.target.as_deref() {
+        Some(t) if t.eq_ignore_ascii_case("v1") => "v1",
+        _ => "v2",
+    };
+    let redirect_to = q
+        .redirect
+        .as_deref()
+        .filter(|r| r.starts_with('/') && !r.starts_with("//"))
+        .unwrap_or("/");
+    let cookie_val = format!("ninjanvr_ui={target}; Path=/; Max-Age=31536000; SameSite=Lax");
+    (
+        StatusCode::FOUND,
+        [
+            (header::SET_COOKIE, cookie_val),
+            (header::LOCATION, redirect_to.to_string()),
+        ],
+    )
+        .into_response()
+}
+
+async fn api_ui_version(headers: HeaderMap, jar: CookieJar) -> Json<Value> {
+    let active = if should_serve_ui_v2(&headers, &jar) {
+        "v2"
+    } else {
+        "v1"
+    };
+    Json(json!({
+        "active": active,
+        "available": ["v1", "v2"]
+    }))
+}
+
+async fn serve_login_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    if should_serve_ui_v2(&headers, &jar) {
+        let v2_index = state.web_v2_dir.join("index.html");
+        if let Ok(html) = tokio::fs::read_to_string(&v2_index).await {
+            return Html(html).into_response();
+        }
+    }
+    let login_html = state.web_dir.join("login.html");
+    match tokio::fs::read_to_string(&login_html).await {
+        Ok(html) => Html(html).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn serve_spa_fallback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    uri: axum::http::Uri,
+) -> Response {
+    let rel_path = uri.path().trim_start_matches('/');
+    let use_v2 = should_serve_ui_v2(&headers, &jar);
+    let primary_dir = if use_v2 && state.web_v2_dir.join("index.html").exists() {
+        &state.web_v2_dir
+    } else {
+        &state.web_dir
+    };
+
+    if !rel_path.is_empty() && !rel_path.contains("..") {
+        let file_candidate = primary_dir.join(rel_path);
+        if file_candidate.is_file()
+            && let Ok(bytes) = tokio::fs::read(&file_candidate).await
+        {
+            let mime = match file_candidate.extension().and_then(|e| e.to_str()) {
+                Some("js" | "mjs") => "application/javascript; charset=utf-8",
+                Some("css") => "text/css; charset=utf-8",
+                Some("svg") => "image/svg+xml",
+                Some("png") => "image/png",
+                Some("ico") => "image/x-icon",
+                Some("webp") => "image/webp",
+                Some("json" | "webmanifest") => "application/json; charset=utf-8",
+                Some("html") => "text/html; charset=utf-8",
+                _ => "application/octet-stream",
+            };
+            return ([(header::CONTENT_TYPE, mime)], bytes).into_response();
+        }
+    }
+
+    let index_path = primary_dir.join("index.html");
+    match tokio::fs::read_to_string(&index_path).await {
+        Ok(html) => Html(html).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 fn is_protected_path(path: &str) -> bool {
     if matches!(
         path,
-        "/api/login" | "/api/logout" | "/api/auth/first_time_login" | "/logout" | "/login"
+        "/api/login"
+            | "/api/logout"
+            | "/api/auth/first_time_login"
+            | "/api/ui/switch"
+            | "/api/ui/version"
+            | "/logout"
+            | "/login"
     ) {
         return false;
     }
@@ -596,7 +716,10 @@ async fn auth_gate_middleware(
         }
     }
     let resp = next.run(req).await;
-    if !path.starts_with("/api/logs") && !path.starts_with("/assets/") {
+    if !path.starts_with("/api/logs")
+        && !path.starts_with("/assets/")
+        && !path.starts_with("/assets-v2/")
+    {
         state
             .log_hub
             .push_nginx(&method, &path, resp.status().as_u16());
@@ -2221,6 +2344,21 @@ pub async fn new_app_state(
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
+    let raw_v2_dir = std::env::var("NINJANVR_WEB_V2_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            web_dir
+                .parent()
+                .map(|p| p.join("web-v2"))
+                .unwrap_or_else(|| PathBuf::from("/opt/ninjanvr/web-v2"))
+        });
+    let web_v2_dir = if raw_v2_dir.join("dist").join("index.html").exists() {
+        raw_v2_dir.join("dist")
+    } else {
+        raw_v2_dir
+    };
+
     let state = AppState {
         config: shared_cfg,
         db,
@@ -2232,6 +2370,7 @@ pub async fn new_app_state(
         jwt_secret,
         start_instant: Instant::now(),
         web_dir,
+        web_v2_dir,
         media_dir,
         latest_frames,
         activity_ledger,
@@ -2298,7 +2437,14 @@ mod tests {
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(
             web_dir.join("index.html"),
-            "<html><body>NinjaNVR UI</body></html>",
+            "<html><body>NinjaNVR UI v1</body></html>",
+        )
+        .unwrap();
+        let web_v2_dir = tmp_dir.join("web-v2");
+        std::fs::create_dir_all(&web_v2_dir).unwrap();
+        std::fs::write(
+            web_v2_dir.join("index.html"),
+            "<html><body>NinjaNVR Console v2</body></html>",
         )
         .unwrap();
 
@@ -2378,7 +2524,7 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // 4. Test SPA index fallback
+        // 4. Test SPA index fallback (v1 by default, v2 via Host or Cookie)
         let resp = app
             .clone()
             .oneshot(
@@ -2391,7 +2537,51 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), 4096).await.unwrap();
-        assert!(std::str::from_utf8(&body).unwrap().contains("NinjaNVR UI"));
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("NinjaNVR UI v1")
+        );
+
+        let resp_v2_host = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/review")
+                    .header("Host", "frigate-beta.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_v2_host.status(), StatusCode::OK);
+        let body_v2 = to_bytes(resp_v2_host.into_body(), 4096).await.unwrap();
+        assert!(
+            std::str::from_utf8(&body_v2)
+                .unwrap()
+                .contains("NinjaNVR Console v2")
+        );
+
+        let resp_switch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ui/switch?target=v2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_switch.status(), StatusCode::FOUND);
+        assert!(
+            resp_switch
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("ninjanvr_ui=v2")
+        );
 
         // 5. Test enforce_auth=true router blocks unauthenticated /api/config with 401
         let auth_app = build_router_with_auth(state, true);

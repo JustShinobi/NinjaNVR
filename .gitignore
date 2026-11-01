@@ -6,3 +6,5 @@
 *.db-shm
 *.db-wal
 /tmp/
+node_modules/
+**/node_modules/

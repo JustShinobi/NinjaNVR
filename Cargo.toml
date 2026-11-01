@@ -10,6 +10,7 @@ members = [
     "crates/ninjanvr-vod",
     "crates/ninjanvr-comms",
     "crates/ninjanvr-server",
+    "crates/ninjanvr-desktop",
 ]
 
 [workspace.package]
