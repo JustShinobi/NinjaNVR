@@ -1,18 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Calendar,
   ChevronLeft,
   ChevronRight,
-  Clock,
   Download,
-  Film,
   Grid,
-  Play,
   Scissors,
   SkipBack,
   SkipForward,
   X,
-  ZoomIn,
 } from "lucide-react";
 import {
   RecordingDaySummary,
@@ -253,7 +248,6 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   }, [camera]);
 
   // Fetch exact recording segments and review items covering `[fetchBucketStart, fetchBucketEnd]`
-  // so historical days from 2, 5, or 12 days ago always have full segment & event data!
   useEffect(() => {
     if (!camera) return;
     let cancelled = false;
@@ -365,7 +359,6 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   ]);
 
   // Native non-passive wheel listener on the timeline track for PC mouse-wheel scrubbing & Ctrl+wheel zoom
-  // Strictly bounded within `selectedDay` (`[dayBounds.dayStart, dayBounds.dayEnd]`)!
   useEffect(() => {
     const el = trackRef.current;
     if (!el) return;
@@ -595,7 +588,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       const ts = Math.round(winStart + i * step);
       out.push({
         pct: (i / count) * 100,
-        label: zoomMin >= 1440 ? `${toLocalDateInputValue(ts).slice(5)} ${formatHHMM(ts)}` : formatHHMM(ts),
+        label:
+          zoomMin >= 1440
+            ? `${toLocalDateInputValue(ts).slice(5)} ${formatHHMM(ts)}`
+            : formatHHMM(ts),
       });
     }
     return out;
@@ -631,7 +627,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     [daysSummary, selectedDay]
   );
 
-  // Build 24 hour slots ("00" .. "23") for the selected day
+  // Populate 24 hourly slots ("00" .. "23") for the selected day
   const day24Hours = useMemo(() => {
     const map = new Map<string, RecordingHourSummary>();
     for (const h of activeDaySummary?.hours || []) {
@@ -704,7 +700,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       {showArchiveDeck && (
         <div
           style={{
-            background: "#080b10",
+            background: "var(--bg-canvas)",
             border: "1px solid var(--border-strong)",
             borderRadius: 3,
             padding: "8px 10px",
@@ -734,11 +730,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               }}
             >
               <span
-                className="mono"
                 style={{
-                  fontSize: 10.5,
+                  fontSize: "var(--text-xs)",
                   fontWeight: 700,
-                  color: "#38bdf8",
+                  color: "var(--signal-accent-text)",
                   marginRight: 4,
                   whiteSpace: "nowrap",
                 }}
@@ -754,7 +749,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                     style={{
                       height: 26,
                       padding: "0 8px",
-                      fontSize: 10.5,
+                      fontSize: "var(--text-xs)",
                       display: "inline-flex",
                       alignItems: "center",
                       gap: 6,
@@ -764,14 +759,17 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                     <span style={{ fontWeight: 700 }}>{formatDayShort(d.day)}</span>
                     <span
                       style={{
-                        fontSize: 9.5,
+                        fontSize: 10.5,
                         padding: "0 4px",
                         borderRadius: 2,
                         background:
                           d.events > 0
                             ? "rgba(239, 68, 68, 0.22)"
                             : "rgba(16, 185, 129, 0.16)",
-                        color: d.events > 0 ? "#fca5a5" : "#34d399",
+                        color:
+                          d.events > 0
+                            ? "var(--signal-alert-text)"
+                            : "var(--signal-live-text)",
                       }}
                     >
                       {d.events} ev
@@ -803,7 +801,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               />
               <button
                 className={`nvr-btn ${showStoryboard ? "primary" : ""}`}
-                style={{ height: 24, fontSize: 10.5 }}
+                style={{ height: 24, fontSize: "var(--text-xs)" }}
                 onClick={() => setShowStoryboard((s) => !s)}
                 title="Scan visual thumbnails across this day/hour to spot changes quickly"
               >
@@ -814,6 +812,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 className="nvr-btn"
                 style={{ height: 24, padding: "0 5px" }}
                 onClick={() => setShowArchiveDeck(false)}
+                aria-label="Collapse multi-day navigator"
                 title="Collapse multi-day navigator"
               >
                 <X size={12} />
@@ -824,11 +823,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           {/* Row 2: 24-Hour Activity Heatmap Bar (00h .. 23h) for the Selected Day */}
           <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
             <span
-              className="mono"
               style={{
-                fontSize: 10.5,
+                fontSize: "var(--text-xs)",
                 fontWeight: 700,
-                color: "#fcd34d",
+                color: "var(--signal-motion-text)",
                 marginRight: 4,
                 whiteSpace: "nowrap",
               }}
@@ -855,17 +853,17 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                     disabled={!hasRecording}
                     title={
                       hasRecording
-                        ? `${selectedDay} ${hour}:00 — ${meta?.events || 0} events, ${Math.round(
+                        ? `${selectedDay} ${hour}:00 (${meta?.events || 0} events, ${Math.round(
                             (meta?.duration || 0) / 60
-                          )}m recorded`
-                        : `${selectedDay} ${hour}:00 — No recording`
+                          )}m recorded)`
+                        : `${selectedDay} ${hour}:00 (No recording)`
                     }
                     className="mono"
                     style={{
-                      height: 34,
+                      height: 36,
                       borderRadius: 2,
                       border: isSelected
-                        ? "1px solid #38bdf8"
+                        ? "1px solid var(--signal-accent-text)"
                         : hasEvents
                         ? "1px solid rgba(239, 68, 68, 0.55)"
                         : hasRecording
@@ -879,7 +877,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                         ? "rgba(245, 158, 11, 0.15)"
                         : hasRecording
                         ? "rgba(16, 185, 129, 0.10)"
-                        : "#050608",
+                        : "var(--bg-deep)",
                       color: hasRecording ? "var(--text-primary)" : "var(--text-muted)",
                       opacity: hasRecording ? 1 : 0.4,
                       cursor: hasRecording ? "pointer" : "default",
@@ -890,15 +888,15 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                       padding: 1,
                     }}
                   >
-                    <span style={{ fontSize: 10, fontWeight: 700 }}>{hour}h</span>
+                    <span style={{ fontSize: "var(--text-xs)", fontWeight: 700 }}>{hour}h</span>
                     <span
                       style={{
-                        fontSize: 8.5,
+                        fontSize: 10,
                         color: hasEvents
-                          ? "#fca5a5"
+                          ? "var(--signal-alert-text)"
                           : hasMotion
-                          ? "#fcd34d"
-                          : "#34d399",
+                          ? "var(--signal-motion-text)"
+                          : "var(--signal-live-text)",
                       }}
                     >
                       {hasEvents ? `${meta?.events}ev` : hasRecording ? "rec" : "-"}
@@ -922,7 +920,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               }}
             >
               {windowReviews.length === 0 ? (
-                <div className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                <div style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
                   No motion/object events recorded in this time window. Select another day or hour above.
                 </div>
               ) : (
@@ -936,6 +934,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                     return (
                       <div
                         key={rev.id}
+                        role="button"
+                        tabIndex={0}
                         onPointerEnter={() => setHoveredStoryboardId(rev.id)}
                         onPointerLeave={() =>
                           setHoveredStoryboardId((c) => (c === rev.id ? null : c))
@@ -947,13 +947,23 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                           setRangeStart(Math.max(0, ts - 5));
                           setRangeEnd(Math.min(nowSec, (rev.end_time || ts + 20) + 5));
                         }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            const ts = Math.floor(rev.start_time);
+                            setCustomWinEnd(
+                              Math.min(nowSec, ts + Math.round(windowSpanSec * 0.5))
+                            );
+                            onSeek(ts);
+                          }
+                        }}
                         style={{
                           width: 148,
                           minWidth: 148,
-                          background: "#05070a",
+                          background: "var(--bg-deep)",
                           border:
                             currentTs && Math.abs(currentTs - rev.start_time) < 15
-                              ? "1px solid #38bdf8"
+                              ? "1px solid var(--signal-accent-text)"
                               : "1px solid var(--border-hairline)",
                           borderRadius: 3,
                           overflow: "hidden",
@@ -974,7 +984,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                           ) : (
                             <img
                               src={thumbSrc}
-                              alt={rev.camera}
+                              alt={`${rev.camera} event at ${formatHHMMSS(rev.start_time)}`}
+                              width={148}
+                              height={74}
                               loading="lazy"
                               style={{ width: "100%", height: "100%", objectFit: "contain" }}
                             />
@@ -987,27 +999,29 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "space-between",
-                            fontSize: 9.5,
+                            fontSize: "var(--text-xs)",
                           }}
                         >
-                          <span style={{ color: "#38bdf8", fontWeight: 700 }}>
+                          <span style={{ color: "var(--signal-accent-text)", fontWeight: 700 }}>
                             {formatHHMMSS(rev.start_time)}
                           </span>
                           <button
                             className="nvr-btn"
-                            style={{ height: 18, padding: "0 5px", fontSize: 9 }}
+                            style={{ height: 20, padding: "0 6px", fontSize: 10.5 }}
                             title="Open Segment Clipper on this exact event"
                             onClick={(e) => {
                               e.stopPropagation();
                               const ts = Math.floor(rev.start_time);
                               onSeek(ts);
                               setRangeStart(Math.max(0, ts - 5));
-                              setRangeEnd(Math.min(nowSec, Math.ceil((rev.end_time || ts + 20) + 5)));
+                              setRangeEnd(
+                                Math.min(nowSec, Math.ceil((rev.end_time || ts + 20) + 5))
+                              );
                               setReadyDownloadUrl(null);
                               setRangeMode(true);
                             }}
                           >
-                            <Scissors size={9} />
+                            <Scissors size={10} />
                             Clip
                           </button>
                         </div>
@@ -1036,8 +1050,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
           {titlePrefix && (
             <span
-              className="mono"
-              style={{ fontSize: 10.5, fontWeight: 700, color: "var(--text-secondary)" }}
+              style={{
+                fontSize: "var(--text-xs)",
+                fontWeight: 700,
+                letterSpacing: "0.04em",
+                color: "var(--text-secondary)",
+              }}
             >
               {titlePrefix}
             </span>
@@ -1048,7 +1066,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 <button
                   key={cam}
                   className={`nvr-btn mono ${camera === cam ? "active" : ""}`}
-                  style={{ height: 22, padding: "0 7px", fontSize: 10, textTransform: "uppercase" }}
+                  style={{
+                    height: 24,
+                    padding: "0 7px",
+                    fontSize: "var(--text-xs)",
+                    textTransform: "uppercase",
+                  }}
                   onClick={() => onSelectCamera(cam)}
                 >
                   {cam}
@@ -1057,7 +1080,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             </div>
           )}
 
-          {/* Prominent Multi-Day Archive & Heatmap Button + Direct Recording Calendar Popover */}
+          {/* Direct Recording Calendar Popover (neutral when closed) */}
           <RecordingCalendarPopover
             daysSummary={daysSummary}
             selectedDate={selectedDay}
@@ -1077,15 +1100,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             }}
           />
 
+          {/* 24h Activity Matrix Toggle: neutral when closed, accent when open */}
           <button
-            className={`nvr-btn ${showArchiveDeck ? "primary" : ""}`}
+            className={`nvr-btn ${showArchiveDeck ? "active" : ""}`}
             style={{
               height: 26,
               padding: "0 9px",
-              fontSize: 11,
-              fontWeight: 600,
-              borderColor: "#f59e0b",
-              color: showArchiveDeck ? "#38bdf8" : "#fcd34d",
+              fontSize: "var(--text-xs)",
             }}
             onClick={() => setShowArchiveDeck((v) => !v)}
           >
@@ -1097,16 +1118,16 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
           <span
             className={`nvr-badge ${currentTs === null ? "live" : "rewind"}`}
-            style={{ height: 22 }}
+            style={{ height: 24 }}
           >
-            <Clock size={11} />
+            <span className={`nvr-dot ${currentTs === null ? "live" : "motion"}`} />
             {currentTs === null ? "LIVE EDGE" : formatFullDateTime(currentTs)}
           </span>
 
           {/* Skip Silence: Prev / Next Activity Event */}
           <button
-            className="nvr-btn mono"
-            style={{ height: 22, padding: "0 7px", fontSize: 10 }}
+            className="nvr-btn"
+            style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
             onClick={() => jumpToActivity("prev")}
             title="Jump to previous motion or person event (skip empty gaps)"
           >
@@ -1114,8 +1135,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             Prev Event
           </button>
           <button
-            className="nvr-btn mono"
-            style={{ height: 22, padding: "0 7px", fontSize: 10 }}
+            className="nvr-btn"
+            style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
             onClick={() => jumpToActivity("next")}
             title="Jump to next motion or person event (skip empty gaps)"
           >
@@ -1125,14 +1146,14 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
           <button
             className="nvr-btn mono"
-            style={{ height: 22, padding: "0 6px", fontSize: 10 }}
+            style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
             onClick={() => onSeek(clampTsToDay((currentTs ?? winEnd) - 30))}
           >
             -30s
           </button>
           <button
             className="nvr-btn mono"
-            style={{ height: 22, padding: "0 6px", fontSize: 10 }}
+            style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
             onClick={() => {
               const next = clampTsToDay((currentTs ?? winEnd) + 30);
               onSeek(dayBounds.isToday && next >= nowSec - 2 ? null : next);
@@ -1140,23 +1161,33 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           >
             +30s
           </button>
-          <button
-            className={`nvr-btn mono ${currentTs === null ? "success" : ""}`}
-            style={{ height: 22, padding: "0 8px", fontSize: 10.5 }}
-            onClick={() => {
-              setSelectedDay(toLocalDateInputValue(nowSec));
-              setCustomWinEnd(null);
-              onSeek(null);
-            }}
-          >
-            LIVE
-          </button>
+          {currentTs !== null && (
+            <button
+              className="nvr-btn success"
+              style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              onClick={() => {
+                setSelectedDay(toLocalDateInputValue(nowSec));
+                setCustomWinEnd(null);
+                onSeek(null);
+              }}
+            >
+              Return to Live
+            </button>
+          )}
         </div>
 
-        {/* Right: Zoom (15m / 1h / 6h / 24h), Pan (◀ / ▶), and Segment Clipper Toggle */}
+        {/* Right: Zoom (5m / 15m / 1h / 6h / 24h), Pan, and Segment Clipper Toggle */}
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
-            <ZoomIn size={12} color="var(--text-muted)" />
+            <span
+              style={{
+                fontSize: "var(--text-xs)",
+                color: "var(--text-muted)",
+                marginRight: 2,
+              }}
+            >
+              Zoom:
+            </span>
             {(
               [
                 { min: 5, label: "5m" },
@@ -1169,7 +1200,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               <button
                 key={z.min}
                 className={`nvr-btn mono ${zoomMin === z.min ? "active" : ""}`}
-                style={{ height: 22, padding: "0 6px", fontSize: 10 }}
+                style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
                 onClick={() => setZoomMin(z.min)}
               >
                 {z.label}
@@ -1180,7 +1211,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
             <button
               className="nvr-btn"
-              style={{ height: 22, padding: "0 5px" }}
+              style={{ height: 24, padding: "0 5px" }}
+              aria-label="Pan timeline earlier within selected day"
               title="Pan timeline earlier within selected day"
               disabled={winStart <= dayBounds.dayStart}
               onClick={() =>
@@ -1193,7 +1225,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             </button>
             <button
               className="nvr-btn"
-              style={{ height: 22, padding: "0 5px" }}
+              style={{ height: 24, padding: "0 5px" }}
+              aria-label="Pan timeline later within selected day"
               title="Pan timeline later within selected day"
               disabled={winEnd >= dayBounds.dayEnd}
               onClick={() =>
@@ -1209,11 +1242,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           <button
             className={`nvr-btn ${rangeMode ? "primary" : ""}`}
             style={{
-              height: 24,
+              height: 26,
               padding: "0 10px",
-              fontSize: 11,
-              fontWeight: 600,
-              borderColor: rangeMode ? "var(--signal-accent)" : "#38bdf8",
+              fontSize: "var(--text-xs)",
             }}
             onClick={toggleRangeSelector}
           >
@@ -1241,18 +1272,25 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <span className="mono" style={{ fontSize: 11, fontWeight: 700, color: "#38bdf8" }}>
+            <span
+              className="mono"
+              style={{
+                fontSize: "var(--text-xs)",
+                fontWeight: 700,
+                color: "var(--signal-accent-text)",
+              }}
+            >
               EXPORT [{camera.toUpperCase()} · {toLocalDateInputValue(rangeStart)}]:
             </span>
 
             {/* IN Start Controls */}
             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span className="mono" style={{ fontSize: 10.5, color: "var(--text-secondary)" }}>
+              <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 IN:
               </span>
               <button
                 className="nvr-btn mono"
-                style={{ height: 20, padding: "0 5px", fontSize: 10 }}
+                style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
                 onClick={() => setRangeStart((s) => s - 10)}
               >
                 -10s
@@ -1261,26 +1299,26 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 className="mono"
                 style={{
                   padding: "2px 6px",
-                  background: "#05070a",
+                  background: "var(--bg-deep)",
                   border: "1px solid var(--border-strong)",
                   borderRadius: 2,
-                  fontSize: 11,
+                  fontSize: "var(--text-xs)",
                   fontWeight: 700,
-                  color: "#fcd34d",
+                  color: "var(--signal-motion-text)",
                 }}
               >
                 {formatHHMMSS(rangeStart)}
               </span>
               <button
                 className="nvr-btn mono"
-                style={{ height: 20, padding: "0 5px", fontSize: 10 }}
+                style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
                 onClick={() => setRangeStart((s) => Math.min(rangeEnd - 5, s + 10))}
               >
                 +10s
               </button>
               <button
-                className="nvr-btn mono"
-                style={{ height: 20, padding: "0 6px", fontSize: 10 }}
+                className="nvr-btn"
+                style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
                 title="Set IN point to current playhead"
                 onClick={() => {
                   const anchor = currentTs ?? winEnd - 30;
@@ -1295,12 +1333,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
             {/* OUT End Controls */}
             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span className="mono" style={{ fontSize: 10.5, color: "var(--text-secondary)" }}>
+              <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 OUT:
               </span>
               <button
                 className="nvr-btn mono"
-                style={{ height: 20, padding: "0 5px", fontSize: 10 }}
+                style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
                 onClick={() => setRangeEnd((e) => Math.max(rangeStart + 5, e - 10))}
               >
                 -10s
@@ -1309,26 +1347,26 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 className="mono"
                 style={{
                   padding: "2px 6px",
-                  background: "#05070a",
+                  background: "var(--bg-deep)",
                   border: "1px solid var(--border-strong)",
                   borderRadius: 2,
-                  fontSize: 11,
+                  fontSize: "var(--text-xs)",
                   fontWeight: 700,
-                  color: "#fcd34d",
+                  color: "var(--signal-motion-text)",
                 }}
               >
                 {formatHHMMSS(rangeEnd)}
               </span>
               <button
                 className="nvr-btn mono"
-                style={{ height: 20, padding: "0 5px", fontSize: 10 }}
+                style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
                 onClick={() => setRangeEnd((e) => Math.min(nowSec, e + 10))}
               >
                 +10s
               </button>
               <button
-                className="nvr-btn mono"
-                style={{ height: 20, padding: "0 6px", fontSize: 10 }}
+                className="nvr-btn"
+                style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
                 title="Set OUT point to current playhead"
                 onClick={() => {
                   const anchor = currentTs ?? winEnd;
@@ -1339,7 +1377,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               </button>
             </div>
 
-            <span className="nvr-badge" style={{ color: "#38bdf8" }}>
+            <span className="nvr-badge" style={{ color: "var(--signal-accent-text)" }}>
               {formatDuration(rangeEnd - rangeStart)}
             </span>
 
@@ -1354,7 +1392,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               <button
                 key={p.sec}
                 className="nvr-btn mono"
-                style={{ height: 20, padding: "0 6px", fontSize: 10 }}
+                style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
                 onClick={() => setRangeEnd(Math.min(nowSec, rangeStart + p.sec))}
               >
                 {p.label}
@@ -1364,28 +1402,27 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <input
-              className="nvr-input mono"
-              style={{ height: 24, width: 145, fontSize: 11 }}
+              className="nvr-input"
+              style={{ height: 24, width: 145, fontSize: "var(--text-xs)" }}
               placeholder="Clip label (optional)"
+              aria-label="Clip export label"
               value={clipLabel}
               onChange={(e) => setClipLabel(e.target.value)}
             />
             <button
               className="nvr-btn"
-              style={{ height: 24, fontSize: 11 }}
+              style={{ height: 24, fontSize: "var(--text-xs)" }}
               onClick={() => onSeek(rangeStart)}
               title="Preview selected segment from IN point"
             >
-              <Play size={11} />
               Preview
             </button>
             <button
               className="nvr-btn success"
-              style={{ height: 24, fontSize: 11, fontWeight: 600 }}
+              style={{ height: 24, fontSize: "var(--text-xs)", fontWeight: 600 }}
               disabled={exportBusy}
               onClick={handleTriggerExport}
             >
-              <Film size={12} />
               {exportBusy
                 ? "Remuxing MP4..."
                 : `Export MP4 (${formatDuration(rangeEnd - rangeStart)})`}
@@ -1394,8 +1431,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               <a
                 href={readyDownloadUrl}
                 download
-                className="nvr-btn primary mono"
-                style={{ height: 24, fontSize: 11, fontWeight: 700, textDecoration: "none" }}
+                className="nvr-btn primary"
+                style={{
+                  height: 24,
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 700,
+                  textDecoration: "none",
+                }}
               >
                 <Download size={12} />
                 Download MP4
@@ -1405,6 +1447,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               className="nvr-btn"
               style={{ height: 24, padding: "0 5px" }}
               onClick={() => setRangeMode(false)}
+              aria-label="Close segment clipper"
               title="Close segment clipper"
             >
               <X size={12} />
@@ -1419,11 +1462,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       <div
         ref={trackRef}
         className="nvr-timeline-track"
-        title="Scroll mouse wheel to scrub time (Shift+Wheel = 10s fine step, Ctrl+Wheel = Zoom) · Drag to pan · Click/Tap to seek"
+        title="Use mouse wheel to scrub time (Shift+Wheel = 10s fine step, Ctrl+Wheel = Zoom) · Drag to pan · Click/Tap to seek"
         style={{
           position: "relative",
           height: 44,
-          background: "#06080c",
+          background: "var(--bg-deep)",
           border: "1px solid var(--border-strong)",
           borderRadius: 3,
           cursor: draggingTarget === "track" ? "grabbing" : "grab",
@@ -1484,7 +1527,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   position: "absolute",
                   top: 2,
                   left: 4,
-                  fontSize: 9.5,
+                  fontSize: "var(--text-xs)",
                   color: "var(--text-muted)",
                   whiteSpace: "nowrap",
                 }}
@@ -1552,7 +1595,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   top: 16,
                   height: 6,
                   borderRadius: 2,
-                  background: rev.severity === "alert" ? "#ef4444" : "#f59e0b",
+                  background:
+                    rev.severity === "alert" ? "var(--signal-alert)" : "var(--signal-motion)",
                 }}
               />
             );
@@ -1569,8 +1613,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               top: 0,
               bottom: 0,
               background: "rgba(14, 165, 233, 0.22)",
-              borderTop: "2px solid #38bdf8",
-              borderBottom: "2px solid #38bdf8",
+              borderTop: "2px solid var(--signal-accent-text)",
+              borderBottom: "2px solid var(--signal-accent-text)",
               zIndex: 8,
             }}
           >
@@ -1587,7 +1631,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 top: 0,
                 bottom: 0,
                 width: 16,
-                background: "#0ea5e9",
+                background: "var(--signal-accent)",
                 cursor: "ew-resize",
                 touchAction: "none",
                 display: "flex",
@@ -1598,7 +1642,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             >
               <span
                 className="mono"
-                style={{ fontSize: 8.5, fontWeight: 800, color: "#000", pointerEvents: "none" }}
+                style={{ fontSize: 10, fontWeight: 800, color: "#000000", pointerEvents: "none" }}
               >
                 IN
               </span>
@@ -1617,7 +1661,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 top: 0,
                 bottom: 0,
                 width: 16,
-                background: "#0ea5e9",
+                background: "var(--signal-accent)",
                 cursor: "ew-resize",
                 touchAction: "none",
                 display: "flex",
@@ -1628,7 +1672,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             >
               <span
                 className="mono"
-                style={{ fontSize: 8.5, fontWeight: 800, color: "#000", pointerEvents: "none" }}
+                style={{ fontSize: 10, fontWeight: 800, color: "#000000", pointerEvents: "none" }}
               >
                 OUT
               </span>
@@ -1661,12 +1705,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 )}px`,
                 bottom: 48,
                 transform: "translateX(-50%)",
-                background: "#0c1018",
+                background: "var(--bg-panel)",
                 border: "1px solid var(--signal-accent)",
-                color: "#fff",
+                color: "var(--text-primary)",
                 padding: hoveredReviewOnTrack ? 4 : "2px 7px",
                 borderRadius: 3,
-                fontSize: 10,
+                fontSize: "var(--text-xs)",
                 fontWeight: 700,
                 pointerEvents: "none",
                 zIndex: 30,
@@ -1682,11 +1726,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 <img
                   src={hoveredReviewOnTrack.thumb_path.replace("/media/frigate", "")}
                   alt="preview"
+                  width={128}
+                  height={72}
                   style={{
                     width: 128,
                     height: 72,
                     objectFit: "contain",
-                    background: "#000",
+                    background: "#000000",
                     borderRadius: 2,
                   }}
                 />
@@ -1705,7 +1751,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               top: 0,
               bottom: 0,
               width: 2,
-              background: currentTs === null ? "#10b981" : "#fbbf24",
+              background:
+                currentTs === null ? "var(--signal-live)" : "var(--signal-motion-text)",
               boxShadow: "0 0 6px rgba(0,0,0,0.8)",
               pointerEvents: "none",
               zIndex: 11,

@@ -3,7 +3,7 @@ export const en = {
     name: "NINJANVR",
     release: "CONSOLE v2.0",
     engine: "RUST + OPENVINO",
-    classicSwitch: "Classic UI (v1)",
+    classicSwitch: "v1 UI",
     classicSwitchHint: "Switch back to Frigate Classic UI (v1)",
   },
   nav: {
@@ -71,7 +71,7 @@ export const en = {
     markSelectedReviewed: "Mark Viewed",
     deleteSelected: "Delete",
     exportClip: "Export MP4",
-    keyboardHint: "Shortcuts: [J/K] Next/Prev · [R] Mark Reviewed · [E] Export MP4 · [1/2/4] Speed",
+    keyboardHint: "[J/K] Nav · [R] Ack · [E] Clip",
     emptyState: "No review segments match the active filter criteria.",
   },
   explore: {
@@ -82,9 +82,9 @@ export const en = {
     topScore: "Peak Confidence",
     duration: "Duration",
     inProgress: "Active Track",
-    retainToggle: "Retain Indefinitely",
-    falsePositive: "Flag False Positive",
-    viewSnapshot: "Annotated Snapshot",
+    retainToggle: "Retain",
+    falsePositive: "False Positive",
+    viewSnapshot: "Snapshot",
     playClip: "Play Clip",
   },
   exports: {
@@ -121,9 +121,9 @@ export const en = {
     memoryRss: "Container Memory Footprint (%)",
     storageVolumes: "Storage Mounts & Retention Capacity",
     cameraHealth: "Per-Camera Pipeline Telemetry",
-    liveLogs: "Real-Time Service Log Tail",
-    pauseStream: "Pause Tail",
-    resumeStream: "Resume Tail",
+    liveLogs: "Service Log Stream",
+    pauseStream: "Pause",
+    resumeStream: "Resume",
     copyLogs: "Copy Buffer",
   },
 } as const;

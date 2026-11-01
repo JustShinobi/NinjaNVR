@@ -1,35 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Activity,
-  AlertTriangle,
   Camera,
   Check,
-  CheckCircle2,
-  Clock,
   Copy,
-  Cpu,
-  Database,
   Download,
   Eye,
-  Film,
-  Filter,
-  HardDrive,
-  Layers,
-  LogOut,
   Pause,
   Play,
-  RefreshCw,
-  RotateCcw,
-  Save,
-  Search,
-  Server,
-  ShieldAlert,
-  Sliders,
-  Sparkles,
-  Star,
-  Terminal,
   Trash2,
-  Video,
 } from "lucide-react";
 import { useI18n } from "./i18n";
 import {
@@ -678,7 +656,8 @@ export const App: React.FC = () => {
         <form
           onSubmit={handleLogin}
           style={{
-            width: 380,
+            width: "100%",
+            maxWidth: 380,
             background: "var(--bg-panel)",
             border: "1px solid var(--border-strong)",
             borderRadius: 4,
@@ -801,7 +780,6 @@ export const App: React.FC = () => {
             className={`nvr-nav-btn ${activeTab === "live" ? "active" : ""}`}
             onClick={() => switchTab("live")}
           >
-            <Video size={14} />
             {t.nav.live}
             <span className="nvr-kbd">1</span>
           </button>
@@ -809,7 +787,6 @@ export const App: React.FC = () => {
             className={`nvr-nav-btn ${activeTab === "sync" ? "active" : ""}`}
             onClick={() => switchTab("sync")}
           >
-            <Layers size={14} />
             {t.nav.sync}
             <span className="nvr-kbd">2</span>
           </button>
@@ -817,17 +794,16 @@ export const App: React.FC = () => {
             className={`nvr-nav-btn ${activeTab === "review" ? "active" : ""}`}
             onClick={() => switchTab("review")}
           >
-            <ShieldAlert size={14} />
             {t.nav.review}
             {unreviewedAlerts.length > 0 && (
               <span
                 className="mono"
                 style={{
-                  fontSize: 10,
+                  fontSize: "var(--text-xs)",
                   padding: "0 5px",
                   background: "rgba(239, 68, 68, 0.22)",
                   border: "1px solid rgba(239, 68, 68, 0.55)",
-                  color: "#fca5a5",
+                  color: "var(--signal-alert-text)",
                   borderRadius: 2,
                 }}
               >
@@ -840,7 +816,6 @@ export const App: React.FC = () => {
             className={`nvr-nav-btn ${activeTab === "explore" ? "active" : ""}`}
             onClick={() => switchTab("explore")}
           >
-            <Search size={14} />
             {t.nav.explore}
             <span className="nvr-kbd">4</span>
           </button>
@@ -848,7 +823,6 @@ export const App: React.FC = () => {
             className={`nvr-nav-btn ${activeTab === "exports" ? "active" : ""}`}
             onClick={() => switchTab("exports")}
           >
-            <Film size={14} />
             {t.nav.exports}
             <span className="nvr-kbd">5</span>
           </button>
@@ -856,7 +830,6 @@ export const App: React.FC = () => {
             className={`nvr-nav-btn ${activeTab === "zones" ? "active" : ""}`}
             onClick={() => switchTab("zones")}
           >
-            <Sliders size={14} />
             {t.nav.zones}
             <span className="nvr-kbd">6</span>
           </button>
@@ -864,7 +837,6 @@ export const App: React.FC = () => {
             className={`nvr-nav-btn ${activeTab === "system" ? "active" : ""}`}
             onClick={() => switchTab("system")}
           >
-            <Activity size={14} />
             {t.nav.system}
             <span className="nvr-kbd">7</span>
           </button>
@@ -878,11 +850,11 @@ export const App: React.FC = () => {
           >
             <span className="nvr-dot live" />
             <span>CPU {sysCpu}%</span>
-            <span style={{ color: "var(--border-strong)" }}>|</span>
-            <span>MEM {sysMem}%</span>
-            <span style={{ color: "var(--border-strong)" }}>|</span>
+            <span className="nvr-divider nvr-telemetry-ext" aria-hidden="true" />
+            <span className="nvr-telemetry-ext">MEM {sysMem}%</span>
+            <span className="nvr-divider" aria-hidden="true" />
             <span>OV {inferMs}ms</span>
-            <span style={{ color: "var(--border-strong)" }}>|</span>
+            <span className="nvr-divider" aria-hidden="true" />
             <span>{totalFps} FPS</span>
           </button>
 
@@ -892,7 +864,6 @@ export const App: React.FC = () => {
             title={t.brand.classicSwitchHint}
             style={{ textDecoration: "none" }}
           >
-            <RotateCcw size={13} />
             {t.brand.classicSwitch}
           </a>
         </div>
@@ -902,17 +873,19 @@ export const App: React.FC = () => {
       {toastMsg && (
         <div
           className="mono"
+          role="status"
+          aria-live="polite"
           style={{
             position: "fixed",
             bottom: 14,
             right: 16,
             zIndex: 9999,
-            background: "#10151f",
+            background: "var(--bg-elevated)",
             border: "1px solid var(--signal-accent)",
             color: "var(--text-primary)",
             padding: "8px 14px",
             borderRadius: 3,
-            fontSize: 11.5,
+            fontSize: "var(--text-sm)",
             boxShadow: "0 8px 24px rgba(0,0,0,0.65)",
           }}
         >
@@ -951,26 +924,28 @@ export const App: React.FC = () => {
                 >
                   {t.live.singleFull}
                 </button>
-                <span style={{ color: "var(--border-strong)", margin: "0 4px" }}>|</span>
-                {cameraNames.map((cam) => (
-                  <button
-                    key={cam}
-                    className={`nvr-btn mono ${selectedCamera === cam && liveLayout !== "2x2" ? "active" : ""}`}
-                    onClick={() => {
-                      setSelectedCamera(cam);
-                      if (liveLayout === "2x2") setLiveLayout("focus");
-                    }}
-                    style={{ textTransform: "uppercase" }}
-                  >
-                    {cam}
-                  </button>
-                ))}
+                {liveLayout !== "2x2" && (
+                  <>
+                    <span className="nvr-divider" aria-hidden="true" />
+                    {cameraNames.map((cam) => (
+                      <button
+                        key={cam}
+                        className={`nvr-btn mono ${selectedCamera === cam ? "active" : ""}`}
+                        onClick={() => setSelectedCamera(cam)}
+                        style={{ textTransform: "uppercase" }}
+                      >
+                        {cam}
+                      </button>
+                    ))}
+                  </>
+                )}
               </div>
 
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <select
                   className="nvr-select mono"
-                  style={{ height: 28, fontSize: 11 }}
+                  aria-label="Camera HUD badge position"
+                  style={{ height: 28, fontSize: "var(--text-xs)" }}
                   value={hudPosition}
                   onChange={(e) => {
                     const next = e.target.value as HudPosition;
@@ -1005,7 +980,7 @@ export const App: React.FC = () => {
                     className="nvr-btn success"
                     onClick={() =>
                       handleMarkReviews(
-                        unreviewedAlerts.slice(0, 25).map((r) => r.id),
+                        unreviewedAlerts.map((r) => r.id),
                         true
                       )
                     }
@@ -1033,11 +1008,15 @@ export const App: React.FC = () => {
                 >
                   <div
                     className="mono"
-                    style={{ fontSize: 10.5, fontWeight: 700, color: "#fca5a5" }}
+                    style={{
+                      fontSize: "var(--text-xs)",
+                      fontWeight: 700,
+                      color: "var(--signal-alert-text)",
+                    }}
                   >
                     {unreviewedAlerts.length} UNREVIEWED
                   </div>
-                  <div style={{ fontSize: 10.5, color: "var(--text-muted)", lineHeight: 1.25 }}>
+                  <div style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)", lineHeight: 1.25 }}>
                     Hover for MP4 · Click for Time-Shift
                   </div>
                 </div>
@@ -1052,6 +1031,8 @@ export const App: React.FC = () => {
                   return (
                     <div
                       key={item.id}
+                      role="button"
+                      tabIndex={0}
                       className={`nvr-alert-card severity-${item.severity}`}
                       onPointerEnter={() => setHoveredAlertId(item.id)}
                       onPointerLeave={() =>
@@ -1061,6 +1042,14 @@ export const App: React.FC = () => {
                         setSelectedCamera(item.camera);
                         setLiveLayout("focus");
                         setTimeShiftTs(Math.floor(item.start_time));
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setSelectedCamera(item.camera);
+                          setLiveLayout("focus");
+                          setTimeShiftTs(Math.floor(item.start_time));
+                        }
                       }}
                     >
                       {isHovered ? (
@@ -1072,7 +1061,13 @@ export const App: React.FC = () => {
                           playsInline
                         />
                       ) : (
-                        <img src={thumbSrc} alt={`${item.camera} alert`} loading="lazy" />
+                        <img
+                          src={thumbSrc}
+                          alt={`${item.camera} alert`}
+                          width={156}
+                          height={68}
+                          loading="lazy"
+                        />
                       )}
                       <div className="nvr-alert-card-hud">
                         <div
@@ -1085,10 +1080,10 @@ export const App: React.FC = () => {
                           <span
                             className="mono"
                             style={{
-                              fontSize: 9.5,
+                              fontSize: "var(--text-xs)",
                               fontWeight: 700,
                               textTransform: "uppercase",
-                              color: "#fff",
+                              color: "var(--text-primary)",
                             }}
                           >
                             {item.camera}
@@ -1096,13 +1091,14 @@ export const App: React.FC = () => {
                           <button
                             className="nvr-btn"
                             style={{
-                              height: 18,
-                              padding: "0 4px",
-                              fontSize: 9,
+                              height: 20,
+                              padding: "0 5px",
+                              fontSize: "var(--text-xs)",
                               background: "rgba(16,185,129,0.25)",
                               borderColor: "rgba(16,185,129,0.6)",
                             }}
                             title={t.live.markReviewed}
+                            aria-label={`Mark ${item.camera} alert at ${formatTs(item.start_time)} as reviewed`}
                             onClick={(e) => {
                               e.stopPropagation();
                               handleMarkReviews([item.id], true);
@@ -1116,16 +1112,16 @@ export const App: React.FC = () => {
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "space-between",
-                            fontSize: 9.5,
+                            fontSize: "var(--text-xs)",
                           }}
                         >
                           <span
                             className="mono"
-                            style={{ color: "#fcd34d", textTransform: "uppercase" }}
+                            style={{ color: "var(--signal-motion-text)", textTransform: "uppercase" }}
                           >
                             {objs[0]}
                           </span>
-                          <span className="mono" style={{ color: "#cbd5e1" }}>
+                          <span className="mono" style={{ color: "var(--text-primary)" }}>
                             {formatTs(item.start_time)}
                           </span>
                         </div>
@@ -1152,7 +1148,7 @@ export const App: React.FC = () => {
                   return (
                     <div
                       key={cam}
-                      className="nvr-cam-tile"
+                      className={`nvr-cam-tile ${isTimeShifted ? "has-native-controls" : ""}`}
                       style={{
                         outline: isTimelineCam ? "1px solid var(--signal-accent)" : "none",
                         outlineOffset: -1,
@@ -1204,21 +1200,20 @@ export const App: React.FC = () => {
                           AI {camStat?.detection_fps?.toFixed(1) || "0.0"} FPS
                         </span>
                         <button
-                          className="nvr-btn"
-                          style={{ height: 20, padding: "0 6px", fontSize: 10 }}
+                          className="nvr-btn nvr-tile-action mono"
+                          style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
                           onClick={(e) => {
                             e.stopPropagation();
                             setSelectedCamera(cam);
                             setTimeShiftTs(Math.floor(Date.now() / 1000) - 30);
                           }}
                         >
-                          <Clock size={10} />
                           {t.live.rewind30s}
                         </button>
                         {isTimeShifted && (
                           <button
-                            className="nvr-btn success"
-                            style={{ height: 20, padding: "0 6px", fontSize: 10 }}
+                            className="nvr-btn success mono"
+                            style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
                             onClick={(e) => {
                               e.stopPropagation();
                               setTimeShiftTs(null);
@@ -1228,8 +1223,8 @@ export const App: React.FC = () => {
                           </button>
                         )}
                         <button
-                          className="nvr-btn"
-                          style={{ height: 20, padding: "0 6px", fontSize: 10 }}
+                          className="nvr-btn nvr-tile-action"
+                          style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
                           onClick={(e) => {
                             e.stopPropagation();
                             setSelectedCamera(cam);
@@ -1241,17 +1236,18 @@ export const App: React.FC = () => {
                         <a
                           href={`/api/${cam}/latest.jpg`}
                           download={`${cam}-snapshot.jpg`}
-                          className="nvr-btn"
+                          className="nvr-btn nvr-tile-action"
                           style={{
-                            height: 20,
+                            height: 22,
                             padding: "0 6px",
-                            fontSize: 10,
+                            fontSize: "var(--text-xs)",
                             textDecoration: "none",
                           }}
                           onClick={(e) => e.stopPropagation()}
                           title={t.live.snapshot}
+                          aria-label={`Download ${cam} snapshot`}
                         >
-                          <Camera size={10} />
+                          <Camera size={11} />
                         </a>
                       </div>
                     </div>
@@ -1268,7 +1264,10 @@ export const App: React.FC = () => {
                 }
               >
                 <div className="nvr-focus-stage">
-                  <div className="nvr-cam-tile" style={{ flex: 1 }}>
+                  <div
+                    className={`nvr-cam-tile ${timeShiftTs !== null ? "has-native-controls" : ""}`}
+                    style={{ flex: 1 }}
+                  >
                     {timeShiftTs === null ? (
                       <LiveMsePlayer
                         camera={selectedCamera}
@@ -1414,7 +1413,7 @@ export const App: React.FC = () => {
               <div className="nvr-panel">
                 <div className="nvr-panel-header">
                   <span>{t.sync.recentIncidents}</span>
-                  <span>{reviews.length}</span>
+                  <span className="mono">{reviews.length}</span>
                 </div>
                 <div className="nvr-scroll-y">
                   {reviews.slice(0, 35).map((rev) => {
@@ -1422,20 +1421,22 @@ export const App: React.FC = () => {
                     return (
                       <div
                         key={rev.id}
+                        role="button"
+                        tabIndex={0}
+                        className={`nvr-list-row ${isSelected ? "is-selected" : ""}`}
                         onClick={() => setSyncMasterTs(Math.floor(rev.start_time))}
-                        style={{
-                          padding: "8px 10px",
-                          borderBottom: "1px solid var(--border-hairline)",
-                          background: isSelected ? "var(--bg-active)" : "transparent",
-                          cursor: "pointer",
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 10,
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            setSyncMasterTs(Math.floor(rev.start_time));
+                          }
                         }}
                       >
                         <img
                           src={rev.thumb_path.replace("/media/frigate", "")}
                           alt={rev.camera}
+                          width={68}
+                          height={40}
                           loading="lazy"
                           style={{
                             width: 68,
@@ -1454,13 +1455,19 @@ export const App: React.FC = () => {
                             }}
                           >
                             <span style={{ textTransform: "uppercase" }}>{rev.camera}</span>
-                            <span className="mono" style={{ fontSize: 11, color: "#38bdf8" }}>
+                            <span
+                              className="mono"
+                              style={{
+                                fontSize: "var(--text-xs)",
+                                color: "var(--signal-accent-text)",
+                              }}
+                            >
                               {formatTs(rev.start_time)}
                             </span>
                           </div>
                           <div
                             className="mono"
-                            style={{ fontSize: 10.5, color: "var(--text-secondary)" }}
+                            style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
                           >
                             {(rev.data?.objects || ["motion"]).join(", ")} · {rev.severity}
                           </div>
@@ -1488,10 +1495,14 @@ export const App: React.FC = () => {
                       </span>
                       <button
                         className="nvr-btn"
-                        style={{ height: 22, padding: "0 7px", fontSize: 10, pointerEvents: "auto" }}
+                        style={{
+                          height: 22,
+                          padding: "0 8px",
+                          fontSize: "var(--text-xs)",
+                          pointerEvents: "auto",
+                        }}
                         onClick={() => handleQuickExport(cam, syncMasterTs, syncMasterTs + 60)}
                       >
-                        <Film size={11} />
                         {t.live.export60s}
                       </button>
                     </div>
@@ -1523,9 +1534,9 @@ export const App: React.FC = () => {
           <>
             <div className="nvr-subbar">
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <Filter size={13} color="var(--text-muted)" />
                 <select
-                  className="nvr-select mono"
+                  className="nvr-select"
+                  aria-label="Filter review queue by camera"
                   value={reviewCameraFilter}
                   onChange={(e) => setReviewCameraFilter(e.target.value)}
                 >
@@ -1537,7 +1548,8 @@ export const App: React.FC = () => {
                   ))}
                 </select>
                 <select
-                  className="nvr-select mono"
+                  className="nvr-select"
+                  aria-label="Filter review queue by severity"
                   value={reviewSeverityFilter}
                   onChange={(e) => setReviewSeverityFilter(e.target.value)}
                 >
@@ -1546,7 +1558,8 @@ export const App: React.FC = () => {
                   <option value="detection">{t.review.detections}</option>
                 </select>
                 <select
-                  className="nvr-select mono"
+                  className="nvr-select"
+                  aria-label="Filter review queue by object class"
                   value={reviewObjectFilter}
                   onChange={(e) => setReviewObjectFilter(e.target.value)}
                 >
@@ -1557,7 +1570,8 @@ export const App: React.FC = () => {
                   <option value="car">CAR</option>
                 </select>
                 <select
-                  className="nvr-select mono"
+                  className="nvr-select"
+                  aria-label="Filter review queue by status"
                   value={reviewStatusFilter}
                   onChange={(e) =>
                     setReviewStatusFilter(e.target.value as "unreviewed" | "reviewed" | "all")
@@ -1580,13 +1594,27 @@ export const App: React.FC = () => {
                   }}
                   onClear={() => setReviewDateFilter("")}
                 />
-                <span className="mono" style={{ color: "var(--text-muted)", fontSize: 11 }}>
-                  {filteredReviews.length} matching (showing top 40)
+                <span
+                  className="mono"
+                  style={{
+                    color: "var(--text-muted)",
+                    fontSize: "var(--text-xs)",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {filteredReviews.length} items
                 </span>
               </div>
 
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <span className="mono" style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: "var(--text-xs)",
+                    color: "var(--text-muted)",
+                    whiteSpace: "nowrap",
+                  }}
+                >
                   {t.review.keyboardHint}
                 </span>
                 {[0.5, 1, 2, 4].map((spd) => (
@@ -1609,7 +1637,7 @@ export const App: React.FC = () => {
                   {filteredReviews.length > 0 && (
                     <button
                       className="nvr-btn success"
-                      style={{ height: 22, padding: "0 7px", fontSize: 10 }}
+                      style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
                       onClick={() =>
                         handleMarkReviews(
                           filteredReviews.slice(0, 40).map((r) => r.id),
@@ -1631,24 +1659,28 @@ export const App: React.FC = () => {
                     return (
                       <div
                         key={item.id}
+                        role="button"
+                        tabIndex={0}
+                        className={`nvr-list-row ${isSelected ? "is-selected" : ""}`}
                         onClick={() => setActiveReview(item)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            setActiveReview(item);
+                          }
+                        }}
                         style={{
-                          padding: "8px 10px",
-                          borderBottom: "1px solid var(--border-hairline)",
                           borderLeft:
                             item.severity === "alert"
-                              ? "3px solid var(--signal-alert)"
-                              : "3px solid var(--signal-motion)",
-                          background: isSelected ? "var(--bg-active)" : "transparent",
-                          cursor: "pointer",
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 10,
+                              ? "3px solid var(--signal-alert)" /* slop-lint-disable-line side-tab-border -- real alert severity indicator */
+                              : "3px solid var(--signal-motion)" /* slop-lint-disable-line side-tab-border -- real detection severity indicator */,
                         }}
                       >
                         <img
                           src={thumbUrl}
                           alt={item.camera}
+                          width={84}
+                          height={48}
                           loading="lazy"
                           style={{
                             width: 84,
@@ -1667,12 +1699,18 @@ export const App: React.FC = () => {
                             }}
                           >
                             <span
-                              className="mono"
                               style={{ fontWeight: 700, textTransform: "uppercase" }}
                             >
                               {item.camera}
                             </span>
-                            <span className="mono" style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+                            <span
+                              className="mono"
+                              style={{
+                                fontSize: "var(--text-xs)",
+                                color: "var(--text-secondary)",
+                                whiteSpace: "nowrap",
+                              }}
+                            >
                               {formatDateTime(item.start_time)}
                             </span>
                           </div>
@@ -1687,35 +1725,42 @@ export const App: React.FC = () => {
                             <span
                               className="mono"
                               style={{
-                                fontSize: 10.5,
-                                color: item.severity === "alert" ? "#fca5a5" : "#fcd34d",
+                                fontSize: "var(--text-xs)",
+                                color:
+                                  item.severity === "alert"
+                                    ? "var(--signal-alert-text)"
+                                    : "var(--signal-motion-text)",
                                 textTransform: "uppercase",
                               }}
                             >
                               {(item.data?.objects || ["motion"]).join(", ")}
                             </span>
-                            <div style={{ display: "flex", gap: 4 }}>
+                            <div className="nvr-row-actions">
                               {!item.has_been_reviewed && (
                                 <button
                                   className="nvr-btn success"
-                                  style={{ height: 20, padding: "0 6px", fontSize: 10 }}
+                                  style={{ height: 22, padding: "0 6px" }}
+                                  aria-label={`Mark ${item.camera} review item as viewed`}
+                                  title={t.live.markReviewed}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     handleMarkReviews([item.id], true);
                                   }}
                                 >
-                                  <Check size={10} />
+                                  <Check size={11} />
                                 </button>
                               )}
                               <button
                                 className="nvr-btn danger"
-                                style={{ height: 20, padding: "0 6px", fontSize: 10 }}
+                                style={{ height: 22, padding: "0 6px" }}
+                                aria-label={`Delete ${item.camera} review item`}
+                                title={t.review.deleteSelected}
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   handleDeleteReviews([item.id]);
                                 }}
                               >
-                                <Trash2 size={10} />
+                                <Trash2 size={11} />
                               </button>
                             </div>
                           </div>
@@ -1751,7 +1796,17 @@ export const App: React.FC = () => {
                         fallbackPreviewId={activeReview.id}
                         playbackRate={playbackSpeed}
                       />
-                      <div className="nvr-cam-hud-top">
+                    </div>
+                    <div className="nvr-subbar" style={{ borderTop: "1px solid var(--border-hairline)" }}>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          minWidth: 0,
+                          whiteSpace: "nowrap",
+                        }}
+                      >
                         <span className="nvr-badge alert">
                           {activeReview.camera.toUpperCase()} //{" "}
                           {formatDateTime(activeReview.start_time)}
@@ -1759,18 +1814,21 @@ export const App: React.FC = () => {
                         <span className="nvr-badge">
                           {(activeReview.data?.objects || ["person"]).join(", ").toUpperCase()}
                         </span>
-                      </div>
-                    </div>
-                    <div className="nvr-subbar" style={{ borderTop: "1px solid var(--border-hairline)" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <span className="mono" style={{ color: "var(--text-secondary)" }}>
+                        <span
+                          className="mono"
+                          style={{
+                            color: "var(--text-secondary)",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                          }}
+                        >
                           ID: {activeReview.id}
                         </span>
-                        <span className="mono" style={{ color: "var(--text-muted)" }}>
+                        <span className="mono" style={{ color: "var(--text-muted)", flexShrink: 0 }}>
                           ({formatRelTime(activeReview.start_time)})
                         </span>
                       </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
                         <button
                           className="nvr-btn"
                           onClick={() => {
@@ -1778,7 +1836,6 @@ export const App: React.FC = () => {
                             switchTab("sync");
                           }}
                         >
-                          <Layers size={12} />
                           Open in 4-Cam Sync
                         </button>
                         <button
@@ -1792,7 +1849,6 @@ export const App: React.FC = () => {
                             )
                           }
                         >
-                          <Film size={12} />
                           {t.review.exportClip}
                         </button>
                         <button
@@ -1850,12 +1906,14 @@ export const App: React.FC = () => {
                 <input
                   className="nvr-input"
                   style={{ width: 240 }}
+                  aria-label="Filter tracked objects"
                   placeholder={t.explore.searchPlaceholder}
                   value={exploreQuery}
                   onChange={(e) => setExploreQuery(e.target.value)}
                 />
                 <select
-                  className="nvr-select mono"
+                  className="nvr-select"
+                  aria-label="Filter objects by camera"
                   value={exploreCamera}
                   onChange={(e) => setExploreCamera(e.target.value)}
                 >
@@ -1867,7 +1925,8 @@ export const App: React.FC = () => {
                   ))}
                 </select>
                 <select
-                  className="nvr-select mono"
+                  className="nvr-select"
+                  aria-label="Filter objects by label"
                   value={exploreLabel}
                   onChange={(e) => setExploreLabel(e.target.value)}
                 >
@@ -1881,7 +1940,6 @@ export const App: React.FC = () => {
                   className={`nvr-btn ${exploreRetainedOnly ? "active" : ""}`}
                   onClick={() => setExploreRetainedOnly((v) => !v)}
                 >
-                  <Star size={12} />
                   {t.explore.favoritesOnly}
                 </button>
                 <RecordingCalendarPopover
@@ -1895,7 +1953,7 @@ export const App: React.FC = () => {
                   onClear={() => setReviewDateFilter("")}
                 />
               </div>
-              <span className="mono" style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+              <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 {filteredEvents.length} tracked object events
               </span>
             </div>
@@ -1905,7 +1963,7 @@ export const App: React.FC = () => {
               <div className="nvr-panel">
                 <div className="nvr-panel-header">
                   <span>TRACKED OBJECTS</span>
-                  <span>TOP 50</span>
+                  <span className="mono">TOP 50</span>
                 </div>
                 <div className="nvr-scroll-y">
                   {filteredEvents.slice(0, 50).map((ev) => {
@@ -1916,32 +1974,42 @@ export const App: React.FC = () => {
                     return (
                       <div
                         key={ev.id}
+                        role="button"
+                        tabIndex={0}
+                        className={`nvr-list-row ${isSelected ? "is-selected" : ""}`}
                         onClick={() => setSelectedEvent(ev)}
-                        style={{
-                          padding: "8px 10px",
-                          borderBottom: "1px solid var(--border-hairline)",
-                          background: isSelected ? "var(--bg-active)" : "transparent",
-                          cursor: "pointer",
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 10,
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            setSelectedEvent(ev);
+                          }
                         }}
                       >
                         <img
                           src={`/api/events/${encodeURIComponent(ev.id)}/thumbnail.webp`}
                           alt={ev.label}
+                          width={80}
+                          height={46}
                           loading="lazy"
                           style={{
                             width: 80,
                             height: 46,
                             objectFit: "contain",
-                            background: "#050608",
+                            background: "var(--bg-deep)",
                             borderRadius: 3,
                             border: "1px solid var(--border-hairline)",
                           }}
                         />
-                        <div style={{ flex: 1 }}>
-                          <div style={{ display: "flex", justifyContent: "space-between" }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              gap: 6,
+                              whiteSpace: "nowrap",
+                            }}
+                          >
                             <span
                               className="mono"
                               style={{ fontWeight: 700, textTransform: "uppercase" }}
@@ -1950,14 +2018,19 @@ export const App: React.FC = () => {
                             </span>
                             <span
                               className="mono"
-                              style={{ fontSize: 11, color: "var(--text-secondary)" }}
+                              style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
                             >
                               {ev.camera.toUpperCase()}
                             </span>
                           </div>
                           <div
                             className="mono"
-                            style={{ fontSize: 10.5, color: "var(--text-muted)", marginTop: 3 }}
+                            style={{
+                              fontSize: "var(--text-xs)",
+                              color: "var(--text-muted)",
+                              marginTop: 3,
+                              whiteSpace: "nowrap",
+                            }}
                           >
                             {formatDateTime(ev.start_time)} ·{" "}
                             {ev.end_time
@@ -1968,6 +2041,17 @@ export const App: React.FC = () => {
                       </div>
                     );
                   })}
+                  {filteredEvents.length === 0 && (
+                    <div
+                      style={{
+                        padding: 24,
+                        textAlign: "center",
+                        color: "var(--text-muted)",
+                      }}
+                    >
+                      No tracked object events match the active filter criteria.
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -1976,7 +2060,15 @@ export const App: React.FC = () => {
                 {selectedEvent ? (
                   <>
                     <div className="nvr-subbar">
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          minWidth: 0,
+                          whiteSpace: "nowrap",
+                        }}
+                      >
                         <span className="nvr-badge alert">
                           {selectedEvent.label.toUpperCase()}{" "}
                           {Math.round(
@@ -1986,11 +2078,19 @@ export const App: React.FC = () => {
                           )}
                           %
                         </span>
-                        <span className="mono">
-                          {selectedEvent.camera.toUpperCase()} · ID {selectedEvent.id}
+                        <span
+                          className="mono"
+                          title={selectedEvent.id}
+                          style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            color: "var(--text-secondary)",
+                          }}
+                        >
+                          {selectedEvent.camera.toUpperCase()} · #{selectedEvent.id.slice(-8)}
                         </span>
                       </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
                         <button
                           className={`nvr-btn ${eventViewMode === "snapshot" ? "active" : ""}`}
                           onClick={() => setEventViewMode("snapshot")}
@@ -2009,7 +2109,6 @@ export const App: React.FC = () => {
                           className={`nvr-btn ${selectedEvent.retain_indefinitely ? "active" : ""}`}
                           onClick={() => handleEventRetain(selectedEvent)}
                         >
-                          <Star size={12} />
                           {t.explore.retainToggle}
                         </button>
                         <button
@@ -2027,7 +2126,6 @@ export const App: React.FC = () => {
                             notify("Event flagged as false positive");
                           }}
                         >
-                          <AlertTriangle size={12} />
                           {t.explore.falsePositive}
                         </button>
                         <button
@@ -2037,11 +2135,12 @@ export const App: React.FC = () => {
                             switchTab("sync");
                           }}
                         >
-                          <Layers size={12} />
                           4-Cam Sync
                         </button>
                         <button
                           className="nvr-btn danger"
+                          aria-label="Delete tracked object event"
+                          title="Delete tracked object event"
                           onClick={() => handleEventDelete(selectedEvent.id)}
                         >
                           <Trash2 size={12} />
@@ -2097,11 +2196,12 @@ export const App: React.FC = () => {
           <>
             <div className="nvr-subbar">
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span className="mono" style={{ fontWeight: 700 }}>
+                <span style={{ fontWeight: 700 }}>
                   {t.exports.createTitle}:
                 </span>
                 <select
-                  className="nvr-select mono"
+                  className="nvr-select"
+                  aria-label="Select camera channel to export"
                   value={exportCam}
                   onChange={(e) => setExportCam(e.target.value)}
                 >
@@ -2112,7 +2212,8 @@ export const App: React.FC = () => {
                   ))}
                 </select>
                 <select
-                  className="nvr-select mono"
+                  className="nvr-select"
+                  aria-label="Select export duration preset"
                   value={exportPresetMin}
                   onChange={(e) => setExportPresetMin(Number(e.target.value))}
                 >
@@ -2122,6 +2223,7 @@ export const App: React.FC = () => {
                 </select>
                 <input
                   className="nvr-input"
+                  aria-label="Custom export label"
                   placeholder={t.exports.customName}
                   value={exportLabel}
                   onChange={(e) => setExportLabel(e.target.value)}
@@ -2140,7 +2242,6 @@ export const App: React.FC = () => {
                     if (r.ok) setExportsList(await r.json());
                   }}
                 >
-                  <Film size={12} />
                   {t.exports.generateBtn}
                 </button>
               </div>
@@ -2150,47 +2251,70 @@ export const App: React.FC = () => {
               <div className="nvr-panel">
                 <div className="nvr-panel-header">
                   <span>{t.exports.archiveTitle}</span>
-                  <span>{exportsList.length}</span>
+                  <span className="mono">{exportsList.length}</span>
                 </div>
                 <div className="nvr-scroll-y">
                   {exportsList.map((ex) => (
                     <div
                       key={ex.id}
+                      role="button"
+                      tabIndex={0}
+                      className={`nvr-list-row ${
+                        activeExportPreview?.id === ex.id ? "is-selected" : ""
+                      }`}
                       onClick={() => setActiveExportPreview(ex)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setActiveExportPreview(ex);
+                        }
+                      }}
                       style={{
                         padding: "10px 12px",
-                        borderBottom: "1px solid var(--border-hairline)",
-                        background:
-                          activeExportPreview?.id === ex.id ? "var(--bg-active)" : "transparent",
-                        cursor: "pointer",
-                        display: "flex",
-                        alignItems: "center",
                         justifyContent: "space-between",
                       }}
                     >
-                      <div>
-                        <div className="mono" style={{ fontWeight: 700 }}>
+                      <div style={{ minWidth: 0, flex: 1 }}>
+                        <div
+                          className="mono"
+                          title={ex.name}
+                          style={{
+                            fontWeight: 700,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
                           {ex.name}
                         </div>
                         <div
                           className="mono"
-                          style={{ fontSize: 11, color: "var(--text-secondary)" }}
+                          style={{
+                            fontSize: "var(--text-xs)",
+                            color: "var(--text-secondary)",
+                            whiteSpace: "nowrap",
+                            marginTop: 2,
+                          }}
                         >
                           {ex.camera.toUpperCase()} · {formatDateTime(ex.date)}
                         </div>
                       </div>
-                      <div style={{ display: "flex", gap: 6 }}>
+                      <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
                         <a
                           href={ex.video_path.replace("/media/frigate", "")}
                           download={`${ex.id}.mp4`}
                           className="nvr-btn"
                           style={{ textDecoration: "none" }}
+                          aria-label={`Download ${ex.name} MP4`}
+                          title={t.exports.downloadMp4}
                           onClick={(e) => e.stopPropagation()}
                         >
                           <Download size={12} />
                         </a>
                         <button
                           className="nvr-btn danger"
+                          aria-label={`Delete export ${ex.name}`}
+                          title={t.exports.deleteBtn}
                           onClick={async (e) => {
                             e.stopPropagation();
                             await fetch(`/api/export/${encodeURIComponent(ex.id)}`, {
@@ -2218,52 +2342,62 @@ export const App: React.FC = () => {
 
               <div className="nvr-focus-stage">
                 {activeExportPreview ? (
-                  <div className="nvr-cam-tile" style={{ flex: 1 }}>
-                    <video
-                      src={activeExportPreview.video_path.replace("/media/frigate", "")}
-                      controls
-                      autoPlay
-                      muted
-                      playsInline
-                      style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                    />
-                    <div className="nvr-cam-hud-top">
+                  <>
+                    <div className="nvr-cam-tile" style={{ flex: 1 }}>
+                      <video
+                        src={activeExportPreview.video_path.replace("/media/frigate", "")}
+                        controls
+                        autoPlay
+                        muted
+                        playsInline
+                        style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                      />
+                    </div>
+                    <div
+                      className="nvr-subbar"
+                      style={{ borderTop: "1px solid var(--border-hairline)" }}
+                    >
                       <span className="nvr-badge live">
                         ARCHIVE PREVIEW // {activeExportPreview.name}
                       </span>
                       <button
                         className="nvr-btn"
-                        style={{ height: 22, padding: "0 8px", fontSize: 10, pointerEvents: "auto" }}
+                        style={{ height: 24, padding: "0 10px", fontSize: "var(--text-xs)" }}
                         onClick={() => setActiveExportPreview(null)}
                       >
                         Close Preview & Use Timeline Clipper
                       </button>
                     </div>
-                  </div>
+                  </>
                 ) : (
-                  <div className="nvr-cam-tile" style={{ flex: 1 }}>
-                    {timeShiftTs === null ? (
-                      <LiveMsePlayer
-                        camera={exportCam}
-                        useMainStream={true}
-                        cameraConfig={config?.cameras?.[exportCam]}
-                      />
-                    ) : (
-                      <VodHlsPlayer
-                        camera={exportCam}
-                        startTime={timeShiftTs}
-                        endTime={timeShiftTs + 180}
-                      />
-                    )}
-                    <div className="nvr-cam-hud-top">
+                  <>
+                    <div className="nvr-cam-tile" style={{ flex: 1 }}>
+                      {timeShiftTs === null ? (
+                        <LiveMsePlayer
+                          camera={exportCam}
+                          useMainStream={true}
+                          cameraConfig={config?.cameras?.[exportCam]}
+                        />
+                      ) : (
+                        <VodHlsPlayer
+                          camera={exportCam}
+                          startTime={timeShiftTs}
+                          endTime={timeShiftTs + 180}
+                        />
+                      )}
+                    </div>
+                    <div
+                      className="nvr-subbar"
+                      style={{ borderTop: "1px solid var(--border-hairline)" }}
+                    >
                       <span className="nvr-badge rewind">
                         CLIPPER STAGE // {exportCam.toUpperCase()}
                       </span>
-                      <span className="nvr-badge">
-                        USE TIMELINE BELOW TO SCRUB OR SELECT [ IN ... OUT ] RANGE TO EXPORT
+                      <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                        Use timeline below to scrub or select [ IN ... OUT ] range to export
                       </span>
                     </div>
-                  </div>
+                  </>
                 )}
 
                 <TimelineScrubber
@@ -2303,13 +2437,12 @@ export const App: React.FC = () => {
                   className={`nvr-btn ${zonesSubTab === "yaml" ? "active" : ""}`}
                   onClick={() => setZonesSubTab("yaml")}
                 >
-                  <Terminal size={13} />
                   {t.zones.yamlTab}
                 </button>
 
                 {zonesSubTab === "visual" && (
                   <>
-                    <span style={{ color: "var(--border-strong)", margin: "0 4px" }}>|</span>
+                    <span className="nvr-divider" aria-hidden="true" />
                     {cameraNames.map((cam) => (
                       <button
                         key={cam}
@@ -2340,14 +2473,12 @@ export const App: React.FC = () => {
                     className="nvr-btn primary"
                     onClick={() => handleSaveConfig("saveonly")}
                   >
-                    <Save size={12} />
                     {t.zones.saveOnly}
                   </button>
                   <button
                     className="nvr-btn success"
                     onClick={() => handleSaveConfig("restart")}
                   >
-                    <RefreshCw size={12} />
                     {t.zones.saveAndRestart}
                   </button>
                 </div>
@@ -2362,11 +2493,10 @@ export const App: React.FC = () => {
                   </div>
                   <div className="nvr-scroll-y" style={{ padding: 12 }}>
                     <div
-                      className="mono"
                       style={{
-                        fontSize: 11,
+                        fontSize: "var(--text-xs)",
                         fontWeight: 700,
-                        color: "#fbbf24",
+                        color: "var(--signal-motion-text)",
                         marginBottom: 6,
                       }}
                     >
@@ -2384,17 +2514,17 @@ export const App: React.FC = () => {
                         gap: 6,
                       }}
                     >
-                      <div style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+                      <div style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                         Click anywhere on the camera preview to plot normalized polygon vertices.
                       </div>
                       <div
                         className="mono"
                         style={{
-                          fontSize: 10.5,
-                          color: "#fcd34d",
+                          fontSize: "var(--text-xs)",
+                          color: "var(--signal-motion-text)",
                           wordBreak: "break-all",
                           padding: "4px 6px",
-                          background: "#050608",
+                          background: "var(--bg-deep)",
                           borderRadius: 2,
                         }}
                       >
@@ -2407,7 +2537,7 @@ export const App: React.FC = () => {
                       <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                         <button
                           className="nvr-btn"
-                          style={{ height: 22, fontSize: 10 }}
+                          style={{ height: 22, fontSize: "var(--text-xs)" }}
                           onClick={() =>
                             setDraftPoints([
                               [0.01, 0.01],
@@ -2421,7 +2551,7 @@ export const App: React.FC = () => {
                         </button>
                         <button
                           className="nvr-btn primary"
-                          style={{ height: 22, fontSize: 10 }}
+                          style={{ height: 22, fontSize: "var(--text-xs)" }}
                           onClick={() => {
                             const coords =
                               draftPoints.length > 0
@@ -2437,8 +2567,17 @@ export const App: React.FC = () => {
                           Copy Coords
                         </button>
                         <button
+                          className="nvr-btn"
+                          style={{ height: 22, fontSize: "var(--text-xs)" }}
+                          disabled={draftPoints.length === 0}
+                          onClick={() => setDraftPoints((prev) => prev.slice(0, -1))}
+                        >
+                          Undo Point
+                        </button>
+                        <button
                           className="nvr-btn danger"
-                          style={{ height: 22, fontSize: 10 }}
+                          style={{ height: 22, fontSize: "var(--text-xs)" }}
+                          disabled={draftPoints.length === 0}
                           onClick={() => setDraftPoints([])}
                         >
                           Clear
@@ -2447,11 +2586,10 @@ export const App: React.FC = () => {
                     </div>
 
                     <div
-                      className="mono"
                       style={{
-                        fontSize: 11,
+                        fontSize: "var(--text-xs)",
                         fontWeight: 700,
-                        color: "#fca5a5",
+                        color: "var(--signal-alert-text)",
                         marginBottom: 6,
                       }}
                     >
@@ -2460,29 +2598,29 @@ export const App: React.FC = () => {
                     </div>
                     {extractMaskPolygons(config?.cameras?.[inspectorCam]?.motion?.mask).map(
                       (m, idx) => (
-                      <div
-                        key={idx}
-                        className="mono"
-                        style={{
-                          padding: 8,
-                          background: "var(--bg-canvas)",
-                          border: "1px solid rgba(239, 68, 68, 0.35)",
-                          borderRadius: 3,
-                          fontSize: 10.5,
-                          marginBottom: 8,
-                          wordBreak: "break-all",
-                        }}
-                      >
-                        MASK #{idx + 1}: {m}
-                      </div>
-                    ))}
+                        <div
+                          key={idx}
+                          className="mono"
+                          style={{
+                            padding: 8,
+                            background: "var(--bg-canvas)",
+                            border: "1px solid rgba(239, 68, 68, 0.35)",
+                            borderRadius: 3,
+                            fontSize: "var(--text-xs)",
+                            marginBottom: 8,
+                            wordBreak: "break-all",
+                          }}
+                        >
+                          MASK #{idx + 1}: {m}
+                        </div>
+                      )
+                    )}
 
                     <div
-                      className="mono"
                       style={{
-                        fontSize: 11,
+                        fontSize: "var(--text-xs)",
                         fontWeight: 700,
-                        color: "#38bdf8",
+                        color: "var(--signal-accent-text)",
                         marginTop: 14,
                         marginBottom: 6,
                       }}
@@ -2500,7 +2638,7 @@ export const App: React.FC = () => {
                             background: "var(--bg-canvas)",
                             border: "1px solid rgba(14, 165, 233, 0.35)",
                             borderRadius: 3,
-                            fontSize: 10.5,
+                            fontSize: "var(--text-xs)",
                             marginBottom: 8,
                             wordBreak: "break-all",
                           }}
@@ -2511,11 +2649,10 @@ export const App: React.FC = () => {
                     )}
 
                     <div
-                      className="mono"
                       style={{
-                        fontSize: 11,
+                        fontSize: "var(--text-xs)",
                         fontWeight: 700,
-                        color: "#34d399",
+                        color: "var(--signal-live-text)",
                         marginTop: 14,
                         marginBottom: 6,
                       }}
@@ -2529,7 +2666,7 @@ export const App: React.FC = () => {
                         background: "var(--bg-canvas)",
                         border: "1px solid var(--border-hairline)",
                         borderRadius: 3,
-                        fontSize: 10.5,
+                        fontSize: "var(--text-xs)",
                         overflowX: "auto",
                       }}
                     >
@@ -2550,10 +2687,10 @@ export const App: React.FC = () => {
                     />
                     <div className="nvr-cam-hud-top">
                       <span className="nvr-badge live">
-                        {inspectorCam.toUpperCase()} // VECTOR OVERLAY & DRAWER ACTIVE
+                        {inspectorCam.toUpperCase()} // VECTORS ACTIVE
                       </span>
                       <span className="nvr-badge">
-                        CLICK VIDEO TO PLOT VERTICES · RED = MASK · CYAN = ZONE · AMBER = DRAFT
+                        CLICK VIDEO TO PLOT · RED MASK · CYAN ZONE · AMBER DRAFT
                       </span>
                     </div>
                   </div>
@@ -2585,9 +2722,12 @@ export const App: React.FC = () => {
                   HARDWARE & PIPELINE TELEMETRY (UPTIME{" "}
                   {formatUptime(stats?.service?.uptime || 0)})
                 </span>
-                <span>{stats?.service?.version || "0.18.2"}</span>
+                <span className="mono">{stats?.service?.version || "0.9.0"}</span>
               </div>
-              <div className="nvr-scroll-y" style={{ padding: 12, display: "flex", flexDirection: "column", gap: 12 }}>
+              <div
+                className="nvr-scroll-y"
+                style={{ padding: 12, display: "flex", flexDirection: "column", gap: 12 }}
+              >
                 {/* 3 Canvas Sparklines */}
                 <div
                   style={{
@@ -2605,16 +2745,22 @@ export const App: React.FC = () => {
                     }}
                   >
                     <div
-                      className="mono"
                       style={{
                         display: "flex",
                         justifyContent: "space-between",
-                        fontSize: 11,
+                        gap: 6,
+                        fontSize: "var(--text-xs)",
                         marginBottom: 6,
+                        whiteSpace: "nowrap",
                       }}
                     >
-                      <span style={{ color: "var(--text-secondary)" }}>OPENVINO LATENCY</span>
-                      <span style={{ color: "#38bdf8", fontWeight: 700 }}>{inferMs} ms</span>
+                      <span style={{ color: "var(--text-secondary)" }}>OPENVINO</span>
+                      <span
+                        className="mono"
+                        style={{ color: "var(--signal-accent-text)", fontWeight: 700 }}
+                      >
+                        {inferMs} ms
+                      </span>
                     </div>
                     <CanvasSparkline
                       values={statsHistory.map(
@@ -2634,16 +2780,20 @@ export const App: React.FC = () => {
                     }}
                   >
                     <div
-                      className="mono"
                       style={{
                         display: "flex",
                         justifyContent: "space-between",
-                        fontSize: 11,
+                        fontSize: "var(--text-xs)",
                         marginBottom: 6,
                       }}
                     >
                       <span style={{ color: "var(--text-secondary)" }}>SYSTEM CPU</span>
-                      <span style={{ color: "#10b981", fontWeight: 700 }}>{sysCpu}%</span>
+                      <span
+                        className="mono"
+                        style={{ color: "var(--signal-live-text)", fontWeight: 700 }}
+                      >
+                        {sysCpu}%
+                      </span>
                     </div>
                     <CanvasSparkline
                       values={statsHistory.map((s) =>
@@ -2663,16 +2813,20 @@ export const App: React.FC = () => {
                     }}
                   >
                     <div
-                      className="mono"
                       style={{
                         display: "flex",
                         justifyContent: "space-between",
-                        fontSize: 11,
+                        fontSize: "var(--text-xs)",
                         marginBottom: 6,
                       }}
                     >
                       <span style={{ color: "var(--text-secondary)" }}>MEMORY RSS</span>
-                      <span style={{ color: "#f59e0b", fontWeight: 700 }}>{sysMem}%</span>
+                      <span
+                        className="mono"
+                        style={{ color: "var(--signal-motion-text)", fontWeight: 700 }}
+                      >
+                        {sysMem}%
+                      </span>
                     </div>
                     <CanvasSparkline
                       values={statsHistory.map((s) =>
@@ -2714,7 +2868,7 @@ export const App: React.FC = () => {
                             <td style={{ fontWeight: 700, textTransform: "uppercase" }}>{cam}</td>
                             <td>{cs?.camera_fps?.toFixed(1) || "5.0"}</td>
                             <td>{cs?.process_fps?.toFixed(1) || "5.0"}</td>
-                            <td style={{ color: "#38bdf8" }}>
+                            <td style={{ color: "var(--signal-accent-text)" }}>
                               {cs?.detection_fps?.toFixed(1) || "0.0"}
                             </td>
                             <td>{cs?.ffmpeg_cpu || "1.2"}%</td>
@@ -2753,13 +2907,45 @@ export const App: React.FC = () => {
                           100,
                           Math.round((st.used / Math.max(1, st.total)) * 100)
                         );
+                        const isCrit = pct >= 90;
+                        const isWarn = pct >= 80 && pct < 90;
+                        const barColor = isCrit
+                          ? "var(--signal-alert)"
+                          : isWarn
+                          ? "var(--signal-motion)"
+                          : "var(--signal-live)";
+                        const textColor = isCrit
+                          ? "var(--signal-alert-text)"
+                          : isWarn
+                          ? "var(--signal-motion-text)"
+                          : "var(--text-primary)";
                         return (
                           <tr key={mPath}>
                             <td>{mPath}</td>
                             <td>{st.mount_type}</td>
                             <td>{(st.used / 1024).toFixed(1)} GB</td>
                             <td>{(st.total / 1024).toFixed(1)} GB</td>
-                            <td>{pct}%</td>
+                            <td>
+                              <div className="nvr-util-cell">
+                                <div className="nvr-util-bar" aria-hidden="true">
+                                  <div
+                                    className="nvr-util-fill"
+                                    style={{
+                                      width: `${pct}%`,
+                                      background: barColor,
+                                    }}
+                                  />
+                                </div>
+                                <span
+                                  style={{
+                                    color: textColor,
+                                    fontWeight: isCrit || isWarn ? 700 : 500,
+                                  }}
+                                >
+                                  {pct}%
+                                </span>
+                              </div>
+                            </td>
                           </tr>
                         );
                       })}
@@ -2778,7 +2964,7 @@ export const App: React.FC = () => {
                     <button
                       key={svc}
                       className={`nvr-btn mono ${logService === svc ? "active" : ""}`}
-                      style={{ height: 22, padding: "0 7px", fontSize: 10 }}
+                      style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
                       onClick={() => setLogService(svc)}
                     >
                       {svc.toUpperCase()}
@@ -2788,14 +2974,15 @@ export const App: React.FC = () => {
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <input
                     className="nvr-input"
-                    style={{ height: 22, width: 130, fontSize: 11 }}
+                    style={{ height: 22, width: 130, fontSize: "var(--text-xs)" }}
+                    aria-label="Filter service logs"
                     placeholder="Filter logs..."
                     value={logSearch}
                     onChange={(e) => setLogSearch(e.target.value)}
                   />
                   <button
                     className={`nvr-btn ${logPaused ? "active" : ""}`}
-                    style={{ height: 22, padding: "0 7px", fontSize: 10 }}
+                    style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
                     onClick={() => setLogPaused((p) => !p)}
                   >
                     {logPaused ? <Play size={11} /> : <Pause size={11} />}
@@ -2803,10 +2990,15 @@ export const App: React.FC = () => {
                   </button>
                   <button
                     className="nvr-btn"
-                    style={{ height: 22, padding: "0 7px", fontSize: 10 }}
+                    style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    aria-label="Copy service logs to clipboard"
+                    title={t.system.copyLogs}
                     onClick={() => {
-                      navigator.clipboard?.writeText(logLines.join("\n"));
-                      notify("Copied service logs to clipboard");
+                      const visibleLogs = logLines.filter((l) =>
+                        logSearch ? l.toLowerCase().includes(logSearch.toLowerCase()) : true
+                      );
+                      navigator.clipboard?.writeText(visibleLogs.join("\n"));
+                      notify(`Copied ${visibleLogs.length} log line(s) to clipboard`);
                     }}
                   >
                     <Copy size={11} />
@@ -2816,9 +3008,9 @@ export const App: React.FC = () => {
               <div
                 className="nvr-scroll-y mono"
                 style={{
-                  background: "#05070a",
+                  background: "var(--bg-deep)",
                   padding: "8px 10px",
-                  fontSize: 11,
+                  fontSize: "var(--text-xs)",
                   lineHeight: 1.5,
                   userSelect: "text",
                 }}
@@ -2833,9 +3025,10 @@ export const App: React.FC = () => {
                       style={{
                         padding: "2px 0",
                         borderBottom: "1px solid rgba(255,255,255,0.03)",
-                        color: line.includes("ERR") || line.includes("WARN")
-                          ? "#fcd34d"
-                          : "#cbd5e1",
+                        color:
+                          line.includes("ERR") || line.includes("WARN")
+                            ? "var(--signal-motion-text)"
+                            : "var(--text-primary)",
                         wordBreak: "break-all",
                       }}
                     >
