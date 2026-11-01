@@ -564,6 +564,9 @@ fn should_serve_ui_v2(headers: &HeaderMap, jar: &CookieJar, uri: Option<&Uri>) -
     for hdr_name in ["x-forwarded-host", "host"] {
         if let Some(host) = headers.get(hdr_name).and_then(|v| v.to_str().ok()) {
             let lower = host.to_ascii_lowercase();
+            if lower.contains("v1") || lower.contains("classic") || lower.contains("legacy") {
+                return false;
+            }
             if lower.contains("beta") || lower.contains("v2") {
                 return true;
             }
@@ -571,11 +574,14 @@ fn should_serve_ui_v2(headers: &HeaderMap, jar: &CookieJar, uri: Option<&Uri>) -
     }
     if let Some(auth) = uri.and_then(|u| u.authority()).map(|a| a.as_str()) {
         let lower = auth.to_ascii_lowercase();
+        if lower.contains("v1") || lower.contains("classic") || lower.contains("legacy") {
+            return false;
+        }
         if lower.contains("beta") || lower.contains("v2") {
             return true;
         }
     }
-    false
+    true
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2537,7 +2543,7 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // 4. Test SPA index fallback (v1 by default, v2 via Host or Cookie)
+        // 4. Test SPA index fallback (v2 by default, v1 via Cookie or Host)
         let resp = app
             .clone()
             .oneshot(
@@ -2553,26 +2559,26 @@ version: 0.18-0
         assert!(
             std::str::from_utf8(&body)
                 .unwrap()
-                .contains("NinjaNVR UI v1")
+                .contains("NinjaNVR Console v2")
         );
 
-        let resp_v2_host = app
+        let resp_v1_cookie = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri("/review")
-                    .header("Host", "frigate-beta.example.com")
+                    .header(header::COOKIE, "ninjanvr_ui=v1")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp_v2_host.status(), StatusCode::OK);
-        let body_v2 = to_bytes(resp_v2_host.into_body(), 4096).await.unwrap();
+        assert_eq!(resp_v1_cookie.status(), StatusCode::OK);
+        let body_v1 = to_bytes(resp_v1_cookie.into_body(), 4096).await.unwrap();
         assert!(
-            std::str::from_utf8(&body_v2)
+            std::str::from_utf8(&body_v1)
                 .unwrap()
-                .contains("NinjaNVR Console v2")
+                .contains("NinjaNVR UI v1")
         );
 
         let resp_switch = app
