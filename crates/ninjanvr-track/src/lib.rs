@@ -252,20 +252,27 @@ impl ByteTracker {
             }
         }
 
-        // 3. Handle unmatched tracks (preserving stationary tracks that were not in any scanned region)
+        // 3. Handle unmatched tracks (preserving stationary tracks that were not in any scanned region,
+        // and immediately dropping unconfirmed tentative tracks that missed their second frame)
         let mut ended_tracks = Vec::new();
         for (t_idx, tid) in track_ids.iter().enumerate() {
             if !matched_tracks[t_idx] {
+                let mut drop_unconfirmed = false;
                 if let Some(trk) = self.tracks.get_mut(tid) {
-                    let was_scanned = scanned_regions.iter().any(|r| r.intersects(&trk.bbox));
-                    if trk.stationary && !was_scanned {
-                        // Stationary track was intentionally skipped on this frame; keep it active
-                        trk.disappeared_frames = 0;
+                    if trk.frames_tracked < self.min_initialized {
+                        drop_unconfirmed = true;
                     } else {
-                        trk.disappeared_frames += 1;
+                        let was_scanned = scanned_regions.iter().any(|r| r.intersects(&trk.bbox));
+                        if trk.stationary && !was_scanned {
+                            trk.disappeared_frames = 0;
+                        } else {
+                            trk.disappeared_frames += 1;
+                        }
                     }
                 }
-                if self.tracks[tid].disappeared_frames > self.max_disappeared
+                if drop_unconfirmed {
+                    self.tracks.remove(tid);
+                } else if self.tracks[tid].disappeared_frames > self.max_disappeared
                     && let Some(removed) = self.tracks.remove(tid)
                     && removed.frames_tracked >= self.min_initialized
                 {

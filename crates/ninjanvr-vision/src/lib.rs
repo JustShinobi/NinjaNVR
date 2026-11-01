@@ -210,11 +210,14 @@ pub struct SimdMotionDetector {
     avg_frame: Vec<f32>,
     avg_delta: Vec<f32>,
     work_gray: Vec<u8>,
+    work_blurred: Vec<u8>,
     work_thresh: Vec<u8>,
     work_dilated: Vec<u8>,
     labels: Vec<u32>,
     frame_counter: u64,
     motion_frame_count: u32,
+    smooth_min_v: f32,
+    smooth_max_v: f32,
 }
 
 impl SimdMotionDetector {
@@ -252,11 +255,14 @@ impl SimdMotionDetector {
             avg_frame: vec![0.0; len],
             avg_delta: vec![0.0; len],
             work_gray: vec![0; len],
+            work_blurred: vec![0; len],
             work_thresh: vec![0; len],
             work_dilated: vec![0; len],
             labels: vec![0; len],
             frame_counter: 0,
             motion_frame_count: 0,
+            smooth_min_v: 16.0,
+            smooth_max_v: 235.0,
         }
     }
 
@@ -266,48 +272,62 @@ impl SimdMotionDetector {
             return Vec::new();
         }
 
-        // 1. Fast area/nearest downscale of Y-plane into `work_gray`
+        // 1. Box-averaging downscale of Y-plane into `work_gray` (suppresses sensor & H.264 pixel noise)
         let mw = self.motion_w as usize;
         let mh = self.motion_h as usize;
         let fw = self.frame_w as usize;
         let fh = self.frame_h as usize;
 
         for my in 0..mh {
-            let sy = (my * fh) / mh;
-            let row_src = &y_plane[sy * fw..(sy + 1) * fw];
+            let sy0 = (my * fh) / mh;
+            let sy1 = (((my + 1) * fh) / mh).max(sy0 + 1).min(fh);
+            let sy_mid = (sy0 + sy1) / 2;
+            let row_a = &y_plane[sy0 * fw..(sy0 + 1) * fw];
+            let row_b = &y_plane[sy_mid * fw..(sy_mid + 1) * fw];
             let row_dst = &mut self.work_gray[my * mw..(my + 1) * mw];
             for (mx, dst) in row_dst.iter_mut().enumerate() {
-                let sx = (mx * fw) / mw;
-                *dst = row_src[sx];
+                let sx0 = (mx * fw) / mw;
+                let sx1 = (((mx + 1) * fw) / mw)
+                    .saturating_sub(1)
+                    .max(sx0)
+                    .min(fw - 1);
+                let sum = (row_a[sx0] as u32)
+                    + (row_a[sx1] as u32)
+                    + (row_b[sx0] as u32)
+                    + (row_b[sx1] as u32);
+                *dst = ((sum + 2) >> 2) as u8;
             }
         }
 
-        // 2. Apply motion mask first so masked pixels do not skew contrast stretching
+        // 2. 3x3 Gaussian blur (`[1, 2, 1; 2, 4, 2; 1, 2, 1] / 16`, matching Frigate's gaussian_filter sigma=1, radius=1)
+        self.gaussian_blur_3x3();
+
+        // 3. Apply motion mask first so masked pixels do not skew contrast stretching
         for &idx in &self.masked_indices {
-            self.work_gray[idx] = 255;
+            self.work_blurred[idx] = 255;
         }
 
-        // 3. O(1) 256-bin histogram contrast stretching (P4..P96)
+        // 4. O(1) 256-bin histogram contrast stretching (P4..P96) with EMA-smoothed bounds and max gain cap
         if self.config.improve_contrast {
             let mut hist = [0u32; 256];
-            for &px in &self.work_gray {
+            for &px in &self.work_blurred {
                 hist[px as usize] += 1;
             }
             let masked_len = self.masked_indices.len() as u32;
             hist[255] = hist[255].saturating_sub(masked_len);
-            let total = (self.work_gray.len() as u32)
+            let total = (self.work_blurred.len() as u32)
                 .saturating_sub(masked_len)
                 .max(1);
             let p4_target = (total * 4) / 100;
             let p96_target = (total * 96) / 100;
 
             let mut acc = 0u32;
-            let mut min_v = 0u8;
-            let mut max_v = 255u8;
+            let mut raw_min = 0u8;
+            let mut raw_max = 255u8;
             for (val, &cnt) in hist.iter().enumerate() {
                 acc += cnt;
                 if acc >= p4_target {
-                    min_v = val as u8;
+                    raw_min = val as u8;
                     break;
                 }
             }
@@ -315,30 +335,39 @@ impl SimdMotionDetector {
             for (val, &cnt) in hist.iter().enumerate() {
                 acc += cnt;
                 if acc >= p96_target {
-                    max_v = val as u8;
+                    raw_max = val as u8;
                     break;
                 }
             }
+
+            if self.frame_counter == 0 {
+                self.smooth_min_v = raw_min as f32;
+                self.smooth_max_v = raw_max as f32;
+            } else {
+                self.smooth_min_v = 0.90 * self.smooth_min_v + 0.10 * (raw_min as f32);
+                self.smooth_max_v = 0.90 * self.smooth_max_v + 0.10 * (raw_max as f32);
+            }
+
+            let min_v = self.smooth_min_v.round().clamp(0.0, 254.0) as u8;
+            // Enforce a minimum span of 85 (~3x max gain) so dark/uniform rooms never amplify compression noise
+            let max_v =
+                (self.smooth_max_v.round().clamp(1.0, 255.0) as u8).max(min_v.saturating_add(85));
             if min_v < max_v {
                 let span = (max_v - min_v) as u32;
-                for px in &mut self.work_gray {
+                for px in &mut self.work_blurred {
                     let clamped = (*px).clamp(min_v, max_v);
                     *px = (((clamped - min_v) as u32 * 255) / span) as u8;
                 }
             }
             for &idx in &self.masked_indices {
-                self.work_gray[idx] = 255;
+                self.work_blurred[idx] = 255;
             }
         }
 
-        // 4. Warmup baseline for first 30 frames
+        // 5. Warmup baseline for first 30 frames
         if self.frame_counter < 30 {
-            let alpha = if self.frame_counter == 0 {
-                1.0
-            } else {
-                self.config.frame_alpha.clamp(0.01, 1.0)
-            };
-            for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_gray.iter()) {
+            let alpha = if self.frame_counter == 0 { 1.0 } else { 0.15 };
+            for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
                 *avg = (1.0 - alpha) * (*avg) + alpha * (px as f32);
             }
             self.frame_counter += 1;
@@ -346,13 +375,13 @@ impl SimdMotionDetector {
         }
         self.frame_counter += 1;
 
-        // 5. Compute frameDelta, EMA avg_delta, and threshold
+        // 6. Compute frameDelta, EMA avg_delta, and threshold
         let delta_alpha = self.config.delta_alpha.clamp(0.01, 1.0);
         let thresh_val = self.config.threshold;
         let mut active_pixels = 0usize;
 
-        for i in 0..self.work_gray.len() {
-            let px = self.work_gray[i];
+        for i in 0..self.work_blurred.len() {
+            let px = self.work_blurred[i];
             let avg_u8 = self.avg_frame[i].round().clamp(0.0, 255.0) as u8;
             let frame_delta = px.abs_diff(avg_u8);
             self.avg_delta[i] =
@@ -372,38 +401,61 @@ impl SimdMotionDetector {
         }
 
         // Lightning / IR cut-filter switch rejection
-        let active_fraction = (active_pixels as f32) / (self.work_gray.len().max(1) as f32);
+        let active_fraction = (active_pixels as f32) / (self.work_blurred.len().max(1) as f32);
         if active_fraction >= self.config.lightning_threshold {
-            for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_gray.iter()) {
+            for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
                 *avg = px as f32;
             }
             self.avg_delta.fill(0.0);
             return Vec::new();
         }
 
-        // 6. Separable 3x3 morphological dilation to bridge adjacent motion pixels
+        // 7. Separable 3x3 morphological dilation to bridge adjacent motion pixels
         self.dilate_3x3();
 
-        // 7. Connected Components Labeling & BoundingBox extraction
+        // 8. Connected Components Labeling & BoundingBox extraction
         let motion_boxes = self.extract_connected_boxes();
 
-        // 8. Update background model
+        // 9. Update background model
         let f_alpha = self.config.frame_alpha.clamp(0.001, 0.5);
         if !motion_boxes.is_empty() {
             self.motion_frame_count += 1;
             if self.motion_frame_count >= 10 {
-                for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_gray.iter()) {
+                for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
                     *avg = (1.0 - f_alpha) * (*avg) + f_alpha * (px as f32);
                 }
             }
         } else {
-            for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_gray.iter()) {
+            for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
                 *avg = (1.0 - f_alpha) * (*avg) + f_alpha * (px as f32);
             }
             self.motion_frame_count = 0;
         }
 
         motion_boxes
+    }
+
+    fn gaussian_blur_3x3(&mut self) {
+        let w = self.motion_w as usize;
+        let h = self.motion_h as usize;
+        for y in 0..h {
+            let ym1 = y.saturating_sub(1);
+            let yp1 = (y + 1).min(h - 1);
+            for x in 0..w {
+                let xm1 = x.saturating_sub(1);
+                let xp1 = (x + 1).min(w - 1);
+                let sum = (self.work_gray[ym1 * w + xm1] as u32)
+                    + (self.work_gray[ym1 * w + x] as u32) * 2
+                    + (self.work_gray[ym1 * w + xp1] as u32)
+                    + (self.work_gray[y * w + xm1] as u32) * 2
+                    + (self.work_gray[y * w + x] as u32) * 4
+                    + (self.work_gray[y * w + xp1] as u32) * 2
+                    + (self.work_gray[yp1 * w + xm1] as u32)
+                    + (self.work_gray[yp1 * w + x] as u32) * 2
+                    + (self.work_gray[yp1 * w + xp1] as u32);
+                self.work_blurred[y * w + x] = ((sum + 8) >> 4) as u8;
+            }
+        }
     }
 
     fn dilate_3x3(&mut self) {
