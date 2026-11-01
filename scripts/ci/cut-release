@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""
+Automated SemVer release & CHANGELOG.md generator for NinjaNVR.
+Inspects Conventional Commits since the latest v* tag, calculates the next
+version, updates Cargo.toml, Cargo.lock, web-v2/package.json, tauri.conf.json,
+.release-please-manifest.json, and CHANGELOG.md, commits, tags, pushes, and
+creates the GitHub Release.
+"""
+
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run(cmd: list[str], check: bool = True) -> str:
+    res = subprocess.run(cmd, capture_output=True, text=True, check=check)
+    return res.stdout.strip()
+
+
+def write_output(key: str, val: str) -> None:
+    gh_out = os.environ.get("GITHUB_OUTPUT")
+    if gh_out:
+        with open(gh_out, "a", encoding="utf-8") as f:
+            f.write(f"{key}={val}\n")
+
+
+def main() -> int:
+    head_subject = run(["git", "log", "-1", "--pretty=%s"])
+    if head_subject.startswith("chore(release):") or "[skip release]" in head_subject:
+        print(f"Skipping release cut on release commit: {head_subject}")
+        write_output("release_created", "false")
+        return 0
+
+    last_tag = run(["git", "describe", "--tags", "--match", "v*", "--abbrev=0"], check=False)
+    if not last_tag:
+        last_tag = "v0.9.0"
+
+    log_range = f"{last_tag}..HEAD"
+    raw_commits = run(["git", "log", log_range, "--no-merges", "--pretty=format:%h|%s"], check=False)
+    lines = [ln for ln in raw_commits.splitlines() if ln.strip()]
+    commits = []
+    for ln in lines:
+        sha, subj = ln.split("|", 1)
+        if subj.startswith("chore(release):"):
+            continue
+        commits.append((sha, subj))
+
+    if not commits:
+        print(f"No new releasable commits since {last_tag}.")
+        write_output("release_created", "false")
+        return 0
+
+    cargo_toml_path = Path("Cargo.toml")
+    cargo_toml = cargo_toml_path.read_text(encoding="utf-8")
+    m = re.search(r'(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"', cargo_toml)
+    if not m:
+        raise RuntimeError("Could not parse [workspace.package] version in Cargo.toml")
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    current_version = f"{major}.{minor}.{patch}"
+
+    # Determine next version:
+    # While in 0.9.x pre-1.0 refinement, increment PATCH (0.9.1, 0.9.2, ...) unless [major] or [minor] is requested
+    has_major = any("[major]" in s.lower() or "BREAKING CHANGE" in s for _, s in commits)
+    has_minor = any("[minor]" in s.lower() for _, s in commits)
+    has_feat = any(re.match(r"^feat(\([^)]+\))?!:", s) for _, s in commits)
+
+    if has_major or has_feat:
+        next_version = f"{major + 1}.0.0"
+    elif has_minor or (major >= 1 and any(s.startswith("feat") for _, s in commits)):
+        next_version = f"{major}.{minor + 1}.0"
+    else:
+        next_version = f"{major}.{minor}.{patch + 1}"
+
+    next_tag = f"v{next_version}"
+    print(f"Bumping version: {current_version} -> {next_version} ({next_tag})")
+
+    # 1. Update Cargo.toml
+    cargo_toml_updated = re.sub(
+        r'(?m)^version\s*=\s*"\d+\.\d+\.\d+"',
+        f'version = "{next_version}"',
+        cargo_toml,
+        count=1,
+    )
+    cargo_toml_path.write_text(cargo_toml_updated, encoding="utf-8")
+
+    # 2. Update Cargo.lock for all ninjanvr-* workspace crates
+    cargo_lock_path = Path("Cargo.lock")
+    if cargo_lock_path.exists():
+        cargo_lock = cargo_lock_path.read_text(encoding="utf-8")
+        cargo_lock_updated = re.sub(
+            r'(name = "ninjanvr(?:-[a-z0-9_]+)?"\nversion = )"\d+\.\d+\.\d+"',
+            rf'\g<1>"{next_version}"',
+            cargo_lock,
+        )
+        cargo_lock_path.write_text(cargo_lock_updated, encoding="utf-8")
+
+    # 3. Update JSON version files
+    for json_file in ["web-v2/package.json", "crates/ninjanvr-desktop/tauri.conf.json"]:
+        p = Path(json_file)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        data["version"] = next_version
+        p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    # 4. Categorize commits & update CHANGELOG.md
+    feats, fixes, perfs, others = [], [], [], []
+    for sha, subj in commits:
+        entry = f"- {subj} (`{sha}`)"
+        if subj.startswith("feat"):
+            feats.append(entry)
+        elif subj.startswith("fix"):
+            fixes.append(entry)
+        elif subj.startswith("perf"):
+            perfs.append(entry)
+        else:
+            others.append(entry)
+
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    section_lines = [f"## [{next_version}] - {today}", ""]
+    if feats:
+        section_lines.extend(["### Features", *feats, ""])
+    if fixes:
+        section_lines.extend(["### Bug Fixes", *fixes, ""])
+    if perfs:
+        section_lines.extend(["### Performance", *perfs, ""])
+    if others:
+        section_lines.extend(["### Documentation & Maintenance", *others, ""])
+
+    release_notes = "\n".join(section_lines[2:]).strip()
+    new_section = "\n".join(section_lines).rstrip() + "\n\n"
+
+    changelog_path = Path("CHANGELOG.md")
+    changelog = changelog_path.read_text(encoding="utf-8")
+    first_h2 = changelog.find("\n## [")
+    if first_h2 != -1:
+        updated_changelog = changelog[: first_h2 + 1] + new_section + changelog[first_h2 + 1 :]
+    else:
+        updated_changelog = changelog.rstrip() + "\n\n" + new_section
+    changelog_path.write_text(updated_changelog, encoding="utf-8")
+
+    # 5. Commit, tag, push, and create GitHub Release
+    run(["git", "config", "user.name", "github-actions[bot]"])
+    run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
+    run([
+        "git",
+        "add",
+        "Cargo.toml",
+        "Cargo.lock",
+        "web-v2/package.json",
+        "crates/ninjanvr-desktop/tauri.conf.json",
+        "CHANGELOG.md",
+    ])
+    run(["git", "commit", "-m", f"chore(release): {next_tag} [skip ci]"])
+    run(["git", "tag", "-a", next_tag, "-m", f"chore(release): {next_tag}"])
+    run(["git", "push", "origin", "HEAD:main"])
+    run(["git", "push", "origin", next_tag])
+
+    notes_file = Path("/tmp/ninjanvr-release-notes.md")
+    notes_file.write_text(release_notes, encoding="utf-8")
+    run(["gh", "release", "create", next_tag, "--title", next_tag, "--notes-file", str(notes_file)])
+
+    write_output("release_created", "true")
+    write_output("tag_name", next_tag)
+    write_output("version", next_version)
+    print(f"Successfully released {next_tag}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

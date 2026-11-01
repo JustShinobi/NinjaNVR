@@ -4,12 +4,10 @@ on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       publish_tag:
-        description: 'Optional explicit tag (e.g. v0.9.0) to build & publish manually'
+        description: 'Optional explicit tag (e.g. v0.9.1) to build & publish manually'
         required: false
         type: string
 
@@ -19,39 +17,40 @@ permissions:
   packages: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-main
   cancel-in-progress: false
 
 jobs:
-  release-please:
-    name: Release Please (Version & Changelog)
+  cut-release:
+    name: Cut Release (Version, Tag & Changelog)
     if: >-
-      (
-        github.event_name == 'push' ||
-        (github.event_name == 'workflow_dispatch' && inputs.publish_tag == '')
-      ) && github.ref == 'refs/heads/main'
+      !startsWith(github.event.head_commit.message, 'chore(release):') &&
+      (github.event_name == 'push' || inputs.publish_tag == '')
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Run release-please
-        id: release
-        uses: googleapis/release-please-action@v4
+      - name: Checkout repository with full history and tags
+        uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           token: ${{ secrets.PLATFORM_GITOPS_TOKEN || secrets.GITHUB_TOKEN }}
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
+
+      - name: Cut next SemVer release & update CHANGELOG.md
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.PLATFORM_GITOPS_TOKEN || secrets.GITHUB_TOKEN }}
+        run: ./scripts/ci/cut-release
 
   publish-ghcr:
     name: Build & Publish Container (ghcr.io)
-    needs: [release-please]
+    needs: [cut-release]
     if: >-
       always() &&
       (
-        needs.release-please.outputs.release_created == 'true' ||
-        startsWith(github.ref, 'refs/tags/v') ||
+        needs.cut-release.outputs.release_created == 'true' ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_tag != '')
       )
     runs-on: ubuntu-latest
@@ -63,10 +62,8 @@ jobs:
       - name: Resolve target release tag
         id: resolve
         run: |
-          if [ -n "${{ needs.release-please.outputs.tag_name }}" ]; then
-            TAG="${{ needs.release-please.outputs.tag_name }}"
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            TAG="${{ github.ref_name }}"
+          if [ -n "${{ needs.cut-release.outputs.tag_name }}" ]; then
+            TAG="${{ needs.cut-release.outputs.tag_name }}"
           else
             TAG="${{ inputs.publish_tag }}"
           fi

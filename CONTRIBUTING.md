@@ -39,7 +39,7 @@ Thank you for your interest in contributing to **NinjaNVR**! This document outli
 
 ## 📏 Commit Message Convention (Conventional Commits)
 
-NinjaNVR uses **[release-please](https://github.com/googleapis/release-please)** to automate semantic versioning (`Cargo.toml`, `web-v2/package.json`, `crates/ninjanvr-desktop/tauri.conf.json`), `CHANGELOG.md` generation, and container publishing (`ghcr.io/justshinobi/ninjanvr`).
+NinjaNVR uses an automated continuous release pipeline (`./scripts/ci/cut-release` in `.github/workflows/release.yml`) to manage semantic versioning (`Cargo.toml`, `Cargo.lock`, `web-v2/package.json`, `crates/ninjanvr-desktop/tauri.conf.json`), `CHANGELOG.md` generation, and container publishing (`ghcr.io/justshinobi/ninjanvr`).
 
 All commit messages and PR titles **must** follow [Conventional Commits](https://www.conventionalcommits.org/):
 
