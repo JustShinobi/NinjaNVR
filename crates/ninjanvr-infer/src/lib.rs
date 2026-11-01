@@ -26,6 +26,7 @@ type OvCoreCompileModelFn = unsafe extern "C" fn(
     *const c_char,
     usize,
     *mut *mut c_void,
+    ...
 ) -> c_int;
 type OvCompiledModelCreateInferReqFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int;
 type OvInferReqGetTensorFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int;
@@ -222,16 +223,30 @@ impl AiDetectorEngine {
 
             let c_model = CString::new(model_path.to_string_lossy().as_bytes())?;
             let c_dev = CString::new(device)?;
+            let c_prop_key = CString::new("INFERENCE_NUM_THREADS")?;
+            let c_prop_val = CString::new("1")?;
             let mut compiled_model: *mut c_void = std::ptr::null_mut();
             let rc = compile_model(
                 core,
                 c_model.as_ptr(),
                 c_dev.as_ptr(),
-                0,
+                2,
                 &mut compiled_model,
+                c_prop_key.as_ptr(),
+                c_prop_val.as_ptr(),
             );
             if rc != 0 || compiled_model.is_null() {
-                bail!("ov_core_compile_model_from_file returned {rc}");
+                // Fallback without properties if device plugin rejects INFERENCE_NUM_THREADS
+                let rc2 = compile_model(
+                    core,
+                    c_model.as_ptr(),
+                    c_dev.as_ptr(),
+                    0,
+                    &mut compiled_model,
+                );
+                if rc2 != 0 || compiled_model.is_null() {
+                    bail!("ov_core_compile_model_from_file returned {rc2}");
+                }
             }
 
             let mut infer_req: *mut c_void = std::ptr::null_mut();

@@ -239,21 +239,15 @@ impl VisionPipeline {
                     let motion_boxes = motion_detector.detect(&yuv_frame);
                     let motion_px: u32 = motion_boxes.iter().map(|b| b.area()).sum();
 
-                    // 2. Dynamic Region Cropping & AI Object Detection
+                    // 2. Dynamic Region Cropping & AI Object Detection (only when motion or non-stationary objects exist)
                     let tracked_boxes = tracker.non_stationary_boxes(&motion_boxes);
-                    let mut regions = compute_inference_regions(
+                    let regions = compute_inference_regions(
                         width,
                         height,
                         model_w.max(model_h),
                         &motion_boxes,
                         &tracked_boxes,
                     );
-                    // Periodic 1 Hz full/center scan when idle so stationary & slow-entering objects are verified
-                    if regions.is_empty() && frame_count.is_multiple_of(fps as u64) {
-                        let side = height.min(width);
-                        let x0 = (width - side) / 2;
-                        regions.push(BoundingBox::new(x0, 0, x0 + side, side));
-                    }
 
                     let mut raw_detections = Vec::new();
                     for region in &regions {

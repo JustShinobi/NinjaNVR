@@ -976,9 +976,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         } else {
             0.0
         });
-        let det_fps = m
-            .map(|x| x.detection_fps.max(1.0))
-            .unwrap_or(if cam_cfg.enabled { 1.2 } else { 0.0 });
+        let det_fps = m.map(|x| x.detection_fps).unwrap_or(0.0);
         let cam_pid = m.map(|x| x.pid).unwrap_or(pid);
         let (ff_cpu, _) = if cam_pid != pid {
             state.cpu_tracker.sample_pid(cam_pid, 1.8, 4.5)
