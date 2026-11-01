@@ -10,6 +10,7 @@ node_modules/
 **/node_modules/
 web-v2/dist/
 DESIGN.md
+CLAUDE.md
 .agents/
 .claude/
 .codegraph/

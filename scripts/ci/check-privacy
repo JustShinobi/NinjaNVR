@@ -7,16 +7,17 @@ cd -- "$repo_root"
 
 echo "==> Checking repository privacy and hygiene guardrails..."
 
-# 1. Ensure DESIGN.md and web-v2/dist are never tracked or present in root
-if git ls-files --error-unmatch DESIGN.md >/dev/null 2>&1; then
-  echo "ERROR: DESIGN.md must never be tracked in Git." >&2
-  exit 1
-fi
-
-if [ -e DESIGN.md ] || [ -L DESIGN.md ]; then
-  echo "ERROR: DESIGN.md exists in the repository root. Remove it or move local notes to .agents/." >&2
-  exit 1
-fi
+# 1. Ensure DESIGN.md, CLAUDE.md, and web-v2/dist are never tracked or present in root
+for forbidden in DESIGN.md CLAUDE.md; do
+  if git ls-files --error-unmatch "$forbidden" >/dev/null 2>&1; then
+    echo "ERROR: $forbidden must never be tracked in Git (use AGENTS.md for agent instructions)." >&2
+    exit 1
+  fi
+  if [ -e "$forbidden" ] || [ -L "$forbidden" ]; then
+    echo "ERROR: $forbidden exists in the repository root. Remove it and use AGENTS.md." >&2
+    exit 1
+  fi
+done
 
 if [ -n "$(git ls-files web-v2/dist)" ]; then
   echo "ERROR: web-v2/dist build artifacts must not be tracked in Git." >&2

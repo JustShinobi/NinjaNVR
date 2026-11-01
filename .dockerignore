@@ -11,3 +11,4 @@ web-v2/dist
 *.db-shm
 *.db-wal
 DESIGN.md
+CLAUDE.md

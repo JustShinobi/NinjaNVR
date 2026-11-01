@@ -1,35 +1,54 @@
 # Repository Guidelines (AGENTS.md)
 
-## Project Structure & Module Organization
-NinjaNVR is an ultra-low-footprint, 10-crate Rust NVR workspace and Dual-UI console (`v1` Frigate Classic + `v2` NinjaNVR Console & Tauri v2 desktop):
+## Product Identity & Architecture
+**NinjaNVR** is an independent, ultra-low-footprint AI Network Video Recorder (NVR) and Tactical Video-Wall Console built in **Rust (Edition 2024)**, **React 19**, and **Tauri v2**.
 
-- `crates/ninjanvr-config`: YAML configuration parser, credential scrubber, and `go2rtc` supervisor.
+- **Not a Clone:** While NinjaNVR maintains backwards-compatible parsing for legacy `config.yml` files, SQLite schemas, and Home Assistant MQTT discovery topics to ease migration, it is an independent product. All new frontend and operator workflow development happens exclusively in **`web-v2/` (NinjaNVR Console v2)** and **`crates/ninjanvr-desktop/` (Tauri v2)**.
+- **Default UI:** `ninjanvr-server` serves **NinjaNVR Console (`v2`)** by default. `web/` (`v1`) is retained strictly as a read-only legacy compatibility bundle (`/api/ui/switch?target=v1`).
+
+### Workspace Crates & Directories
+- `crates/ninjanvr-config`: YAML configuration parser, credential scrubber (`rtsp://*:*@...`), and `go2rtc` supervisor.
 - `crates/ninjanvr-db`: SQLite WAL persistence (`recordings`, `event`, `reviewsegment`, `export`, `previews`, `user`) and PBKDF2-HMAC-SHA256 authentication.
 - `crates/ninjanvr-media`: Direct 10s MP4 segment recorder, pure-Rust `vide` `mdhd` duration parser, retention cleanup, and MP4 segment exporter.
 - `crates/ninjanvr-vision`: Planar YUV420p SIMD motion detector with 3x3 Gaussian blur, EMA contrast cap, CCL, and scaled RGB/WebP/JPEG encoders.
 - `crates/ninjanvr-infer`: Dynamic `libopenvino_c.so` FFI AI detector (`INFERENCE_NUM_THREADS=1`) with SSD/YOLO output decoding and NMS.
-- `crates/ninjanvr-track`: 2-stage `ByteTracker` with stationary object classification and zone entry hysteresis.
+- `crates/ninjanvr-track`: 2-stage `ByteTracker` with stationary object classification and polygon zone entry hysteresis.
 - `crates/ninjanvr-vod`: Pure-Rust ISO-BMFF fMP4 HLS VOD remuxer (`init-v1-a1.mp4` + `seg-N-v1-a1.m4s`).
 - `crates/ninjanvr-comms`: Real-time `/ws` WebSocket broadcaster and `rumqttc` MQTT publisher.
 - `crates/ninjanvr-server`: Axum HTTP (`:5000`) & TLS (`:8971`) server, JWT auth gate, `/api/*` handlers, and Dual-UI static/SPA router.
 - `crates/ninjanvr-desktop`: Tauri v2 native desktop shell (`tauri.conf.json`) packaging `web-v2/dist`.
-- `web/`: Classic UI (`v1`) static bundle served at `/assets/*`.
-- `web-v2/`: NinjaNVR Console (`v2`) React 19 + TypeScript + Vite SPA built into `web-v2/dist` (`/assets-v2/*`).
+- `web-v2/`: Primary NinjaNVR Console (`v2`) React 19 + TypeScript + Vite SPA.
+- `web/`: Legacy Classic UI (`v1`) static fallback bundle.
 
-## Build, Test, and Deployment Commands
-Run all commands from `/srv/workspaces/NinjaNVR`:
+## UI v2 (`web-v2/`) Design & Engineering Guardrails
+- **Tactical Dark Surface:** Low-luminance dark palette (`color-scheme: dark`) defined via CSS custom properties in `web-v2/src/styles.css` (`--bg-deep`, `--bg-canvas`, `--bg-panel`, `--border-hairline`). Maintain WCAG AA contrast (`>= 4.5:1`) and never use font sizes below `11px` (`--text-xs`).
+- **Typography:** System sans-serif stack (`--font-sans`) for UI labels; locally bundled `JetBrains Mono` (`--font-mono`, `font-variant-numeric: tabular-nums`) in `web-v2/src/fonts/` for timestamps, FPS, telemetry metrics, polygon coordinates, YAML, and logs.
+- **Video Aspect Integrity:** Always keep `object-fit: contain` on live and VOD video elements so camera corner OSD timestamps are never cropped.
+- **Zero-Decoder-Bloat:** Timeline and review MP4 previews must mount only on pointer hover and unmount immediately on pointer leave.
 
-- `make verify` (or `./scripts/ci/verify`): Runs `./scripts/ci/check-privacy`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 build`.
-- `make build-ui`: Type-checks and builds `web-v2/dist` (`< 2s`). Note: `web-v2/dist` is gitignored and built in CI / `Dockerfile`.
-- `make fast-ui`: Builds `web-v2/dist` and hot-syncs `/opt/ninjanvr/web-v2` into the running K3s pod via `kubectl cp` for instant visual verification.
-- `make build`: Builds both `web-v2/dist` and the release Rust binary (`target/release/ninjanvr`).
-- `make build-desktop`: Builds the Tauri v2 native desktop shell (`ninjanvr-desktop`).
-- `make image`: Builds the multi-stage container image (`Dockerfile`) tagged with the current workspace version (`v0.9.0`). Production releases are published via `.github/workflows/release.yml` (`release-please` -> `ghcr.io` -> GitOps bump).
-- `make status` / `make logs`: Inspects the live K3s pod health, resource usage (`kubectl top pod`), and logs.
+## Build, Verification, and CI/CD Workflow
+Run all commands from the repository root:
+
+- `make verify` (or `./scripts/ci/verify`): Mandatory pre-commit/pre-PR gate. Runs:
+  1. `./scripts/ci/check-privacy` (blocks private domains, internal hostnames, `DESIGN.md`, and `web-v2/dist` from being tracked)
+  2. `cargo fmt --all --check`
+  3. `cargo clippy --workspace --all-targets -- -D warnings`
+  4. `cargo test --workspace`
+  5. `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 build`
+- `make build-ui`: Type-checks and builds `web-v2/dist` (`< 2s`). Note: `web-v2/dist/` is gitignored and built automatically inside CI and the multi-stage `Dockerfile`.
+- `make build`: Builds both `web-v2/dist` and `target/release/ninjanvr`.
+- `make build-desktop`: Builds the Tauri v2 native desktop application (`ninjanvr-desktop`).
+- `make image`: Builds the multi-stage container image (`Dockerfile`) tagged with the current workspace version.
+- `make fast-ui`: Local development helper that hot-syncs `web-v2/dist` into the running K3s pod via `kubectl cp` for rapid visual preview.
+
+### Versioning, Releases & GitOps Promotion
+- **Atomic Conventional Commits:** Always create atomic commits using [Conventional Commits](https://www.conventionalcommits.org/) (`feat(scope):`, `fix(scope):`, `perf(scope):`, `refactor(scope):`, `docs(scope):`, `ci(scope):`, `chore(scope):`).
+- **Automated Continuous Release (`.github/workflows/release.yml`):** Every push to `main` (after passing verification) automatically runs `./scripts/ci/cut-release`, which increments the version across `Cargo.toml`, `Cargo.lock`, `web-v2/package.json`, and `crates/ninjanvr-desktop/tauri.conf.json`, updates `CHANGELOG.md`, creates the Git tag (`v0.9.x`) and GitHub Release, publishes `ghcr.io/justshinobi/ninjanvr:v0.9.x` to GHCR, and bumps the GitOps manifest in `JustShinobi/k3s-gitops-prod` for ArgoCD rollout.
 
 ## Public Repository Privacy Guardrail
 - This repository (`https://github.com/JustShinobi/NinjaNVR`) is public open-source.
-- **Never commit private domains, internal IP addresses, or credentials/secrets** to any tracked file. Environment-specific overrides belong in `.env` or `.agents/` (which are gitignored).
+- **Never commit private domains, internal IP addresses, hostnames, or credentials/secrets** to any tracked file. Environment-specific overrides belong in `.env` or `.agents/` (which are gitignored).
+- **Never create or commit `DESIGN.md` or `CLAUDE.md`** in the repository root; all agent instructions belong in `AGENTS.md` and all design tokens live in `web-v2/src/styles.css`.
 
 <!-- CODEGRAPH_START -->
 ## CodeGraph
