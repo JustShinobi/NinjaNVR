@@ -19,12 +19,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=upstream-assets /usr/local/go2rtc/bin/go2rtc /usr/local/go2rtc/bin/go2rtc
 COPY --from=upstream-assets /openvino-model /openvino-model
+COPY --from=upstream-assets /usr/local/lib/python3.11/dist-packages/openvino/libs /usr/local/lib/ninjanvr/openvino
 COPY --from=builder /src/target/release/ninjanvr /usr/local/bin/ninjanvr
 COPY web /opt/ninjanvr/web
 
 ENV CONFIG_FILE=/config/config.yml
 ENV NINJANVR_WEB_DIR=/opt/ninjanvr/web
 ENV NINJANVR_MEDIA_DIR=/media/frigate
+ENV NINJANVR_OPENVINO_LIB_DIR=/usr/local/lib/ninjanvr/openvino
+ENV LD_LIBRARY_PATH=/usr/local/lib/ninjanvr/openvino
 
 EXPOSE 5000 8971 8554 8555/tcp 8555/udp
 
