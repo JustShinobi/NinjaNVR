@@ -7,7 +7,7 @@ use rumqttc::{AsyncClient, Event as MqttEvent, LastWill, MqttOptions, Packet, Qo
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsMessage {
@@ -293,14 +293,14 @@ async fn run_mqtt_loop(
                         }
                         Ok(_) => {}
                         Err(err) => {
-                            warn!("MQTT connection lost ({err}); reconnecting in 10s");
+                            debug!("MQTT broker unreachable ({err}); retrying in 30s");
                             break;
                         }
                     }
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 
