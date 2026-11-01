@@ -1823,8 +1823,9 @@ async fn api_export_create(
     let db_clone = state.db.clone();
     let media_dir_clone = state.media_dir.clone();
     let id_clone = id.clone();
-    tokio::spawn(async move {
-        if let Err(err) = build_mp4_export(
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        build_mp4_export(
             &db_clone,
             &media_dir_clone,
             &id_clone,
@@ -1832,14 +1833,17 @@ async fn api_export_create(
             &name,
             start,
             end,
-        )
-        .await
-        {
-            warn!("Export {id_clone} failed: {err:#}");
-        }
-    });
+        ),
+    )
+    .await;
 
-    Json(json!({ "success": true, "export_id": id })).into_response()
+    Json(json!({
+        "success": true,
+        "export_id": id,
+        "video_url": format!("/exports/{id}.mp4"),
+        "thumb_url": format!("/clips/{id}.webp")
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]

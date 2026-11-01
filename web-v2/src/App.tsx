@@ -47,6 +47,7 @@ import {
   VodHlsPlayer,
   extractMaskPolygons,
 } from "./components/VideoPlayers";
+import { TimelineScrubber } from "./components/TimelineScrubber";
 
 type WorkspaceTab =
   | "live"
@@ -293,12 +294,19 @@ export const App: React.FC = () => {
     };
   }, [authNeeded]);
 
-  // Fetch recordings for Focus Stage timeline
+  // Fetch 24h recordings for the active timeline camera
+  const timelineCam =
+    activeTab === "review" && activeReview
+      ? activeReview.camera
+      : activeTab === "exports"
+      ? exportCam
+      : selectedCamera;
+
   useEffect(() => {
-    if (authNeeded || !selectedCamera) return;
+    if (authNeeded || !timelineCam) return;
     const now = Math.floor(Date.now() / 1000);
     fetch(
-      `/api/${encodeURIComponent(selectedCamera)}/recordings?after=${now - 3600}&before=${now + 10}`,
+      `/api/${encodeURIComponent(timelineCam)}/recordings?after=${now - 86400}&before=${now + 10}`,
       { credentials: "include" }
     )
       .then((r) => (r.ok ? r.json() : []))
@@ -306,7 +314,7 @@ export const App: React.FC = () => {
         if (Array.isArray(segs)) setFocusSegments(segs);
       })
       .catch(() => {});
-  }, [authNeeded, selectedCamera, stats?.service?.last_updated]);
+  }, [authNeeded, timelineCam, stats?.service?.last_updated]);
 
   // Tab-specific data loaders
   useEffect(() => {
@@ -428,17 +436,33 @@ export const App: React.FC = () => {
     notify(`Deleted ${ids.length} review segment(s)`);
   };
 
-  const handleQuickExport = async (camera: string, startSec: number, endSec: number, label?: string) => {
+  const handleQuickExport = async (
+    camera: string,
+    startSec: number,
+    endSec: number,
+    label?: string
+  ): Promise<{ exportId?: string; videoUrl?: string } | void> => {
     const s = Math.floor(startSec);
-    const e = Math.ceil(Math.max(endSec, startSec + 15));
+    const e = Math.ceil(Math.max(endSec, startSec + 5));
     const res = await fetch(`/api/export/${encodeURIComponent(camera)}/start/${s}/end/${e}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
-      body: JSON.stringify({ name: label || `${camera} ${formatTs(s)}` }),
+      body: JSON.stringify({ name: label || `${camera} ${formatTs(s)}-${formatTs(e)}` }),
     });
     if (res.ok) {
-      notify(`MP4 export queued for ${camera} (${formatTs(s)} - ${formatTs(e)})`);
+      const data = await res.json().catch(() => ({}));
+      notify(`MP4 clip ready for ${camera} (${formatTs(s)} - ${formatTs(e)})`);
+      const listRes = await fetch("/api/exports", { credentials: "include" });
+      if (listRes.ok) {
+        const arr: ExportItem[] = await listRes.json();
+        setExportsList(arr);
+        if (arr.length > 0) setActiveExportPreview(arr[0]);
+      }
+      return {
+        exportId: data.export_id,
+        videoUrl: data.video_url || `/exports/${camera}_${s}_${e}.mp4`,
+      };
     }
   };
 
@@ -1032,26 +1056,55 @@ export const App: React.FC = () => {
                   const camCfg = config?.cameras?.[cam];
                   const camStat = stats?.cameras?.[cam];
                   const act = cameraActivity[cam];
-                  const hasPerson = (act?.objects || []).length > 0 || (camStat?.detection_fps || 0) > 1.5;
+                  const hasPerson =
+                    (act?.objects || []).length > 0 || (camStat?.detection_fps || 0) > 1.5;
                   const hasMotion = act?.motion || (camStat?.detection_fps || 0) > 0.2;
+                  const isTimelineCam = selectedCamera === cam;
+                  const isTimeShifted = isTimelineCam && timeShiftTs !== null;
 
                   return (
-                    <div key={cam} className="nvr-cam-tile">
-                      <LiveMsePlayer
-                        camera={cam}
-                        useMainStream={useMainStream}
-                        cameraConfig={camCfg}
-                        showVectors={showVectors}
-                        onClick={() => {
-                          setSelectedCamera(cam);
-                          setLiveLayout("focus");
-                        }}
-                      />
+                    <div
+                      key={cam}
+                      className="nvr-cam-tile"
+                      style={{
+                        outline: isTimelineCam ? "1px solid var(--signal-accent)" : "none",
+                        outlineOffset: -1,
+                      }}
+                    >
+                      {isTimeShifted && timeShiftTs !== null ? (
+                        <VodHlsPlayer
+                          camera={cam}
+                          startTime={timeShiftTs}
+                          endTime={timeShiftTs + 180}
+                          playbackRate={playbackSpeed}
+                        />
+                      ) : (
+                        <LiveMsePlayer
+                          camera={cam}
+                          useMainStream={useMainStream}
+                          cameraConfig={camCfg}
+                          showVectors={showVectors}
+                          onClick={() => {
+                            if (selectedCamera === cam) {
+                              setLiveLayout("focus");
+                            } else {
+                              setSelectedCamera(cam);
+                            }
+                          }}
+                        />
+                      )}
                       <div className="nvr-cam-hud-top">
                         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          <span className="nvr-badge live">
-                            <span className="nvr-dot live" />
+                          <span
+                            className={`nvr-badge ${isTimeShifted ? "rewind" : "live"}`}
+                          >
+                            <span
+                              className={`nvr-dot ${isTimeShifted ? "motion" : "live"}`}
+                            />
                             {cam.toUpperCase()}
+                            {isTimeShifted && timeShiftTs !== null
+                              ? ` @ ${formatTs(timeShiftTs)}`
+                              : ""}
                           </span>
                           <span className="nvr-badge">
                             {camCfg?.detect?.width || 1280}×{camCfg?.detect?.height || 720} ·{" "}
@@ -1076,24 +1129,34 @@ export const App: React.FC = () => {
                             onClick={(e) => {
                               e.stopPropagation();
                               setSelectedCamera(cam);
-                              setLiveLayout("focus");
                               setTimeShiftTs(Math.floor(Date.now() / 1000) - 30);
                             }}
                           >
                             <Clock size={11} />
                             {t.live.rewind30s}
                           </button>
+                          {isTimeShifted && (
+                            <button
+                              className="nvr-btn success"
+                              style={{ height: 22, padding: "0 7px", fontSize: 10.5 }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setTimeShiftTs(null);
+                              }}
+                            >
+                              LIVE
+                            </button>
+                          )}
                           <button
                             className="nvr-btn"
                             style={{ height: 22, padding: "0 7px", fontSize: 10.5 }}
                             onClick={(e) => {
                               e.stopPropagation();
-                              const now = Math.floor(Date.now() / 1000);
-                              handleQuickExport(cam, now - 60, now);
+                              setSelectedCamera(cam);
+                              setLiveLayout("focus");
                             }}
                           >
-                            <Film size={11} />
-                            {t.live.export60s}
+                            Expand Focus
                           </button>
                         </div>
                         <a
@@ -1118,7 +1181,7 @@ export const App: React.FC = () => {
               </div>
             )}
 
-            {/* Focus Stage + Side Dock + Unified Time-Shift Timeline */}
+            {/* Focus Stage + Side Dock */}
             {(liveLayout === "focus" || liveLayout === "single") && (
               <div
                 className={
@@ -1174,145 +1237,6 @@ export const App: React.FC = () => {
                       </div>
                     </div>
                   </div>
-
-                  {/* Unified Time-Shift Scrubber Bar */}
-                  <div className="nvr-timeline-bar">
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                      }}
-                    >
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <span
-                          className="mono"
-                          style={{ fontSize: 11, fontWeight: 700, color: "var(--text-secondary)" }}
-                        >
-                          TIME-SHIFT SCRUBBER (LAST 60M)
-                        </span>
-                        <button
-                          className="nvr-btn"
-                          style={{ height: 22, padding: "0 7px", fontSize: 10.5 }}
-                          onClick={() =>
-                            setTimeShiftTs(
-                              (curr) => (curr || Math.floor(Date.now() / 1000)) - 120
-                            )
-                          }
-                        >
-                          {t.live.rewind2m}
-                        </button>
-                        <button
-                          className="nvr-btn"
-                          style={{ height: 22, padding: "0 7px", fontSize: 10.5 }}
-                          onClick={() =>
-                            setTimeShiftTs(
-                              (curr) => (curr || Math.floor(Date.now() / 1000)) - 30
-                            )
-                          }
-                        >
-                          {t.live.rewind30s}
-                        </button>
-                        <button
-                          className="nvr-btn"
-                          style={{ height: 22, padding: "0 7px", fontSize: 10.5 }}
-                          onClick={() =>
-                            setTimeShiftTs(
-                              (curr) => (curr || Math.floor(Date.now() / 1000)) - 10
-                            )
-                          }
-                        >
-                          {t.live.rewind10s}
-                        </button>
-                        <button
-                          className={`nvr-btn ${timeShiftTs === null ? "success" : ""}`}
-                          style={{ height: 22, padding: "0 8px", fontSize: 10.5 }}
-                          onClick={() => setTimeShiftTs(null)}
-                        >
-                          LIVE EDGE
-                        </button>
-                      </div>
-
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <button
-                          className="nvr-btn"
-                          style={{ height: 22, padding: "0 8px", fontSize: 10.5 }}
-                          onClick={() => {
-                            const anchor = timeShiftTs || Math.floor(Date.now() / 1000) - 60;
-                            handleQuickExport(selectedCamera, anchor, anchor + 60);
-                          }}
-                        >
-                          <Film size={11} />
-                          {t.live.export60s}
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Interactive 60-minute Scrub Track */}
-                    <div
-                      className="nvr-timeline-track"
-                      onClick={(e) => {
-                        const rect = e.currentTarget.getBoundingClientRect();
-                        const frac = Math.max(
-                          0,
-                          Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width))
-                        );
-                        const now = Math.floor(Date.now() / 1000);
-                        const targetTs = Math.floor(now - 3600 + frac * 3600);
-                        setTimeShiftTs(targetTs);
-                      }}
-                    >
-                      {/* Recorded segments & motion activity bars */}
-                      {focusSegments.map((seg) => {
-                        const now = Date.now() / 1000;
-                        const winStart = now - 3600;
-                        const leftPct = Math.max(
-                          0,
-                          Math.min(100, ((seg.start_time - winStart) / 3600) * 100)
-                        );
-                        const widthPct = Math.max(0.25, (seg.duration / 3600) * 100);
-                        const hasObj = seg.objects > 0;
-                        const hasMot = seg.motion > 0;
-                        return (
-                          <div
-                            key={seg.id}
-                            style={{
-                              position: "absolute",
-                              left: `${leftPct}%`,
-                              width: `${widthPct}%`,
-                              bottom: 0,
-                              height: hasObj ? "100%" : hasMot ? "65%" : "30%",
-                              background: hasObj
-                                ? "rgba(239, 68, 68, 0.65)"
-                                : hasMot
-                                ? "rgba(245, 158, 11, 0.45)"
-                                : "rgba(16, 185, 129, 0.25)",
-                            }}
-                          />
-                        );
-                      })}
-                      {/* Playhead needle */}
-                      <div
-                        style={{
-                          position: "absolute",
-                          top: 0,
-                          bottom: 0,
-                          width: 2,
-                          background: "#38bdf8",
-                          left:
-                            timeShiftTs === null
-                              ? "99.5%"
-                              : `${Math.max(
-                                  0,
-                                  Math.min(
-                                    99.5,
-                                    ((timeShiftTs - (Date.now() / 1000 - 3600)) / 3600) * 100
-                                  )
-                                )}%`,
-                        }}
-                      />
-                    </div>
-                  </div>
                 </div>
 
                 {/* Right-hand camera dock in Focus mode */}
@@ -1345,6 +1269,19 @@ export const App: React.FC = () => {
                 )}
               </div>
             )}
+
+            {/* Always-Docked Interactive Timeline & Segment Export Bar */}
+            <TimelineScrubber
+              camera={selectedCamera}
+              cameras={cameraNames}
+              onSelectCamera={(cam) => setSelectedCamera(cam)}
+              segments={focusSegments}
+              reviews={reviews}
+              currentTs={timeShiftTs}
+              onSeek={(ts) => setTimeShiftTs(ts)}
+              onExportRange={handleQuickExport}
+              titlePrefix="TIMELINE"
+            />
           </>
         )}
 
@@ -1487,6 +1424,20 @@ export const App: React.FC = () => {
                 ))}
               </div>
             </div>
+
+            <TimelineScrubber
+              camera={selectedCamera}
+              cameras={cameraNames}
+              onSelectCamera={(cam) => setSelectedCamera(cam)}
+              segments={focusSegments}
+              reviews={reviews}
+              currentTs={syncMasterTs}
+              onSeek={(ts) =>
+                setSyncMasterTs(ts ?? Math.floor(Date.now() / 1000) - 30)
+              }
+              onExportRange={handleQuickExport}
+              titlePrefix="4-CH SYNC TIMELINE"
+            />
           </>
         )}
 
@@ -1765,6 +1716,23 @@ export const App: React.FC = () => {
                         </button>
                       </div>
                     </div>
+                    <TimelineScrubber
+                      camera={activeReview.camera}
+                      segments={focusSegments}
+                      reviews={reviews}
+                      currentTs={Math.floor(activeReview.start_time)}
+                      onSeek={(ts) => {
+                        if (ts !== null) {
+                          setActiveReview({
+                            ...activeReview,
+                            start_time: ts,
+                            end_time: ts + 30,
+                          });
+                        }
+                      }}
+                      onExportRange={handleQuickExport}
+                      titlePrefix={`REVIEW TIMELINE (${activeReview.camera.toUpperCase()})`}
+                    />
                   </>
                 ) : (
                   <div
@@ -1866,9 +1834,10 @@ export const App: React.FC = () => {
                           alt={ev.label}
                           loading="lazy"
                           style={{
-                            width: 52,
-                            height: 52,
-                            objectFit: "cover",
+                            width: 80,
+                            height: 46,
+                            objectFit: "contain",
+                            background: "#050608",
                             borderRadius: 3,
                             border: "1px solid var(--border-hairline)",
                           }}
@@ -2160,20 +2129,59 @@ export const App: React.FC = () => {
                       playsInline
                       style={{ width: "100%", height: "100%", objectFit: "contain" }}
                     />
+                    <div className="nvr-cam-hud-top">
+                      <span className="nvr-badge live">
+                        ARCHIVE PREVIEW // {activeExportPreview.name}
+                      </span>
+                      <button
+                        className="nvr-btn"
+                        style={{ height: 22, padding: "0 8px", fontSize: 10, pointerEvents: "auto" }}
+                        onClick={() => setActiveExportPreview(null)}
+                      >
+                        Close Preview & Use Timeline Clipper
+                      </button>
+                    </div>
                   </div>
                 ) : (
-                  <div
-                    style={{
-                      flex: 1,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      color: "var(--text-muted)",
-                    }}
-                  >
-                    Select an exported clip or generate a new MP4 clip
+                  <div className="nvr-cam-tile" style={{ flex: 1 }}>
+                    {timeShiftTs === null ? (
+                      <LiveMsePlayer
+                        camera={exportCam}
+                        useMainStream={true}
+                        cameraConfig={config?.cameras?.[exportCam]}
+                      />
+                    ) : (
+                      <VodHlsPlayer
+                        camera={exportCam}
+                        startTime={timeShiftTs}
+                        endTime={timeShiftTs + 180}
+                      />
+                    )}
+                    <div className="nvr-cam-hud-top">
+                      <span className="nvr-badge rewind">
+                        CLIPPER STAGE // {exportCam.toUpperCase()}
+                      </span>
+                      <span className="nvr-badge">
+                        USE TIMELINE BELOW TO SCRUB OR SELECT [ IN ... OUT ] RANGE TO EXPORT
+                      </span>
+                    </div>
                   </div>
                 )}
+
+                <TimelineScrubber
+                  camera={exportCam}
+                  cameras={cameraNames}
+                  onSelectCamera={(cam) => setExportCam(cam)}
+                  segments={focusSegments}
+                  reviews={reviews}
+                  currentTs={timeShiftTs}
+                  onSeek={(ts) => {
+                    setActiveExportPreview(null);
+                    setTimeShiftTs(ts);
+                  }}
+                  onExportRange={handleQuickExport}
+                  titlePrefix="EXPORT TIMELINE CLIPPER"
+                />
               </div>
             </div>
           </>

@@ -801,7 +801,10 @@ async fn build_mp4_export_inner(
     start_time: f64,
     end_time: f64,
 ) -> Result<()> {
-    let segments = db.query_recordings(camera, start_time, end_time)?;
+    let mut segments = db.query_recordings(camera, start_time, end_time)?;
+    if segments.is_empty() {
+        segments = db.query_recordings(camera, start_time - 15.0, end_time + 15.0)?;
+    }
     if segments.is_empty() {
         anyhow::bail!("no recording segments found for {camera} in [{start_time}, {end_time}]");
     }
@@ -817,6 +820,7 @@ async fn build_mp4_export_inner(
 
     let mut list_content = String::new();
     let mut existing_paths = Vec::new();
+    let mut first_seg_start = None;
     for seg in &segments {
         let local_path = if let Some(rel) = seg.path.strip_prefix("/media/frigate/") {
             media_dir.join(rel)
@@ -824,6 +828,9 @@ async fn build_mp4_export_inner(
             PathBuf::from(&seg.path)
         };
         if local_path.exists() {
+            if first_seg_start.is_none() {
+                first_seg_start = Some(seg.start_time);
+            }
             let escaped = local_path.to_string_lossy().replace('\'', "'\\''");
             list_content.push_str(&format!("file '{escaped}'\n"));
             existing_paths.push(local_path);
@@ -835,6 +842,11 @@ async fn build_mp4_export_inner(
     }
 
     std::fs::write(&list_file, &list_content)?;
+
+    let trim_offset = first_seg_start
+        .map(|s0| (start_time - s0).max(0.0))
+        .unwrap_or(0.0);
+    let target_dur = (end_time - start_time).max(3.0);
 
     let ffmpeg_bin = resolve_ffmpeg_bin();
     let status = Command::new(&ffmpeg_bin)
@@ -850,23 +862,46 @@ async fn build_mp4_export_inner(
             "-i",
         ])
         .arg(&list_file)
-        .args(["-c", "copy", "-movflags", "+faststart"])
+        .args([
+            "-ss",
+            &format!("{trim_offset:.2}"),
+            "-t",
+            &format!("{target_dur:.2}"),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+        ])
         .arg(&out_file)
         .status()
         .await;
 
     let _ = std::fs::remove_file(&list_file);
 
-    if status.map(|s| !s.success()).unwrap_or(true) {
+    if status.map(|s| !s.success()).unwrap_or(true)
+        || std::fs::metadata(&out_file)
+            .map(|m| m.len() < 1024)
+            .unwrap_or(true)
+    {
         std::fs::copy(&existing_paths[0], &out_file)?;
     }
 
-    // Generate a valid WebP thumbnail so the UI Exports grid always has an image
-    let mut img = image::RgbImage::new(320, 180);
-    for p in img.pixels_mut() {
-        *p = image::Rgb([24, 30, 38]);
+    // Extract a real video frame thumbnail as WebP (with RgbImage fallback)
+    let thumb_status = Command::new(&ffmpeg_bin)
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&out_file)
+        .args(["-frames:v", "1", "-vf", "scale=320:-1"])
+        .arg(&thumb_file)
+        .status()
+        .await;
+
+    if thumb_status.map(|s| !s.success()).unwrap_or(true) || !thumb_file.exists() {
+        let mut img = image::RgbImage::new(320, 180);
+        for p in img.pixels_mut() {
+            *p = image::Rgb([24, 30, 38]);
+        }
+        let _ = img.save_with_format(&thumb_file, image::ImageFormat::WebP);
     }
-    let _ = img.save_with_format(&thumb_file, image::ImageFormat::WebP);
 
     let video_rel = format!("/media/frigate/exports/{export_id}.mp4");
     let thumb_rel = format!("/media/frigate/clips/{export_id}.webp");

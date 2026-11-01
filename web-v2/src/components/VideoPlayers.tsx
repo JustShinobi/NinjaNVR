@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
 import { CameraConfig } from "../types/nvr";
 
@@ -74,6 +74,44 @@ export function parsePolygonPoints(
   return pairs.join(" ");
 }
 
+interface ContainedBox {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+function computeContainedBox(
+  containerW: number,
+  containerH: number,
+  mediaW: number,
+  mediaH: number
+): ContainedBox {
+  if (containerW <= 0 || containerH <= 0 || mediaW <= 0 || mediaH <= 0) {
+    return { left: 0, top: 0, width: containerW, height: containerH };
+  }
+  const containerRatio = containerW / containerH;
+  const mediaRatio = mediaW / mediaH;
+  if (containerRatio > mediaRatio) {
+    const height = containerH;
+    const width = containerH * mediaRatio;
+    return {
+      left: (containerW - width) / 2,
+      top: 0,
+      width,
+      height,
+    };
+  }
+  const width = containerW;
+  const height = containerW / mediaRatio;
+  return {
+    left: 0,
+    top: (containerH - height) / 2,
+    width,
+    height,
+  };
+}
+
 export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   camera,
   useMainStream = false,
@@ -84,9 +122,44 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   muted = true,
   onClick,
 }) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
   const [mseReady, setMseReady] = useState(false);
   const [posterTick, setPosterTick] = useState(() => Date.now());
+  const [overlayBox, setOverlayBox] = useState<ContainedBox | null>(null);
+
+  const detW = cameraConfig?.detect?.width || 1280;
+  const detH = cameraConfig?.detect?.height || 720;
+
+  const updateOverlayGeometry = useCallback(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const cw = el.clientWidth;
+    const ch = el.clientHeight;
+    const v = videoRef.current;
+    const im = imgRef.current;
+    const mw =
+      (v && v.videoWidth > 0 ? v.videoWidth : 0) ||
+      (im && im.naturalWidth > 0 ? im.naturalWidth : 0) ||
+      detW;
+    const mh =
+      (v && v.videoHeight > 0 ? v.videoHeight : 0) ||
+      (im && im.naturalHeight > 0 ? im.naturalHeight : 0) ||
+      detH;
+    setOverlayBox(computeContainedBox(cw, ch, mw, mh));
+  }, [detW, detH]);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    updateOverlayGeometry();
+    const ro = new ResizeObserver(() => {
+      updateOverlayGeometry();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [updateOverlayGeometry]);
 
   // Periodic fallback snapshot refresh when MSE is still handshaking
   useEffect(() => {
@@ -128,7 +201,6 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       if (!chunk) return;
       try {
         sourceBuffer.appendBuffer(chunk);
-        // Keep live latency tight (< 2.5s) and trim old buffer
         if (videoEl.buffered.length > 0) {
           const end = videoEl.buffered.end(videoEl.buffered.length - 1);
           const start = videoEl.buffered.start(0);
@@ -200,14 +272,17 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     const onLoadedData = () => {
       if (!closed) {
         setMseReady(true);
+        updateOverlayGeometry();
         videoEl.play().catch(() => {});
       }
     };
     videoEl.addEventListener("loadeddata", onLoadedData);
+    videoEl.addEventListener("resize", updateOverlayGeometry);
 
     return () => {
       closed = true;
       videoEl.removeEventListener("loadeddata", onLoadedData);
+      videoEl.removeEventListener("resize", updateOverlayGeometry);
       try {
         ws?.close();
       } catch {
@@ -222,142 +297,137 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       }
       URL.revokeObjectURL(objUrl);
     };
-  }, [camera, useMainStream]);
+  }, [camera, useMainStream, updateOverlayGeometry]);
 
-  const detW = cameraConfig?.detect?.width || 1280;
-  const detH = cameraConfig?.detect?.height || 720;
   const masks = extractMaskPolygons(cameraConfig?.motion?.mask);
   const zones = cameraConfig?.zones || {};
 
   return (
     <div
+      ref={containerRef}
       style={{
         position: "relative",
         width: "100%",
         height: "100%",
+        minWidth: 0,
+        minHeight: 0,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
+        overflow: "hidden",
+        background: "#040507",
         cursor: onPlotPoint ? "crosshair" : onClick ? "pointer" : "default",
       }}
-      onClick={!onPlotPoint ? onClick : undefined}
+      onClick={
+        onPlotPoint
+          ? (e) => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const box = overlayBox || {
+                left: 0,
+                top: 0,
+                width: rect.width,
+                height: rect.height,
+              };
+              const relX = e.clientX - rect.left - box.left;
+              const relY = e.clientY - rect.top - box.top;
+              const nx = Math.max(0, Math.min(1, relX / Math.max(1, box.width)));
+              const ny = Math.max(0, Math.min(1, relY / Math.max(1, box.height)));
+              onPlotPoint(nx, ny);
+            }
+          : onClick
+      }
     >
-      <div
+      {/* Zero-black-screen instant snapshot underlay while MSE connects — strictly object-fit: contain */}
+      <img
+        ref={imgRef}
+        className="nvr-cam-poster"
+        src={`/api/${camera}/latest.webp?height=360&cache=${posterTick}`}
+        alt={camera}
+        onLoad={updateOverlayGeometry}
         style={{
-          position: "relative",
-          aspectRatio: `${detW} / ${detH}`,
-          maxWidth: "100%",
-          maxHeight: "100%",
+          position: "absolute",
+          inset: 0,
           width: "100%",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
+          height: "100%",
+          objectFit: "contain",
+          opacity: mseReady ? 0 : 1,
+          transition: "opacity 0.2s ease",
+          pointerEvents: "none",
         }}
-        onClick={
-          onPlotPoint
-            ? (e) => {
-                const rect = e.currentTarget.getBoundingClientRect();
-                const nx = Math.max(
-                  0,
-                  Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width))
-                );
-                const ny = Math.max(
-                  0,
-                  Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height))
-                );
-                onPlotPoint(nx, ny);
-              }
-            : undefined
-        }
-      >
-        {/* Zero-black-screen instant snapshot underlay while MSE connects */}
-        <img
-          className="nvr-cam-poster"
-          src={`/api/${camera}/latest.webp?height=360&cache=${posterTick}`}
-          alt={camera}
+      />
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted={muted}
+        style={{
+          width: "100%",
+          height: "100%",
+          objectFit: "contain",
+          opacity: mseReady ? 1 : 0,
+          transition: "opacity 0.2s ease",
+          pointerEvents: "none",
+        }}
+      />
+      {(showVectors || (draftPoints && draftPoints.length > 0)) && overlayBox && (
+        <svg
+          viewBox="0 0 1000 1000"
+          preserveAspectRatio="none"
           style={{
             position: "absolute",
-            inset: 0,
-            width: "100%",
-            height: "100%",
-            objectFit: "fill",
-            opacity: mseReady ? 0 : 1,
-            transition: "opacity 0.2s ease",
+            left: `${overlayBox.left}px`,
+            top: `${overlayBox.top}px`,
+            width: `${overlayBox.width}px`,
+            height: `${overlayBox.height}px`,
             pointerEvents: "none",
+            zIndex: 4,
           }}
-        />
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted={muted}
-          style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "fill",
-            opacity: mseReady ? 1 : 0,
-            transition: "opacity 0.2s ease",
-          }}
-        />
-        {(showVectors || (draftPoints && draftPoints.length > 0)) && (
-          <svg
-            viewBox="0 0 1000 1000"
-            preserveAspectRatio="none"
-            style={{
-              position: "absolute",
-              inset: 0,
-              width: "100%",
-              height: "100%",
-              pointerEvents: "none",
-              zIndex: 4,
-            }}
-          >
-            {masks.map((m, idx) => (
+        >
+          {masks.map((m, idx) => (
+            <polygon
+              key={`mask-${idx}`}
+              points={parsePolygonPoints(m, detW, detH)}
+              fill="rgba(239, 68, 68, 0.24)"
+              stroke="#ef4444"
+              strokeWidth="3"
+              strokeDasharray="8 4"
+            />
+          ))}
+          {Object.entries(zones).map(([zName, zCfg]) => (
+            <g key={`zone-${zName}`}>
               <polygon
-                key={`mask-${idx}`}
-                points={parsePolygonPoints(m, detW, detH)}
-                fill="rgba(239, 68, 68, 0.24)"
-                stroke="#ef4444"
+                points={parsePolygonPoints(zCfg.coordinates, detW, detH)}
+                fill="rgba(14, 165, 233, 0.18)"
+                stroke="#0ea5e9"
                 strokeWidth="3"
-                strokeDasharray="8 4"
               />
-            ))}
-            {Object.entries(zones).map(([zName, zCfg]) => (
-              <g key={`zone-${zName}`}>
-                <polygon
-                  points={parsePolygonPoints(zCfg.coordinates, detW, detH)}
-                  fill="rgba(14, 165, 233, 0.18)"
-                  stroke="#0ea5e9"
-                  strokeWidth="3"
+            </g>
+          ))}
+          {draftPoints && draftPoints.length > 0 && (
+            <g>
+              <polygon
+                points={draftPoints
+                  .map(([x, y]) => `${Math.round(x * 1000)},${Math.round(y * 1000)}`)
+                  .join(" ")}
+                fill="rgba(245, 158, 11, 0.25)"
+                stroke="#f59e0b"
+                strokeWidth="3"
+              />
+              {draftPoints.map(([x, y], idx) => (
+                <circle
+                  key={idx}
+                  cx={Math.round(x * 1000)}
+                  cy={Math.round(y * 1000)}
+                  r="7"
+                  fill="#fbbf24"
+                  stroke="#000"
+                  strokeWidth="2"
                 />
-              </g>
-            ))}
-            {draftPoints && draftPoints.length > 0 && (
-              <g>
-                <polygon
-                  points={draftPoints
-                    .map(([x, y]) => `${Math.round(x * 1000)},${Math.round(y * 1000)}`)
-                    .join(" ")}
-                  fill="rgba(245, 158, 11, 0.25)"
-                  stroke="#f59e0b"
-                  strokeWidth="3"
-                />
-                {draftPoints.map(([x, y], idx) => (
-                  <circle
-                    key={idx}
-                    cx={Math.round(x * 1000)}
-                    cy={Math.round(y * 1000)}
-                    r="7"
-                    fill="#fbbf24"
-                    stroke="#000"
-                    strokeWidth="2"
-                  />
-                ))}
-              </g>
-            )}
-          </svg>
-        )}
-      </div>
+              ))}
+            </g>
+          )}
+        </svg>
+      )}
     </div>
   );
 };
@@ -506,7 +576,6 @@ export const CanvasSparkline: React.FC<CanvasSparklineProps> = ({
 
     ctx.clearRect(0, 0, w, h);
 
-    // Subtle horizontal grid lines
     ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
     ctx.lineWidth = 1;
     for (const frac of [0.25, 0.5, 0.75]) {
@@ -531,7 +600,6 @@ export const CanvasSparkline: React.FC<CanvasSparklineProps> = ({
     ctx.lineWidth = 1.75;
     ctx.stroke();
 
-    // Fill area under curve
     ctx.lineTo(w - 2, h - 2);
     ctx.lineTo(2, h - 2);
     ctx.closePath();
