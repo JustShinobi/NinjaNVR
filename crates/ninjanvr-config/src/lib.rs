@@ -807,6 +807,9 @@ impl NinjaConfig {
                     .streams
                     .insert("Stream 2".to_string(), cam_name.clone());
             }
+            if cam.objects.track.is_empty() {
+                cam.objects.track = cfg.objects.track.clone();
+            }
         }
 
         Ok(cfg)

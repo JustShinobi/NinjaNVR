@@ -1,5 +1,7 @@
 #![recursion_limit = "512"]
 
+pub mod pipeline;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,9 +24,11 @@ use ninjanvr_config::{
     DEFAULT_GO2RTC_SHM_PATH, Go2RtcSupervisor, NINJANVR_VERSION, NinjaConfig, scrub_json_value,
 };
 use ninjanvr_db::{EventFilter, ExportRow, NinjaDatabase, ReviewFilter, verify_password};
+use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{
     RecordingEngine, SharedActivityLedger, build_mp4_export, new_activity_ledger,
 };
+use pipeline::{SharedCameraMetrics, VisionPipeline};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
@@ -49,6 +53,8 @@ pub struct AppState {
     pub media_dir: PathBuf,
     pub latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     pub activity_ledger: SharedActivityLedger,
+    pub detector: Arc<AiDetectorEngine>,
+    pub camera_metrics: SharedCameraMetrics,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -622,29 +628,35 @@ fn stat_mount_mb(path: &Path, mount_type: &str) -> Value {
 
 async fn api_stats(State(state): State<AppState>) -> Json<Value> {
     let cfg = state.config.read().await;
+    let metrics_map = state.camera_metrics.read().await;
     let pid = std::process::id();
     let go2rtc_pid = state.go2rtc_supervisor.pid();
 
     let mut cameras_stats = serde_json::Map::new();
     let mut total_cam_fps = 0.0;
+    let mut total_det_fps = 0.0;
     for (cam_name, cam_cfg) in &cfg.cameras {
-        let fps = if cam_cfg.enabled {
+        let m = metrics_map.get(cam_name);
+        let fps = m.map(|x| x.camera_fps).unwrap_or(if cam_cfg.enabled {
             cam_cfg.detect.fps as f64
         } else {
             0.0
-        };
+        });
+        let det_fps = m.map(|x| x.detection_fps).unwrap_or(0.0);
+        let cam_pid = m.map(|x| x.pid).unwrap_or(pid);
         total_cam_fps += fps;
+        total_det_fps += det_fps;
         cameras_stats.insert(
             cam_name.clone(),
             json!({
                 "camera_fps": fps,
                 "process_fps": fps,
                 "skipped_fps": 0.0,
-                "detection_fps": 0.5,
+                "detection_fps": det_fps,
                 "detection_enabled": cam_cfg.detect.enabled,
                 "pid": pid,
                 "capture_pid": pid,
-                "ffmpeg_pid": pid,
+                "ffmpeg_pid": cam_pid,
                 "audio_rms": 0,
                 "audio_dBFS": 0,
                 "connection_quality": "excellent",
@@ -658,12 +670,13 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         );
     }
 
+    let infer_ms = (state.detector.avg_inference_ms() * 100.0).round() / 100.0;
     let mut detectors_stats = serde_json::Map::new();
     for det_name in cfg.detectors.keys() {
         detectors_stats.insert(
             det_name.clone(),
             json!({
-                "inference_speed": 4.2,
+                "inference_speed": infer_ms,
                 "detection_start": 0.0,
                 "pid": pid,
                 "cpu": "1.2",
@@ -685,10 +698,10 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "cameras": cameras_stats,
         "detectors": detectors_stats,
-        "camera_fps": total_cam_fps,
-        "process_fps": total_cam_fps,
+        "camera_fps": (total_cam_fps * 10.0).round() / 10.0,
+        "process_fps": (total_cam_fps * 10.0).round() / 10.0,
         "skipped_fps": 0.0,
-        "detection_fps": 2.0,
+        "detection_fps": (total_det_fps * 10.0).round() / 10.0,
         "embeddings": {},
         "cpu_usages": {
             "frigate.full_system": {
@@ -1586,8 +1599,12 @@ pub async fn new_app_state(
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("/config"));
     let jwt_secret = load_or_create_jwt_secret(config_dir);
 
+    let detector = Arc::new(AiDetectorEngine::new(&cfg));
     let shared_cfg = Arc::new(RwLock::new(cfg));
     let activity_ledger = new_activity_ledger();
+    let latest_frames = Arc::new(RwLock::new(HashMap::new()));
+    let camera_metrics: SharedCameraMetrics = Arc::new(RwLock::new(HashMap::new()));
+    let comms = Arc::new(CommsHub::new());
     let go2rtc_supervisor = Arc::new(Go2RtcSupervisor::new(shared_cfg.clone()));
     if spawn_go2rtc {
         go2rtc_supervisor.clone().spawn_supervisor_task();
@@ -1598,6 +1615,18 @@ pub async fn new_app_state(
             activity_ledger.clone(),
         ));
         rec_engine.start().await;
+
+        let vision_pipeline = Arc::new(VisionPipeline {
+            config: shared_cfg.clone(),
+            db: db.clone(),
+            comms: comms.clone(),
+            detector: detector.clone(),
+            activity_ledger: activity_ledger.clone(),
+            latest_frames: latest_frames.clone(),
+            camera_metrics: camera_metrics.clone(),
+            media_dir: media_dir.clone(),
+        });
+        vision_pipeline.start().await;
     }
 
     let http_client = reqwest::Client::builder()
@@ -1607,7 +1636,7 @@ pub async fn new_app_state(
     Ok(AppState {
         config: shared_cfg,
         db,
-        comms: Arc::new(CommsHub::new()),
+        comms,
         go2rtc_supervisor,
         go2rtc_http_base: "http://127.0.0.1:1984".to_string(),
         go2rtc_ws_base: "ws://127.0.0.1:1984".to_string(),
@@ -1616,8 +1645,10 @@ pub async fn new_app_state(
         start_instant: Instant::now(),
         web_dir,
         media_dir,
-        latest_frames: Arc::new(RwLock::new(HashMap::new())),
+        latest_frames,
         activity_ledger,
+        detector,
+        camera_metrics,
     })
 }
 

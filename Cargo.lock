@@ -1241,6 +1241,7 @@ name = "ninjanvr-infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "ninjanvr-config",
  "ninjanvr-vision",
  "serde",
@@ -1322,6 +1323,7 @@ dependencies = [
  "ninjanvr-config",
  "ninjanvr-media",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

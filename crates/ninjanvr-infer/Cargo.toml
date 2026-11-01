@@ -8,5 +8,6 @@ license.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 tracing.workspace = true
+libc = "0.2"
 ninjanvr-vision = { path = "../ninjanvr-vision" }
 ninjanvr-config = { path = "../ninjanvr-config" }
