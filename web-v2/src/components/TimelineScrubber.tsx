@@ -167,18 +167,73 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     return () => window.clearInterval(timer);
   }, []);
 
-  const windowSpanSec = zoomMin * 60;
-  const winEnd = customWinEnd ?? nowSec;
-  const winStart = winEnd - windowSpanSec;
-  const fetchBucketStart = Math.floor((winStart - 1800) / 15) * 15;
-  const fetchBucketEnd = Math.ceil((winEnd + 1800) / 15) * 15;
+  // Compute exact [00:00:00 .. 23:59:59 (or now)] bounds for the currently selected day
+  const dayBounds = useMemo(() => {
+    const todayStr = toLocalDateInputValue(nowSec);
+    const parts = selectedDay.split("-").map(Number);
+    if (parts.length !== 3 || Number.isNaN(parts[0])) {
+      const d = new Date(nowSec * 1000);
+      d.setHours(0, 0, 0, 0);
+      const start = Math.floor(d.getTime() / 1000);
+      return {
+        dayStart: start,
+        dayEnd: Math.max(start + 300, nowSec),
+        isToday: true,
+      };
+    }
+    const start = Math.floor(
+      new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000
+    );
+    const fullEnd = start + 86399;
+    const isToday = selectedDay === todayStr;
+    const end = isToday ? Math.max(start + 300, Math.min(nowSec, fullEnd)) : fullEnd;
+    return {
+      dayStart: start,
+      dayEnd: end,
+      isToday,
+    };
+  }, [selectedDay, nowSec]);
+
+  const daySpanSec = Math.max(300, dayBounds.dayEnd - dayBounds.dayStart);
+  const windowSpanSec = Math.min(zoomMin * 60, daySpanSec);
+  const rawWinEnd = customWinEnd ?? dayBounds.dayEnd;
+  const winEnd = Math.max(
+    dayBounds.dayStart + windowSpanSec,
+    Math.min(dayBounds.dayEnd, rawWinEnd)
+  );
+  const winStart = Math.max(dayBounds.dayStart, winEnd - windowSpanSec);
+  const fetchBucketStart = Math.floor(dayBounds.dayStart / 15) * 15;
+  const fetchBucketEnd = Math.ceil((dayBounds.dayEnd + 60) / 15) * 15;
+
+  const clampTsToDay = useCallback(
+    (ts: number): number =>
+      Math.max(dayBounds.dayStart, Math.min(dayBounds.dayEnd, Math.round(ts))),
+    [dayBounds]
+  );
+
+  const clampWinEndToDay = useCallback(
+    (candidateEnd: number): number | null => {
+      const clamped = Math.max(
+        dayBounds.dayStart + windowSpanSec,
+        Math.min(dayBounds.dayEnd, Math.round(candidateEnd))
+      );
+      if (dayBounds.isToday && clamped >= nowSec - 2) {
+        return null;
+      }
+      return clamped;
+    },
+    [dayBounds, windowSpanSec, nowSec]
+  );
 
   // Re-center timeline window when parent seeks to a timestamp outside the current window
   useEffect(() => {
     if (currentTs === null) return;
-    setSelectedDay(toLocalDateInputValue(currentTs));
+    const targetDay = toLocalDateInputValue(currentTs);
+    if (targetDay !== selectedDay) {
+      setSelectedDay(targetDay);
+    }
     if (currentTs < winStart || currentTs > winEnd) {
-      setCustomWinEnd(Math.min(nowSec, currentTs + Math.round(windowSpanSec * 0.5)));
+      setCustomWinEnd(currentTs + Math.round(windowSpanSec * 0.5));
     }
   }, [currentTs]);
 
@@ -251,24 +306,20 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         }
         if (dragOriginRef.current.moved) {
           const deltaSec = -Math.round((dx / Math.max(1, width)) * windowSpanSec);
-          const nextWinEnd = Math.min(
-            nowSec,
-            dragOriginRef.current.startWinEnd + deltaSec
+          setCustomWinEnd(
+            clampWinEndToDay(dragOriginRef.current.startWinEnd + deltaSec)
           );
-          setCustomWinEnd(nextWinEnd >= nowSec - 2 ? null : nextWinEnd);
-          setHoverTs(
-            Math.min(nowSec, dragOriginRef.current.startPlayhead + deltaSec)
-          );
+          setHoverTs(clampTsToDay(dragOriginRef.current.startPlayhead + deltaSec));
         }
         return;
       }
 
-      const ts = clientXToTs(e.clientX);
+      const ts = clampTsToDay(clientXToTs(e.clientX));
       if (draggingTarget === "in") {
-        setRangeStart(Math.min(ts, rangeEnd - 5));
+        setRangeStart(Math.max(dayBounds.dayStart, Math.min(ts, rangeEnd - 5)));
         setReadyDownloadUrl(null);
       } else if (draggingTarget === "out") {
-        setRangeEnd(Math.max(ts, rangeStart + 5));
+        setRangeEnd(Math.min(dayBounds.dayEnd, Math.max(ts, rangeStart + 5)));
         setReadyDownloadUrl(null);
       }
     };
@@ -278,15 +329,15 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         dragOriginRef.current = null;
         setDraggingTarget(null);
         if (!origin.moved) {
-          const ts = clientXToTs(e.clientX);
-          onSeek(ts >= nowSec - 3 ? null : ts);
+          const ts = clampTsToDay(clientXToTs(e.clientX));
+          onSeek(dayBounds.isToday && ts >= nowSec - 3 ? null : ts);
         } else {
           const el = trackRef.current;
           const width = el?.clientWidth || 800;
           const dx = e.clientX - origin.startX;
           const deltaSec = -Math.round((dx / Math.max(1, width)) * windowSpanSec);
-          const targetTs = Math.min(nowSec, origin.startPlayhead + deltaSec);
-          onSeek(targetTs >= nowSec - 3 ? null : targetTs);
+          const targetTs = clampTsToDay(origin.startPlayhead + deltaSec);
+          onSeek(dayBounds.isToday && targetTs >= nowSec - 3 ? null : targetTs);
         }
         return;
       }
@@ -300,9 +351,21 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-  }, [draggingTarget, clientXToTs, nowSec, onSeek, rangeEnd, rangeStart, windowSpanSec]);
+  }, [
+    draggingTarget,
+    clientXToTs,
+    clampTsToDay,
+    clampWinEndToDay,
+    dayBounds,
+    nowSec,
+    onSeek,
+    rangeEnd,
+    rangeStart,
+    windowSpanSec,
+  ]);
 
   // Native non-passive wheel listener on the timeline track for PC mouse-wheel scrubbing & Ctrl+wheel zoom
+  // Strictly bounded within `selectedDay` (`[dayBounds.dayStart, dayBounds.dayEnd]`)!
   useEffect(() => {
     const el = trackRef.current;
     if (!el) return;
@@ -313,7 +376,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
       if (rawDelta === 0) return;
 
-      // Ctrl + Wheel or Alt + Wheel = Zoom In / Out around hovered timestamp
+      // Ctrl + Wheel or Alt + Wheel = Zoom In / Out around hovered timestamp (clamped to selectedDay)
       if (e.ctrlKey || e.altKey) {
         const curIdx = ZOOM_LEVELS.indexOf(zoomMin);
         const nextIdx =
@@ -322,27 +385,32 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             : Math.min(ZOOM_LEVELS.length - 1, curIdx + 1);
         const nextZoom = ZOOM_LEVELS[nextIdx];
         if (nextZoom !== zoomMin) {
-          const anchor = clientXToTs(e.clientX);
+          const anchor = clampTsToDay(clientXToTs(e.clientX));
           setZoomMin(nextZoom);
-          const nextSpan = nextZoom * 60;
-          const nextEnd = Math.min(nowSec, anchor + Math.round(nextSpan * 0.5));
-          setCustomWinEnd(nextEnd >= nowSec - 2 ? null : nextEnd);
+          const nextSpan = Math.min(nextZoom * 60, daySpanSec);
+          const nextEnd = Math.max(
+            dayBounds.dayStart + nextSpan,
+            Math.min(dayBounds.dayEnd, anchor + Math.round(nextSpan * 0.5))
+          );
+          setCustomWinEnd(
+            dayBounds.isToday && nextEnd >= nowSec - 2 ? null : nextEnd
+          );
         }
         return;
       }
 
-      // Normal Wheel = Scrub / Pan through time (Shift = fine 10s step)
+      // Normal Wheel = Scrub / Pan through time within selectedDay (Shift = fine 10s step)
       const dir = rawDelta > 0 ? 1 : -1;
       const stepSec = e.shiftKey
         ? 10
         : Math.max(15, Math.round(windowSpanSec * 0.08));
 
-      const nextWinEnd = Math.min(nowSec, winEnd + dir * stepSec);
-      setCustomWinEnd(nextWinEnd >= nowSec - 2 ? null : nextWinEnd);
+      setCustomWinEnd(clampWinEndToDay(winEnd + dir * stepSec));
 
-      const basePlayhead =
-        pendingWheelPlayheadRef.current ?? currentTs ?? winEnd;
-      const nextPlayhead = Math.min(nowSec, basePlayhead + dir * stepSec);
+      const basePlayhead = clampTsToDay(
+        pendingWheelPlayheadRef.current ?? currentTs ?? winEnd
+      );
+      const nextPlayhead = clampTsToDay(basePlayhead + dir * stepSec);
       pendingWheelPlayheadRef.current = nextPlayhead;
       setHoverTs(nextPlayhead);
 
@@ -350,9 +418,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         window.clearTimeout(wheelSeekTimerRef.current);
       }
       wheelSeekTimerRef.current = window.setTimeout(() => {
-        const finalTarget = pendingWheelPlayheadRef.current ?? nextPlayhead;
+        const finalTarget = clampTsToDay(
+          pendingWheelPlayheadRef.current ?? nextPlayhead
+        );
         pendingWheelPlayheadRef.current = null;
-        onSeek(finalTarget >= nowSec - 3 ? null : finalTarget);
+        onSeek(
+          dayBounds.isToday && finalTarget >= nowSec - 3 ? null : finalTarget
+        );
       }, 140);
     };
 
@@ -360,7 +432,19 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     return () => {
       el.removeEventListener("wheel", onWheel);
     };
-  }, [zoomMin, windowSpanSec, winEnd, currentTs, nowSec, clientXToTs, onSeek]);
+  }, [
+    zoomMin,
+    windowSpanSec,
+    daySpanSec,
+    dayBounds,
+    winEnd,
+    currentTs,
+    nowSec,
+    clientXToTs,
+    clampTsToDay,
+    clampWinEndToDay,
+    onSeek,
+  ]);
 
   // Jump to a specific Day from the Multi-Day Calendar
   const handleSelectDay = (dayObj: RecordingDaySummary) => {
@@ -443,9 +527,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     }
   };
 
-  // Activity-Only Skip: Jump to Previous or Next Event/Motion Segment (skips quiet hours!)
+  // Activity-Only Skip: Jump to Previous or Next Event/Motion Segment within selectedDay
   const jumpToActivity = (direction: "prev" | "next") => {
-    const anchor = currentTs ?? nowSec;
+    const anchor = clampTsToDay(currentTs ?? winEnd);
     const candidates: number[] = [];
     for (const r of windowReviews) {
       candidates.push(Math.floor(r.start_time));
@@ -459,30 +543,29 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
     if (direction === "prev") {
       const prev = [...candidates].reverse().find((t) => t < anchor - 8);
-      const target = prev ?? anchor - 300;
+      const target = clampTsToDay(prev ?? anchor - 300);
       if (target < winStart) {
-        setCustomWinEnd(target + Math.round(windowSpanSec * 0.8));
+        setCustomWinEnd(clampWinEndToDay(target + Math.round(windowSpanSec * 0.8)));
       }
       onSeek(target);
       if (rangeMode) {
         setRangeStart(target);
-        setRangeEnd(target + 45);
+        setRangeEnd(clampTsToDay(target + 45));
       }
     } else {
       const next = candidates.find((t) => t > anchor + 8);
-      const fallbackNext = Math.min(nowSec, anchor + 300);
-      const target = next ?? fallbackNext;
-      if (target >= nowSec - 3) {
+      const target = clampTsToDay(next ?? anchor + 300);
+      if (dayBounds.isToday && target >= nowSec - 3) {
         setCustomWinEnd(null);
         onSeek(null);
       } else {
         if (target > winEnd) {
-          setCustomWinEnd(Math.min(nowSec, target + Math.round(windowSpanSec * 0.5)));
+          setCustomWinEnd(clampWinEndToDay(target + Math.round(windowSpanSec * 0.5)));
         }
         onSeek(target);
         if (rangeMode) {
           setRangeStart(target);
-          setRangeEnd(Math.min(nowSec, target + 45));
+          setRangeEnd(clampTsToDay(target + 45));
         }
       }
     }
@@ -1043,7 +1126,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           <button
             className="nvr-btn mono"
             style={{ height: 22, padding: "0 6px", fontSize: 10 }}
-            onClick={() => onSeek((currentTs ?? winEnd) - 30)}
+            onClick={() => onSeek(clampTsToDay((currentTs ?? winEnd) - 30))}
           >
             -30s
           </button>
@@ -1051,8 +1134,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             className="nvr-btn mono"
             style={{ height: 22, padding: "0 6px", fontSize: 10 }}
             onClick={() => {
-              const next = (currentTs ?? winEnd) + 30;
-              onSeek(next >= nowSec - 2 ? null : next);
+              const next = clampTsToDay((currentTs ?? winEnd) + 30);
+              onSeek(dayBounds.isToday && next >= nowSec - 2 ? null : next);
             }}
           >
             +30s
@@ -1061,6 +1144,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             className={`nvr-btn mono ${currentTs === null ? "success" : ""}`}
             style={{ height: 22, padding: "0 8px", fontSize: 10.5 }}
             onClick={() => {
+              setSelectedDay(toLocalDateInputValue(nowSec));
               setCustomWinEnd(null);
               onSeek(null);
             }}
@@ -1097,9 +1181,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             <button
               className="nvr-btn"
               style={{ height: 22, padding: "0 5px" }}
-              title="Pan timeline earlier"
+              title="Pan timeline earlier within selected day"
+              disabled={winStart <= dayBounds.dayStart}
               onClick={() =>
-                setCustomWinEnd((curr) => (curr ?? nowSec) - Math.round(windowSpanSec * 0.5))
+                setCustomWinEnd(
+                  clampWinEndToDay(winEnd - Math.round(windowSpanSec * 0.5))
+                )
               }
             >
               <ChevronLeft size={12} />
@@ -1107,13 +1194,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             <button
               className="nvr-btn"
               style={{ height: 22, padding: "0 5px" }}
-              title="Pan timeline later"
-              disabled={customWinEnd === null || customWinEnd >= nowSec}
+              title="Pan timeline later within selected day"
+              disabled={winEnd >= dayBounds.dayEnd}
               onClick={() =>
-                setCustomWinEnd((curr) => {
-                  const next = (curr ?? nowSec) + Math.round(windowSpanSec * 0.5);
-                  return next >= nowSec ? null : next;
-                })
+                setCustomWinEnd(
+                  clampWinEndToDay(winEnd + Math.round(windowSpanSec * 0.5))
+                )
               }
             >
               <ChevronRight size={12} />
