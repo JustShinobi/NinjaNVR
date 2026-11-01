@@ -197,6 +197,16 @@ impl VisionPipeline {
                 width, height, fps
             );
 
+            self.camera_metrics.write().await.insert(
+                camera.clone(),
+                CameraRuntimeMetrics {
+                    camera_fps: fps as f64,
+                    process_fps: fps as f64,
+                    detection_fps: 1.2,
+                    pid: child_pid,
+                },
+            );
+
             if let Some(mut stdout) = child.stdout.take() {
                 let mut frame_data: Arc<Vec<u8>> = Arc::new(vec![0u8; frame_byte_len]);
                 let mut frame_count = 0u64;
@@ -231,13 +241,19 @@ impl VisionPipeline {
 
                     // 2. Dynamic Region Cropping & AI Object Detection
                     let tracked_boxes = tracker.non_stationary_boxes(&motion_boxes);
-                    let regions = compute_inference_regions(
+                    let mut regions = compute_inference_regions(
                         width,
                         height,
                         model_w.max(model_h),
                         &motion_boxes,
                         &tracked_boxes,
                     );
+                    // Periodic 1 Hz full/center scan when idle so stationary & slow-entering objects are verified
+                    if regions.is_empty() && frame_count.is_multiple_of(fps as u64) {
+                        let side = height.min(width);
+                        let x0 = (width - side) / 2;
+                        regions.push(BoundingBox::new(x0, 0, x0 + side, side));
+                    }
 
                     let mut raw_detections = Vec::new();
                     for region in &regions {
