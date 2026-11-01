@@ -1,0 +1,19 @@
+name: Feature Request
+description: Propose an enhancement for NinjaNVR engine, Console v2, or Tauri desktop client
+title: "[Feat]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Use Case / Problem Statement
+      description: What operator workflow or system capability would this improve?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe how the feature should work in NinjaNVR.
+    validations:
+      required: true

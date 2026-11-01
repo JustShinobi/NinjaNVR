@@ -1,0 +1,41 @@
+name: Bug Report
+description: Report a bug in NinjaNVR server, vision/AI pipeline, VOD playback, or Console v2
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue! **Never paste real RTSP passwords, tokens, or private internal domain names.**
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - NinjaNVR Console v2 (web-v2)
+        - Tauri v2 Desktop App (ninjanvr-desktop)
+        - Server & API (ninjanvr-server / ninjanvr-comms)
+        - Media & VOD Remuxer (ninjanvr-media / ninjanvr-vod)
+        - Vision, AI Inference & Tracking (ninjanvr-vision / ninjanvr-infer / ninjanvr-track)
+        - Database & Config (ninjanvr-db / ninjanvr-config)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: NinjaNVR Version
+      placeholder: "v0.9.0"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs or Sanitized Config
+      render: shell
