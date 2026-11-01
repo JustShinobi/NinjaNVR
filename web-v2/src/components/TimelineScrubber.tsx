@@ -20,6 +20,7 @@ import {
   RecordingSegment,
   ReviewItem,
 } from "../types/nvr";
+import { RecordingCalendarPopover } from "./RecordingCalendarPopover";
 
 export type TimelineZoomMinutes = 15 | 60 | 360 | 1440;
 
@@ -589,35 +590,25 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               })}
             </div>
 
-            {/* Direct Date + Time Jump & Storyboard Toggle */}
+            {/* Interactive Calendar Popover + Time Jump & Storyboard Toggle */}
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span className="mono" style={{ fontSize: 10, color: "var(--text-muted)" }}>
-                JUMP TO:
-              </span>
-              <input
-                type="date"
-                className="nvr-input mono"
-                style={{ height: 24, fontSize: 11, padding: "0 6px" }}
-                value={toLocalDateInputValue(displayAnchorTs)}
-                onChange={(e) =>
-                  handleDirectDateTimeJump(
-                    e.target.value,
-                    toLocalTimeInputValue(displayAnchorTs)
-                  )
-                }
-              />
-              <input
-                type="time"
-                step="1"
-                className="nvr-input mono"
-                style={{ height: 24, fontSize: 11, padding: "0 6px" }}
-                value={toLocalTimeInputValue(displayAnchorTs)}
-                onChange={(e) =>
-                  handleDirectDateTimeJump(
-                    toLocalDateInputValue(displayAnchorTs),
-                    e.target.value
-                  )
-                }
+              <RecordingCalendarPopover
+                daysSummary={daysSummary}
+                selectedDate={selectedDay}
+                selectedTime={toLocalTimeInputValue(displayAnchorTs)}
+                showTimePicker={true}
+                openUpward={true}
+                buttonLabelPrefix="Calendar"
+                onSelectDate={(dateStr, dayObj) => {
+                  if (dayObj) {
+                    handleSelectDay(dayObj);
+                  } else {
+                    handleDirectDateTimeJump(dateStr, "12:00:00");
+                  }
+                }}
+                onSelectDateTime={(dateStr, timeStr) => {
+                  handleDirectDateTimeJump(dateStr, timeStr);
+                }}
               />
               <button
                 className={`nvr-btn ${showStoryboard ? "primary" : ""}`}
@@ -875,11 +866,30 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             </div>
           )}
 
-          {/* Prominent Multi-Day Archive & Heatmap Button */}
+          {/* Prominent Multi-Day Archive & Heatmap Button + Direct Recording Calendar Popover */}
+          <RecordingCalendarPopover
+            daysSummary={daysSummary}
+            selectedDate={selectedDay}
+            selectedTime={toLocalTimeInputValue(displayAnchorTs)}
+            showTimePicker={true}
+            openUpward={true}
+            buttonLabelPrefix="Calendar"
+            onSelectDate={(dateStr, dayObj) => {
+              if (dayObj) {
+                handleSelectDay(dayObj);
+              } else {
+                handleDirectDateTimeJump(dateStr, "12:00:00");
+              }
+            }}
+            onSelectDateTime={(dateStr, timeStr) => {
+              handleDirectDateTimeJump(dateStr, timeStr);
+            }}
+          />
+
           <button
             className={`nvr-btn ${showArchiveDeck ? "primary" : ""}`}
             style={{
-              height: 24,
+              height: 26,
               padding: "0 9px",
               fontSize: 11,
               fontWeight: 600,
@@ -888,10 +898,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             }}
             onClick={() => setShowArchiveDeck((v) => !v)}
           >
-            <Calendar size={12} />
+            <Grid size={12} />
             {showArchiveDeck
-              ? "Hide Days & Hours"
-              : `Browse Days & Hours (${daysSummary.length || 1}d)`}
+              ? "Hide 24h Matrix"
+              : `24h Activity Matrix (${daysSummary.length || 1}d)`}
           </button>
 
           <span

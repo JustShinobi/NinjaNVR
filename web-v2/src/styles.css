@@ -404,30 +404,56 @@ body,
   display: block;
 }
 
-.nvr-cam-hud-top {
+.nvr-cam-hud {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  padding: 7px 10px;
+  padding: 6px 8px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  background: linear-gradient(180deg, rgba(6, 7, 10, 0.82) 0%, rgba(6, 7, 10, 0) 100%);
-  pointer-events: none;
+  gap: 5px;
+  flex-wrap: wrap;
   z-index: 5;
+  pointer-events: auto;
+  max-width: 98%;
 }
 
-.nvr-cam-hud-bottom {
-  position: absolute;
+.nvr-cam-hud.pos-bottom-right {
+  bottom: 0;
+  right: 0;
+  justify-content: flex-end;
+}
+
+.nvr-cam-hud.pos-top-right {
+  top: 0;
+  right: 0;
+  justify-content: flex-end;
+}
+
+.nvr-cam-hud.pos-top-left {
+  top: 0;
+  left: 0;
+  justify-content: flex-start;
+}
+
+.nvr-cam-hud.pos-bottom-left {
   bottom: 0;
   left: 0;
+  justify-content: flex-start;
+}
+
+.nvr-cam-hud.pos-hidden {
+  display: none !important;
+}
+
+.nvr-cam-hud-top {
+  position: absolute;
+  bottom: 0;
   right: 0;
-  padding: 6px 10px;
+  padding: 6px 8px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  background: linear-gradient(0deg, rgba(6, 7, 10, 0.86) 0%, rgba(6, 7, 10, 0) 100%);
+  justify-content: flex-end;
+  gap: 6px;
+  pointer-events: none;
   z-index: 5;
 }
 

@@ -38,6 +38,7 @@ import {
   ExportItem,
   NinjaConfigResponse,
   NinjaStatsResponse,
+  RecordingDaySummary,
   RecordingSegment,
   ReviewItem,
 } from "./types/nvr";
@@ -48,6 +49,9 @@ import {
   extractMaskPolygons,
 } from "./components/VideoPlayers";
 import { TimelineScrubber } from "./components/TimelineScrubber";
+import { RecordingCalendarPopover } from "./components/RecordingCalendarPopover";
+
+type HudPosition = "bottom-right" | "top-right" | "top-left" | "bottom-left" | "hidden";
 
 type WorkspaceTab =
   | "live"
@@ -132,8 +136,22 @@ export const App: React.FC = () => {
   const [selectedCamera, setSelectedCamera] = useState<string>("escritorio");
   const [useMainStream, setUseMainStream] = useState(false);
   const [showVectors, setShowVectors] = useState(false);
+  const [hudPosition, setHudPosition] = useState<HudPosition>(() => {
+    const saved = window.localStorage?.getItem("ninjanvr_hud_position");
+    if (
+      saved === "bottom-right" ||
+      saved === "top-right" ||
+      saved === "top-left" ||
+      saved === "bottom-left" ||
+      saved === "hidden"
+    ) {
+      return saved;
+    }
+    return "bottom-right";
+  });
   const [timeShiftTs, setTimeShiftTs] = useState<number | null>(null);
   const [focusSegments, setFocusSegments] = useState<RecordingSegment[]>([]);
+  const [globalDaysSummary, setGlobalDaysSummary] = useState<RecordingDaySummary[]>([]);
   const [hoveredAlertId, setHoveredAlertId] = useState<string | null>(null);
 
   // Review & Triage state
@@ -330,7 +348,15 @@ export const App: React.FC = () => {
         if (Array.isArray(segs)) setFocusSegments(segs);
       })
       .catch(() => {});
-  }, [authNeeded, timelineCam, stats?.service?.last_updated]);
+    fetch(`/api/${encodeURIComponent(timelineCam)}/recordings/summary`, {
+      credentials: "include",
+    })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((days) => {
+        if (Array.isArray(days)) setGlobalDaysSummary(days);
+      })
+      .catch(() => {});
+  }, [authChecked, authNeeded, timelineCam, stats?.service?.last_updated]);
 
   // Tab-specific data loaders
   useEffect(() => {
@@ -942,6 +968,23 @@ export const App: React.FC = () => {
               </div>
 
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <select
+                  className="nvr-select mono"
+                  style={{ height: 28, fontSize: 11 }}
+                  value={hudPosition}
+                  onChange={(e) => {
+                    const next = e.target.value as HudPosition;
+                    setHudPosition(next);
+                    window.localStorage?.setItem("ninjanvr_hud_position", next);
+                  }}
+                  title="Configure where camera info badges appear so they never cover camera OSD text"
+                >
+                  <option value="bottom-right">HUD: Bottom-Right</option>
+                  <option value="top-right">HUD: Top-Right</option>
+                  <option value="top-left">HUD: Top-Left</option>
+                  <option value="bottom-left">HUD: Bottom-Left</option>
+                  <option value="hidden">HUD: Hidden</option>
+                </select>
                 <button
                   className={`nvr-btn ${useMainStream ? "active" : ""}`}
                   onClick={() => setUseMainStream((v) => !v)}
@@ -1137,86 +1180,78 @@ export const App: React.FC = () => {
                           }}
                         />
                       )}
-                      <div className="nvr-cam-hud-top">
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <div className={`nvr-cam-hud pos-${hudPosition}`}>
+                        <span
+                          className={`nvr-badge ${isTimeShifted ? "rewind" : "live"}`}
+                        >
                           <span
-                            className={`nvr-badge ${isTimeShifted ? "rewind" : "live"}`}
-                          >
-                            <span
-                              className={`nvr-dot ${isTimeShifted ? "motion" : "live"}`}
-                            />
-                            {cam.toUpperCase()}
-                            {isTimeShifted && timeShiftTs !== null
-                              ? ` @ ${formatTs(timeShiftTs)}`
-                              : ""}
-                          </span>
-                          <span className="nvr-badge">
-                            {camCfg?.detect?.width || 1280}×{camCfg?.detect?.height || 720} ·{" "}
-                            {camStat?.camera_fps?.toFixed(1) || "5.0"} FPS
-                          </span>
-                        </div>
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                          {hasPerson && <span className="nvr-badge alert">PERSON TRACK</span>}
-                          {hasMotion && !hasPerson && (
-                            <span className="nvr-badge motion">{t.live.motionActive}</span>
-                          )}
-                          <span className="nvr-badge">
-                            AI {camStat?.detection_fps?.toFixed(1) || "0.0"} FPS
-                          </span>
-                        </div>
-                      </div>
-                      <div className="nvr-cam-hud-bottom">
-                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            className={`nvr-dot ${isTimeShifted ? "motion" : "live"}`}
+                          />
+                          {cam.toUpperCase()}
+                          {isTimeShifted && timeShiftTs !== null
+                            ? ` @ ${formatTs(timeShiftTs)}`
+                            : ""}
+                        </span>
+                        <span className="nvr-badge">
+                          {camCfg?.detect?.width || 1280}×{camCfg?.detect?.height || 720} ·{" "}
+                          {camStat?.camera_fps?.toFixed(1) || "5.0"} FPS
+                        </span>
+                        {hasPerson && <span className="nvr-badge alert">PERSON</span>}
+                        {hasMotion && !hasPerson && (
+                          <span className="nvr-badge motion">{t.live.motionActive}</span>
+                        )}
+                        <span className="nvr-badge">
+                          AI {camStat?.detection_fps?.toFixed(1) || "0.0"} FPS
+                        </span>
+                        <button
+                          className="nvr-btn"
+                          style={{ height: 20, padding: "0 6px", fontSize: 10 }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedCamera(cam);
+                            setTimeShiftTs(Math.floor(Date.now() / 1000) - 30);
+                          }}
+                        >
+                          <Clock size={10} />
+                          {t.live.rewind30s}
+                        </button>
+                        {isTimeShifted && (
                           <button
-                            className="nvr-btn"
-                            style={{ height: 22, padding: "0 7px", fontSize: 10.5 }}
+                            className="nvr-btn success"
+                            style={{ height: 20, padding: "0 6px", fontSize: 10 }}
                             onClick={(e) => {
                               e.stopPropagation();
-                              setSelectedCamera(cam);
-                              setTimeShiftTs(Math.floor(Date.now() / 1000) - 30);
+                              setTimeShiftTs(null);
                             }}
                           >
-                            <Clock size={11} />
-                            {t.live.rewind30s}
+                            LIVE
                           </button>
-                          {isTimeShifted && (
-                            <button
-                              className="nvr-btn success"
-                              style={{ height: 22, padding: "0 7px", fontSize: 10.5 }}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setTimeShiftTs(null);
-                              }}
-                            >
-                              LIVE
-                            </button>
-                          )}
-                          <button
-                            className="nvr-btn"
-                            style={{ height: 22, padding: "0 7px", fontSize: 10.5 }}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSelectedCamera(cam);
-                              setLiveLayout("focus");
-                            }}
-                          >
-                            Expand Focus
-                          </button>
-                        </div>
+                        )}
+                        <button
+                          className="nvr-btn"
+                          style={{ height: 20, padding: "0 6px", fontSize: 10 }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedCamera(cam);
+                            setLiveLayout("focus");
+                          }}
+                        >
+                          Expand
+                        </button>
                         <a
                           href={`/api/${cam}/latest.jpg`}
                           download={`${cam}-snapshot.jpg`}
                           className="nvr-btn"
                           style={{
-                            height: 22,
-                            padding: "0 7px",
-                            fontSize: 10.5,
+                            height: 20,
+                            padding: "0 6px",
+                            fontSize: 10,
                             textDecoration: "none",
                           }}
                           onClick={(e) => e.stopPropagation()}
+                          title={t.live.snapshot}
                         >
-                          <Camera size={11} />
-                          {t.live.snapshot}
+                          <Camera size={10} />
                         </a>
                       </div>
                     </div>
@@ -1249,36 +1284,32 @@ export const App: React.FC = () => {
                         playbackRate={playbackSpeed}
                       />
                     )}
-                    <div className="nvr-cam-hud-top">
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <div className={`nvr-cam-hud pos-${hudPosition}`}>
+                      <span
+                        className={`nvr-badge ${timeShiftTs === null ? "live" : "rewind"}`}
+                      >
                         <span
-                          className={`nvr-badge ${timeShiftTs === null ? "live" : "rewind"}`}
+                          className={`nvr-dot ${timeShiftTs === null ? "live" : "motion"}`}
+                        />
+                        {selectedCamera.toUpperCase()} //{" "}
+                        {timeShiftTs === null
+                          ? t.live.liveBadge
+                          : `${t.live.timeShiftBadge} @ ${formatTs(timeShiftTs)}`}
+                      </span>
+                      <span className="nvr-badge">
+                        {stats?.cameras?.[selectedCamera]?.camera_fps?.toFixed(1) || "5.0"} FPS ·
+                        AI {stats?.cameras?.[selectedCamera]?.detection_fps?.toFixed(1) || "0.0"}{" "}
+                        FPS
+                      </span>
+                      {timeShiftTs !== null && (
+                        <button
+                          className="nvr-btn success"
+                          onClick={() => setTimeShiftTs(null)}
                         >
-                          <span
-                            className={`nvr-dot ${timeShiftTs === null ? "live" : "motion"}`}
-                          />
-                          {selectedCamera.toUpperCase()} //{" "}
-                          {timeShiftTs === null
-                            ? t.live.liveBadge
-                            : `${t.live.timeShiftBadge} @ ${formatTs(timeShiftTs)}`}
-                        </span>
-                        <span className="nvr-badge">
-                          {stats?.cameras?.[selectedCamera]?.camera_fps?.toFixed(1) || "5.0"} FPS ·
-                          AI {stats?.cameras?.[selectedCamera]?.detection_fps?.toFixed(1) || "0.0"}{" "}
-                          FPS
-                        </span>
-                      </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6, pointerEvents: "auto" }}>
-                        {timeShiftTs !== null && (
-                          <button
-                            className="nvr-btn success"
-                            onClick={() => setTimeShiftTs(null)}
-                          >
-                            <Play size={12} />
-                            {t.live.returnToLive}
-                          </button>
-                        )}
-                      </div>
+                          <Play size={12} />
+                          {t.live.returnToLive}
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -1301,7 +1332,7 @@ export const App: React.FC = () => {
                             showVectors={showVectors}
                             onClick={() => setSelectedCamera(cam)}
                           />
-                          <div className="nvr-cam-hud-top">
+                          <div className={`nvr-cam-hud pos-${hudPosition}`}>
                             <span className="nvr-badge live">{cam.toUpperCase()}</span>
                             <span className="nvr-badge">
                               {stats?.cameras?.[cam]?.camera_fps?.toFixed(1) || "5.0"} FPS
@@ -1536,26 +1567,19 @@ export const App: React.FC = () => {
                   <option value="reviewed">{t.review.reviewedOnly}</option>
                   <option value="all">{t.review.allStatuses}</option>
                 </select>
-                <input
-                  type="date"
-                  className="nvr-input mono"
-                  style={{ height: 28, fontSize: 11.5 }}
-                  value={reviewDateFilter}
-                  onChange={(e) => {
-                    setReviewDateFilter(e.target.value);
-                    if (e.target.value) setReviewStatusFilter("all");
+                <RecordingCalendarPopover
+                  daysSummary={globalDaysSummary}
+                  selectedDate={reviewDateFilter}
+                  showTimePicker={false}
+                  allowClear={true}
+                  openUpward={false}
+                  buttonLabelPrefix="Date"
+                  onSelectDate={(dateStr) => {
+                    setReviewDateFilter(dateStr);
+                    if (dateStr) setReviewStatusFilter("all");
                   }}
-                  title="Filter reviews by specific historical date"
+                  onClear={() => setReviewDateFilter("")}
                 />
-                {reviewDateFilter && (
-                  <button
-                    className="nvr-btn mono"
-                    style={{ height: 28, fontSize: 10.5 }}
-                    onClick={() => setReviewDateFilter("")}
-                  >
-                    All Dates
-                  </button>
-                )}
                 <span className="mono" style={{ color: "var(--text-muted)", fontSize: 11 }}>
                   {filteredReviews.length} matching (showing top 40)
                 </span>
@@ -1860,23 +1884,16 @@ export const App: React.FC = () => {
                   <Star size={12} />
                   {t.explore.favoritesOnly}
                 </button>
-                <input
-                  type="date"
-                  className="nvr-input mono"
-                  style={{ height: 28, fontSize: 11.5 }}
-                  value={reviewDateFilter}
-                  onChange={(e) => setReviewDateFilter(e.target.value)}
-                  title="Filter tracked objects by specific historical date"
+                <RecordingCalendarPopover
+                  daysSummary={globalDaysSummary}
+                  selectedDate={reviewDateFilter}
+                  showTimePicker={false}
+                  allowClear={true}
+                  openUpward={false}
+                  buttonLabelPrefix="Date"
+                  onSelectDate={(dateStr) => setReviewDateFilter(dateStr)}
+                  onClear={() => setReviewDateFilter("")}
                 />
-                {reviewDateFilter && (
-                  <button
-                    className="nvr-btn mono"
-                    style={{ height: 28, fontSize: 10.5 }}
-                    onClick={() => setReviewDateFilter("")}
-                  >
-                    All Dates
-                  </button>
-                )}
               </div>
               <span className="mono" style={{ fontSize: 11, color: "var(--text-secondary)" }}>
                 {filteredEvents.length} tracked object events
