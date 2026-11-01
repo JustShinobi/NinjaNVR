@@ -109,10 +109,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     return Math.round(winStart + frac * windowSpanSec);
   };
 
-  // Global mouse move / up when dragging playhead or IN/OUT handles
+  // Global pointer move / up when dragging playhead or IN/OUT handles
   useEffect(() => {
     if (!draggingTarget) return;
-    const onMove = (e: MouseEvent) => {
+    const onMove = (e: PointerEvent) => {
       const ts = clientXToTs(e.clientX);
       if (draggingTarget === "playhead") {
         onSeek(ts >= nowSec - 3 ? null : ts);
@@ -127,11 +127,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     const onUp = () => {
       setDraggingTarget(null);
     };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
     return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
     };
   });
 
@@ -429,7 +429,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 style={{ height: 20, padding: "0 6px", fontSize: 10 }}
                 title="Set IN point to current playhead"
                 onClick={() => {
-                  if (currentTs) setRangeStart(Math.min(currentTs, rangeEnd - 5));
+                  const anchor = currentTs ?? nowSec - 30;
+                  setRangeStart(Math.min(anchor, rangeEnd - 5));
                 }}
               >
                 [ Set IN
@@ -476,7 +477,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 style={{ height: 20, padding: "0 6px", fontSize: 10 }}
                 title="Set OUT point to current playhead"
                 onClick={() => {
-                  if (currentTs) setRangeEnd(Math.max(currentTs, rangeStart + 5));
+                  const anchor = currentTs ?? nowSec;
+                  setRangeEnd(Math.max(anchor, rangeStart + 5));
                 }}
               >
                 Set OUT ]
@@ -576,7 +578,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           setHoverTs(clientXToTs(e.clientX));
         }}
         onMouseLeave={() => setHoverTs(null)}
-        onMouseDown={(e) => {
+        onPointerDown={(e) => {
           if ((e.target as HTMLElement).dataset.handle) return;
           const ts = clientXToTs(e.clientX);
           onSeek(ts >= nowSec - 3 ? null : ts);
@@ -703,7 +705,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             {/* Left Draggable [ IN Handle */}
             <div
               data-handle="in"
-              onMouseDown={(e) => {
+              onPointerDown={(e) => {
                 e.stopPropagation();
                 setDraggingTarget("in");
               }}
@@ -733,7 +735,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             {/* Right Draggable OUT ] Handle */}
             <div
               data-handle="out"
-              onMouseDown={(e) => {
+              onPointerDown={(e) => {
                 e.stopPropagation();
                 setDraggingTarget("out");
               }}
