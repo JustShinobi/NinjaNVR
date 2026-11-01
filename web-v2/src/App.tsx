@@ -697,7 +697,7 @@ export const App: React.FC = () => {
               </span>
             </div>
             <div className="nvr-brand-sub">
-              {wsOnline ? "WS REALTIME NOMINAL" : "POLLING SYNC"} · {cameraNames.length} CH
+              {wsOnline ? "WS NOMINAL" : "POLLING"} · {cameraNames.length} CH
             </div>
           </div>
         </div>
@@ -1468,6 +1468,7 @@ export const App: React.FC = () => {
                       startTime={syncMasterTs}
                       endTime={syncMasterTs + 120}
                       playbackRate={syncSpeed}
+                      controls={false}
                     />
                     <div className="nvr-cam-hud-top">
                       <span className="nvr-badge rewind">
@@ -1945,6 +1946,34 @@ export const App: React.FC = () => {
                           {t.explore.retainToggle}
                         </button>
                         <button
+                          className="nvr-btn"
+                          onClick={async () => {
+                            await fetch(
+                              `/api/events/${encodeURIComponent(selectedEvent.id)}/false_positive`,
+                              {
+                                method: "PUT",
+                                headers: { "Content-Type": "application/json" },
+                                credentials: "include",
+                                body: JSON.stringify({ false_positive: true }),
+                              }
+                            );
+                            notify("Event flagged as false positive");
+                          }}
+                        >
+                          <AlertTriangle size={12} />
+                          {t.explore.falsePositive}
+                        </button>
+                        <button
+                          className="nvr-btn"
+                          onClick={() => {
+                            setSyncMasterTs(Math.floor(selectedEvent.start_time));
+                            switchTab("sync");
+                          }}
+                        >
+                          <Layers size={12} />
+                          4-Cam Sync
+                        </button>
+                        <button
                           className="nvr-btn danger"
                           onClick={() => handleEventDelete(selectedEvent.id)}
                         >
@@ -2404,62 +2433,15 @@ export const App: React.FC = () => {
                 </div>
 
                 <div className="nvr-focus-stage">
-                  <div
-                    className="nvr-cam-tile"
-                    style={{ flex: 1, cursor: "crosshair" }}
-                    onClick={(e) => {
-                      const rect = e.currentTarget.getBoundingClientRect();
-                      const nx = Math.max(
-                        0,
-                        Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width))
-                      );
-                      const ny = Math.max(
-                        0,
-                        Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height))
-                      );
-                      setDraftPoints((prev) => [...prev, [nx, ny]]);
-                    }}
-                  >
+                  <div className="nvr-cam-tile" style={{ flex: 1 }}>
                     <LiveMsePlayer
                       camera={inspectorCam}
                       useMainStream={false}
                       cameraConfig={config?.cameras?.[inspectorCam]}
                       showVectors={true}
+                      draftPoints={draftPoints}
+                      onPlotPoint={(nx, ny) => setDraftPoints((prev) => [...prev, [nx, ny]])}
                     />
-                    {draftPoints.length > 0 && (
-                      <svg
-                        viewBox="0 0 1000 1000"
-                        preserveAspectRatio="none"
-                        style={{
-                          position: "absolute",
-                          inset: 0,
-                          width: "100%",
-                          height: "100%",
-                          pointerEvents: "none",
-                          zIndex: 6,
-                        }}
-                      >
-                        <polygon
-                          points={draftPoints
-                            .map(([x, y]) => `${Math.round(x * 1000)},${Math.round(y * 1000)}`)
-                            .join(" ")}
-                          fill="rgba(245, 158, 11, 0.25)"
-                          stroke="#f59e0b"
-                          strokeWidth="3"
-                        />
-                        {draftPoints.map(([x, y], idx) => (
-                          <circle
-                            key={idx}
-                            cx={Math.round(x * 1000)}
-                            cy={Math.round(y * 1000)}
-                            r="7"
-                            fill="#fbbf24"
-                            stroke="#000"
-                            strokeWidth="2"
-                          />
-                        ))}
-                      </svg>
-                    )}
                     <div className="nvr-cam-hud-top">
                       <span className="nvr-badge live">
                         {inspectorCam.toUpperCase()} // VECTOR OVERLAY & DRAWER ACTIVE

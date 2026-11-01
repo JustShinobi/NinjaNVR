@@ -54,26 +54,27 @@ body,
 
 /* Top Command Header */
 .nvr-header {
-  height: 46px;
-  min-height: 46px;
+  height: 44px;
+  min-height: 44px;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border-hairline);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 12px;
-  gap: 12px;
+  padding: 0 10px;
+  gap: 8px;
 }
 
 .nvr-brand {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-width: 150px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .nvr-brand-mark {
-  width: 8px;
+  width: 6px;
   height: 22px;
   background: var(--signal-accent);
   border-radius: 1px;
@@ -82,31 +83,32 @@ body,
 .nvr-brand-title {
   font-family: var(--font-mono);
   font-weight: 700;
-  font-size: 13px;
+  font-size: 12.5px;
   letter-spacing: 0.08em;
   color: var(--text-primary);
 }
 
 .nvr-brand-sub {
   font-family: var(--font-mono);
-  font-size: 10px;
-  letter-spacing: 0.06em;
+  font-size: 9.5px;
+  letter-spacing: 0.05em;
   color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .nvr-nav {
   display: flex;
   align-items: center;
   gap: 2px;
-  overflow-x: auto;
+  flex-shrink: 0;
 }
 
 .nvr-nav-btn {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  height: 32px;
-  padding: 0 9px;
+  height: 30px;
+  padding: 0 8px;
   background: transparent;
   border: 1px solid transparent;
   border-radius: 3px;
@@ -143,22 +145,24 @@ body,
 .nvr-header-right {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 .nvr-telemetry-pill {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  height: 30px;
-  padding: 0 10px;
+  gap: 7px;
+  height: 28px;
+  padding: 0 8px;
   background: var(--bg-canvas);
   border: 1px solid var(--border-hairline);
   border-radius: 3px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-secondary);
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .nvr-telemetry-pill:hover {

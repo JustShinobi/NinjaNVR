@@ -7,6 +7,8 @@ interface LiveMsePlayerProps {
   useMainStream?: boolean;
   cameraConfig?: CameraConfig;
   showVectors?: boolean;
+  draftPoints?: Array<[number, number]>;
+  onPlotPoint?: (nx: number, ny: number) => void;
   muted?: boolean;
   onClick?: () => void;
 }
@@ -77,6 +79,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   useMainStream = false,
   cameraConfig,
   showVectors = false,
+  draftPoints,
+  onPlotPoint,
   muted = true,
   onClick,
 }) => {
@@ -234,71 +238,126 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        cursor: onClick ? "pointer" : "default",
+        cursor: onPlotPoint ? "crosshair" : onClick ? "pointer" : "default",
       }}
-      onClick={onClick}
+      onClick={!onPlotPoint ? onClick : undefined}
     >
-      {/* Zero-black-screen instant snapshot underlay while MSE connects */}
-      <img
-        className="nvr-cam-poster"
-        src={`/api/${camera}/latest.webp?height=360&cache=${posterTick}`}
-        alt={camera}
+      <div
         style={{
-          position: "absolute",
-          inset: 0,
-          opacity: mseReady ? 0 : 1,
-          transition: "opacity 0.2s ease",
-          pointerEvents: "none",
-        }}
-      />
-      <video
-        ref={videoRef}
-        autoPlay
-        playsInline
-        muted={muted}
-        style={{
+          position: "relative",
+          aspectRatio: `${detW} / ${detH}`,
+          maxWidth: "100%",
+          maxHeight: "100%",
           width: "100%",
-          height: "100%",
-          objectFit: "contain",
-          opacity: mseReady ? 1 : 0,
-          transition: "opacity 0.2s ease",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
         }}
-      />
-      {showVectors && (
-        <svg
-          viewBox="0 0 1000 1000"
-          preserveAspectRatio="none"
+        onClick={
+          onPlotPoint
+            ? (e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const nx = Math.max(
+                  0,
+                  Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width))
+                );
+                const ny = Math.max(
+                  0,
+                  Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height))
+                );
+                onPlotPoint(nx, ny);
+              }
+            : undefined
+        }
+      >
+        {/* Zero-black-screen instant snapshot underlay while MSE connects */}
+        <img
+          className="nvr-cam-poster"
+          src={`/api/${camera}/latest.webp?height=360&cache=${posterTick}`}
+          alt={camera}
           style={{
             position: "absolute",
             inset: 0,
             width: "100%",
             height: "100%",
+            objectFit: "fill",
+            opacity: mseReady ? 0 : 1,
+            transition: "opacity 0.2s ease",
             pointerEvents: "none",
-            zIndex: 4,
           }}
-        >
-          {masks.map((m, idx) => (
-            <polygon
-              key={`mask-${idx}`}
-              points={parsePolygonPoints(m, detW, detH)}
-              fill="rgba(239, 68, 68, 0.24)"
-              stroke="#ef4444"
-              strokeWidth="3"
-              strokeDasharray="8 4"
-            />
-          ))}
-          {Object.entries(zones).map(([zName, zCfg]) => (
-            <g key={`zone-${zName}`}>
+        />
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted={muted}
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "fill",
+            opacity: mseReady ? 1 : 0,
+            transition: "opacity 0.2s ease",
+          }}
+        />
+        {(showVectors || (draftPoints && draftPoints.length > 0)) && (
+          <svg
+            viewBox="0 0 1000 1000"
+            preserveAspectRatio="none"
+            style={{
+              position: "absolute",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              pointerEvents: "none",
+              zIndex: 4,
+            }}
+          >
+            {masks.map((m, idx) => (
               <polygon
-                points={parsePolygonPoints(zCfg.coordinates, detW, detH)}
-                fill="rgba(14, 165, 233, 0.18)"
-                stroke="#0ea5e9"
+                key={`mask-${idx}`}
+                points={parsePolygonPoints(m, detW, detH)}
+                fill="rgba(239, 68, 68, 0.24)"
+                stroke="#ef4444"
                 strokeWidth="3"
+                strokeDasharray="8 4"
               />
-            </g>
-          ))}
-        </svg>
-      )}
+            ))}
+            {Object.entries(zones).map(([zName, zCfg]) => (
+              <g key={`zone-${zName}`}>
+                <polygon
+                  points={parsePolygonPoints(zCfg.coordinates, detW, detH)}
+                  fill="rgba(14, 165, 233, 0.18)"
+                  stroke="#0ea5e9"
+                  strokeWidth="3"
+                />
+              </g>
+            ))}
+            {draftPoints && draftPoints.length > 0 && (
+              <g>
+                <polygon
+                  points={draftPoints
+                    .map(([x, y]) => `${Math.round(x * 1000)},${Math.round(y * 1000)}`)
+                    .join(" ")}
+                  fill="rgba(245, 158, 11, 0.25)"
+                  stroke="#f59e0b"
+                  strokeWidth="3"
+                />
+                {draftPoints.map(([x, y], idx) => (
+                  <circle
+                    key={idx}
+                    cx={Math.round(x * 1000)}
+                    cy={Math.round(y * 1000)}
+                    r="7"
+                    fill="#fbbf24"
+                    stroke="#000"
+                    strokeWidth="2"
+                  />
+                ))}
+              </g>
+            )}
+          </svg>
+        )}
+      </div>
     </div>
   );
 };
