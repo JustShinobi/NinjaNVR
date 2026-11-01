@@ -22,6 +22,9 @@ use ninjanvr_config::{
     DEFAULT_GO2RTC_SHM_PATH, Go2RtcSupervisor, NINJANVR_VERSION, NinjaConfig, scrub_json_value,
 };
 use ninjanvr_db::{EventFilter, ExportRow, NinjaDatabase, ReviewFilter, verify_password};
+use ninjanvr_media::{
+    RecordingEngine, SharedActivityLedger, build_mp4_export, new_activity_ledger,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
@@ -45,6 +48,7 @@ pub struct AppState {
     pub web_dir: PathBuf,
     pub media_dir: PathBuf,
     pub latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    pub activity_ledger: SharedActivityLedger,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -278,6 +282,14 @@ pub fn build_router(state: AppState) -> Router {
             get(vod_index_m3u8),
         )
         .route(
+            "/vod/{camera}/start/{start}/end/{end}/init-v1-a1.mp4",
+            get(vod_init_mp4),
+        )
+        .route(
+            "/vod/{camera}/start/{start}/end/{end}/{segment}",
+            get(vod_segment_m4s),
+        )
+        .route(
             "/vod/clip/{camera}/start/{start}/end/{end}/master.m3u8",
             get(vod_master_m3u8),
         )
@@ -288,6 +300,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/vod/clip/{camera}/start/{start}/end/{end}/index-v1-a1.m3u8",
             get(vod_index_m3u8),
+        )
+        .route(
+            "/vod/clip/{camera}/start/{start}/end/{end}/init-v1-a1.mp4",
+            get(vod_init_mp4),
+        )
+        .route(
+            "/vod/clip/{camera}/start/{start}/end/{end}/{segment}",
+            get(vod_segment_m4s),
         )
         .route(
             "/login",
@@ -1006,11 +1026,13 @@ async fn api_event_clip_mp4(
         && let (Some(cam), Some(start)) = (ev["camera"].as_str(), ev["start_time"].as_f64())
     {
         let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
-        if let Ok(recs) = state.db.query_recordings(cam, start - 5.0, end + 5.0)
-            && let Some(first) = recs.first()
-            && let Ok(bytes) = tokio::fs::read(&first.path).await
-        {
-            return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
+        if let Ok(recs) = state.db.query_recordings(cam, start - 5.0, end + 5.0) {
+            for rec in recs {
+                let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+                if let Ok(bytes) = tokio::fs::read(&disk_path).await {
+                    return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
+                }
+            }
         }
     }
     StatusCode::NOT_FOUND.into_response()
@@ -1121,13 +1143,33 @@ async fn api_export_create(
     let now = unix_now() as f64;
     let _ = state.db.insert_export(&ExportRow {
         id: id.clone(),
-        camera,
-        name,
+        camera: camera.clone(),
+        name: name.clone(),
         date: now,
         video_path: video_rel,
         thumb_path: thumb_rel,
-        in_progress: false,
+        in_progress: true,
     });
+
+    let db_clone = state.db.clone();
+    let media_dir_clone = state.media_dir.clone();
+    let id_clone = id.clone();
+    tokio::spawn(async move {
+        if let Err(err) = build_mp4_export(
+            &db_clone,
+            &media_dir_clone,
+            &id_clone,
+            &camera,
+            &name,
+            start,
+            end,
+        )
+        .await
+        {
+            warn!("Export {id_clone} failed: {err:#}");
+        }
+    });
+
     Json(json!({ "success": true, "export_id": id })).into_response()
 }
 
@@ -1151,8 +1193,8 @@ async fn api_export_delete(
     AxumPath(id): AxumPath<String>,
 ) -> Json<Value> {
     if let Ok(Some((vpath, tpath))) = state.db.delete_export(&id) {
-        let _ = tokio::fs::remove_file(vpath).await;
-        let _ = tokio::fs::remove_file(tpath).await;
+        let _ = tokio::fs::remove_file(resolve_recording_disk_path(&state.media_dir, &vpath)).await;
+        let _ = tokio::fs::remove_file(resolve_recording_disk_path(&state.media_dir, &tpath)).await;
     }
     Json(json!({ "success": true }))
 }
@@ -1163,8 +1205,10 @@ async fn api_exports_bulk_delete(
 ) -> Json<Value> {
     for id in body.ids {
         if let Ok(Some((vpath, tpath))) = state.db.delete_export(&id) {
-            let _ = tokio::fs::remove_file(vpath).await;
-            let _ = tokio::fs::remove_file(tpath).await;
+            let _ =
+                tokio::fs::remove_file(resolve_recording_disk_path(&state.media_dir, &vpath)).await;
+            let _ =
+                tokio::fs::remove_file(resolve_recording_disk_path(&state.media_dir, &tpath)).await;
         }
     }
     Json(json!({ "success": true }))
@@ -1394,6 +1438,14 @@ async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) 
     }
 }
 
+fn resolve_recording_disk_path(media_dir: &Path, db_path: &str) -> PathBuf {
+    if let Some(rel) = db_path.strip_prefix("/media/frigate/") {
+        media_dir.join(rel)
+    } else {
+        PathBuf::from(db_path)
+    }
+}
+
 async fn vod_master_m3u8(
     AxumPath((_camera, _start, _end)): AxumPath<(String, f64, f64)>,
 ) -> impl IntoResponse {
@@ -1403,14 +1455,26 @@ async fn vod_master_m3u8(
     )
 }
 
+fn existing_recordings_for_vod(
+    state: &AppState,
+    camera: &str,
+    start: f64,
+    end: f64,
+) -> Vec<ninjanvr_db::RecordingRow> {
+    state
+        .db
+        .query_recordings(camera, start, end)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| resolve_recording_disk_path(&state.media_dir, &r.path).exists())
+        .collect()
+}
+
 async fn vod_index_m3u8(
     State(state): State<AppState>,
     AxumPath((camera, start, end)): AxumPath<(String, f64, f64)>,
 ) -> Response {
-    let recs = state
-        .db
-        .query_recordings(&camera, start, end)
-        .unwrap_or_default();
+    let recs = existing_recordings_for_vod(&state, &camera, start, end);
     if recs.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -1420,6 +1484,64 @@ async fn vod_index_m3u8(
             m3u8,
         )
             .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn vod_init_mp4(
+    State(state): State<AppState>,
+    AxumPath((camera, start, end)): AxumPath<(String, f64, f64)>,
+) -> Response {
+    let recs = existing_recordings_for_vod(&state, &camera, start, end);
+    for rec in recs {
+        let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+        if let Ok(Ok(init_bytes)) =
+            tokio::task::spawn_blocking(move || ninjanvr_vod::build_init_mp4(&disk_path)).await
+        {
+            return ([(header::CONTENT_TYPE, "video/mp4")], init_bytes).into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+async fn vod_segment_m4s(
+    State(state): State<AppState>,
+    AxumPath((camera, start, end, segment)): AxumPath<(String, f64, f64, String)>,
+) -> Response {
+    let Some(num_str) = segment
+        .strip_prefix("seg-")
+        .and_then(|s| s.split('-').next())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(seq_num) = num_str.parse::<usize>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if seq_num == 0 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let recs = existing_recordings_for_vod(&state, &camera, start, end);
+    let Some(rec) = recs.get(seq_num - 1).cloned() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let base_time = recs
+        .iter()
+        .take(seq_num - 1)
+        .map(|r| r.duration.max(0.0))
+        .sum::<f64>();
+    let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+    match tokio::task::spawn_blocking(move || {
+        ninjanvr_vod::build_media_segment_m4s(&disk_path, seq_num as u32, base_time)
+    })
+    .await
+    {
+        Ok(Ok(bytes)) => ([(header::CONTENT_TYPE, "video/iso.segment")], bytes).into_response(),
+        Ok(Err(err)) => {
+            warn!("Failed to build fMP4 segment {segment} for {camera}: {err:#}");
+            StatusCode::NOT_FOUND.into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -1465,9 +1587,17 @@ pub async fn new_app_state(
     let jwt_secret = load_or_create_jwt_secret(config_dir);
 
     let shared_cfg = Arc::new(RwLock::new(cfg));
+    let activity_ledger = new_activity_ledger();
     let go2rtc_supervisor = Arc::new(Go2RtcSupervisor::new(shared_cfg.clone()));
     if spawn_go2rtc {
         go2rtc_supervisor.clone().spawn_supervisor_task();
+        let rec_engine = Arc::new(RecordingEngine::new(
+            shared_cfg.clone(),
+            db.clone(),
+            media_dir.clone(),
+            activity_ledger.clone(),
+        ));
+        rec_engine.start().await;
     }
 
     let http_client = reqwest::Client::builder()
@@ -1487,6 +1617,7 @@ pub async fn new_app_state(
         web_dir,
         media_dir,
         latest_frames: Arc::new(RwLock::new(HashMap::new())),
+        activity_ledger,
     })
 }
 

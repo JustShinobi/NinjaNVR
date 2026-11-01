@@ -10,5 +10,7 @@ bytes.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 chrono.workspace = true
+rand.workspace = true
+image.workspace = true
 ninjanvr-config = { path = "../ninjanvr-config" }
 ninjanvr-db = { path = "../ninjanvr-db" }

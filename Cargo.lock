@@ -1254,8 +1254,10 @@ dependencies = [
  "anyhow",
  "bytes",
  "chrono",
+ "image",
  "ninjanvr-config",
  "ninjanvr-db",
+ "rand 0.8.8",
  "tokio",
  "tracing",
 ]

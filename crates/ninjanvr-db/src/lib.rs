@@ -1400,20 +1400,44 @@ impl NinjaDatabase {
         Ok(())
     }
 
-    pub fn delete_expired_recordings(&self, camera: &str, before_ts: f64) -> Result<Vec<String>> {
+    pub fn delete_expired_recordings(
+        &self,
+        camera: &str,
+        continuous_before_ts: f64,
+        event_before_ts: f64,
+    ) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn
-            .prepare("SELECT path FROM recordings WHERE camera = ?1 AND end_time < ?2 LIMIT 500")?;
-        let rows = stmt.query_map(params![camera, before_ts], |r| r.get::<_, String>(0))?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, path
+            FROM recordings
+            WHERE camera = ?1
+              AND (
+                (COALESCE(motion, 0) = 0 AND COALESCE(objects, 0) = 0 AND end_time < ?2)
+                OR end_time < ?3
+              )
+            ORDER BY end_time ASC
+            LIMIT 500
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![camera, continuous_before_ts, event_before_ts],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let mut ids = Vec::new();
         let mut paths = Vec::new();
         for r in rows {
-            paths.push(r?);
+            let (id, path) = r?;
+            ids.push(id);
+            paths.push(path);
         }
-        if !paths.is_empty() {
-            conn.execute(
-                "DELETE FROM recordings WHERE camera = ?1 AND end_time < ?2",
-                params![camera, before_ts],
-            )?;
+        drop(stmt);
+
+        if !ids.is_empty() {
+            let mut del_stmt = conn.prepare("DELETE FROM recordings WHERE id = ?1")?;
+            for id in &ids {
+                del_stmt.execute(params![id])?;
+            }
         }
         Ok(paths)
     }
