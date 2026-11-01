@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+cd -- "$repo_root"
+
+echo "==> Checking repository privacy and hygiene guardrails..."
+
+# 1. Ensure DESIGN.md and web-v2/dist are never tracked or present in root
+if git ls-files --error-unmatch DESIGN.md >/dev/null 2>&1; then
+  echo "ERROR: DESIGN.md must never be tracked in Git." >&2
+  exit 1
+fi
+
+if [ -e DESIGN.md ] || [ -L DESIGN.md ]; then
+  echo "ERROR: DESIGN.md exists in the repository root. Remove it or move local notes to .agents/." >&2
+  exit 1
+fi
+
+if [ -n "$(git ls-files web-v2/dist)" ]; then
+  echo "ERROR: web-v2/dist build artifacts must not be tracked in Git." >&2
+  exit 1
+fi
+
+# 2. Scan tracked, untracked (non-ignored), and staged text files for private domains or internal hostnames
+private_pattern='(\.lan\.|kyo\.ninja|pve0[0-9]|k3s-prod-)'
+matches_worktree="$(git grep --untracked -I -E -n "$private_pattern" -- . ':!scripts/ci/check-privacy' || true)"
+matches_staged="$(git grep --cached -I -E -n "$private_pattern" -- . ':!scripts/ci/check-privacy' || true)"
+
+if [ -n "$matches_worktree" ] || [ -n "$matches_staged" ]; then
+  echo "ERROR: Private domain or internal infrastructure reference found:" >&2
+  [ -n "$matches_worktree" ] && echo "$matches_worktree" >&2
+  [ -n "$matches_staged" ] && echo "$matches_staged" >&2
+  exit 1
+fi
+
+echo "==> Privacy and hygiene checks passed."

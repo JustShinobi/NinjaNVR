@@ -8,6 +8,8 @@
 /tmp/
 node_modules/
 **/node_modules/
+web-v2/dist/
+DESIGN.md
 .agents/
 .claude/
 .codegraph/

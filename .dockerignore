@@ -1,0 +1,13 @@
+/target
+**/node_modules
+web-v2/dist
+.git
+.github
+.agents
+.claude
+.codegraph
+.env
+*.db
+*.db-shm
+*.db-wal
+DESIGN.md
