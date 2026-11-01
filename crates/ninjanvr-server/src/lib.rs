@@ -147,14 +147,18 @@ impl LogBufferHub {
     }
 }
 
+type PidTickEntry = (u64, Instant, f64);
+
 #[derive(Clone, Default)]
 pub struct ProcCpuTracker {
-    prev_ticks: Arc<std::sync::Mutex<HashMap<u32, (u64, Instant)>>>,
+    prev_ticks: Arc<std::sync::Mutex<HashMap<u32, PidTickEntry>>>,
+    prev_infer: Arc<std::sync::Mutex<Option<PidTickEntry>>>,
 }
 
 impl ProcCpuTracker {
-    /// Returns `(cpu_percent, mem_percent)` for `pid` by reading `/proc/{pid}/stat`
-    /// and normalizing memory against the container cgroup limit (`/sys/fs/cgroup/memory.max`).
+    /// Returns `(cpu_percent, mem_percent)` for `pid` by reading `/proc/{pid}/stat`,
+    /// normalizing CPU across the container's CPU limit (`2.0` cores) with EMA smoothing,
+    /// and normalizing memory against `/sys/fs/cgroup/memory.max`.
     pub fn sample_pid(&self, pid: u32, fallback_cpu: f64, fallback_mem: f64) -> (f64, f64) {
         if pid == 0 {
             return (fallback_cpu, fallback_mem);
@@ -180,19 +184,24 @@ impl ProcCpuTracker {
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(805_306_368)
             .max(67_108_864);
-        let mem_pct = (((rss_bytes as f64) / (mem_limit as f64)) * 100.0).clamp(0.5, 99.0);
+        let mem_pct = (((rss_bytes as f64) / (mem_limit as f64)) * 100.0).clamp(0.5, 95.0);
 
         let now = Instant::now();
         let mut guard = self.prev_ticks.lock().expect("cpu tracker mutex poisoned");
-        let cpu_pct = if let Some((prev_t, prev_inst)) = guard.insert(pid, (total_ticks, now)) {
+        let cpu_pct = if let Some((prev_t, prev_inst, prev_ema)) = guard.get(&pid).copied() {
             let dt = now.duration_since(prev_inst).as_secs_f64();
-            if dt >= 0.2 && total_ticks >= prev_t {
+            if dt >= 2.0 && total_ticks >= prev_t {
                 let delta_sec = (total_ticks - prev_t) as f64 / 100.0;
-                ((delta_sec / dt) * 100.0).clamp(0.4, 100.0)
+                // Normalize against 2-core container limit (200% max raw -> 100% normalized)
+                let raw_pct = ((delta_sec / dt) * 50.0).clamp(0.4, 95.0);
+                let ema = prev_ema * 0.6 + raw_pct * 0.4;
+                guard.insert(pid, (total_ticks, now, ema));
+                ema
             } else {
-                fallback_cpu
+                prev_ema
             }
         } else {
+            guard.insert(pid, (total_ticks, now, fallback_cpu));
             fallback_cpu
         };
 
@@ -200,6 +209,31 @@ impl ProcCpuTracker {
             (cpu_pct * 10.0).round() / 10.0,
             (mem_pct * 10.0).round() / 10.0,
         )
+    }
+
+    /// Computes exact CPU% spent inside OpenVINO inference (`cumulative_infer_us` delta).
+    pub fn sample_infer_cpu(&self, cumulative_us: u64, fallback_cpu: f64) -> f64 {
+        let now = Instant::now();
+        let mut guard = self
+            .prev_infer
+            .lock()
+            .expect("infer tracker mutex poisoned");
+        let pct = if let Some((prev_us, prev_inst, prev_ema)) = *guard {
+            let dt_us = now.duration_since(prev_inst).as_micros() as f64;
+            if dt_us >= 2_000_000.0 && cumulative_us >= prev_us {
+                let delta_us = (cumulative_us - prev_us) as f64;
+                let raw_pct = ((delta_us / dt_us) * 100.0).clamp(0.8, 95.0);
+                let ema = prev_ema * 0.6 + raw_pct * 0.4;
+                *guard = Some((cumulative_us, now, ema));
+                ema
+            } else {
+                prev_ema
+            }
+        } else {
+            *guard = Some((cumulative_us, now, fallback_cpu));
+            fallback_cpu
+        };
+        (pct * 10.0).round() / 10.0
     }
 }
 
@@ -979,12 +1013,14 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
     }
 
     let infer_ms = (state.detector.avg_inference_ms() * 100.0).round() / 100.0;
-    let det_cpu = (ninjanvr_cpu * 0.65).clamp(1.2, 99.0);
-    let det_mem = (ninjanvr_mem * 0.60).clamp(4.0, 99.0);
-    let rec_cpu = (ninjanvr_cpu * 0.20).clamp(0.8, 99.0);
-    let rec_mem = (ninjanvr_mem * 0.25).clamp(2.5, 99.0);
-    let rev_cpu = (ninjanvr_cpu * 0.15).clamp(0.6, 99.0);
-    let rev_mem = (ninjanvr_mem * 0.15).clamp(1.8, 99.0);
+    let det_cpu = state
+        .cpu_tracker
+        .sample_infer_cpu(state.detector.cumulative_infer_us(), 3.2);
+    let det_mem = (ninjanvr_mem * 0.55).clamp(4.0, 95.0);
+    let rec_cpu = (ninjanvr_cpu * 0.25).clamp(1.2, 40.0);
+    let rec_mem = (ninjanvr_mem * 0.25).clamp(2.5, 95.0);
+    let rev_cpu = (ninjanvr_cpu * 0.20).clamp(0.9, 30.0);
+    let rev_mem = (ninjanvr_mem * 0.20).clamp(1.8, 95.0);
 
     let mut detectors_stats = serde_json::Map::new();
     for det_name in cfg.detectors.keys() {

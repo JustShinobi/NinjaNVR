@@ -13,7 +13,7 @@ use ninjanvr_media::{SharedActivityLedger, YuvFrame, resolve_ffmpeg_bin};
 use ninjanvr_track::{ByteTracker, TrackedObject};
 use ninjanvr_vision::{
     BoundingBox, SimdMotionDetector, compute_inference_regions, crop_yuv420p_to_tensor_nhwc,
-    encode_image_jpeg, encode_image_webp, yuv420p_to_rgb_image,
+    encode_image_jpeg, encode_image_webp, yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -345,13 +345,14 @@ impl VisionPipeline {
                         );
                     }
 
-                    // 6. Update latest frame JPEG cache every 5 frames (~1s) or when objects are active
-                    if frame_count.is_multiple_of(5) || !active_tracks.is_empty() {
+                    // 6. Update latest frame JPEG cache every 25 frames (~5s) at 360p to keep idle CPU near zero
+                    if frame_count == 1 || frame_count.is_multiple_of(25) {
                         let annotated: Vec<(BoundingBox, [u8; 3])> = active_tracks
                             .iter()
                             .map(|t| (t.bbox, [31, 119, 180]))
                             .collect();
-                        let rgb = yuv420p_to_rgb_image(&yuv_frame, None, &annotated);
+                        let rgb =
+                            yuv420p_to_rgb_image_scaled(&yuv_frame, None, &annotated, Some(360));
                         if let Ok(jpeg_bytes) = encode_image_jpeg(&rgb) {
                             self.latest_frames
                                 .write()
@@ -421,7 +422,7 @@ impl VisionPipeline {
             let prev = track_snapshots.get(&trk.id);
             let is_new = prev.is_none();
             let is_better_score = prev
-                .map(|p| trk.score > p.best_score + 0.01)
+                .map(|p| trk.score > p.best_score + 0.05)
                 .unwrap_or(true);
             let state_changed = prev
                 .map(|p| p.zones != trk.entered_zones || p.stationary != trk.stationary)
@@ -443,7 +444,8 @@ impl VisionPipeline {
                 let mut thumb_b64 = None;
                 if is_new || is_better_score {
                     let _ = std::fs::create_dir_all(&clips_dir);
-                    let crop_img = yuv420p_to_rgb_image(frame, Some(trk.region), &[]);
+                    let crop_img =
+                        yuv420p_to_rgb_image_scaled(frame, Some(trk.region), &[], Some(175));
                     thumb_b64 = encode_image_webp(&crop_img)
                         .ok()
                         .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
@@ -454,7 +456,13 @@ impl VisionPipeline {
                         if let Ok(jpg) = encode_image_jpeg(&full_img) {
                             let _ = std::fs::write(clips_dir.join(format!("{}.jpg", trk.id)), jpg);
                         }
-                        if let Ok(webp) = encode_image_webp(&full_img) {
+                        let thumb_img = yuv420p_to_rgb_image_scaled(
+                            frame,
+                            None,
+                            &[(trk.bbox, [31, 119, 180])],
+                            Some(360),
+                        );
+                        if let Ok(webp) = encode_image_webp(&thumb_img) {
                             let _ = std::fs::write(
                                 clips_dir.join(format!("{camera}-{}.webp", trk.id)),
                                 webp,
@@ -585,12 +593,17 @@ impl VisionPipeline {
                     rev.dirty = true;
                 }
             }
-            if trk.score > rev.best_score || promoted_to_alert {
+            if trk.score > rev.best_score + 0.05 || promoted_to_alert {
                 rev.best_score = trk.score;
                 rev.thumb_time = now;
                 let _ = std::fs::create_dir_all(&review_dir);
-                let full_img = yuv420p_to_rgb_image(frame, None, &[(trk.bbox, [31, 119, 180])]);
-                if let Ok(webp) = encode_image_webp(&full_img) {
+                let rev_img = yuv420p_to_rgb_image_scaled(
+                    frame,
+                    None,
+                    &[(trk.bbox, [31, 119, 180])],
+                    Some(180),
+                );
+                if let Ok(webp) = encode_image_webp(&rev_img) {
                     let fname = format!("thumb-{camera}-{}.webp", rev.id);
                     let _ = std::fs::write(review_dir.join(fname), webp);
                 }

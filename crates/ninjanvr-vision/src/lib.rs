@@ -680,11 +680,21 @@ pub fn crop_yuv420p_to_tensor_nhwc(
     }
 }
 
-/// Converts a `YuvFrame` (or a cropped sub-region) to an `RgbImage` and optionally draws bounding boxes.
+/// Converts a `YuvFrame` (or a cropped sub-region) to an `RgbImage` (optionally downscaled to `max_dim`)
+/// and draws bounding boxes.
 pub fn yuv420p_to_rgb_image(
     frame: &YuvFrame,
     crop: Option<BoundingBox>,
     boxes: &[(BoundingBox, [u8; 3])],
+) -> RgbImage {
+    yuv420p_to_rgb_image_scaled(frame, crop, boxes, None)
+}
+
+pub fn yuv420p_to_rgb_image_scaled(
+    frame: &YuvFrame,
+    crop: Option<BoundingBox>,
+    boxes: &[(BoundingBox, [u8; 3])],
+    max_height: Option<u32>,
 ) -> RgbImage {
     let fw = frame.width as usize;
     let fh = frame.height as usize;
@@ -697,18 +707,28 @@ pub fn yuv420p_to_rgb_image(
     let region = crop.unwrap_or_else(|| BoundingBox::new(0, 0, frame.width, frame.height));
     let rw = region.width().max(1);
     let rh = region.height().max(1);
-    let mut img = RgbImage::new(rw, rh);
+    let (out_w, out_h) = match max_height {
+        Some(mh) if rh > mh && mh > 0 => {
+            let ow = ((rw as u64 * mh as u64) / (rh as u64)).max(1) as u32;
+            (ow, mh)
+        }
+        _ => (rw, rh),
+    };
+
+    let mut img = RgbImage::new(out_w, out_h);
 
     let y_plane = &frame.data[..y_size];
     let u_plane = &frame.data[y_size..y_size + uv_size];
     let v_plane = &frame.data[y_size + uv_size..y_size + uv_size * 2];
     let uv_stride = fw / 2;
 
-    for dy in 0..rh {
-        let sy = ((region.y_min + dy) as usize).min(fh - 1);
+    for dy in 0..out_h {
+        let sy =
+            (region.y_min as usize + (dy as usize * rh as usize) / (out_h as usize)).min(fh - 1);
         let uv_y = sy / 2;
-        for dx in 0..rw {
-            let sx = ((region.x_min + dx) as usize).min(fw - 1);
+        for dx in 0..out_w {
+            let sx = (region.x_min as usize + (dx as usize * rw as usize) / (out_w as usize))
+                .min(fw - 1);
             let uv_x = sx / 2;
             let (r, g, b) = yuv_to_rgb_pixel(
                 y_plane[sy * fw + sx],
@@ -719,22 +739,26 @@ pub fn yuv420p_to_rgb_image(
         }
     }
 
-    // Draw 2px bounding boxes
+    // Draw 2px bounding boxes scaled to (out_w, out_h)
     for (bbox, color) in boxes {
-        let x1 = bbox.x_min.saturating_sub(region.x_min).min(rw - 1);
-        let y1 = bbox.y_min.saturating_sub(region.y_min).min(rh - 1);
-        let x2 = bbox.x_max.saturating_sub(region.x_min).min(rw - 1);
-        let y2 = bbox.y_max.saturating_sub(region.y_min).min(rh - 1);
+        let rx1 = bbox.x_min.saturating_sub(region.x_min);
+        let ry1 = bbox.y_min.saturating_sub(region.y_min);
+        let rx2 = bbox.x_max.saturating_sub(region.x_min);
+        let ry2 = bbox.y_max.saturating_sub(region.y_min);
+        let x1 = ((rx1 as u64 * out_w as u64) / (rw as u64)).min((out_w - 1) as u64) as u32;
+        let y1 = ((ry1 as u64 * out_h as u64) / (rh as u64)).min((out_h - 1) as u64) as u32;
+        let x2 = ((rx2 as u64 * out_w as u64) / (rw as u64)).min((out_w - 1) as u64) as u32;
+        let y2 = ((ry2 as u64 * out_h as u64) / (rh as u64)).min((out_h - 1) as u64) as u32;
         let rgb = Rgb(*color);
         for x in x1..=x2 {
             for t in 0..2 {
-                img.put_pixel(x, (y1 + t).min(rh - 1), rgb);
+                img.put_pixel(x, (y1 + t).min(out_h - 1), rgb);
                 img.put_pixel(x, y2.saturating_sub(t), rgb);
             }
         }
         for y in y1..=y2 {
             for t in 0..2 {
-                img.put_pixel((x1 + t).min(rw - 1), y, rgb);
+                img.put_pixel((x1 + t).min(out_w - 1), y, rgb);
                 img.put_pixel(x2.saturating_sub(t), y, rgb);
             }
         }

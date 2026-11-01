@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
@@ -57,6 +58,7 @@ pub struct AiDetectorEngine {
     labelmap: BTreeMap<i32, String>,
     ov_ctx: Mutex<Option<OpenVinoCContext>>,
     last_inference_ms: Mutex<f32>,
+    cumulative_infer_us: AtomicU64,
 }
 
 impl AiDetectorEngine {
@@ -103,7 +105,8 @@ impl AiDetectorEngine {
             is_yolo,
             labelmap,
             ov_ctx: Mutex::new(ov_ctx),
-            last_inference_ms: Mutex::new(2.5),
+            last_inference_ms: Mutex::new(2.1),
+            cumulative_infer_us: AtomicU64::new(0),
         }
     }
 
@@ -113,6 +116,10 @@ impl AiDetectorEngine {
 
     pub fn avg_inference_ms(&self) -> f32 {
         *self.last_inference_ms.lock().expect("mutex poisoned")
+    }
+
+    pub fn cumulative_infer_us(&self) -> u64 {
+        self.cumulative_infer_us.load(Ordering::Relaxed)
     }
 
     fn resolve_openvino_c_lib() -> Option<PathBuf> {
@@ -330,7 +337,10 @@ impl AiDetectorEngine {
         }
         drop(guard);
 
-        let elapsed_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        let elapsed_us = t0.elapsed().as_micros() as u64;
+        self.cumulative_infer_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+        let elapsed_ms = (elapsed_us as f32) / 1000.0;
         let mut avg = self.last_inference_ms.lock().expect("mutex poisoned");
         *avg = (*avg * 0.9) + (elapsed_ms.max(0.2) * 0.1);
 
