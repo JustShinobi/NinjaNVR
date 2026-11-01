@@ -116,7 +116,7 @@ jobs:
   gitops-bump:
     name: Promote Release Tag to GitOps
     needs: [publish-ghcr]
-    if: needs.publish-ghcr.result == 'success'
+    if: always() && needs.publish-ghcr.result == 'success'
     runs-on: ubuntu-latest
     env:
       GITOPS_TOKEN: ${{ secrets.PLATFORM_GITOPS_TOKEN }}
