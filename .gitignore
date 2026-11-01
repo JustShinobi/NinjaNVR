@@ -8,3 +8,14 @@
 /tmp/
 node_modules/
 **/node_modules/
+.agents/
+.claude/
+.codegraph/
+.opencode/
+.gemini/
+.codex/
+.kimi-code/
+.specify/
+.playwright-mcp/
+local/
+.local/

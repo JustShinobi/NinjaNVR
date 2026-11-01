@@ -1,0 +1,7 @@
+{
+  "exclude": [
+    "web/**",
+    "web-v2/dist/**",
+    "target/**"
+  ]
+}
