@@ -43,6 +43,7 @@ export const App: React.FC = () => {
   const [authNeeded, setAuthNeeded] = useState(false);
   const [, setUsername] = useState("admin");
   const [loginUser, setLoginUser] = useState("admin");
+  const [userRole, setUserRole] = useState<string>("admin");
   const [loginPass, setLoginPass] = useState("");
   const [loginError, setLoginError] = useState<string | null>(null);
   const [loginBusy, setLoginBusy] = useState(false);
@@ -199,6 +200,9 @@ export const App: React.FC = () => {
       }
       if (profRes.ok) {
         const profJson = await profRes.json();
+        if (profJson && typeof profJson.role === "string") {
+          setUserRole(profJson.role.trim().toLowerCase());
+        }
         if (profJson && typeof profJson.active_profile === "string") {
           const p = profJson.active_profile.trim().toLowerCase();
           if (p === "armed" || p === "home" || p === "disarmed") {
@@ -620,8 +624,8 @@ export const App: React.FC = () => {
       else if (e.key === "3") switchTab("review");
       else if (e.key === "4") switchTab("explore");
       else if (e.key === "5") switchTab("exports");
-      else if (e.key === "6") switchTab("zones");
-      else if (e.key === "7") switchTab("system");
+      else if (e.key === "6" && userRole === "admin") switchTab("zones");
+      else if (e.key === "7" && userRole === "admin") switchTab("system");
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -633,6 +637,7 @@ export const App: React.FC = () => {
     handleMarkReviews,
     handleQuickExport,
     setPlaybackSpeed,
+    userRole,
   ]);
 
   // Telemetry summary values
@@ -830,20 +835,24 @@ export const App: React.FC = () => {
             {t.nav.exports}
             <span className="nvr-kbd">5</span>
           </button>
-          <button
-            className={`nvr-nav-btn ${activeTab === "zones" ? "active" : ""}`}
-            onClick={() => switchTab("zones")}
-          >
-            {t.nav.zones}
-            <span className="nvr-kbd">6</span>
-          </button>
-          <button
-            className={`nvr-nav-btn ${activeTab === "system" ? "active" : ""}`}
-            onClick={() => switchTab("system")}
-          >
-            {t.nav.system}
-            <span className="nvr-kbd">7</span>
-          </button>
+          {userRole === "admin" && (
+            <>
+              <button
+                className={`nvr-nav-btn ${activeTab === "zones" ? "active" : ""}`}
+                onClick={() => switchTab("zones")}
+              >
+                {t.nav.zones}
+                <span className="nvr-kbd">6</span>
+              </button>
+              <button
+                className={`nvr-nav-btn ${activeTab === "system" ? "active" : ""}`}
+                onClick={() => switchTab("system")}
+              >
+                {t.nav.system}
+                <span className="nvr-kbd">7</span>
+              </button>
+            </>
+          )}
         </nav>
 
         <div className="nvr-header-right">
@@ -866,6 +875,7 @@ export const App: React.FC = () => {
                 <button
                   key={prof}
                   type="button"
+                  disabled={userRole === "viewer"}
                   className={`nvr-btn mono ${isAct ? "active" : ""}`}
                   style={{
                     height: 22,

@@ -209,7 +209,8 @@ export interface NinjaConfigResponse {
 
 export interface UserAccountItem {
   username: string;
-  role: "admin" | "viewer" | string;
+  role: "admin" | "operator" | "viewer" | string;
+  allowed_cameras?: string;
   password_changed_at?: string | null;
 }
 

@@ -268,6 +268,8 @@ pub struct AppState {
 pub struct JwtClaims {
     pub sub: String,
     pub role: String,
+    #[serde(default)]
+    pub allowed_cameras: Option<String>,
     pub exp: u64,
     pub iat: u64,
 }
@@ -396,6 +398,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/users/{username}", delete(api_user_delete))
         .route("/users/{username}/password", put(api_user_password))
         .route("/users/{username}/role", put(api_user_role))
+        .route("/users/{username}/cameras", put(api_user_cameras))
         .route("/config", get(api_config))
         .route("/config/raw", get(api_config_raw))
         .route("/config/raw_paths", get(api_empty_array))
@@ -752,7 +755,7 @@ async fn auth_gate_middleware(
             (cfg.auth.cookie_name.clone(), cfg.auth.enabled)
         };
         if auth_enabled {
-            let Some((_user, role)) =
+            let Some((user, role)) =
                 extract_authenticated_user(&state, &jar, req.headers(), &cookie_name, true)
             else {
                 state.log_hub.push_nginx(&method, &path, 401);
@@ -763,18 +766,127 @@ async fn auth_gate_middleware(
                     .into_response();
             };
 
+            let role_lc = role.to_ascii_lowercase();
             let is_admin_only = path.starts_with("/api/config/save")
                 || path.starts_with("/api/config/structured")
                 || path.starts_with("/api/config/set")
+                || path.starts_with("/api/config/raw")
                 || path.starts_with("/api/restart")
-                || (path.starts_with("/api/users") && method != "GET");
-            if is_admin_only && !role.eq_ignore_ascii_case("admin") {
+                || path.starts_with("/api/users")
+                || path.starts_with("/api/recordings/sync")
+                || (method == "DELETE"
+                    && (path.ends_with("/recordings")
+                        || path.starts_with("/api/events")
+                        || path.starts_with("/api/review")
+                        || path.starts_with("/api/export")));
+            if is_admin_only && role_lc != "admin" {
                 state.log_hub.push_nginx(&method, &path, 403);
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({ "message": "Admin role required" })),
                 )
                     .into_response();
+            }
+
+            if role_lc == "viewer"
+                && method != "GET"
+                && method != "HEAD"
+                && !path.starts_with("/api/logout")
+            {
+                state.log_hub.push_nginx(&method, &path, 403);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "message": "Viewer role is read-only" })),
+                )
+                    .into_response();
+            }
+
+            // Enforce per-camera scoping when user is restricted to specific cameras
+            if role_lc != "admin"
+                && let Ok(Some(db_u)) = state.db.get_user(&user)
+            {
+                let allowed_raw = db_u.allowed_cameras.trim();
+                if !allowed_raw.is_empty() && allowed_raw != "*" {
+                    let allowed_set: Vec<String> = allowed_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let query_cam = if path.starts_with("/api/go2rtc") {
+                        req.uri().query().and_then(|q| {
+                            q.split('&').find_map(|kv| {
+                                let (k, v) = kv.split_once('=')?;
+                                if k == "src" || k == "dst" {
+                                    Some(v.strip_suffix("_sub").unwrap_or(v).to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    let target_cam = if let Some(ref qc) = query_cam {
+                        Some(qc.as_str())
+                    } else if let Some(rest) = path.strip_prefix("/vod/") {
+                        rest.split('/').next()
+                    } else if let Some(rest) = path.strip_prefix("/api/") {
+                        let first = rest.split('/').next().unwrap_or("");
+                        if matches!(
+                            first,
+                            "version"
+                                | "ui"
+                                | "auth"
+                                | "login"
+                                | "logout"
+                                | "profile"
+                                | "profiles"
+                                | "users"
+                                | "config"
+                                | "detectors"
+                                | "ffmpeg"
+                                | "ffprobe"
+                                | "streams"
+                                | "keyframe_analysis"
+                                | "restart"
+                                | "logs"
+                                | "stats"
+                                | "review"
+                                | "review_ids"
+                                | "reviews"
+                                | "events"
+                                | "event_ids"
+                                | "timeline"
+                                | "recordings"
+                                | "exports"
+                                | "jobs"
+                                | "cases"
+                                | "preview"
+                                | "go2rtc"
+                                | "ws"
+                                | "labels"
+                        ) {
+                            None
+                        } else if first == "export" || first == "vod" {
+                            rest.split('/').nth(1)
+                        } else {
+                            Some(first)
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(cam) = target_cam
+                        && !cam.is_empty()
+                        && !allowed_set.iter().any(|a| a == cam)
+                    {
+                        state.log_hub.push_nginx(&method, &path, 403);
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "message": format!("Camera '{cam}' is not permitted for this user") })),
+                        )
+                            .into_response();
+                    }
+                }
             }
         }
     }
@@ -881,6 +993,7 @@ async fn api_login(
     let claims = JwtClaims {
         sub: db_user.username.clone(),
         role: db_user.role.clone(),
+        allowed_cameras: Some(db_user.allowed_cameras.clone()),
         iat: now,
         exp: now + session_len,
     };
@@ -969,11 +1082,31 @@ async fn api_profile(
     );
 
     let (username, role) = user_opt.unwrap_or_else(|| ("admin".to_string(), "admin".to_string()));
+    let scoped_cameras: Vec<String> = if role.eq_ignore_ascii_case("admin") {
+        cameras
+    } else if let Ok(Some(u)) = state.db.get_user(&username) {
+        let raw = u.allowed_cameras.trim();
+        if raw.is_empty() || raw == "*" {
+            cameras
+        } else {
+            let allowed: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            cameras
+                .into_iter()
+                .filter(|c| allowed.contains(c))
+                .collect()
+        }
+    } else {
+        cameras
+    };
 
     Json(json!({
         "username": username,
         "role": role,
-        "allowed_cameras": cameras,
+        "allowed_cameras": scoped_cameras,
         "active_profile": state.comms.get_active_profile()
     }))
     .into_response()
@@ -1022,6 +1155,8 @@ pub struct CreateUserBody {
     pub password: String,
     #[serde(default = "default_admin_role")]
     pub role: String,
+    #[serde(default)]
+    pub allowed_cameras: Option<String>,
 }
 
 fn default_admin_role() -> String {
@@ -1033,10 +1168,14 @@ async fn api_user_create(
     Json(body): Json<CreateUserBody>,
 ) -> Response {
     let iterations = state.config.read().await.auth.hash_iterations;
-    match state
-        .db
-        .create_user(&body.username, &body.password, &body.role, iterations)
-    {
+    let cams = body.allowed_cameras.as_deref().unwrap_or("*");
+    match state.db.create_user_with_cameras(
+        &body.username,
+        &body.password,
+        &body.role,
+        cams,
+        iterations,
+    ) {
         Ok(()) => Json(json!({
             "success": true,
             "message": format!("User '{}' created", body.username.trim()),
@@ -1087,6 +1226,13 @@ async fn api_user_password(
 #[derive(Debug, Deserialize)]
 pub struct UpdateUserRoleBody {
     pub role: String,
+    #[serde(default)]
+    pub allowed_cameras: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateUserCamerasBody {
+    pub allowed_cameras: String,
 }
 
 async fn api_user_role(
@@ -1094,10 +1240,41 @@ async fn api_user_role(
     AxumPath(username): AxumPath<String>,
     Json(body): Json<UpdateUserRoleBody>,
 ) -> Response {
+    if let Some(ref cams) = body.allowed_cameras {
+        let _ = state.db.update_user_allowed_cameras(&username, cams);
+    }
     match state.db.update_user_role(&username, &body.role) {
         Ok(true) => Json(json!({
             "success": true,
             "message": format!("Role updated for '{username}'"),
+            "users": state.db.list_users().unwrap_or_default()
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "User not found" })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_user_cameras(
+    State(state): State<AppState>,
+    AxumPath(username): AxumPath<String>,
+    Json(body): Json<UpdateUserCamerasBody>,
+) -> Response {
+    match state
+        .db
+        .update_user_allowed_cameras(&username, &body.allowed_cameras)
+    {
+        Ok(true) => Json(json!({
+            "success": true,
+            "message": format!("Allowed cameras updated for '{username}'"),
             "users": state.db.list_users().unwrap_or_default()
         }))
         .into_response(),
@@ -1138,9 +1315,70 @@ async fn api_user_delete(
     }
 }
 
-async fn api_config(State(state): State<AppState>) -> Json<Value> {
+async fn caller_allowed_cameras(
+    state: &AppState,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+) -> Option<Vec<String>> {
     let cfg = state.config.read().await;
-    Json(cfg.to_frigate_api_config())
+    let (user, role) =
+        extract_authenticated_user(state, jar, headers, &cfg.auth.cookie_name, cfg.auth.enabled)?;
+    if role.eq_ignore_ascii_case("admin") {
+        return None;
+    }
+    let db_u = state.db.get_user(&user).ok().flatten()?;
+    let raw = db_u.allowed_cameras.trim();
+    if raw.is_empty() || raw == "*" {
+        return None;
+    }
+    Some(
+        raw.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
+}
+
+fn scope_cameras_filter(
+    requested: Option<Vec<String>>,
+    allowed: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    match (requested, allowed) {
+        (req, None) => req,
+        (None, Some(allow_list)) => Some(if allow_list.is_empty() {
+            vec!["__none__".to_string()]
+        } else {
+            allow_list
+        }),
+        (Some(req_list), Some(allow_list)) => {
+            let filtered: Vec<String> = req_list
+                .into_iter()
+                .filter(|c| allow_list.contains(c))
+                .collect();
+            Some(if filtered.is_empty() {
+                vec!["__none__".to_string()]
+            } else {
+                filtered
+            })
+        }
+    }
+}
+
+async fn api_config(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let mut api_cfg = {
+        let cfg = state.config.read().await;
+        cfg.to_frigate_api_config()
+    };
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && let Some(cams_obj) = api_cfg.get_mut("cameras").and_then(|v| v.as_object_mut())
+    {
+        cams_obj.retain(|k, _| allowed.contains(k));
+    }
+    Json(api_cfg)
 }
 
 async fn api_config_raw(State(state): State<AppState>) -> Json<Value> {
@@ -1588,10 +1826,13 @@ fn split_csv_opt(raw: &Option<String>) -> Option<Vec<String>> {
 
 async fn api_review(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     Query(q): Query<ReviewQueryParams>,
 ) -> Json<Value> {
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     let filter = ReviewFilter {
-        cameras: split_csv_opt(&q.cameras),
+        cameras: scope_cameras_filter(split_csv_opt(&q.cameras), allowed),
         labels: split_csv_opt(&q.labels),
         exclude_labels: split_csv_opt(&q.exclude_labels),
         zones: split_csv_opt(&q.zones),
@@ -1741,9 +1982,15 @@ async fn api_reviews_delete(
 
 async fn api_events(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     Query(q): Query<EventQueryParams>,
 ) -> Json<Value> {
-    let cameras = split_csv_opt(&q.cameras).or_else(|| split_csv_opt(&q.camera));
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    let cameras = scope_cameras_filter(
+        split_csv_opt(&q.cameras).or_else(|| split_csv_opt(&q.camera)),
+        allowed,
+    );
     let labels = split_csv_opt(&q.labels).or_else(|| split_csv_opt(&q.label));
     let filter = EventFilter {
         cameras,
@@ -3685,6 +3932,68 @@ version: 0.18-0
         assert_eq!(state_json["detect"], false);
         assert_eq!(state_json["alerts"], false);
         assert_eq!(state_json["record"], true);
+
+        // 16. Test RBAC (admin, operator, viewer) and per-camera user scoping
+        state
+            .db
+            .create_user_with_cameras("guard1", "guard-pass", "viewer", "front_door", 1000)
+            .unwrap();
+        let guard_claims = JwtClaims {
+            sub: "guard1".to_string(),
+            role: "viewer".to_string(),
+            allowed_cameras: Some("front_door".to_string()),
+            iat: 1700000000,
+            exp: 9999999999,
+        };
+        let guard_token = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &guard_claims,
+            &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+
+        // Viewer is blocked from POST /api/config/save with 403 Forbidden
+        let resp_viewer_save = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/save")
+                    .header(header::AUTHORIZATION, format!("Bearer {guard_token}"))
+                    .body(Body::from("version: 0.18-0"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_viewer_save.status(), StatusCode::FORBIDDEN);
+
+        // Viewer is allowed to read permitted camera (/api/front_door/recordings)
+        let resp_viewer_ok_cam = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/recordings")
+                    .header(header::AUTHORIZATION, format!("Bearer {guard_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_viewer_ok_cam.status(), StatusCode::OK);
+
+        // Viewer is blocked from accessing unpermitted camera (/api/indoor_bedroom/recordings) with 403 Forbidden
+        let resp_viewer_unauth_cam = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/indoor_bedroom/recordings")
+                    .header(header::AUTHORIZATION, format!("Bearer {guard_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_viewer_unauth_cam.status(), StatusCode::FORBIDDEN);
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

@@ -746,7 +746,8 @@ export const CommsAuthUsersSection: React.FC<{
   const [users, setUsers] = useState<UserAccountItem[]>([]);
   const [newUsername, setNewUsername] = useState("");
   const [newPassword, setNewPassword] = useState("");
-  const [newRole, setNewRole] = useState<"admin" | "viewer">("viewer");
+  const [newRole, setNewRole] = useState<"admin" | "operator" | "viewer">("viewer");
+  const [newAllowedCameras, setNewAllowedCameras] = useState("*");
   const [pwResetTarget, setPwResetTarget] = useState<string | null>(null);
   const [pwResetValue, setPwResetValue] = useState("");
 
@@ -811,12 +812,14 @@ export const CommsAuthUsersSection: React.FC<{
         username: newUsername.trim(),
         password: newPassword,
         role: newRole,
+        allowed_cameras: newAllowedCameras.trim() || "*",
       }),
     });
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.success !== false) {
       setNewUsername("");
       setNewPassword("");
+      setNewAllowedCameras("*");
       if (Array.isArray(data.users)) setUsers(data.users);
       else loadUsers();
       notify(data.message || "User created");
@@ -839,6 +842,23 @@ export const CommsAuthUsersSection: React.FC<{
       notify(`Updated role for '${username}' to ${role}`);
     } else {
       notify(data.message || "Failed to update role");
+    }
+  };
+
+  const handleCamerasChange = async (username: string, allowed_cameras: string) => {
+    const res = await fetch(`/api/users/${encodeURIComponent(username)}/cameras`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ allowed_cameras: allowed_cameras.trim() || "*" }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success !== false) {
+      if (Array.isArray(data.users)) setUsers(data.users);
+      else loadUsers();
+      notify(`Updated camera scope for '${username}'`);
+    } else {
+      notify(data.message || "Failed to update camera scope");
     }
   };
 
@@ -1142,6 +1162,7 @@ export const CommsAuthUsersSection: React.FC<{
               <tr>
                 <th>{isPt ? "Usuário" : "Username"}</th>
                 <th>{isPt ? "Nível de Acesso" : "Access Role"}</th>
+                <th>{isPt ? "Câmeras Permitidas" : "Allowed Cameras"}</th>
                 <th>{isPt ? "Status da Senha" : "Password Status"}</th>
                 <th>{isPt ? "Ações" : "Actions"}</th>
               </tr>
@@ -1159,8 +1180,19 @@ export const CommsAuthUsersSection: React.FC<{
                       onChange={(e) => handleRoleChange(u.username, e.target.value)}
                     >
                       <option value="admin">admin (Full Access)</option>
+                      <option value="operator">operator (Triage & Export)</option>
                       <option value="viewer">viewer (Read-Only)</option>
                     </select>
+                  </td>
+                  <td>
+                    <input
+                      className="nvr-input mono"
+                      style={{ height: 24, width: 140, fontSize: "var(--text-xs)" }}
+                      aria-label={`Allowed cameras for ${u.username}`}
+                      defaultValue={u.allowed_cameras || "*"}
+                      disabled={u.role === "admin"}
+                      onBlur={(e) => handleCamerasChange(u.username, e.target.value)}
+                    />
                   </td>
                   <td style={{ color: "var(--text-secondary)" }}>
                     {u.password_changed_at
@@ -1260,11 +1292,22 @@ export const CommsAuthUsersSection: React.FC<{
               className="nvr-select mono"
               aria-label="New Account Role"
               value={newRole}
-              onChange={(e) => setNewRole(e.target.value as "admin" | "viewer")}
+              onChange={(e) =>
+                setNewRole(e.target.value as "admin" | "operator" | "viewer")
+              }
             >
               <option value="viewer">Role: viewer</option>
+              <option value="operator">Role: operator</option>
               <option value="admin">Role: admin</option>
             </select>
+            <input
+              className="nvr-input mono"
+              style={{ width: 160 }}
+              placeholder="Allowed cams (* or cam1,cam2)"
+              aria-label="New Account Allowed Cameras"
+              value={newAllowedCameras}
+              onChange={(e) => setNewAllowedCameras(e.target.value)}
+            />
             <button
               type="button"
               className="nvr-btn primary"

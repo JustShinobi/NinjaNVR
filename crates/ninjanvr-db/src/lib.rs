@@ -26,7 +26,13 @@ pub struct DbUser {
     pub username: String,
     pub password_hash: String,
     pub role: String,
+    #[serde(default = "default_wildcard_cameras")]
+    pub allowed_cameras: String,
     pub notification_tokens: Value,
+}
+
+fn default_wildcard_cameras() -> String {
+    "*".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +336,7 @@ impl NinjaDatabase {
                 "password_hash" VARCHAR(120) NOT NULL,
                 "notification_tokens" JSON NOT NULL,
                 "role" VARCHAR(20) NOT NULL DEFAULT 'admin',
+                "allowed_cameras" TEXT NOT NULL DEFAULT '*',
                 "password_changed_at" DATETIME NULL
             );
             CREATE TABLE IF NOT EXISTS "event" (
@@ -385,6 +392,10 @@ impl NinjaDatabase {
             CREATE UNIQUE INDEX IF NOT EXISTS "userreviewstatus_user_segment" ON "userreviewstatus" ("user_id", "review_segment_id");
             "#,
         )?;
+        let _ = conn.execute(
+            "ALTER TABLE user ADD COLUMN allowed_cameras TEXT NOT NULL DEFAULT '*'",
+            [],
+        );
         Ok(())
     }
 
@@ -425,14 +436,16 @@ impl NinjaDatabase {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let row = conn
             .query_row(
-                "SELECT username, password_hash, role, notification_tokens FROM user WHERE username = ?1",
+                "SELECT username, password_hash, role, notification_tokens, COALESCE(allowed_cameras, '*') FROM user WHERE username = ?1",
                 params![username],
                 |r| {
                     let tokens_raw: Option<String> = r.get(3).ok();
+                    let allowed_cameras: String = r.get::<_, Option<String>>(4)?.unwrap_or_else(|| "*".to_string());
                     Ok(DbUser {
                         username: r.get(0)?,
                         password_hash: r.get(1)?,
                         role: r.get::<_, Option<String>>(2)?.unwrap_or_else(|| "admin".to_string()),
+                        allowed_cameras,
                         notification_tokens: parse_json_or(tokens_raw, json!([])),
                     })
                 },
@@ -443,13 +456,15 @@ impl NinjaDatabase {
 
     pub fn list_users(&self) -> Result<Vec<Value>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt =
-            conn.prepare("SELECT username, role, password_changed_at FROM user ORDER BY username")?;
+        let mut stmt = conn.prepare(
+            "SELECT username, role, password_changed_at, COALESCE(allowed_cameras, '*') FROM user ORDER BY username",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok(json!({
                 "username": r.get::<_, String>(0)?,
                 "role": r.get::<_, Option<String>>(1)?.unwrap_or_else(|| "admin".to_string()),
                 "password_changed_at": r.get::<_, Option<String>>(2).ok().flatten(),
+                "allowed_cameras": r.get::<_, Option<String>>(3)?.unwrap_or_else(|| "*".to_string()),
             }))
         })?;
         let mut out = Vec::new();
@@ -464,6 +479,17 @@ impl NinjaDatabase {
         username: &str,
         password: &str,
         role: &str,
+        iterations: u32,
+    ) -> Result<()> {
+        self.create_user_with_cameras(username, password, role, "*", iterations)
+    }
+
+    pub fn create_user_with_cameras(
+        &self,
+        username: &str,
+        password: &str,
+        role: &str,
+        allowed_cameras: &str,
         iterations: u32,
     ) -> Result<()> {
         let trimmed = username.trim();
@@ -481,8 +507,14 @@ impl NinjaDatabase {
         }
         let norm_role = match role.trim().to_ascii_lowercase().as_str() {
             "viewer" => "viewer",
+            "operator" => "operator",
             "admin" => "admin",
-            _ => anyhow::bail!("Role must be 'admin' or 'viewer'"),
+            _ => anyhow::bail!("Role must be 'admin', 'operator', or 'viewer'"),
+        };
+        let norm_cams = if allowed_cameras.trim().is_empty() {
+            "*"
+        } else {
+            allowed_cameras.trim()
         };
 
         let conn = self.conn.lock().expect("db mutex poisoned");
@@ -501,10 +533,10 @@ impl NinjaDatabase {
         let now_str = Utc::now().to_rfc3339();
         conn.execute(
             r#"
-            INSERT INTO user (username, role, password_hash, notification_tokens, password_changed_at)
-            VALUES (?1, ?2, ?3, '[]', ?4)
+            INSERT INTO user (username, role, allowed_cameras, password_hash, notification_tokens, password_changed_at)
+            VALUES (?1, ?2, ?3, ?4, '[]', ?5)
             "#,
-            params![trimmed, norm_role, pw_hash, now_str],
+            params![trimmed, norm_role, norm_cams, pw_hash, now_str],
         )?;
         Ok(())
     }
@@ -531,8 +563,9 @@ impl NinjaDatabase {
     pub fn update_user_role(&self, username: &str, role: &str) -> Result<bool> {
         let norm_role = match role.trim().to_ascii_lowercase().as_str() {
             "viewer" => "viewer",
+            "operator" => "operator",
             "admin" => "admin",
-            _ => anyhow::bail!("Role must be 'admin' or 'viewer'"),
+            _ => anyhow::bail!("Role must be 'admin', 'operator', or 'viewer'"),
         };
         let target = username.trim();
         let conn = self.conn.lock().expect("db mutex poisoned");
@@ -549,6 +582,24 @@ impl NinjaDatabase {
         let updated = conn.execute(
             "UPDATE user SET role = ?1 WHERE username = ?2",
             params![norm_role, target],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn update_user_allowed_cameras(
+        &self,
+        username: &str,
+        allowed_cameras: &str,
+    ) -> Result<bool> {
+        let norm = if allowed_cameras.trim().is_empty() {
+            "*"
+        } else {
+            allowed_cameras.trim()
+        };
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            "UPDATE user SET allowed_cameras = ?1 WHERE username = ?2",
+            params![norm, username.trim()],
         )?;
         Ok(updated > 0)
     }
