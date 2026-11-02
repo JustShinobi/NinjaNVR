@@ -23,6 +23,7 @@ interface NvrRealtimeState {
   liveLayout: LiveLayoutMode;
   spotlightFilter: SpotlightFilter;
   spotlightHoldSec: number;
+  securityProfile: "armed" | "home" | "disarmed";
   selectedCamera: string;
   hudPosition: HudPosition;
   useMainStream: boolean;
@@ -41,6 +42,7 @@ interface NvrRealtimeState {
   setLiveLayout: (layout: LiveLayoutMode) => void;
   setSpotlightFilter: (filter: SpotlightFilter) => void;
   setSpotlightHoldSec: (sec: number) => void;
+  setSecurityProfile: (profile: "armed" | "home" | "disarmed") => void;
   setSelectedCamera: (camera: string) => void;
   setHudPosition: (pos: HudPosition) => void;
   setUseMainStream: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
@@ -62,6 +64,7 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
   liveLayout: resolveInitialLiveLayout(),
   spotlightFilter: "all_activity",
   spotlightHoldSec: 15,
+  securityProfile: "armed",
   selectedCamera: "escritorio",
   hudPosition: resolveInitialHudPosition(),
   useMainStream: resolveInitialBool("ninjanvr_use_main_stream", false),
@@ -85,6 +88,7 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
   },
   setSpotlightFilter: (spotlightFilter) => set({ spotlightFilter }),
   setSpotlightHoldSec: (spotlightHoldSec) => set({ spotlightHoldSec }),
+  setSecurityProfile: (securityProfile) => set({ securityProfile }),
   setSelectedCamera: (selectedCamera) => set({ selectedCamera }),
   setHudPosition: (hudPosition) => {
     if (typeof window !== "undefined") {

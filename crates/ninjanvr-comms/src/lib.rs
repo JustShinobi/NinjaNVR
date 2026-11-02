@@ -48,6 +48,7 @@ pub struct CommsHub {
     ws_tx: broadcast::Sender<String>,
     mqtt_tx: mpsc::UnboundedSender<(String, Vec<u8>, bool)>,
     camera_states: Arc<RwLock<BTreeMap<String, Value>>>,
+    active_profile: Arc<RwLock<String>>,
 }
 
 impl Default for CommsHub {
@@ -64,6 +65,7 @@ impl CommsHub {
             ws_tx,
             mqtt_tx,
             camera_states: Arc::new(RwLock::new(BTreeMap::new())),
+            active_profile: Arc::new(RwLock::new("armed".to_string())),
         }
     }
 
@@ -74,6 +76,7 @@ impl CommsHub {
             ws_tx,
             mqtt_tx,
             camera_states: Arc::new(RwLock::new(BTreeMap::new())),
+            active_profile: Arc::new(RwLock::new("armed".to_string())),
         };
         if mqtt_cfg.enabled {
             let cfg_clone = mqtt_cfg.clone();
@@ -187,6 +190,33 @@ impl CommsHub {
         );
     }
 
+    /// Returns the currently active operational security profile (`"armed"`, `"home"`, or `"disarmed"`).
+    pub fn get_active_profile(&self) -> String {
+        self.active_profile
+            .read()
+            .expect("active_profile lock poisoned")
+            .clone()
+    }
+
+    /// Sets the active operational security profile (`"armed"`, `"home"`, `"disarmed"`)
+    /// and broadcasts `profile/state` over MQTT and WebSocket.
+    pub fn set_active_profile(&self, profile: &str) -> String {
+        let norm = match profile.trim().to_ascii_lowercase().as_str() {
+            "home" => "home".to_string(),
+            "disarmed" | "off" => "disarmed".to_string(),
+            _ => "armed".to_string(),
+        };
+        {
+            let mut g = self
+                .active_profile
+                .write()
+                .expect("active_profile lock poisoned");
+            *g = norm.clone();
+        }
+        self.publish_topic("profile/state", norm.clone());
+        norm
+    }
+
     /// Updates live motion/object activity for a camera and broadcasts `camera_activity` to `/ws`.
     pub fn update_camera_activity(
         &self,
@@ -232,6 +262,10 @@ impl CommsHub {
         let Some(base) = topic.strip_suffix("/set") else {
             return;
         };
+        if base == "profile" {
+            self.set_active_profile(payload);
+            return;
+        }
         let parts: Vec<&str> = base.split('/').collect();
         if parts.len() == 2 {
             let cam = parts[0];
@@ -315,6 +349,13 @@ impl CommsHub {
         };
         msgs.push(
             json!({
+                "topic": "profile/state",
+                "payload": self.get_active_profile()
+            })
+            .to_string(),
+        );
+        msgs.push(
+            json!({
                 "topic": "camera_activity",
                 "payload": activity_str
             })
@@ -366,6 +407,9 @@ async fn run_mqtt_loop(
                             let _ = client
                                 .subscribe(format!("{prefix}/+/+/set"), QoS::AtMostOnce)
                                 .await;
+                            let _ = client
+                                .subscribe(format!("{prefix}/profile/set"), QoS::AtMostOnce)
+                                .await;
                         }
                         Ok(MqttEvent::Incoming(Packet::Publish(pub_pkt))) => {
                             if let Some(rel) = pub_pkt.topic.strip_prefix(&format!("{prefix}/"))
@@ -416,6 +460,7 @@ mod tests {
 
         let snaps = hub.initial_ws_snapshots(&["front_door".to_string()]);
         assert!(!snaps.is_empty());
+        assert!(snaps.iter().any(|s| s.contains("profile/state")));
         assert!(snaps.last().unwrap().contains("1200"));
 
         // Verify camera availability state transitions publish online/offline topics
@@ -431,5 +476,10 @@ mod tests {
         // Duplicate state does not re-trigger transition
         assert!(!hub.set_camera_availability("front_door", false));
         assert!(hub.set_camera_availability("front_door", true));
+
+        // Verify operational security profile transitions via MQTT command
+        assert_eq!(hub.get_active_profile(), "armed");
+        hub.apply_set_command("profile/set", "home");
+        assert_eq!(hub.get_active_profile(), "home");
     }
 }

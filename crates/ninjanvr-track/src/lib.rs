@@ -668,6 +668,7 @@ mod tests {
     fn bytetracker_tracks_across_high_and_low_score_frames_and_preserves_stationary() {
         let mut cam_cfg = CameraConfig {
             enabled: true,
+            indoor: false,
             ffmpeg: Default::default(),
             live: Default::default(),
             detect: Default::default(),
@@ -807,6 +808,7 @@ mod tests {
         // Verify ByteTracker records crossed_lines and promotes to entered_zones
         let mut cam_cfg = CameraConfig {
             enabled: true,
+            indoor: false,
             ffmpeg: Default::default(),
             live: Default::default(),
             detect: Default::default(),
@@ -865,6 +867,7 @@ mod tests {
     fn night_ir_mode_suppresses_transient_two_frame_spider_flashes() {
         let mut cam_cfg = CameraConfig {
             enabled: true,
+            indoor: false,
             ffmpeg: Default::default(),
             live: Default::default(),
             detect: Default::default(),
@@ -909,6 +912,7 @@ mod tests {
     fn fractional_area_bounds_and_per_zone_overrides_filter_accurately() {
         let mut cam_cfg = CameraConfig {
             enabled: true,
+            indoor: false,
             ffmpeg: Default::default(),
             live: Default::default(),
             detect: Default::default(),

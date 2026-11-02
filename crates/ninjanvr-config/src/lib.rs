@@ -22,6 +22,14 @@ pub const NINJANVR_VERSION: &str = match option_env!("NINJANVR_RELEASE_VERSION")
     _ => env!("CARGO_PKG_VERSION"),
 };
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfileOverrideConfig {
+    #[serde(default)]
+    pub disabled_alerts_cameras: Vec<String>,
+    #[serde(default)]
+    pub disabled_record_cameras: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NinjaConfig {
     #[serde(default = "default_version")]
@@ -50,6 +58,8 @@ pub struct NinjaConfig {
     pub audio: AudioConfig,
     #[serde(default)]
     pub review: ReviewConfig,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ProfileOverrideConfig>,
     #[serde(default)]
     pub go2rtc: Go2RtcConfig,
     #[serde(default)]
@@ -861,6 +871,8 @@ pub struct CameraConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
+    pub indoor: bool,
+    #[serde(default)]
     pub ffmpeg: CameraFfmpegConfig,
     #[serde(default)]
     pub live: CameraLiveConfig,
@@ -888,6 +900,7 @@ impl Default for CameraConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            indoor: false,
             ffmpeg: CameraFfmpegConfig::default(),
             live: CameraLiveConfig::default(),
             detect: DetectConfig::default(),

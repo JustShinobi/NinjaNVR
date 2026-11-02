@@ -386,8 +386,11 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/auth/first_time_login", get(api_first_time_login))
         .route("/login", post(api_login))
         .route("/logout", get(api_logout).post(api_logout))
-        .route("/profile", get(api_profile))
-        .route("/profile/active", get(api_profile_active))
+        .route("/profile", get(api_profile).post(api_profile_set))
+        .route(
+            "/profile/active",
+            get(api_profile_active).post(api_profile_set),
+        )
         .route("/profiles", get(api_profiles))
         .route("/users", get(api_users).post(api_user_create))
         .route("/users/{username}", delete(api_user_delete))
@@ -966,19 +969,40 @@ async fn api_profile(
     Json(json!({
         "username": username,
         "role": role,
-        "allowed_cameras": cameras
+        "allowed_cameras": cameras,
+        "active_profile": state.comms.get_active_profile()
     }))
     .into_response()
 }
 
-async fn api_profile_active() -> Json<Value> {
-    Json(json!({ "active_profile": null }))
+#[derive(Debug, Deserialize)]
+pub struct SetProfileBody {
+    pub profile: String,
 }
 
-async fn api_profiles() -> Json<Value> {
+async fn api_profile_set(
+    State(state): State<AppState>,
+    Json(body): Json<SetProfileBody>,
+) -> Json<Value> {
+    let active = state.comms.set_active_profile(&body.profile);
+    let cfg = state.config.read().await;
+    if let Some(cfg_dir) = cfg.config_path.parent() {
+        let _ = std::fs::write(cfg_dir.join(".active_profile"), &active);
+    }
     Json(json!({
-        "profiles": [],
-        "active_profile": null,
+        "success": true,
+        "active_profile": active
+    }))
+}
+
+async fn api_profile_active(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "active_profile": state.comms.get_active_profile() }))
+}
+
+async fn api_profiles(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "profiles": ["armed", "home", "disarmed"],
+        "active_profile": state.comms.get_active_profile(),
         "last_activated": {}
     }))
 }
@@ -2911,6 +2935,11 @@ pub async fn new_app_state(
 
     let detector = Arc::new(AiDetectorEngine::new(&cfg));
     let comms = Arc::new(CommsHub::with_mqtt(&cfg.mqtt));
+    if let Ok(saved_prof) = std::fs::read_to_string(config_dir.join(".active_profile"))
+        && !saved_prof.trim().is_empty()
+    {
+        comms.set_active_profile(saved_prof.trim());
+    }
     let log_hub = LogBufferHub::new();
     log_hub.push_frigate(
         "INFO",
@@ -3561,6 +3590,35 @@ version: 0.18-0
         );
         let probe_err_json: Value = serde_json::from_slice(&probe_err_bytes).unwrap();
         assert_eq!(probe_err_json["ok"], false);
+
+        // 14. Test POST /api/profile switches operational security profile and persists state
+        let resp_prof_set = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/profile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"profile":"home"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_prof_set.status(), StatusCode::OK);
+        let resp_prof_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/profile/active")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let prof_json: Value =
+            serde_json::from_slice(&to_bytes(resp_prof_get.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(prof_json["active_profile"], "home");
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

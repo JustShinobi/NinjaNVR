@@ -516,6 +516,20 @@ impl VisionPipeline {
         let review_dir = self.media_dir.join("clips").join("review");
         let clips_dir = self.media_dir.join("clips");
 
+        let active_profile = self.comms.get_active_profile();
+        let camera_suppressed_in_profile = {
+            let cfg_guard = self.config.read().await;
+            cfg_guard
+                .profiles
+                .get(&active_profile)
+                .or_else(|| cfg_guard.profiles.get(&active_profile.to_ascii_uppercase()))
+                .map(|p| {
+                    p.disabled_alerts_cameras
+                        .iter()
+                        .any(|c| c == camera || c == "*")
+                })
+                .unwrap_or(false)
+        };
         for trk in active_tracks {
             let prev = track_snapshots.get(&trk.id);
             let is_new = prev.is_none();
@@ -623,7 +637,12 @@ impl VisionPipeline {
 
                 let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
                 let norm_reg = trk.region.to_normalized(frame.width, frame.height);
-                let severity = compute_track_severity(cam_cfg, trk);
+                let severity = compute_track_severity_for_profile(
+                    cam_cfg,
+                    trk,
+                    &active_profile,
+                    camera_suppressed_in_profile,
+                );
                 let area = trk.bbox.area();
                 let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
 
@@ -698,7 +717,12 @@ impl VisionPipeline {
             }
 
             // Update or open ReviewSegment if enabled
-            let track_sev = compute_track_severity(cam_cfg, trk);
+            let track_sev = compute_track_severity_for_profile(
+                cam_cfg,
+                trk,
+                &active_profile,
+                camera_suppressed_in_profile,
+            );
             let is_alert = track_sev == "alert";
             if !is_alert && !cam_cfg.review.detections.enabled {
                 continue;
@@ -771,7 +795,12 @@ impl VisionPipeline {
                 .unwrap_or(trk.top_score);
             let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
             let norm_reg = trk.region.to_normalized(frame.width, frame.height);
-            let severity = compute_track_severity(cam_cfg, trk);
+            let severity = compute_track_severity_for_profile(
+                cam_cfg,
+                trk,
+                &active_profile,
+                camera_suppressed_in_profile,
+            );
             let area = trk.bbox.area();
             let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
             let ev_dto = EventDto {
@@ -915,6 +944,21 @@ impl VisionPipeline {
     }
 }
 
+fn compute_track_severity_for_profile(
+    cam_cfg: &CameraConfig,
+    trk: &TrackedObject,
+    active_profile: &str,
+    camera_suppressed_in_profile: bool,
+) -> &'static str {
+    if active_profile == "disarmed"
+        || camera_suppressed_in_profile
+        || (active_profile == "home" && cam_cfg.indoor)
+    {
+        return "detection";
+    }
+    compute_track_severity(cam_cfg, trk)
+}
+
 fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'static str {
     if cam_cfg.review.alerts.enabled
         && cam_cfg.review.alerts.labels.contains(&trk.label)
@@ -927,5 +971,100 @@ fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'stat
         "alert"
     } else {
         "detection"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ninjanvr_track::TriggerProvenance;
+    use ninjanvr_vision::BoundingBox;
+
+    fn sample_track() -> TrackedObject {
+        TrackedObject {
+            id: "1730500000.000000-abc123".to_string(),
+            label: "person".to_string(),
+            bbox: BoundingBox {
+                x_min: 10,
+                y_min: 10,
+                x_max: 100,
+                y_max: 200,
+            },
+            region: BoundingBox {
+                x_min: 0,
+                y_min: 0,
+                x_max: 320,
+                y_max: 320,
+            },
+            score: 0.91,
+            top_score: 0.91,
+            start_time: 1000.0,
+            last_seen_time: 1001.0,
+            frames_tracked: 5,
+            disappeared_frames: 0,
+            motionless_count: 0,
+            stationary: false,
+            zones: Vec::new(),
+            entered_zones: Vec::new(),
+            crossed_lines: Vec::new(),
+            prev_bottom_center: (55.0, 200.0),
+            has_snapshot: true,
+            vx: 0.0,
+            vy: 0.0,
+            provenance: TriggerProvenance {
+                trigger_ts: 1000.0,
+                bbox: [10, 10, 100, 200],
+                norm_bbox: [0.01, 0.01, 0.1, 0.2],
+                area_px: 17100,
+                area_pct: 1.5,
+                aspect_ratio: 0.47,
+                score: 0.91,
+                top_score: 0.91,
+                min_score_cfg: 0.5,
+                threshold_cfg: 0.7,
+                zones: Vec::new(),
+                frames_tracked: 5,
+                stationary: false,
+            },
+        }
+    }
+
+    #[test]
+    fn test_profile_alert_suppression_rules() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.review.alerts.enabled = true;
+        cam_cfg.review.alerts.labels = vec!["person".to_string()];
+        let trk = sample_track();
+
+        // ARMED promotes matching track to alert
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk, "armed", false),
+            "alert"
+        );
+
+        // DISARMED suppresses alert promotion across all cameras
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk, "disarmed", false),
+            "detection"
+        );
+
+        // HOME suppresses indoor cameras while perimeter cameras stay armed
+        cam_cfg.indoor = false;
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk, "home", false),
+            "alert"
+        );
+        cam_cfg.indoor = true;
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk, "home", false),
+            "detection"
+        );
+
+        // Custom profile disabled_alerts_cameras override suppresses alert promotion
+        cam_cfg.indoor = false;
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk, "home", true),
+            "detection"
+        );
     }
 }

@@ -23,6 +23,8 @@ export const App: React.FC = () => {
   const { t } = useI18n();
   const activeTab = useNvrStore((s) => s.activeTab);
   const setActiveTab = useNvrStore((s) => s.setActiveTab);
+  const securityProfile = useNvrStore((s) => s.securityProfile);
+  const setSecurityProfile = useNvrStore((s) => s.setSecurityProfile);
   const selectedCamera = useNvrStore((s) => s.selectedCamera);
   const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
   const timeShiftTs = useNvrStore((s) => s.timeShiftTs);
@@ -143,12 +145,13 @@ export const App: React.FC = () => {
           revUrl = `/api/review?after=${dayStart}&before=${dayEnd}&limit=300`;
         }
       }
-      const [cfgRes, statsRes, histRes, revRes, expRes] = await Promise.all([
+      const [cfgRes, statsRes, histRes, revRes, expRes, profRes] = await Promise.all([
         fetch("/api/config", { credentials: "include" }),
         fetch("/api/stats", { credentials: "include" }),
         fetch("/api/stats/history", { credentials: "include" }),
         fetch(revUrl, { credentials: "include" }),
         fetch("/api/exports", { credentials: "include" }),
+        fetch("/api/profile", { credentials: "include" }),
       ]);
 
       if (cfgRes.status === 401 || statsRes.status === 401) {
@@ -194,6 +197,15 @@ export const App: React.FC = () => {
           setExportsList(expJson);
         }
       }
+      if (profRes.ok) {
+        const profJson = await profRes.json();
+        if (profJson && typeof profJson.active_profile === "string") {
+          const p = profJson.active_profile.trim().toLowerCase();
+          if (p === "armed" || p === "home" || p === "disarmed") {
+            setSecurityProfile(p);
+          }
+        }
+      }
     } catch {
       // network retry on next tick
     }
@@ -207,6 +219,7 @@ export const App: React.FC = () => {
     setSelectedCamera,
     setStats,
     setStatsHistory,
+    setSecurityProfile,
   ]);
 
   useEffect(() => {
@@ -237,6 +250,11 @@ export const App: React.FC = () => {
           const parsed =
             typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
           setCameraActivity(parsed);
+        } else if (msg.topic === "profile/state" && typeof msg.payload === "string") {
+          const p = msg.payload.trim().toLowerCase();
+          if (p === "armed" || p === "home" || p === "disarmed") {
+            setSecurityProfile(p);
+          }
         }
       } catch {
         // ignore
@@ -247,7 +265,7 @@ export const App: React.FC = () => {
       closed = true;
       ws.close();
     };
-  }, [authChecked, authNeeded, setWsOnline, setCameraActivity]);
+  }, [authChecked, authNeeded, setWsOnline, setCameraActivity, setSecurityProfile]);
 
   // Fetch 24h recordings for the active timeline camera
   const timelineCam =
@@ -829,6 +847,57 @@ export const App: React.FC = () => {
         </nav>
 
         <div className="nvr-header-right">
+          <div
+            className="mono"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 2,
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-strong)",
+              borderRadius: 3,
+              padding: 2,
+            }}
+            aria-label="Operational Security Profile"
+          >
+            {(["armed", "home", "disarmed"] as const).map((prof) => {
+              const isAct = securityProfile === prof;
+              return (
+                <button
+                  key={prof}
+                  type="button"
+                  className={`nvr-btn mono ${isAct ? "active" : ""}`}
+                  style={{
+                    height: 22,
+                    padding: "0 6px",
+                    fontSize: "var(--text-xs)",
+                    color:
+                      isAct && prof === "armed"
+                        ? "var(--signal-alert-text)"
+                        : isAct && prof === "home"
+                        ? "var(--signal-motion-text)"
+                        : undefined,
+                  }}
+                  onClick={async () => {
+                    setSecurityProfile(prof);
+                    try {
+                      await fetch("/api/profile", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        credentials: "include",
+                        body: JSON.stringify({ profile: prof }),
+                      });
+                      notify(`Operational security profile switched to ${prof.toUpperCase()}`);
+                    } catch {
+                      // ignore
+                    }
+                  }}
+                >
+                  {prof.toUpperCase()}
+                </button>
+              );
+            })}
+          </div>
           {stats?.service?.storage_degraded && (
             <button
               className="nvr-badge alert mono"
