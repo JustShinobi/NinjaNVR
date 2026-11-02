@@ -1,22 +1,27 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
+import { Camera, ChevronLeft, ChevronRight } from "lucide-react";
+import { useI18n } from "../i18n";
 import { CameraConfig } from "../types/nvr";
 import { useNvrStore } from "../store/useNvrStore";
 import { formatRelTime, formatTs } from "../utils/format";
 
 interface ZoomableVideoStageProps {
   disabled?: boolean;
+  extraHud?: React.ReactNode;
   children: React.ReactNode;
 }
 
 export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
   disabled = false,
+  extraHud,
   children,
 }) => {
   const stageRef = useRef<HTMLDivElement | null>(null);
   const [scale, setScale] = useState<number>(1.0);
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState<boolean>(false);
+  const [isHovered, setIsHovered] = useState<boolean>(false);
   const dragOriginRef = useRef<{
     startX: number;
     startY: number;
@@ -146,6 +151,8 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
         setIsDragging(false);
         dragOriginRef.current = null;
       }}
+      onPointerEnter={() => setIsHovered(true)}
+      onPointerLeave={() => setIsHovered(false)}
     >
       <div
         style={{
@@ -169,22 +176,38 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
             position: "absolute",
             top: 8,
             right: 8,
-            zIndex: 12,
+            zIndex: 14,
             display: "inline-flex",
             alignItems: "center",
-            gap: 3,
-            background: "rgba(9, 13, 20, 0.82)",
+            gap: 4,
+            background: "rgba(9, 13, 20, 0.88)",
             border: "1px solid var(--border-strong)",
             borderRadius: 3,
-            padding: "2px 4px",
+            padding: "3px 5px",
             fontSize: "var(--text-xs)",
             fontVariantNumeric: "tabular-nums",
+            opacity: isHovered || scale > 1.0 ? 1 : 0,
+            transition: "opacity 0.16s ease",
+            pointerEvents: isHovered || scale > 1.0 ? "auto" : "none",
           }}
         >
+          {extraHud && (
+            <>
+              {extraHud}
+              <span
+                style={{
+                  width: 1,
+                  height: 14,
+                  background: "var(--border-strong)",
+                  margin: "0 2px",
+                }}
+              />
+            </>
+          )}
           <button
             type="button"
             className="nvr-btn mono"
-            style={{ height: 18, padding: "0 5px", fontSize: "var(--text-xs)" }}
+            style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
             title="Zoom out (-0.25x)"
             disabled={scale <= 1.0}
             onClick={() => applyZoom(scale - 0.25)}
@@ -195,7 +218,7 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
             type="button"
             className="nvr-btn mono"
             style={{
-              height: 18,
+              height: 20,
               padding: "0 6px",
               fontSize: "var(--text-xs)",
               color: scale > 1.0 ? "var(--signal-accent-text)" : "var(--text-secondary)",
@@ -208,7 +231,7 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
           <button
             type="button"
             className="nvr-btn mono"
-            style={{ height: 18, padding: "0 5px", fontSize: "var(--text-xs)" }}
+            style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
             title="Zoom in (+0.25x)"
             disabled={scale >= 5.0}
             onClick={() => applyZoom(scale + 0.25)}
@@ -655,7 +678,21 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       }
     >
       {/* Zero-black-screen instant snapshot underlay while MSE connects — strictly object-fit: contain */}
-      <ZoomableVideoStage disabled={Boolean(onPlotPoint)}>
+      <ZoomableVideoStage
+        disabled={Boolean(onPlotPoint)}
+        extraHud={
+          <button
+            type="button"
+            className="nvr-btn mono"
+            style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+            title="Save high-resolution PNG photo of current frame"
+            onClick={handleCaptureLiveStill}
+          >
+            <Camera size={11} />
+            Photo
+          </button>
+        }
+      >
         <img
           ref={imgRef}
           className="nvr-cam-poster"
@@ -839,24 +876,6 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
           </svg>
         )}
       </ZoomableVideoStage>
-      <button
-        type="button"
-        className="nvr-btn nvr-tile-action mono"
-        style={{
-          position: "absolute",
-          top: 8,
-          left: 8,
-          zIndex: 14,
-          height: 22,
-          padding: "0 6px",
-          fontSize: "var(--text-xs)",
-          background: "rgba(9, 13, 20, 0.86)",
-        }}
-        title="Capture native-resolution PNG still frame"
-        onClick={handleCaptureLiveStill}
-      >
-        Capture Frame
-      </button>
     </div>
   );
 };
@@ -1023,61 +1042,54 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     link.click();
   };
 
+  const { locale } = useI18n();
+  const isPt = locale === "pt";
+
   const vodFrameControls = (
-    <div
-      style={{
-        position: "absolute",
-        top: 8,
-        left: 8,
-        zIndex: 14,
-        display: "flex",
-        alignItems: "center",
-        gap: 4,
-      }}
-    >
+    <>
       <button
         type="button"
         className="nvr-btn mono"
-        style={{
-          height: 22,
-          padding: "0 6px",
-          fontSize: "var(--text-xs)",
-          background: "rgba(9, 13, 20, 0.88)",
-        }}
-        title="Step 1 frame backward (Hotkey: ,)"
+        style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+        title={
+          isPt
+            ? "Recuar 1 quadro de vídeo (Atalho: tecla ,)"
+            : "Step 1 frame backward (Hotkey: ,)"
+        }
         onClick={() => stepVodFrame(-1)}
       >
-        &lt; 1f
+        <ChevronLeft size={12} />
+        {isPt ? "Quadro Ant." : "Prev Frame"}
       </button>
       <button
         type="button"
         className="nvr-btn mono"
-        style={{
-          height: 22,
-          padding: "0 6px",
-          fontSize: "var(--text-xs)",
-          background: "rgba(9, 13, 20, 0.88)",
-        }}
-        title="Step 1 frame forward (Hotkey: .)"
+        style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+        title={
+          isPt
+            ? "Avançar 1 quadro de vídeo (Atalho: tecla .)"
+            : "Step 1 frame forward (Hotkey: .)"
+        }
         onClick={() => stepVodFrame(1)}
       >
-        1f &gt;
+        {isPt ? "Próx. Quadro" : "Next Frame"}
+        <ChevronRight size={12} />
       </button>
       <button
         type="button"
         className="nvr-btn mono"
-        style={{
-          height: 22,
-          padding: "0 6px",
-          fontSize: "var(--text-xs)",
-          background: "rgba(9, 13, 20, 0.88)",
-        }}
-        title="Capture native-resolution PNG still frame"
+        style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+        title={
+          isPt
+            ? "Salvar foto PNG na resolução original deste quadro"
+            : "Save native-resolution PNG photo of this frame"
+        }
         onClick={handleCaptureVodStill}
       >
-        Capture Frame
+        <Camera size={11} />
+        {isPt ? "Salvar Foto" : "Save Photo"}
       </button>
-    </div>
+    </>
   );
 
   const handleTimeUpdateInternal = (curSec: number, durSec: number) => {
@@ -1095,7 +1107,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 
   if (useFallbackMp4 && fallbackPreviewId) {
     return (
-      <ZoomableVideoStage>
+      <ZoomableVideoStage extraHud={vodFrameControls}>
         <video
           ref={videoRef}
           src={mp4FallbackUrl}
@@ -1126,13 +1138,12 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
             background: "#000",
           }}
         />
-        {vodFrameControls}
       </ZoomableVideoStage>
     );
   }
 
   return (
-    <ZoomableVideoStage>
+    <ZoomableVideoStage extraHud={vodFrameControls}>
       <video
         ref={videoRef}
         controls={controls}
@@ -1161,7 +1172,6 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           background: "#000",
         }}
       />
-      {vodFrameControls}
     </ZoomableVideoStage>
   );
 };

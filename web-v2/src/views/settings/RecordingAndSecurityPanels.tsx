@@ -1124,6 +1124,10 @@ export const CommsAuthUsersSection: React.FC<{
     "read_only"
   );
   const [createdPlaintextToken, setCreatedPlaintextToken] = useState<string | null>(null);
+  const [newPeerId, setNewPeerId] = useState("");
+  const [newPeerUrl, setNewPeerUrl] = useState("");
+  const [newPeerTokenEnv, setNewPeerTokenEnv] = useState("NINJANVR_PEER_TOKEN");
+  const [federationStatus, setFederationStatus] = useState<string | null>(null);
 
   const loadTokens = useCallback(async () => {
     try {
@@ -2058,6 +2062,166 @@ export const CommsAuthUsersSection: React.FC<{
               />
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Multi-Node NVR Federation (Single Glass Console) Card */}
+      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="nvr-cfg-card-header">
+          <span>
+            {isPt
+              ? `FEDERAÇÃO MULTI-NÓ NVR (${Object.keys(draftConfig.peers || {}).length + 1} NÓS)`
+              : `MULTI-NODE NVR FEDERATION (${Object.keys(draftConfig.peers || {}).length + 1} NODES)`}
+          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <button
+              type="button"
+              className="nvr-btn mono"
+              style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              onClick={async () => {
+                try {
+                  const res = await fetch("/api/federation/nodes", { credentials: "include" });
+                  if (res.ok) {
+                    const data = await res.json();
+                    setFederationStatus(JSON.stringify(data, null, 2));
+                    notify("Probed federated NVR topology (/api/federation/nodes)");
+                  }
+                } catch {
+                  notify("Failed to query /api/federation/nodes");
+                }
+              }}
+            >
+              {isPt ? "Testar Topologia Federada" : "Probe Federated Nodes"}
+            </button>
+            <span className="nvr-badge live mono">SINGLE GLASS CONSOLE</span>
+          </div>
+        </div>
+        <div className="nvr-cfg-card-body">
+          <table className="nvr-table mono">
+            <thead>
+              <tr>
+                <th>{isPt ? "Nó NVR" : "Node ID"}</th>
+                <th>{isPt ? "Endereço / Papel" : "Endpoint / Role"}</th>
+                <th>{isPt ? "Autenticação" : "Auth Token Env"}</th>
+                <th>{isPt ? "Status" : "Status"}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style={{ fontWeight: 700, color: "var(--signal-live-text)" }}>
+                  local (Primary)
+                </td>
+                <td>{window.location.origin}</td>
+                <td>Local Session</td>
+                <td>
+                  <span className="nvr-badge live mono">ONLINE</span>
+                </td>
+              </tr>
+              {Object.entries(draftConfig.peers || {}).map(([peerId, peerCfg]) => (
+                <tr key={peerId}>
+                  <td style={{ fontWeight: 700 }}>{peerId}</td>
+                  <td>{peerCfg.url}</td>
+                  <td>{peerCfg.token_env || "NINJANVR_PEER_TOKEN"}</td>
+                  <td>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <ToggleSwitch
+                        checked={peerCfg.enabled}
+                        label={`Enable peer ${peerId}`}
+                        onChange={(v) =>
+                          updateDraft((next) => {
+                            if (next.peers && next.peers[peerId]) {
+                              next.peers[peerId].enabled = v;
+                            }
+                          })
+                        }
+                      />
+                      <button
+                        type="button"
+                        className="nvr-btn danger mono"
+                        style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        onClick={() =>
+                          updateDraft((next) => {
+                            if (next.peers) {
+                              delete next.peers[peerId];
+                            }
+                          })
+                        }
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", paddingTop: 6 }}>
+            <input
+              className="nvr-input mono"
+              style={{ width: 150 }}
+              placeholder={isPt ? "ID do nó (ex: sitio)" : "Peer ID (e.g. country_house)"}
+              value={newPeerId}
+              onChange={(e) => setNewPeerId(e.target.value)}
+            />
+            <input
+              className="nvr-input mono"
+              style={{ width: 260 }}
+              placeholder="https://nvr-remote.internal:8971"
+              value={newPeerUrl}
+              onChange={(e) => setNewPeerUrl(e.target.value)}
+            />
+            <input
+              className="nvr-input mono"
+              style={{ width: 210 }}
+              placeholder="NINJANVR_PEER_TOKEN"
+              value={newPeerTokenEnv}
+              onChange={(e) => setNewPeerTokenEnv(e.target.value)}
+            />
+            <button
+              type="button"
+              className="nvr-btn primary"
+              onClick={() => {
+                const slug = newPeerId.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+                if (!slug || !newPeerUrl.trim()) {
+                  notify("Enter both a Peer ID and URL");
+                  return;
+                }
+                updateDraft((next) => {
+                  if (!next.peers) next.peers = {};
+                  next.peers[slug] = {
+                    enabled: true,
+                    url: newPeerUrl.trim(),
+                    token_env: newPeerTokenEnv.trim() || "NINJANVR_PEER_TOKEN",
+                  };
+                });
+                setNewPeerId("");
+                setNewPeerUrl("");
+                notify(`Added federated NVR node '${slug}' (click Save Config to persist)`);
+              }}
+            >
+              <Plus size={12} />
+              {isPt ? "Adicionar Nó NVR" : "Add Federated Peer"}
+            </button>
+          </div>
+
+          {federationStatus && (
+            <pre
+              className="mono"
+              style={{
+                margin: 0,
+                padding: 8,
+                background: "var(--bg-canvas)",
+                border: "1px solid var(--border-hairline)",
+                borderRadius: 3,
+                fontSize: "var(--text-xs)",
+                maxHeight: 160,
+                overflowY: "auto",
+              }}
+            >
+              {federationStatus}
+            </pre>
+          )}
         </div>
       </div>
     </div>
