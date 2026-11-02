@@ -185,7 +185,9 @@ def main() -> int:
         next_tag = f"v{next_version}"
         print(f"[dev pre-release] Cutting {next_tag} (commits since {last_any_tag}: {len(incremental_commits)})")
 
-        _, release_notes = format_release_notes(incremental_commits)
+        # Since superseded -rc.* pre-releases are pruned below, the active pre-release
+        # must include all cumulative commits since the last stable release (`last_stable_tag..HEAD`).
+        _, release_notes = format_release_notes(commits_since_stable)
         run(["git", "config", "user.name", "github-actions[bot]"])
         run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
         run(["git", "tag", "-a", next_tag, "-m", f"chore(release): {next_tag}"])
