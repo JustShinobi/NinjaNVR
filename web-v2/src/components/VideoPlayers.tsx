@@ -2,6 +2,223 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
 import { CameraConfig } from "../types/nvr";
 
+interface ZoomableVideoStageProps {
+  disabled?: boolean;
+  children: React.ReactNode;
+}
+
+export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
+  disabled = false,
+  children,
+}) => {
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [scale, setScale] = useState<number>(1.0);
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState<boolean>(false);
+  const dragOriginRef = useRef<{
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+
+  const clampPan = useCallback(
+    (nextScale: number, rawX: number, rawY: number) => {
+      if (nextScale <= 1.0) return { x: 0, y: 0 };
+      const el = stageRef.current;
+      const w = el?.clientWidth || 640;
+      const h = el?.clientHeight || 360;
+      const maxX = ((nextScale - 1) * w) / 2;
+      const maxY = ((nextScale - 1) * h) / 2;
+      return {
+        x: Math.max(-maxX, Math.min(maxX, rawX)),
+        y: Math.max(-maxY, Math.min(maxY, rawY)),
+      };
+    },
+    []
+  );
+
+  const applyZoom = useCallback(
+    (nextRawScale: number, anchorX?: number, anchorY?: number) => {
+      const nextScale = Math.round(Math.max(1.0, Math.min(5.0, nextRawScale)) * 100) / 100;
+      setScale((prevScale) => {
+        if (nextScale <= 1.0) {
+          setPan({ x: 0, y: 0 });
+          return 1.0;
+        }
+        setPan((prevPan) => {
+          const el = stageRef.current;
+          if (el && anchorX !== undefined && anchorY !== undefined && prevScale > 0) {
+            const rect = el.getBoundingClientRect();
+            const cx = anchorX - (rect.left + rect.width / 2);
+            const cy = anchorY - (rect.top + rect.height / 2);
+            const ratio = nextScale / prevScale;
+            const targetX = cx - (cx - prevPan.x) * ratio;
+            const targetY = cy - (cy - prevPan.y) * ratio;
+            return clampPan(nextScale, targetX, targetY);
+          }
+          return clampPan(nextScale, prevPan.x, prevPan.y);
+        });
+        return nextScale;
+      });
+    },
+    [clampPan]
+  );
+
+  const resetZoom = useCallback(() => {
+    setScale(1.0);
+    setPan({ x: 0, y: 0 });
+    setIsDragging(false);
+    dragOriginRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el || disabled) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.altKey && scale <= 1.0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const step = e.deltaY < 0 ? 0.25 : -0.25;
+      applyZoom(scale + step, e.clientX, e.clientY);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [disabled, scale, applyZoom]);
+
+  return (
+    <div
+      ref={stageRef}
+      style={{
+        position: "relative",
+        width: "100%",
+        height: "100%",
+        overflow: "hidden",
+        cursor:
+          !disabled && scale > 1.0 ? (isDragging ? "grabbing" : "grab") : "inherit",
+      }}
+      onDoubleClick={(e) => {
+        if (disabled) return;
+        if (scale > 1.0) {
+          e.stopPropagation();
+          resetZoom();
+        }
+      }}
+      onPointerDown={(e) => {
+        if (disabled || scale <= 1.0) return;
+        if ((e.target as HTMLElement).closest("[data-zoom-hud]")) return;
+        e.stopPropagation();
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+          // ignore
+        }
+        setIsDragging(true);
+        dragOriginRef.current = {
+          startX: e.clientX,
+          startY: e.clientY,
+          originX: pan.x,
+          originY: pan.y,
+        };
+      }}
+      onPointerMove={(e) => {
+        if (!isDragging || !dragOriginRef.current) return;
+        e.stopPropagation();
+        const dx = e.clientX - dragOriginRef.current.startX;
+        const dy = e.clientY - dragOriginRef.current.startY;
+        setPan(
+          clampPan(
+            scale,
+            dragOriginRef.current.originX + dx,
+            dragOriginRef.current.originY + dy
+          )
+        );
+      }}
+      onPointerUp={(e) => {
+        if (!isDragging) return;
+        e.stopPropagation();
+        setIsDragging(false);
+        dragOriginRef.current = null;
+      }}
+      onPointerCancel={() => {
+        setIsDragging(false);
+        dragOriginRef.current = null;
+      }}
+    >
+      <div
+        style={{
+          position: "relative",
+          width: "100%",
+          height: "100%",
+          transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${scale})`,
+          transformOrigin: "center center",
+          transition: isDragging ? "none" : "transform 0.1s ease-out",
+        }}
+      >
+        {children}
+      </div>
+
+      {!disabled && (
+        <div
+          data-zoom-hud="true"
+          className="mono"
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: "absolute",
+            top: 8,
+            right: 8,
+            zIndex: 12,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 3,
+            background: "rgba(9, 13, 20, 0.82)",
+            border: "1px solid var(--border-strong)",
+            borderRadius: 3,
+            padding: "2px 4px",
+            fontSize: "var(--text-xs)",
+            fontVariantNumeric: "tabular-nums",
+          }}
+        >
+          <button
+            type="button"
+            className="nvr-btn mono"
+            style={{ height: 18, padding: "0 5px", fontSize: "var(--text-xs)" }}
+            title="Zoom out (-0.25x)"
+            disabled={scale <= 1.0}
+            onClick={() => applyZoom(scale - 0.25)}
+          >
+            -
+          </button>
+          <button
+            type="button"
+            className="nvr-btn mono"
+            style={{
+              height: 18,
+              padding: "0 6px",
+              fontSize: "var(--text-xs)",
+              color: scale > 1.0 ? "var(--signal-accent-text)" : "var(--text-secondary)",
+            }}
+            title="Click to reset digital zoom to 1.0x (Ctrl+Wheel to zoom)"
+            onClick={resetZoom}
+          >
+            {scale.toFixed(2)}x{scale > 1.0 ? " [RESET]" : ""}
+          </button>
+          <button
+            type="button"
+            className="nvr-btn mono"
+            style={{ height: 18, padding: "0 5px", fontSize: "var(--text-xs)" }}
+            title="Zoom in (+0.25x)"
+            disabled={scale >= 5.0}
+            onClick={() => applyZoom(scale + 0.25)}
+          >
+            +
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
 interface LiveMsePlayerProps {
   camera: string;
   useMainStream?: boolean;
@@ -364,106 +581,108 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       }
     >
       {/* Zero-black-screen instant snapshot underlay while MSE connects — strictly object-fit: contain */}
-      <img
-        ref={imgRef}
-        className="nvr-cam-poster"
-        src={`/api/${camera}/latest.webp?height=360&cache=${posterTick}`}
-        alt={camera}
-        onLoad={updateOverlayGeometry}
-        style={{
-          position: "absolute",
-          inset: 0,
-          width: "100%",
-          height: "100%",
-          objectFit: "contain",
-          opacity: mseReady ? 0 : 1,
-          transition: "opacity 0.2s ease",
-          pointerEvents: "none",
-        }}
-      />
-      <video
-        ref={videoRef}
-        autoPlay
-        playsInline
-        muted={muted}
-        style={{
-          width: "100%",
-          height: "100%",
-          objectFit: "contain",
-          opacity: mseReady ? 1 : 0,
-          transition: "opacity 0.2s ease",
-          pointerEvents: "none",
-        }}
-      />
-      {(showVectors || (draftPoints && draftPoints.length > 0)) && overlayBox && (
-        <svg
-          viewBox="0 0 1000 1000"
-          preserveAspectRatio="none"
+      <ZoomableVideoStage disabled={Boolean(onPlotPoint)}>
+        <img
+          ref={imgRef}
+          className="nvr-cam-poster"
+          src={`/api/${camera}/latest.webp?height=360&cache=${posterTick}`}
+          alt={camera}
+          onLoad={updateOverlayGeometry}
           style={{
             position: "absolute",
-            left: `${overlayBox.left}px`,
-            top: `${overlayBox.top}px`,
-            width: `${overlayBox.width}px`,
-            height: `${overlayBox.height}px`,
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            opacity: mseReady ? 0 : 1,
+            transition: "opacity 0.2s ease",
             pointerEvents: "none",
-            zIndex: 4,
           }}
-        >
-          {masks.map((m, idx) => (
-            <polygon
-              key={`mask-${idx}`}
-              points={parsePolygonPoints(m, detW, detH)}
-              fill="rgba(239, 68, 68, 0.24)"
-              stroke="#ef4444"
-              strokeWidth="3"
-              strokeDasharray="8 4"
-            />
-          ))}
-          {objectMasks.map((m, idx) => (
-            <polygon
-              key={`objmask-${idx}`}
-              points={parsePolygonPoints(m, detW, detH)}
-              fill="rgba(168, 85, 247, 0.22)"
-              stroke="#a855f7"
-              strokeWidth="3"
-              strokeDasharray="5 5"
-            />
-          ))}
-          {Object.entries(zones).map(([zName, zCfg]) => (
-            <g key={`zone-${zName}`}>
+        />
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted={muted}
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            opacity: mseReady ? 1 : 0,
+            transition: "opacity 0.2s ease",
+            pointerEvents: "none",
+          }}
+        />
+        {(showVectors || (draftPoints && draftPoints.length > 0)) && overlayBox && (
+          <svg
+            viewBox="0 0 1000 1000"
+            preserveAspectRatio="none"
+            style={{
+              position: "absolute",
+              left: `${overlayBox.left}px`,
+              top: `${overlayBox.top}px`,
+              width: `${overlayBox.width}px`,
+              height: `${overlayBox.height}px`,
+              pointerEvents: "none",
+              zIndex: 4,
+            }}
+          >
+            {masks.map((m, idx) => (
               <polygon
-                points={parsePolygonPoints(zCfg.coordinates, detW, detH)}
-                fill="rgba(14, 165, 233, 0.18)"
-                stroke="#0ea5e9"
+                key={`mask-${idx}`}
+                points={parsePolygonPoints(m, detW, detH)}
+                fill="rgba(239, 68, 68, 0.24)"
+                stroke="#ef4444"
                 strokeWidth="3"
+                strokeDasharray="8 4"
               />
-            </g>
-          ))}
-          {draftPoints && draftPoints.length > 0 && (
-            <g>
+            ))}
+            {objectMasks.map((m, idx) => (
               <polygon
-                points={draftPoints
-                  .map(([x, y]) => `${Math.round(x * 1000)},${Math.round(y * 1000)}`)
-                  .join(" ")}
-                fill="rgba(245, 158, 11, 0.25)"
-                stroke="#f59e0b"
+                key={`objmask-${idx}`}
+                points={parsePolygonPoints(m, detW, detH)}
+                fill="rgba(168, 85, 247, 0.22)"
+                stroke="#a855f7"
                 strokeWidth="3"
+                strokeDasharray="5 5"
               />
-              {draftPoints.map(([x, y], idx) => (
-                <circle
-                  key={idx}
-                  cx={Math.round(x * 1000)}
-                  cy={Math.round(y * 1000)}
-                  r="7"
-                  fill="#fbbf24"
-                  stroke="#000"
-                  strokeWidth="2"
+            ))}
+            {Object.entries(zones).map(([zName, zCfg]) => (
+              <g key={`zone-${zName}`}>
+                <polygon
+                  points={parsePolygonPoints(zCfg.coordinates, detW, detH)}
+                  fill="rgba(14, 165, 233, 0.18)"
+                  stroke="#0ea5e9"
+                  strokeWidth="3"
                 />
-              ))}
-            </g>
-          )}
-        </svg>
-      )}
+              </g>
+            ))}
+            {draftPoints && draftPoints.length > 0 && (
+              <g>
+                <polygon
+                  points={draftPoints
+                    .map(([x, y]) => `${Math.round(x * 1000)},${Math.round(y * 1000)}`)
+                    .join(" ")}
+                  fill="rgba(245, 158, 11, 0.25)"
+                  stroke="#f59e0b"
+                  strokeWidth="3"
+                />
+                {draftPoints.map(([x, y], idx) => (
+                  <circle
+                    key={idx}
+                    cx={Math.round(x * 1000)}
+                    cy={Math.round(y * 1000)}
+                    r="7"
+                    fill="#fbbf24"
+                    stroke="#000"
+                    strokeWidth="2"
+                  />
+                ))}
+              </g>
+            )}
+          </svg>
+        )}
+      </ZoomableVideoStage>
     </div>
   );
 };
@@ -582,14 +801,35 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 
   if (useFallbackMp4 && fallbackPreviewId) {
     return (
+      <ZoomableVideoStage>
+        <video
+          ref={videoRef}
+          src={mp4FallbackUrl}
+          controls={controls}
+          autoPlay={autoPlay}
+          playsInline
+          muted={userMuted}
+          loop
+          onVolumeChange={(e) => {
+            const next = e.currentTarget.muted;
+            setUserMuted(next);
+            window.sessionStorage?.setItem("ninjanvr_vod_muted", String(next));
+          }}
+          onTimeUpdate={(e) => onTimeUpdate?.(e.currentTarget.currentTime)}
+          style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
+        />
+      </ZoomableVideoStage>
+    );
+  }
+
+  return (
+    <ZoomableVideoStage>
       <video
         ref={videoRef}
-        src={mp4FallbackUrl}
         controls={controls}
         autoPlay={autoPlay}
         playsInline
         muted={userMuted}
-        loop
         onVolumeChange={(e) => {
           const next = e.currentTarget.muted;
           setUserMuted(next);
@@ -598,24 +838,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         onTimeUpdate={(e) => onTimeUpdate?.(e.currentTarget.currentTime)}
         style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
       />
-    );
-  }
-
-  return (
-    <video
-      ref={videoRef}
-      controls={controls}
-      autoPlay={autoPlay}
-      playsInline
-      muted={userMuted}
-      onVolumeChange={(e) => {
-        const next = e.currentTarget.muted;
-        setUserMuted(next);
-        window.sessionStorage?.setItem("ninjanvr_vod_muted", String(next));
-      }}
-      onTimeUpdate={(e) => onTimeUpdate?.(e.currentTarget.currentTime)}
-      style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
-    />
+    </ZoomableVideoStage>
   );
 };
 
