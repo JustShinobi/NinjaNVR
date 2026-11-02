@@ -386,6 +386,10 @@ pub struct RecordConfig {
     pub enabled: bool,
     #[serde(default = "default_expire_interval")]
     pub expire_interval: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size_gb: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_free_gb: Option<f64>,
     #[serde(default)]
     pub continuous: RecordDaysConfig,
     #[serde(default)]
@@ -409,6 +413,8 @@ impl Default for RecordConfig {
         Self {
             enabled: true,
             expire_interval: default_expire_interval(),
+            max_size_gb: None,
+            min_free_gb: None,
             continuous: RecordDaysConfig::default(),
             motion: RecordZeroDaysConfig::default(),
             alerts: RecordEventRetainConfig::default(),
@@ -473,6 +479,10 @@ pub struct RetainPolicyConfig {
     pub days: f64,
     #[serde(default = "default_retain_mode")]
     pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size_gb: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_free_gb: Option<f64>,
 }
 
 fn default_retain_mode() -> String {
@@ -484,6 +494,8 @@ impl Default for RetainPolicyConfig {
         Self {
             days: default_retain_days(),
             mode: default_retain_mode(),
+            max_size_gb: None,
+            min_free_gb: None,
         }
     }
 }

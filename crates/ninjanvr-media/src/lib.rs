@@ -1032,10 +1032,18 @@ impl RecordingEngine {
 
     async fn run_retention_cleanup_loop(&self) {
         let recordings_root = self.media_dir.join("recordings");
+        struct CameraRetentionEntry {
+            camera: String,
+            continuous_days: f64,
+            alerts_days: f64,
+            detections_days: f64,
+            quota_gb: Option<f64>,
+        }
         loop {
-            let (expire_interval, camera_retentions): (u64, Vec<(String, f64, f64, f64)>) = {
+            let (expire_interval, camera_retentions): (u64, Vec<CameraRetentionEntry>) = {
                 let cfg = self.config.read().await;
                 let interval = cfg.record.expire_interval.max(30);
+                let global_quota = cfg.record.max_size_gb;
                 let cams = cfg
                     .cameras
                     .iter()
@@ -1043,14 +1051,32 @@ impl RecordingEngine {
                         let continuous_days = c.record.continuous.days.max(0.1);
                         let alerts_days = c.record.alerts.retain.days.max(0.1);
                         let detections_days = c.record.detections.retain.days.max(0.1);
-                        (name.clone(), continuous_days, alerts_days, detections_days)
+                        let quota_gb = c
+                            .record
+                            .max_size_gb
+                            .or(c.record.alerts.retain.max_size_gb)
+                            .or(global_quota);
+                        CameraRetentionEntry {
+                            camera: name.clone(),
+                            continuous_days,
+                            alerts_days,
+                            detections_days,
+                            quota_gb,
+                        }
                     })
                     .collect();
                 (interval, cams)
             };
 
             let now = unix_now_f64();
-            for (camera, continuous_days, alerts_days, detections_days) in camera_retentions {
+            for CameraRetentionEntry {
+                camera,
+                continuous_days,
+                alerts_days,
+                detections_days,
+                quota_gb,
+            } in camera_retentions
+            {
                 let continuous_cutoff = now - continuous_days * 86400.0;
                 let alerts_cutoff = now - alerts_days * 86400.0;
                 let detections_cutoff = now - detections_days * 86400.0;
@@ -1084,6 +1110,24 @@ impl RecordingEngine {
                     );
                     if batch_len < 500 {
                         break;
+                    }
+                }
+
+                if let Some(max_gb) = quota_gb
+                    && max_gb > 0.0
+                    && let Ok(quota_paths) = self
+                        .db
+                        .delete_recordings_over_quota_mb(&camera, max_gb * 1024.0)
+                {
+                    for db_path in &quota_paths {
+                        let disk_path = if let Some(rel) = db_path.strip_prefix("/media/frigate/") {
+                            self.media_dir.join(rel)
+                        } else {
+                            PathBuf::from(db_path)
+                        };
+                        if std::fs::remove_file(&disk_path).is_ok() {
+                            prune_empty_parent_dirs(&disk_path, &recordings_root);
+                        }
                     }
                 }
 

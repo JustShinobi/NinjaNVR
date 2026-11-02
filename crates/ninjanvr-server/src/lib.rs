@@ -1458,11 +1458,39 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         }
     };
 
+    let rec_mount = stat_mount_mb(&rec_dir, "ext4");
+    let free_mb = rec_mount["free"].as_f64().unwrap_or(20_000.0).max(1.0);
+    let mut cam_storage = state
+        .db
+        .query_recordings_storage_usage()
+        .unwrap_or_else(|_| json!({}));
+    let mut total_bw_mb_hr = 0.0;
+    if let Some(obj) = cam_storage.as_object() {
+        for v in obj.values() {
+            total_bw_mb_hr += v["bandwidth"].as_f64().unwrap_or(0.0);
+        }
+    }
+    let estimated_retention_days = if total_bw_mb_hr > 0.1 {
+        ((free_mb / (total_bw_mb_hr * 24.0)) * 10.0).round() / 10.0
+    } else {
+        14.0
+    };
+    if let Some(obj) = cam_storage.as_object_mut() {
+        for (_cam, v) in obj.iter_mut() {
+            let bw = v["bandwidth"].as_f64().unwrap_or(0.0);
+            let runway = if bw > 0.1 {
+                ((free_mb / (bw * 24.0)) * 10.0).round() / 10.0
+            } else {
+                14.0
+            };
+            if let Some(m) = v.as_object_mut() {
+                m.insert("estimated_retention_days".to_string(), json!(runway));
+            }
+        }
+    }
+
     let mut storage_map = serde_json::Map::new();
-    storage_map.insert(
-        "/media/frigate/recordings".to_string(),
-        stat_mount_mb(&rec_dir, "ext4"),
-    );
+    storage_map.insert("/media/frigate/recordings".to_string(), rec_mount);
     if cfg.record.storage_tiers.enabled
         && let Some(ref cold_dir) = cfg.record.storage_tiers.cold_dir
     {
@@ -1496,6 +1524,8 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
             "latest_version": NINJANVR_VERSION,
             "storage_degraded": storage_degraded_val,
             "storage_error": storage_error_val,
+            "estimated_retention_days": estimated_retention_days,
+            "camera_storage": cam_storage,
             "storage": Value::Object(storage_map),
             "last_updated": unix_now()
         },

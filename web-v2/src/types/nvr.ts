@@ -278,6 +278,15 @@ export interface NinjaStatsResponse {
     latest_version: string;
     storage_degraded?: boolean;
     storage_error?: string | null;
+    estimated_retention_days?: number;
+    camera_storage?: Record<
+      string,
+      {
+        usage: number;
+        bandwidth: number;
+        estimated_retention_days?: number;
+      }
+    >;
     storage: Record<string, StorageStatItem>;
     last_updated: number;
   };

@@ -301,6 +301,31 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 })}
               </tbody>
             </table>
+            {stats?.service?.camera_storage &&
+              Object.keys(stats.service.camera_storage).length > 0 && (
+                <table className="nvr-table mono" style={{ borderTop: "1px solid var(--border-hairline)" }}>
+                  <thead>
+                    <tr>
+                      <th>Camera Channel</th>
+                      <th>Disk Usage</th>
+                      <th>Write Rate</th>
+                      <th>Est. Runway</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.entries(stats.service.camera_storage).map(([cam, cs]) => (
+                      <tr key={cam}>
+                        <td style={{ fontWeight: 700, textTransform: "uppercase" }}>{cam}</td>
+                        <td>{((cs.usage || 0) / 1024).toFixed(2)} GB</td>
+                        <td>{(cs.bandwidth || 0).toFixed(1)} MB/h</td>
+                        <td style={{ color: "var(--signal-live-text)" }}>
+                          {(cs.estimated_retention_days ?? stats.service.estimated_retention_days ?? 14).toFixed(1)}d
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
           </div>
         </div>
       </div>

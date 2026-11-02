@@ -1782,6 +1782,63 @@ impl NinjaDatabase {
         Ok(rows > 0)
     }
 
+    /// Evicts the oldest recording segments for `camera` until total `segment_size` (in MB)
+    /// is at or below `max_size_mb`, returning the `path` of each evicted segment.
+    pub fn delete_recordings_over_quota_mb(
+        &self,
+        camera: &str,
+        max_size_mb: f64,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let total_mb: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(segment_size), 0.0) FROM recordings WHERE camera = ?1",
+            params![camera],
+            |r| r.get(0),
+        )?;
+        if total_mb <= max_size_mb {
+            return Ok(Vec::new());
+        }
+        let excess_mb = total_mb - max_size_mb;
+        let tx = conn.transaction()?;
+        let mut to_delete = Vec::new();
+        let mut accumulated_mb = 0.0;
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT id, path, COALESCE(segment_size, 0.0)
+                FROM recordings
+                WHERE camera = ?1
+                ORDER BY start_time ASC
+                "#,
+            )?;
+            let rows = stmt.query_map(params![camera], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2).unwrap_or(0.0),
+                ))
+            })?;
+            for r in rows {
+                let (id, path, sz) = r?;
+                to_delete.push((id, path));
+                accumulated_mb += sz.max(0.001);
+                if accumulated_mb >= excess_mb {
+                    break;
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        if !to_delete.is_empty() {
+            let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1")?;
+            for (id, path) in to_delete {
+                del_stmt.execute(params![id])?;
+                paths.push(path);
+            }
+        }
+        tx.commit()?;
+        Ok(paths)
+    }
+
     pub fn query_timeline(
         &self,
         camera: Option<&str>,
@@ -2261,6 +2318,31 @@ mod tests {
             .unwrap();
         assert_eq!(filtered_evs.len(), 1);
         assert_eq!(filtered_evs[0]["id"], "ev_person_driveway");
+
+        // Test disk quota eviction (oldest segments pruned first when total exceeds max_size_mb)
+        for i in 0..4 {
+            db.insert_recording(&RecordingRow {
+                id: format!("quota_seg_{i}"),
+                camera: "front_door".to_string(),
+                path: format!("/media/frigate/recordings/2026-11-01/01/front_door/00.{i}0.mp4"),
+                start_time: 1700001000.0 + (i as f64) * 10.0,
+                end_time: 1700001010.0 + (i as f64) * 10.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 100.0, // 4 * 100 MB = 400 MB total
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        }
+        let evicted = db
+            .delete_recordings_over_quota_mb("front_door", 220.0)
+            .unwrap();
+        assert_eq!(evicted.len(), 2);
+        assert!(evicted[0].ends_with("00.00.mp4"));
+        assert!(evicted[1].ends_with("00.10.mp4"));
 
         // User management CRUD & last-admin guardrails
         assert!(db.delete_user("admin").is_err());
