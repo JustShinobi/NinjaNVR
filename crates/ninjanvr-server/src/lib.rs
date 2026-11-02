@@ -442,6 +442,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/events/{id}/clip.mp4", get(api_event_clip_mp4))
         .route("/timeline", get(api_timeline))
         .route("/recordings/summary", get(api_all_recordings_summary))
+        .route("/recordings/sync", post(api_recordings_sync))
         .route("/recordings/unavailable", get(api_empty_array))
         .route("/recordings/storage", get(api_recordings_storage))
         .route("/exports", get(api_exports))
@@ -473,7 +474,10 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/go2rtc/streams", get(api_go2rtc_streams))
         .route("/go2rtc/streams/{stream}", get(api_go2rtc_stream_one))
         .route("/go2rtc/webrtc", post(api_go2rtc_webrtc))
-        .route("/{camera}/recordings", get(api_camera_recordings))
+        .route(
+            "/{camera}/recordings",
+            get(api_camera_recordings).delete(api_camera_recordings_delete),
+        )
         .route(
             "/{camera}/recordings/summary",
             get(api_camera_recordings_summary),
@@ -1970,6 +1974,52 @@ async fn api_camera_recordings(
     Json(Value::Array(dto))
 }
 
+async fn api_camera_recordings_delete(
+    State(state): State<AppState>,
+    AxumPath(camera): AxumPath<String>,
+    Query(q): Query<RecordingsQueryParams>,
+) -> Json<Value> {
+    let now = unix_now() as f64;
+    let before = q.before.unwrap_or(now);
+    let after = q.after.unwrap_or(0.0);
+    let deleted = state
+        .db
+        .delete_recordings_in_range(&camera, after, before)
+        .unwrap_or_default();
+    let recordings_root = state.media_dir.join("recordings");
+    let mut freed_bytes: u64 = 0;
+    for (_id, db_path, seg_size_mb) in &deleted {
+        let disk_path = resolve_recording_disk_path(&state.media_dir, db_path);
+        if let Ok(meta) = std::fs::metadata(&disk_path) {
+            freed_bytes += meta.len();
+        } else {
+            freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
+        }
+        let _ = std::fs::remove_file(&disk_path);
+        ninjanvr_media::prune_empty_parent_dirs(&disk_path, &recordings_root);
+    }
+    Json(json!({
+        "deleted_segments": deleted.len(),
+        "freed_bytes": freed_bytes
+    }))
+}
+
+async fn api_recordings_sync(State(state): State<AppState>) -> Json<Value> {
+    let started = Instant::now();
+    let media_dir = state.media_dir.clone();
+    let removed_orphans = state
+        .db
+        .prune_missing_recording_files(|db_path| {
+            resolve_recording_disk_path(&media_dir, db_path).exists()
+        })
+        .unwrap_or(0);
+    let duration_ms = started.elapsed().as_millis() as u64;
+    Json(json!({
+        "removed_orphans": removed_orphans,
+        "duration_ms": duration_ms
+    }))
+}
+
 async fn api_camera_recordings_summary(
     State(state): State<AppState>,
     AxumPath(camera): AxumPath<String>,
@@ -3029,7 +3079,7 @@ version: 0.18-0
         assert_eq!(resp_del_user.status(), StatusCode::OK);
 
         // 9. Test enforce_auth=true router blocks unauthenticated /api/config with 401
-        let auth_app = build_router_with_auth(state, true);
+        let auth_app = build_router_with_auth(state.clone(), true);
         let resp = auth_app
             .clone()
             .oneshot(
@@ -3085,6 +3135,82 @@ version: 0.18-0
         let rec_json: Value =
             serde_json::from_slice(&to_bytes(resp_rec.into_body(), 65536).await.unwrap()).unwrap();
         assert_eq!(rec_json["service"]["storage_degraded"], false);
+
+        // 11. Test DELETE /api/:camera/recordings and POST /api/recordings/sync
+        let rec_subdir = tmp_dir.join("recordings/2026-11-01/00/front_door");
+        std::fs::create_dir_all(&rec_subdir).unwrap();
+        let disk_seg_1 = rec_subdir.join("00.00.mp4");
+        std::fs::write(&disk_seg_1, vec![0x11u8; 1024]).unwrap();
+
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "seg_on_disk".to_string(),
+                camera: "front_door".to_string(),
+                path: "/media/frigate/recordings/2026-11-01/00/front_door/00.00.mp4".to_string(),
+                start_time: 2000.0,
+                end_time: 2010.0,
+                duration: 10.0,
+                motion: 1,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 0.001,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "seg_ghost".to_string(),
+                camera: "front_door".to_string(),
+                path: "/media/frigate/recordings/2026-11-01/00/front_door/00.10.mp4".to_string(),
+                start_time: 2010.0,
+                end_time: 2020.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 0.001,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+
+        let resp_sync = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/recordings/sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_sync.status(), StatusCode::OK);
+        let sync_json: Value =
+            serde_json::from_slice(&to_bytes(resp_sync.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(sync_json["removed_orphans"], 1);
+
+        let resp_del_rec = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/front_door/recordings?after=1995&before=2015")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_del_rec.status(), StatusCode::OK);
+        let del_rec_json: Value =
+            serde_json::from_slice(&to_bytes(resp_del_rec.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(del_rec_json["deleted_segments"], 1);
+        assert_eq!(del_rec_json["freed_bytes"], 1024);
+        assert!(!disk_seg_1.exists());
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

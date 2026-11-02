@@ -1619,6 +1619,75 @@ impl NinjaDatabase {
         Ok(paths)
     }
 
+    /// Deletes recording rows for `camera` overlapping `[after, before]` in a single transaction
+    /// and returns `(id, path, segment_size_mb)` for each deleted segment.
+    pub fn delete_recordings_in_range(
+        &self,
+        camera: &str,
+        after: f64,
+        before: f64,
+    ) -> Result<Vec<(String, String, f64)>> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut matched = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT id, path, COALESCE(segment_size, 0.0)
+                FROM recordings
+                WHERE camera = ?1 AND end_time >= ?2 AND start_time <= ?3
+                "#,
+            )?;
+            let rows = stmt.query_map(params![camera, after, before], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2).unwrap_or(0.0),
+                ))
+            })?;
+            for r in rows {
+                matched.push(r?);
+            }
+        }
+        if !matched.is_empty() {
+            let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1")?;
+            for (id, _, _) in &matched {
+                del_stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(matched)
+    }
+
+    /// Scans all rows in `recordings` and removes any entries whose on-disk file no longer exists.
+    pub fn prune_missing_recording_files<F>(&self, file_exists: F) -> Result<usize>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut orphan_ids = Vec::new();
+        {
+            let mut stmt = tx.prepare("SELECT id, path FROM recordings")?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            for r in rows {
+                let (id, path) = r?;
+                if !file_exists(&path) {
+                    orphan_ids.push(id);
+                }
+            }
+        }
+        if !orphan_ids.is_empty() {
+            let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1")?;
+            for id in &orphan_ids {
+                del_stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(orphan_ids.len())
+    }
+
     pub fn query_timeline(
         &self,
         camera: Option<&str>,
@@ -2006,6 +2075,38 @@ mod tests {
             .unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].duration, 10.0);
+
+        // Test orphan file pruning and manual time-range deletion
+        db.insert_recording(&RecordingRow {
+            id: "1700000020.0-orphan".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/frigate/recordings/2026-11-01/00/front_door/00.20.mp4".to_string(),
+            start_time: 1700000020.0,
+            end_time: 1700000030.0,
+            duration: 10.0,
+            motion: 0,
+            objects: 0,
+            dbfs: 0,
+            segment_size: 1.0,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        let removed_orphans = db
+            .prune_missing_recording_files(|p| p.ends_with("00.00.mp4"))
+            .unwrap();
+        assert_eq!(removed_orphans, 1);
+
+        let deleted_range = db
+            .delete_recordings_in_range("front_door", 1699999990.0, 1700000015.0)
+            .unwrap();
+        assert_eq!(deleted_range.len(), 1);
+        assert!(
+            db.query_recordings("front_door", 1699999990.0, 1700000050.0)
+                .unwrap()
+                .is_empty()
+        );
 
         // User management CRUD & last-admin guardrails
         assert!(db.delete_user("admin").is_err());

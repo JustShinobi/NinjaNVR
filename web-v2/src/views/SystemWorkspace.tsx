@@ -210,8 +210,36 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               borderRadius: 3,
             }}
           >
-            <div className="nvr-panel-header">
+            <div
+              className="nvr-panel-header"
+              style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}
+            >
               <span>{t.system.storageVolumes}</span>
+              <button
+                className="nvr-btn mono"
+                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                title="Reconcile SQLite recordings table against on-disk MP4 files"
+                onClick={async () => {
+                  try {
+                    const res = await fetch("/api/recordings/sync", {
+                      method: "POST",
+                      credentials: "include",
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      notify(
+                        `Synced Storage DB: removed ${data.removed_orphans ?? 0} orphan segment(s) in ${data.duration_ms ?? 0}ms`
+                      );
+                    } else {
+                      notify(`Storage DB sync failed (${res.status})`);
+                    }
+                  } catch {
+                    notify("Storage DB sync request failed");
+                  }
+                }}
+              >
+                Sync Storage DB
+              </button>
             </div>
             <table className="nvr-table mono">
               <thead>
