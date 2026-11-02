@@ -132,7 +132,7 @@ jobs:
     env:
       GITOPS_TOKEN: ${{ secrets.PLATFORM_GITOPS_TOKEN }}
       GITOPS_REPO: ${{ vars.GITOPS_REPO || 'JustShinobi/k3s-gitops-prod' }}
-      GITOPS_MANIFEST_PATH: ${{ vars.GITOPS_MANIFEST_PATH || 'clusters/prod/workloads/frigate/frigate.yaml' }}
+      GITOPS_MANIFEST_PATH: ${{ vars.GITOPS_MANIFEST_PATH || 'clusters/prod/workloads/ninjanvr/ninjanvr.yaml' }}
       IMAGE_TAG: ${{ needs.publish-ghcr.outputs.image_tag }}
     steps:
       - name: Check GitOps token availability

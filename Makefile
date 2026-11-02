@@ -4,8 +4,8 @@ export
 VERSION       ?= $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
 IMAGE         ?= ghcr.io/justshinobi/ninjanvr:v$(VERSION)
 K3S_HOST      ?= localhost
-K8S_NAMESPACE ?= frigate
-K8S_DEPLOY    ?= frigate
+K8S_NAMESPACE ?= ninjanvr
+K8S_DEPLOY    ?= ninjanvr
 
 .PHONY: verify check privacy test build build-ui image fast-ui logs status help
 
