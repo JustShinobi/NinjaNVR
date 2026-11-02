@@ -1348,6 +1348,160 @@ impl NinjaDatabase {
         Ok(out)
     }
 
+    /// Computes aggregated analytics for AI/LLM context digests and MCP tool calls over `[after, before]`,
+    /// including counts by camera, label, zone, severity, hourly histogram, and top unreviewed alerts with deep links.
+    pub fn query_ai_digest_summary(
+        &self,
+        after: f64,
+        before: f64,
+        allowed_cameras: Option<&[String]>,
+    ) -> Result<Value> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut ev_sql = String::from(
+            "SELECT id, camera, label, zones, start_time, top_score FROM event WHERE start_time >= ?1 AND start_time <= ?2",
+        );
+        if let Some(cams) = allowed_cameras {
+            let list: Vec<String> = cams
+                .iter()
+                .map(|c| format!("'{}'", c.replace('\'', "")))
+                .collect();
+            if list.is_empty() {
+                ev_sql.push_str(" AND 1=0");
+            } else {
+                ev_sql.push_str(&format!(" AND camera IN ({})", list.join(",")));
+            }
+        }
+        ev_sql.push_str(" ORDER BY start_time DESC LIMIT 5000");
+
+        let mut total_events = 0usize;
+        let mut by_camera: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_label: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_zone: BTreeMap<String, usize> = BTreeMap::new();
+        let mut hourly_histogram: BTreeMap<String, usize> = BTreeMap::new();
+
+        {
+            let mut stmt = conn.prepare(&ev_sql)?;
+            let rows = stmt.query_map(params![after, before], |r| {
+                let cam: String = r.get(1)?;
+                let label: String = r.get(2)?;
+                let zones_raw: Option<String> = r.get(3).ok();
+                let ts = value_to_f64(&r.get_ref(4)?).unwrap_or(0.0);
+                Ok((cam, label, parse_json_or(zones_raw, json!([])), ts))
+            })?;
+            for r in rows {
+                let (cam, label, zones_val, ts) = r?;
+                total_events += 1;
+                *by_camera.entry(cam).or_default() += 1;
+                *by_label.entry(label).or_default() += 1;
+                if let Some(z_arr) = zones_val.as_array() {
+                    for z in z_arr.iter().filter_map(|v| v.as_str()) {
+                        if !z.is_empty() {
+                            *by_zone.entry(z.to_string()).or_default() += 1;
+                        }
+                    }
+                }
+                if let Some(dt) = Utc.timestamp_opt(ts as i64, 0).single() {
+                    let hour_bucket = dt.format("%Y-%m-%dT%H:00Z").to_string();
+                    *hourly_histogram.entry(hour_bucket).or_default() += 1;
+                }
+            }
+        }
+
+        let mut rev_sql = String::from(
+            r#"
+            SELECT
+                r.id, r.camera, r.start_time, r.end_time, r.severity, r.data,
+                COALESCE(u.has_been_reviewed, 0) as reviewed
+            FROM reviewsegment r
+            LEFT JOIN userreviewstatus u ON u.review_segment_id = r.id
+            WHERE r.start_time >= ?1 AND r.start_time <= ?2
+            "#,
+        );
+        if let Some(cams) = allowed_cameras {
+            let list: Vec<String> = cams
+                .iter()
+                .map(|c| format!("'{}'", c.replace('\'', "")))
+                .collect();
+            if list.is_empty() {
+                rev_sql.push_str(" AND 1=0");
+            } else {
+                rev_sql.push_str(&format!(" AND r.camera IN ({})", list.join(",")));
+            }
+        }
+        rev_sql.push_str(" ORDER BY r.start_time DESC LIMIT 1000");
+
+        let mut by_severity: BTreeMap<String, usize> = BTreeMap::new();
+        let mut unreviewed_alerts = Vec::new();
+        {
+            let mut stmt = conn.prepare(&rev_sql)?;
+            let rows = stmt.query_map(params![after, before], |r| {
+                let id: String = r.get(0)?;
+                let cam: String = r.get(1)?;
+                let start_time = value_to_f64(&r.get_ref(2)?).unwrap_or(0.0);
+                let end_time = value_to_f64(&r.get_ref(3)?);
+                let sev: String = r.get(4)?;
+                let data_raw: Option<String> = r.get(5).ok();
+                let reviewed = r.get::<_, i64>(6).unwrap_or(0) != 0;
+                Ok((
+                    id,
+                    cam,
+                    start_time,
+                    end_time,
+                    sev,
+                    parse_json_or(data_raw, json!({})),
+                    reviewed,
+                ))
+            })?;
+            for r in rows {
+                let (id, cam, start_time, end_time, sev, data_val, reviewed) = r?;
+                *by_severity.entry(sev.clone()).or_default() += 1;
+                if sev == "alert" && !reviewed && unreviewed_alerts.len() < 20 {
+                    let objs = data_val
+                        .get("objects")
+                        .cloned()
+                        .unwrap_or_else(|| json!([]));
+                    let zones = data_val.get("zones").cloned().unwrap_or_else(|| json!([]));
+                    let top_score = data_val
+                        .get("provenance")
+                        .and_then(|p| p.get("top_score"))
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.85);
+                    let first_det = data_val
+                        .get("detections")
+                        .and_then(|d| d.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&id);
+                    unreviewed_alerts.push(json!({
+                        "id": id,
+                        "camera": cam,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "objects": objs,
+                        "zones": zones,
+                        "top_score": top_score,
+                        "review_url": format!("/review?id={id}"),
+                        "snapshot_url": format!("/api/events/{first_det}/snapshot.jpg")
+                    }));
+                }
+            }
+        }
+
+        Ok(json!({
+            "window": {
+                "after": after,
+                "before": before
+            },
+            "total_events": total_events,
+            "counts_by_camera": by_camera,
+            "counts_by_label": by_label,
+            "counts_by_zone": by_zone,
+            "counts_by_severity": by_severity,
+            "hourly_histogram": hourly_histogram,
+            "unreviewed_alerts": unreviewed_alerts
+        }))
+    }
+
     pub fn get_event(&self, id: &str) -> Result<Option<Value>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let row = conn

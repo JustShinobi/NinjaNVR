@@ -423,6 +423,8 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/stats", get(api_stats))
         .route("/stats/history", get(api_stats_history))
         .route("/metrics", get(api_stats))
+        .route("/ai/context", get(api_ai_context))
+        .route("/mcp", post(api_mcp_handler))
         .route("/review", get(api_review))
         .route("/review/summary", get(api_review_summary))
         .route("/review/activity/motion", get(api_review_activity_motion))
@@ -811,6 +813,7 @@ async fn auth_gate_middleware(
             }
 
             if role_lc == "read_only"
+                && !path.starts_with("/api/mcp")
                 && ((method != "GET" && method != "HEAD") || !path.starts_with("/api/"))
             {
                 state.log_hub.push_nginx(&method, &path, 403);
@@ -825,6 +828,7 @@ async fn auth_gate_middleware(
                 && method != "GET"
                 && method != "HEAD"
                 && !path.starts_with("/api/logout")
+                && !path.starts_with("/api/mcp")
             {
                 state.log_hub.push_nginx(&method, &path, 403);
                 return (
@@ -898,6 +902,8 @@ async fn auth_gate_middleware(
                                 | "share"
                                 | "tokens"
                                 | "metrics"
+                                | "ai"
+                                | "mcp"
                                 | "go2rtc"
                                 | "ws"
                                 | "labels"
@@ -1646,6 +1652,334 @@ async fn api_stats_history(State(state): State<AppState>) -> Json<Value> {
     }
     let items: Vec<Value> = history.iter().cloned().collect();
     Json(Value::Array(items))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AiContextQueryParams {
+    pub hours: Option<f64>,
+    pub after: Option<f64>,
+    pub before: Option<f64>,
+}
+
+async fn build_ai_context_digest(
+    state: &AppState,
+    hours: f64,
+    after_opt: Option<f64>,
+    before_opt: Option<f64>,
+    allowed_cameras: Option<&[String]>,
+) -> Value {
+    let now = unix_now() as f64;
+    let before = before_opt.unwrap_or(now + 5.0);
+    let clamped_hours = hours.clamp(0.1, 720.0);
+    let after = after_opt.unwrap_or(before - clamped_hours * 3600.0);
+
+    let cfg = state.config.read().await;
+    let metrics_map = state.camera_metrics.read().await;
+    let mut cameras_health = serde_json::Map::new();
+    for (cam_name, cam_cfg) in &cfg.cameras {
+        if let Some(allowed) = allowed_cameras
+            && !allowed.contains(cam_name)
+        {
+            continue;
+        }
+        let m = metrics_map.get(cam_name);
+        let rt_flags = state.comms.get_camera_flags(cam_name);
+        let fps = m.map(|x| x.camera_fps).unwrap_or(if cam_cfg.enabled {
+            cam_cfg.detect.fps as f64
+        } else {
+            0.0
+        });
+        cameras_health.insert(
+            cam_name.clone(),
+            json!({
+                "enabled": rt_flags.enabled,
+                "online": fps > 0.0 || cam_cfg.enabled,
+                "fps": fps,
+                "detection_fps": m.map(|x| x.detection_fps).unwrap_or(0.0),
+                "night_mode": m.map(|x| x.night_mode).unwrap_or(false),
+                "detect": rt_flags.detect,
+                "record": rt_flags.record,
+                "alerts": rt_flags.alerts
+            }),
+        );
+    }
+
+    let db_digest = state
+        .db
+        .query_ai_digest_summary(after, before, allowed_cameras)
+        .unwrap_or_else(|_| json!({}));
+
+    json!({
+        "service": {
+            "version": NINJANVR_VERSION,
+            "active_profile": state.comms.get_active_profile(),
+            "storage_degraded": state.storage_degraded.load(std::sync::atomic::Ordering::Relaxed)
+        },
+        "cameras": cameras_health,
+        "digest": db_digest
+    })
+}
+
+async fn api_ai_context(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Query(q): Query<AiContextQueryParams>,
+) -> Json<Value> {
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    let hours = q.hours.unwrap_or(24.0);
+    let digest =
+        build_ai_context_digest(&state, hours, q.after, q.before, allowed.as_deref()).await;
+    Json(digest)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct McpJsonRpcRequest {
+    #[serde(default)]
+    pub jsonrpc: String,
+    #[serde(default)]
+    pub id: Value,
+    pub method: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+async fn api_mcp_handler(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(req): Json<McpJsonRpcRequest>,
+) -> Response {
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    let id = req.id.clone();
+
+    match req.method.as_str() {
+        "initialize" => Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {
+                    "name": "ninjanvr-mcp",
+                    "version": NINJANVR_VERSION
+                },
+                "capabilities": {
+                    "tools": {}
+                }
+            }
+        }))
+        .into_response(),
+        "tools/list" => Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "get_security_digest",
+                        "description": "Returns a structured summary of camera health, object/alert counts by camera/label/zone, and unreviewed alerts with deep links.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "hours": { "type": "number", "default": 24 }
+                            }
+                        }
+                    },
+                    {
+                        "name": "search_events",
+                        "description": "Searches detected object events by camera, label, zone, or minimum confidence score.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "camera": { "type": "string" },
+                                "label": { "type": "string" },
+                                "zone": { "type": "string" },
+                                "limit": { "type": "integer", "default": 25 }
+                            }
+                        }
+                    },
+                    {
+                        "name": "get_camera_status",
+                        "description": "Returns live health, FPS, night IR state, and runtime flags for all permitted cameras.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    },
+                    {
+                        "name": "set_security_profile",
+                        "description": "Switches the active operational security profile (armed, home, disarmed).",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "profile": { "type": "string", "enum": ["armed", "home", "disarmed"] }
+                            },
+                            "required": ["profile"]
+                        }
+                    }
+                ]
+            }
+        }))
+        .into_response(),
+        "tools/call" => {
+            let tool_name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let args = req
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+
+            match tool_name {
+                "get_security_digest" => {
+                    let hours = args.get("hours").and_then(|v| v.as_f64()).unwrap_or(24.0);
+                    let digest =
+                        build_ai_context_digest(&state, hours, None, None, allowed.as_deref())
+                            .await;
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": digest.to_string() }],
+                            "structuredContent": digest
+                        }
+                    }))
+                    .into_response()
+                }
+                "search_events" | "query_events" => {
+                    let req_cams = args
+                        .get("camera")
+                        .and_then(|v| v.as_str())
+                        .map(|s| vec![s.to_string()]);
+                    let filter = EventFilter {
+                        cameras: scope_cameras_filter(req_cams, allowed),
+                        labels: args
+                            .get("label")
+                            .and_then(|v| v.as_str())
+                            .map(|s| vec![s.to_string()]),
+                        exclude_labels: None,
+                        zones: args
+                            .get("zone")
+                            .and_then(|v| v.as_str())
+                            .map(|s| vec![s.to_string()]),
+                        sub_labels: None,
+                        favorites: None,
+                        min_score: args.get("min_score").and_then(|v| v.as_f64()),
+                        stationary: None,
+                        before: args.get("before").and_then(|v| v.as_f64()),
+                        after: args.get("after").and_then(|v| v.as_f64()),
+                        limit: Some(
+                            args.get("limit")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(25)
+                                .clamp(1, 500) as usize,
+                        ),
+                    };
+                    let events = state.db.query_events(&filter).unwrap_or_default();
+                    let val = json!({ "events": events, "count": events.len() });
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": val.to_string() }],
+                            "structuredContent": val
+                        }
+                    }))
+                    .into_response()
+                }
+                "get_camera_status" | "get_camera_health" => {
+                    let digest =
+                        build_ai_context_digest(&state, 1.0, None, None, allowed.as_deref()).await;
+                    let health = json!({
+                        "service": digest["service"],
+                        "cameras": digest["cameras"]
+                    });
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": health.to_string() }],
+                            "structuredContent": health
+                        }
+                    }))
+                    .into_response()
+                }
+                "set_security_profile" => {
+                    let caller_role = {
+                        let cfg = state.config.read().await;
+                        extract_authenticated_user(
+                            &state,
+                            &jar,
+                            &headers,
+                            &cfg.auth.cookie_name,
+                            cfg.auth.enabled,
+                        )
+                        .map(|(_, r)| r.to_ascii_lowercase())
+                        .unwrap_or_else(|| "admin".to_string())
+                    };
+                    if caller_role == "viewer" || caller_role == "read_only" || caller_role == "metrics" {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32003,
+                                    "message": "Read-only role or token cannot modify security profile"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    let prof = args
+                        .get("profile")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("armed");
+                    let active = state.comms.set_active_profile(prof);
+                    let cfg = state.config.read().await;
+                    if let Some(cfg_dir) = cfg.config_path.parent() {
+                        let _ = std::fs::write(cfg_dir.join(".active_profile"), &active);
+                    }
+                    let res_val = json!({ "success": true, "active_profile": active });
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "content": [{ "type": "text", "text": res_val.to_string() }],
+                            "structuredContent": res_val
+                        }
+                    }))
+                    .into_response()
+                }
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32601,
+                            "message": format!("Unknown MCP tool: {tool_name}")
+                        }
+                    })),
+                )
+                    .into_response(),
+            }
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("Method not found: {}", req.method)
+                }
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn api_config_schema() -> Json<Value> {
@@ -4648,6 +4982,68 @@ version: 0.18-0
             .await
             .unwrap();
         assert_eq!(resp_revoked.status(), StatusCode::UNAUTHORIZED);
+
+        // 19. Test GET /api/ai/context and POST /api/mcp (tools/list and tools/call)
+        let resp_ai_ctx = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ai/context?hours=24")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ai_ctx.status(), StatusCode::OK);
+        let ai_ctx_json: Value =
+            serde_json::from_slice(&to_bytes(resp_ai_ctx.into_body(), 16384).await.unwrap())
+                .unwrap();
+        assert!(ai_ctx_json["service"]["version"].is_string());
+        assert!(ai_ctx_json["cameras"]["front_door"].is_object());
+        assert!(ai_ctx_json["digest"]["counts_by_camera"].is_object());
+        assert!(ai_ctx_json["digest"]["unreviewed_alerts"].is_array());
+
+        let resp_mcp_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_mcp_list.status(), StatusCode::OK);
+        let mcp_list_json: Value =
+            serde_json::from_slice(&to_bytes(resp_mcp_list.into_body(), 16384).await.unwrap())
+                .unwrap();
+        let tools_arr = mcp_list_json["result"]["tools"].as_array().unwrap();
+        assert!(tools_arr.iter().any(|t| t["name"] == "get_security_digest"));
+        assert!(tools_arr.iter().any(|t| t["name"] == "search_events"));
+
+        let resp_mcp_call = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_security_digest","arguments":{"hours":24}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_mcp_call.status(), StatusCode::OK);
+        let mcp_call_json: Value =
+            serde_json::from_slice(&to_bytes(resp_mcp_call.into_body(), 16384).await.unwrap())
+                .unwrap();
+        assert!(mcp_call_json["result"]["structuredContent"]["digest"].is_object());
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app
