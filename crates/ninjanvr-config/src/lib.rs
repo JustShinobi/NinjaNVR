@@ -357,6 +357,30 @@ impl Default for ModelConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageTiersConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_dir: Option<PathBuf>,
+    #[serde(default = "default_migrate_after_hours")]
+    pub migrate_after_hours: u32,
+}
+
+fn default_migrate_after_hours() -> u32 {
+    24
+}
+
+impl Default for StorageTiersConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cold_dir: None,
+            migrate_after_hours: default_migrate_after_hours(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -372,6 +396,8 @@ pub struct RecordConfig {
     pub detections: RecordEventRetainConfig,
     #[serde(default)]
     pub preview: RecordPreviewConfig,
+    #[serde(default)]
+    pub storage_tiers: StorageTiersConfig,
 }
 
 fn default_expire_interval() -> u64 {
@@ -388,6 +414,7 @@ impl Default for RecordConfig {
             alerts: RecordEventRetainConfig::default(),
             detections: RecordEventRetainConfig::default(),
             preview: RecordPreviewConfig::default(),
+            storage_tiers: StorageTiersConfig::default(),
         }
     }
 }

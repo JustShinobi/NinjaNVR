@@ -1744,6 +1744,44 @@ impl NinjaDatabase {
         Ok(orphan_ids.len())
     }
 
+    /// Lists up to `limit` recording segments with `start_time < before_ts` whose `path` matches `hot_prefix_like`
+    /// so the Hot-to-Cold storage tier migration worker can move them to the cold archive tier.
+    pub fn list_recordings_for_tier_migration(
+        &self,
+        before_ts: f64,
+        hot_prefix_like: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, path
+            FROM recordings
+            WHERE start_time < ?1 AND path LIKE ?2
+            ORDER BY start_time ASC
+            LIMIT ?3
+            "#,
+        )?;
+        let rows = stmt.query_map(params![before_ts, hot_prefix_like, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Updates `recordings.path` atomically after migrating a segment file to the cold archive tier.
+    pub fn update_recording_path(&self, id: &str, new_path: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let rows = conn.execute(
+            "UPDATE recordings SET path = ?2 WHERE id = ?1",
+            params![id, new_path],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn query_timeline(
         &self,
         camera: Option<&str>,

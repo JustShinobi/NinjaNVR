@@ -1458,6 +1458,29 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         }
     };
 
+    let mut storage_map = serde_json::Map::new();
+    storage_map.insert(
+        "/media/frigate/recordings".to_string(),
+        stat_mount_mb(&rec_dir, "ext4"),
+    );
+    if cfg.record.storage_tiers.enabled
+        && let Some(ref cold_dir) = cfg.record.storage_tiers.cold_dir
+    {
+        storage_map.insert(
+            cold_dir.to_string_lossy().to_string(),
+            stat_mount_mb(cold_dir, "ext4"),
+        );
+    }
+    storage_map.insert(
+        "/media/frigate/clips".to_string(),
+        stat_mount_mb(&clips_dir, "ext4"),
+    );
+    storage_map.insert(
+        "/tmp/cache".to_string(),
+        stat_mount_mb(Path::new("/tmp"), "tmpfs"),
+    );
+    storage_map.insert("/dev/shm".to_string(), shm_stat);
+
     Json(json!({
         "cameras": cameras_stats,
         "detectors": detectors_stats,
@@ -1473,12 +1496,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
             "latest_version": NINJANVR_VERSION,
             "storage_degraded": storage_degraded_val,
             "storage_error": storage_error_val,
-            "storage": {
-                "/media/frigate/recordings": stat_mount_mb(&rec_dir, "ext4"),
-                "/media/frigate/clips": stat_mount_mb(&clips_dir, "ext4"),
-                "/tmp/cache": stat_mount_mb(Path::new("/tmp"), "tmpfs"),
-                "/dev/shm": shm_stat
-            },
+            "storage": Value::Object(storage_map),
             "last_updated": unix_now()
         },
         "processes": {

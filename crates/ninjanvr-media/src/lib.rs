@@ -1103,6 +1103,25 @@ impl RecordingEngine {
                 }
             }
 
+            // Hot-to-Cold tiered storage migration pass
+            let tier_cfg = {
+                let cfg = self.config.read().await;
+                cfg.record.storage_tiers.clone()
+            };
+            if tier_cfg.enabled
+                && let Some(ref cold_dir) = tier_cfg.cold_dir
+            {
+                let migrate_before = now - (tier_cfg.migrate_after_hours.max(1) as f64) * 3600.0;
+                if let Err(err) = migrate_hot_segments_to_cold(
+                    &self.db,
+                    &self.media_dir,
+                    cold_dir,
+                    migrate_before,
+                ) {
+                    warn!("Hot-to-cold storage tier migration skipped: {err:#}");
+                }
+            }
+
             tokio::time::sleep(std::time::Duration::from_secs(expire_interval)).await;
         }
     }
@@ -1233,6 +1252,77 @@ impl RecordingEngine {
             tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         }
     }
+}
+
+/// Migrates recording segments older than `before_ts` from `hot_media_dir/recordings/`
+/// to `cold_dir`, updating `recordings.path` in SQLite atomically and unlinking the hot source file.
+pub fn migrate_hot_segments_to_cold(
+    db: &NinjaDatabase,
+    hot_media_dir: &Path,
+    cold_dir: &Path,
+    before_ts: f64,
+) -> Result<usize> {
+    if let Err(err) = std::fs::create_dir_all(cold_dir) {
+        anyhow::bail!(
+            "cold tier directory {} unreachable: {err}",
+            cold_dir.display()
+        );
+    }
+    let candidates =
+        db.list_recordings_for_tier_migration(before_ts, "/media/frigate/recordings/%", 200)?;
+    let hot_rec_root = hot_media_dir.join("recordings");
+    let mut migrated = 0usize;
+
+    for (id, db_path) in candidates {
+        let Some(rel_under_rec) = db_path.strip_prefix("/media/frigate/recordings/") else {
+            continue;
+        };
+        let src_path = hot_rec_root.join(rel_under_rec);
+        if !src_path.exists() {
+            continue;
+        }
+        let dst_path = cold_dir.join(rel_under_rec);
+        let Some(dst_parent) = dst_path.parent() else {
+            continue;
+        };
+        if let Err(err) = std::fs::create_dir_all(dst_parent) {
+            warn!(
+                "Failed to create cold tier dir {}: {err}",
+                dst_parent.display()
+            );
+            break;
+        }
+        let tmp_dst = dst_parent.join(format!(
+            ".{}.tmp",
+            dst_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("seg.mp4")
+        ));
+        if let Err(err) = std::fs::copy(&src_path, &tmp_dst) {
+            let _ = std::fs::remove_file(&tmp_dst);
+            warn!(
+                "Failed to copy segment {} to cold tier: {err}",
+                src_path.display()
+            );
+            break;
+        }
+        if let Err(err) = std::fs::rename(&tmp_dst, &dst_path) {
+            let _ = std::fs::remove_file(&tmp_dst);
+            warn!(
+                "Failed to rename cold tier segment {}: {err}",
+                dst_path.display()
+            );
+            break;
+        }
+        let new_db_path = dst_path.to_string_lossy().to_string();
+        if db.update_recording_path(&id, &new_db_path)? {
+            let _ = std::fs::remove_file(&src_path);
+            prune_empty_parent_dirs(&src_path, &hot_rec_root);
+            migrated += 1;
+        }
+    }
+    Ok(migrated)
 }
 
 /// Builds the FFmpeg CLI arguments used to remux/concatenate segments into an exported MP4 clip.
@@ -1672,5 +1762,51 @@ mod tests {
             check_acoustic_event_trigger(-18, &cfg),
             Some("audio".to_string())
         );
+    }
+
+    #[test]
+    fn hot_to_cold_tiered_storage_migrates_segments_and_updates_sqlite_path() {
+        let root = std::env::temp_dir().join(format!("ninjanvr-tier-test-{}", random_suffix()));
+        let hot_media = root.join("hot_media");
+        let cold_archive = root.join("cold_archive");
+        let hot_seg_dir = hot_media.join("recordings/2026-11-01/08/front_door");
+        std::fs::create_dir_all(&hot_seg_dir).unwrap();
+
+        let db = NinjaDatabase::open(root.join("frigate.db")).unwrap();
+        let seg_file = hot_seg_dir.join("00.00.mp4");
+        std::fs::write(&seg_file, b"mp4_segment_payload_bytes").unwrap();
+
+        db.insert_recording(&RecordingRow {
+            id: "seg_tier_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/frigate/recordings/2026-11-01/08/front_door/00.00.mp4".to_string(),
+            start_time: 1000.0,
+            end_time: 1010.0,
+            duration: 10.0,
+            motion: 1,
+            objects: 0,
+            dbfs: 0,
+            segment_size: 0.01,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        let migrated =
+            migrate_hot_segments_to_cold(&db, &hot_media, &cold_archive, 2000.0).unwrap();
+        assert_eq!(migrated, 1);
+        assert!(
+            !seg_file.exists(),
+            "hot segment must be unlinked after migration"
+        );
+
+        let cold_seg_file = cold_archive.join("2026-11-01/08/front_door/00.00.mp4");
+        assert!(cold_seg_file.exists(), "cold segment must exist in archive");
+
+        let recs = db.query_recordings("front_door", 990.0, 1020.0).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].path, cold_seg_file.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
