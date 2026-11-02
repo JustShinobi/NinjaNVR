@@ -27,12 +27,18 @@
 ## Build, Verification, and CI/CD Workflow
 Run all commands from the repository root:
 
+- `make hooks` (or `./scripts/ci/install-hooks`): Configures `git config core.hooksPath .githooks` across the repository and all worktrees:
+  - `.githooks/pre-commit`: Runs `./scripts/ci/check-privacy`, `./scripts/ci/check-semver --staged` (blocks manual edits to `CHANGELOG.md` and SemVer manifest versions), blocks forbidden secrets/artifacts/conflict markers, and runs fast staged checks (`cargo fmt`, `cargo clippy`, `web-v2` typecheck, `docs` build).
+  - `.githooks/commit-msg`: Enforces strict scoped Conventional Commits (`<type>(<scope>): <description>`, 12–120 chars, no trailing period, no WIP/todo markers) via `./scripts/ci/check-commit-msg`.
+  - `.githooks/pre-push`: Blocks force-pushes and branch deletion on `dev`/`main`, blocks manual SemVer tag pushes (`v*`), blocks direct commits to `main` bypassing `dev`, audits all unpushed commit messages, and runs `./scripts/ci/verify`.
 - `make verify` (or `./scripts/ci/verify`): Mandatory pre-commit/pre-PR gate. Runs:
-  1. `./scripts/ci/check-privacy` (blocks private domains, internal hostnames, `DESIGN.md`, and `web-v2/dist` from being tracked)
-  2. `cargo fmt --all --check`
-  3. `cargo clippy --workspace --all-targets -- -D warnings`
-  4. `cargo test --workspace`
-  5. `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 build`
+  1. `./scripts/ci/install-hooks --quiet` (ensures `.githooks/` is active)
+  2. `./scripts/ci/check-privacy` (blocks private domains, internal hostnames, `DESIGN.md`, and `web-v2/dist` from being tracked)
+  3. `./scripts/ci/check-semver` (verifies `Cargo.toml`, `Cargo.lock`, `web-v2/package.json`, and `CHANGELOG.md` SemVer synchronization)
+  4. `cargo fmt --all --check`
+  5. `cargo clippy --workspace --all-targets -- -D warnings`
+  6. `cargo test --workspace`
+  7. `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 build`
 - `make build-ui`: Type-checks and builds `web-v2/dist` (`< 2s`). Note: `web-v2/dist/` is gitignored and built automatically inside CI and the multi-stage `Dockerfile`.
 - `make build`: Builds both `web-v2/dist` and `target/release/ninjanvr`.
 - `make image`: Builds the multi-stage container image (`Dockerfile`) tagged with the current workspace version.

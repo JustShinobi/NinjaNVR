@@ -8,10 +8,11 @@
 
 ## Verification
 
-Install frontend dependencies once:
+Install frontend dependencies and activate the repository Git hooks once:
 
 ```bash
 bun install --cwd web-v2 --frozen-lockfile
+make hooks
 ```
 
 Run the verification suite before submitting a pull request:
@@ -21,11 +22,13 @@ make verify
 ```
 
 `make verify` runs:
-1. `./scripts/ci/check-privacy` (blocks private hostnames, `DESIGN.md`, `CLAUDE.md`, and `web-v2/dist` from being tracked)
-2. `cargo fmt --all --check`
-3. `cargo clippy --workspace --all-targets -- -D warnings`
-4. `cargo test --workspace`
-5. `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 build`
+1. `./scripts/ci/install-hooks --quiet` (activates `.githooks/pre-commit`, `.githooks/commit-msg`, and `.githooks/pre-push`)
+2. `./scripts/ci/check-privacy` (blocks private hostnames, `DESIGN.md`, `CLAUDE.md`, and `web-v2/dist` from being tracked)
+3. `./scripts/ci/check-semver` (verifies `Cargo.toml`, `Cargo.lock`, `web-v2/package.json`, and `CHANGELOG.md` SemVer synchronization)
+4. `cargo fmt --all --check`
+5. `cargo clippy --workspace --all-targets -- -D warnings`
+6. `cargo test --workspace`
+7. `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 build`
 
 Do not commit `web-v2/dist/`. Frontend assets are built automatically in CI and inside the multi-stage `Dockerfile`.
 
