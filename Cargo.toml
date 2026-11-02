@@ -30,7 +30,7 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 rusqlite = { version = "0.41", features = ["bundled"] }
 axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
-axum-extra = { version = "0.10", features = ["cookie"] }
+axum-extra = { version = "0.12", features = ["cookie"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["fs", "cors", "compression-gzip", "compression-br", "trace"] }
 tokio-tungstenite = "0.26"
