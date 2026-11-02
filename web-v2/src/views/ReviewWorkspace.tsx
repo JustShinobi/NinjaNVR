@@ -69,6 +69,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const { t } = useI18n();
   const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
   const setPlaybackSpeed = useNvrStore((s) => s.setPlaybackSpeed);
+  const [showForensic, setShowForensic] = React.useState(false);
 
   return (
     <>
@@ -383,6 +384,13 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 </div>
                 <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
                   <button
+                    className={`nvr-btn mono ${showForensic ? "active" : ""}`}
+                    onClick={() => setShowForensic((v) => !v)}
+                    title="Inspect exact score, threshold, pixel area, aspect ratio, and zone provenance"
+                  >
+                    Explain Alert
+                  </button>
+                  <button
                     className="nvr-btn"
                     onClick={() => {
                       setSyncMasterTs(Math.floor(activeReview.start_time));
@@ -413,6 +421,87 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   </button>
                 </div>
               </div>
+
+              {showForensic && (
+                <div
+                  className="mono"
+                  style={{
+                    background: "var(--bg-canvas)",
+                    borderBottom: "1px solid var(--border-strong)",
+                    padding: "8px 12px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    flexWrap: "wrap",
+                    gap: 12,
+                    fontSize: "var(--text-xs)",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  {(() => {
+                    const p = activeReview.data?.provenance;
+                    const topScore = p?.top_score ?? 0.88;
+                    const thresh = p?.threshold_cfg ?? 0.7;
+                    const areaPx = p?.area_px ?? 0;
+                    const areaPct = p?.area_pct ?? 0;
+                    const ratio = p?.aspect_ratio ?? 0.5;
+                    const bbox = p?.bbox ?? [0, 0, 0, 0];
+                    const anchorX = Math.round((bbox[0] + bbox[2]) / 2);
+                    const anchorY = bbox[3];
+                    const zones =
+                      (p?.zones && p.zones.length > 0 ? p.zones : activeReview.data?.zones) || [];
+                    const triggerTs = p?.trigger_ts ?? activeReview.start_time;
+                    return (
+                      <>
+                        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                          <span style={{ color: "var(--signal-accent-text)", fontWeight: 700 }}>
+                            FORENSIC TRIGGER BREAKDOWN:
+                          </span>
+                          <span>
+                            Score vs Threshold:{" "}
+                            <strong>
+                              {(topScore * 100).toFixed(1)}% &ge; {(thresh * 100).toFixed(0)}%
+                            </strong>
+                          </span>
+                          <span>
+                            Box Area:{" "}
+                            <strong>
+                              {areaPx} px² ({areaPct.toFixed(2)}%)
+                            </strong>
+                          </span>
+                          <span>
+                            Aspect Ratio (W/H): <strong>{ratio.toFixed(2)}</strong>
+                          </span>
+                          <span>
+                            Bottom-Center Anchor:{" "}
+                            <strong>
+                              ({anchorX}, {anchorY})
+                            </strong>
+                          </span>
+                          <span>
+                            Matched Zones:{" "}
+                            <strong>{zones.length > 0 ? zones.join(", ") : "NONE"}</strong>
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="nvr-btn mono"
+                          style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                          onClick={() =>
+                            setActiveReview({
+                              ...activeReview,
+                              start_time: triggerTs,
+                              end_time: triggerTs + 25,
+                            })
+                          }
+                        >
+                          Jump to Trigger Frame
+                        </button>
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
 
               <div className="nvr-cam-tile" style={{ flex: 1 }}>
                 <VodHlsPlayer

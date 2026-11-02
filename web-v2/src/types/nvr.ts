@@ -271,6 +271,22 @@ export interface NinjaStatsResponse {
   processes: Record<string, ProcessStatItem>;
 }
 
+export interface TriggerProvenance {
+  trigger_ts: number;
+  bbox: [number, number, number, number];
+  norm_bbox: [number, number, number, number];
+  area_px: number;
+  area_pct: number;
+  aspect_ratio: number;
+  score: number;
+  top_score: number;
+  min_score_cfg: number;
+  threshold_cfg: number;
+  zones: string[];
+  frames_tracked: number;
+  stationary: boolean;
+}
+
 export interface ReviewItem {
   id: string;
   camera: string;
@@ -284,6 +300,7 @@ export interface ReviewItem {
     sub_labels?: string[];
     zones?: string[];
     detections?: string[];
+    provenance?: TriggerProvenance | null;
     metadata?: {
       potential_threat_level?: number;
     };
@@ -305,11 +322,15 @@ export interface EventItem {
   retain_indefinitely: boolean;
   false_positive: boolean | null;
   box: [number, number, number, number] | null;
+  area?: number | null;
+  ratio?: number | null;
+  stationary?: boolean;
   data?: {
     score?: number;
     top_score?: number;
     description?: string;
     box?: [number, number, number, number];
+    provenance?: TriggerProvenance | null;
   };
 }
 

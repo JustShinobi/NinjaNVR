@@ -10,7 +10,7 @@ use ninjanvr_config::{CameraConfig, NinjaConfig};
 use ninjanvr_db::{EventDto, NinjaDatabase, ReviewItemDto};
 use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{SharedActivityLedger, YuvFrame, resolve_ffmpeg_bin};
-use ninjanvr_track::{ByteTracker, TrackedObject};
+use ninjanvr_track::{ByteTracker, TrackedObject, TriggerProvenance};
 use ninjanvr_vision::{
     BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, compute_inference_regions,
     crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp, yuv420p_to_rgb_image,
@@ -70,6 +70,7 @@ struct ActiveReviewState {
     detections: Vec<String>,
     objects: Vec<String>,
     zones: Vec<String>,
+    provenance: Option<TriggerProvenance>,
     is_new: bool,
     dirty: bool,
     prev_dto: Option<ReviewItemDto>,
@@ -92,6 +93,7 @@ impl ActiveReviewState {
                 "zones": self.zones,
                 "audio": [],
                 "thumb_time": self.thumb_time,
+                "provenance": self.provenance,
                 "metadata": null
             }),
             has_been_reviewed: false,
@@ -587,7 +589,8 @@ impl VisionPipeline {
                         "top_score": best_score,
                         "attributes": [],
                         "type": "object",
-                        "max_severity": severity
+                        "max_severity": severity,
+                        "provenance": trk.provenance
                     }),
                     thumbnail: thumb_b64,
                     area: Some(area),
@@ -655,6 +658,7 @@ impl VisionPipeline {
                     detections: Vec::new(),
                     objects: Vec::new(),
                     zones: Vec::new(),
+                    provenance: Some(trk.provenance.clone()),
                     is_new: true,
                     dirty: true,
                     prev_dto: None,
@@ -684,6 +688,7 @@ impl VisionPipeline {
             if trk.score > rev.best_score + 0.05 || promoted_to_alert {
                 rev.best_score = trk.score;
                 rev.thumb_time = now;
+                rev.provenance = Some(trk.provenance.clone());
                 let _ = std::fs::create_dir_all(&review_dir);
                 let rev_img = yuv420p_to_rgb_image_scaled(
                     frame,
@@ -731,7 +736,8 @@ impl VisionPipeline {
                     "top_score": best_score,
                     "attributes": [],
                     "type": "object",
-                    "max_severity": severity
+                    "max_severity": severity,
+                    "provenance": trk.provenance
                 }),
                 thumbnail: None,
                 area: Some(area),

@@ -59,6 +59,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   notify,
 }) => {
   const { t } = useI18n();
+  const [showForensic, setShowForensic] = React.useState(false);
 
   return (
     <>
@@ -334,6 +335,13 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     4-Cam Sync
                   </button>
                   <button
+                    className={`nvr-btn mono ${showForensic ? "active" : ""}`}
+                    onClick={() => setShowForensic((v) => !v)}
+                    title="Inspect exact score, threshold, pixel area, aspect ratio, and zone provenance"
+                  >
+                    Explain Alert
+                  </button>
+                  <button
                     className="nvr-btn danger"
                     aria-label="Delete tracked object event"
                     title="Delete tracked object event"
@@ -343,6 +351,90 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   </button>
                 </div>
               </div>
+
+              {showForensic && (
+                <div
+                  className="mono"
+                  style={{
+                    background: "var(--bg-canvas)",
+                    borderBottom: "1px solid var(--border-strong)",
+                    padding: "8px 12px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    flexWrap: "wrap",
+                    gap: 12,
+                    fontSize: "var(--text-xs)",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  {(() => {
+                    const p = selectedEvent.data?.provenance;
+                    const topScore =
+                      p?.top_score ??
+                      selectedEvent.top_score ??
+                      selectedEvent.data?.top_score ??
+                      0.85;
+                    const thresh = p?.threshold_cfg ?? 0.7;
+                    const areaPx = p?.area_px ?? selectedEvent.area ?? 0;
+                    const areaPct = p?.area_pct ?? 0;
+                    const ratio =
+                      p?.aspect_ratio ??
+                      (selectedEvent.ratio ? Math.round(selectedEvent.ratio * 100) / 100 : 0.5);
+                    const bbox = p?.bbox ?? [0, 0, 0, 0];
+                    const anchorX = Math.round((bbox[0] + bbox[2]) / 2);
+                    const anchorY = bbox[3];
+                    const zones =
+                      (p?.zones && p.zones.length > 0 ? p.zones : selectedEvent.zones) || [];
+                    const triggerTs = p?.trigger_ts ?? selectedEvent.start_time;
+                    return (
+                      <>
+                        <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                          <span style={{ color: "var(--signal-accent-text)", fontWeight: 700 }}>
+                            FORENSIC TRIGGER BREAKDOWN:
+                          </span>
+                          <span>
+                            Score vs Threshold:{" "}
+                            <strong>
+                              {(topScore * 100).toFixed(1)}% &ge; {(thresh * 100).toFixed(0)}%
+                            </strong>
+                          </span>
+                          <span>
+                            Box Area:{" "}
+                            <strong>
+                              {areaPx} px² ({areaPct.toFixed(2)}%)
+                            </strong>
+                          </span>
+                          <span>
+                            Aspect Ratio (W/H): <strong>{ratio.toFixed(2)}</strong>
+                          </span>
+                          <span>
+                            Bottom-Center Anchor:{" "}
+                            <strong>
+                              ({anchorX}, {anchorY})
+                            </strong>
+                          </span>
+                          <span>
+                            Matched Zones:{" "}
+                            <strong>{zones.length > 0 ? zones.join(", ") : "NONE"}</strong>
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="nvr-btn mono"
+                          style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                          onClick={() => {
+                            setEventViewMode("clip");
+                            setSyncMasterTs(Math.floor(triggerTs));
+                          }}
+                        >
+                          Jump to Trigger Frame
+                        </button>
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
 
               <div className="nvr-cam-tile" style={{ flex: 1 }}>
                 {eventViewMode === "snapshot" ? (

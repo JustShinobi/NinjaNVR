@@ -6,6 +6,23 @@ use ninjanvr_vision::{BoundingBox, PolygonMask};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerProvenance {
+    pub trigger_ts: f64,
+    pub bbox: [u32; 4],
+    pub norm_bbox: [f64; 4],
+    pub area_px: u32,
+    pub area_pct: f32,
+    pub aspect_ratio: f32,
+    pub score: f32,
+    pub top_score: f32,
+    pub min_score_cfg: f32,
+    pub threshold_cfg: f32,
+    pub zones: Vec<String>,
+    pub frames_tracked: u32,
+    pub stationary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedObject {
     pub id: String,
     pub label: String,
@@ -24,6 +41,7 @@ pub struct TrackedObject {
     pub has_snapshot: bool,
     pub vx: f32,
     pub vy: f32,
+    pub provenance: TriggerProvenance,
 }
 
 /// Multi-Object Tracker implementing 2-stage **ByteTrack** association
@@ -223,7 +241,7 @@ impl ByteTracker {
                 matched_tracks[t_idx] = true;
                 matched_high[d_idx] = true;
                 let tid = &track_ids[t_idx];
-                self.apply_match(tid, det, frame_time);
+                self.apply_match(tid, det, frame_time, cfg);
             }
         }
 
@@ -248,7 +266,7 @@ impl ByteTracker {
             if let Some(t_idx) = best_t {
                 matched_tracks[t_idx] = true;
                 let tid = &track_ids[t_idx];
-                self.apply_match(tid, det, frame_time);
+                self.apply_match(tid, det, frame_time, cfg);
             }
         }
 
@@ -300,6 +318,38 @@ impl ByteTracker {
             );
             let id = format!("{frame_time:.6}-{suffix}");
             let zones = self.evaluate_zones(&det.label, &det.bbox);
+            let (min_score_cfg, threshold_cfg) = cfg
+                .objects
+                .filters
+                .get(&det.label)
+                .map(|f| (f.min_score, f.threshold))
+                .unwrap_or((0.5, 0.7));
+            let frame_area = (self.frame_w.saturating_mul(self.frame_h)).max(1) as f32;
+            let area_px = det.bbox.area();
+            let area_pct = ((area_px as f32 / frame_area) * 10000.0).round() / 100.0;
+            let aspect_ratio =
+                ((det.bbox.width() as f32 / (det.bbox.height().max(1) as f32)) * 100.0).round()
+                    / 100.0;
+            let provenance = TriggerProvenance {
+                trigger_ts: frame_time,
+                bbox: [
+                    det.bbox.x_min,
+                    det.bbox.y_min,
+                    det.bbox.x_max,
+                    det.bbox.y_max,
+                ],
+                norm_bbox: det.bbox.to_normalized(self.frame_w, self.frame_h),
+                area_px,
+                area_pct,
+                aspect_ratio,
+                score: det.score,
+                top_score: det.score,
+                min_score_cfg,
+                threshold_cfg,
+                zones: zones.clone(),
+                frames_tracked: 1,
+                stationary: false,
+            };
             let _ = &self.camera_name;
             self.tracks.insert(
                 id.clone(),
@@ -321,6 +371,7 @@ impl ByteTracker {
                     has_snapshot: false,
                     vx: 0.0,
                     vy: 0.0,
+                    provenance,
                 },
             );
         }
@@ -329,9 +380,23 @@ impl ByteTracker {
         (active, ended_tracks)
     }
 
-    fn apply_match(&mut self, tid: &str, det: &DetectionResult, frame_time: f64) {
+    fn apply_match(
+        &mut self,
+        tid: &str,
+        det: &DetectionResult,
+        frame_time: f64,
+        cfg: &CameraConfig,
+    ) {
         let zones = self.evaluate_zones(&det.label, &det.bbox);
         let stationary_thresh = self.stationary_threshold;
+        let frame_w = self.frame_w;
+        let frame_h = self.frame_h;
+        let (min_score_cfg, threshold_cfg) = cfg
+            .objects
+            .filters
+            .get(&det.label)
+            .map(|f| (f.min_score, f.threshold))
+            .unwrap_or((0.5, 0.7));
         if let Some(trk) = self.tracks.get_mut(tid) {
             let (old_cx, old_cy) = trk.bbox.center();
             let (new_cx, new_cy) = det.bbox.center();
@@ -351,10 +416,11 @@ impl ByteTracker {
                 trk.stationary = false;
             }
 
+            let is_new_top = det.score > trk.top_score;
             trk.bbox = det.bbox;
             trk.region = det.region;
             trk.score = det.score;
-            if det.score > trk.top_score {
+            if is_new_top {
                 trk.top_score = det.score;
             }
             trk.last_seen_time = frame_time;
@@ -366,6 +432,33 @@ impl ByteTracker {
                     trk.entered_zones.push(z);
                 }
             }
+
+            if is_new_top || trk.frames_tracked == self.min_initialized {
+                let frame_area = (frame_w.saturating_mul(frame_h)).max(1) as f32;
+                let area_px = det.bbox.area();
+                let area_pct = ((area_px as f32 / frame_area) * 10000.0).round() / 100.0;
+                let aspect_ratio =
+                    ((det.bbox.width() as f32 / (det.bbox.height().max(1) as f32)) * 100.0).round()
+                        / 100.0;
+                trk.provenance.trigger_ts = frame_time;
+                trk.provenance.bbox = [
+                    det.bbox.x_min,
+                    det.bbox.y_min,
+                    det.bbox.x_max,
+                    det.bbox.y_max,
+                ];
+                trk.provenance.norm_bbox = det.bbox.to_normalized(frame_w, frame_h);
+                trk.provenance.area_px = area_px;
+                trk.provenance.area_pct = area_pct;
+                trk.provenance.aspect_ratio = aspect_ratio;
+                trk.provenance.score = det.score;
+            }
+            trk.provenance.top_score = trk.top_score;
+            trk.provenance.min_score_cfg = min_score_cfg;
+            trk.provenance.threshold_cfg = threshold_cfg;
+            trk.provenance.zones = trk.entered_zones.clone();
+            trk.provenance.frames_tracked = trk.frames_tracked;
+            trk.provenance.stationary = trk.stationary;
         }
     }
 }
@@ -426,6 +519,9 @@ mod tests {
         assert_eq!(active2.len(), 1);
         assert_eq!(active2[0].label, "person");
         assert_eq!(active2[0].top_score, 0.85);
+        assert_eq!(active2[0].provenance.area_px, 20000);
+        assert_eq!(active2[0].provenance.aspect_ratio, 0.5);
+        assert_eq!(active2[0].provenance.frames_tracked, 2);
 
         // Feed 10 motionless frames so object becomes stationary
         for i in 0..10 {
