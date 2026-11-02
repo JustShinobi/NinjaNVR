@@ -75,6 +75,11 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [presetName, setPresetName] = React.useState("");
   const [shareTtlSec, setShareTtlSec] = React.useState<number>(86400);
   const [shareCopied, setShareCopied] = React.useState(false);
+  const [briefingActive, setBriefingActive] = React.useState(false);
+  const [briefingSpeed, setBriefingSpeed] = React.useState<1 | 2 | 4>(2);
+  const [briefingAutoMark, setBriefingAutoMark] = React.useState(true);
+  const [briefingQueueIds, setBriefingQueueIds] = React.useState<string[]>([]);
+  const [briefingIdx, setBriefingIdx] = React.useState(0);
   const [savedPresets, setSavedPresets] = React.useState<
     Array<{
       name: string;
@@ -139,6 +144,46 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     window.localStorage?.setItem("ninjanvr_saved_filters", JSON.stringify(next));
     setPresetName("");
   };
+
+  const handleStartBriefing = () => {
+    const queue = visibleFilteredReviews.slice(0, 40);
+    if (queue.length === 0) return;
+    setBriefingQueueIds(queue.map((r) => r.id));
+    setBriefingIdx(0);
+    setBriefingActive(true);
+    setPlaybackSpeed(briefingSpeed);
+    setActiveReview(queue[0]);
+  };
+
+  const handleAdvanceBriefing = React.useCallback(() => {
+    if (!briefingActive) return;
+    const currentId = briefingQueueIds[briefingIdx] || activeReview?.id;
+    if (briefingAutoMark && currentId) {
+      void handleMarkReviews([currentId], true);
+    }
+    const nextIdx = briefingIdx + 1;
+    if (nextIdx >= briefingQueueIds.length) {
+      setBriefingActive(false);
+      return;
+    }
+    const nextId = briefingQueueIds[nextIdx];
+    const nextItem = reviews.find((r) => r.id === nextId);
+    setBriefingIdx(nextIdx);
+    if (nextItem) {
+      setActiveReview(nextItem);
+    } else {
+      setBriefingActive(false);
+    }
+  }, [
+    briefingActive,
+    briefingQueueIds,
+    briefingIdx,
+    activeReview,
+    briefingAutoMark,
+    handleMarkReviews,
+    reviews,
+    setActiveReview,
+  ]);
 
   return (
     <>
@@ -293,6 +338,24 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+          {visibleFilteredReviews.length > 0 && (
+            <button
+              type="button"
+              className={`nvr-btn mono ${briefingActive ? "active" : "primary"}`}
+              onClick={() => {
+                if (briefingActive) {
+                  setBriefingActive(false);
+                } else {
+                  handleStartBriefing();
+                }
+              }}
+              title="Sequential accelerated auto-playback of queued review segments"
+            >
+              {briefingActive
+                ? `■ Stop Brief (${briefingIdx + 1}/${briefingQueueIds.length})`
+                : `▶ Play Tactical Brief (${Math.min(40, visibleFilteredReviews.length)})`}
+            </button>
+          )}
           <span
             className="mono"
             style={{
@@ -697,13 +760,85 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 </div>
               )}
 
+              {briefingActive && (
+                <div
+                  className="mono"
+                  style={{
+                    padding: "6px 12px",
+                    background: "rgba(14, 165, 233, 0.14)",
+                    borderBottom: "1px solid var(--signal-accent)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 10,
+                    fontSize: "var(--text-xs)",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <strong style={{ color: "var(--signal-accent-text)" }}>
+                      BRIEFING: {briefingIdx + 1} / {briefingQueueIds.length} •{" "}
+                      {briefingSpeed.toFixed(1)}x
+                    </strong>
+                    {([1, 2, 4] as const).map((spd) => (
+                      <button
+                        key={spd}
+                        type="button"
+                        className={`nvr-btn mono ${briefingSpeed === spd ? "active" : ""}`}
+                        style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        onClick={() => {
+                          setBriefingSpeed(spd);
+                          setPlaybackSpeed(spd);
+                        }}
+                      >
+                        {spd}x
+                      </button>
+                    ))}
+                    <label
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 5,
+                        cursor: "pointer",
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={briefingAutoMark}
+                        onChange={(e) => setBriefingAutoMark(e.target.checked)}
+                      />
+                      Auto-mark reviewed on completion
+                    </label>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <button
+                      type="button"
+                      className="nvr-btn mono"
+                      style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      onClick={handleAdvanceBriefing}
+                    >
+                      SKIP NEXT
+                    </button>
+                    <button
+                      type="button"
+                      className="nvr-btn danger mono"
+                      style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      onClick={() => setBriefingActive(false)}
+                    >
+                      STOP
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="nvr-cam-tile" style={{ flex: 1 }}>
                 <VodHlsPlayer
                   camera={activeReview.camera}
                   startTime={activeReview.start_time - 4}
                   endTime={(activeReview.end_time || activeReview.start_time + 20) + 6}
                   fallbackPreviewId={activeReview.id}
-                  playbackRate={playbackSpeed}
+                  playbackRate={briefingActive ? briefingSpeed : playbackSpeed}
+                  onEnded={briefingActive ? handleAdvanceBriefing : undefined}
                 />
               </div>
 

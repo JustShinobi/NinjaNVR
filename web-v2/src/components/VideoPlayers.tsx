@@ -805,6 +805,7 @@ interface VodHlsPlayerProps {
   muted?: boolean;
   controls?: boolean;
   onTimeUpdate?: (currentSec: number) => void;
+  onEnded?: () => void;
 }
 
 export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
@@ -817,8 +818,10 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   muted = true,
   controls = true,
   onTimeUpdate,
+  onEnded,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const endedFiredRef = useRef(false);
   const [useFallbackMp4, setUseFallbackMp4] = useState(false);
   const [userMuted, setUserMuted] = useState<boolean>(() => {
     if (typeof window !== "undefined") {
@@ -838,6 +841,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 
   useEffect(() => {
     setUseFallbackMp4(false);
+    endedFiredRef.current = false;
   }, [camera, safeStart, safeEnd, fallbackPreviewId]);
 
   useEffect(() => {
@@ -907,6 +911,19 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     }
   }, [playbackRate]);
 
+  const handleTimeUpdateInternal = (curSec: number, durSec: number) => {
+    onTimeUpdate?.(curSec);
+    if (!onEnded || endedFiredRef.current) return;
+    const clipLen = Math.max(4, safeEnd - safeStart);
+    if (
+      (Number.isFinite(durSec) && durSec > 0 && curSec >= durSec - 0.25) ||
+      curSec >= clipLen
+    ) {
+      endedFiredRef.current = true;
+      onEnded();
+    }
+  };
+
   if (useFallbackMp4 && fallbackPreviewId) {
     return (
       <ZoomableVideoStage>
@@ -917,13 +934,21 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           autoPlay={autoPlay}
           playsInline
           muted={userMuted}
-          loop
+          loop={!onEnded}
           onVolumeChange={(e) => {
             const next = e.currentTarget.muted;
             setUserMuted(next);
             window.sessionStorage?.setItem("ninjanvr_vod_muted", String(next));
           }}
-          onTimeUpdate={(e) => onTimeUpdate?.(e.currentTarget.currentTime)}
+          onTimeUpdate={(e) =>
+            handleTimeUpdateInternal(e.currentTarget.currentTime, e.currentTarget.duration)
+          }
+          onEnded={() => {
+            if (onEnded && !endedFiredRef.current) {
+              endedFiredRef.current = true;
+              onEnded();
+            }
+          }}
           style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
         />
       </ZoomableVideoStage>
@@ -943,7 +968,15 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           setUserMuted(next);
           window.sessionStorage?.setItem("ninjanvr_vod_muted", String(next));
         }}
-        onTimeUpdate={(e) => onTimeUpdate?.(e.currentTarget.currentTime)}
+        onTimeUpdate={(e) =>
+          handleTimeUpdateInternal(e.currentTarget.currentTime, e.currentTarget.duration)
+        }
+        onEnded={() => {
+          if (onEnded && !endedFiredRef.current) {
+            endedFiredRef.current = true;
+            onEnded();
+          }
+        }}
         style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
       />
     </ZoomableVideoStage>
