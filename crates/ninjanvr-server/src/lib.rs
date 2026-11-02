@@ -27,7 +27,7 @@ use ninjanvr_config::{
 use ninjanvr_db::{EventFilter, ExportRow, NinjaDatabase, ReviewFilter, verify_password};
 use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{
-    RecordingEngine, SharedActivityLedger, build_mp4_export, new_activity_ledger,
+    RecordingEngine, SharedActivityLedger, build_mp4_export_with_options, new_activity_ledger,
 };
 use pipeline::{SharedCameraMetrics, VisionPipeline};
 use serde::{Deserialize, Serialize};
@@ -1984,9 +1984,27 @@ async fn api_case_create() -> Json<Value> {
     Json(json!({ "success": true }))
 }
 
-#[derive(Debug, Deserialize, Default)]
+fn default_export_include_audio() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateExportBody {
     pub name: Option<String>,
+    #[serde(default = "default_export_include_audio")]
+    pub include_audio: bool,
+    #[serde(default)]
+    pub strip_audio: bool,
+}
+
+impl Default for CreateExportBody {
+    fn default() -> Self {
+        Self {
+            name: None,
+            include_audio: true,
+            strip_audio: false,
+        }
+    }
 }
 
 async fn api_export_create(
@@ -1995,8 +2013,10 @@ async fn api_export_create(
     body: Option<Json<CreateExportBody>>,
 ) -> Response {
     let id = format!("{camera}_{}_{}", start as u64, end as u64);
-    let name = body
-        .and_then(|b| b.0.name)
+    let parsed_body = body.map(|b| b.0).unwrap_or_default();
+    let include_audio = parsed_body.include_audio && !parsed_body.strip_audio;
+    let name = parsed_body
+        .name
         .unwrap_or_else(|| format!("{camera} export"));
     let video_rel = format!("/media/frigate/exports/{id}.mp4");
     let thumb_rel = format!("/media/frigate/clips/{id}.webp");
@@ -2016,7 +2036,7 @@ async fn api_export_create(
     let id_clone = id.clone();
     let export_res = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        build_mp4_export(
+        build_mp4_export_with_options(
             &db_clone,
             &media_dir_clone,
             &id_clone,
@@ -2024,6 +2044,7 @@ async fn api_export_create(
             &name,
             start,
             end,
+            include_audio,
         ),
     )
     .await;

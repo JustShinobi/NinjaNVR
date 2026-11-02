@@ -1058,6 +1058,52 @@ impl RecordingEngine {
     }
 }
 
+/// Builds the FFmpeg CLI arguments used to remux/concatenate segments into an exported MP4 clip.
+/// When `include_audio` is `false`, `-an` is included to strip the audio stream for privacy compliance.
+pub fn build_mp4_export_ffmpeg_args(
+    list_file: &Path,
+    trim_offset: f64,
+    target_dur: f64,
+    include_audio: bool,
+    out_file: &Path,
+) -> Vec<String> {
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+    ];
+    if trim_offset > 0.05 {
+        args.push("-ss".to_string());
+        args.push(format!("{trim_offset:.2}"));
+    }
+    args.extend([
+        "-f".to_string(),
+        "concat".to_string(),
+        "-safe".to_string(),
+        "0".to_string(),
+        "-i".to_string(),
+        list_file.to_string_lossy().to_string(),
+        "-t".to_string(),
+        format!("{target_dur:.2}"),
+        "-fflags".to_string(),
+        "+genpts+igndts".to_string(),
+        "-avoid_negative_ts".to_string(),
+        "make_zero".to_string(),
+        "-c".to_string(),
+        "copy".to_string(),
+    ]);
+    if !include_audio {
+        args.push("-an".to_string());
+    }
+    args.extend([
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        out_file.to_string_lossy().to_string(),
+    ]);
+    args
+}
+
 /// Concatenates recording segments in `[start, end]` into a single MP4 export file.
 pub async fn build_mp4_export(
     db: &NinjaDatabase,
@@ -1068,14 +1114,43 @@ pub async fn build_mp4_export(
     start_time: f64,
     end_time: f64,
 ) -> Result<()> {
-    let res =
-        build_mp4_export_inner(db, media_dir, export_id, camera, name, start_time, end_time).await;
+    build_mp4_export_with_options(
+        db, media_dir, export_id, camera, name, start_time, end_time, true,
+    )
+    .await
+}
+
+/// Concatenates recording segments in `[start, end]` into a single MP4 export file,
+/// optionally stripping the audio track when `include_audio` is `false`.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_mp4_export_with_options(
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    export_id: &str,
+    camera: &str,
+    name: &str,
+    start_time: f64,
+    end_time: f64,
+    include_audio: bool,
+) -> Result<()> {
+    let res = build_mp4_export_inner(
+        db,
+        media_dir,
+        export_id,
+        camera,
+        name,
+        start_time,
+        end_time,
+        include_audio,
+    )
+    .await;
     if res.is_err() {
         let _ = db.delete_export(export_id);
     }
     res
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_mp4_export_inner(
     db: &NinjaDatabase,
     media_dir: &Path,
@@ -1084,6 +1159,7 @@ async fn build_mp4_export_inner(
     name: &str,
     start_time: f64,
     end_time: f64,
+    include_audio: bool,
 ) -> Result<()> {
     let mut segments = db.query_recordings(camera, start_time, end_time)?;
     if segments.is_empty() {
@@ -1135,30 +1211,16 @@ async fn build_mp4_export_inner(
     let target_dur = (end_time - start_time).max(3.0);
 
     let ffmpeg_bin = resolve_ffmpeg_bin();
+    let ffmpeg_args = build_mp4_export_ffmpeg_args(
+        &list_file,
+        trim_offset,
+        target_dur,
+        include_audio,
+        &tmp_out_file,
+    );
     let mut cmd = Command::new(&ffmpeg_bin);
     cmd.kill_on_drop(true);
-    cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
-    if trim_offset > 0.05 {
-        cmd.args(["-ss", &format!("{trim_offset:.2}")]);
-    }
-    let status = cmd
-        .args(["-f", "concat", "-safe", "0", "-i"])
-        .arg(&list_file)
-        .args([
-            "-t",
-            &format!("{target_dur:.2}"),
-            "-fflags",
-            "+genpts+igndts",
-            "-avoid_negative_ts",
-            "make_zero",
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-        ])
-        .arg(&tmp_out_file)
-        .status()
-        .await;
+    let status = cmd.args(&ffmpeg_args).status().await;
 
     let _ = std::fs::remove_file(&list_file);
 
@@ -1406,5 +1468,18 @@ mod tests {
         assert_eq!(exports[0]["in_progress"], false);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn export_ffmpeg_args_include_or_strip_audio_track() {
+        let list_path = Path::new("/tmp/list.txt");
+        let out_path = Path::new("/tmp/out.mp4");
+
+        let args_with_audio = build_mp4_export_ffmpeg_args(list_path, 2.5, 16.0, true, out_path);
+        assert!(!args_with_audio.iter().any(|a| a == "-an"));
+
+        let args_stripped_audio =
+            build_mp4_export_ffmpeg_args(list_path, 2.5, 16.0, false, out_path);
+        assert!(args_stripped_audio.iter().any(|a| a == "-an"));
     }
 }

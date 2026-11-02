@@ -32,7 +32,8 @@ interface ExportsWorkspaceProps {
     camera: string,
     startSec: number,
     endSec: number,
-    label?: string
+    label?: string,
+    includeAudio?: boolean
   ) => Promise<{ exportId?: string; videoUrl?: string } | void>;
   notify: (msg: string) => void;
 }
@@ -58,6 +59,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   notify,
 }) => {
   const { t } = useI18n();
+  const [includeAudio, setIncludeAudio] = React.useState(true);
 
   return (
     <>
@@ -93,6 +95,26 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
             value={exportLabel}
             onChange={(e) => setExportLabel(e.target.value)}
           />
+          <label
+            className="mono"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 5,
+              fontSize: "var(--text-xs)",
+              color: "var(--text-secondary)",
+              cursor: "pointer",
+              userSelect: "none",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={includeAudio}
+              onChange={(e) => setIncludeAudio(e.target.checked)}
+              aria-label="Include Audio"
+            />
+            Include Audio
+          </label>
           <button
             className="nvr-btn primary"
             onClick={async () => {
@@ -101,7 +123,8 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 exportCam,
                 now - exportPresetMin * 60,
                 now,
-                exportLabel || `${exportCam}_${exportPresetMin}m`
+                exportLabel || `${exportCam}_${exportPresetMin}m`,
+                includeAudio
               );
             }}
           >
@@ -258,7 +281,9 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
               setActiveExportPreview(null);
               setTimeShiftTs(ts);
             }}
-            onExportRange={handleQuickExport}
+            onExportRange={(cam, start, end, label) =>
+              handleQuickExport(cam, start, end, label, includeAudio)
+            }
             titlePrefix="EXPORT CLIPPER"
             defaultRangeMode={true}
           />

@@ -413,7 +413,8 @@ export const App: React.FC = () => {
       camera: string,
       startSec: number,
       endSec: number,
-      label?: string
+      label?: string,
+      includeAudio: boolean = true
     ): Promise<{ exportId?: string; videoUrl?: string } | void> => {
       const s = Math.floor(startSec);
       const e = Math.ceil(Math.max(endSec, startSec + 5));
@@ -421,7 +422,10 @@ export const App: React.FC = () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify({ name: label || `${camera} ${formatTs(s)}-${formatTs(e)}` }),
+        body: JSON.stringify({
+          name: label || `${camera} ${formatTs(s)}-${formatTs(e)}`,
+          include_audio: includeAudio,
+        }),
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.success !== false) {
