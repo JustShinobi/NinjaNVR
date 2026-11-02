@@ -473,7 +473,7 @@ export const RecordingReviewSection: React.FC<{
             </div>
           </div>
 
-          {/* [ST-03] Hybrid Dual-Stream Recording & [ST-02] Disk Quota Retention */}
+          {/* Hybrid Dual-Stream Recording & Disk Quota Retention */}
           <div
             style={{
               padding: 10,
@@ -488,8 +488,8 @@ export const RecordingReviewSection: React.FC<{
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-accent-text)" }}>
                 {isPt
-                  ? "GRAVAÇÃO HÍBRIDA SUB/MAIN & COTA DE DISCO ([ST-02] / [ST-03])"
-                  : "HYBRID DUAL-STREAM & DISK QUOTA ([ST-02] / [ST-03])"}
+                  ? "GRAVAÇÃO HÍBRIDA SUB/MAIN & COTA DE DISCO"
+                  : "HYBRID DUAL-STREAM & DISK QUOTA"}
               </span>
             </div>
 
@@ -557,7 +557,7 @@ export const RecordingReviewSection: React.FC<{
             </div>
           </div>
 
-          {/* [ST-01] Hot-to-Cold Tiered Storage & [ST-06] Real-Time Alert Clip Backup */}
+          {/* Hot-to-Cold Tiered Storage & Real-Time Alert Clip Backup */}
           <div
             style={{
               padding: 10,
@@ -572,8 +572,8 @@ export const RecordingReviewSection: React.FC<{
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-live-text)" }}>
                 {isPt
-                  ? "ARMAZENAMENTO EM CAMADAS HOT→COLD ([ST-01])"
-                  : "HOT-TO-COLD TIERED STORAGE ([ST-01])"}
+                  ? "ARMAZENAMENTO EM CAMADAS HOT→COLD"
+                  : "HOT-TO-COLD TIERED STORAGE"}
               </span>
               <ToggleSwitch
                 checked={Boolean(activeRec.storage_tiers?.enabled)}
@@ -648,8 +648,8 @@ export const RecordingReviewSection: React.FC<{
             >
               <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-alert-text)" }}>
                 {isPt
-                  ? "BACKUP EM TEMPO REAL DE CLIPES DE ALERTA ([ST-06])"
-                  : "REAL-TIME OFFSITE ALERT CLIP BACKUP ([ST-06])"}
+                  ? "BACKUP EM TEMPO REAL DE CLIPES DE ALERTA"
+                  : "REAL-TIME OFFSITE ALERT CLIP BACKUP"}
               </span>
               <ToggleSwitch
                 checked={Boolean(activeRec.alert_backup?.enabled)}
@@ -1002,7 +1002,7 @@ export const RecordingReviewSection: React.FC<{
             </div>
           </div>
 
-          {/* Acoustic Event Detections ([AU-02]) */}
+          {/* Acoustic Event Detections */}
           <div
             style={{
               padding: 10,

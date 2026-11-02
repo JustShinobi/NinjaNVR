@@ -1704,8 +1704,8 @@ export const AiDetectionObjectsSection: React.FC<{
             <div className="nvr-field-meta">
               <div className="nvr-field-label">
                 {isPt
-                  ? "Roteamento de Detector IA ([AI-07])"
-                  : "Assigned AI Detector Instance ([AI-07])"}
+                  ? "Roteamento de Detector IA"
+                  : "Assigned AI Detector Instance"}
               </div>
               <div className="nvr-field-desc">
                 {isPt
