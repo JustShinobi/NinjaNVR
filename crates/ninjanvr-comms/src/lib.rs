@@ -3,7 +3,10 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ninjanvr_config::MqttConfig;
-use rumqttc::{AsyncClient, Event as MqttEvent, LastWill, MqttOptions, Packet, QoS};
+use rumqttc::{
+    AsyncClient, Event as MqttEvent, LastWill, MqttOptions, Packet, QoS, TlsConfiguration,
+    Transport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
@@ -478,25 +481,60 @@ impl CommsHub {
     }
 }
 
+/// Builds `MqttOptions` from `MqttConfig`, automatically configuring MQTTS (`Transport::Tls`)
+/// with either custom `tls_ca_certs` or system Root CAs (`/etc/ssl/certs/ca-certificates.crt`)
+/// and optional client mTLS (`tls_client_cert` / `tls_client_key`).
+pub fn build_mqtt_options(cfg: &MqttConfig) -> MqttOptions {
+    let prefix = cfg.topic_prefix.trim_end_matches('/').to_string();
+    let mut mqtt_opts = MqttOptions::new(&cfg.client_id, &cfg.host, cfg.port);
+    mqtt_opts.set_keep_alive(Duration::from_secs(30));
+    mqtt_opts.set_last_will(LastWill::new(
+        format!("{prefix}/available"),
+        "offline",
+        QoS::AtMostOnce,
+        true,
+    ));
+    if let (Some(u), Some(p)) = (&cfg.user, &cfg.password) {
+        mqtt_opts.set_credentials(u, p);
+    }
+    if cfg.should_use_tls() {
+        let ca = cfg
+            .tls_ca_certs
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .or_else(|| std::fs::read("/etc/ssl/certs/ca-certificates.crt").ok())
+            .or_else(|| std::fs::read("/etc/pki/tls/certs/ca-bundle.crt").ok())
+            .unwrap_or_default();
+        let client_auth = match (&cfg.tls_client_cert, &cfg.tls_client_key) {
+            (Some(cert_path), Some(key_path)) => {
+                if let (Ok(cert_bytes), Ok(key_bytes)) =
+                    (std::fs::read(cert_path), std::fs::read(key_path))
+                {
+                    Some((cert_bytes, key_bytes))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        mqtt_opts.set_transport(Transport::Tls(TlsConfiguration::Simple {
+            ca,
+            alpn: None,
+            client_auth,
+        }));
+    }
+    mqtt_opts
+}
+
 async fn run_mqtt_loop(
     cfg: MqttConfig,
     mut rx: mpsc::UnboundedReceiver<(String, Vec<u8>, bool)>,
     hub: CommsHub,
 ) {
     let prefix = cfg.topic_prefix.trim_end_matches('/').to_string();
+    let mut backoff_secs = 2u64;
     loop {
-        let mut mqtt_opts = MqttOptions::new(&cfg.client_id, &cfg.host, cfg.port);
-        mqtt_opts.set_keep_alive(Duration::from_secs(30));
-        mqtt_opts.set_last_will(LastWill::new(
-            format!("{prefix}/available"),
-            "offline",
-            QoS::AtMostOnce,
-            true,
-        ));
-        if let (Some(u), Some(p)) = (&cfg.user, &cfg.password) {
-            mqtt_opts.set_credentials(u, p);
-        }
-
+        let mqtt_opts = build_mqtt_options(&cfg);
         let (client, mut eventloop) = AsyncClient::new(mqtt_opts, 256);
 
         loop {
@@ -508,6 +546,7 @@ async fn run_mqtt_loop(
                 ev = eventloop.poll() => {
                     match ev {
                         Ok(MqttEvent::Incoming(Packet::ConnAck(_))) => {
+                            backoff_secs = 2;
                             info!("Connected to MQTT broker at {}:{}", cfg.host, cfg.port);
                             let _ = client
                                 .publish(
@@ -535,14 +574,15 @@ async fn run_mqtt_loop(
                         }
                         Ok(_) => {}
                         Err(err) => {
-                            debug!("MQTT broker unreachable ({err}); retrying in 30s");
+                            debug!("MQTT broker unreachable ({err}); retrying in {backoff_secs}s");
                             break;
                         }
                     }
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(60);
     }
 }
 
@@ -594,5 +634,18 @@ mod tests {
         assert_eq!(hub.get_active_profile(), "armed");
         hub.apply_set_command("profile/set", "home");
         assert_eq!(hub.get_active_profile(), "home");
+    }
+
+    #[test]
+    fn build_mqtt_options_enables_tls_on_8883_and_custom_ca() {
+        let mut cfg = MqttConfig::default();
+        assert!(!cfg.should_use_tls());
+        let opts_plain = build_mqtt_options(&cfg);
+        assert!(matches!(opts_plain.transport(), Transport::Tcp));
+
+        cfg.port = 8883;
+        assert!(cfg.should_use_tls());
+        let opts_tls = build_mqtt_options(&cfg);
+        assert!(matches!(opts_tls.transport(), Transport::Tls(_)));
     }
 }

@@ -108,6 +108,27 @@ pub struct MqttConfig {
     pub password: Option<String>,
     #[serde(default = "default_stats_interval")]
     pub stats_interval: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_certs: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_cert: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_key: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_insecure: bool,
+}
+
+impl MqttConfig {
+    /// Returns `true` when MQTTS (TLS) should be used: either `tls_enabled == Some(true)`
+    /// or `tls_enabled.is_none()` and (`port == 8883` or `tls_ca_certs.is_some()`).
+    pub fn should_use_tls(&self) -> bool {
+        match self.tls_enabled {
+            Some(v) => v,
+            None => self.port == 8883 || self.tls_ca_certs.is_some(),
+        }
+    }
 }
 
 fn default_mqtt_host() -> String {
@@ -137,6 +158,11 @@ impl Default for MqttConfig {
             user: None,
             password: None,
             stats_interval: default_stats_interval(),
+            tls_enabled: None,
+            tls_ca_certs: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            tls_insecure: false,
         }
     }
 }
@@ -1671,6 +1697,11 @@ impl NinjaConfig {
                 "user": self.mqtt.user,
                 "has_password": self.mqtt.password.as_ref().is_some_and(|p| !p.is_empty()),
                 "stats_interval": self.mqtt.stats_interval,
+                "tls_enabled": self.mqtt.should_use_tls(),
+                "tls_ca_certs": self.mqtt.tls_ca_certs,
+                "tls_client_cert": self.mqtt.tls_client_cert,
+                "tls_client_key": self.mqtt.tls_client_key,
+                "tls_insecure": self.mqtt.tls_insecure,
                 "qos": 0
             },
             "notifications": {
