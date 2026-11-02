@@ -224,6 +224,17 @@ def main() -> int:
         gh_cmd.append("--latest")
     run(gh_cmd)
 
+    # Prune superseded -rc.* pre-releases and tags so GitHub Releases/Tags never clutter
+    # or sort older single-digit RCs (e.g. rc.9) above double-digit RCs (e.g. rc.12).
+    superseded_rcs = [t for t in all_tags if "-rc." in t and t != next_tag]
+    for old_rc in superseded_rcs:
+        print(f"Pruning superseded pre-release and tag: {old_rc}")
+        subprocess.run(
+            ["gh", "release", "delete", old_rc, "--cleanup-tag", "--yes"],
+            check=False,
+        )
+        subprocess.run(["git", "tag", "-d", old_rc], check=False)
+
     write_output("release_created", "true")
     write_output("tag_name", next_tag)
     write_output("version", next_version)
