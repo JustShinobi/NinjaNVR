@@ -851,6 +851,75 @@ pub fn encode_image_jpeg(img: &RgbImage) -> Result<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FrameIntegrityReport {
+    pub y_variance: f32,
+    pub uniform_ratio: f32,
+    pub is_tampered_or_blind: bool,
+}
+
+/// Evaluates spatial luminance variance and modal pixel uniformity on a YUV420p frame
+/// to detect camera tampering (spray paint, cloth/tape occlusion) or solid-color encoder hangs.
+pub fn check_frame_tamper(yuv_data: &[u8], width: u32, height: u32) -> FrameIntegrityReport {
+    let y_len = (width as usize).saturating_mul(height as usize);
+    if y_len == 0 || yuv_data.len() < y_len {
+        return FrameIntegrityReport {
+            y_variance: 0.0,
+            uniform_ratio: 1.0,
+            is_tampered_or_blind: true,
+        };
+    }
+    let y_plane = &yuv_data[..y_len];
+    let step = (y_len / 2048).max(1);
+    let mut hist = [0u32; 256];
+    let mut sum: f64 = 0.0;
+    let mut sum_sq: f64 = 0.0;
+    let mut count: u32 = 0;
+
+    let mut idx = 0usize;
+    while idx < y_len {
+        let v = y_plane[idx];
+        hist[v as usize] += 1;
+        let vf = v as f64;
+        sum += vf;
+        sum_sq += vf * vf;
+        count += 1;
+        idx += step;
+    }
+
+    if count == 0 {
+        return FrameIntegrityReport {
+            y_variance: 0.0,
+            uniform_ratio: 1.0,
+            is_tampered_or_blind: true,
+        };
+    }
+
+    let mean = sum / (count as f64);
+    let variance = ((sum_sq / (count as f64)) - mean * mean).max(0.0) as f32;
+
+    let mut modal_val = 0usize;
+    let mut modal_count = 0u32;
+    for (val, &c) in hist.iter().enumerate() {
+        if c > modal_count {
+            modal_count = c;
+            modal_val = val;
+        }
+    }
+
+    let low = modal_val.saturating_sub(4);
+    let high = (modal_val + 4).min(255);
+    let near_modal: u32 = hist[low..=high].iter().sum();
+    let uniform_ratio = (near_modal as f32) / (count as f32);
+    let is_tampered_or_blind = uniform_ratio >= 0.85 || variance < 2.0;
+
+    FrameIntegrityReport {
+        y_variance: variance,
+        uniform_ratio,
+        is_tampered_or_blind,
+    }
+}
+
 /// Detects Infrared (IR) / monochrome night mode directly from a YUV420p buffer's `U` and `V`
 /// chroma planes with near-zero CPU overhead. Returns `true` when the mean chroma deviation
 /// `|U - 128| + |V - 128| < 3.0`.
@@ -990,5 +1059,29 @@ mod tests {
         color_buf[y_len..y_len + uv_len].fill(96);
         color_buf[y_len + uv_len..].fill(165);
         assert!(!is_monochrome_ir(&color_buf, w, h));
+    }
+
+    #[test]
+    fn check_frame_tamper_detects_solid_blind_feed_and_passes_structured_night_scene() {
+        let w = 320u32;
+        let h = 180u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+
+        // 1. Solid black / spray-painted occluded frame
+        let blind_buf = vec![16u8; y_len + uv_len * 2];
+        let rep_blind = check_frame_tamper(&blind_buf, w, h);
+        assert!(rep_blind.is_tampered_or_blind);
+        assert!(rep_blind.uniform_ratio >= 0.99);
+
+        // 2. Normal dark night scene with visible spatial structure (buildings, streetlamp gradient)
+        let mut night_scene = vec![128u8; y_len + uv_len * 2];
+        for (i, px) in night_scene.iter_mut().enumerate().take(y_len) {
+            *px = ((i * 17) % 90 + 15) as u8;
+        }
+        let rep_normal = check_frame_tamper(&night_scene, w, h);
+        assert!(!rep_normal.is_tampered_or_blind);
+        assert!(rep_normal.y_variance > 20.0);
+        assert!(rep_normal.uniform_ratio < 0.30);
     }
 }

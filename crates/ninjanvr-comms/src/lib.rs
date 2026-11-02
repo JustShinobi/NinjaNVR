@@ -20,6 +20,7 @@ fn default_camera_activity_entry() -> Value {
         "enabled": true,
         "online": true,
         "night_mode": false,
+        "tamper": false,
         "motion": false,
         "objects": [],
         "count": 0,
@@ -140,6 +141,38 @@ impl CommsHub {
             let status_str = if online { "online" } else { "offline" };
             self.publish_topic(&format!("{camera}/available"), status_str);
             self.publish_topic(&format!("{camera}/status"), status_str);
+            self.publish_ws_only("camera_activity", snapshot_str);
+        }
+        transitioned
+    }
+
+    /// Updates per-camera tamper / blind-feed state and publishes `<camera>/tamper` (`"ON"` / `"OFF"`)
+    /// over MQTT and WebSocket when changed. Returns `true` if the state transitioned.
+    pub fn set_camera_tamper(&self, camera: &str, tampered: bool) -> bool {
+        let (transitioned, snapshot_str) = {
+            let mut map = self
+                .camera_states
+                .write()
+                .expect("camera_states lock poisoned");
+            let entry = map
+                .entry(camera.to_string())
+                .or_insert_with(default_camera_activity_entry);
+            let prev = entry
+                .get("tamper")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let changed = prev != tampered;
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("tamper".to_string(), json!(tampered));
+            }
+            let s = serde_json::to_string(&*map).unwrap_or_else(|_| "{}".to_string());
+            (changed, s)
+        };
+        if transitioned {
+            self.publish_topic(
+                &format!("{camera}/tamper"),
+                if tampered { "ON" } else { "OFF" },
+            );
             self.publish_ws_only("camera_activity", snapshot_str);
         }
         transitioned

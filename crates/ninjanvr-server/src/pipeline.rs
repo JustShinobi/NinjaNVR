@@ -12,9 +12,9 @@ use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{SharedActivityLedger, YuvFrame, resolve_ffmpeg_bin};
 use ninjanvr_track::{ByteTracker, TrackedObject, TriggerProvenance, should_replace_snapshot};
 use ninjanvr_vision::{
-    BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, compute_inference_regions,
-    crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp, is_monochrome_ir,
-    yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
+    BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, check_frame_tamper,
+    compute_inference_regions, crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp,
+    is_monochrome_ir, yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -232,6 +232,8 @@ impl VisionPipeline {
                     prev_label_counts.insert(lbl.clone(), 0);
                 }
                 let mut prev_total_objs = 0usize;
+                let mut consecutive_tamper_frames = 0u32;
+                let tamper_threshold_frames = (fps * 15).max(15);
 
                 while stdout
                     .read_exact(Arc::<Vec<u8>>::make_mut(&mut frame_data))
@@ -257,6 +259,47 @@ impl VisionPipeline {
                     };
                     let is_night_ir = is_monochrome_ir(&yuv_frame.data, width, height);
                     tracker.set_night_mode(is_night_ir);
+
+                    let tamper_report = check_frame_tamper(&yuv_frame.data, width, height);
+                    if tamper_report.is_tampered_or_blind {
+                        consecutive_tamper_frames = consecutive_tamper_frames.saturating_add(1);
+                        if consecutive_tamper_frames == tamper_threshold_frames
+                            && self.comms.set_camera_tamper(&camera, true)
+                        {
+                            self.log_hub.push_frigate(
+                                "WARNING",
+                                &format!("ninjanvr.vision.{camera}"),
+                                &format!(
+                                    "Camera tamper / blind feed detected (uniform_ratio={:.2}, y_variance={:.2})",
+                                    tamper_report.uniform_ratio, tamper_report.y_variance
+                                ),
+                            );
+                            let tamper_id = format!("{now:.6}-tamper-{}", random_suffix());
+                            let _ = self.db.insert_review_segment(&ReviewItemDto {
+                                id: tamper_id,
+                                camera: camera.clone(),
+                                start_time: now,
+                                end_time: None,
+                                severity: "alert".to_string(),
+                                thumb_path: format!("/api/{camera}/latest.jpg"),
+                                data: json!({
+                                    "detections": [],
+                                    "objects": ["camera_tamper"],
+                                    "zones": [],
+                                    "audio": [],
+                                    "thumb_time": now,
+                                    "metadata": {
+                                        "uniform_ratio": tamper_report.uniform_ratio,
+                                        "y_variance": tamper_report.y_variance
+                                    }
+                                }),
+                                has_been_reviewed: false,
+                            });
+                        }
+                    } else {
+                        consecutive_tamper_frames = 0;
+                        let _ = self.comms.set_camera_tamper(&camera, false);
+                    }
 
                     // 1. SIMD Motion Detection on Y-plane
                     let motion_boxes = motion_detector.detect(&yuv_frame);
