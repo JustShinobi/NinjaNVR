@@ -147,6 +147,7 @@ def update_version_manifests(next_version: str) -> list[str]:
 
 
 def main() -> int:
+    os.environ["NINJANVR_RELEASE_BOT"] = "1"
     head_subject = run(["git", "log", "-1", "--pretty=%s"])
     if head_subject.startswith("chore(release):") or "[skip release]" in head_subject:
         print(f"Skipping release cut on release commit: {head_subject}")

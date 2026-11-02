@@ -29,9 +29,22 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Check repository privacy and hygiene guardrails
         run: ./scripts/ci/check-privacy
+
+      - name: Check SemVer and release manifest invariants
+        run: ./scripts/ci/check-semver
+
+      - name: Validate Conventional Commit messages
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            ./scripts/ci/check-commit-msg --range "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            ./scripts/ci/check-commit-msg --range "HEAD~1..HEAD"
+          fi
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2

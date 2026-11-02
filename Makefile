@@ -7,15 +7,21 @@ K3S_HOST      ?= localhost
 K8S_NAMESPACE ?= ninjanvr
 K8S_DEPLOY    ?= ninjanvr
 
-.PHONY: verify check privacy test build build-ui docs-dev docs-build image fast-ui logs status help
+.PHONY: verify check hooks privacy semver test build build-ui docs-dev docs-build image fast-ui logs status help
 
 verify:
 	./scripts/ci/verify
 
 check: verify
 
+hooks:
+	./scripts/ci/install-hooks
+
 privacy:
 	./scripts/ci/check-privacy
+
+semver:
+	./scripts/ci/check-semver
 
 test:
 	cargo test --workspace
