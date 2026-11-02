@@ -401,6 +401,8 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/users/{username}/password", put(api_user_password))
         .route("/users/{username}/role", put(api_user_role))
         .route("/users/{username}/cameras", put(api_user_cameras))
+        .route("/tokens", get(api_tokens_list).post(api_token_create))
+        .route("/tokens/{id}", delete(api_token_delete))
         .route("/config", get(api_config))
         .route("/config/raw", get(api_config_raw))
         .route("/config/raw_paths", get(api_empty_array))
@@ -420,6 +422,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/logs/{service}", get(api_service_logs))
         .route("/stats", get(api_stats))
         .route("/stats/history", get(api_stats_history))
+        .route("/metrics", get(api_stats))
         .route("/review", get(api_review))
         .route("/review/summary", get(api_review_summary))
         .route("/review/activity/motion", get(api_review_activity_motion))
@@ -772,11 +775,25 @@ async fn auth_gate_middleware(
             };
 
             let role_lc = role.to_ascii_lowercase();
+            if role_lc == "metrics" {
+                let is_metrics_route = (method == "GET" || method == "HEAD")
+                    && (path.starts_with("/api/stats") || path.starts_with("/api/metrics"));
+                if !is_metrics_route {
+                    state.log_hub.push_nginx(&method, &path, 403);
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "message": "Token scope 'metrics' only permits GET /api/stats and /api/metrics" })),
+                    )
+                        .into_response();
+                }
+            }
+
             let is_admin_only = path.starts_with("/api/config/save")
                 || path.starts_with("/api/config/structured")
                 || path.starts_with("/api/config/set")
                 || path.starts_with("/api/config/raw")
                 || path.starts_with("/api/restart")
+                || path.starts_with("/api/tokens")
                 || path.starts_with("/api/users")
                 || path.starts_with("/api/recordings/sync")
                 || (method == "DELETE"
@@ -789,6 +806,17 @@ async fn auth_gate_middleware(
                 return (
                     StatusCode::FORBIDDEN,
                     Json(json!({ "message": "Admin role required" })),
+                )
+                    .into_response();
+            }
+
+            if role_lc == "read_only"
+                && ((method != "GET" && method != "HEAD") || !path.starts_with("/api/"))
+            {
+                state.log_hub.push_nginx(&method, &path, 403);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "message": "Token scope 'read_only' only permits GET /api/*" })),
                 )
                     .into_response();
             }
@@ -868,6 +896,8 @@ async fn auth_gate_middleware(
                                 | "cases"
                                 | "preview"
                                 | "share"
+                                | "tokens"
+                                | "metrics"
                                 | "go2rtc"
                                 | "ws"
                                 | "labels"
@@ -1049,16 +1079,26 @@ fn extract_authenticated_user(
         return Some((remote_user.to_string(), role));
     }
 
-    let token_str = jar
-        .get(cookie_name)
-        .map(|c| c.value().to_string())
-        .or_else(|| {
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-                .map(|s| s.to_string())
-        })?;
+    let token_str = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+        .or_else(|| jar.get(cookie_name).map(|c| c.value().to_string()))?;
+
+    if token_str.starts_with("nnvr_") {
+        if let Ok(Some((token_name, scope))) =
+            state.db.verify_api_token(&token_str, unix_now() as f64)
+        {
+            let mapped_role = if scope == "full" {
+                "admin".to_string()
+            } else {
+                scope
+            };
+            return Some((format!("token:{token_name}"), mapped_role));
+        }
+        return None;
+    }
 
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
@@ -1311,6 +1351,73 @@ async fn api_user_delete(
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "success": false, "message": "User not found" })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateApiTokenBody {
+    pub name: String,
+    #[serde(default = "default_token_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub expires_in_days: Option<u32>,
+}
+
+fn default_token_scope() -> String {
+    "read_only".to_string()
+}
+
+async fn api_tokens_list(State(state): State<AppState>) -> Json<Value> {
+    let tokens = state.db.list_api_tokens().unwrap_or_default();
+    Json(Value::Array(tokens))
+}
+
+async fn api_token_create(
+    State(state): State<AppState>,
+    Json(body): Json<CreateApiTokenBody>,
+) -> Response {
+    let expires_at = body
+        .expires_in_days
+        .map(|d| (unix_now() as f64) + (d as f64) * 86400.0);
+    match state
+        .db
+        .create_api_token(&body.name, &body.scope, expires_at)
+    {
+        Ok((meta, plaintext)) => Json(json!({
+            "success": true,
+            "token": plaintext,
+            "metadata": meta,
+            "tokens": state.db.list_api_tokens().unwrap_or_default()
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_token_delete(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match state.db.delete_api_token(&id) {
+        Ok(true) => Json(json!({
+            "success": true,
+            "tokens": state.db.list_api_tokens().unwrap_or_default()
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "Token not found" })),
         )
             .into_response(),
         Err(err) => (
@@ -4411,6 +4518,136 @@ version: 0.18-0
             .await
             .unwrap();
         assert_eq!(resp_expired.status(), StatusCode::GONE);
+
+        // 18. Test scoped API Bearer tokens (nnvr_...) creation, scope enforcement, and revocation
+        let (tok_meta, raw_ro_tok) = state
+            .db
+            .create_api_token("ha_sensor", "read_only", None)
+            .unwrap();
+        assert!(raw_ro_tok.starts_with("nnvr_"));
+        let tok_id = tok_meta["id"].as_str().unwrap();
+
+        // read_only token can query GET /api/stats and GET /api/events
+        let resp_ro_stats = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw_ro_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ro_stats.status(), StatusCode::OK);
+
+        let resp_ro_events = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw_ro_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ro_events.status(), StatusCode::OK);
+
+        // read_only token is blocked from GET /api/users, GET /api/tokens, and GET /api/config/raw (403 Forbidden)
+        for admin_path in ["/api/users", "/api/tokens", "/api/config/raw"] {
+            let resp_ro_admin = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(admin_path)
+                        .header(header::AUTHORIZATION, format!("Bearer {raw_ro_tok}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp_ro_admin.status(), StatusCode::FORBIDDEN);
+        }
+
+        // read_only token is rejected (403 Forbidden) on POST/DELETE mutations
+        let resp_ro_mutate = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/profile")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw_ro_tok}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"profile":"disarmed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ro_mutate.status(), StatusCode::FORBIDDEN);
+
+        // metrics token can query GET /api/stats and GET /api/metrics, but is rejected (403) on GET /api/events
+        let (_, raw_metrics_tok) = state
+            .db
+            .create_api_token("prom_scraper", "metrics", None)
+            .unwrap();
+        let resp_metrics_ok = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw_metrics_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_metrics_ok.status(), StatusCode::OK);
+        let resp_metrics_events = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw_metrics_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_metrics_events.status(), StatusCode::FORBIDDEN);
+
+        // full token has admin-equivalent access to /api/tokens CRUD
+        let (_, raw_full_tok) = state
+            .db
+            .create_api_token("cli_admin", "full", None)
+            .unwrap();
+        let resp_full_list = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tokens")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw_full_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_full_list.status(), StatusCode::OK);
+
+        // Revoking the token blocks subsequent requests with 401 Unauthorized
+        assert!(state.db.delete_api_token(tok_id).unwrap());
+        let resp_revoked = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .header(header::AUTHORIZATION, format!("Bearer {raw_ro_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_revoked.status(), StatusCode::UNAUTHORIZED);
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

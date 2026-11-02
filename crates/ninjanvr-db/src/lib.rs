@@ -10,7 +10,7 @@ use pbkdf2::pbkdf2;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tracing::info;
 
 const PASSWORD_HASH_ALGORITHM: &str = "pbkdf2_sha256";
@@ -390,6 +390,16 @@ impl NinjaDatabase {
             CREATE INDEX IF NOT EXISTS "event_camera" ON "event" ("camera");
             CREATE INDEX IF NOT EXISTS "event_start_time_end_time" ON "event" ("start_time" DESC, "end_time" DESC);
             CREATE UNIQUE INDEX IF NOT EXISTS "userreviewstatus_user_segment" ON "userreviewstatus" ("user_id", "review_segment_id");
+            CREATE TABLE IF NOT EXISTS "api_token" (
+                "id" TEXT NOT NULL PRIMARY KEY,
+                "name" TEXT NOT NULL,
+                "token_hash" TEXT NOT NULL UNIQUE,
+                "prefix" TEXT NOT NULL,
+                "scope" TEXT NOT NULL,
+                "created_at" REAL NOT NULL,
+                "last_used_at" REAL NULL,
+                "expires_at" REAL NULL
+            );
             "#,
         )?;
         let _ = conn.execute(
@@ -602,6 +612,128 @@ impl NinjaDatabase {
             params![norm, username.trim()],
         )?;
         Ok(updated > 0)
+    }
+
+    /// Generates a high-entropy `nnvr_<32_hex>` API bearer token, stores ONLY its SHA-256 hash
+    /// and 8-char display prefix in SQLite, and returns `(token_metadata_json, plaintext_token)`.
+    pub fn create_api_token(
+        &self,
+        name: &str,
+        scope: &str,
+        expires_at: Option<f64>,
+    ) -> Result<(Value, String)> {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            anyhow::bail!("Token name cannot be empty");
+        }
+        let norm_scope = match scope.trim().to_ascii_lowercase().as_str() {
+            "read_only" => "read_only",
+            "metrics" => "metrics",
+            "full" => "full",
+            _ => anyhow::bail!("Scope must be 'read_only', 'metrics', or 'full'"),
+        };
+
+        let mut rand_bytes = [0u8; 16];
+        rand::fill(&mut rand_bytes);
+        let hex_part: String = rand_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let plaintext = format!("nnvr_{hex_part}");
+        let prefix = plaintext[..13].to_string(); // e.g. "nnvr_a1b2c3d4"
+
+        let hash_bytes = Sha256::digest(plaintext.as_bytes());
+        let token_hash: String = hash_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+        let mut id_bytes = [0u8; 6];
+        rand::fill(&mut id_bytes);
+        let id: String = id_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let created_at = Utc::now().timestamp() as f64;
+
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO api_token (id, name, token_hash, prefix, scope, created_at, last_used_at, expires_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
+            "#,
+            params![id, trimmed_name, token_hash, prefix, norm_scope, created_at, expires_at],
+        )?;
+
+        Ok((
+            json!({
+                "id": id,
+                "name": trimmed_name,
+                "prefix": prefix,
+                "scope": norm_scope,
+                "created_at": created_at,
+                "last_used_at": Value::Null,
+                "expires_at": expires_at
+            }),
+            plaintext,
+        ))
+    }
+
+    pub fn list_api_tokens(&self) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, name, prefix, scope, created_at, last_used_at, expires_at FROM api_token ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "name": r.get::<_, String>(1)?,
+                "prefix": r.get::<_, String>(2)?,
+                "scope": r.get::<_, String>(3)?,
+                "created_at": r.get::<_, f64>(4).unwrap_or(0.0),
+                "last_used_at": r.get::<_, Option<f64>>(5).ok().flatten(),
+                "expires_at": r.get::<_, Option<f64>>(6).ok().flatten(),
+            }))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_api_token(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let deleted = conn.execute("DELETE FROM api_token WHERE id = ?1", params![id.trim()])?;
+        Ok(deleted > 0)
+    }
+
+    /// Validates an incoming `nnvr_...` bearer token by its SHA-256 hash, checks expiration,
+    /// updates `last_used_at`, and returns `Some((token_name, scope))` if valid.
+    pub fn verify_api_token(
+        &self,
+        raw_token: &str,
+        now_ts: f64,
+    ) -> Result<Option<(String, String)>> {
+        if !raw_token.starts_with("nnvr_") {
+            return Ok(None);
+        }
+        let hash_bytes = Sha256::digest(raw_token.as_bytes());
+        let token_hash: String = hash_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let row: Option<(String, String, String, Option<f64>)> = conn
+            .query_row(
+                "SELECT id, name, scope, expires_at FROM api_token WHERE token_hash = ?1",
+                params![token_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3).ok().flatten())),
+            )
+            .optional()?;
+
+        let Some((id, name, scope, expires_at)) = row else {
+            return Ok(None);
+        };
+        if let Some(exp) = expires_at
+            && now_ts >= exp
+        {
+            return Ok(None);
+        }
+        let _ = conn.execute(
+            "UPDATE api_token SET last_used_at = ?1 WHERE id = ?2",
+            params![now_ts, id],
+        );
+        Ok(Some((name, scope)))
     }
 
     pub fn delete_user(&self, username: &str) -> Result<bool> {

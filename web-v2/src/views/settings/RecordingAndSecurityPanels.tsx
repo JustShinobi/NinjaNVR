@@ -750,6 +750,72 @@ export const CommsAuthUsersSection: React.FC<{
   const [newAllowedCameras, setNewAllowedCameras] = useState("*");
   const [pwResetTarget, setPwResetTarget] = useState<string | null>(null);
   const [pwResetValue, setPwResetValue] = useState("");
+  const [apiTokens, setApiTokens] = useState<
+    Array<{
+      id: string;
+      name: string;
+      prefix: string;
+      scope: string;
+      created_at: number;
+    }>
+  >([]);
+  const [newTokenName, setNewTokenName] = useState("");
+  const [newTokenScope, setNewTokenScope] = useState<"read_only" | "metrics" | "full">(
+    "read_only"
+  );
+  const [createdPlaintextToken, setCreatedPlaintextToken] = useState<string | null>(null);
+
+  const loadTokens = useCallback(async () => {
+    try {
+      const res = await fetch("/api/tokens", { credentials: "include" });
+      if (res.ok) {
+        const list = await res.json();
+        if (Array.isArray(list)) setApiTokens(list);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    loadTokens();
+  }, [loadTokens]);
+
+  const handleCreateToken = async () => {
+    if (!newTokenName.trim()) {
+      notify("Enter a name for the API token");
+      return;
+    }
+    const res = await fetch("/api/tokens", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ name: newTokenName.trim(), scope: newTokenScope }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.token) {
+      setNewTokenName("");
+      setCreatedPlaintextToken(data.token);
+      if (Array.isArray(data.tokens)) setApiTokens(data.tokens);
+      else loadTokens();
+      notify("API Bearer token generated — copy it now (shown only once)");
+    } else {
+      notify(data.message || "Failed to generate API token");
+    }
+  };
+
+  const handleRevokeToken = async (id: string) => {
+    const res = await fetch(`/api/tokens/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+      credentials: "include",
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      if (Array.isArray(data.tokens)) setApiTokens(data.tokens);
+      else loadTokens();
+      notify("API token revoked");
+    }
+  };
 
   const loadUsers = useCallback(async () => {
     try {
@@ -1315,6 +1381,114 @@ export const CommsAuthUsersSection: React.FC<{
             >
               <Plus size={12} />
               {isPt ? "Criar Conta de Operador" : "Create Operator Account"}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Scoped API Bearer Tokens Card */}
+      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="nvr-cfg-card-header">
+          <span>
+            {isPt
+              ? `TOKENS DE API SCOPED (${apiTokens.length})`
+              : `SCOPED API BEARER TOKENS (${apiTokens.length})`}
+          </span>
+          <span className="nvr-badge mono">SHA-256 HASHED // nnvr_*</span>
+        </div>
+        <div className="nvr-cfg-card-body">
+          {createdPlaintextToken && (
+            <div
+              className="mono"
+              style={{
+                padding: "8px 10px",
+                background: "rgba(16, 185, 129, 0.14)",
+                border: "1px solid var(--signal-live)",
+                borderRadius: 3,
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                fontSize: "var(--text-xs)",
+              }}
+            >
+              <span>
+                NEW TOKEN (COPY NOW): <strong>{createdPlaintextToken}</strong>
+              </span>
+              <button
+                type="button"
+                className="nvr-btn success mono"
+                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                onClick={() => {
+                  navigator.clipboard?.writeText(createdPlaintextToken);
+                  notify("Copied API token to clipboard");
+                }}
+              >
+                Copy Token
+              </button>
+            </div>
+          )}
+
+          {apiTokens.length > 0 && (
+            <table className="nvr-table mono">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Prefix</th>
+                  <th>Scope</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {apiTokens.map((tk) => (
+                  <tr key={tk.id}>
+                    <td style={{ fontWeight: 700 }}>{tk.name}</td>
+                    <td>{tk.prefix}...</td>
+                    <td>{tk.scope}</td>
+                    <td>
+                      <button
+                        type="button"
+                        className="nvr-btn danger"
+                        style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                        onClick={() => handleRevokeToken(tk.id)}
+                      >
+                        <Trash2 size={11} />
+                        Revoke
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <input
+              className="nvr-input mono"
+              style={{ width: 200 }}
+              placeholder="Token name (e.g. prometheus)"
+              aria-label="API Token Name"
+              value={newTokenName}
+              onChange={(e) => setNewTokenName(e.target.value)}
+            />
+            <select
+              className="nvr-select mono"
+              aria-label="API Token Scope"
+              value={newTokenScope}
+              onChange={(e) =>
+                setNewTokenScope(e.target.value as "read_only" | "metrics" | "full")
+              }
+            >
+              <option value="read_only">Scope: read_only (GET /api/*)</option>
+              <option value="metrics">Scope: metrics (GET /api/stats*)</option>
+              <option value="full">Scope: full (Admin)</option>
+            </select>
+            <button
+              type="button"
+              className="nvr-btn primary"
+              onClick={handleCreateToken}
+            >
+              <Plus size={12} />
+              Generate API Token
             </button>
           </div>
         </div>
