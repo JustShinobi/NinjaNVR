@@ -538,14 +538,17 @@ export const VisionZonesMotionSection: React.FC<{
             <div className="nvr-cfg-card-header">
               <span>
                 {isPt ? "ZONAS" : "ZONES"} ({Object.keys(zonesMap).length}) ·{" "}
+                {isPt ? "TRIPWIRES" : "TRIPWIRES"} (
+                {Object.keys(camCfg?.lines || {}).length}) ·{" "}
                 {isPt ? "MÁSCARAS" : "MASKS"} ({motionMasks.length + objectMasks.length})
               </span>
               <span style={{ color: "var(--signal-accent-text)" }}>
-                CYAN / RED / VIOLET
+                CYAN / GREEN / RED / VIOLET
               </span>
             </div>
             <div className="nvr-cfg-card-body" style={{ padding: 8, gap: 6 }}>
               {Object.keys(zonesMap).length === 0 &&
+                Object.keys(camCfg?.lines || {}).length === 0 &&
                 motionMasks.length === 0 &&
                 objectMasks.length === 0 && (
                   <div style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
@@ -554,6 +557,85 @@ export const VisionZonesMotionSection: React.FC<{
                       : `No zones or masks configured on ${inspectorCam}. Click on the live video to draw one.`}
                   </div>
                 )}
+
+              {Object.entries(camCfg?.lines || {}).map(([lName, lCfg]) => (
+                <div
+                  key={`line-${lName}`}
+                  style={{
+                    padding: 6,
+                    background: "var(--bg-canvas)",
+                    border: "1px solid rgba(16, 185, 129, 0.45)",
+                    borderRadius: 2,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 6,
+                  }}
+                >
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div
+                      className="mono"
+                      style={{
+                        fontSize: "var(--text-xs)",
+                        fontWeight: 700,
+                        color: "var(--signal-live-text)",
+                      }}
+                    >
+                      TRIPWIRE: {lName.toUpperCase()} · dir=
+                      {(lCfg.direction || "any").toUpperCase()}
+                    </div>
+                    <div
+                      className="mono"
+                      style={{
+                        fontSize: "var(--text-xs)",
+                        color: "var(--text-secondary)",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {(lCfg.objects || ["all"]).join(", ")} · [
+                      {(lCfg.points || [0, 0, 0, 0]).join(", ")}]
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <button
+                      type="button"
+                      className="nvr-btn"
+                      style={{ height: 22, padding: "0 6px" }}
+                      title="Load tripwire vertices into canvas"
+                      onClick={() => {
+                        setPolyType("tripwire");
+                        setZoneNameInput(lName);
+                        setLineDirection(lCfg.direction || "any");
+                        setZoneObjects(lCfg.objects || ["person"]);
+                        const pts = lCfg.points || [0.2, 0.5, 0.8, 0.5];
+                        setDraftPoints([
+                          [pts[0], pts[1]],
+                          [pts[2], pts[3]],
+                        ]);
+                      }}
+                    >
+                      <Edit3 size={11} />
+                    </button>
+                    <button
+                      type="button"
+                      className="nvr-btn danger"
+                      style={{ height: 22, padding: "0 6px" }}
+                      title="Delete tripwire"
+                      onClick={() =>
+                        updateDraft((next) => {
+                          if (next.cameras[inspectorCam]?.lines) {
+                            delete next.cameras[inspectorCam].lines![lName];
+                          }
+                        })
+                      }
+                    >
+                      <Trash2 size={11} />
+                    </button>
+                  </div>
+                </div>
+              ))}
 
               {Object.entries(zonesMap).map(([zName, zCfg]) => (
                 <div
@@ -1816,7 +1898,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 border: "1px solid var(--border-hairline)",
                 borderRadius: 3,
                 display: "grid",
-                gridTemplateColumns: "1fr 1fr 1fr 1fr",
+                gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr",
                 gap: 6,
               }}
             >
@@ -1847,6 +1929,29 @@ export const AiDetectionObjectsSection: React.FC<{
                   value={activeDetect.min_initialized ?? 2}
                   onChange={(e) =>
                     updateDetect({ min_initialized: Number(e.target.value) })
+                  }
+                />
+              </div>
+              <div>
+                <div
+                  className="mono"
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                  title="Minimum consecutive hits required when camera is in Night IR mode (Spider/Insect flash filter)"
+                >
+                  Night IR Hits
+                </div>
+                <input
+                  type="number"
+                  min={1}
+                  max={25}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={
+                    activeDetect.min_initialized_night ??
+                    (activeDetect.min_initialized ?? 2) + 2
+                  }
+                  onChange={(e) =>
+                    updateDetect({ min_initialized_night: Number(e.target.value) })
                   }
                 />
               </div>

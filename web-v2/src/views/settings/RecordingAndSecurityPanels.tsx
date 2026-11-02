@@ -503,6 +503,33 @@ export const RecordingReviewSection: React.FC<{
           <div className="nvr-field-row">
             <div className="nvr-field-meta">
               <div className="nvr-field-label">
+                {isPt
+                  ? "Snapshot Alta Resolução (Main Stream)"
+                  : "High-Res Main-Stream Snapshots"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Projeta a caixa delimitadora do substream sobre o quadro 1080p/4K da câmera."
+                  : "Projects normalized substream bounding boxes onto full-resolution main-stream frames."}
+              </div>
+            </div>
+            <ToggleSwitch
+              checked={
+                (activeSnap.high_res ?? true) && (activeSnap.from_main_stream ?? true)
+              }
+              label="High-Res Main-Stream Snapshots"
+              onChange={(v) =>
+                mutateSnap((s) => {
+                  s.high_res = v;
+                  s.from_main_stream = v;
+                })
+              }
+            />
+          </div>
+
+          <div className="nvr-field-row">
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
                 {isPt ? "Política de Seleção de Snapshot" : "Snapshot Selection Policy"}
               </div>
               <div className="nvr-field-desc">

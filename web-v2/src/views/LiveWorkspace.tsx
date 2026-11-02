@@ -533,6 +533,22 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   {hasMotion && !hasPerson && (
                     <span className="nvr-badge motion">{t.live.motionActive}</span>
                   )}
+                  {Boolean(act?.tamper) && (
+                    <span
+                      className="nvr-badge alert mono"
+                      title="Camera tamper / blind-feed occlusion detected"
+                    >
+                      TAMPER
+                    </span>
+                  )}
+                  {Boolean(act?.night_mode || camStat?.night_mode) && (
+                    <span
+                      className="nvr-badge mono"
+                      title="Infrared (IR) monochrome night profile active — spider/insect flash filter engaged"
+                    >
+                      IR NIGHT
+                    </span>
+                  )}
                   <span className="nvr-badge">
                     AI {camStat?.detection_fps?.toFixed(1) || "0.0"} FPS
                   </span>

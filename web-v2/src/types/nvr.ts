@@ -10,6 +10,7 @@ export interface CameraDetectConfig {
   height: number;
   fps: number;
   min_initialized?: number;
+  min_initialized_night?: number;
   max_disappeared?: number;
   stationary?: StationaryConfig;
 }
@@ -260,6 +261,7 @@ export interface CameraRuntimeStats {
   capture_pid: number;
   ffmpeg_pid: number;
   last_frame_ts?: number;
+  night_mode?: boolean;
   ffmpeg_cpu?: string;
   capture_cpu?: string;
   detect_cpu?: string;
@@ -427,6 +429,8 @@ export interface ExportItem {
 
 export interface CameraLiveActivity {
   enabled?: boolean;
+  night_mode?: boolean;
+  tamper?: boolean;
   motion: boolean;
   objects: Array<{
     id: string;
