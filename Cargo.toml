@@ -41,7 +41,7 @@ sha2 = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 base64 = "0.23"
 jsonwebtoken = { version = "11.1", features = ["rust_crypto"] }
-rcgen = "0.13"
+rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 hyper = { version = "1.6", features = ["full"] }
