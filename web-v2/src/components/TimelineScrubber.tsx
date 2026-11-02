@@ -354,6 +354,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         if (!origin.moved) {
           const ts = clampTsToDay(clientXToTs(e.clientX));
           onSeek(dayBounds.isToday && ts >= nowSec - 3 ? null : ts);
+          if (rangeMode && (rangeEnd < winStart || rangeStart > winEnd)) {
+            setRangeStart(ts);
+            setRangeEnd(Math.min(dayBounds.dayEnd, ts + 60));
+            setReadyDownloadUrl(null);
+          }
         } else {
           const el = trackRef.current;
           const width = el?.clientWidth || 800;
@@ -822,9 +827,6 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       const res = await onExportRange(camera, rangeStart, rangeEnd, label);
       if (res && res.videoUrl) {
         setReadyDownloadUrl(res.videoUrl);
-      } else {
-        const id = `${camera}_${Math.floor(rangeStart)}_${Math.floor(rangeEnd)}`;
-        setReadyDownloadUrl(`/exports/${id}.mp4`);
       }
     } finally {
       setExportBusy(false);
@@ -1475,8 +1477,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
                 title="Set IN point to current playhead"
                 onClick={() => {
-                  const anchor = currentTs ?? winEnd - 30;
-                  setRangeStart(Math.min(anchor, rangeEnd - 5));
+                  const anchor = Math.round(effectivePlayheadTs ?? winEnd - 60);
+                  setRangeStart(anchor);
+                  if (rangeEnd <= anchor + 5 || rangeEnd - anchor > 600) {
+                    setRangeEnd(Math.min(dayBounds.dayEnd, anchor + 60));
+                  }
+                  setReadyDownloadUrl(null);
                 }}
               >
                 [ Set IN
@@ -1523,8 +1529,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
                 title="Set OUT point to current playhead"
                 onClick={() => {
-                  const anchor = currentTs ?? winEnd;
-                  setRangeEnd(Math.max(anchor, rangeStart + 5));
+                  const anchor = Math.round(effectivePlayheadTs ?? winEnd);
+                  setRangeEnd(anchor);
+                  if (rangeStart >= anchor - 5 || anchor - rangeStart > 600) {
+                    setRangeStart(Math.max(dayBounds.dayStart, anchor - 60));
+                  }
+                  setReadyDownloadUrl(null);
                 }}
               >
                 Set OUT ]

@@ -815,6 +815,7 @@ async fn build_mp4_export_inner(
     std::fs::create_dir_all(&clips_dir)?;
 
     let out_file = exports_dir.join(format!("{export_id}.mp4"));
+    let tmp_out_file = exports_dir.join(format!(".{export_id}.tmp.mp4"));
     let thumb_file = clips_dir.join(format!("{export_id}.webp"));
     let list_file = std::env::temp_dir().join(format!("ninjanvr-export-{export_id}.txt"));
 
@@ -842,6 +843,7 @@ async fn build_mp4_export_inner(
     }
 
     std::fs::write(&list_file, &list_content)?;
+    let _ = std::fs::remove_file(&tmp_out_file);
 
     let trim_offset = first_seg_start
         .map(|s0| (start_time - s0).max(0.0))
@@ -849,42 +851,43 @@ async fn build_mp4_export_inner(
     let target_dur = (end_time - start_time).max(3.0);
 
     let ffmpeg_bin = resolve_ffmpeg_bin();
-    let status = Command::new(&ffmpeg_bin)
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-        ])
+    let mut cmd = Command::new(&ffmpeg_bin);
+    cmd.kill_on_drop(true);
+    cmd.args(["-y", "-hide_banner", "-loglevel", "error"]);
+    if trim_offset > 0.05 {
+        cmd.args(["-ss", &format!("{trim_offset:.2}")]);
+    }
+    let status = cmd
+        .args(["-f", "concat", "-safe", "0", "-i"])
         .arg(&list_file)
         .args([
-            "-ss",
-            &format!("{trim_offset:.2}"),
             "-t",
             &format!("{target_dur:.2}"),
+            "-fflags",
+            "+genpts+igndts",
+            "-avoid_negative_ts",
+            "make_zero",
             "-c",
             "copy",
             "-movflags",
             "+faststart",
         ])
-        .arg(&out_file)
+        .arg(&tmp_out_file)
         .status()
         .await;
 
     let _ = std::fs::remove_file(&list_file);
 
     if status.map(|s| !s.success()).unwrap_or(true)
-        || std::fs::metadata(&out_file)
+        || std::fs::metadata(&tmp_out_file)
             .map(|m| m.len() < 1024)
             .unwrap_or(true)
     {
-        std::fs::copy(&existing_paths[0], &out_file)?;
+        std::fs::copy(&existing_paths[0], &tmp_out_file)?;
     }
+
+    // Atomically publish completed MP4 only after +faststart rewrite has finished
+    std::fs::rename(&tmp_out_file, &out_file)?;
 
     // Extract a real video frame thumbnail as WebP (with RgbImage fallback)
     let thumb_status = Command::new(&ffmpeg_bin)
@@ -949,6 +952,86 @@ mod tests {
         assert!(!leaf_dir.exists());
         assert!(!root.join("2026-11-01").exists());
         assert!(root.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn build_mp4_export_atomically_publishes_mp4_and_clears_in_progress() {
+        let root = std::env::temp_dir().join(format!("ninjanvr-export-test-{}", random_suffix()));
+        let rec_dir = root.join("recordings/2026-11-01/12/front_door");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        let db_path = root.join("frigate.db");
+        let db = NinjaDatabase::open(&db_path).unwrap();
+
+        let seg1_disk = rec_dir.join("00.00.mp4");
+        let seg2_disk = rec_dir.join("00.10.mp4");
+        // Write valid 2KB synthetic segment payloads
+        let mut fake_mp4 = vec![0u8; 2048];
+        fake_mp4[0..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p']);
+        std::fs::write(&seg1_disk, &fake_mp4).unwrap();
+        std::fs::write(&seg2_disk, &fake_mp4).unwrap();
+
+        db.insert_recording(&RecordingRow {
+            id: "seg1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/frigate/recordings/2026-11-01/12/front_door/00.00.mp4".to_string(),
+            start_time: 1000.0,
+            end_time: 1010.0,
+            duration: 10.0,
+            motion: 5,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 0.002,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+        db.insert_recording(&RecordingRow {
+            id: "seg2".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/frigate/recordings/2026-11-01/12/front_door/00.10.mp4".to_string(),
+            start_time: 1010.0,
+            end_time: 1020.0,
+            duration: 10.0,
+            motion: 2,
+            objects: 0,
+            dbfs: 0,
+            segment_size: 0.002,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        let export_id = "front_door_1002_1018";
+        build_mp4_export(
+            &db,
+            &root,
+            export_id,
+            "front_door",
+            "Test Export Clip",
+            1002.0,
+            1018.0,
+        )
+        .await
+        .unwrap();
+
+        let final_mp4 = root.join("exports").join(format!("{export_id}.mp4"));
+        let staging_mp4 = root.join("exports").join(format!(".{export_id}.tmp.mp4"));
+        let thumb_webp = root.join("clips").join(format!("{export_id}.webp"));
+
+        assert!(final_mp4.exists(), "final exported MP4 must exist");
+        assert!(
+            !staging_mp4.exists(),
+            "staging .tmp.mp4 must be removed after atomic rename"
+        );
+        assert!(thumb_webp.exists(), "export thumbnail WebP must exist");
+
+        let exports = db.query_exports().unwrap();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0]["id"], export_id);
+        assert_eq!(exports[0]["in_progress"], false);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

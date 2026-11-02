@@ -414,18 +414,24 @@ export const App: React.FC = () => {
         credentials: "include",
         body: JSON.stringify({ name: label || `${camera} ${formatTs(s)}-${formatTs(e)}` }),
       });
-      if (res.ok) {
-        const data = await res.json().catch(() => ({}));
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success !== false) {
         notify(`MP4 clip ready for ${camera} (${formatTs(s)} - ${formatTs(e)})`);
         const listRes = await fetch("/api/exports", { credentials: "include" });
         if (listRes.ok) {
           const arr: ExportItem[] = await listRes.json();
           setExportsList(arr);
+          const created = arr.find((x) => x.id === data.export_id);
+          if (created) {
+            setActiveExportPreview(created);
+          }
         }
         return {
           exportId: data.export_id,
           videoUrl: data.video_url || `/exports/${camera}_${s}_${e}.mp4`,
         };
+      } else {
+        notify(data.message || `Export failed (${res.status})`);
       }
     },
     [notify]

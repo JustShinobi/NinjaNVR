@@ -538,15 +538,17 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .nest_service("/assets", ServeDir::new(web_dir.join("assets")))
         .nest_service("/locales", ServeDir::new(web_dir.join("locales")))
         .nest_service("/assets-v2", ServeDir::new(web_v2_dir.join("assets-v2")))
+        .fallback(get(serve_spa_fallback))
+        .layer(CompressionLayer::new())
+        // Binary media directories are mounted outside CompressionLayer so MP4/WebP files
+        // always preserve exact Content-Length and Accept-Ranges: bytes without Brotli/Gzip chunking.
         .nest_service("/clips", ServeDir::new(clips_dir))
         .nest_service("/recordings", ServeDir::new(recordings_dir))
         .nest_service("/exports", ServeDir::new(exports_dir))
-        .fallback(get(serve_spa_fallback))
         .layer(axum::middleware::from_fn_with_state(
             (state.clone(), enforce_auth),
             auth_gate_middleware,
         ))
-        .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -1829,8 +1831,8 @@ async fn api_export_create(
     let db_clone = state.db.clone();
     let media_dir_clone = state.media_dir.clone();
     let id_clone = id.clone();
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
+    let export_res = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
         build_mp4_export(
             &db_clone,
             &media_dir_clone,
@@ -1843,13 +1845,37 @@ async fn api_export_create(
     )
     .await;
 
-    Json(json!({
-        "success": true,
-        "export_id": id,
-        "video_url": format!("/exports/{id}.mp4"),
-        "thumb_url": format!("/clips/{id}.webp")
-    }))
-    .into_response()
+    match export_res {
+        Ok(Ok(())) => Json(json!({
+            "success": true,
+            "export_id": id,
+            "video_url": format!("/exports/{id}.mp4"),
+            "thumb_url": format!("/clips/{id}.webp")
+        }))
+        .into_response(),
+        Ok(Err(err)) => {
+            let _ = state.db.delete_export(&id);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "message": format!("Export failed: {err}")
+                })),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            let _ = state.db.delete_export(&id);
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(json!({
+                    "success": false,
+                    "message": "Export timed out while remuxing MP4 segments"
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2602,7 +2628,53 @@ version: 0.18-0
                 .contains("ninjanvr_ui=v2")
         );
 
-        // 5. Test enforce_auth=true router blocks unauthenticated /api/config with 401
+        // 5. Test /exports/*.mp4 is served uncompressed with Accept-Ranges and exact Content-Length
+        let exports_dir = tmp_dir.join("exports");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        let dummy_mp4 = vec![0x42u8; 4096];
+        std::fs::write(exports_dir.join("sample.mp4"), &dummy_mp4).unwrap();
+
+        let resp_mp4 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/exports/sample.mp4")
+                    .header(header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_mp4.status(), StatusCode::OK);
+        assert!(
+            resp_mp4.headers().get(header::CONTENT_ENCODING).is_none(),
+            "MP4 exports must not be Brotli/Gzip compressed by CompressionLayer"
+        );
+        assert_eq!(
+            resp_mp4
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("4096")
+        );
+
+        // 6. Test POST /api/export with no segments returns 400 and cleans up in_progress row
+        let resp_exp_err = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export/front_door/start/1000/end/1060")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"missing_clip"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_exp_err.status(), StatusCode::BAD_REQUEST);
+        assert!(state.db.query_exports().unwrap().is_empty());
+
+        // 7. Test enforce_auth=true router blocks unauthenticated /api/config with 401
         let auth_app = build_router_with_auth(state, true);
         let resp = auth_app
             .clone()
