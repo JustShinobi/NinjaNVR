@@ -35,7 +35,7 @@ use ninjanvr_media::{
 use pipeline::{SharedCameraMetrics, VisionPipeline};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::sync::{RwLock, broadcast};
 use tokio_tungstenite::tungstenite::protocol::Message as TungMsg;
 use tower_http::compression::CompressionLayer;
@@ -388,6 +388,9 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/ui/version", get(api_ui_version))
         .route("/auth", get(api_auth_verify))
         .route("/auth/first_time_login", get(api_first_time_login))
+        .route("/auth/providers", get(api_auth_providers))
+        .route("/auth/oidc/login", get(api_auth_oidc_login))
+        .route("/auth/oidc/callback", get(api_auth_oidc_callback))
         .route("/login", post(api_login))
         .route("/logout", get(api_logout).post(api_logout))
         .route("/profile", get(api_profile).post(api_profile_set))
@@ -734,6 +737,9 @@ fn is_protected_path(path: &str) -> bool {
         "/api/login"
             | "/api/logout"
             | "/api/auth/first_time_login"
+            | "/api/auth/providers"
+            | "/api/auth/oidc/login"
+            | "/api/auth/oidc/callback"
             | "/api/ui/switch"
             | "/api/ui/version"
             | "/logout"
@@ -760,13 +766,10 @@ async fn auth_gate_middleware(
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     if enforce_auth && is_protected_path(&path) {
-        let (cookie_name, auth_enabled) = {
-            let cfg = state.config.read().await;
-            (cfg.auth.cookie_name.clone(), cfg.auth.enabled)
-        };
-        if auth_enabled {
+        let auth_cfg = state.config.read().await.auth.clone();
+        if auth_cfg.enabled {
             let Some((user, role)) =
-                extract_authenticated_user(&state, &jar, req.headers(), &cookie_name, true)
+                extract_authenticated_user_with_cfg(&state, &jar, req.headers(), &auth_cfg)
             else {
                 state.log_hub.push_nginx(&method, &path, 401);
                 return (
@@ -979,18 +982,454 @@ async fn api_first_time_login(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+async fn api_auth_providers(State(state): State<AppState>) -> Json<Value> {
+    let cfg = state.config.read().await;
+    let oidc = &cfg.auth.oidc;
+    let issuer = if !oidc.issuer_url.trim().is_empty() {
+        oidc.issuer_url.trim().to_string()
+    } else {
+        std::env::var("NINJANVR_OIDC_ISSUER_URL").unwrap_or_default()
+    };
+    let client_id = if !oidc.client_id.trim().is_empty() {
+        oidc.client_id.trim().to_string()
+    } else {
+        std::env::var("NINJANVR_OIDC_CLIENT_ID").unwrap_or_default()
+    };
+    let oidc_ready = oidc.enabled && !issuer.is_empty() && !client_id.is_empty();
+    Json(json!({
+        "enabled": cfg.auth.enabled,
+        "local_login_enabled": cfg.auth.local_login_enabled,
+        "oidc": {
+            "enabled": oidc_ready || oidc.enabled,
+            "provider_name": oidc.provider_name,
+            "auto_redirect": oidc.auto_redirect
+        },
+        "proxy": {
+            "enabled": cfg.auth.proxy.enabled,
+            "logout_url": cfg.auth.proxy.logout_url
+        }
+    }))
+}
+
+/// Checks whether `ip_str` matches a single CIDR (`"10.42.0.0/16"`, `"127.0.0.1/32"`) or bare IP (`"127.0.0.1"`).
+pub fn ip_matches_cidr(ip_str: &str, cidr_str: &str) -> bool {
+    use std::net::IpAddr;
+    let Ok(ip) = ip_str.trim().parse::<IpAddr>() else {
+        return false;
+    };
+    let cidr = cidr_str.trim();
+    if let Some((net_s, prefix_s)) = cidr.split_once('/') {
+        let Ok(net_ip) = net_s.trim().parse::<IpAddr>() else {
+            return false;
+        };
+        let Ok(prefix_len) = prefix_s.trim().parse::<u32>() else {
+            return false;
+        };
+        match (ip, net_ip) {
+            (IpAddr::V4(a), IpAddr::V4(b)) if prefix_len <= 32 => {
+                if prefix_len == 0 {
+                    return true;
+                }
+                let mask = !0u32 << (32 - prefix_len);
+                (u32::from(a) & mask) == (u32::from(b) & mask)
+            }
+            (IpAddr::V6(a), IpAddr::V6(b)) if prefix_len <= 128 => {
+                if prefix_len == 0 {
+                    return true;
+                }
+                let mask = !0u128 << (128 - prefix_len);
+                (u128::from(a) & mask) == (u128::from(b) & mask)
+            }
+            _ => false,
+        }
+    } else if let Ok(net_ip) = cidr.parse::<IpAddr>() {
+        ip == net_ip
+    } else {
+        false
+    }
+}
+
+pub fn ip_matches_trusted_proxies(ip_str: &str, cidrs: &[String]) -> bool {
+    cidrs.iter().any(|c| ip_matches_cidr(ip_str, c))
+}
+
+/// Resolves a NinjaNVR role (`"admin"`, `"operator"`, or `"viewer"`) from OIDC ID-token / UserInfo claims,
+/// supporting both Authelia array claims (`"groups": ["admins"]`) and Zitadel project role map claims
+/// (`"urn:zitadel:iam:org:project:roles": { "ninjanvr-admin": { ... } }`).
+pub fn resolve_oidc_role(claims: &Value, oidc_cfg: &ninjanvr_config::OidcAuthConfig) -> String {
+    let mut candidate_groups: Vec<String> = Vec::new();
+    let mut collect_from_val = |val: &Value| match val {
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    candidate_groups.push(s.trim().to_string());
+                }
+            }
+        }
+        Value::String(s) => {
+            for part in s.split([',', ' ']) {
+                let t = part.trim();
+                if !t.is_empty() {
+                    candidate_groups.push(t.to_string());
+                }
+            }
+        }
+        Value::Object(map) => {
+            for key in map.keys() {
+                candidate_groups.push(key.trim().to_string());
+            }
+        }
+        _ => {}
+    };
+
+    if let Some(v) = claims.get(&oidc_cfg.groups_claim) {
+        collect_from_val(v);
+    }
+    if oidc_cfg.groups_claim != "groups"
+        && let Some(v) = claims.get("groups")
+    {
+        collect_from_val(v);
+    }
+    if let Some(v) = claims.get("urn:zitadel:iam:org:project:roles") {
+        collect_from_val(v);
+    }
+    if let Some(v) = claims.get("roles") {
+        collect_from_val(v);
+    }
+
+    let matches_any = |targets: &[String]| -> bool {
+        targets.iter().any(|t| {
+            candidate_groups
+                .iter()
+                .any(|cg| cg.eq_ignore_ascii_case(t.trim()))
+        })
+    };
+
+    if matches_any(&oidc_cfg.role_mapping.admin) {
+        "admin".to_string()
+    } else if matches_any(&oidc_cfg.role_mapping.operator) {
+        "operator".to_string()
+    } else if matches_any(&oidc_cfg.role_mapping.viewer) {
+        "viewer".to_string()
+    } else {
+        let def = oidc_cfg.default_role.trim().to_ascii_lowercase();
+        if def == "admin" || def == "operator" {
+            def
+        } else {
+            "viewer".to_string()
+        }
+    }
+}
+
+fn generate_pkce_pair() -> (String, String, String) {
+    let mut verifier_bytes = [0u8; 32];
+    rand::fill(&mut verifier_bytes);
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
+    let challenge_hash = Sha256::digest(verifier.as_bytes());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge_hash);
+    let mut state_bytes = [0u8; 16];
+    rand::fill(&mut state_bytes);
+    let state_str: String = state_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    (state_str, verifier, challenge)
+}
+
+async fn api_auth_oidc_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    let cfg = state.config.read().await;
+    let oidc = &cfg.auth.oidc;
+    let issuer = if !oidc.issuer_url.trim().is_empty() {
+        oidc.issuer_url.trim().trim_end_matches('/').to_string()
+    } else {
+        std::env::var("NINJANVR_OIDC_ISSUER_URL")
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let client_id = if !oidc.client_id.trim().is_empty() {
+        oidc.client_id.trim().to_string()
+    } else {
+        std::env::var("NINJANVR_OIDC_CLIENT_ID").unwrap_or_default()
+    };
+    if !oidc.enabled || issuer.is_empty() || client_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "OIDC SSO is not enabled or missing issuer_url/client_id" })),
+        )
+            .into_response();
+    }
+
+    let (state_str, verifier, challenge) = generate_pkce_pair();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost:5000");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let redirect_uri = format!("{proto}://{host}/api/auth/oidc/callback");
+
+    // Discover authorization_endpoint or fall back to standard /authorize
+    let mut auth_endpoint = format!("{issuer}/authorize");
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        && let Ok(resp) = client
+            .get(format!("{issuer}/.well-known/openid-configuration"))
+            .send()
+            .await
+        && let Ok(disc) = resp.json::<Value>().await
+        && let Some(ep) = disc.get("authorization_endpoint").and_then(|v| v.as_str())
+    {
+        auth_endpoint = ep.to_string();
+    }
+
+    let scope_str = if oidc.scopes.is_empty() {
+        "openid profile email groups".to_string()
+    } else {
+        oidc.scopes.join(" ")
+    };
+
+    let redirect_target = format!(
+        "{auth_endpoint}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={state_str}&code_challenge={challenge}&code_challenge_method=S256",
+        urlencoding_simple(&client_id),
+        urlencoding_simple(&redirect_uri),
+        urlencoding_simple(&scope_str),
+    );
+
+    let mut pkce_cookie = Cookie::new("ninjanvr_oidc_pkce", format!("{state_str}:{verifier}"));
+    pkce_cookie.set_path("/");
+    pkce_cookie.set_http_only(true);
+    pkce_cookie.set_same_site(SameSite::Lax);
+
+    (jar.add(pkce_cookie), Redirect::to(&redirect_target)).into_response()
+}
+
+fn urlencoding_simple(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct OidcCallbackQuery {
+    pub code: Option<String>,
+    pub state: Option<String>,
+}
+
+async fn api_auth_oidc_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Query(q): Query<OidcCallbackQuery>,
+) -> Response {
+    let Some(code) = q.code.as_deref().filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Missing authorization code" })),
+        )
+            .into_response();
+    };
+    let Some(returned_state) = q.state.as_deref().filter(|s| !s.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Missing OIDC state parameter" })),
+        )
+            .into_response();
+    };
+    let Some(pkce_cookie) = jar.get("ninjanvr_oidc_pkce") else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Missing OIDC PKCE state cookie" })),
+        )
+            .into_response();
+    };
+    let Some((expected_state, code_verifier)) = pkce_cookie.value().split_once(':') else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Malformed OIDC PKCE cookie" })),
+        )
+            .into_response();
+    };
+    if expected_state != returned_state {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "OIDC state mismatch" })),
+        )
+            .into_response();
+    }
+
+    let (oidc_cfg, cookie_name, cookie_secure, session_len) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.auth.oidc.clone(),
+            cfg.auth.cookie_name.clone(),
+            cfg.auth.cookie_secure,
+            cfg.auth.session_length,
+        )
+    };
+
+    let issuer = if !oidc_cfg.issuer_url.trim().is_empty() {
+        oidc_cfg.issuer_url.trim().trim_end_matches('/').to_string()
+    } else {
+        std::env::var("NINJANVR_OIDC_ISSUER_URL")
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches('/')
+            .to_string()
+    };
+    let client_id = if !oidc_cfg.client_id.trim().is_empty() {
+        oidc_cfg.client_id.trim().to_string()
+    } else {
+        std::env::var("NINJANVR_OIDC_CLIENT_ID").unwrap_or_default()
+    };
+    let client_secret = std::env::var(&oidc_cfg.client_secret_env).unwrap_or_default();
+
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost:5000");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let redirect_uri = format!("{proto}://{host}/api/auth/oidc/callback");
+
+    let mut token_endpoint = format!("{issuer}/oauth/v2/token");
+    let mut userinfo_endpoint = format!("{issuer}/oidc/v1/userinfo");
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        if let Ok(resp) = client
+            .get(format!("{issuer}/.well-known/openid-configuration"))
+            .send()
+            .await
+            && let Ok(disc) = resp.json::<Value>().await
+        {
+            if let Some(ep) = disc.get("token_endpoint").and_then(|v| v.as_str()) {
+                token_endpoint = ep.to_string();
+            }
+            if let Some(uep) = disc.get("userinfo_endpoint").and_then(|v| v.as_str()) {
+                userinfo_endpoint = uep.to_string();
+            }
+        }
+
+        let form_body = format!(
+            "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&client_secret={}&code_verifier={}",
+            urlencoding_simple(code),
+            urlencoding_simple(&redirect_uri),
+            urlencoding_simple(&client_id),
+            urlencoding_simple(&client_secret),
+            urlencoding_simple(code_verifier)
+        );
+        if let Ok(tok_resp) = client
+            .post(&token_endpoint)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(form_body)
+            .send()
+            .await
+            && let Ok(tok_json) = tok_resp.json::<Value>().await
+        {
+            let mut merged_claims = json!({});
+            if let Some(id_token) = tok_json.get("id_token").and_then(|v| v.as_str()) {
+                let parts: Vec<&str> = id_token.split('.').collect();
+                if parts.len() >= 2
+                    && let Ok(payload_bytes) =
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1])
+                    && let Ok(claims_json) = serde_json::from_slice::<Value>(&payload_bytes)
+                {
+                    merged_claims = claims_json;
+                }
+            }
+            if let Some(access_token) = tok_json.get("access_token").and_then(|v| v.as_str())
+                && let Ok(ui_resp) = client
+                    .get(&userinfo_endpoint)
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                    .send()
+                    .await
+                && let Ok(Value::Object(ui_map)) = ui_resp.json::<Value>().await
+                && let Some(obj) = merged_claims.as_object_mut()
+            {
+                for (k, v) in ui_map {
+                    obj.entry(k).or_insert(v);
+                }
+            }
+            if merged_claims.as_object().is_some_and(|m| !m.is_empty()) {
+                let username = merged_claims
+                    .get(&oidc_cfg.username_claim)
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        merged_claims
+                            .get("preferred_username")
+                            .and_then(|v| v.as_str())
+                    })
+                    .or_else(|| merged_claims.get("email").and_then(|v| v.as_str()))
+                    .or_else(|| merged_claims.get("sub").and_then(|v| v.as_str()))
+                    .unwrap_or("oidc_user")
+                    .to_string();
+                let role = resolve_oidc_role(&merged_claims, &oidc_cfg);
+                let now = unix_now();
+                let jwt_claims = JwtClaims {
+                    sub: username,
+                    role,
+                    allowed_cameras: Some("*".to_string()),
+                    iat: now,
+                    exp: now + session_len,
+                };
+                let session_token = jsonwebtoken::encode(
+                    &Header::new(Algorithm::HS256),
+                    &jwt_claims,
+                    &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+                )
+                .unwrap_or_default();
+                let mut session_cookie = Cookie::new(cookie_name, session_token);
+                session_cookie.set_path("/");
+                session_cookie.set_http_only(true);
+                session_cookie.set_secure(cookie_secure);
+                session_cookie.set_same_site(SameSite::Lax);
+
+                let mut clear_pkce = Cookie::from("ninjanvr_oidc_pkce");
+                clear_pkce.set_path("/");
+                return (
+                    jar.remove(clear_pkce).add(session_cookie),
+                    Redirect::to("/"),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({ "message": "OIDC token exchange failed" })),
+    )
+        .into_response()
+}
+
 async fn api_login(
     State(state): State<AppState>,
     jar: CookieJar,
     Json(body): Json<LoginBody>,
 ) -> impl IntoResponse {
-    let (cookie_name, cookie_secure, session_len, auth_enabled) = {
+    let (cookie_name, cookie_secure, session_len, auth_enabled, local_login_enabled) = {
         let cfg = state.config.read().await;
         (
             cfg.auth.cookie_name.clone(),
             cfg.auth.cookie_secure,
             cfg.auth.session_length,
             cfg.auth.enabled,
+            cfg.auth.local_login_enabled,
         )
     };
 
@@ -1000,6 +1439,17 @@ async fn api_login(
             (
                 StatusCode::NOT_FOUND,
                 Json(json!({ "message": "Authentication is disabled" })),
+            )
+                .into_response(),
+        );
+    }
+
+    if !local_login_enabled {
+        return (
+            jar,
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "message": "Local password login is disabled; use OIDC SSO" })),
             )
                 .into_response(),
         );
@@ -1073,16 +1523,76 @@ fn extract_authenticated_user(
     if !auth_enabled {
         return Some(("admin".to_string(), "admin".to_string()));
     }
+    if let Ok(cfg) = state.config.try_read() {
+        return extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth);
+    }
+    let fallback = ninjanvr_config::AuthConfig {
+        cookie_name: cookie_name.to_string(),
+        enabled: auth_enabled,
+        ..Default::default()
+    };
+    extract_authenticated_user_with_cfg(state, jar, headers, &fallback)
+}
 
-    if let Some(remote_user) = headers.get("remote-user").and_then(|v| v.to_str().ok())
-        && !remote_user.is_empty()
-    {
-        let role = headers
-            .get("remote-role")
+fn extract_authenticated_user_with_cfg(
+    state: &AppState,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+    auth_cfg: &ninjanvr_config::AuthConfig,
+) -> Option<(String, String)> {
+    if !auth_cfg.enabled {
+        return Some(("admin".to_string(), "admin".to_string()));
+    }
+
+    // Hardened Trusted-Proxy ForwardAuth: only trust Remote-User / Remote-Groups headers
+    // when proxy auth is explicitly enabled AND the peer IP matches trusted_proxies CIDRs.
+    if auth_cfg.proxy.enabled {
+        let peer_ip = headers
+            .get("x-peer-ip")
+            .or_else(|| headers.get("x-real-ip"))
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("admin")
-            .to_string();
-        return Some((remote_user.to_string(), role));
+            .or_else(|| {
+                headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|xff| xff.split(',').next_back())
+            })
+            .map(|s| s.trim());
+
+        let trusted_cidrs = if !auth_cfg.proxy.trusted_proxies.is_empty() {
+            &auth_cfg.proxy.trusted_proxies
+        } else {
+            &auth_cfg.trusted_proxies
+        };
+
+        if let Some(ip) = peer_ip
+            && ip_matches_trusted_proxies(ip, trusted_cidrs)
+        {
+            let user_hdr_name = auth_cfg.proxy.user_header.to_ascii_lowercase();
+            if let Some(remote_user) = headers
+                .get(user_hdr_name.as_str())
+                .or_else(|| headers.get("remote-user"))
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                let groups_hdr_name = auth_cfg.proxy.groups_header.to_ascii_lowercase();
+                let role = if let Some(explicit_role) =
+                    headers.get("remote-role").and_then(|v| v.to_str().ok())
+                {
+                    explicit_role.trim().to_string()
+                } else if let Some(groups_str) = headers
+                    .get(groups_hdr_name.as_str())
+                    .or_else(|| headers.get("remote-groups"))
+                    .and_then(|v| v.to_str().ok())
+                {
+                    resolve_oidc_role(&json!({ "groups": groups_str }), &auth_cfg.oidc)
+                } else {
+                    "viewer".to_string()
+                };
+                return Some((remote_user.to_string(), role));
+            }
+        }
     }
 
     let token_str = headers
@@ -1090,7 +1600,10 @@ fn extract_authenticated_user(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string())
-        .or_else(|| jar.get(cookie_name).map(|c| c.value().to_string()))?;
+        .or_else(|| {
+            jar.get(&auth_cfg.cookie_name)
+                .map(|c| c.value().to_string())
+        })?;
 
     if token_str.starts_with("nnvr_") {
         if let Ok(Some((token_name, scope))) =
@@ -5044,6 +5557,76 @@ version: 0.18-0
             serde_json::from_slice(&to_bytes(resp_mcp_call.into_body(), 16384).await.unwrap())
                 .unwrap();
         assert!(mcp_call_json["result"]["structuredContent"]["digest"].is_object());
+
+        // 20. Test OIDC role claim mapping (Authelia array & Zitadel object map) and Trusted-Proxy CIDR verification
+        let oidc_cfg = ninjanvr_config::OidcAuthConfig::default();
+        assert_eq!(
+            resolve_oidc_role(&json!({ "groups": ["users", "admins"] }), &oidc_cfg),
+            "admin"
+        );
+        assert_eq!(
+            resolve_oidc_role(
+                &json!({
+                    "urn:zitadel:iam:org:project:roles": {
+                        "ninjanvr-operator": { "12345": "org" }
+                    }
+                }),
+                &oidc_cfg
+            ),
+            "operator"
+        );
+        assert_eq!(
+            resolve_oidc_role(
+                &json!({
+                    "urn:zitadel:iam:org:project:roles": {
+                        "ninjanvr-viewer": { "12345": "org" }
+                    }
+                }),
+                &oidc_cfg
+            ),
+            "viewer"
+        );
+        assert!(ip_matches_trusted_proxies(
+            "10.42.5.19",
+            &["127.0.0.1/32".to_string(), "10.42.0.0/16".to_string()]
+        ));
+        assert!(!ip_matches_trusted_proxies(
+            "203.0.113.99",
+            &["127.0.0.1/32".to_string(), "10.42.0.0/16".to_string()]
+        ));
+
+        // Spoofed Remote-User header from untrusted IP (or when proxy.enabled == false) is strictly rejected (401)
+        let resp_spoofed = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .header("Remote-User", "admin")
+                    .header("x-real-ip", "203.0.113.99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_spoofed.status(), StatusCode::UNAUTHORIZED);
+
+        // Public /api/auth/providers endpoint works without authentication
+        let resp_providers = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_providers.status(), StatusCode::OK);
+        let prov_json: Value =
+            serde_json::from_slice(&to_bytes(resp_providers.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(prov_json["local_login_enabled"], true);
+        assert!(prov_json["oidc"].is_object());
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

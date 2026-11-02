@@ -1492,6 +1492,26 @@ export const CommsAuthUsersSection: React.FC<{
             </button>
           </div>
         </div>
+
+        <div
+          style={{
+            marginTop: 18,
+            paddingTop: 14,
+            borderTop: "1px solid var(--border-hairline)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+          }}
+        >
+          <strong className="mono" style={{ fontSize: 12, color: "var(--text-primary)" }}>
+            OIDC SSO (Authelia / Zitadel) & Trusted-Proxy ForwardAuth
+          </strong>
+          <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+            Configure <code>auth.oidc</code> (Authorization Code + PKCE, Zitadel project role mapping) and{" "}
+            <code>auth.proxy.trusted_proxies</code> CIDRs in Config Studio. Plaintext OIDC client secrets are read
+            exclusively from environment variable <code>NINJANVR_OIDC_CLIENT_SECRET</code>.
+          </span>
+        </div>
       </div>
     </div>
   );

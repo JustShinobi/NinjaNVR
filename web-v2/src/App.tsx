@@ -44,6 +44,10 @@ export const App: React.FC = () => {
   const [, setUsername] = useState("admin");
   const [loginUser, setLoginUser] = useState("admin");
   const [userRole, setUserRole] = useState<string>("admin");
+  const [authProviders, setAuthProviders] = useState<{
+    local_login_enabled: boolean;
+    oidc?: { enabled: boolean; provider_name: string; auto_redirect: boolean };
+  }>({ local_login_enabled: true });
   const [loginPass, setLoginPass] = useState("");
   const [loginError, setLoginError] = useState<string | null>(null);
   const [loginBusy, setLoginBusy] = useState(false);
@@ -225,6 +229,24 @@ export const App: React.FC = () => {
     setStatsHistory,
     setSecurityProfile,
   ]);
+
+  useEffect(() => {
+    if (!authNeeded) return;
+    fetch("/api/auth/providers", { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data && typeof data === "object") {
+          setAuthProviders({
+            local_login_enabled: data.local_login_enabled !== false,
+            oidc: data.oidc,
+          });
+          if (data.oidc?.enabled && data.oidc?.auto_redirect) {
+            window.location.href = "/api/auth/oidc/login";
+          }
+        }
+      })
+      .catch(() => {});
+  }, [authNeeded]);
 
   useEffect(() => {
     fetchCoreData();
@@ -735,10 +757,27 @@ export const App: React.FC = () => {
             type="submit"
             className="nvr-btn primary"
             style={{ height: 34 }}
-            disabled={loginBusy}
+            disabled={loginBusy || !authProviders.local_login_enabled}
           >
             {loginBusy ? t.auth.signingIn : t.auth.signIn}
           </button>
+          {authProviders.oidc?.enabled && (
+            <a
+              href="/api/auth/oidc/login"
+              className="nvr-btn mono"
+              style={{
+                height: 34,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                textDecoration: "none",
+                border: "1px solid var(--signal-accent)",
+                color: "var(--signal-accent-text)",
+              }}
+            >
+              Sign in with {authProviders.oidc.provider_name || "SSO"} (OIDC)
+            </a>
+          )}
           <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 6 }}>
             <a
               href="/api/ui/switch?target=v1"

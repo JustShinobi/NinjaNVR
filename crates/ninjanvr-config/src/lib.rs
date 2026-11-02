@@ -142,9 +142,145 @@ impl Default for MqttConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcRoleMappingConfig {
+    #[serde(default = "default_oidc_admin_groups")]
+    pub admin: Vec<String>,
+    #[serde(default = "default_oidc_operator_groups")]
+    pub operator: Vec<String>,
+    #[serde(default = "default_oidc_viewer_groups")]
+    pub viewer: Vec<String>,
+}
+
+fn default_oidc_admin_groups() -> Vec<String> {
+    vec!["admins".to_string(), "ninjanvr-admin".to_string()]
+}
+fn default_oidc_operator_groups() -> Vec<String> {
+    vec!["operators".to_string(), "ninjanvr-operator".to_string()]
+}
+fn default_oidc_viewer_groups() -> Vec<String> {
+    vec!["users".to_string(), "ninjanvr-viewer".to_string()]
+}
+
+impl Default for OidcRoleMappingConfig {
+    fn default() -> Self {
+        Self {
+            admin: default_oidc_admin_groups(),
+            operator: default_oidc_operator_groups(),
+            viewer: default_oidc_viewer_groups(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_oidc_provider_name")]
+    pub provider_name: String,
+    #[serde(default)]
+    pub issuer_url: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default = "default_oidc_secret_env")]
+    pub client_secret_env: String,
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub auto_redirect: bool,
+    #[serde(default = "default_oidc_username_claim")]
+    pub username_claim: String,
+    #[serde(default = "default_oidc_groups_claim")]
+    pub groups_claim: String,
+    #[serde(default)]
+    pub role_mapping: OidcRoleMappingConfig,
+    #[serde(default = "default_oidc_default_role")]
+    pub default_role: String,
+}
+
+fn default_oidc_provider_name() -> String {
+    "SSO".to_string()
+}
+fn default_oidc_secret_env() -> String {
+    "NINJANVR_OIDC_CLIENT_SECRET".to_string()
+}
+fn default_oidc_scopes() -> Vec<String> {
+    vec![
+        "openid".to_string(),
+        "profile".to_string(),
+        "email".to_string(),
+        "groups".to_string(),
+    ]
+}
+fn default_oidc_username_claim() -> String {
+    "preferred_username".to_string()
+}
+fn default_oidc_groups_claim() -> String {
+    "groups".to_string()
+}
+fn default_oidc_default_role() -> String {
+    "viewer".to_string()
+}
+
+impl Default for OidcAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider_name: default_oidc_provider_name(),
+            issuer_url: String::new(),
+            client_id: String::new(),
+            client_secret_env: default_oidc_secret_env(),
+            scopes: default_oidc_scopes(),
+            auto_redirect: false,
+            username_claim: default_oidc_username_claim(),
+            groups_claim: default_oidc_groups_claim(),
+            role_mapping: OidcRoleMappingConfig::default(),
+            default_role: default_oidc_default_role(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_trusted_proxies")]
+    pub trusted_proxies: Vec<String>,
+    #[serde(default = "default_proxy_user_header")]
+    pub user_header: String,
+    #[serde(default = "default_proxy_groups_header")]
+    pub groups_header: String,
+    #[serde(default)]
+    pub logout_url: String,
+}
+
+fn default_trusted_proxies() -> Vec<String> {
+    vec!["127.0.0.1/32".to_string(), "::1/128".to_string()]
+}
+fn default_proxy_user_header() -> String {
+    "Remote-User".to_string()
+}
+fn default_proxy_groups_header() -> String {
+    "Remote-Groups".to_string()
+}
+
+impl Default for ProxyAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            trusted_proxies: default_trusted_proxies(),
+            user_header: default_proxy_user_header(),
+            groups_header: default_proxy_groups_header(),
+            logout_url: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub local_login_enabled: bool,
     #[serde(default)]
     pub reset_admin_password: bool,
     #[serde(default = "default_cookie_name")]
@@ -161,6 +297,10 @@ pub struct AuthConfig {
     pub trusted_proxies: Vec<String>,
     #[serde(default)]
     pub admin_first_time_login: bool,
+    #[serde(default)]
+    pub oidc: OidcAuthConfig,
+    #[serde(default)]
+    pub proxy: ProxyAuthConfig,
 }
 
 fn default_cookie_name() -> String {
@@ -180,6 +320,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            local_login_enabled: true,
             reset_admin_password: false,
             cookie_name: default_cookie_name(),
             cookie_secure: false,
@@ -188,6 +329,8 @@ impl Default for AuthConfig {
             hash_iterations: default_hash_iterations(),
             trusted_proxies: Vec::new(),
             admin_first_time_login: false,
+            oidc: OidcAuthConfig::default(),
+            proxy: ProxyAuthConfig::default(),
         }
     }
 }
@@ -1469,6 +1612,7 @@ impl NinjaConfig {
             "logger": { "default": "info", "logs": {} },
             "auth": {
                 "enabled": self.auth.enabled,
+                "local_login_enabled": self.auth.local_login_enabled,
                 "reset_admin_password": self.auth.reset_admin_password,
                 "cookie_name": self.auth.cookie_name,
                 "cookie_secure": self.auth.cookie_secure,
@@ -1480,7 +1624,21 @@ impl NinjaConfig {
                     "admin": [],
                     "viewer": []
                 },
-                "admin_first_time_login": self.auth.admin_first_time_login
+                "admin_first_time_login": self.auth.admin_first_time_login,
+                "oidc": {
+                    "enabled": self.auth.oidc.enabled,
+                    "provider_name": self.auth.oidc.provider_name,
+                    "issuer_url": self.auth.oidc.issuer_url,
+                    "client_id": self.auth.oidc.client_id,
+                    "client_secret_env": self.auth.oidc.client_secret_env,
+                    "scopes": self.auth.oidc.scopes,
+                    "auto_redirect": self.auth.oidc.auto_redirect,
+                    "username_claim": self.auth.oidc.username_claim,
+                    "groups_claim": self.auth.oidc.groups_claim,
+                    "role_mapping": self.auth.oidc.role_mapping,
+                    "default_role": self.auth.oidc.default_role
+                },
+                "proxy": self.auth.proxy
             },
             "database": {
                 "path": self.database.path
