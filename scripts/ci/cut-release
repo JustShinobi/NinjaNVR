@@ -66,15 +66,23 @@ def collect_commits(rev_range: str) -> list[tuple[str, str]]:
 def compute_next_stable_version(
     major: int, minor: int, patch: int, commits: list[tuple[str, str]]
 ) -> str:
-    has_major = any("[major]" in s.lower() or "BREAKING CHANGE" in s for _, s in commits)
-    has_breaking_bang = any(re.match(r"^[a-z]+(\([^)]+\))?!:", s) for _, s in commits)
-    has_minor = any("[minor]" in s.lower() for _, s in commits)
-
-    if has_major or has_breaking_bang:
-        return f"{major + 1}.0.0"
-    if has_minor or (major >= 1 and any(s.startswith("feat") for _, s in commits)):
-        return f"{major}.{minor + 1}.0"
-    return f"{major}.{minor}.{patch + 1}"
+    """
+    Cumulative Decimal SemVer by feat/fix/perf (0.9.9 -> 1.0.0, 1.0.9 -> 1.1.0):
+    Each feat/fix/perf commit since the last stable release increments the decimal
+    version by +0.0.1 (minimum +1 step when a release contains only chore/docs/ci).
+    """
+    value_commits = [
+        (sha, s)
+        for sha, s in commits
+        if re.match(r"^(feat|fix|perf)(\([^)]+\))?!?\s*:", s)
+    ]
+    steps = max(1, len(value_commits))
+    base_val = (major * 100) + (minor * 10) + patch
+    next_val = base_val + steps
+    next_major = next_val // 100
+    next_minor = (next_val % 100) // 10
+    next_patch = next_val % 10
+    return f"{next_major}.{next_minor}.{next_patch}"
 
 
 def format_release_notes(commits: list[tuple[str, str]]) -> tuple[list[str], str]:
