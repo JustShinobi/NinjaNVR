@@ -36,6 +36,7 @@ interface TimelineScrubberProps {
     label: string
   ) => Promise<{ exportId?: string; videoUrl?: string } | void>;
   titlePrefix?: string;
+  defaultRangeMode?: boolean;
 }
 
 function formatHHMM(unixSec: number): string {
@@ -113,8 +114,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   onSeek,
   onExportRange,
   titlePrefix,
+  defaultRangeMode = false,
 }) => {
   const trackRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [trackWidth, setTrackWidth] = useState<number>(800);
   const [zoomMin, setZoomMin] = useState<TimelineZoomMinutes>(60);
   const [nowSec, setNowSec] = useState<number>(() => Math.floor(Date.now() / 1000));
   // Explicit window end timestamp (null = locked to live `nowSec`)
@@ -137,9 +141,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   const [hoverX, setHoverX] = useState<number>(0);
 
   // Range Export Selector state (`[ IN ... OUT ]`)
-  const [rangeMode, setRangeMode] = useState<boolean>(false);
-  const [rangeStart, setRangeStart] = useState<number>(() => Math.floor(Date.now() / 1000) - 90);
-  const [rangeEnd, setRangeEnd] = useState<number>(() => Math.floor(Date.now() / 1000) - 30);
+  const [rangeMode, setRangeMode] = useState<boolean>(defaultRangeMode);
+  const [rangeStart, setRangeStart] = useState<number>(
+    () => (currentTs ?? Math.floor(Date.now() / 1000)) - 90
+  );
+  const [rangeEnd, setRangeEnd] = useState<number>(
+    () => (currentTs ?? Math.floor(Date.now() / 1000)) - 30
+  );
   const [clipLabel, setClipLabel] = useState<string>("");
   const [exportBusy, setExportBusy] = useState<boolean>(false);
   const [readyDownloadUrl, setReadyDownloadUrl] = useState<string | null>(null);
@@ -656,6 +664,77 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     0,
     Math.min(100, ((rangeEnd - winStart) / windowSpanSec) * 100)
   );
+
+  // Observe track width for crisp High-DPI Canvas rendering
+  useEffect(() => {
+    const el = trackRef.current;
+    if (!el) return;
+    setTrackWidth(el.clientWidth || 800);
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.contentRect.width > 0) {
+          setTrackWidth(Math.round(entry.contentRect.width));
+        }
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Draw recording segments, motion/object heatbars, and review pins onto High-DPI 2D Canvas
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const w = Math.max(100, trackWidth);
+    const h = 36;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    // 1. Vertical tick grid lines
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.06)";
+    ctx.lineWidth = 1;
+    for (const tk of ticks) {
+      const x = Math.round((tk.pct / 100) * w) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+
+    // 2. Continuous recording base bar & motion/object activity bars
+    for (const seg of windowSegments) {
+      if (seg.end_time < winStart || seg.start_time > winEnd) continue;
+      const x0 = Math.max(0, Math.min(w, ((seg.start_time - winStart) / windowSpanSec) * w));
+      const segW = Math.max(1.5, (seg.duration / windowSpanSec) * w);
+
+      // Continuous recording base lane (bottom 5px)
+      ctx.fillStyle = "rgba(16, 185, 129, 0.42)";
+      ctx.fillRect(x0, h - 5, segW, 5);
+
+      if (seg.objects > 0) {
+        ctx.fillStyle = "rgba(239, 68, 68, 0.72)";
+        ctx.fillRect(x0, h - 23, segW, 18);
+      } else if (seg.motion > 0) {
+        ctx.fillStyle = "rgba(245, 158, 11, 0.48)";
+        ctx.fillRect(x0, h - 15, segW, 10);
+      }
+    }
+
+    // 3. Review event markers along upper track lane (top: 4px, height: 6px)
+    for (const rev of visibleReviews) {
+      const x0 = Math.max(0, Math.min(w, ((rev.start_time - winStart) / windowSpanSec) * w));
+      const dur = Math.max(15, (rev.end_time || rev.start_time + 15) - rev.start_time);
+      const revW = Math.max(3, (dur / windowSpanSec) * w);
+      ctx.fillStyle = rev.severity === "alert" ? "#ef4444" : "#f59e0b";
+      ctx.fillRect(x0, 4, revW, 6);
+    }
+  }, [trackWidth, ticks, windowSegments, visibleReviews, winStart, winEnd, windowSpanSec]);
 
   const handleTriggerExport = async () => {
     setExportBusy(true);
@@ -1457,308 +1536,258 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       )}
 
       {/* =====================================================================
-          FINE TIMELINE TRACK WITH RULER, HEAT BARS, EVENT PINS & THUMB TOOLTIP
+          DEDICATED TIME RULER HEADER (ABOVE SEEK TRACK - ZERO OVERLAP)
          ===================================================================== */}
-      <div
-        ref={trackRef}
-        className="nvr-timeline-track"
-        title="Use mouse wheel to scrub time (Shift+Wheel = 10s fine step, Ctrl+Wheel = Zoom) · Drag to pan · Click/Tap to seek"
-        style={{
-          position: "relative",
-          height: 44,
-          background: "var(--bg-deep)",
-          border: "1px solid var(--border-strong)",
-          borderRadius: 3,
-          cursor: draggingTarget === "track" ? "grabbing" : "grab",
-          touchAction: "none",
-          overflow: "visible",
-        }}
-        onPointerMove={(e) => {
-          const rect = e.currentTarget.getBoundingClientRect();
-          setHoverX(e.clientX - rect.left);
-          if (draggingTarget !== "track") {
-            setHoverTs(clientXToTs(e.clientX));
-          }
-        }}
-        onPointerLeave={() => {
-          if (!draggingTarget) setHoverTs(null);
-        }}
-        onPointerDown={(e) => {
-          if ((e.target as HTMLElement).dataset.handle) return;
-          try {
-            e.currentTarget.setPointerCapture(e.pointerId);
-          } catch {
-            // ignore
-          }
-          dragOriginRef.current = {
-            startX: e.clientX,
-            startWinEnd: winEnd,
-            startPlayhead: currentTs ?? winEnd,
-            moved: false,
-          };
-          setDraggingTarget("track");
-        }}
-      >
-        {/* Inner clipped layer for bars */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
         <div
+          className="nvr-timeline-ruler"
           style={{
-            position: "absolute",
-            inset: 0,
-            overflow: "hidden",
-            borderRadius: 3,
+            position: "relative",
+            height: 16,
+            width: "100%",
             pointerEvents: "none",
+            overflow: "hidden",
           }}
         >
-          {/* 1. Time Ruler Ticks & Labels along top edge */}
-          {ticks.map((tk, i) => (
-            <div
-              key={i}
-              style={{
-                position: "absolute",
-                left: `${tk.pct}%`,
-                top: 0,
-                bottom: 0,
-                borderLeft: "1px solid rgba(255, 255, 255, 0.07)",
-              }}
-            >
+          {ticks.map((tk, i) => {
+            const isFirst = i === 0;
+            const isLast = i === ticks.length - 1;
+            return (
               <span
+                key={i}
                 className="mono"
                 style={{
                   position: "absolute",
-                  top: 2,
-                  left: 4,
+                  top: 0,
+                  left: isLast ? undefined : isFirst ? 2 : `${tk.pct}%`,
+                  right: isLast ? 2 : undefined,
+                  transform: !isFirst && !isLast ? "translateX(-50%)" : undefined,
                   fontSize: "var(--text-xs)",
+                  lineHeight: "16px",
                   color: "var(--text-muted)",
                   whiteSpace: "nowrap",
                 }}
               >
                 {tk.label}
               </span>
-            </div>
-          ))}
-
-          {/* 2. Continuous Recording Base Bar & Motion/Object Activity Bars */}
-          {windowSegments.map((seg) => {
-            if (seg.end_time < winStart || seg.start_time > winEnd) return null;
-            const leftPct = Math.max(
-              0,
-              Math.min(100, ((seg.start_time - winStart) / windowSpanSec) * 100)
-            );
-            const widthPct = Math.max(0.2, (seg.duration / windowSpanSec) * 100);
-            const hasObj = seg.objects > 0;
-            const hasMot = seg.motion > 0;
-            return (
-              <React.Fragment key={seg.id}>
-                <div
-                  style={{
-                    position: "absolute",
-                    left: `${leftPct}%`,
-                    width: `${widthPct}%`,
-                    bottom: 0,
-                    height: 6,
-                    background: "rgba(16, 185, 129, 0.38)",
-                  }}
-                />
-                {(hasMot || hasObj) && (
-                  <div
-                    style={{
-                      position: "absolute",
-                      left: `${leftPct}%`,
-                      width: `${widthPct}%`,
-                      bottom: 6,
-                      height: hasObj ? 20 : 11,
-                      background: hasObj
-                        ? "rgba(239, 68, 68, 0.65)"
-                        : "rgba(245, 158, 11, 0.45)",
-                    }}
-                  />
-                )}
-              </React.Fragment>
-            );
-          })}
-
-          {/* 3. Review Event Markers */}
-          {visibleReviews.map((rev) => {
-            const sPct = Math.max(
-              0,
-              Math.min(100, ((rev.start_time - winStart) / windowSpanSec) * 100)
-            );
-            const dur = Math.max(15, (rev.end_time || rev.start_time + 15) - rev.start_time);
-            const wPct = Math.max(0.4, (dur / windowSpanSec) * 100);
-            return (
-              <div
-                key={rev.id}
-                style={{
-                  position: "absolute",
-                  left: `${sPct}%`,
-                  width: `${wPct}%`,
-                  top: 16,
-                  height: 6,
-                  borderRadius: 2,
-                  background:
-                    rev.severity === "alert" ? "var(--signal-alert)" : "var(--signal-motion)",
-                }}
-              />
             );
           })}
         </div>
 
-        {/* 4. Visual Range Export Overlay (`[ IN ... OUT ]`) with Draggable Handles */}
-        {rangeMode && (
-          <div
+        {/* ===================================================================
+            HIGH-DPI CANVAS SEEK TRACK + RANGE CLIPPER + PLAYHEAD NEEDLE
+           =================================================================== */}
+        <div
+          ref={trackRef}
+          className="nvr-timeline-track"
+          title="Use mouse wheel to scrub time (Shift+Wheel = 10s fine step, Ctrl+Wheel = Zoom) · Drag to pan · Click/Tap to seek"
+          style={{
+            position: "relative",
+            height: 36,
+            background: "var(--bg-deep)",
+            border: "1px solid var(--border-strong)",
+            borderRadius: 3,
+            cursor: draggingTarget === "track" ? "grabbing" : "grab",
+            touchAction: "none",
+            overflow: "visible",
+          }}
+          onPointerMove={(e) => {
+            const rect = e.currentTarget.getBoundingClientRect();
+            setHoverX(e.clientX - rect.left);
+            if (draggingTarget !== "track") {
+              setHoverTs(clientXToTs(e.clientX));
+            }
+          }}
+          onPointerLeave={() => {
+            if (!draggingTarget) setHoverTs(null);
+          }}
+          onPointerDown={(e) => {
+            if ((e.target as HTMLElement).dataset.handle) return;
+            try {
+              e.currentTarget.setPointerCapture(e.pointerId);
+            } catch {
+              // ignore
+            }
+            dragOriginRef.current = {
+              startX: e.clientX,
+              startWinEnd: winEnd,
+              startPlayhead: currentTs ?? winEnd,
+              moved: false,
+            };
+            setDraggingTarget("track");
+          }}
+        >
+          {/* High-DPI 2D Canvas for recording segments, activity bars, and event markers */}
+          <canvas
+            ref={canvasRef}
             style={{
               position: "absolute",
-              left: `${rangeStartPct}%`,
-              width: `${Math.max(0.5, rangeEndPct - rangeStartPct)}%`,
-              top: 0,
-              bottom: 0,
-              background: "rgba(14, 165, 233, 0.22)",
-              borderTop: "2px solid var(--signal-accent-text)",
-              borderBottom: "2px solid var(--signal-accent-text)",
-              zIndex: 8,
-            }}
-          >
-            <div
-              data-handle="in"
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                setDraggingTarget("in");
-              }}
-              title="Drag IN handle to adjust export start time"
-              style={{
-                position: "absolute",
-                left: -8,
-                top: 0,
-                bottom: 0,
-                width: 16,
-                background: "var(--signal-accent)",
-                cursor: "ew-resize",
-                touchAction: "none",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                borderRadius: "2px 0 0 2px",
-              }}
-            >
-              <span
-                className="mono"
-                style={{ fontSize: 10, fontWeight: 800, color: "#000000", pointerEvents: "none" }}
-              >
-                IN
-              </span>
-            </div>
-
-            <div
-              data-handle="out"
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                setDraggingTarget("out");
-              }}
-              title="Drag OUT handle to adjust export end time"
-              style={{
-                position: "absolute",
-                right: -8,
-                top: 0,
-                bottom: 0,
-                width: 16,
-                background: "var(--signal-accent)",
-                cursor: "ew-resize",
-                touchAction: "none",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                borderRadius: "0 2px 2px 0",
-              }}
-            >
-              <span
-                className="mono"
-                style={{ fontSize: 10, fontWeight: 800, color: "#000000", pointerEvents: "none" }}
-              >
-                OUT
-              </span>
-            </div>
-          </div>
-        )}
-
-        {/* 5. Hover Scrub Crosshair + Floating Thumbnail & Timestamp Peeker */}
-        {hoverTs !== null && (
-          <>
-            <div
-              style={{
-                position: "absolute",
-                left: `${hoverX}px`,
-                top: 0,
-                bottom: 0,
-                width: 1,
-                background: "rgba(255, 255, 255, 0.55)",
-                pointerEvents: "none",
-                zIndex: 9,
-              }}
-            />
-            <div
-              className="mono"
-              style={{
-                position: "absolute",
-                left: `${Math.max(
-                  75,
-                  Math.min((trackRef.current?.clientWidth || 800) - 95, hoverX)
-                )}px`,
-                bottom: 48,
-                transform: "translateX(-50%)",
-                background: "var(--bg-panel)",
-                border: "1px solid var(--signal-accent)",
-                color: "var(--text-primary)",
-                padding: hoveredReviewOnTrack ? 4 : "2px 7px",
-                borderRadius: 3,
-                fontSize: "var(--text-xs)",
-                fontWeight: 700,
-                pointerEvents: "none",
-                zIndex: 30,
-                whiteSpace: "nowrap",
-                boxShadow: "0 6px 18px rgba(0,0,0,0.75)",
-                display: "flex",
-                flexDirection: "column",
-                alignItems: "center",
-                gap: 3,
-              }}
-            >
-              {hoveredReviewOnTrack && (
-                <img
-                  src={hoveredReviewOnTrack.thumb_path.replace("/media/frigate", "")}
-                  alt="preview"
-                  width={128}
-                  height={72}
-                  style={{
-                    width: 128,
-                    height: 72,
-                    objectFit: "contain",
-                    background: "#000000",
-                    borderRadius: 2,
-                  }}
-                />
-              )}
-              <span>{formatFullDateTime(hoverTs)}</span>
-            </div>
-          </>
-        )}
-
-        {/* 6. Active Playhead Needle */}
-        {playheadPct >= 0 && playheadPct <= 100 && (
-          <div
-            style={{
-              position: "absolute",
-              left: `${playheadPct}%`,
-              top: 0,
-              bottom: 0,
-              width: 2,
-              background:
-                currentTs === null ? "var(--signal-live)" : "var(--signal-motion-text)",
-              boxShadow: "0 0 6px rgba(0,0,0,0.8)",
+              inset: 0,
+              width: "100%",
+              height: "100%",
+              borderRadius: 3,
               pointerEvents: "none",
-              zIndex: 11,
+              display: "block",
             }}
           />
-        )}
+
+          {/* Visual Range Export Overlay (`[ IN ... OUT ]`) with Draggable Handles */}
+          {rangeMode && (
+            <div
+              style={{
+                position: "absolute",
+                left: `${rangeStartPct}%`,
+                width: `${Math.max(0.5, rangeEndPct - rangeStartPct)}%`,
+                top: 0,
+                bottom: 0,
+                background: "rgba(14, 165, 233, 0.20)",
+                borderTop: "2px solid var(--signal-accent-text)",
+                borderBottom: "2px solid var(--signal-accent-text)",
+                zIndex: 8,
+              }}
+            >
+              <div
+                data-handle="in"
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  setDraggingTarget("in");
+                }}
+                title="Drag IN handle to adjust export start time"
+                style={{
+                  position: "absolute",
+                  left: -7,
+                  top: 0,
+                  bottom: 0,
+                  width: 14,
+                  background: "var(--signal-accent)",
+                  cursor: "ew-resize",
+                  touchAction: "none",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  borderRadius: "2px 0 0 2px",
+                }}
+              >
+                <span
+                  className="mono"
+                  style={{ fontSize: 10, fontWeight: 800, color: "#000000", pointerEvents: "none" }}
+                >
+                  [
+                </span>
+              </div>
+
+              <div
+                data-handle="out"
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  setDraggingTarget("out");
+                }}
+                title="Drag OUT handle to adjust export end time"
+                style={{
+                  position: "absolute",
+                  right: -7,
+                  top: 0,
+                  bottom: 0,
+                  width: 14,
+                  background: "var(--signal-accent)",
+                  cursor: "ew-resize",
+                  touchAction: "none",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  borderRadius: "0 2px 2px 0",
+                }}
+              >
+                <span
+                  className="mono"
+                  style={{ fontSize: 10, fontWeight: 800, color: "#000000", pointerEvents: "none" }}
+                >
+                  ]
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Hover Scrub Crosshair + Floating Thumbnail & Timestamp Peeker */}
+          {hoverTs !== null && (
+            <>
+              <div
+                style={{
+                  position: "absolute",
+                  left: `${hoverX}px`,
+                  top: 0,
+                  bottom: 0,
+                  width: 1,
+                  background: "rgba(255, 255, 255, 0.55)",
+                  pointerEvents: "none",
+                  zIndex: 9,
+                }}
+              />
+              <div
+                className="mono"
+                style={{
+                  position: "absolute",
+                  left: `${Math.max(
+                    75,
+                    Math.min((trackRef.current?.clientWidth || 800) - 95, hoverX)
+                  )}px`,
+                  bottom: 58,
+                  transform: "translateX(-50%)",
+                  background: "var(--bg-panel)",
+                  border: "1px solid var(--signal-accent)",
+                  color: "var(--text-primary)",
+                  padding: hoveredReviewOnTrack ? 4 : "2px 7px",
+                  borderRadius: 3,
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 700,
+                  pointerEvents: "none",
+                  zIndex: 30,
+                  whiteSpace: "nowrap",
+                  boxShadow: "0 6px 18px rgba(0,0,0,0.75)",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: 3,
+                }}
+              >
+                {hoveredReviewOnTrack && (
+                  <img
+                    src={hoveredReviewOnTrack.thumb_path.replace("/media/frigate", "")}
+                    alt="preview"
+                    width={128}
+                    height={72}
+                    style={{
+                      width: 128,
+                      height: 72,
+                      objectFit: "contain",
+                      background: "#000000",
+                      borderRadius: 2,
+                    }}
+                  />
+                )}
+                <span>{formatFullDateTime(hoverTs)}</span>
+              </div>
+            </>
+          )}
+
+          {/* Active Playhead Needle */}
+          {playheadPct >= 0 && playheadPct <= 100 && (
+            <div
+              style={{
+                position: "absolute",
+                left: `${playheadPct}%`,
+                top: -2,
+                bottom: -2,
+                width: 2,
+                background:
+                  currentTs === null ? "var(--signal-live)" : "var(--signal-motion-text)",
+                boxShadow: "0 0 6px rgba(0,0,0,0.8)",
+                pointerEvents: "none",
+                zIndex: 11,
+              }}
+            />
+          )}
+        </div>
       </div>
     </div>
   );
