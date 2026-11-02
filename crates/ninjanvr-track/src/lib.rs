@@ -483,14 +483,17 @@ impl ByteTracker {
             trk.vy = 0.7 * trk.vy + 0.3 * dy;
 
             let iou = trk.bbox.iou(&det.bbox);
-            if iou > 0.85 && dx.hypot(dy) < 4.0 {
+            let max_jitter = ((frame_w.max(frame_h) as f32) * 0.02).max(6.0);
+            if iou > 0.72 && dx.hypot(dy) < max_jitter {
                 trk.motionless_count += 1;
                 if trk.motionless_count >= stationary_thresh {
                     trk.stationary = true;
                 }
-            } else {
+            } else if iou < 0.55 || dx.hypot(dy) > max_jitter * 2.5 {
                 trk.motionless_count = 0;
                 trk.stationary = false;
+            } else {
+                trk.motionless_count = trk.motionless_count.saturating_sub(2);
             }
 
             let prev_bc = trk.prev_bottom_center;

@@ -234,8 +234,9 @@ impl VisionPipeline {
                     prev_label_counts.insert(lbl.clone(), 0);
                 }
                 let mut prev_total_objs = 0usize;
+                let mut prev_night_ir = false;
                 let mut consecutive_tamper_frames = 0u32;
-                let tamper_threshold_frames = (fps * 15).max(15);
+                let tamper_threshold_frames = (fps * 4).max(12);
 
                 while stdout
                     .read_exact(Arc::<Vec<u8>>::make_mut(&mut frame_data))
@@ -402,7 +403,15 @@ impl VisionPipeline {
                             .publish_topic(&format!("{camera}/all"), prev_total_objs.to_string());
                     }
 
-                    if activity_changed || !active_tracks.is_empty() {
+                    if is_night_ir != prev_night_ir {
+                        prev_night_ir = is_night_ir;
+                        activity_changed = true;
+                    }
+
+                    if activity_changed
+                        || !active_tracks.is_empty()
+                        || (motion_on && frame_count.is_multiple_of(5))
+                    {
                         let max_area = motion_boxes.iter().map(|b| b.area()).max().unwrap_or(0);
                         let objs_json: Vec<Value> = active_tracks
                             .iter()

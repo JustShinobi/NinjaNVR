@@ -59,6 +59,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const spotlightFilter = useNvrStore((s) => s.spotlightFilter);
   const setSpotlightFilter = useNvrStore((s) => s.setSpotlightFilter);
   const spotlightHoldSec = useNvrStore((s) => s.spotlightHoldSec);
+  const setSpotlightHoldSec = useNvrStore((s) => s.setSpotlightHoldSec);
   const selectedCamera = useNvrStore((s) => s.selectedCamera);
   const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
   const hudPosition = useNvrStore((s) => s.hudPosition);
@@ -77,6 +78,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const cameraActivity = useNvrStore((s) => s.cameraActivity);
 
   const lastActiveRef = useRef<Record<string, number>>({});
+  const lastSurgeRef = useRef<Record<string, number>>({});
+  const prevMatchRef = useRef<Record<string, boolean>>({});
+  const [spotlightTrail, setSpotlightTrail] = useState<Array<{ cam: string; ts: number }>>([]);
   const [nowTick, setNowTick] = useState<number>(() => Math.floor(Date.now() / 1000));
   const [mapEditMode, setMapEditMode] = useState(false);
   const [draggingCam, setDraggingCam] = useState<string | null>(null);
@@ -156,27 +160,46 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     const nowSec = Math.floor(Date.now() / 1000);
     for (const cam of cameraNames) {
       const act = cameraActivity[cam];
-      if (!act) continue;
-      const objs = act.objects || [];
+      const camStat = stats?.cameras?.[cam];
+      const objs = act?.objects || [];
+      const activeNonStationary = objs.filter((o) => !o.stationary);
+      // Ignore tiny < 3500 px² motion boxes caused by 1-second camera OSD clock digit ticks
+      const hasRealMotion =
+        Boolean(act?.motion && (act?.max_Area ?? 5000) >= 3500) ||
+        (camStat?.detection_fps ?? 0) >= 2.0;
+
       let matches = false;
       if (spotlightFilter === "all_activity") {
-        matches = Boolean(act.motion) || objs.length > 0;
+        matches = hasRealMotion || activeNonStationary.length > 0;
       } else if (spotlightFilter === "objects") {
-        matches = objs.some((o) => !o.stationary);
+        matches = activeNonStationary.length > 0;
       } else if (spotlightFilter === "person") {
-        matches = objs.some((o) => o.label === "person" && !o.stationary);
+        matches = activeNonStationary.some((o) => o.label === "person");
       } else if (spotlightFilter === "vehicle") {
-        matches = objs.some(
-          (o) =>
-            ["car", "truck", "motorcycle", "bicycle"].includes(o.label) && !o.stationary
+        matches = activeNonStationary.some((o) =>
+          ["car", "truck", "motorcycle", "bicycle"].includes(o.label)
         );
       }
+
+      const wasMatching = Boolean(prevMatchRef.current[cam]);
       if (matches) {
         lastActiveRef.current[cam] = nowSec;
+        if (!wasMatching || nowSec - (lastSurgeRef.current[cam] || 0) >= 8) {
+          lastSurgeRef.current[cam] = nowSec;
+          setSpotlightTrail((prev) => {
+            if (prev.length > 0 && prev[prev.length - 1].cam === cam) {
+              const updated = [...prev];
+              updated[updated.length - 1] = { cam, ts: nowSec };
+              return updated;
+            }
+            return [...prev.slice(-4), { cam, ts: nowSec }];
+          });
+        }
       }
+      prevMatchRef.current[cam] = matches;
     }
     setNowTick(nowSec);
-  }, [cameraActivity, cameraNames, spotlightFilter]);
+  }, [cameraActivity, stats, cameraNames, spotlightFilter]);
 
   useEffect(() => {
     if (liveLayout !== "spotlight") return;
@@ -186,12 +209,20 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     return () => window.clearInterval(tmr);
   }, [liveLayout]);
 
-  const spotlightPromotedCams = cameraNames.filter(
-    (cam) => nowTick - (lastActiveRef.current[cam] || 0) <= spotlightHoldSec
-  );
-  const spotlightActiveCams =
-    spotlightPromotedCams.length > 0 ? spotlightPromotedCams : [selectedCamera];
-  const spotlightIdleCams = cameraNames.filter((c) => !spotlightActiveCams.includes(c));
+  const spotlightPromotedCams = [...cameraNames]
+    .filter((cam) => nowTick - (lastActiveRef.current[cam] || 0) <= spotlightHoldSec)
+    .sort(
+      (a, b) =>
+        (lastSurgeRef.current[b] || lastActiveRef.current[b] || 0) -
+        (lastSurgeRef.current[a] || lastActiveRef.current[a] || 0)
+    );
+  const spotlightHeroCam =
+    spotlightPromotedCams[0] ||
+    (spotlightTrail.length > 0
+      ? spotlightTrail[spotlightTrail.length - 1].cam
+      : selectedCamera);
+  const spotlightActiveCams = [spotlightHeroCam];
+  const spotlightIdleCams = cameraNames.filter((c) => c !== spotlightHeroCam);
 
   return (
     <>
@@ -258,6 +289,52 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   {lbl}
                 </button>
               ))}
+              <select
+                className="nvr-select mono"
+                aria-label="Spotlight hold duration"
+                style={{ height: 24, fontSize: "var(--text-xs)" }}
+                value={spotlightHoldSec}
+                onChange={(e) => setSpotlightHoldSec(Number(e.target.value))}
+                title="How long a promoted camera stays on the main stage before returning to standby"
+              >
+                <option value={15}>Hold: 15s</option>
+                <option value={30}>Hold: 30s</option>
+                <option value={60}>Hold: 60s</option>
+              </select>
+              {spotlightTrail.length > 0 && (
+                <span
+                  className="mono"
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 4,
+                    fontSize: "var(--text-xs)",
+                    color: "var(--text-secondary)",
+                    marginLeft: 4,
+                  }}
+                >
+                  <span>TRAIL:</span>
+                  {spotlightTrail.map((item, idx) => {
+                    const ago = Math.max(0, nowTick - item.ts);
+                    const isCurrent = item.cam === spotlightHeroCam;
+                    return (
+                      <button
+                        key={`${item.cam}-${item.ts}-${idx}`}
+                        type="button"
+                        className={`nvr-btn mono ${isCurrent ? "active" : ""}`}
+                        style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        onClick={() => {
+                          lastActiveRef.current[item.cam] = nowTick;
+                          lastSurgeRef.current[item.cam] = nowTick;
+                          setSelectedCamera(item.cam);
+                        }}
+                      >
+                        {item.cam.toUpperCase()} ({ago}s)
+                      </button>
+                    );
+                  })}
+                </span>
+              )}
             </>
           )}
           {(liveLayout === "focus" || liveLayout === "single") && (
@@ -679,6 +756,22 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     <span className="nvr-badge">
                       {camStat?.camera_fps?.toFixed(1) || "5.0"} FPS
                     </span>
+                    {Boolean(act?.tamper) && (
+                      <span
+                        className="nvr-badge alert mono"
+                        title="Camera tamper / blind-feed occlusion detected"
+                      >
+                        TAMPER
+                      </span>
+                    )}
+                    {Boolean(act?.night_mode || camStat?.night_mode) && (
+                      <span
+                        className="nvr-badge mono"
+                        title="Infrared (IR) monochrome night profile active"
+                      >
+                        IR NIGHT
+                      </span>
+                    )}
                     {activeLabels.length > 0 && (
                       <span className="nvr-badge alert">
                         {activeLabels.join(", ")}
@@ -704,13 +797,18 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     cameraConfig={config?.cameras?.[cam]}
                     showVectors={showVectors}
                     onClick={() => {
-                      lastActiveRef.current[cam] = Math.floor(Date.now() / 1000);
+                      const ts = Math.floor(Date.now() / 1000);
+                      lastActiveRef.current[cam] = ts;
+                      lastSurgeRef.current[cam] = ts;
                       setSelectedCamera(cam);
-                      setNowTick(Math.floor(Date.now() / 1000));
+                      setNowTick(ts);
                     }}
                   />
                   <div className={`nvr-cam-hud pos-${hudPosition}`}>
                     <span className="nvr-badge mono">{cam.toUpperCase()} · STANDBY</span>
+                    {Boolean(
+                      cameraActivity[cam]?.night_mode || stats?.cameras?.[cam]?.night_mode
+                    ) && <span className="nvr-badge mono">IR NIGHT</span>}
                   </div>
                 </div>
               ))}
@@ -760,6 +858,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   AI{" "}
                   {stats?.cameras?.[selectedCamera]?.detection_fps?.toFixed(1) || "0.0"} FPS
                 </span>
+                {Boolean(cameraActivity[selectedCamera]?.tamper) && (
+                  <span className="nvr-badge alert mono">TAMPER</span>
+                )}
+                {Boolean(
+                  cameraActivity[selectedCamera]?.night_mode ||
+                    stats?.cameras?.[selectedCamera]?.night_mode
+                ) && <span className="nvr-badge mono">IR NIGHT</span>}
                 {timeShiftTs !== null && (
                   <button
                     className="nvr-btn success"

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { KeyRound, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { useI18n } from "../../i18n";
 import {
+  AudioConfig,
   AuthConfig,
   MqttConfig,
   NinjaConfigResponse,
@@ -139,6 +140,33 @@ export const RecordingReviewSection: React.FC<{
         next.review = cloned;
       } else if (next.cameras[inspectorCam]) {
         next.cameras[inspectorCam].review = cloned;
+      }
+    });
+  };
+
+  const defaultAudio: AudioConfig = {
+    enabled: false,
+    min_volume_dbfs: -60,
+    labels: ["audio", "speech", "bark", "alarm"],
+  };
+
+  const activeAudio: AudioConfig =
+    scope === "global"
+      ? { ...defaultAudio, ...(draftConfig.audio || {}) }
+      : {
+          ...defaultAudio,
+          ...(draftConfig.audio || {}),
+          ...(draftConfig.cameras?.[inspectorCam]?.audio || {}),
+        };
+
+  const mutateAudio = (fn: (au: AudioConfig) => void) => {
+    updateDraft((next) => {
+      const cloned: AudioConfig = JSON.parse(JSON.stringify(activeAudio));
+      fn(cloned);
+      if (scope === "global") {
+        next.audio = cloned;
+      } else if (next.cameras[inspectorCam]) {
+        next.cameras[inspectorCam].audio = cloned;
       }
     });
   };
@@ -755,6 +783,95 @@ export const RecordingReviewSection: React.FC<{
                   mutateRev((rv) => (rv.detections.cutoff_time = Number(e.target.value)))
                 }
               />
+            </div>
+          </div>
+
+          {/* Acoustic Event Detections ([AU-02]) */}
+          <div
+            style={{
+              padding: 10,
+              background: "var(--bg-canvas)",
+              border: "1px solid rgba(6, 182, 212, 0.45)",
+              borderRadius: 3,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span
+                className="mono"
+                style={{
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 700,
+                  color: "var(--signal-accent-text)",
+                }}
+              >
+                {isPt
+                  ? `GATILHO ACÚSTICO / DETECÇÃO DE ÁUDIO (${activeAudio.min_volume_dbfs ?? -60} dBFS)`
+                  : `ACOUSTIC EVENT DETECTIONS (${activeAudio.min_volume_dbfs ?? -60} dBFS)`}
+              </span>
+              <ToggleSwitch
+                checked={activeAudio.enabled}
+                label="Enable Audio Event Detections"
+                onChange={(v) => mutateAudio((a) => (a.enabled = v))}
+              />
+            </div>
+
+            <div className="nvr-field-row">
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? `Limiar de Volume Acústico (${activeAudio.min_volume_dbfs ?? -60} dBFS)`
+                    : `Audio Trigger Threshold (${activeAudio.min_volume_dbfs ?? -60} dBFS)`}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Gera evento 'Audio Detections' quando o RMS do segmento supera este nível (ex.: -68 dBFS p/ música ambiente)."
+                    : "Triggers an 'Audio Detections' review event when segment RMS exceeds this level (e.g. -68 dBFS for room music)."}
+                </div>
+              </div>
+              <input
+                type="range"
+                min={-80}
+                max={-10}
+                step={1}
+                aria-label="Audio Trigger Threshold dBFS"
+                value={activeAudio.min_volume_dbfs ?? -60}
+                onChange={(e) =>
+                  mutateAudio((a) => (a.min_volume_dbfs = Number(e.target.value)))
+                }
+              />
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, flexWrap: "wrap" }}>
+              <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                {isPt ? "Presets Rápidos de Microfone:" : "Quick Mic Sensitivity Presets:"}
+              </span>
+              <div style={{ display: "flex", gap: 4 }}>
+                {(
+                  [
+                    [-70, isPt ? "Música / Ambiente (-70 dBFS)" : "Music / Ambient (-70 dBFS)"],
+                    [-58, isPt ? "Voz Normal (-58 dBFS)" : "Normal Voice (-58 dBFS)"],
+                    [-38, isPt ? "Alarme / Latido Alto (-38 dBFS)" : "Loud Alarm / Bark (-38 dBFS)"],
+                  ] as const
+                ).map(([dbVal, lbl]) => (
+                  <button
+                    key={dbVal}
+                    type="button"
+                    className={`nvr-btn mono ${(activeAudio.min_volume_dbfs ?? -60) === dbVal ? "active" : ""}`}
+                    style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    onClick={() =>
+                      mutateAudio((a) => {
+                        a.enabled = true;
+                        a.min_volume_dbfs = dbVal;
+                      })
+                    }
+                  >
+                    {lbl}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
         </div>

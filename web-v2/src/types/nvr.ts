@@ -93,6 +93,12 @@ export interface ReviewConfig {
   detections: ReviewSeverityConfig;
 }
 
+export interface AudioConfig {
+  enabled: boolean;
+  min_volume_dbfs?: number;
+  labels?: string[];
+}
+
 export interface ZoneConfig {
   coordinates: string;
   objects?: string[];
@@ -153,6 +159,7 @@ export interface CameraConfig {
   record: RecordConfig;
   snapshots: SnapshotsConfig;
   review?: ReviewConfig;
+  audio?: AudioConfig;
 }
 
 export interface DetectorEntryConfig {
@@ -222,6 +229,7 @@ export interface NinjaConfigResponse {
   record?: RecordConfig;
   snapshots?: SnapshotsConfig;
   review?: ReviewConfig;
+  audio?: AudioConfig;
   go2rtc?: {
     streams: Record<string, unknown>;
   };
@@ -432,6 +440,7 @@ export interface CameraLiveActivity {
   night_mode?: boolean;
   tamper?: boolean;
   motion: boolean;
+  max_Area?: number;
   objects: Array<{
     id: string;
     label: string;

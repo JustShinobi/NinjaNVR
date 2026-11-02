@@ -858,10 +858,13 @@ pub struct FrameIntegrityReport {
     pub is_tampered_or_blind: bool,
 }
 
-/// Evaluates spatial luminance variance and modal pixel uniformity on a YUV420p frame
-/// to detect camera tampering (spray paint, cloth/tape occlusion) or solid-color encoder hangs.
+/// Evaluates spatial luminance variance, modal pixel uniformity, and edge gradient energy on a YUV420p
+/// frame (excluding top/bottom 12% OSD timestamp margins) to detect camera tampering (hand/cloth/tape
+/// occlusion, spray paint, IR lens washout) or solid-color encoder hangs.
 pub fn check_frame_tamper(yuv_data: &[u8], width: u32, height: u32) -> FrameIntegrityReport {
-    let y_len = (width as usize).saturating_mul(height as usize);
+    let w = width as usize;
+    let h = height as usize;
+    let y_len = w.saturating_mul(h);
     if y_len == 0 || yuv_data.len() < y_len {
         return FrameIntegrityReport {
             y_variance: 0.0,
@@ -870,19 +873,28 @@ pub fn check_frame_tamper(yuv_data: &[u8], width: u32, height: u32) -> FrameInte
         };
     }
     let y_plane = &yuv_data[..y_len];
-    let step = (y_len / 2048).max(1);
+    let row_start = (h * 12) / 100;
+    let row_end = (h * 88) / 100;
+    let slice_start = (row_start * w).min(y_len.saturating_sub(1));
+    let slice_end = (row_end * w).max(slice_start + 1).min(y_len);
+    let roi = &y_plane[slice_start..slice_end];
+    let step = (roi.len() / 2048).max(1);
     let mut hist = [0u32; 256];
     let mut sum: f64 = 0.0;
     let mut sum_sq: f64 = 0.0;
+    let mut grad_sum: u64 = 0;
     let mut count: u32 = 0;
 
     let mut idx = 0usize;
-    while idx < y_len {
-        let v = y_plane[idx];
+    while idx < roi.len() {
+        let v = roi[idx];
         hist[v as usize] += 1;
         let vf = v as f64;
         sum += vf;
         sum_sq += vf * vf;
+        if idx + 1 < roi.len() {
+            grad_sum += (v as i32 - roi[idx + 1] as i32).unsigned_abs() as u64;
+        }
         count += 1;
         idx += step;
     }
@@ -897,6 +909,7 @@ pub fn check_frame_tamper(yuv_data: &[u8], width: u32, height: u32) -> FrameInte
 
     let mean = sum / (count as f64);
     let variance = ((sum_sq / (count as f64)) - mean * mean).max(0.0) as f32;
+    let edge_gradient = (grad_sum as f32) / (count as f32);
 
     let mut modal_val = 0usize;
     let mut modal_count = 0u32;
@@ -911,11 +924,23 @@ pub fn check_frame_tamper(yuv_data: &[u8], width: u32, height: u32) -> FrameInte
     let high = (modal_val + 4).min(255);
     let near_modal: u32 = hist[low..=high].iter().sum();
     let uniform_ratio = (near_modal as f32) / (count as f32);
-    let is_tampered_or_blind = uniform_ratio >= 0.85 || variance < 2.0;
+
+    let low16 = modal_val.saturating_sub(16);
+    let high16 = (modal_val + 16).min(255);
+    let near_modal_16: u32 = hist[low16..=high16].iter().sum();
+    let uniform_ratio_16 = (near_modal_16 as f32) / (count as f32);
+
+    let is_tampered_or_blind = uniform_ratio >= 0.85
+        || variance < 2.0
+        || (edge_gradient < 1.8 && uniform_ratio_16 >= 0.55 && variance < 450.0);
 
     FrameIntegrityReport {
         y_variance: variance,
-        uniform_ratio,
+        uniform_ratio: uniform_ratio.max(if is_tampered_or_blind {
+            uniform_ratio_16
+        } else {
+            uniform_ratio
+        }),
         is_tampered_or_blind,
     }
 }

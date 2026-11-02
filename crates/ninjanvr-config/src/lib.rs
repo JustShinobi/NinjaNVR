@@ -1042,7 +1042,7 @@ pub struct AudioConfig {
 }
 
 fn default_audio_min_volume_dbfs() -> i32 {
-    -24
+    -60
 }
 
 fn default_audio_labels() -> Vec<String> {
@@ -1455,8 +1455,10 @@ impl NinjaConfig {
                     "type": "generic",
                     "best_image_timeout": 60,
                     "audio": {
-                        "enabled": false,
-                        "enabled_in_config": false,
+                        "enabled": cam.audio.enabled,
+                        "enabled_in_config": cam.audio.enabled,
+                        "min_volume_dbfs": cam.audio.min_volume_dbfs,
+                        "labels": cam.audio.labels,
                         "max_not_heard": 30,
                         "min_volume": 500,
                         "listen": ["bark", "fire_alarm", "speech", "yell"],
@@ -1484,7 +1486,9 @@ impl NinjaConfig {
                         "height": cam.detect.height,
                         "fps": cam.detect.fps,
                         "min_initialized": cam.detect.min_initialized,
+                        "min_initialized_night": cam.detect.min_initialized_night,
                         "max_disappeared": cam.detect.max_disappeared,
+                        "detector": cam.detect.detector,
                         "stationary": {
                             "interval": cam.detect.stationary.interval,
                             "threshold": cam.detect.stationary.threshold,
@@ -1617,6 +1621,8 @@ impl NinjaConfig {
                         "required_zones": [],
                         "retain": { "default": 10.0, "objects": {} },
                         "quality": cam.snapshots.quality,
+                        "high_res": cam.snapshots.high_res,
+                        "from_main_stream": cam.snapshots.from_main_stream,
                         "selection": cam.snapshots.selection
                     },
                     "timestamp_style": {
@@ -1778,7 +1784,9 @@ impl NinjaConfig {
             "genai": {},
             "cameras": cameras_json,
             "audio": {
-                "enabled": false,
+                "enabled": self.audio.enabled,
+                "min_volume_dbfs": self.audio.min_volume_dbfs,
+                "labels": self.audio.labels,
                 "max_not_heard": 30,
                 "min_volume": 500,
                 "listen": ["bark", "fire_alarm", "speech", "yell"],
@@ -1802,7 +1810,9 @@ impl NinjaConfig {
                 "width": self.detect.width,
                 "fps": self.detect.fps,
                 "min_initialized": self.detect.min_initialized,
+                "min_initialized_night": self.detect.min_initialized_night,
                 "max_disappeared": self.detect.max_disappeared,
+                "detector": self.detect.detector,
                 "stationary": {
                     "interval": self.detect.stationary.interval,
                     "threshold": self.detect.stationary.threshold,
@@ -1913,7 +1923,10 @@ impl NinjaConfig {
                 "crop": self.snapshots.crop,
                 "required_zones": [],
                 "retain": { "default": 10.0, "objects": {} },
-                "quality": self.snapshots.quality
+                "quality": self.snapshots.quality,
+                "high_res": self.snapshots.high_res,
+                "from_main_stream": self.snapshots.from_main_stream,
+                "selection": self.snapshots.selection
             },
             "timestamp_style": {
                 "position": "tl",
@@ -2111,6 +2124,10 @@ impl NinjaConfig {
         if let Some(rev_val) = obj.get("review") {
             self.review =
                 serde_json::from_value(rev_val.clone()).context("invalid review config")?;
+        }
+        if let Some(audio_val) = obj.get("audio") {
+            self.audio =
+                serde_json::from_value(audio_val.clone()).context("invalid audio config")?;
         }
         if let Some(peers_val) = obj.get("peers") {
             self.peers =
