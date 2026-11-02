@@ -420,6 +420,23 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                     {cam}
                   </button>
                 ))}
+                <a
+                  href={`/api/camera-proxy/${encodeURIComponent(inspectorCam)}/`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="nvr-btn mono"
+                  style={{
+                    height: 24,
+                    padding: "0 8px",
+                    fontSize: "var(--text-xs)",
+                    textDecoration: "none",
+                    display: "inline-flex",
+                    alignItems: "center",
+                  }}
+                  title="Open camera's native Web UI via authenticated SSRF-safe reverse proxy"
+                >
+                  Open Camera Web UI ↗
+                </a>
               </>
             )}
           </div>

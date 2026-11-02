@@ -429,6 +429,18 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/ai/context", get(api_ai_context))
         .route("/mcp", post(api_mcp_handler))
         .route("/debug/reprocess", post(api_debug_reprocess))
+        .route(
+            "/camera-proxy/{camera}",
+            get(api_camera_proxy_root).post(api_camera_proxy_root),
+        )
+        .route(
+            "/camera-proxy/{camera}/",
+            get(api_camera_proxy_root).post(api_camera_proxy_root),
+        )
+        .route(
+            "/camera-proxy/{camera}/{*path}",
+            get(api_camera_proxy_subpath).post(api_camera_proxy_subpath),
+        )
         .route("/review", get(api_review))
         .route("/review/summary", get(api_review_summary))
         .route("/review/activity/motion", get(api_review_activity_motion))
@@ -801,6 +813,7 @@ async fn auth_gate_middleware(
                 || path.starts_with("/api/restart")
                 || path.starts_with("/api/tokens")
                 || path.starts_with("/api/users")
+                || path.starts_with("/api/camera-proxy")
                 || path.starts_with("/api/recordings/sync")
                 || (method == "DELETE"
                     && (path.ends_with("/recordings")
@@ -909,6 +922,7 @@ async fn auth_gate_middleware(
                                 | "ai"
                                 | "mcp"
                                 | "debug"
+                                | "camera-proxy"
                                 | "go2rtc"
                                 | "ws"
                                 | "labels"
@@ -2814,6 +2828,108 @@ async fn api_debug_reprocess(
         "frames": frames_trace
     }))
     .into_response()
+}
+
+async fn api_camera_proxy_root(
+    State(state): State<AppState>,
+    AxumPath(camera): AxumPath<String>,
+    uri: Uri,
+) -> Response {
+    handle_camera_webui_proxy(&state, &camera, "", uri.query()).await
+}
+
+async fn api_camera_proxy_subpath(
+    State(state): State<AppState>,
+    AxumPath((camera, subpath)): AxumPath<(String, String)>,
+    uri: Uri,
+) -> Response {
+    handle_camera_webui_proxy(&state, &camera, &subpath, uri.query()).await
+}
+
+async fn handle_camera_webui_proxy(
+    state: &AppState,
+    camera: &str,
+    subpath: &str,
+    query: Option<&str>,
+) -> Response {
+    let base_url_opt = {
+        let cfg = state.config.read().await;
+        cfg.resolve_camera_webui_base_url(camera)
+    };
+    let Some(base_url) = base_url_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "message": format!("Camera '{camera}' is not configured or has no non-loopback Web UI host")
+            })),
+        )
+            .into_response();
+    };
+
+    let clean_sub = subpath.trim_start_matches('/');
+    let mut target_url = if clean_sub.is_empty() {
+        format!("{base_url}/")
+    } else {
+        format!("{base_url}/{clean_sub}")
+    };
+    if let Some(q) = query
+        && !q.is_empty()
+    {
+        target_url.push('?');
+        target_url.push_str(q);
+    }
+
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+
+    match client.get(&target_url).send().await {
+        Ok(upstream) => {
+            let status =
+                StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let content_type = upstream
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("text/html; charset=utf-8")
+                .to_string();
+            let rewritten_loc = upstream
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|loc| {
+                    if let Some(rel) = loc.strip_prefix('/') {
+                        format!("/api/camera-proxy/{camera}/{rel}")
+                    } else {
+                        loc.to_string()
+                    }
+                });
+            let body_bytes = upstream.bytes().await.unwrap_or_default().to_vec();
+            let mut resp =
+                (status, [(header::CONTENT_TYPE, content_type)], body_bytes).into_response();
+            if let Some(loc_str) = rewritten_loc
+                && let Ok(hv) = header::HeaderValue::from_str(&loc_str)
+            {
+                resp.headers_mut().insert(header::LOCATION, hv);
+            }
+            resp
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "success": false,
+                "camera": camera,
+                "target": base_url,
+                "message": format!("Camera Web UI unreachable: {err}")
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn api_config_schema() -> Json<Value> {
@@ -5973,6 +6089,34 @@ version: 0.18-0
         let frames_arr = reproc_json["frames"].as_array().unwrap();
         assert!(!frames_arr.is_empty());
         assert!(frames_arr[0]["filtered_reasons"].is_array());
+
+        // 22. Test Camera Web-UI Reverse Proxy (/api/camera-proxy/:camera/) SSRF & Admin RBAC enforcement
+        // Viewer role is blocked with 403 Forbidden
+        let resp_proxy_viewer = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/camera-proxy/front_door/")
+                    .header(header::AUTHORIZATION, format!("Bearer {guard_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_proxy_viewer.status(), StatusCode::FORBIDDEN);
+
+        // Unconfigured camera host returns 404 Not Found (prevents arbitrary SSRF)
+        let resp_proxy_unconf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/camera-proxy/non_existent_cam/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_proxy_unconf.status(), StatusCode::NOT_FOUND);
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

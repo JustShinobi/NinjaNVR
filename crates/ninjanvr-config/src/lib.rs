@@ -1059,6 +1059,8 @@ pub struct CameraConfig {
     pub enabled: bool,
     #[serde(default)]
     pub indoor: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webui_url: Option<String>,
     #[serde(default)]
     pub map: CameraMapPlacement,
     #[serde(default)]
@@ -1090,6 +1092,7 @@ impl Default for CameraConfig {
         Self {
             enabled: true,
             indoor: false,
+            webui_url: None,
             map: CameraMapPlacement::default(),
             ffmpeg: CameraFfmpegConfig::default(),
             live: CameraLiveConfig::default(),
@@ -1596,6 +1599,7 @@ impl NinjaConfig {
                         "dashboard": true,
                         "review": true
                     },
+                    "webui_url": cam.webui_url,
                     "map": cam.map,
                     "profiles": {},
                     "zones": cam.zones,
@@ -1894,6 +1898,35 @@ impl NinjaConfig {
         })
     }
 
+    /// Resolves the SSRF-safe base HTTP/HTTPS URL for a camera's native Web UI, using either
+    /// `camera.webui_url` or the host/IP extracted from its configured RTSP input or go2rtc stream.
+    /// Loopback addresses (`127.0.0.1`, `localhost`, `::1`) are never returned as a camera host.
+    pub fn resolve_camera_webui_base_url(&self, camera: &str) -> Option<String> {
+        let cam = self.cameras.get(camera)?;
+        if let Some(ref custom) = cam.webui_url {
+            let trimmed = custom.trim().trim_end_matches('/');
+            if (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+                && let Some(h) = extract_non_loopback_host(trimmed)
+                && !h.is_empty()
+            {
+                return Some(trimmed.to_string());
+            }
+        }
+        for inp in &cam.ffmpeg.inputs {
+            if let Some(host) = extract_non_loopback_host(&inp.path) {
+                return Some(format!("http://{host}"));
+            }
+        }
+        for key in [camera.to_string(), format!("{camera}_sub")] {
+            if let Some(val) = self.go2rtc.streams.get(&key)
+                && let Some(host) = extract_host_from_go2rtc_val(val)
+            {
+                return Some(format!("http://{host}"));
+            }
+        }
+        None
+    }
+
     /// Collects all raw URL strings currently stored in `cameras.*.ffmpeg.inputs` and `go2rtc.streams`.
     pub fn collect_original_urls(&self) -> Vec<String> {
         let mut out = Vec::new();
@@ -2038,6 +2071,46 @@ impl NinjaConfig {
         let _ = Self::from_yaml_str(&clean_yaml, self.config_path.clone())?;
         self.raw_yaml = clean_yaml;
         Ok(())
+    }
+}
+
+fn extract_non_loopback_host(url: &str) -> Option<String> {
+    let idx = url.find("://")?;
+    let after_scheme = &url[idx + 3..];
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let host_port = if let Some(at_idx) = authority.rfind('@') {
+        &authority[at_idx + 1..]
+    } else {
+        authority
+    };
+    let host = if host_port.starts_with('[') {
+        host_port
+            .find(']')
+            .map(|end| &host_port[..=end])
+            .unwrap_or(host_port)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    }
+    .trim();
+    if host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "[::1]"
+    {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+fn extract_host_from_go2rtc_val(val: &Value) -> Option<String> {
+    match val {
+        Value::String(s) => extract_non_loopback_host(s),
+        Value::Array(arr) => arr.iter().find_map(extract_host_from_go2rtc_val),
+        _ => None,
     }
 }
 
