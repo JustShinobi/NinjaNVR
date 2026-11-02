@@ -322,7 +322,11 @@ impl VisionPipeline {
                     let motion_px: u32 = motion_boxes.iter().map(|b| b.area()).sum();
 
                     // 2. Dynamic Region Cropping & AI Object Detection (only when motion or non-stationary objects exist)
-                    let (model_w, model_h, bgr_order) = self.detector.model_dimensions();
+                    let active_det = self
+                        .detector
+                        .named_detector(cam_cfg.detect.detector.as_deref())
+                        .unwrap_or_else(|| self.detector.clone());
+                    let (model_w, model_h, bgr_order) = active_det.model_dimensions();
                     let needed_tensor_len = (model_w * model_h * 3) as usize;
                     if tensor_buf.len() != needed_tensor_len {
                         tensor_buf.resize(needed_tensor_len, 0);
@@ -352,8 +356,7 @@ impl VisionPipeline {
                         );
                         detect_calls += 1;
                         let dets =
-                            self.detector
-                                .detect_region(&tensor_buf, *region, width, height, 0.40);
+                            active_det.detect_region(&tensor_buf, *region, width, height, 0.40);
                         raw_detections.extend(dets);
                     }
 

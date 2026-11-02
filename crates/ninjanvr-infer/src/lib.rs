@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
-use ninjanvr_config::NinjaConfig;
+use ninjanvr_config::{DetectorEntryConfig, NinjaConfig};
 use ninjanvr_vision::BoundingBox;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -94,6 +94,47 @@ pub struct AiDetectorEngine {
     inner: Mutex<DetectorRuntimeState>,
     last_inference_ms: Mutex<f32>,
     cumulative_infer_us: AtomicU64,
+    pool: Mutex<BTreeMap<String, Arc<AiDetectorEngine>>>,
+}
+
+/// Registry of named `AiDetectorEngine` instances supporting multi-detector routing per camera.
+pub struct DetectorPool {
+    default_detector: Arc<AiDetectorEngine>,
+    detectors: BTreeMap<String, Arc<AiDetectorEngine>>,
+}
+
+impl DetectorPool {
+    pub fn new(config: &NinjaConfig) -> Self {
+        let default_detector = Arc::new(AiDetectorEngine::new(config));
+        let mut detectors = BTreeMap::new();
+        for (name, entry) in &config.detectors {
+            detectors.insert(
+                name.clone(),
+                Arc::new(AiDetectorEngine::new_for_entry(config, entry)),
+            );
+        }
+        Self {
+            default_detector,
+            detectors,
+        }
+    }
+
+    pub fn get(&self, name: Option<&str>) -> Arc<AiDetectorEngine> {
+        if let Some(n) = name
+            && let Some(det) = self.detectors.get(n)
+        {
+            return det.clone();
+        }
+        self.detectors
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| self.default_detector.clone())
+    }
+
+    pub fn detector_names(&self) -> Vec<String> {
+        self.detectors.keys().cloned().collect()
+    }
 }
 
 /// Standard 80-class COCO index to label mapping used by YOLOv5/v8/v11/YOLOX models when
@@ -183,21 +224,68 @@ const YOLO_COCO_80: [&str; 80] = [
 
 impl AiDetectorEngine {
     pub fn new(config: &NinjaConfig) -> Self {
-        let state = Self::build_runtime_state(config);
+        let state = Self::build_runtime_state(config, None);
+        let mut pool_map = BTreeMap::new();
+        for (name, entry) in &config.detectors {
+            pool_map.insert(name.clone(), Arc::new(Self::new_for_entry(config, entry)));
+        }
         Self {
             inner: Mutex::new(state),
             last_inference_ms: Mutex::new(2.1),
             cumulative_infer_us: AtomicU64::new(0),
+            pool: Mutex::new(pool_map),
+        }
+    }
+
+    pub fn new_for_entry(config: &NinjaConfig, entry: &DetectorEntryConfig) -> Self {
+        let state = Self::build_runtime_state(config, Some(entry));
+        Self {
+            inner: Mutex::new(state),
+            last_inference_ms: Mutex::new(2.1),
+            cumulative_infer_us: AtomicU64::new(0),
+            pool: Mutex::new(BTreeMap::new()),
         }
     }
 
     /// Hot-reloads the detector model, OpenVINO device, tensor layout, and labelmap when config changes.
     pub fn reload(&self, config: &NinjaConfig) {
-        let next_state = Self::build_runtime_state(config);
+        let next_state = Self::build_runtime_state(config, None);
         *self.inner.lock().expect("detector inner mutex poisoned") = next_state;
+        let mut pool_map = BTreeMap::new();
+        for (name, entry) in &config.detectors {
+            pool_map.insert(name.clone(), Arc::new(Self::new_for_entry(config, entry)));
+        }
+        *self.pool.lock().expect("detector pool mutex poisoned") = pool_map;
     }
 
-    fn build_runtime_state(config: &NinjaConfig) -> DetectorRuntimeState {
+    /// Resolves a named detector from the pool if present, or returns `None` (caller uses `self`).
+    pub fn named_detector(&self, name: Option<&str>) -> Option<Arc<AiDetectorEngine>> {
+        let n = name?;
+        self.pool
+            .lock()
+            .expect("detector pool mutex poisoned")
+            .get(n)
+            .cloned()
+    }
+
+    /// Returns the average inference latency (ms) for a specific named detector, falling back to the primary detector.
+    pub fn avg_inference_ms_for(&self, name: &str) -> f32 {
+        if let Some(det) = self
+            .pool
+            .lock()
+            .expect("detector pool mutex poisoned")
+            .get(name)
+            .cloned()
+        {
+            return det.avg_inference_ms();
+        }
+        self.avg_inference_ms()
+    }
+
+    fn build_runtime_state(
+        config: &NinjaConfig,
+        entry_override: Option<&DetectorEntryConfig>,
+    ) -> DetectorRuntimeState {
         let raw_labels = config.load_labelmap();
         let mut labelmap = BTreeMap::new();
         for (k, v) in raw_labels {
@@ -206,19 +294,20 @@ impl AiDetectorEngine {
             }
         }
 
-        let requested_device = config
-            .detectors
-            .values()
-            .next()
-            .map(|d| d.device.as_str())
+        let requested_device = entry_override
+            .map(|e| e.device.as_str())
+            .or_else(|| config.detectors.values().next().map(|d| d.device.as_str()))
             .unwrap_or("CPU");
+        let effective_model = entry_override
+            .and_then(|e| e.model.as_ref())
+            .unwrap_or(&config.model);
 
         let mut active_device = requested_device.to_string();
-        let ov_ctx = match Self::try_init_openvino(&config.model.path, requested_device) {
+        let ov_ctx = match Self::try_init_openvino(&effective_model.path, requested_device) {
             Ok((ctx, actual_dev)) => {
                 info!(
                     "Initialized native OpenVINO C-API detector (model={}, device={actual_dev}, in_bytes={}, out_floats={})",
-                    config.model.path, ctx.in_bytes, ctx.out_floats
+                    effective_model.path, ctx.in_bytes, ctx.out_floats
                 );
                 active_device = actual_dev;
                 Some(ctx)
@@ -231,8 +320,8 @@ impl AiDetectorEngine {
             }
         };
 
-        let mut model_w = config.model.width.max(64);
-        let mut model_h = config.model.height.max(64);
+        let mut model_w = effective_model.width.max(64);
+        let mut model_h = effective_model.height.max(64);
 
         // Reconcile configured width/height against compiled OpenVINO input tensor byte size
         // so changing width/height in UI without changing the underlying .xml/.onnx model never overflows.
@@ -261,17 +350,19 @@ impl AiDetectorEngine {
             }
         }
 
-        let mt = config.model.model_type.to_ascii_lowercase();
-        let is_yolo = mt.contains("yolo") || config.model.path.ends_with(".onnx");
+        let mt = effective_model.model_type.to_ascii_lowercase();
+        let is_yolo = mt.contains("yolo") || effective_model.path.ends_with(".onnx");
 
         DetectorRuntimeState {
             model_w,
             model_h,
-            bgr_order: config.model.input_pixel_format.eq_ignore_ascii_case("bgr"),
-            nchw_layout: config.model.input_tensor.eq_ignore_ascii_case("nchw"),
+            bgr_order: effective_model
+                .input_pixel_format
+                .eq_ignore_ascii_case("bgr"),
+            nchw_layout: effective_model.input_tensor.eq_ignore_ascii_case("nchw"),
             is_yolo,
             active_device,
-            active_model_path: config.model.path.clone(),
+            active_model_path: effective_model.path.clone(),
             labelmap,
             ov_ctx,
         }
@@ -988,5 +1079,40 @@ mod tests {
         let merged = nms_detections(dup, 0.55);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].score, 0.91);
+    }
+
+    #[test]
+    fn detector_pool_routes_per_camera_models_and_reports_independent_metrics() {
+        let yaml = r#"
+detectors:
+  fast_cpu:
+    type: openvino
+    device: CPU
+    model:
+      width: 320
+      height: 320
+      path: /config/model_cache/yolov9-t.onnx
+  accurate_gpu:
+    type: openvino
+    device: GPU
+    model:
+      width: 640
+      height: 640
+      path: /config/model_cache/yolov9-s.onnx
+cameras:
+  driveway:
+    detect:
+      detector: accurate_gpu
+version: 0.18-0
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let pool = DetectorPool::new(&cfg);
+        assert_eq!(pool.detector_names(), vec!["accurate_gpu", "fast_cpu"]);
+
+        let fast = pool.get(Some("fast_cpu"));
+        assert_eq!(fast.model_dimensions().0, 320);
+
+        let acc = pool.get(cfg.cameras["driveway"].detect.detector.as_deref());
+        assert_eq!(acc.model_dimensions().0, 640);
     }
 }

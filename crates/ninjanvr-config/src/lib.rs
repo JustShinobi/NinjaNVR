@@ -214,6 +214,8 @@ impl Default for DatabaseConfig {
 pub struct DetectConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector: Option<String>,
     #[serde(default = "default_detect_width")]
     pub width: u32,
     #[serde(default = "default_detect_height")]
@@ -250,6 +252,7 @@ impl Default for DetectConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            detector: None,
             width: default_detect_width(),
             height: default_detect_height(),
             fps: default_detect_fps(),
@@ -294,6 +297,8 @@ pub struct DetectorEntryConfig {
     pub detector_type: String,
     #[serde(default = "default_detector_device")]
     pub device: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelConfig>,
 }
 
 fn default_detector_type() -> String {
@@ -308,6 +313,7 @@ impl Default for DetectorEntryConfig {
         Self {
             detector_type: default_detector_type(),
             device: default_detector_device(),
+            model: None,
         }
     }
 }

@@ -1402,7 +1402,6 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         );
     }
 
-    let infer_ms = (state.detector.avg_inference_ms() * 100.0).round() / 100.0;
     let det_cpu = state
         .cpu_tracker
         .sample_infer_cpu(state.detector.cumulative_infer_us(), 3.2);
@@ -1414,10 +1413,11 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
 
     let mut detectors_stats = serde_json::Map::new();
     for det_name in cfg.detectors.keys() {
+        let det_infer_ms = (state.detector.avg_inference_ms_for(det_name) * 100.0).round() / 100.0;
         detectors_stats.insert(
             det_name.clone(),
             json!({
-                "inference_speed": infer_ms,
+                "inference_speed": det_infer_ms,
                 "detection_start": 0.0,
                 "pid": pid,
                 "cpu": format!("{det_cpu:.1}"),
