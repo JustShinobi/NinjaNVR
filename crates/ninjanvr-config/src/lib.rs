@@ -474,6 +474,15 @@ impl Default for RecordPreviewConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotSelectionPolicy {
+    BestOverall,
+    #[default]
+    BestInZone,
+    FirstTrigger,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotsConfig {
     #[serde(default = "default_true")]
@@ -490,6 +499,8 @@ pub struct SnapshotsConfig {
     pub high_res: bool,
     #[serde(default = "default_true")]
     pub from_main_stream: bool,
+    #[serde(default)]
+    pub selection: SnapshotSelectionPolicy,
 }
 
 fn default_snapshot_quality() -> u8 {
@@ -506,6 +517,7 @@ impl Default for SnapshotsConfig {
             quality: default_snapshot_quality(),
             high_res: true,
             from_main_stream: true,
+            selection: SnapshotSelectionPolicy::default(),
         }
     }
 }

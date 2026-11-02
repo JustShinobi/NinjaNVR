@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use ninjanvr_config::CameraConfig;
+use ninjanvr_config::{CameraConfig, SnapshotSelectionPolicy};
 use ninjanvr_infer::{DetectionResult, nms_detections};
 use ninjanvr_vision::{BoundingBox, PolygonMask};
 use serde::{Deserialize, Serialize};
@@ -474,6 +474,32 @@ fn association_similarity(a: &BoundingBox, b: &BoundingBox) -> f32 {
     iou.max(dist_sim * 0.65)
 }
 
+/// Evaluates whether a newly observed detection frame should replace the active event's snapshot
+/// according to the camera's configured `SnapshotSelectionPolicy`.
+pub fn should_replace_snapshot(
+    policy: SnapshotSelectionPolicy,
+    is_first_snapshot: bool,
+    prev_best_score: f32,
+    new_score: f32,
+    current_zones: &[String],
+    entered_zones: &[String],
+) -> bool {
+    if is_first_snapshot {
+        return true;
+    }
+    match policy {
+        SnapshotSelectionPolicy::FirstTrigger => false,
+        SnapshotSelectionPolicy::BestOverall => new_score > prev_best_score + 0.05,
+        SnapshotSelectionPolicy::BestInZone => {
+            if !entered_zones.is_empty() && current_zones.is_empty() {
+                false
+            } else {
+                new_score > prev_best_score + 0.05
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +565,57 @@ mod tests {
         // Next frame with NO scanned regions: stationary track must remain active!
         let (active_after_skip, _) = tracker.update(1020.0, &[], &[], &cam_cfg);
         assert_eq!(active_after_skip.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_selection_policies_respect_zone_and_first_trigger_rules() {
+        let z_driveway = vec!["driveway".to_string()];
+        let empty: Vec<String> = Vec::new();
+
+        // FirstTrigger locks on first frame and never overwrites
+        assert!(should_replace_snapshot(
+            SnapshotSelectionPolicy::FirstTrigger,
+            true,
+            0.0,
+            0.75,
+            &z_driveway,
+            &z_driveway
+        ));
+        assert!(!should_replace_snapshot(
+            SnapshotSelectionPolicy::FirstTrigger,
+            false,
+            0.75,
+            0.95,
+            &z_driveway,
+            &z_driveway
+        ));
+
+        // BestInZone rejects out-of-zone higher score when track previously entered a zone
+        assert!(!should_replace_snapshot(
+            SnapshotSelectionPolicy::BestInZone,
+            false,
+            0.78,
+            0.92,
+            &empty,
+            &z_driveway
+        ));
+        assert!(should_replace_snapshot(
+            SnapshotSelectionPolicy::BestInZone,
+            false,
+            0.78,
+            0.92,
+            &z_driveway,
+            &z_driveway
+        ));
+
+        // BestOverall replaces even when out of zone if score improves
+        assert!(should_replace_snapshot(
+            SnapshotSelectionPolicy::BestOverall,
+            false,
+            0.78,
+            0.92,
+            &empty,
+            &z_driveway
+        ));
     }
 }

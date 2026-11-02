@@ -75,6 +75,9 @@ export interface SnapshotsConfig {
   bounding_box?: boolean;
   crop?: boolean;
   quality?: number;
+  high_res?: boolean;
+  from_main_stream?: boolean;
+  selection?: "best_overall" | "best_in_zone" | "first_trigger";
 }
 
 export interface ReviewSeverityConfig {

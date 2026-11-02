@@ -500,6 +500,43 @@ export const RecordingReviewSection: React.FC<{
             />
           </div>
 
+          <div className="nvr-field-row">
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt ? "Política de Seleção de Snapshot" : "Snapshot Selection Policy"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Evita sobrescrever snapshots de zona quando o objeto sai da zona."
+                  : "Controls whether out-of-zone higher scores can overwrite in-zone alert snapshots."}
+              </div>
+            </div>
+            <select
+              className="nvr-select mono"
+              aria-label="Snapshot Selection Policy"
+              value={activeSnap.selection || "best_in_zone"}
+              onChange={(e) =>
+                mutateSnap(
+                  (s) =>
+                    (s.selection = e.target.value as
+                      | "best_overall"
+                      | "best_in_zone"
+                      | "first_trigger")
+                )
+              }
+            >
+              <option value="best_in_zone">
+                {isPt ? "Melhor na Zona (best_in_zone)" : "Best in Zone (best_in_zone)"}
+              </option>
+              <option value="best_overall">
+                {isPt ? "Melhor Geral (best_overall)" : "Best Overall (best_overall)"}
+              </option>
+              <option value="first_trigger">
+                {isPt ? "Primeiro Gatilho (first_trigger)" : "First Trigger (first_trigger)"}
+              </option>
+            </select>
+          </div>
+
           <div
             style={{
               display: "grid",

@@ -10,7 +10,7 @@ use ninjanvr_config::{CameraConfig, NinjaConfig};
 use ninjanvr_db::{EventDto, NinjaDatabase, ReviewItemDto};
 use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{SharedActivityLedger, YuvFrame, resolve_ffmpeg_bin};
-use ninjanvr_track::{ByteTracker, TrackedObject, TriggerProvenance};
+use ninjanvr_track::{ByteTracker, TrackedObject, TriggerProvenance, should_replace_snapshot};
 use ninjanvr_vision::{
     BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, compute_inference_regions,
     crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp, yuv420p_to_rgb_image,
@@ -474,9 +474,8 @@ impl VisionPipeline {
                 .unwrap_or(false);
 
             if is_new || is_better_score || state_changed {
-                let best_score = prev
-                    .map(|p| p.best_score.max(trk.score))
-                    .unwrap_or(trk.score);
+                let prev_best_score = prev.map(|p| p.best_score).unwrap_or(0.0);
+                let best_score = prev_best_score.max(trk.score);
                 track_snapshots.insert(
                     trk.id.clone(),
                     TrackPersistSnapshot {
@@ -487,7 +486,15 @@ impl VisionPipeline {
                 );
 
                 let mut thumb_b64 = None;
-                if is_new || is_better_score {
+                let replace_snap = should_replace_snapshot(
+                    cam_cfg.snapshots.selection,
+                    is_new,
+                    prev_best_score,
+                    trk.score,
+                    &trk.zones,
+                    &trk.entered_zones,
+                );
+                if replace_snap {
                     let _ = std::fs::create_dir_all(&clips_dir);
                     let crop_img =
                         yuv420p_to_rgb_image_scaled(frame, Some(trk.region), &[], Some(175));
