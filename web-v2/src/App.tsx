@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { LogOut } from "lucide-react";
 import { useI18n } from "./i18n";
 import {
   EventItem,
@@ -67,7 +68,8 @@ export const App: React.FC = () => {
 
   const [authChecked, setAuthChecked] = useState(false);
   const [authNeeded, setAuthNeeded] = useState(false);
-  const [, setUsername] = useState("admin");
+  const manualLogoutRef = useRef(false);
+  const [username, setUsername] = useState("admin");
   const [loginUser, setLoginUser] = useState("admin");
   const [userRole, setUserRole] = useState<string>("admin");
   const [selectedNode, setSelectedNode] = useState<string>("local");
@@ -267,7 +269,11 @@ export const App: React.FC = () => {
             local_login_enabled: data.local_login_enabled !== false,
             oidc: data.oidc,
           });
-          if (data.oidc?.enabled && data.oidc?.auto_redirect) {
+          if (
+            data.oidc?.enabled &&
+            data.oidc?.auto_redirect &&
+            !manualLogoutRef.current
+          ) {
             window.location.href = "/api/auth/oidc/login";
           }
         }
@@ -1080,6 +1086,35 @@ export const App: React.FC = () => {
             <span>OV {inferMs}ms</span>
             <span className="nvr-divider" aria-hidden="true" />
             <span>{totalFps} FPS</span>
+          </button>
+          <button
+            type="button"
+            className="nvr-btn mono"
+            style={{
+              height: 26,
+              padding: "0 8px",
+              fontSize: "var(--text-xs)",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+            }}
+            title={`Signed in as ${username} (${userRole}) — Click to log out`}
+            aria-label="Log out of NinjaNVR Console"
+            onClick={async () => {
+              manualLogoutRef.current = true;
+              try {
+                await fetch("/api/logout", {
+                  method: "POST",
+                  credentials: "include",
+                });
+              } catch {
+                // ignore
+              }
+              setAuthNeeded(true);
+            }}
+          >
+            <LogOut size={12} />
+            <span>Logout</span>
           </button>
         </div>
       </header>
