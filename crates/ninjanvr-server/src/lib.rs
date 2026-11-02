@@ -350,7 +350,7 @@ pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
         }
     }
     let mut bytes = [0u8; 64];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut bytes);
+    rand::fill(&mut bytes);
     let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     let _ = std::fs::write(&secret_path, &secret);
     secret
@@ -2279,11 +2279,11 @@ pub fn generate_self_signed_tls_config() -> Result<Arc<rustls::ServerConfig>> {
         "ninjanvr".to_string(),
         "127.0.0.1".to_string(),
     ];
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(subject_alt_names)?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert);
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()),
+        rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
     );
 
     let mut server_config = rustls::ServerConfig::builder()
@@ -2385,6 +2385,7 @@ pub async fn new_app_state(
         vision_pipeline.start().await;
     }
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;

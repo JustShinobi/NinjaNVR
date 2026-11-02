@@ -7,7 +7,6 @@ use base64::Engine;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
-use rand::Rng;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -129,7 +128,7 @@ pub fn hash_password(password: &str, salt: Option<&str>, iterations: u32) -> Str
         Some(s) => s,
         None => {
             let mut bytes = [0u8; 16];
-            rand::thread_rng().fill(&mut bytes);
+            rand::fill(&mut bytes);
             owned_salt = bytes.iter().map(|b| format!("{b:02x}")).collect();
             &owned_salt
         }
@@ -400,7 +399,7 @@ impl NinjaDatabase {
         }
 
         let mut bytes = [0u8; 16];
-        rand::thread_rng().fill(&mut bytes);
+        rand::fill(&mut bytes);
         let password: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let pw_hash = hash_password(&password, None, iterations);
 

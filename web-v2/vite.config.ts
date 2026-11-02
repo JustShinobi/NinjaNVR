@@ -12,9 +12,16 @@ export default defineConfig({
     chunkSizeWarningLimit: 650,
     rollupOptions: {
       output: {
-        manualChunks: {
-          hls: ["hls.js"],
-          vendor: ["react", "react-dom", "lucide-react"],
+        manualChunks(id) {
+          if (id.includes("node_modules/hls.js")) {
+            return "hls";
+          }
+          if (
+            id.includes("node_modules/react") ||
+            id.includes("node_modules/lucide-react")
+          ) {
+            return "vendor";
+          }
         },
       },
     },
