@@ -18,6 +18,7 @@ pub struct WsMessage {
 fn default_camera_activity_entry() -> Value {
     json!({
         "enabled": true,
+        "online": true,
         "motion": false,
         "objects": [],
         "count": 0,
@@ -112,6 +113,35 @@ impl CommsHub {
 
     pub fn publish_mqtt_bytes(&self, topic: &str, bytes: Vec<u8>, retain: bool) {
         let _ = self.mqtt_tx.send((topic.to_string(), bytes, retain));
+    }
+
+    /// Updates per-camera online/offline connectivity state and publishes `<camera>/available`
+    /// and `<camera>/status` (`"online"` / `"offline"`) over MQTT and WebSocket when changed.
+    /// Returns `true` if the state transitioned.
+    pub fn set_camera_availability(&self, camera: &str, online: bool) -> bool {
+        let (transitioned, snapshot_str) = {
+            let mut map = self
+                .camera_states
+                .write()
+                .expect("camera_states lock poisoned");
+            let entry = map
+                .entry(camera.to_string())
+                .or_insert_with(default_camera_activity_entry);
+            let prev = entry.get("online").and_then(|v| v.as_bool());
+            let changed = prev != Some(online);
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("online".to_string(), json!(online));
+            }
+            let s = serde_json::to_string(&*map).unwrap_or_else(|_| "{}".to_string());
+            (changed, s)
+        };
+        if transitioned {
+            let status_str = if online { "online" } else { "offline" };
+            self.publish_topic(&format!("{camera}/available"), status_str);
+            self.publish_topic(&format!("{camera}/status"), status_str);
+            self.publish_ws_only("camera_activity", snapshot_str);
+        }
+        transitioned
     }
 
     /// Updates live motion/object activity for a camera and broadcasts `camera_activity` to `/ws`.
@@ -332,5 +362,19 @@ mod tests {
         let snaps = hub.initial_ws_snapshots(&["front_door".to_string()]);
         assert!(!snaps.is_empty());
         assert!(snaps.last().unwrap().contains("1200"));
+
+        // Verify camera availability state transitions publish online/offline topics
+        assert!(hub.set_camera_availability("front_door", false));
+        let avail_msg = rx.recv().await.unwrap();
+        assert!(avail_msg.contains("front_door/available"));
+        assert!(avail_msg.contains("offline"));
+        let status_msg = rx.recv().await.unwrap();
+        assert!(status_msg.contains("front_door/status"));
+        assert!(status_msg.contains("offline"));
+        let _ = rx.recv().await.unwrap(); // camera_activity
+
+        // Duplicate state does not re-trigger transition
+        assert!(!hub.set_camera_availability("front_door", false));
+        assert!(hub.set_camera_availability("front_door", true));
     }
 }

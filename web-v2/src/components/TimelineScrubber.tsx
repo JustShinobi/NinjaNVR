@@ -718,6 +718,39 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     return null;
   }, [hoverTs, windowSegments]);
 
+  // Compute unrecorded offline gaps (> 25s) between consecutive recording segments
+  const offlineGaps = useMemo(() => {
+    if (windowSegments.length < 2) return [];
+    const sorted = [...windowSegments].sort((a, b) => a.start_time - b.start_time);
+    const gaps: Array<{ start_time: number; end_time: number; duration: number }> = [];
+    let prevEnd = sorted[0].end_time;
+    for (let i = 1; i < sorted.length; i++) {
+      const cur = sorted[i];
+      const gapDur = cur.start_time - prevEnd;
+      if (gapDur > 25) {
+        gaps.push({
+          start_time: prevEnd,
+          end_time: cur.start_time,
+          duration: Math.round(gapDur),
+        });
+      }
+      if (cur.end_time > prevEnd) {
+        prevEnd = cur.end_time;
+      }
+    }
+    return gaps;
+  }, [windowSegments]);
+
+  const hoveredGapOnTrack = useMemo(() => {
+    if (hoverTs === null || offlineGaps.length === 0) return null;
+    for (const g of offlineGaps) {
+      if (hoverTs >= g.start_time && hoverTs <= g.end_time) {
+        return g;
+      }
+    }
+    return null;
+  }, [hoverTs, offlineGaps]);
+
   const activeDaySummary = useMemo(
     () => daysSummary.find((d) => d.day === selectedDay) || daysSummary[0] || null,
     [daysSummary, selectedDay]
@@ -829,6 +862,29 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       }
     }
 
+    // 2b. Hatched red/amber offline gap bars between consecutive recording segments
+    for (const gap of offlineGaps) {
+      if (gap.end_time < winStart || gap.start_time > winEnd) continue;
+      const gx0 = Math.max(0, Math.min(w, ((gap.start_time - winStart) / windowSpanSec) * w));
+      const gx1 = Math.max(0, Math.min(w, ((gap.end_time - winStart) / windowSpanSec) * w));
+      const gw = Math.max(2, gx1 - gx0);
+      ctx.fillStyle = "rgba(239, 68, 68, 0.22)";
+      ctx.fillRect(gx0, h - 9, gw, 9);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(gx0, h - 9, gw, 9);
+      ctx.clip();
+      ctx.strokeStyle = "rgba(245, 158, 11, 0.65)";
+      ctx.lineWidth = 1;
+      for (let sx = gx0 - 9; sx < gx0 + gw + 9; sx += 6) {
+        ctx.beginPath();
+        ctx.moveTo(sx, h);
+        ctx.lineTo(sx + 7, h - 9);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
     // 3. Review event markers along upper track lane (top: 4px, height: 6px)
     for (const rev of visibleReviews) {
       const x0 = Math.max(0, Math.min(w, ((rev.start_time - winStart) / windowSpanSec) * w));
@@ -837,7 +893,16 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       ctx.fillStyle = rev.severity === "alert" ? "#ef4444" : "#f59e0b";
       ctx.fillRect(x0, 4, revW, 6);
     }
-  }, [trackWidth, ticks, windowSegments, visibleReviews, winStart, winEnd, windowSpanSec]);
+  }, [
+    trackWidth,
+    ticks,
+    windowSegments,
+    offlineGaps,
+    visibleReviews,
+    winStart,
+    winEnd,
+    windowSpanSec,
+  ]);
 
   const handleTriggerExport = async () => {
     setExportBusy(true);
@@ -1871,6 +1936,20 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   />
                 )}
                 <span>{formatFullDateTime(hoverTs)}</span>
+                {hoveredGapOnTrack && (
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: "var(--text-xs)",
+                      color: "var(--signal-alert-text)",
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    OFFLINE GAP: {formatHHMMSS(hoveredGapOnTrack.start_time)} –{" "}
+                    {formatHHMMSS(hoveredGapOnTrack.end_time)} (
+                    {formatDuration(hoveredGapOnTrack.duration)})
+                  </span>
+                )}
                 {hoveredSegmentOnTrack &&
                   hoveredSegmentOnTrack.dbfs !== undefined &&
                   hoveredSegmentOnTrack.dbfs !== 0 && (

@@ -187,6 +187,13 @@ impl VisionPipeline {
             .kill_on_drop(true);
 
             let Ok(mut child) = cmd.spawn() else {
+                if self.comms.set_camera_availability(&camera, false) {
+                    self.log_hub.push_frigate(
+                        "WARNING",
+                        &format!("ninjanvr.camera.{camera}"),
+                        "Camera stream went OFFLINE (decoder spawn failed)",
+                    );
+                }
                 warn!("Substream decoder for {camera} could not start; retrying in 15s");
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 continue;
@@ -228,6 +235,13 @@ impl VisionPipeline {
                 {
                     let now = unix_now_f64();
                     frame_count += 1;
+                    if frame_count == 1 && self.comms.set_camera_availability(&camera, true) {
+                        self.log_hub.push_frigate(
+                            "INFO",
+                            &format!("ninjanvr.camera.{camera}"),
+                            "Camera stream reconnected (ONLINE)",
+                        );
+                    }
 
                     let yuv_frame = YuvFrame {
                         camera: cam_arc.clone(),
@@ -418,6 +432,13 @@ impl VisionPipeline {
                     m.process_fps = 0.0;
                     m.detection_fps = 0.0;
                 }
+            }
+            if self.comms.set_camera_availability(&camera, false) {
+                self.log_hub.push_frigate(
+                    "WARNING",
+                    &format!("ninjanvr.camera.{camera}"),
+                    "Camera stream disconnected (OFFLINE)",
+                );
             }
             let _ = child.wait().await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
