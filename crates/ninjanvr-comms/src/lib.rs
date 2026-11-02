@@ -19,6 +19,7 @@ fn default_camera_activity_entry() -> Value {
     json!({
         "enabled": true,
         "online": true,
+        "night_mode": false,
         "motion": false,
         "objects": [],
         "count": 0,
@@ -152,6 +153,17 @@ impl CommsHub {
         objects: Vec<Value>,
         max_area: u32,
     ) {
+        self.update_camera_activity_with_night(camera, motion, objects, max_area, false);
+    }
+
+    pub fn update_camera_activity_with_night(
+        &self,
+        camera: &str,
+        motion: bool,
+        objects: Vec<Value>,
+        max_area: u32,
+        night_mode: bool,
+    ) {
         let snapshot_str = {
             let mut map = self
                 .camera_states
@@ -162,6 +174,7 @@ impl CommsHub {
                 .or_insert_with(default_camera_activity_entry);
             if let Some(obj) = entry.as_object_mut() {
                 obj.insert("motion".to_string(), json!(motion));
+                obj.insert("night_mode".to_string(), json!(night_mode));
                 obj.insert("count".to_string(), json!(objects.len()));
                 obj.insert("max_Area".to_string(), json!(max_area));
                 obj.insert("objects".to_string(), Value::Array(objects));

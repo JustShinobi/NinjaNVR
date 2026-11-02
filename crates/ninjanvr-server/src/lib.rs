@@ -1318,6 +1318,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         });
         let det_fps = m.map(|x| x.detection_fps).unwrap_or(0.0);
         let cam_pid = m.map(|x| x.pid).unwrap_or(pid);
+        let night_mode = m.map(|x| x.night_mode).unwrap_or(false);
         let last_frame_ts = m
             .map(|x| x.last_frame_ts)
             .filter(|&ts| ts > 0.0)
@@ -1350,6 +1351,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
                 "detection_fps": det_fps,
                 "detection_enabled": cam_cfg.detect.enabled,
                 "last_frame_ts": last_frame_ts,
+                "night_mode": night_mode,
                 "pid": pid,
                 "capture_pid": pid,
                 "ffmpeg_pid": cam_pid,
@@ -3450,6 +3452,7 @@ version: 0.18-0
                 detection_fps: 0.0,
                 pid: 123,
                 last_frame_ts: 1730500123.0,
+                night_mode: false,
             },
         );
 

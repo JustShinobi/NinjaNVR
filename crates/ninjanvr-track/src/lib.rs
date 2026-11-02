@@ -57,6 +57,8 @@ pub struct ByteTracker {
     frame_w: u32,
     frame_h: u32,
     min_initialized: u32,
+    min_initialized_night: u32,
+    night_mode: bool,
     max_disappeared: u32,
     stationary_threshold: u32,
     stationary_interval: u32,
@@ -92,11 +94,20 @@ impl ByteTracker {
             }
         }
 
+        let min_init = cfg.detect.min_initialized.max(1);
+        let min_init_night = cfg
+            .detect
+            .min_initialized_night
+            .unwrap_or(min_init + 2)
+            .max(min_init);
+
         Self {
             camera_name: camera_name.into(),
             frame_w: frame_w.max(1),
             frame_h: frame_h.max(1),
-            min_initialized: cfg.detect.min_initialized.max(1),
+            min_initialized: min_init,
+            min_initialized_night: min_init_night,
+            night_mode: false,
             max_disappeared: cfg.detect.max_disappeared.max(5),
             stationary_threshold: cfg.detect.stationary.threshold.max(10),
             stationary_interval: cfg.detect.stationary.interval.max(10),
@@ -108,10 +119,27 @@ impl ByteTracker {
         }
     }
 
+    pub fn set_night_mode(&mut self, night_mode: bool) {
+        self.night_mode = night_mode;
+    }
+
+    pub fn is_night_mode(&self) -> bool {
+        self.night_mode
+    }
+
+    fn effective_min_initialized(&self) -> u32 {
+        if self.night_mode {
+            self.min_initialized_night
+        } else {
+            self.min_initialized
+        }
+    }
+
     pub fn active_tracks(&self) -> impl Iterator<Item = &TrackedObject> {
+        let req_frames = self.effective_min_initialized();
         self.tracks
             .values()
-            .filter(|t| t.frames_tracked >= self.min_initialized && t.disappeared_frames == 0)
+            .filter(move |t| t.frames_tracked >= req_frames && t.disappeared_frames == 0)
     }
 
     pub fn non_stationary_boxes(&self, motion_boxes: &[BoundingBox]) -> Vec<BoundingBox> {
@@ -210,7 +238,13 @@ impl ByteTracker {
                 .objects
                 .filters
                 .get(&det.label)
-                .map(|f| f.threshold)
+                .map(|f| {
+                    if self.night_mode {
+                        f.night_threshold.unwrap_or(f.threshold)
+                    } else {
+                        f.threshold
+                    }
+                })
                 .unwrap_or(0.7);
             if det.score >= high_thresh {
                 high_dets.push(det);
@@ -276,12 +310,13 @@ impl ByteTracker {
 
         // 3. Handle unmatched tracks (preserving stationary tracks that were not in any scanned region,
         // and immediately dropping unconfirmed tentative tracks that missed their second frame)
+        let req_init = self.effective_min_initialized();
         let mut ended_tracks = Vec::new();
         for (t_idx, tid) in track_ids.iter().enumerate() {
             if !matched_tracks[t_idx] {
                 let mut drop_unconfirmed = false;
                 if let Some(trk) = self.tracks.get_mut(tid) {
-                    if trk.frames_tracked < self.min_initialized {
+                    if trk.frames_tracked < req_init {
                         drop_unconfirmed = true;
                     } else {
                         let was_scanned = scanned_regions.iter().any(|r| r.intersects(&trk.bbox));
@@ -296,7 +331,7 @@ impl ByteTracker {
                     self.tracks.remove(tid);
                 } else if self.tracks[tid].disappeared_frames > self.max_disappeared
                     && let Some(removed) = self.tracks.remove(tid)
-                    && removed.frames_tracked >= self.min_initialized
+                    && removed.frames_tracked >= req_init
                 {
                     ended_tracks.push(removed);
                 }
@@ -786,5 +821,48 @@ mod tests {
                 .entered_zones
                 .contains(&"driveway_entry".to_string())
         );
+    }
+
+    #[test]
+    fn night_ir_mode_suppresses_transient_two_frame_spider_flashes() {
+        let mut cam_cfg = CameraConfig {
+            enabled: true,
+            ffmpeg: Default::default(),
+            live: Default::default(),
+            detect: Default::default(),
+            record: Default::default(),
+            snapshots: Default::default(),
+            motion: Default::default(),
+            objects: Default::default(),
+            review: Default::default(),
+            zones: Default::default(),
+            lines: Default::default(),
+        };
+        cam_cfg.detect.min_initialized = 2;
+        cam_cfg.detect.min_initialized_night = Some(4);
+
+        let mut tracker = ByteTracker::new("front_door", 640, 360, &cam_cfg);
+        tracker.set_night_mode(true);
+        let reg = BoundingBox::new(0, 0, 640, 360);
+        let det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.78,
+            bbox: BoundingBox::new(100, 100, 180, 260),
+            region: reg,
+        };
+
+        // 2 frames (would confirm in daytime, but suppressed in IR night mode!)
+        let (a1, _) = tracker.update(10.0, std::slice::from_ref(&det), &[reg], &cam_cfg);
+        assert!(a1.is_empty());
+        let (a2, _) = tracker.update(10.2, std::slice::from_ref(&det), &[reg], &cam_cfg);
+        assert!(
+            a2.is_empty(),
+            "2-frame flash must be suppressed in night IR mode"
+        );
+
+        // Frame 3 & 4 confirm legitimate sustained object
+        let _ = tracker.update(10.4, std::slice::from_ref(&det), &[reg], &cam_cfg);
+        let (a4, _) = tracker.update(10.6, std::slice::from_ref(&det), &[reg], &cam_cfg);
+        assert_eq!(a4.len(), 1);
     }
 }

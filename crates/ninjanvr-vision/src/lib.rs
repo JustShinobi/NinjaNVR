@@ -851,6 +851,34 @@ pub fn encode_image_jpeg(img: &RgbImage) -> Result<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
+/// Detects Infrared (IR) / monochrome night mode directly from a YUV420p buffer's `U` and `V`
+/// chroma planes with near-zero CPU overhead. Returns `true` when the mean chroma deviation
+/// `|U - 128| + |V - 128| < 3.0`.
+pub fn is_monochrome_ir(yuv_data: &[u8], width: u32, height: u32) -> bool {
+    let y_len = (width as usize).saturating_mul(height as usize);
+    let uv_len = y_len / 4;
+    if uv_len == 0 || yuv_data.len() < y_len + uv_len * 2 {
+        return false;
+    }
+    let u_plane = &yuv_data[y_len..y_len + uv_len];
+    let v_plane = &yuv_data[y_len + uv_len..y_len + uv_len * 2];
+    let step = (uv_len / 512).max(1);
+    let mut total_dev: u64 = 0;
+    let mut samples: u64 = 0;
+    let mut idx = 0usize;
+    while idx < uv_len {
+        let u_dev = (u_plane[idx] as i32 - 128).unsigned_abs() as u64;
+        let v_dev = (v_plane[idx] as i32 - 128).unsigned_abs() as u64;
+        total_dev += u_dev + v_dev;
+        samples += 1;
+        idx += step;
+    }
+    if samples == 0 {
+        return false;
+    }
+    (total_dev as f64 / samples as f64) < 3.0
+}
+
 /// Draws 2px bounding boxes onto an existing `RgbImage` (e.g. a high-resolution main-stream frame).
 pub fn annotate_rgb_image_with_boxes(img: &mut RgbImage, boxes: &[(BoundingBox, [u8; 3])]) {
     let w = img.width();
@@ -943,5 +971,24 @@ mod tests {
 
         let uhd_box = sub_box.project_to_resolution(640, 360, 3840, 2160);
         assert_eq!(uhd_box, BoundingBox::new(960, 540, 1920, 1620));
+    }
+
+    #[test]
+    fn monochrome_ir_detector_distinguishes_color_vs_grayscale_yuv420p() {
+        let w = 320u32;
+        let h = 180u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+
+        // Grayscale IR frame: U = 128, V = 128
+        let mut ir_buf = vec![90u8; y_len + uv_len * 2];
+        ir_buf[y_len..].fill(128);
+        assert!(is_monochrome_ir(&ir_buf, w, h));
+
+        // Color daytime frame: U = 96, V = 165
+        let mut color_buf = vec![140u8; y_len + uv_len * 2];
+        color_buf[y_len..y_len + uv_len].fill(96);
+        color_buf[y_len + uv_len..].fill(165);
+        assert!(!is_monochrome_ir(&color_buf, w, h));
     }
 }

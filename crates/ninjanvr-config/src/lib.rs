@@ -210,6 +210,8 @@ pub struct DetectConfig {
     pub fps: u32,
     #[serde(default = "default_min_initialized")]
     pub min_initialized: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_initialized_night: Option<u32>,
     #[serde(default = "default_max_disappeared")]
     pub max_disappeared: u32,
     #[serde(default)]
@@ -240,6 +242,7 @@ impl Default for DetectConfig {
             height: default_detect_height(),
             fps: default_detect_fps(),
             min_initialized: default_min_initialized(),
+            min_initialized_night: None,
             max_disappeared: default_max_disappeared(),
             stationary: StationaryConfig::default(),
         }
@@ -617,6 +620,8 @@ pub struct ObjectFilterConfig {
     pub max_ratio: f32,
     #[serde(default = "default_filter_threshold")]
     pub threshold: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub night_threshold: Option<f32>,
     #[serde(default = "default_filter_min_score")]
     pub min_score: f32,
     #[serde(default)]
@@ -644,6 +649,7 @@ impl Default for ObjectFilterConfig {
             min_ratio: 0.0,
             max_ratio: default_max_ratio(),
             threshold: default_filter_threshold(),
+            night_threshold: None,
             min_score: default_filter_min_score(),
             mask: json!({}),
         }

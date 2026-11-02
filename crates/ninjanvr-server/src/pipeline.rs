@@ -13,8 +13,8 @@ use ninjanvr_media::{SharedActivityLedger, YuvFrame, resolve_ffmpeg_bin};
 use ninjanvr_track::{ByteTracker, TrackedObject, TriggerProvenance, should_replace_snapshot};
 use ninjanvr_vision::{
     BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, compute_inference_regions,
-    crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp, yuv420p_to_rgb_image,
-    yuv420p_to_rgb_image_scaled,
+    crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp, is_monochrome_ir,
+    yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -29,6 +29,7 @@ pub struct CameraRuntimeMetrics {
     pub detection_fps: f64,
     pub pid: u32,
     pub last_frame_ts: f64,
+    pub night_mode: bool,
 }
 
 pub type SharedCameraMetrics = Arc<RwLock<HashMap<String, CameraRuntimeMetrics>>>;
@@ -216,6 +217,7 @@ impl VisionPipeline {
                     detection_fps: 1.2,
                     pid: child_pid,
                     last_frame_ts: unix_now_f64(),
+                    night_mode: false,
                 },
             );
 
@@ -253,6 +255,8 @@ impl VisionPipeline {
                         height,
                         data: frame_data.clone(),
                     };
+                    let is_night_ir = is_monochrome_ir(&yuv_frame.data, width, height);
+                    tracker.set_night_mode(is_night_ir);
 
                     // 1. SIMD Motion Detection on Y-plane
                     let motion_boxes = motion_detector.detect(&yuv_frame);
@@ -348,8 +352,13 @@ impl VisionPipeline {
                                 })
                             })
                             .collect();
-                        self.comms
-                            .update_camera_activity(&camera, motion_on, objs_json, max_area);
+                        self.comms.update_camera_activity_with_night(
+                            &camera,
+                            motion_on,
+                            objs_json,
+                            max_area,
+                            is_night_ir,
+                        );
                     }
 
                     // 5. Record activity into in-memory ring buffer for RecordingEngine
@@ -419,6 +428,7 @@ impl VisionPipeline {
                                 detection_fps: d_fps,
                                 pid: child_pid,
                                 last_frame_ts: now,
+                                night_mode: is_night_ir,
                             },
                         );
                         frame_count = 0;
