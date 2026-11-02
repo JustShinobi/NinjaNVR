@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd -- "$repo_root"
+
+remote_name="${1:-origin}"
+zero_sha="0000000000000000000000000000000000000000"
+run_full_verify=0
+
+echo "==> [pre-push] Validating push to '$remote_name'..."
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [[ -z "${local_ref:-}" ]] && continue
+
+  # 1. Block deletion of protected branches (main, dev)
+  if [[ "$local_sha" == "$zero_sha" ]]; then
+    if [[ "$remote_ref" == "refs/heads/main" || "$remote_ref" == "refs/heads/dev" ]]; then
+      echo "ERROR [pre-push]: Deleting protected branch '$remote_ref' is forbidden." >&2
+      exit 1
+    fi
+    continue
+  fi
+
+  # 2. Block non-fast-forward (force) pushes to main and dev
+  if [[ "$remote_ref" == "refs/heads/main" || "$remote_ref" == "refs/heads/dev" ]]; then
+    if [[ "$remote_sha" != "$zero_sha" ]]; then
+      if ! git merge-base --is-ancestor "$remote_sha" "$local_sha"; then
+        echo "ERROR [pre-push]: Force-push (non-fast-forward) to '$remote_ref' is forbidden." >&2
+        echo "  Remote commit $remote_sha is not an ancestor of $local_sha." >&2
+        exit 1
+      fi
+    fi
+  fi
+
+  # 3. Protect SemVer tags (v*): only ./scripts/ci/cut-release may push release tags
+  if [[ "$remote_ref" == refs/tags/* ]]; then
+    tag_name="${remote_ref#refs/tags/}"
+    if [[ ! "$tag_name" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+      echo "ERROR [pre-push]: Tag '$tag_name' does not match strict SemVer (vX.Y.Z or vX.Y.Z-rc.N)." >&2
+      exit 1
+    fi
+    if [[ "${NINJANVR_RELEASE_BOT:-0}" != "1" && "${CI:-false}" != "true" && "${NINJANVR_ALLOW_TAG_PUSH:-0}" != "1" ]]; then
+      echo "ERROR [pre-push]: Manual tag push ($tag_name) is blocked." >&2
+      echo "  SemVer tags and releases are created automatically by ./scripts/ci/cut-release in CI." >&2
+      exit 1
+    fi
+    continue
+  fi
+
+  # 4. Enforce Two-Track Promotion Flow (dev -> main): block direct feature commits onto main
+  if [[ "$remote_ref" == "refs/heads/main" ]]; then
+    if [[ "${NINJANVR_RELEASE_BOT:-0}" != "1" && "${CI:-false}" != "true" && "${NINJANVR_ALLOW_MAIN_PUSH:-0}" != "1" ]]; then
+      if git rev-parse --verify --quiet "refs/remotes/${remote_name}/dev" >/dev/null; then
+        origin_dev_sha="$(git rev-parse "refs/remotes/${remote_name}/dev")"
+        is_ff_from_dev=0
+        if git merge-base --is-ancestor "$local_sha" "$origin_dev_sha"; then
+          is_ff_from_dev=1
+        fi
+        # Also allow a merge commit on main whose second parent is origin/dev
+        second_parent="$(git rev-parse --verify --quiet "${local_sha}^2" || true)"
+        if [[ -n "$second_parent" ]] && git merge-base --is-ancestor "$second_parent" "$origin_dev_sha"; then
+          is_ff_from_dev=1
+        fi
+        if [[ "$is_ff_from_dev" -ne 1 ]]; then
+          echo "ERROR [pre-push]: Direct commits to 'main' bypassing 'dev' are blocked." >&2
+          echo "  All development and PRs must target 'dev' first, then promote 'dev' -> 'main'." >&2
+          echo "  (Set NINJANVR_ALLOW_MAIN_PUSH=1 only for emergency main hotfixes.)" >&2
+          exit 1
+        fi
+      fi
+    fi
+  fi
+
+  # 5. Audit all commit messages in the pushed range (catches --no-verify commits)
+  if [[ "$remote_sha" == "$zero_sha" ]]; then
+    if git rev-parse --verify --quiet "refs/remotes/${remote_name}/dev" >/dev/null; then
+      rev_range="refs/remotes/${remote_name}/dev..${local_sha}"
+    else
+      rev_range="${local_sha}"
+    fi
+  else
+    rev_range="${remote_sha}..${local_sha}"
+  fi
+
+  ./scripts/ci/check-commit-msg --range "$rev_range"
+  run_full_verify=1
+done
+
+# 6. Run full workspace verification gate before pushing branch commits
+if [[ "$run_full_verify" -eq 1 && "${NINJANVR_RELEASE_BOT:-0}" != "1" ]]; then
+  echo "==> [pre-push] Running full verification suite (./scripts/ci/verify)..."
+  ./scripts/ci/verify
+fi
+
+echo "==> [pre-push] Push checks passed."

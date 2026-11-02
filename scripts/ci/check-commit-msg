@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""
+Validates commit messages against NinjaNVR Conventional Commits and SemVer standards:
+- Format: <type>(<scope>)[!]: <description>
+- Allowed types: feat, fix, perf, refactor, docs, ci, chore, test, build, style, revert
+- Scope is mandatory for new commits and must match [a-z0-9][a-z0-9_,-]*
+  (e.g. feat(ui-v2): ..., fix(vision): ..., ci(release): ...)
+- Subject length: 12..120 characters, no trailing period, no WIP/todo/fixup markers.
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ALLOWED_TYPES = (
+    "feat",
+    "fix",
+    "perf",
+    "refactor",
+    "docs",
+    "ci",
+    "chore",
+    "test",
+    "build",
+    "style",
+    "revert",
+)
+
+STRICT_HEADER_RE = re.compile(
+    rf"^({'|'.join(ALLOWED_TYPES)})\(([a-z0-9][a-z0-9_,-]*)\)(!)?:\s+([^\s].*)$"
+)
+RELEASE_COMMIT_RE = re.compile(r"^chore\(release\): v\d+\.\d+\.\d+(-rc\.\d+)?(\s+\[skip ci\])?$")
+MERGE_COMMIT_RE = re.compile(
+    r"^Merge (branch|remote-tracking branch|pull request) "
+)
+FORBIDDEN_WORDS_RE = re.compile(
+    r"\b(wip|todo|fixme|xxx|hack|temp commit)\b|^(fixup!|squash!|amend!)",
+    re.IGNORECASE,
+)
+
+
+def validate_message(raw_message: str, source_label: str = "commit") -> list[str]:
+    errors: list[str] = []
+    lines = [
+        ln
+        for ln in raw_message.splitlines()
+        if not ln.lstrip().startswith("#")
+    ]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    if not lines:
+        return [f"[{source_label}] Commit message cannot be empty."]
+
+    header = lines[0].strip()
+
+    if RELEASE_COMMIT_RE.match(header) or MERGE_COMMIT_RE.match(header):
+        return []
+
+    m = STRICT_HEADER_RE.match(header)
+    if not m:
+        errors.append(
+            f"[{source_label}] Invalid header: '{header}'\n"
+            "  Expected Conventional Commit with scope: <type>(<scope>): <description>\n"
+            f"  Allowed types: {', '.join(ALLOWED_TYPES)}\n"
+            "  Scope format: lowercase alphanumeric, '-', '_', or ',' (e.g. feat(ui-v2): ..., fix(vision): ...)\n"
+            "  SemVer impact: feat/fix/perf increment the next release version in ./scripts/ci/cut-release."
+        )
+        return errors
+
+    _commit_type, _scope, _breaking, description = m.groups()
+
+    if len(header) < 12:
+        errors.append(
+            f"[{source_label}] Header too short ({len(header)} chars, min 12): '{header}'"
+        )
+    if len(header) > 120:
+        errors.append(
+            f"[{source_label}] Header too long ({len(header)} chars, max 120): '{header}'"
+        )
+    if len(description.strip()) < 5:
+        errors.append(
+            f"[{source_label}] Description after '<type>(<scope>): ' must be at least 5 characters."
+        )
+    if description.rstrip().endswith("."):
+        errors.append(
+            f"[{source_label}] Header description must not end with a period ('.'): '{header}'"
+        )
+    if FORBIDDEN_WORDS_RE.search(header):
+        errors.append(
+            f"[{source_label}] Header contains forbidden WIP/placeholder marker: '{header}'"
+        )
+
+    if len(lines) > 1 and lines[1].strip() != "":
+        errors.append(
+            f"[{source_label}] Second line of commit message must be blank (separating header and body)."
+        )
+
+    return errors
+
+
+def check_file(path: Path) -> int:
+    msg = path.read_text(encoding="utf-8")
+    errors = validate_message(msg, "commit-msg")
+    if errors:
+        print("ERROR [check-commit-msg]: Commit rejected due to standard violations:", file=sys.stderr)
+        for err in errors:
+            print(f"  - {err}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def check_range(rev_range: str) -> int:
+    # Exclude commits already present on origin/main or origin/dev so historical commits
+    # already in the shared branches never block merges/promotions.
+    cmd = ["git", "rev-list", "--no-merges", rev_range]
+    for existing_ref in ("refs/remotes/origin/main", "refs/remotes/origin/dev"):
+        ref_check = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", existing_ref],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if ref_check.returncode == 0 and not rev_range.endswith(existing_ref):
+            cmd.append(f"^{existing_ref}")
+
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        # Fallback to direct rev-list if exclusions are not applicable
+        res = subprocess.run(
+            ["git", "rev-list", "--no-merges", rev_range],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    shas = [s.strip() for s in res.stdout.splitlines() if s.strip()]
+    if not shas:
+        print(f"==> Commit message check passed (0 new commits in {rev_range}).")
+        return 0
+
+    all_errors: list[str] = []
+    for sha in shas:
+        msg = subprocess.run(
+            ["git", "log", "-1", "--format=%B", sha],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        short_sha = sha[:7]
+        all_errors.extend(validate_message(msg, short_sha))
+
+    if all_errors:
+        print("ERROR [check-commit-msg]: One or more commits violate repository standards:", file=sys.stderr)
+        for err in all_errors:
+            print(f"  - {err}", file=sys.stderr)
+        return 1
+
+    print(f"==> Commit message check passed ({len(shas)} commit(s) verified).")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Validate Conventional Commit messages.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--file", type=Path, help="Path to commit-msg file.")
+    group.add_argument("--range", dest="rev_range", help="Git revision range to validate.")
+    args = parser.parse_args()
+
+    if args.file:
+        return check_file(args.file)
+    return check_range(args.rev_range)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

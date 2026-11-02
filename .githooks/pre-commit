@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd -- "$repo_root"
+
+echo "==> [pre-commit] Running NinjaNVR pre-commit guardrails..."
+
+# 1. Privacy and repository hygiene check
+./scripts/ci/check-privacy
+
+# 2. SemVer and release manifest invariant check
+./scripts/ci/check-semver --staged
+
+# If invoked by the automated release bot during cut-release, skip heavy build checks
+if [[ "${NINJANVR_RELEASE_BOT:-0}" == "1" ]]; then
+  echo "==> [pre-commit] Release bot commit verified."
+  exit 0
+fi
+
+staged_files="$(git diff --cached --name-only --diff-filter=ACMR)"
+if [[ -z "$staged_files" ]]; then
+  exit 0
+fi
+
+# 3. Block forbidden secret, database, cache, and build artifact files from being staged
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+  case "$file" in
+    .env|.env.*)
+      if [[ "$file" != ".env.example" ]]; then
+        echo "ERROR [pre-commit]: Forbidden environment file staged: $file" >&2
+        exit 1
+      fi
+      ;;
+    *.pem|*.key|*.p12|*.pfx|*.db|*.db-shm|*.db-wal|*.pyc)
+      echo "ERROR [pre-commit]: Forbidden secret, database, or bytecode file staged: $file" >&2
+      exit 1
+      ;;
+    DESIGN.md|CLAUDE.md|web-v2/dist/*|docs/.vitepress/dist/*|docs/.vitepress/cache/*|*/__pycache__/*|__pycache__/*)
+      echo "ERROR [pre-commit]: Forbidden artifact or untracked file staged: $file" >&2
+      exit 1
+      ;;
+  esac
+
+  # Ensure scripts in .githooks/ and scripts/ci/ are executable when staged
+  case "$file" in
+    .githooks/*|scripts/ci/*)
+      if [[ -f "$file" && ! -x "$file" ]]; then
+        echo "ERROR [pre-commit]: Script '$file' must be executable (chmod +x $file)." >&2
+        exit 1
+      fi
+      ;;
+  esac
+done <<< "$staged_files"
+
+# 4. Block unresolved git merge conflict markers in staged contents
+conflict_matches="$(git diff --cached -U0 | grep -E '^\+(<<<<<<<|=======|>>>>>>>)(\s|$)' || true)"
+if [[ -n "$conflict_matches" ]]; then
+  echo "ERROR [pre-commit]: Unresolved merge conflict markers detected in staged changes:" >&2
+  echo "$conflict_matches" >&2
+  exit 1
+fi
+
+# 5. Targeted fast verification based on staged file types
+has_rust=0
+has_web=0
+has_docs=0
+py_files=()
+sh_files=()
+
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+  case "$file" in
+    *.rs|Cargo.toml|Cargo.lock)
+      has_rust=1
+      ;;
+  esac
+  case "$file" in
+    web-v2/*)
+      has_web=1
+      ;;
+  esac
+  case "$file" in
+    docs/*)
+      has_docs=1
+      ;;
+  esac
+  case "$file" in
+    *.py|scripts/ci/cut-release|scripts/ci/check-semver|scripts/ci/check-commit-msg)
+      [[ -f "$file" ]] && py_files+=("$file")
+      ;;
+  esac
+  case "$file" in
+    *.sh|.githooks/*|scripts/ci/verify|scripts/ci/check-privacy|scripts/ci/install-hooks)
+      [[ -f "$file" ]] && sh_files+=("$file")
+      ;;
+  esac
+done <<< "$staged_files"
+
+if [[ "${#py_files[@]}" -gt 0 ]]; then
+  echo "==> [pre-commit] Checking Python syntax (${py_files[*]})..."
+  python3 -m py_compile "${py_files[@]}"
+fi
+
+if [[ "${#sh_files[@]}" -gt 0 ]]; then
+  echo "==> [pre-commit] Checking Bash syntax (${sh_files[*]})..."
+  bash -n "${sh_files[@]}"
+fi
+
+if [[ "$has_rust" -eq 1 ]]; then
+  echo "==> [pre-commit] Verifying Rust formatting and Clippy..."
+  cargo fmt --all -- --check
+  cargo clippy --workspace --all-targets -- -D warnings
+fi
+
+if [[ "$has_web" -eq 1 ]]; then
+  echo "==> [pre-commit] Verifying web-v2 TypeScript types..."
+  bun run --cwd web-v2 typecheck
+fi
+
+if [[ "$has_docs" -eq 1 ]]; then
+  echo "==> [pre-commit] Verifying VitePress documentation build..."
+  bun run --cwd docs build
+fi
+
+echo "==> [pre-commit] All pre-commit checks passed."

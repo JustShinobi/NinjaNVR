@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+cd -- "$repo_root"
+
+quiet=0
+if [[ "${1:-}" == "--quiet" || "${1:-}" == "-q" ]]; then
+  quiet=1
+fi
+
+chmod +x .githooks/pre-commit .githooks/commit-msg .githooks/pre-push
+chmod +x scripts/ci/verify scripts/ci/check-privacy scripts/ci/check-semver scripts/ci/check-commit-msg scripts/ci/cut-release scripts/ci/install-hooks
+
+current_hooks_path="$(git config --get core.hooksPath || true)"
+if [[ "$current_hooks_path" != ".githooks" ]]; then
+  git config core.hooksPath .githooks
+fi
+
+if [[ "$quiet" -eq 0 ]]; then
+  echo "==> Git hooks installed and active (core.hooksPath = $(git config --get core.hooksPath))."
+  echo "    - .githooks/pre-commit  (privacy, secrets, SemVer manifest lock, rustfmt/clippy/typecheck)"
+  echo "    - .githooks/commit-msg  (Conventional Commits + scope + anti-WIP validation)"
+  echo "    - .githooks/pre-push    (branch/tag/force-push guardrails + commit audit + make verify)"
+fi
