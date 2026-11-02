@@ -3,6 +3,7 @@ import { useI18n } from "./i18n";
 import {
   EventItem,
   ExportItem,
+  FfprobeItem,
   NinjaConfigResponse,
   RecordingDaySummary,
   RecordingSegment,
@@ -85,7 +86,7 @@ export const App: React.FC = () => {
   const [inspectorCam, setInspectorCam] = useState<string>("escritorio");
   const [rawYaml, setRawYaml] = useState<string>("");
   const [draftPoints, setDraftPoints] = useState<Array<[number, number]>>([]);
-  const [ffprobeInfo, setFfprobeInfo] = useState<unknown[] | null>(null);
+  const [ffprobeInfo, setFfprobeInfo] = useState<FfprobeItem[] | null>(null);
 
   // System & Logs state
   const [logService, setLogService] = useState<"frigate" | "go2rtc" | "nginx">("frigate");
@@ -164,6 +165,12 @@ export const App: React.FC = () => {
         if (cams.length > 0 && !cams.includes(selectedCamera)) {
           setSelectedCamera(cams[0]);
         }
+        if (cams.length > 0 && !cams.includes(inspectorCam)) {
+          setInspectorCam(cams[0]);
+        }
+        if (cams.length > 0 && !cams.includes(exportCam)) {
+          setExportCam(cams[0]);
+        }
       }
       if (statsRes.ok) {
         setStats(await statsRes.json());
@@ -185,6 +192,8 @@ export const App: React.FC = () => {
     }
   }, [
     selectedCamera,
+    inspectorCam,
+    exportCam,
     activeReview,
     reviewDateFilter,
     setConfig,
@@ -469,15 +478,19 @@ export const App: React.FC = () => {
       credentials: "include",
       body: rawYaml,
     });
-    if (res.ok) {
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success !== false) {
+      if (saveOption === "restart") {
+        await fetch("/api/restart", { method: "POST", credentials: "include" });
+      }
       notify(
         saveOption === "restart"
           ? "Configuration saved and NinjaNVR restarted"
           : "Configuration saved to disk"
       );
-      fetchCoreData();
+      await fetchCoreData();
     } else {
-      notify("Failed to validate/save YAML configuration");
+      notify(data.message || "Failed to validate/save YAML configuration");
     }
   };
 
@@ -711,7 +724,7 @@ export const App: React.FC = () => {
               <span
                 className="mono"
                 style={{
-                  fontSize: 10,
+                  fontSize: "var(--text-xs)",
                   padding: "1px 5px",
                   background: "rgba(14, 165, 233, 0.16)",
                   border: "1px solid rgba(14, 165, 233, 0.45)",
@@ -951,6 +964,7 @@ export const App: React.FC = () => {
           <ZonesWorkspace
             cameraNames={cameraNames}
             config={config}
+            setConfig={setConfig}
             zonesSubTab={zonesSubTab}
             setZonesSubTab={setZonesSubTab}
             inspectorCam={inspectorCam}

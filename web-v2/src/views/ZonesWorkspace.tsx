@@ -1,12 +1,46 @@
-import React from "react";
-import { Copy, Eye } from "lucide-react";
+import React, { useEffect, useState } from "react";
+import {
+  Camera,
+  CheckCircle2,
+  Copy,
+  Cpu,
+  Crosshair,
+  FileCode,
+  HardDrive,
+  RotateCcw,
+  Save,
+  Shield,
+  Sliders,
+} from "lucide-react";
 import { useI18n } from "../i18n";
-import { NinjaConfigResponse } from "../types/nvr";
-import { LiveMsePlayer, extractMaskPolygons } from "../components/VideoPlayers";
+import { FfprobeItem, NinjaConfigResponse } from "../types/nvr";
+import { buildCleanYamlFromDraft } from "../utils/configYaml";
+import {
+  ChannelsStreamsSection,
+  ConsoleUiSection,
+} from "./settings/ConsoleAndStreamsPanels";
+import {
+  AiDetectionObjectsSection,
+  VisionZonesMotionSection,
+} from "./settings/VisionAndAiPanels";
+import {
+  CommsAuthUsersSection,
+  RecordingReviewSection,
+} from "./settings/RecordingAndSecurityPanels";
+
+export type SettingsCategory =
+  | "console"
+  | "channels"
+  | "vision"
+  | "ai"
+  | "recording"
+  | "security"
+  | "yaml";
 
 interface ZonesWorkspaceProps {
   cameraNames: string[];
   config: NinjaConfigResponse | null;
+  setConfig: (cfg: NinjaConfigResponse | null) => void;
   zonesSubTab: "visual" | "yaml";
   setZonesSubTab: (tab: "visual" | "yaml") => void;
   inspectorCam: string;
@@ -15,7 +49,7 @@ interface ZonesWorkspaceProps {
   setRawYaml: (yaml: string) => void;
   draftPoints: Array<[number, number]>;
   setDraftPoints: React.Dispatch<React.SetStateAction<Array<[number, number]>>>;
-  ffprobeInfo: unknown[] | null;
+  ffprobeInfo: FfprobeItem[] | null;
   handleSaveConfig: (saveOption: "saveonly" | "restart") => Promise<void>;
   notify: (msg: string) => void;
 }
@@ -23,6 +57,7 @@ interface ZonesWorkspaceProps {
 export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   cameraNames,
   config,
+  setConfig,
   zonesSubTab,
   setZonesSubTab,
   inspectorCam,
@@ -35,291 +70,518 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   handleSaveConfig,
   notify,
 }) => {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const isPt = locale === "pt";
+  const [activeCategory, setActiveCategory] = useState<SettingsCategory>(() =>
+    zonesSubTab === "yaml" ? "yaml" : "vision"
+  );
+  const [scope, setScope] = useState<"global" | string>("camera");
+  const [draftConfig, setDraftConfig] = useState<NinjaConfigResponse | null>(null);
+  const [baselineYaml, setBaselineYaml] = useState<string>("");
+  const [isDirty, setIsDirty] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+
+  // Sync incoming config into draftConfig when no local unsaved changes exist
+  useEffect(() => {
+    if (config && !isDirty) {
+      setDraftConfig(JSON.parse(JSON.stringify(config)));
+    }
+  }, [config, isDirty]);
+
+  useEffect(() => {
+    if (rawYaml && !baselineYaml) {
+      setBaselineYaml(rawYaml);
+    }
+  }, [rawYaml, baselineYaml]);
+
+  const updateDraft = (updater: (next: NinjaConfigResponse) => void) => {
+    setDraftConfig((prev) => {
+      if (!prev) return prev;
+      const cloned: NinjaConfigResponse = JSON.parse(JSON.stringify(prev));
+      updater(cloned);
+      const nextYaml = buildCleanYamlFromDraft(cloned, baselineYaml || rawYaml);
+      setRawYaml(nextYaml);
+      return cloned;
+    });
+    setIsDirty(true);
+  };
+
+  const handleDiscardDraft = () => {
+    if (config) {
+      setDraftConfig(JSON.parse(JSON.stringify(config)));
+    }
+    if (baselineYaml) {
+      setRawYaml(baselineYaml);
+    }
+    setIsDirty(false);
+    notify(
+      isPt
+        ? "Alterações descartadas e restauradas ao estado salvo"
+        : "Reverted unsaved configuration changes"
+    );
+  };
+
+  const handleSaveStructured = async (restartAfter = false) => {
+    if (!draftConfig) return;
+    setIsSaving(true);
+    try {
+      const res = await fetch("/api/config/structured", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(draftConfig),
+      });
+
+      if (res.status === 404) {
+        // Fallback for pods running an older backend binary without /api/config/structured
+        const generatedYaml = buildCleanYamlFromDraft(
+          draftConfig,
+          baselineYaml || rawYaml
+        );
+        const saveRes = await fetch(
+          `/api/config/save?save_option=${restartAfter ? "restart" : "saveonly"}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "text/plain" },
+            credentials: "include",
+            body: generatedYaml,
+          }
+        );
+        const saveData = await saveRes.json().catch(() => ({}));
+        if (saveRes.ok && saveData.success !== false) {
+          setConfig(JSON.parse(JSON.stringify(draftConfig)));
+          setRawYaml(generatedYaml);
+          setBaselineYaml(generatedYaml);
+          setIsDirty(false);
+          if (restartAfter) {
+            await fetch("/api/restart", { method: "POST", credentials: "include" });
+          }
+          notify(
+            restartAfter
+              ? isPt
+                ? "Configuração salva e NVR reiniciado"
+                : "Configuration saved and NVR restart triggered"
+              : isPt
+              ? "Configuração salva em config.yml"
+              : "Configuration saved to config.yml"
+          );
+        } else {
+          notify(saveData.message || "Failed to save configuration");
+        }
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success !== false) {
+        if (data.config) {
+          setConfig(data.config);
+          setDraftConfig(JSON.parse(JSON.stringify(data.config)));
+        }
+        if (typeof data.raw_yaml === "string") {
+          setRawYaml(data.raw_yaml);
+          setBaselineYaml(data.raw_yaml);
+        }
+        setIsDirty(false);
+        if (restartAfter) {
+          await fetch("/api/restart", { method: "POST", credentials: "include" });
+          notify(
+            isPt
+              ? "Configuração salva e pipeline reiniciado"
+              : "Structured configuration saved and pipeline restart triggered"
+          );
+        } else {
+          notify(
+            isPt
+              ? "Configuração salva em config.yml"
+              : "Structured configuration saved to config.yml"
+          );
+        }
+      } else {
+        notify(data.message || "Failed to save structured configuration");
+      }
+    } catch {
+      notify("Network error while saving structured configuration");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const switchInspectorCamera = (cam: string) => {
+    setInspectorCam(cam);
+    setDraftPoints([]);
+  };
+
+  const selectCategory = (cat: SettingsCategory) => {
+    setActiveCategory(cat);
+    setZonesSubTab(cat === "yaml" ? "yaml" : "visual");
+  };
+
+  const allCamKeys = Object.keys(draftConfig?.cameras || {});
+  const displayCams = allCamKeys.length > 0 ? allCamKeys : cameraNames;
+  const supportsGlobalAndCamScope =
+    activeCategory === "ai" || activeCategory === "recording";
+  const supportsCameraOnlyBar =
+    activeCategory === "channels" || activeCategory === "vision";
+
+  const categories: Array<{
+    id: SettingsCategory;
+    num: string;
+    title: string;
+    sub: string;
+    icon: React.ReactNode;
+  }> = [
+    {
+      id: "console",
+      num: "01",
+      title: isPt ? "Console & Interface" : "Console & UI",
+      sub: isPt ? "Layout, HUD & Idioma" : "Layout, HUD & Regional",
+      icon: <Sliders size={14} />,
+    },
+    {
+      id: "channels",
+      num: "02",
+      title: isPt ? "Canais & Streams" : "Channels & Streams",
+      sub: `${displayCams.length} ${isPt ? "Câmeras" : "Cameras"} · go2rtc`,
+      icon: <Camera size={14} />,
+    },
+    {
+      id: "vision",
+      num: "03",
+      title: isPt ? "Zonas, Máscaras & Mov." : "Zones, Masks & Motion",
+      sub: isPt ? "Estúdio Vetorial & Tuner" : "Vector Studio & Tuner",
+      icon: <Crosshair size={14} />,
+    },
+    {
+      id: "ai",
+      num: "04",
+      title: isPt ? "IA & Filtros de Objeto" : "AI & Object Filters",
+      sub: "OpenVINO & ByteTrack",
+      icon: <Cpu size={14} />,
+    },
+    {
+      id: "recording",
+      num: "05",
+      title: isPt ? "Gravação & Revisão" : "Recording & Review",
+      sub: isPt ? "Retenção & Regras de Alerta" : "Retention & Alert Rules",
+      icon: <HardDrive size={14} />,
+    },
+    {
+      id: "security",
+      num: "06",
+      title: isPt ? "Comms, Auth & Usuários" : "Comms, Auth & Users",
+      sub: isPt ? "MQTT, TLS & Contas" : "MQTT, TLS & Accounts",
+      icon: <Shield size={14} />,
+    },
+    {
+      id: "yaml",
+      num: "07",
+      title: "Raw config.yml",
+      sub: isPt ? "Editor YAML Direto" : "Direct YAML Studio",
+      icon: <FileCode size={14} />,
+    },
+  ];
 
   return (
-    <>
-      <div className="nvr-subbar">
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <button
-            className={`nvr-btn ${zonesSubTab === "visual" ? "active" : ""}`}
-            onClick={() => setZonesSubTab("visual")}
-          >
-            <Eye size={13} />
-            {t.zones.visualTab}
-          </button>
-          <button
-            className={`nvr-btn ${zonesSubTab === "yaml" ? "active" : ""}`}
-            onClick={() => setZonesSubTab("yaml")}
-          >
-            {t.zones.yamlTab}
-          </button>
-
-          {zonesSubTab === "visual" && (
-            <>
-              <span className="nvr-divider" aria-hidden="true" />
-              {cameraNames.map((cam) => (
-                <button
-                  key={cam}
-                  className={`nvr-btn mono ${inspectorCam === cam ? "active" : ""}`}
-                  style={{ textTransform: "uppercase" }}
-                  onClick={() => setInspectorCam(cam)}
-                >
-                  {cam}
-                </button>
-              ))}
-            </>
+    <div className="nvr-settings-shell">
+      {/* Left Tactical Category Navigation Rail */}
+      <aside className="nvr-settings-rail" aria-label="Settings Categories">
+        <div className="nvr-panel-header">
+          <span>{isPt ? "BANCADA DE CONFIGURAÇÕES" : "SETTINGS WORKBENCH"}</span>
+          {isDirty && (
+            <span
+              className="nvr-badge motion"
+              style={{ padding: "1px 5px", fontSize: "var(--text-xs)" }}
+            >
+              {isPt ? "NÃO SALVO" : "UNSAVED"}
+            </span>
           )}
         </div>
-
-        {zonesSubTab === "yaml" && (
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        {categories.map((cat) => {
+          const isActive = activeCategory === cat.id;
+          return (
             <button
-              className="nvr-btn"
-              onClick={() => {
-                navigator.clipboard?.writeText(rawYaml);
-                notify("Copied config.yml to clipboard");
-              }}
+              key={cat.id}
+              type="button"
+              className={`nvr-settings-nav-item ${isActive ? "active" : ""}`}
+              onClick={() => selectCategory(cat.id)}
             >
-              <Copy size={12} />
-              {t.zones.copyYaml}
-            </button>
-            <button
-              className="nvr-btn primary"
-              onClick={() => handleSaveConfig("saveonly")}
-            >
-              {t.zones.saveOnly}
-            </button>
-            <button
-              className="nvr-btn success"
-              onClick={() => handleSaveConfig("restart")}
-            >
-              {t.zones.saveAndRestart}
-            </button>
-          </div>
-        )}
-      </div>
-
-      {zonesSubTab === "visual" ? (
-        <div className="nvr-workbench">
-          <div className="nvr-panel">
-            <div className="nvr-panel-header">
-              <span>{inspectorCam.toUpperCase()} // POLYGON VECTORS</span>
-            </div>
-            <div className="nvr-scroll-y" style={{ padding: 12 }}>
-              <div
-                style={{
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 700,
-                  color: "var(--signal-motion-text)",
-                  marginBottom: 6,
-                }}
-              >
-                INTERACTIVE POLYGON BUILDER ({draftPoints.length} vertices)
-              </div>
-              <div
-                style={{
-                  padding: 8,
-                  background: "var(--bg-canvas)",
-                  border: "1px solid rgba(245, 158, 11, 0.4)",
-                  borderRadius: 3,
-                  marginBottom: 12,
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 6,
-                }}
-              >
-                <div style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  Click anywhere on the camera preview to plot normalized polygon vertices.
-                </div>
-                <div
+              <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+                <span
                   className="mono"
                   style={{
                     fontSize: "var(--text-xs)",
-                    color: "var(--signal-motion-text)",
-                    wordBreak: "break-all",
-                    padding: "4px 6px",
-                    background: "var(--bg-deep)",
-                    borderRadius: 2,
+                    color: isActive
+                      ? "var(--signal-accent-text)"
+                      : "var(--text-muted)",
+                    fontWeight: 700,
                   }}
                 >
-                  {draftPoints.length > 0
-                    ? draftPoints.map(([x, y]) => `${x.toFixed(3)},${y.toFixed(3)}`).join(",")
-                    : "0.010,0.010,0.340,0.010,0.340,0.080,0.010,0.080"}
-                </div>
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  <button
-                    className="nvr-btn"
-                    style={{ height: 22, fontSize: "var(--text-xs)" }}
-                    onClick={() =>
-                      setDraftPoints([
-                        [0.01, 0.01],
-                        [0.34, 0.01],
-                        [0.34, 0.08],
-                        [0.01, 0.08],
-                      ])
-                    }
-                  >
-                    Preset: OSD Clock Mask
-                  </button>
-                  <button
-                    className="nvr-btn primary"
-                    style={{ height: 22, fontSize: "var(--text-xs)" }}
-                    onClick={() => {
-                      const coords =
-                        draftPoints.length > 0
-                          ? draftPoints
-                              .map(([x, y]) => `${x.toFixed(3)},${y.toFixed(3)}`)
-                              .join(",")
-                          : "0.010,0.010,0.340,0.010,0.340,0.080,0.010,0.080";
-                      navigator.clipboard?.writeText(coords);
-                      notify("Copied normalized polygon coordinates to clipboard");
+                  {cat.num}
+                </span>
+                <div>
+                  <div
+                    style={{
+                      fontSize: "var(--text-sm)",
+                      fontWeight: 600,
+                      color: isActive
+                        ? "var(--text-primary)"
+                        : "var(--text-secondary)",
                     }}
                   >
-                    <Copy size={10} />
-                    Copy Coords
-                  </button>
-                  <button
-                    className="nvr-btn"
-                    style={{ height: 22, fontSize: "var(--text-xs)" }}
-                    disabled={draftPoints.length === 0}
-                    onClick={() => setDraftPoints((prev) => prev.slice(0, -1))}
-                  >
-                    Undo Point
-                  </button>
-                  <button
-                    className="nvr-btn danger"
-                    style={{ height: 22, fontSize: "var(--text-xs)" }}
-                    disabled={draftPoints.length === 0}
-                    onClick={() => setDraftPoints([])}
-                  >
-                    Clear
-                  </button>
-                </div>
-              </div>
-
-              <div
-                style={{
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 700,
-                  color: "var(--signal-alert-text)",
-                  marginBottom: 6,
-                }}
-              >
-                {t.zones.motionMasks} (
-                {extractMaskPolygons(config?.cameras?.[inspectorCam]?.motion?.mask).length})
-              </div>
-              {extractMaskPolygons(config?.cameras?.[inspectorCam]?.motion?.mask).map(
-                (m, idx) => (
+                    {cat.title}
+                  </div>
                   <div
-                    key={idx}
                     className="mono"
                     style={{
-                      padding: 8,
-                      background: "var(--bg-canvas)",
-                      border: "1px solid rgba(239, 68, 68, 0.35)",
-                      borderRadius: 3,
                       fontSize: "var(--text-xs)",
-                      marginBottom: 8,
-                      wordBreak: "break-all",
+                      color: "var(--text-muted)",
                     }}
                   >
-                    MASK #{idx + 1}: {m}
+                    {cat.sub}
                   </div>
-                )
-              )}
-
-              <div
-                style={{
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 700,
-                  color: "var(--signal-accent-text)",
-                  marginTop: 14,
-                  marginBottom: 6,
-                }}
-              >
-                {t.zones.detectionZones} (
-                {Object.keys(config?.cameras?.[inspectorCam]?.zones || {}).length})
+                </div>
               </div>
-              {Object.entries(config?.cameras?.[inspectorCam]?.zones || {}).map(
-                ([zName, zCfg]) => (
-                  <div
-                    key={zName}
-                    className="mono"
+              {cat.icon}
+            </button>
+          );
+        })}
+      </aside>
+
+      {/* Right Main Configuration Stage */}
+      <section className="nvr-settings-stage">
+        {/* Contextual Scope & Save Action Header */}
+        <div className="nvr-settings-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span
+              className="mono"
+              style={{
+                fontSize: "var(--text-xs)",
+                fontWeight: 700,
+                color: "var(--text-secondary)",
+                textTransform: "uppercase",
+              }}
+            >
+              {categories.find((c) => c.id === activeCategory)?.num} //{" "}
+              {categories.find((c) => c.id === activeCategory)?.title}
+            </span>
+
+            {supportsGlobalAndCamScope && (
+              <>
+                <span className="nvr-divider" aria-hidden="true" />
+                <button
+                  type="button"
+                  className={`nvr-btn mono ${scope === "global" ? "active" : ""}`}
+                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  onClick={() => setScope("global")}
+                >
+                  {isPt ? "PADRÃO GLOBAL" : "GLOBAL DEFAULTS"}
+                </button>
+                {displayCams.map((cam) => {
+                  const isCamScope = scope !== "global" && inspectorCam === cam;
+                  return (
+                    <button
+                      key={cam}
+                      type="button"
+                      className={`nvr-btn mono ${isCamScope ? "active" : ""}`}
+                      style={{
+                        height: 24,
+                        padding: "0 8px",
+                        fontSize: "var(--text-xs)",
+                        textTransform: "uppercase",
+                      }}
+                      onClick={() => {
+                        setScope("camera");
+                        switchInspectorCamera(cam);
+                      }}
+                    >
+                      {cam}
+                    </button>
+                  );
+                })}
+              </>
+            )}
+
+            {supportsCameraOnlyBar && (
+              <>
+                <span className="nvr-divider" aria-hidden="true" />
+                {displayCams.map((cam) => (
+                  <button
+                    key={cam}
+                    type="button"
+                    className={`nvr-btn mono ${inspectorCam === cam ? "active" : ""}`}
                     style={{
-                      padding: 8,
-                      background: "var(--bg-canvas)",
-                      border: "1px solid rgba(14, 165, 233, 0.35)",
-                      borderRadius: 3,
+                      height: 24,
+                      padding: "0 8px",
                       fontSize: "var(--text-xs)",
-                      marginBottom: 8,
-                      wordBreak: "break-all",
+                      textTransform: "uppercase",
                     }}
+                    onClick={() => switchInspectorCamera(cam)}
                   >
-                    <strong>{zName.toUpperCase()}</strong>: {zCfg.coordinates}
-                  </div>
-                )
-              )}
-
-              <div
-                style={{
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 700,
-                  color: "var(--signal-live-text)",
-                  marginTop: 14,
-                  marginBottom: 6,
-                }}
-              >
-                {t.zones.streamProbe}
-              </div>
-              <pre
-                className="mono"
-                style={{
-                  padding: 8,
-                  background: "var(--bg-canvas)",
-                  border: "1px solid var(--border-hairline)",
-                  borderRadius: 3,
-                  fontSize: "var(--text-xs)",
-                  overflowX: "auto",
-                }}
-              >
-                {JSON.stringify(ffprobeInfo, null, 2)}
-              </pre>
-            </div>
+                    {cam}
+                  </button>
+                ))}
+              </>
+            )}
           </div>
 
-          <div className="nvr-focus-stage">
-            <div className="nvr-cam-tile" style={{ flex: 1 }}>
-              <LiveMsePlayer
-                camera={inspectorCam}
-                useMainStream={false}
-                cameraConfig={config?.cameras?.[inspectorCam]}
-                showVectors={true}
-                draftPoints={draftPoints}
-                onPlotPoint={(nx, ny) => setDraftPoints((prev) => [...prev, [nx, ny]])}
-              />
-              <div className="nvr-cam-hud pos-top-right" style={{ pointerEvents: "none" }}>
-                <span className="nvr-badge live">
-                  {inspectorCam.toUpperCase()} // VECTORS ACTIVE
-                </span>
-                <span className="nvr-badge">
-                  CLICK VIDEO TO PLOT · RED MASK · CYAN ZONE · AMBER DRAFT
-                </span>
-              </div>
-            </div>
+          {/* Action Buttons */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            {activeCategory === "console" ? (
+              <span className="nvr-badge live">
+                <CheckCircle2 size={11} />
+                {isPt ? "SALVAMENTO AUTOMÁTICO" : "AUTO-SAVED IN BROWSER"}
+              </span>
+            ) : activeCategory === "yaml" ? (
+              <>
+                {isDirty && (
+                  <button
+                    type="button"
+                    className="nvr-btn"
+                    onClick={handleDiscardDraft}
+                    disabled={isSaving}
+                  >
+                    <RotateCcw size={12} />
+                    {isPt ? "Descartar" : "Discard"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="nvr-btn"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(rawYaml);
+                    notify("Copied config.yml to clipboard");
+                  }}
+                >
+                  <Copy size={12} />
+                  {t.zones.copyYaml}
+                </button>
+                <button
+                  type="button"
+                  className="nvr-btn primary"
+                  onClick={async () => {
+                    setIsDirty(false);
+                    setBaselineYaml(rawYaml);
+                    await handleSaveConfig("saveonly");
+                  }}
+                >
+                  {t.zones.saveOnly}
+                </button>
+                <button
+                  type="button"
+                  className="nvr-btn success"
+                  onClick={async () => {
+                    setIsDirty(false);
+                    setBaselineYaml(rawYaml);
+                    await handleSaveConfig("restart");
+                  }}
+                >
+                  {t.zones.saveAndRestart}
+                </button>
+              </>
+            ) : (
+              <>
+                {isDirty && (
+                  <button
+                    type="button"
+                    className="nvr-btn"
+                    onClick={handleDiscardDraft}
+                    disabled={isSaving}
+                  >
+                    <RotateCcw size={12} />
+                    {isPt ? "Descartar" : "Discard"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="nvr-btn primary"
+                  onClick={() => handleSaveStructured(false)}
+                  disabled={isSaving}
+                >
+                  <Save size={12} />
+                  {t.zones.saveOnly}
+                </button>
+                <button
+                  type="button"
+                  className="nvr-btn success"
+                  onClick={() => handleSaveStructured(true)}
+                  disabled={isSaving}
+                >
+                  {t.zones.saveAndRestart}
+                </button>
+              </>
+            )}
           </div>
         </div>
-      ) : (
-        <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
-          <textarea
-            className="nvr-code-editor"
-            value={rawYaml}
-            onChange={(e) => setRawYaml(e.target.value)}
-            spellCheck={false}
-            aria-label="config.yml editor"
+
+        {/* Main Body Content */}
+        {activeCategory === "yaml" ? (
+          <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+            <textarea
+              className="nvr-code-editor"
+              value={rawYaml}
+              onChange={(e) => {
+                setRawYaml(e.target.value);
+                setIsDirty(true);
+              }}
+              spellCheck={false}
+              aria-label="config.yml editor"
+            />
+          </div>
+        ) : activeCategory === "vision" && draftConfig ? (
+          <VisionZonesMotionSection
+            draftConfig={draftConfig}
+            updateDraft={updateDraft}
+            scope={inspectorCam}
+            inspectorCam={inspectorCam}
+            draftPoints={draftPoints}
+            setDraftPoints={setDraftPoints}
+            notify={notify}
           />
-        </div>
-      )}
-    </>
+        ) : (
+          <div className="nvr-settings-body">
+            {activeCategory === "console" && <ConsoleUiSection notify={notify} />}
+
+            {draftConfig && activeCategory === "channels" && (
+              <ChannelsStreamsSection
+                draftConfig={draftConfig}
+                updateDraft={updateDraft}
+                inspectorCam={inspectorCam}
+                setInspectorCam={switchInspectorCamera}
+                ffprobeInfo={ffprobeInfo}
+                notify={notify}
+              />
+            )}
+
+            {draftConfig && activeCategory === "ai" && (
+              <AiDetectionObjectsSection
+                draftConfig={draftConfig}
+                updateDraft={updateDraft}
+                scope={scope === "global" ? "global" : inspectorCam}
+                inspectorCam={inspectorCam}
+                notify={notify}
+              />
+            )}
+
+            {draftConfig && activeCategory === "recording" && (
+              <RecordingReviewSection
+                draftConfig={draftConfig}
+                updateDraft={updateDraft}
+                scope={scope === "global" ? "global" : inspectorCam}
+                inspectorCam={inspectorCam}
+                notify={notify}
+              />
+            )}
+
+            {draftConfig && activeCategory === "security" && (
+              <CommsAuthUsersSection
+                draftConfig={draftConfig}
+                updateDraft={updateDraft}
+                notify={notify}
+              />
+            )}
+          </div>
+        )}
+      </section>
+    </div>
   );
 };
