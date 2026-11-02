@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Calendar, ChevronDown, ChevronLeft, ChevronRight, Clock, X } from "lucide-react";
+import { useNvrStore } from "../store/useNvrStore";
 import { RecordingDaySummary } from "../types/nvr";
 
 interface RecordingCalendarPopoverProps {
@@ -15,7 +16,8 @@ interface RecordingCalendarPopoverProps {
   onClear?: () => void;
 }
 
-const WEEKDAYS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+const WEEKDAYS_SUN = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+const WEEKDAYS_MON = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 
 function formatReadableDate(dateStr: string): string {
   if (!dateStr) return "All Dates";
@@ -43,6 +45,8 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
 }) => {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const [isOpen, setIsOpen] = useState(false);
+  const firstWeekday = useNvrStore((s) => s.firstWeekday);
+  const weekdayLabels = firstWeekday === "monday" ? WEEKDAYS_MON : WEEKDAYS_SUN;
 
   // Month being viewed in the calendar grid
   const initialDate = useMemo(() => {
@@ -106,7 +110,9 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
 
   // Build calendar cells for (viewYear, viewMonth)
   const calendarCells = useMemo(() => {
-    const firstDayOfWeek = new Date(viewYear, viewMonth, 1).getDay(); // 0=Sun..6=Sat
+    const rawFirstDay = new Date(viewYear, viewMonth, 1).getDay(); // 0=Sun..6=Sat
+    const firstDayOfWeek =
+      firstWeekday === "monday" ? (rawFirstDay + 6) % 7 : rawFirstDay;
     const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
     const cells: Array<{
       dateStr: string;
@@ -128,7 +134,7 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
       });
     }
     return cells;
-  }, [viewYear, viewMonth, dayMap]);
+  }, [viewYear, viewMonth, dayMap, firstWeekday]);
 
   const monthTitle = useMemo(() => {
     return new Date(viewYear, viewMonth, 1).toLocaleDateString([], {
@@ -308,7 +314,7 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
               fontWeight: 600,
             }}
           >
-            {WEEKDAYS.map((w) => (
+            {weekdayLabels.map((w) => (
               <div key={w}>{w}</div>
             ))}
           </div>

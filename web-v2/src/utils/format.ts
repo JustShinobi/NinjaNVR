@@ -15,6 +15,7 @@ export type WorkspaceTab =
   | "system";
 
 export type LiveLayoutMode = "2x2" | "focus" | "single";
+export type FirstWeekday = "sunday" | "monday";
 
 export function resolveInitialTab(): WorkspaceTab {
   if (typeof window === "undefined") return "live";
@@ -41,6 +42,39 @@ export function resolveInitialHudPosition(): HudPosition {
     return saved;
   }
   return "bottom-right";
+}
+
+export function resolveInitialLiveLayout(): LiveLayoutMode {
+  if (typeof window === "undefined") return "2x2";
+  const saved = window.localStorage?.getItem("ninjanvr_live_layout");
+  if (saved === "2x2" || saved === "focus" || saved === "single") {
+    return saved;
+  }
+  return "2x2";
+}
+
+export function resolveInitialBool(key: string, fallback: boolean): boolean {
+  if (typeof window === "undefined") return fallback;
+  const saved = window.localStorage?.getItem(key);
+  if (saved === "true") return true;
+  if (saved === "false") return false;
+  return fallback;
+}
+
+export function resolveInitialPlaybackSpeed(): number {
+  if (typeof window === "undefined") return 1;
+  const saved = Number(window.localStorage?.getItem("ninjanvr_playback_speed"));
+  if (saved === 0.5 || saved === 1 || saved === 2 || saved === 4) {
+    return saved;
+  }
+  return 1;
+}
+
+export function resolveInitialFirstWeekday(): FirstWeekday {
+  if (typeof window === "undefined") return "sunday";
+  const saved = window.localStorage?.getItem("ninjanvr_first_weekday");
+  if (saved === "monday" || saved === "sunday") return saved;
+  return "sunday";
 }
 
 export function formatTs(unixSec: number): string {

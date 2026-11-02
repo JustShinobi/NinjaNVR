@@ -1,15 +1,92 @@
+export interface StationaryConfig {
+  interval: number;
+  threshold: number;
+  classifier: boolean;
+}
+
 export interface CameraDetectConfig {
   enabled: boolean;
   width: number;
   height: number;
   fps: number;
+  min_initialized?: number;
+  max_disappeared?: number;
+  stationary?: StationaryConfig;
 }
 
 export interface CameraMotionConfig {
   enabled: boolean;
   threshold: number;
+  lightning_threshold?: number;
+  improve_contrast?: boolean;
   contour_area: number;
+  delta_alpha?: number;
+  frame_alpha?: number;
+  frame_height?: number;
   mask: unknown;
+}
+
+export interface ObjectFilterConfig {
+  min_area: number;
+  max_area: number;
+  min_ratio: number;
+  max_ratio: number;
+  threshold: number;
+  min_score: number;
+  mask?: unknown;
+}
+
+export interface ObjectsConfig {
+  track: string[];
+  filters?: Record<string, ObjectFilterConfig>;
+  mask?: unknown;
+}
+
+export interface RetainPolicyConfig {
+  days: number;
+  mode: "all" | "motion" | "active_objects" | string;
+}
+
+export interface RecordEventRetainConfig {
+  pre_capture: number;
+  post_capture: number;
+  retain: RetainPolicyConfig;
+}
+
+export interface RecordConfig {
+  enabled: boolean;
+  expire_interval?: number;
+  continuous?: {
+    days: number;
+  };
+  motion?: {
+    days: number;
+  };
+  alerts?: RecordEventRetainConfig;
+  detections?: RecordEventRetainConfig;
+  preview?: {
+    quality: "very_low" | "low" | "medium" | "high" | "very_high" | string;
+  };
+}
+
+export interface SnapshotsConfig {
+  enabled: boolean;
+  timestamp?: boolean;
+  bounding_box?: boolean;
+  crop?: boolean;
+  quality?: number;
+}
+
+export interface ReviewSeverityConfig {
+  enabled: boolean;
+  labels?: string[];
+  required_zones: string[];
+  cutoff_time: number;
+}
+
+export interface ReviewConfig {
+  alerts: ReviewSeverityConfig;
+  detections: ReviewSeverityConfig;
 }
 
 export interface ZoneConfig {
@@ -19,26 +96,122 @@ export interface ZoneConfig {
   loitering_time?: number;
 }
 
+export interface CameraFfmpegInput {
+  path: string;
+  roles: string[];
+  input_args?: unknown;
+}
+
+export interface CameraFfmpegConfig {
+  inputs: CameraFfmpegInput[];
+  output_args?: unknown;
+}
+
+export interface CameraLiveConfig {
+  streams: Record<string, string>;
+  height: number;
+  quality: number;
+}
+
 export interface CameraConfig {
-  name: string;
+  name?: string;
   enabled: boolean;
+  ffmpeg?: CameraFfmpegConfig;
+  live?: CameraLiveConfig;
   detect: CameraDetectConfig;
   motion: CameraMotionConfig;
+  objects?: ObjectsConfig;
   zones: Record<string, ZoneConfig>;
-  record: {
-    enabled: boolean;
-  };
-  snapshots: {
-    enabled: boolean;
-  };
+  record: RecordConfig;
+  snapshots: SnapshotsConfig;
+  review?: ReviewConfig;
+}
+
+export interface DetectorEntryConfig {
+  type: string;
+  device: string;
+  model?: ModelConfig;
+}
+
+export interface ModelConfig {
+  path: string;
+  labelmap_path: string;
+  width: number;
+  height: number;
+  input_tensor: string;
+  input_pixel_format: string;
+  model_type: string;
+  labelmap?: Record<string, string>;
+}
+
+export interface MqttConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  topic_prefix: string;
+  client_id: string;
+  user?: string | null;
+  password?: string | null;
+  has_password?: boolean;
+  clear_password?: boolean;
+  stats_interval: number;
+}
+
+export interface AuthConfig {
+  enabled: boolean;
+  reset_admin_password: boolean;
+  cookie_name: string;
+  cookie_secure: boolean;
+  session_length: number;
+  refresh_time: number;
+  hash_iterations: number;
+  trusted_proxies: string[];
+  admin_first_time_login?: boolean;
 }
 
 export interface NinjaConfigResponse {
   version: string;
   safe_mode: boolean;
+  mqtt?: MqttConfig;
+  auth?: AuthConfig;
+  database?: {
+    path: string;
+  };
+  tls?: {
+    enabled: boolean;
+  };
+  detectors?: Record<string, DetectorEntryConfig>;
+  model?: ModelConfig;
+  detect?: CameraDetectConfig;
+  motion?: CameraMotionConfig;
+  objects?: ObjectsConfig;
+  record?: RecordConfig;
+  snapshots?: SnapshotsConfig;
+  review?: ReviewConfig;
+  go2rtc?: {
+    streams: Record<string, unknown>;
+  };
   cameras: Record<string, CameraConfig>;
-  objects?: {
-    track?: string[];
+}
+
+export interface UserAccountItem {
+  username: string;
+  role: "admin" | "viewer" | string;
+  password_changed_at?: string | null;
+}
+
+export interface FfprobeStreamEntry {
+  codec_long_name?: string;
+  width?: number;
+  height?: number;
+  avg_frame_rate?: string;
+}
+
+export interface FfprobeItem {
+  return_code: number;
+  stderr: string;
+  stdout?: {
+    streams?: FfprobeStreamEntry[];
   };
 }
 
@@ -178,11 +351,22 @@ export interface ExportItem {
 }
 
 export interface CameraLiveActivity {
+  enabled?: boolean;
   motion: boolean;
   objects: Array<{
     id: string;
     label: string;
     score: number;
     stationary: boolean;
+    area?: number;
+    ratio?: number;
   }>;
+  config?: {
+    record?: boolean;
+    detect?: boolean;
+    enabled?: boolean;
+    snapshots?: boolean;
+    alerts?: boolean;
+    detections?: boolean;
+  };
 }

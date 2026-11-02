@@ -74,6 +74,31 @@ export function parsePolygonPoints(
   return pairs.join(" ");
 }
 
+/**
+ * Converts a polygon coordinate string into normalized [x, y] vertex tuples (0..1) for interactive editing.
+ */
+export function coordStringToPoints(
+  coordStr: string,
+  detWidth: number,
+  detHeight: number
+): Array<[number, number]> {
+  const nums = coordStr
+    .split(",")
+    .map((s) => parseFloat(s.trim()))
+    .filter((n) => !Number.isNaN(n));
+  const out: Array<[number, number]> = [];
+  for (let i = 0; i + 1 < nums.length; i += 2) {
+    let x = nums[i];
+    let y = nums[i + 1];
+    if (x > 1.0 || y > 1.0) {
+      x = x / Math.max(1, detWidth);
+      y = y / Math.max(1, detHeight);
+    }
+    out.push([Math.max(0, Math.min(1, x)), Math.max(0, Math.min(1, y))]);
+  }
+  return out;
+}
+
 interface ContainedBox {
   left: number;
   top: number;
@@ -300,6 +325,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   }, [camera, useMainStream, updateOverlayGeometry]);
 
   const masks = extractMaskPolygons(cameraConfig?.motion?.mask);
+  const objectMasks = extractMaskPolygons(cameraConfig?.objects?.mask);
   const zones = cameraConfig?.zones || {};
 
   return (
@@ -391,6 +417,16 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
               stroke="#ef4444"
               strokeWidth="3"
               strokeDasharray="8 4"
+            />
+          ))}
+          {objectMasks.map((m, idx) => (
+            <polygon
+              key={`objmask-${idx}`}
+              points={parsePolygonPoints(m, detW, detH)}
+              fill="rgba(168, 85, 247, 0.22)"
+              stroke="#a855f7"
+              strokeWidth="3"
+              strokeDasharray="5 5"
             />
           ))}
           {Object.entries(zones).map(([zName, zCfg]) => (

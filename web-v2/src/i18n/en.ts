@@ -12,7 +12,7 @@ export const en = {
     review: "Review & Triage",
     explore: "Object Explore",
     exports: "Exports",
-    zones: "Zones & Config",
+    zones: "Settings & Studio",
     system: "System & Logs",
   },
   auth: {
@@ -104,7 +104,7 @@ export const en = {
     noExports: "No exported MP4 clips on disk. Use the generator or 1-click export from Live/Review.",
   },
   zones: {
-    title: "VECTOR ZONE / MASK INSPECTOR & YAML STUDIO",
+    title: "TACTICAL SETTINGS & CONFIGURATION STUDIO",
     visualTab: "Vector Mask & Zone Inspector",
     yamlTab: "Raw config.yml Studio",
     motionMasks: "Motion Mask Polygons",
@@ -126,6 +126,134 @@ export const en = {
     resumeStream: "Resume",
     copyLogs: "Copy Buffer",
   },
-} as const;
+};
 
-export type TranslationDict = typeof en;
+export interface TranslationDict {
+  brand: {
+    name: string;
+    release: string;
+    engine: string;
+    classicSwitch: string;
+    classicSwitchHint: string;
+  };
+  nav: {
+    live: string;
+    sync: string;
+    review: string;
+    explore: string;
+    exports: string;
+    zones: string;
+    system: string;
+  };
+  auth: {
+    title: string;
+    subtitle: string;
+    username: string;
+    password: string;
+    signIn: string;
+    signingIn: string;
+    signOut: string;
+    invalidCredentials: string;
+  };
+  live: {
+    grid2x2: string;
+    focusStage: string;
+    singleFull: string;
+    allCameras: string;
+    unreviewedAlerts: string;
+    hoverToPreview: string;
+    markReviewed: string;
+    markAllReviewed: string;
+    noPendingAlerts: string;
+    liveBadge: string;
+    timeShiftBadge: string;
+    returnToLive: string;
+    rewind10s: string;
+    rewind30s: string;
+    rewind2m: string;
+    export60s: string;
+    snapshot: string;
+    zonesOverlay: string;
+    hdStream: string;
+    subStream: string;
+    motionActive: string;
+    idleState: string;
+  };
+  sync: {
+    title: string;
+    subtitle: string;
+    masterClock: string;
+    jumpBack30: string;
+    jumpBack10: string;
+    jumpFwd10: string;
+    jumpFwd30: string;
+    recentIncidents: string;
+    syncLocked: string;
+  };
+  review: {
+    title: string;
+    alerts: string;
+    detections: string;
+    allSeverities: string;
+    unreviewedOnly: string;
+    reviewedOnly: string;
+    allStatuses: string;
+    markSelectedReviewed: string;
+    deleteSelected: string;
+    exportClip: string;
+    keyboardHint: string;
+    emptyState: string;
+  };
+  explore: {
+    title: string;
+    searchPlaceholder: string;
+    allLabels: string;
+    favoritesOnly: string;
+    topScore: string;
+    duration: string;
+    inProgress: string;
+    retainToggle: string;
+    falsePositive: string;
+    viewSnapshot: string;
+    playClip: string;
+  };
+  exports: {
+    title: string;
+    createTitle: string;
+    camera: string;
+    rangePreset: string;
+    last1m: string;
+    last5m: string;
+    last15m: string;
+    customName: string;
+    generateBtn: string;
+    archiveTitle: string;
+    downloadMp4: string;
+    renameBtn: string;
+    deleteBtn: string;
+    noExports: string;
+  };
+  zones: {
+    title: string;
+    visualTab: string;
+    yamlTab: string;
+    motionMasks: string;
+    detectionZones: string;
+    streamProbe: string;
+    saveOnly: string;
+    saveAndRestart: string;
+    copyYaml: string;
+  };
+  system: {
+    title: string;
+    detectorLatency: string;
+    cpuLoad: string;
+    memoryRss: string;
+    storageVolumes: string;
+    cameraHealth: string;
+    liveLogs: string;
+    pauseStream: string;
+    resumeStream: string;
+    copyLogs: string;
+  };
+}

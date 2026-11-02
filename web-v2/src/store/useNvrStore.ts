@@ -5,10 +5,15 @@ import {
   NinjaStatsResponse,
 } from "../types/nvr";
 import {
+  FirstWeekday,
   HudPosition,
   LiveLayoutMode,
   WorkspaceTab,
+  resolveInitialBool,
+  resolveInitialFirstWeekday,
   resolveInitialHudPosition,
+  resolveInitialLiveLayout,
+  resolveInitialPlaybackSpeed,
   resolveInitialTab,
 } from "../utils/format";
 
@@ -19,6 +24,8 @@ interface NvrRealtimeState {
   hudPosition: HudPosition;
   useMainStream: boolean;
   showVectors: boolean;
+  showAlertRibbon: boolean;
+  firstWeekday: FirstWeekday;
   timeShiftTs: number | null;
   playbackSpeed: number;
   wsOnline: boolean;
@@ -33,8 +40,11 @@ interface NvrRealtimeState {
   setHudPosition: (pos: HudPosition) => void;
   setUseMainStream: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
   setShowVectors: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
+  setShowAlertRibbon: (val: boolean) => void;
+  setFirstWeekday: (day: FirstWeekday) => void;
   setTimeShiftTs: (ts: number | null) => void;
   setPlaybackSpeed: (spd: number) => void;
+  resetUiPreferences: () => void;
   setWsOnline: (online: boolean) => void;
   setConfig: (config: NinjaConfigResponse | null) => void;
   setStats: (stats: NinjaStatsResponse | null) => void;
@@ -44,13 +54,15 @@ interface NvrRealtimeState {
 
 export const useNvrStore = create<NvrRealtimeState>((set) => ({
   activeTab: resolveInitialTab(),
-  liveLayout: "2x2",
+  liveLayout: resolveInitialLiveLayout(),
   selectedCamera: "escritorio",
   hudPosition: resolveInitialHudPosition(),
-  useMainStream: false,
-  showVectors: false,
+  useMainStream: resolveInitialBool("ninjanvr_use_main_stream", false),
+  showVectors: resolveInitialBool("ninjanvr_show_vectors", false),
+  showAlertRibbon: resolveInitialBool("ninjanvr_show_alert_ribbon", true),
+  firstWeekday: resolveInitialFirstWeekday(),
   timeShiftTs: null,
-  playbackSpeed: 1,
+  playbackSpeed: resolveInitialPlaybackSpeed(),
   wsOnline: false,
   config: null,
   stats: null,
@@ -58,7 +70,12 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
   cameraActivity: {},
 
   setActiveTab: (activeTab) => set({ activeTab }),
-  setLiveLayout: (liveLayout) => set({ liveLayout }),
+  setLiveLayout: (liveLayout) => {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem("ninjanvr_live_layout", liveLayout);
+    }
+    set({ liveLayout });
+  },
   setSelectedCamera: (selectedCamera) => set({ selectedCamera }),
   setHudPosition: (hudPosition) => {
     if (typeof window !== "undefined") {
@@ -67,15 +84,62 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
     set({ hudPosition });
   },
   setUseMainStream: (fnOrVal) =>
-    set((s) => ({
-      useMainStream: typeof fnOrVal === "function" ? fnOrVal(s.useMainStream) : fnOrVal,
-    })),
+    set((s) => {
+      const next = typeof fnOrVal === "function" ? fnOrVal(s.useMainStream) : fnOrVal;
+      if (typeof window !== "undefined") {
+        window.localStorage?.setItem("ninjanvr_use_main_stream", String(next));
+      }
+      return { useMainStream: next };
+    }),
   setShowVectors: (fnOrVal) =>
-    set((s) => ({
-      showVectors: typeof fnOrVal === "function" ? fnOrVal(s.showVectors) : fnOrVal,
-    })),
+    set((s) => {
+      const next = typeof fnOrVal === "function" ? fnOrVal(s.showVectors) : fnOrVal;
+      if (typeof window !== "undefined") {
+        window.localStorage?.setItem("ninjanvr_show_vectors", String(next));
+      }
+      return { showVectors: next };
+    }),
+  setShowAlertRibbon: (showAlertRibbon) => {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem("ninjanvr_show_alert_ribbon", String(showAlertRibbon));
+    }
+    set({ showAlertRibbon });
+  },
+  setFirstWeekday: (firstWeekday) => {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem("ninjanvr_first_weekday", firstWeekday);
+    }
+    set({ firstWeekday });
+  },
   setTimeShiftTs: (timeShiftTs) => set({ timeShiftTs }),
-  setPlaybackSpeed: (playbackSpeed) => set({ playbackSpeed }),
+  setPlaybackSpeed: (playbackSpeed) => {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem("ninjanvr_playback_speed", String(playbackSpeed));
+    }
+    set({ playbackSpeed });
+  },
+  resetUiPreferences: () => {
+    if (typeof window !== "undefined") {
+      [
+        "ninjanvr_live_layout",
+        "ninjanvr_hud_position",
+        "ninjanvr_use_main_stream",
+        "ninjanvr_show_vectors",
+        "ninjanvr_show_alert_ribbon",
+        "ninjanvr_first_weekday",
+        "ninjanvr_playback_speed",
+      ].forEach((k) => window.localStorage?.removeItem(k));
+    }
+    set({
+      liveLayout: "2x2",
+      hudPosition: "bottom-right",
+      useMainStream: false,
+      showVectors: false,
+      showAlertRibbon: true,
+      firstWeekday: "sunday",
+      playbackSpeed: 1,
+    });
+  },
   setWsOnline: (wsOnline) => set({ wsOnline }),
   setConfig: (config) => set({ config }),
   setStats: (stats) => set({ stats }),

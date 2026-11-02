@@ -42,6 +42,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const setUseMainStream = useNvrStore((s) => s.setUseMainStream);
   const showVectors = useNvrStore((s) => s.showVectors);
   const setShowVectors = useNvrStore((s) => s.setShowVectors);
+  const showAlertRibbon = useNvrStore((s) => s.showAlertRibbon);
   const timeShiftTs = useNvrStore((s) => s.timeShiftTs);
   const setTimeShiftTs = useNvrStore((s) => s.setTimeShiftTs);
   const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
@@ -141,7 +142,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       </div>
 
       {/* Zero-Decoder-Bloat Unreviewed Alert Ribbon (Video mounts ONLY on pointer hover!) */}
-      {unreviewedAlerts.length > 0 && (
+      {showAlertRibbon && unreviewedAlerts.length > 0 && (
         <div className="nvr-alert-ribbon" aria-label={t.live.unreviewedAlerts}>
           <div
             style={{
