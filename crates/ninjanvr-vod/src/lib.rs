@@ -127,6 +127,7 @@ struct ParsedSample {
 #[derive(Debug, Clone)]
 struct ParsedTrack {
     track_id: u32,
+    handler_type: [u8; 4],
     timescale: u32,
     tkhd_payload: Vec<u8>,
     mdhd_payload: Vec<u8>,
@@ -137,7 +138,7 @@ struct ParsedTrack {
     samples: Vec<ParsedSample>,
 }
 
-fn read_moov_from_file(path: &Path) -> Result<Vec<u8>> {
+fn read_moov_from_file(path: &Path) -> Result<(Vec<u8>, usize)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("failed to open MP4 segment {}", path.display()))?;
@@ -165,14 +166,17 @@ fn read_moov_from_file(path: &Path) -> Result<Vec<u8>> {
             let payload_len = (box_size - hdr_len) as usize;
             let mut buf = vec![0u8; payload_len];
             file.read_exact(&mut buf)?;
-            return Ok(buf);
+            return Ok((buf, file_len as usize));
         }
         pos += box_size;
     }
     bail!("no moov box found in {}", path.display())
 }
 
-fn parse_tracks_from_moov(moov_payload: &[u8]) -> Result<(Vec<u8>, Vec<ParsedTrack>)> {
+fn parse_tracks_from_moov(
+    moov_payload: &[u8],
+    file_len: usize,
+) -> Result<(Vec<u8>, Vec<ParsedTrack>)> {
     let moov_boxes = iter_boxes(moov_payload);
     let mvhd_payload = find_box(&moov_boxes, b"mvhd")
         .ok_or_else(|| anyhow!("missing mvhd inside moov"))?
@@ -183,7 +187,34 @@ fn parse_tracks_from_moov(moov_payload: &[u8]) -> Result<(Vec<u8>, Vec<ParsedTra
         if &b.box_type != b"trak" {
             continue;
         }
-        if let Ok(t) = parse_single_trak(b.payload) {
+        if let Ok(mut t) = parse_single_trak(b.payload) {
+            // Sanitize sample bounds; if an audio (`soun`) track has corrupted or out-of-bounds
+            // samples or an empty sample table, strip the corrupted audio samples/track cleanly
+            // so video (`vide`) fMP4 fragment generation never fails.
+            if &t.handler_type == b"soun" {
+                t.samples.retain(|s| {
+                    s.size > 0
+                        && s.duration > 0
+                        && s.offset
+                            .checked_add(s.size as usize)
+                            .map(|end| end <= file_len)
+                            .unwrap_or(false)
+                });
+                if t.samples.is_empty() {
+                    continue;
+                }
+            } else {
+                t.samples.retain(|s| {
+                    s.size > 0
+                        && s.offset
+                            .checked_add(s.size as usize)
+                            .map(|end| end <= file_len)
+                            .unwrap_or(false)
+                });
+                if t.samples.is_empty() {
+                    continue;
+                }
+            }
             tracks.push(t);
         }
     }
@@ -266,6 +297,7 @@ fn parse_single_trak(trak_payload: &[u8]) -> Result<ParsedTrack> {
 
     Ok(ParsedTrack {
         track_id,
+        handler_type,
         timescale,
         tkhd_payload: tkhd.to_vec(),
         mdhd_payload: mdhd.to_vec(),
@@ -468,8 +500,8 @@ fn parse_sample_table(
 /// Synthesizes an HLS fMP4 initialization segment (`init-v1-a1.mp4`: `ftyp` + `moov` with `mvex`)
 /// from the `moov` atom of a standard MP4 recording file.
 pub fn build_init_mp4(first_segment_path: &Path) -> Result<Vec<u8>> {
-    let moov_payload = read_moov_from_file(first_segment_path)?;
-    let (mut mvhd, tracks) = parse_tracks_from_moov(&moov_payload)?;
+    let (moov_payload, file_len) = read_moov_from_file(first_segment_path)?;
+    let (mut mvhd, tracks) = parse_tracks_from_moov(&moov_payload, file_len)?;
 
     // Zero out duration in mvhd so players treat this as a fragmented stream
     if mvhd.len() >= 20 {
@@ -559,7 +591,7 @@ pub fn build_media_segment_m4s(
     let top_boxes = iter_boxes(&file_bytes);
     let moov_payload =
         find_box(&top_boxes, b"moov").ok_or_else(|| anyhow!("missing moov in segment"))?;
-    let (_mvhd, tracks) = parse_tracks_from_moov(moov_payload)?;
+    let (_mvhd, tracks) = parse_tracks_from_moov(moov_payload, file_bytes.len())?;
 
     // Two-pass moof construction so `data_offset` in each `trun` points accurately into `mdat`
     let build_moof = |data_offsets: &[i32]| -> Vec<u8> {
@@ -703,5 +735,100 @@ mod tests {
         assert!(m3u8.contains("#EXT-X-DISCONTINUITY"));
         assert!(m3u8.contains("seg-1-v1-a1.m4s"));
         assert!(m3u8.contains("seg-2-v1-a1.m4s"));
+    }
+
+    #[test]
+    fn remuxes_video_when_soun_track_is_corrupted_or_out_of_bounds() {
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+        let video_sample = vec![0x65u8; 64];
+        let mdat_offset = (ftyp.len() + 8) as u32;
+        let mdat = make_box(b"mdat", &video_sample);
+
+        let build_trak =
+            |track_id: u32, handler: &[u8; 4], sample_offset: u32, sample_size: u32| {
+                let mut tkhd_body = vec![0u8; 80];
+                tkhd_body[8..12].copy_from_slice(&track_id.to_be_bytes());
+                let tkhd = make_full_box(b"tkhd", 0, 3, &tkhd_body);
+
+                let mut mdhd_body = vec![0u8; 20];
+                mdhd_body[8..12].copy_from_slice(&90000u32.to_be_bytes());
+                mdhd_body[12..16].copy_from_slice(&90000u32.to_be_bytes());
+                let mdhd = make_full_box(b"mdhd", 0, 0, &mdhd_body);
+
+                let mut hdlr_body = vec![0u8; 20];
+                hdlr_body[4..8].copy_from_slice(handler);
+                let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+
+                let stsd = make_full_box(b"stsd", 0, 0, &[0, 0, 0, 1]);
+                let mut stsz_body = Vec::new();
+                stsz_body.extend_from_slice(&sample_size.to_be_bytes());
+                stsz_body.extend_from_slice(&1u32.to_be_bytes());
+                let stsz = make_full_box(b"stsz", 0, 0, &stsz_body);
+
+                let mut stts_body = Vec::new();
+                stts_body.extend_from_slice(&1u32.to_be_bytes());
+                stts_body.extend_from_slice(&1u32.to_be_bytes());
+                stts_body.extend_from_slice(&3000u32.to_be_bytes());
+                let stts = make_full_box(b"stts", 0, 0, &stts_body);
+
+                let mut stsc_body = Vec::new();
+                stsc_body.extend_from_slice(&1u32.to_be_bytes());
+                stsc_body.extend_from_slice(&1u32.to_be_bytes());
+                stsc_body.extend_from_slice(&1u32.to_be_bytes());
+                stsc_body.extend_from_slice(&1u32.to_be_bytes());
+                let stsc = make_full_box(b"stsc", 0, 0, &stsc_body);
+
+                let mut stco_body = Vec::new();
+                stco_body.extend_from_slice(&1u32.to_be_bytes());
+                stco_body.extend_from_slice(&sample_offset.to_be_bytes());
+                let stco = make_full_box(b"stco", 0, 0, &stco_body);
+
+                let mut stbl_children = Vec::new();
+                stbl_children.extend_from_slice(&stsd);
+                stbl_children.extend_from_slice(&stsz);
+                stbl_children.extend_from_slice(&stts);
+                stbl_children.extend_from_slice(&stsc);
+                stbl_children.extend_from_slice(&stco);
+                let stbl = make_box(b"stbl", &stbl_children);
+                let minf = make_box(b"minf", &stbl);
+
+                let mut mdia_children = Vec::new();
+                mdia_children.extend_from_slice(&mdhd);
+                mdia_children.extend_from_slice(&hdlr);
+                mdia_children.extend_from_slice(&minf);
+                let mdia = make_box(b"mdia", &mdia_children);
+
+                let mut trak_children = Vec::new();
+                trak_children.extend_from_slice(&tkhd);
+                trak_children.extend_from_slice(&mdia);
+                make_box(b"trak", &trak_children)
+            };
+
+        let mvhd = make_full_box(b"mvhd", 0, 0, &[0u8; 96]);
+        let vide_trak = build_trak(1, b"vide", mdat_offset, video_sample.len() as u32);
+        // Corrupted soun track pointing far past EOF (999_999)
+        let corrupt_soun_trak = build_trak(2, b"soun", 999_999, 512);
+
+        let mut moov_children = Vec::new();
+        moov_children.extend_from_slice(&mvhd);
+        moov_children.extend_from_slice(&vide_trak);
+        moov_children.extend_from_slice(&corrupt_soun_trak);
+        let moov = make_box(b"moov", &moov_children);
+
+        let mut mp4_bytes = Vec::new();
+        mp4_bytes.extend_from_slice(&ftyp);
+        mp4_bytes.extend_from_slice(&mdat);
+        mp4_bytes.extend_from_slice(&moov);
+
+        let tmp_path = std::env::temp_dir().join("ninjanvr-vod-corrupt-soun-test.mp4");
+        std::fs::write(&tmp_path, &mp4_bytes).unwrap();
+
+        let init = build_init_mp4(&tmp_path).expect("init mp4 should succeed despite corrupt soun");
+        let m4s = build_media_segment_m4s(&tmp_path, 1, 0.0)
+            .expect("m4s segment should succeed despite corrupt soun");
+
+        assert!(init.len() > 64);
+        assert!(m4s.ends_with(&video_sample));
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }

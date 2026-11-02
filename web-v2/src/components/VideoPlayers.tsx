@@ -536,8 +536,26 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           });
         }
       });
+      let mediaErrorRecoveries = 0;
       hls.on(Hls.Events.ERROR, (_ev, data) => {
-        if (data.fatal && fallbackPreviewId) {
+        if (!data.fatal) {
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaErrorRecoveries < 4) {
+            mediaErrorRecoveries += 1;
+            hls?.recoverMediaError();
+          }
+          return;
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaErrorRecoveries < 4) {
+          mediaErrorRecoveries += 1;
+          hls?.recoverMediaError();
+          return;
+        }
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && mediaErrorRecoveries < 2) {
+          mediaErrorRecoveries += 1;
+          hls?.startLoad();
+          return;
+        }
+        if (fallbackPreviewId) {
           setUseFallbackMp4(true);
         }
       });
