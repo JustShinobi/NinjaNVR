@@ -162,6 +162,20 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   } | null>(null);
   const wheelSeekTimerRef = useRef<number | null>(null);
   const pendingWheelPlayheadRef = useRef<number | null>(null);
+  const [scrubPreviewTs, setScrubPreviewTs] = useState<number | null>(null);
+  const wheelAnimRef = useRef<{
+    rafId: number | null;
+    curWinEnd: number;
+    targetWinEnd: number;
+    curPlayhead: number;
+    targetPlayhead: number;
+  }>({
+    rafId: null,
+    curWinEnd: 0,
+    targetWinEnd: 0,
+    curPlayhead: 0,
+    targetPlayhead: 0,
+  });
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -218,15 +232,20 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     (candidateEnd: number): number | null => {
       const clamped = Math.max(
         dayBounds.dayStart + windowSpanSec,
-        Math.min(dayBounds.dayEnd, Math.round(candidateEnd))
+        Math.min(dayBounds.dayEnd, candidateEnd)
       );
-      if (dayBounds.isToday && clamped >= nowSec - 2) {
+      if (dayBounds.isToday && clamped >= nowSec - 1.5) {
         return null;
       }
       return clamped;
     },
     [dayBounds, windowSpanSec, nowSec]
   );
+
+  // Clear local scrubPreviewTs once parent currentTs syncs
+  useEffect(() => {
+    setScrubPreviewTs(null);
+  }, [currentTs]);
 
   // Re-center timeline window when parent seeks to a timestamp outside the current window
   useEffect(() => {
@@ -307,11 +326,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           dragOriginRef.current.moved = true;
         }
         if (dragOriginRef.current.moved) {
-          const deltaSec = -Math.round((dx / Math.max(1, width)) * windowSpanSec);
+          const deltaSec = -(dx / Math.max(1, width)) * windowSpanSec;
           setCustomWinEnd(
             clampWinEndToDay(dragOriginRef.current.startWinEnd + deltaSec)
           );
-          setHoverTs(clampTsToDay(dragOriginRef.current.startPlayhead + deltaSec));
+          const nextPh = clampTsToDay(dragOriginRef.current.startPlayhead + deltaSec);
+          setScrubPreviewTs(nextPh);
+          setHoverTs(nextPh);
         }
         return;
       }
@@ -400,33 +421,73 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         return;
       }
 
-      // Normal Wheel = Scrub / Pan through time within selectedDay (Shift = fine 10s step)
-      const dir = rawDelta > 0 ? 1 : -1;
-      const stepSec = e.shiftKey
-        ? 10
-        : Math.max(15, Math.round(windowSpanSec * 0.08));
-
-      setCustomWinEnd(clampWinEndToDay(winEnd + dir * stepSec));
-
-      const basePlayhead = clampTsToDay(
-        pendingWheelPlayheadRef.current ?? currentTs ?? winEnd
+      // Normal Wheel = Smooth 60fps interpolated scrub/pan within selectedDay (Shift = fine step)
+      const normalizedNotch = Math.max(
+        -2.5,
+        Math.min(2.5, rawDelta === 0 ? 0 : rawDelta / 100)
       );
-      const nextPlayhead = clampTsToDay(basePlayhead + dir * stepSec);
-      pendingWheelPlayheadRef.current = nextPlayhead;
-      setHoverTs(nextPlayhead);
+      const sign = rawDelta > 0 ? 1 : -1;
+      const notchFactor =
+        Math.abs(normalizedNotch) < 0.25 ? sign * 0.25 : normalizedNotch;
+      const deltaSec = e.shiftKey
+        ? notchFactor * 8
+        : notchFactor * Math.max(8, windowSpanSec * 0.025);
+
+      const anim = wheelAnimRef.current;
+      if (anim.rafId === null) {
+        anim.curWinEnd = winEnd;
+        anim.targetWinEnd = winEnd;
+        const startPh = pendingWheelPlayheadRef.current ?? currentTs ?? winEnd;
+        anim.curPlayhead = startPh;
+        anim.targetPlayhead = startPh;
+      }
+
+      anim.targetWinEnd = Math.max(
+        dayBounds.dayStart + windowSpanSec,
+        Math.min(dayBounds.dayEnd, anim.targetWinEnd + deltaSec)
+      );
+      anim.targetPlayhead = Math.max(
+        dayBounds.dayStart,
+        Math.min(dayBounds.dayEnd, anim.targetPlayhead + deltaSec)
+      );
+
+      pendingWheelPlayheadRef.current = Math.round(anim.targetPlayhead);
+      setHoverTs(Math.round(anim.targetPlayhead));
+
+      const stepFrame = () => {
+        const diffWin = anim.targetWinEnd - anim.curWinEnd;
+        const diffPh = anim.targetPlayhead - anim.curPlayhead;
+        if (Math.abs(diffWin) < 0.15 && Math.abs(diffPh) < 0.15) {
+          anim.curWinEnd = anim.targetWinEnd;
+          anim.curPlayhead = anim.targetPlayhead;
+          anim.rafId = null;
+          setCustomWinEnd(clampWinEndToDay(anim.curWinEnd));
+          setScrubPreviewTs(Math.round(anim.curPlayhead));
+          return;
+        }
+        anim.curWinEnd += diffWin * 0.32;
+        anim.curPlayhead += diffPh * 0.32;
+        setCustomWinEnd(clampWinEndToDay(anim.curWinEnd));
+        setScrubPreviewTs(Math.round(anim.curPlayhead));
+        anim.rafId = window.requestAnimationFrame(stepFrame);
+      };
+
+      if (anim.rafId === null) {
+        anim.rafId = window.requestAnimationFrame(stepFrame);
+      }
 
       if (wheelSeekTimerRef.current) {
         window.clearTimeout(wheelSeekTimerRef.current);
       }
       wheelSeekTimerRef.current = window.setTimeout(() => {
         const finalTarget = clampTsToDay(
-          pendingWheelPlayheadRef.current ?? nextPlayhead
+          pendingWheelPlayheadRef.current ?? Math.round(anim.targetPlayhead)
         );
         pendingWheelPlayheadRef.current = null;
         onSeek(
           dayBounds.isToday && finalTarget >= nowSec - 3 ? null : finalTarget
         );
-      }, 140);
+      }, 130);
     };
 
     el.addEventListener("wheel", onWheel, { passive: false });
@@ -587,15 +648,25 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     }
   };
 
-  // Time ruler tick marks (8 ticks across the track)
+  // World-space sliding clock ticks aligned to natural time intervals so ticks glide smoothly with the track
   const ticks = useMemo(() => {
-    const count = 8;
-    const step = windowSpanSec / count;
+    const tickStepSec =
+      zoomMin <= 5
+        ? 60
+        : zoomMin <= 15
+        ? 120
+        : zoomMin <= 60
+        ? 600
+        : zoomMin <= 360
+        ? 3600
+        : 10800;
+    const firstTick = Math.ceil(winStart / tickStepSec) * tickStepSec;
     const out: Array<{ pct: number; label: string }> = [];
-    for (let i = 0; i <= count; i++) {
-      const ts = Math.round(winStart + i * step);
+    for (let ts = firstTick; ts <= winEnd; ts += tickStepSec) {
+      const pct = ((ts - winStart) / windowSpanSec) * 100;
+      if (pct < 2 || pct > 98) continue;
       out.push({
-        pct: (i / count) * 100,
+        pct,
         label:
           zoomMin >= 1440
             ? `${toLocalDateInputValue(ts).slice(5)} ${formatHHMM(ts)}`
@@ -603,7 +674,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       });
     }
     return out;
-  }, [winStart, windowSpanSec, zoomMin]);
+  }, [winStart, winEnd, windowSpanSec, zoomMin]);
 
   const visibleReviews = useMemo(() => {
     return windowReviews.filter(
@@ -649,12 +720,14 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     return slots;
   }, [activeDaySummary]);
 
+  const effectivePlayheadTs = scrubPreviewTs ?? currentTs;
+
   const playheadPct =
-    currentTs === null
+    effectivePlayheadTs === null
       ? customWinEnd === null
         ? 99.6
         : -1
-      : ((currentTs - winStart) / windowSpanSec) * 100;
+      : ((effectivePlayheadTs - winStart) / windowSpanSec) * 100;
 
   const rangeStartPct = Math.max(
     0,
@@ -758,7 +831,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     }
   };
 
-  const displayAnchorTs = currentTs ?? winEnd;
+  const displayAnchorTs = Math.round(effectivePlayheadTs ?? winEnd);
 
   return (
     <div
@@ -1196,11 +1269,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           </button>
 
           <span
-            className={`nvr-badge ${currentTs === null ? "live" : "rewind"}`}
+            className={`nvr-badge ${effectivePlayheadTs === null ? "live" : "rewind"}`}
             style={{ height: 24 }}
           >
-            <span className={`nvr-dot ${currentTs === null ? "live" : "motion"}`} />
-            {currentTs === null ? "LIVE EDGE" : formatFullDateTime(currentTs)}
+            <span className={`nvr-dot ${effectivePlayheadTs === null ? "live" : "motion"}`} />
+            {effectivePlayheadTs === null
+              ? "LIVE EDGE"
+              : formatFullDateTime(Math.round(effectivePlayheadTs))}
           </span>
 
           {/* Skip Silence: Prev / Next Activity Event */}
@@ -1549,29 +1624,24 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             overflow: "hidden",
           }}
         >
-          {ticks.map((tk, i) => {
-            const isFirst = i === 0;
-            const isLast = i === ticks.length - 1;
-            return (
-              <span
-                key={i}
-                className="mono"
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  left: isLast ? undefined : isFirst ? 2 : `${tk.pct}%`,
-                  right: isLast ? 2 : undefined,
-                  transform: !isFirst && !isLast ? "translateX(-50%)" : undefined,
-                  fontSize: "var(--text-xs)",
-                  lineHeight: "16px",
-                  color: "var(--text-muted)",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {tk.label}
-              </span>
-            );
-          })}
+          {ticks.map((tk) => (
+            <span
+              key={tk.label}
+              className="mono"
+              style={{
+                position: "absolute",
+                top: 0,
+                left: `${tk.pct}%`,
+                transform: "translateX(-50%)",
+                fontSize: "var(--text-xs)",
+                lineHeight: "16px",
+                color: "var(--text-muted)",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {tk.label}
+            </span>
+          ))}
         </div>
 
         {/* ===================================================================
