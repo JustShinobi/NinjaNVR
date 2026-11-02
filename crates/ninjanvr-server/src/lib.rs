@@ -429,6 +429,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/ai/context", get(api_ai_context))
         .route("/mcp", post(api_mcp_handler))
         .route("/debug/reprocess", post(api_debug_reprocess))
+        .route("/notifications/test", post(api_notifications_test))
         .route(
             "/camera-proxy/{camera}",
             get(api_camera_proxy_root).post(api_camera_proxy_root),
@@ -930,6 +931,7 @@ async fn auth_gate_middleware(
                                 | "ai"
                                 | "mcp"
                                 | "debug"
+                                | "notifications"
                                 | "camera-proxy"
                                 | "go2rtc"
                                 | "ws"
@@ -2844,6 +2846,45 @@ async fn api_camera_proxy_root(
     uri: Uri,
 ) -> Response {
     handle_camera_webui_proxy(&state, &camera, "", uri.query()).await
+}
+
+async fn api_notifications_test(State(state): State<AppState>) -> Json<Value> {
+    let (first_cam, mqtt_enabled) = {
+        let cfg = state.config.read().await;
+        let cam = cfg
+            .cameras
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "front_door".to_string());
+        (cam, cfg.mqtt.enabled)
+    };
+    let now = unix_now() as f64;
+    let test_id = format!("test-alert-{}", now as u64);
+    let alert_payload = json!({
+        "type": "new",
+        "after": {
+            "id": test_id,
+            "camera": first_cam,
+            "severity": "alert",
+            "start_time": now,
+            "thumb_path": format!("/api/{first_cam}/latest.jpg"),
+            "has_been_reviewed": false,
+            "data": {
+                "objects": ["person"],
+                "zones": ["test_zone"]
+            }
+        }
+    });
+    state.comms.publish_json("reviews", &alert_payload);
+    state.comms.publish_json("events", &alert_payload);
+    Json(json!({
+        "success": true,
+        "ws_delivered": true,
+        "mqtt_connected": mqtt_enabled,
+        "camera": first_cam,
+        "alert_id": test_id
+    }))
 }
 
 async fn api_camera_proxy_subpath(
@@ -6221,6 +6262,25 @@ version: 0.18-0
             ev_with_note["data"]["notes"],
             "Courier left parcel behind planter — verified by guard"
         );
+
+        // 24. Test POST /api/notifications/test broadcasts synthetic alert across WS & MQTT
+        let resp_notif_test = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/notifications/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_notif_test.status(), StatusCode::OK);
+        let notif_json: Value =
+            serde_json::from_slice(&to_bytes(resp_notif_test.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(notif_json["success"], true);
+        assert_eq!(notif_json["ws_delivered"], true);
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

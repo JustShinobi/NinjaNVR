@@ -41,6 +41,10 @@ export const ConsoleUiSection: React.FC<{
   const setShowVectors = useNvrStore((s) => s.setShowVectors);
   const showAlertRibbon = useNvrStore((s) => s.showAlertRibbon);
   const setShowAlertRibbon = useNvrStore((s) => s.setShowAlertRibbon);
+  const audibleAlertChime = useNvrStore((s) => s.audibleAlertChime);
+  const setAudibleAlertChime = useNvrStore((s) => s.setAudibleAlertChime);
+  const browserNotifications = useNvrStore((s) => s.browserNotifications);
+  const setBrowserNotifications = useNvrStore((s) => s.setBrowserNotifications);
   const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
   const setPlaybackSpeed = useNvrStore((s) => s.setPlaybackSpeed);
   const firstWeekday = useNvrStore((s) => s.firstWeekday);
@@ -214,6 +218,76 @@ export const ConsoleUiSection: React.FC<{
               }}
               label="Unreviewed Alert Ribbon"
             />
+          </div>
+
+          <div className="nvr-field-row">
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt ? "Sinal Sonoro Tático de Alerta" : "Audible Tactical Alert Chime"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Emitir sinal sonoro sintetizado (Web Audio API) ao receber novo alerta."
+                  : "Emit a synthesized two-tone Web Audio API chime when a new alert arrives."}
+              </div>
+            </div>
+            <ToggleSwitch
+              checked={audibleAlertChime}
+              onChange={(v) => {
+                setAudibleAlertChime(v);
+                notify(v ? "Audible alert chime enabled" : "Audible alert chime muted");
+              }}
+              label="Audible Tactical Alert Chime"
+            />
+          </div>
+
+          <div className="nvr-field-row">
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt ? "Notificações Web do Navegador" : "Browser Web Notifications"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Exibir notificação nativa do sistema com miniatura da câmera e testar entrega via WebSocket/MQTT."
+                  : "Show desktop browser notifications with camera snapshot and test WebSocket/MQTT alert delivery."}
+              </div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button
+                type="button"
+                className="nvr-btn mono"
+                style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                onClick={async () => {
+                  const res = await fetch("/api/notifications/test", {
+                    method: "POST",
+                    credentials: "include",
+                  });
+                  const data = await res.json().catch(() => ({}));
+                  if (res.ok && data.success) {
+                    notify(`Sent test alert notification (${data.camera})`);
+                  } else {
+                    notify("Failed to send test alert notification");
+                  }
+                }}
+              >
+                Send Test Notification
+              </button>
+              <ToggleSwitch
+                checked={browserNotifications}
+                onChange={async (v) => {
+                  if (v && "Notification" in window && Notification.permission !== "granted") {
+                    const perm = await Notification.requestPermission();
+                    if (perm !== "granted") {
+                      notify("Browser notification permission was not granted");
+                      return;
+                    }
+                  }
+                  setBrowserNotifications(v);
+                  notify(v ? "Browser notifications enabled" : "Browser notifications disabled");
+                }}
+                label="Browser Web Notifications"
+              />
+            </div>
           </div>
         </div>
       </div>

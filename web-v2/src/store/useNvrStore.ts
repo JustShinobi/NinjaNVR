@@ -29,6 +29,8 @@ interface NvrRealtimeState {
   useMainStream: boolean;
   showVectors: boolean;
   showAlertRibbon: boolean;
+  audibleAlertChime: boolean;
+  browserNotifications: boolean;
   firstWeekday: FirstWeekday;
   timeShiftTs: number | null;
   playbackSpeed: number;
@@ -48,6 +50,8 @@ interface NvrRealtimeState {
   setUseMainStream: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
   setShowVectors: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
   setShowAlertRibbon: (val: boolean) => void;
+  setAudibleAlertChime: (val: boolean) => void;
+  setBrowserNotifications: (val: boolean) => void;
   setFirstWeekday: (day: FirstWeekday) => void;
   setTimeShiftTs: (ts: number | null) => void;
   setPlaybackSpeed: (spd: number) => void;
@@ -70,6 +74,8 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
   useMainStream: resolveInitialBool("ninjanvr_use_main_stream", false),
   showVectors: resolveInitialBool("ninjanvr_show_vectors", false),
   showAlertRibbon: resolveInitialBool("ninjanvr_show_alert_ribbon", true),
+  audibleAlertChime: resolveInitialBool("ninjanvr_audible_chime", false),
+  browserNotifications: resolveInitialBool("ninjanvr_browser_notifications", false),
   firstWeekday: resolveInitialFirstWeekday(),
   timeShiftTs: null,
   playbackSpeed: resolveInitialPlaybackSpeed(),
@@ -117,6 +123,21 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
       window.localStorage?.setItem("ninjanvr_show_alert_ribbon", String(showAlertRibbon));
     }
     set({ showAlertRibbon });
+  },
+  setAudibleAlertChime: (audibleAlertChime) => {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem("ninjanvr_audible_chime", String(audibleAlertChime));
+    }
+    set({ audibleAlertChime });
+  },
+  setBrowserNotifications: (browserNotifications) => {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem(
+        "ninjanvr_browser_notifications",
+        String(browserNotifications)
+      );
+    }
+    set({ browserNotifications });
   },
   setFirstWeekday: (firstWeekday) => {
     if (typeof window !== "undefined") {

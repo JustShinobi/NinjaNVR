@@ -19,12 +19,38 @@ import { ExportsWorkspace } from "./views/ExportsWorkspace";
 import { ZonesWorkspace } from "./views/ZonesWorkspace";
 import { SystemWorkspace } from "./views/SystemWorkspace";
 
+export function playTacticalAlertChime(): void {
+  try {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(880, now);
+    osc.frequency.setValueAtTime(1174.66, now + 0.11);
+    gain.gain.setValueAtTime(0.08, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.28);
+  } catch {
+    // ignore autoplay restriction
+  }
+}
+
 export const App: React.FC = () => {
   const { t } = useI18n();
   const activeTab = useNvrStore((s) => s.activeTab);
   const setActiveTab = useNvrStore((s) => s.setActiveTab);
   const securityProfile = useNvrStore((s) => s.securityProfile);
   const setSecurityProfile = useNvrStore((s) => s.setSecurityProfile);
+  const audibleAlertChime = useNvrStore((s) => s.audibleAlertChime);
+  const browserNotifications = useNvrStore((s) => s.browserNotifications);
   const selectedCamera = useNvrStore((s) => s.selectedCamera);
   const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
   const timeShiftTs = useNvrStore((s) => s.timeShiftTs);
@@ -281,6 +307,37 @@ export const App: React.FC = () => {
           if (p === "armed" || p === "home" || p === "disarmed") {
             setSecurityProfile(p);
           }
+        } else if (msg.topic === "reviews" && msg.payload) {
+          const parsed =
+            typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
+          if (parsed?.type === "new" && parsed?.after?.severity === "alert") {
+            const alertItem: ReviewItem = parsed.after;
+            setReviews((prev) =>
+              prev.some((r) => r.id === alertItem.id) ? prev : [alertItem, ...prev]
+            );
+            if (useNvrStore.getState().audibleAlertChime) {
+              playTacticalAlertChime();
+            }
+            if (
+              useNvrStore.getState().browserNotifications &&
+              "Notification" in window &&
+              Notification.permission === "granted"
+            ) {
+              const objs = (alertItem.data?.objects || ["person"]).join(", ").toUpperCase();
+              const n = new Notification(
+                `NinjaNVR Alert // ${alertItem.camera.toUpperCase()}`,
+                {
+                  body: `Detected ${objs}`,
+                  icon: `/api/${encodeURIComponent(alertItem.camera)}/latest.jpg`,
+                }
+              );
+              n.onclick = () => {
+                window.focus();
+                setActiveReview(alertItem);
+                switchTab("review");
+              };
+            }
+          }
         }
       } catch {
         // ignore
@@ -291,7 +348,16 @@ export const App: React.FC = () => {
       closed = true;
       ws.close();
     };
-  }, [authChecked, authNeeded, setWsOnline, setCameraActivity, setSecurityProfile]);
+  }, [
+    authChecked,
+    authNeeded,
+    setWsOnline,
+    setCameraActivity,
+    setSecurityProfile,
+    audibleAlertChime,
+    browserNotifications,
+    switchTab,
+  ]);
 
   // Fetch 24h recordings for the active timeline camera
   const timelineCam =
