@@ -52,6 +52,82 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
           className="nvr-scroll-y"
           style={{ padding: 12, display: "flex", flexDirection: "column", gap: 12 }}
         >
+          {/* Native AI Context Summary & MCP Ecosystem Inspector */}
+          <div
+            style={{
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--signal-accent)",
+              borderRadius: 3,
+            }}
+          >
+            <div
+              className="nvr-panel-header"
+              style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}
+            >
+              <span>AI SITUATION BRIEF & MCP SERVER (/api/ai/context · /api/mcp)</span>
+              <div style={{ display: "flex", gap: 6 }}>
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  onClick={() => {
+                    const url = `${window.location.origin}/api/mcp`;
+                    navigator.clipboard?.writeText(url);
+                    notify(`Copied MCP JSON-RPC endpoint: ${url}`);
+                  }}
+                >
+                  Copy MCP URL
+                </button>
+                <button
+                  type="button"
+                  className="nvr-btn primary mono"
+                  style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  disabled={aiBriefBusy}
+                  onClick={async () => {
+                    setAiBriefBusy(true);
+                    try {
+                      const res = await fetch("/api/ai/context?hours=24", {
+                        credentials: "include",
+                      });
+                      if (res.ok) {
+                        const data = await res.json();
+                        setAiBriefText(
+                          data.markdown_brief || JSON.stringify(data, null, 2)
+                        );
+                        notify("Generated 24h AI Situation Brief");
+                      } else {
+                        notify(`Failed to fetch AI context (${res.status})`);
+                      }
+                    } catch {
+                      notify("Failed to reach /api/ai/context");
+                    } finally {
+                      setAiBriefBusy(false);
+                    }
+                  }}
+                >
+                  {aiBriefBusy ? "Generating..." : "Generate 24h AI Brief"}
+                </button>
+              </div>
+            </div>
+            {aiBriefText && (
+              <pre
+                className="mono"
+                style={{
+                  margin: 0,
+                  padding: 10,
+                  fontSize: "var(--text-xs)",
+                  color: "var(--text-primary)",
+                  whiteSpace: "pre-wrap",
+                  maxHeight: 220,
+                  overflowY: "auto",
+                  borderTop: "1px solid var(--border-hairline)",
+                }}
+              >
+                {aiBriefText}
+              </pre>
+            )}
+          </div>
+
           {/* 3 Canvas Sparklines */}
           <div
             style={{
@@ -337,82 +413,6 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   </tbody>
                 </table>
               )}
-          </div>
-
-          {/* Native AI Context Summary & MCP Ecosystem Inspector */}
-          <div
-            style={{
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-            }}
-          >
-            <div
-              className="nvr-panel-header"
-              style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}
-            >
-              <span>AI SITUATION BRIEF & MCP SERVER (/api/ai/context · /api/mcp)</span>
-              <div style={{ display: "flex", gap: 6 }}>
-                <button
-                  type="button"
-                  className="nvr-btn mono"
-                  style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                  onClick={() => {
-                    const url = `${window.location.origin}/api/mcp`;
-                    navigator.clipboard?.writeText(url);
-                    notify(`Copied MCP JSON-RPC endpoint: ${url}`);
-                  }}
-                >
-                  Copy MCP URL
-                </button>
-                <button
-                  type="button"
-                  className="nvr-btn primary mono"
-                  style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                  disabled={aiBriefBusy}
-                  onClick={async () => {
-                    setAiBriefBusy(true);
-                    try {
-                      const res = await fetch("/api/ai/context?hours=24", {
-                        credentials: "include",
-                      });
-                      if (res.ok) {
-                        const data = await res.json();
-                        setAiBriefText(
-                          data.markdown_brief || JSON.stringify(data, null, 2)
-                        );
-                        notify("Generated 24h AI Situation Brief");
-                      } else {
-                        notify(`Failed to fetch AI context (${res.status})`);
-                      }
-                    } catch {
-                      notify("Failed to reach /api/ai/context");
-                    } finally {
-                      setAiBriefBusy(false);
-                    }
-                  }}
-                >
-                  {aiBriefBusy ? "Generating..." : "Generate 24h AI Brief"}
-                </button>
-              </div>
-            </div>
-            {aiBriefText && (
-              <pre
-                className="mono"
-                style={{
-                  margin: 0,
-                  padding: 10,
-                  fontSize: "var(--text-xs)",
-                  color: "var(--text-primary)",
-                  whiteSpace: "pre-wrap",
-                  maxHeight: 220,
-                  overflowY: "auto",
-                  borderTop: "1px solid var(--border-hairline)",
-                }}
-              >
-                {aiBriefText}
-              </pre>
-            )}
           </div>
         </div>
       </div>

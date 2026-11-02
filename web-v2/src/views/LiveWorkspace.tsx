@@ -101,21 +101,27 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       const next = { ...prev };
       cameraNames.forEach((cam, idx) => {
         const cfgMap = config?.cameras?.[cam]?.map;
-        const defaultX = 0.22 + (idx % 3) * 0.28;
-        const defaultY = 0.28 + Math.floor(idx / 3) * 0.42;
-        if (cfgMap) {
+        const defaultX = 0.25 + (idx % 2) * 0.5;
+        const defaultY = 0.28 + Math.floor(idx / 2) * 0.44;
+        const defaultAngle = (idx * 90 + 45) % 360;
+        const isUnconfiguredDefault =
+          cfgMap &&
+          Math.abs((cfgMap.x ?? 0.5) - 0.5) < 0.001 &&
+          Math.abs((cfgMap.y ?? 0.5) - 0.5) < 0.001 &&
+          Math.abs(cfgMap.angle_deg ?? 0) < 0.001;
+        if (cfgMap && !isUnconfiguredDefault) {
           next[cam] = {
             x: cfgMap.x ?? defaultX,
             y: cfgMap.y ?? defaultY,
-            angle_deg: cfgMap.angle_deg ?? idx * 90,
+            angle_deg: cfgMap.angle_deg ?? defaultAngle,
             fov_deg: cfgMap.fov_deg ?? 90,
             range: cfgMap.range ?? 0.25,
           };
         } else if (!next[cam]) {
           next[cam] = {
-            x: defaultX,
-            y: defaultY,
-            angle_deg: idx * 90,
+            x: Number(defaultX.toFixed(3)),
+            y: Number(defaultY.toFixed(3)),
+            angle_deg: defaultAngle,
             fov_deg: 90,
             range: 0.25,
           };
@@ -1076,9 +1082,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     onPointerDown={(e) => {
                       e.stopPropagation();
                       setSelectedCamera(cam);
-                      if (mapEditMode) {
-                        setDraggingCam(cam);
-                      }
+                      setMapEditMode(true);
+                      setDraggingCam(cam);
                     }}
                   >
                     <path
@@ -1165,6 +1170,20 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 Open Focus
               </button>
             </div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+              {cameraNames.map((cam) => (
+                <button
+                  key={cam}
+                  type="button"
+                  className={`nvr-btn mono ${selectedCamera === cam ? "active" : ""}`}
+                  style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                  onClick={() => setSelectedCamera(cam)}
+                >
+                  {cam.toUpperCase()}
+                </button>
+              ))}
+            </div>
+
             <div className="nvr-cam-tile" style={{ height: 210, flexShrink: 0 }}>
               <LiveMsePlayer
                 camera={selectedCamera}
@@ -1186,6 +1205,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   value={mapPlacements[selectedCamera].angle_deg}
                   onChange={(e) => {
                     const v = Number(e.target.value);
+                    setMapEditMode(true);
                     setMapPlacements((prev) => ({
                       ...prev,
                       [selectedCamera]: { ...prev[selectedCamera], angle_deg: v },
@@ -1202,6 +1222,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   value={mapPlacements[selectedCamera].fov_deg}
                   onChange={(e) => {
                     const v = Number(e.target.value);
+                    setMapEditMode(true);
                     setMapPlacements((prev) => ({
                       ...prev,
                       [selectedCamera]: { ...prev[selectedCamera], fov_deg: v },
@@ -1218,6 +1239,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   value={Math.round(mapPlacements[selectedCamera].range * 100)}
                   onChange={(e) => {
                     const v = Number(e.target.value) / 100;
+                    setMapEditMode(true);
                     setMapPlacements((prev) => ({
                       ...prev,
                       [selectedCamera]: { ...prev[selectedCamera], range: v },

@@ -2381,6 +2381,15 @@ async fn api_mcp_handler(
             }
         }))
         .into_response(),
+        "notifications/initialized" | "notifications/cancelled" => {
+            StatusCode::ACCEPTED.into_response()
+        }
+        "ping" => Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        }))
+        .into_response(),
         "tools/list" => Json(json!({
             "jsonrpc": "2.0",
             "id": id,
