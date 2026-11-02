@@ -1935,6 +1935,7 @@ async fn api_camera_recordings(
                 "duration": r.duration,
                 "motion": r.motion,
                 "objects": r.objects,
+                "dbfs": r.dbfs,
                 "segment_size": r.segment_size,
                 "motion_heatmap": r.motion_heatmap
             })

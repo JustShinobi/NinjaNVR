@@ -1423,7 +1423,7 @@ impl NinjaDatabase {
         let cutoff = (Utc::now().timestamp() - 86400 * 30) as f64;
         let mut stmt = conn.prepare(
             r#"
-            SELECT start_time, duration, COALESCE(motion, 0), COALESCE(objects, 0)
+            SELECT start_time, duration, COALESCE(motion, 0), COALESCE(objects, 0), COALESCE(dbfs, 0)
             FROM recordings
             WHERE camera = ?1 AND start_time >= ?2
             ORDER BY start_time DESC
@@ -1435,6 +1435,7 @@ impl NinjaDatabase {
                 r.get::<_, f64>(1).unwrap_or(0.0),
                 r.get::<_, i64>(2).unwrap_or(0),
                 r.get::<_, i64>(3).unwrap_or(0),
+                r.get::<_, i64>(4).unwrap_or(0),
             ))
         })?;
 
@@ -1443,6 +1444,7 @@ impl NinjaDatabase {
             duration: f64,
             motion: i64,
             objects: i64,
+            dbfs: i64,
             events: i64,
             start_ts: i64,
             end_ts: i64,
@@ -1450,7 +1452,7 @@ impl NinjaDatabase {
         let mut day_hours: BTreeMap<String, BTreeMap<String, HourAgg>> = BTreeMap::new();
 
         for r in rows {
-            let (ts, dur, motion, objs) = r?;
+            let (ts, dur, motion, objs, dbfs) = r?;
             if let Some(dt) = Local.timestamp_opt(ts as i64, 0).single() {
                 let day = dt.format("%Y-%m-%d").to_string();
                 let hour = dt.format("%H").to_string();
@@ -1460,6 +1462,9 @@ impl NinjaDatabase {
                 h.duration += dur;
                 h.motion += motion;
                 h.objects += objs;
+                if dbfs != 0 && (h.dbfs == 0 || dbfs > h.dbfs) {
+                    h.dbfs = dbfs;
+                }
                 if h.start_ts == 0 || seg_start < h.start_ts {
                     h.start_ts = seg_start;
                 }
@@ -1514,6 +1519,7 @@ impl NinjaDatabase {
                     "events": agg.events,
                     "motion": agg.motion,
                     "objects": agg.objects,
+                    "dbfs": agg.dbfs,
                     "duration": dur_i64,
                     "start_ts": agg.start_ts,
                     "end_ts": agg.end_ts

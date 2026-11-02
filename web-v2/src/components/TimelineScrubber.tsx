@@ -602,7 +602,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       candidates.push(Math.floor(r.start_time));
     }
     for (const s of windowSegments) {
-      if (s.objects > 0 || s.motion > 0) {
+      const hasAudio = s.dbfs !== undefined && s.dbfs !== 0 && (s.dbfs < 0 ? s.dbfs > -65 : s.dbfs > 10);
+      if (s.objects > 0 || s.motion > 0 || hasAudio) {
         candidates.push(Math.floor(s.start_time));
       }
     }
@@ -706,6 +707,17 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     return best;
   }, [hoverTs, visibleReviews]);
 
+  // Hovered recording segment for acoustic dBFS & motion telemetry on hover
+  const hoveredSegmentOnTrack = useMemo(() => {
+    if (hoverTs === null || windowSegments.length === 0) return null;
+    for (const s of windowSegments) {
+      if (hoverTs >= s.start_time && hoverTs <= s.end_time) {
+        return s;
+      }
+    }
+    return null;
+  }, [hoverTs, windowSegments]);
+
   const activeDaySummary = useMemo(
     () => daysSummary.find((d) => d.day === selectedDay) || daysSummary[0] || null,
     [daysSummary, selectedDay]
@@ -794,6 +806,19 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       // Continuous recording base lane (bottom 5px)
       ctx.fillStyle = "rgba(16, 185, 129, 0.42)";
       ctx.fillRect(x0, h - 5, segW, 5);
+
+      // Acoustic activity layer (cyan/emerald waveform bar when segment has non-zero dBFS above noise floor)
+      if (seg.dbfs !== undefined && seg.dbfs !== 0) {
+        const normAudio =
+          seg.dbfs < 0
+            ? Math.max(0, Math.min(1, (seg.dbfs + 75) / 70))
+            : Math.max(0, Math.min(1, seg.dbfs / 100));
+        if (normAudio > 0.05) {
+          const audioH = Math.max(4, Math.round(normAudio * 14));
+          ctx.fillStyle = "rgba(6, 182, 212, 0.78)";
+          ctx.fillRect(x0, h - 5 - audioH, segW, audioH);
+        }
+      }
 
       if (seg.objects > 0) {
         ctx.fillStyle = "rgba(239, 68, 68, 0.72)";
@@ -1846,6 +1871,23 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   />
                 )}
                 <span>{formatFullDateTime(hoverTs)}</span>
+                {hoveredSegmentOnTrack &&
+                  hoveredSegmentOnTrack.dbfs !== undefined &&
+                  hoveredSegmentOnTrack.dbfs !== 0 && (
+                    <span
+                      className="mono"
+                      style={{
+                        fontSize: "var(--text-xs)",
+                        color: "var(--signal-accent-text)",
+                        fontVariantNumeric: "tabular-nums",
+                      }}
+                    >
+                      AUDIO:{" "}
+                      {hoveredSegmentOnTrack.dbfs < 0
+                        ? `${hoveredSegmentOnTrack.dbfs} dBFS`
+                        : `${hoveredSegmentOnTrack.dbfs - 90} dBFS`}
+                    </span>
+                  )}
               </div>
             </>
           )}

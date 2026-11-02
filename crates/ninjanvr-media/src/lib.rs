@@ -59,6 +59,7 @@ pub struct ActivitySample {
     pub motion_px: u32,
     pub active_objects: u32,
     pub regions: u32,
+    pub dbfs: i64,
 }
 
 #[derive(Default)]
@@ -74,11 +75,23 @@ impl CameraActivityRing {
         active_objects: u32,
         regions: u32,
     ) {
+        self.record_sample_with_audio(timestamp, motion_px, active_objects, regions, 0);
+    }
+
+    pub fn record_sample_with_audio(
+        &mut self,
+        timestamp: f64,
+        motion_px: u32,
+        active_objects: u32,
+        regions: u32,
+        dbfs: i64,
+    ) {
         self.samples.push_back(ActivitySample {
             timestamp,
             motion_px,
             active_objects,
             regions,
+            dbfs,
         });
         let cutoff = timestamp - 300.0;
         while let Some(front) = self.samples.front() {
@@ -91,17 +104,30 @@ impl CameraActivityRing {
     }
 
     pub fn aggregate_range(&self, start_time: f64, end_time: f64) -> (i64, i64, i64) {
+        let (m, o, r, _) = self.aggregate_range_with_audio(start_time, end_time);
+        (m, o, r)
+    }
+
+    pub fn aggregate_range_with_audio(
+        &self,
+        start_time: f64,
+        end_time: f64,
+    ) -> (i64, i64, i64, i64) {
         let mut motion_sum = 0i64;
         let mut obj_sum = 0i64;
         let mut reg_sum = 0i64;
+        let mut peak_dbfs = 0i64;
         for s in &self.samples {
             if s.timestamp >= start_time && s.timestamp <= end_time {
                 motion_sum += s.motion_px as i64;
                 obj_sum += s.active_objects as i64;
                 reg_sum += s.regions as i64;
+                if s.dbfs != 0 && (peak_dbfs == 0 || s.dbfs > peak_dbfs) {
+                    peak_dbfs = s.dbfs;
+                }
             }
         }
-        (motion_sum, obj_sum, reg_sum)
+        (motion_sum, obj_sum, reg_sum, peak_dbfs)
     }
 }
 
@@ -243,6 +269,258 @@ fn extract_vide_mdhd_duration(trak_body: &[u8]) -> Option<f64> {
             }
             if is_vide && mdhd_dur.is_some() {
                 return mdhd_dur;
+            }
+        }
+        tpos += tsize;
+    }
+    None
+}
+
+/// Computes the RMS level in dBFS (`-89` to `-1` for active audio, `0` for silence/empty)
+/// from signed 16-bit PCM audio samples.
+pub fn compute_pcm_rms_dbfs(samples: &[i16]) -> i64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let sum_sq: f64 = samples
+        .iter()
+        .map(|&s| {
+            let norm = (s as f64) / 32768.0;
+            norm * norm
+        })
+        .sum();
+    let rms = (sum_sq / (samples.len() as f64)).sqrt();
+    if rms <= 0.00005 {
+        return 0;
+    }
+    let db = (20.0 * rms.log10()).round() as i64;
+    if db <= -90 { 0 } else { db.clamp(-89, -1) }
+}
+
+/// Probes an MP4 segment file in pure Rust without spawning `ffprobe` to extract
+/// the acoustic RMS level in dBFS (`-89`..`-1` for active audio, `0` if silent or no `soun` track).
+pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let Ok(meta) = file.metadata() else {
+        return 0;
+    };
+    let file_len = meta.len();
+    let mut pos = 0u64;
+    let mut hdr = [0u8; 8];
+    while pos + 8 <= file_len {
+        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut hdr).is_err() {
+            break;
+        }
+        let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+        let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let (box_size, hdr_len) = if size32 == 1 {
+            let mut ext = [0u8; 8];
+            if file.read_exact(&mut ext).is_err() {
+                break;
+            }
+            (u64::from_be_bytes(ext), 16u64)
+        } else if size32 == 0 {
+            (file_len - pos, 8u64)
+        } else {
+            (size32, 8u64)
+        };
+        if box_size < hdr_len || pos + box_size > file_len {
+            break;
+        }
+        if &btype == b"moov" {
+            let mut moov = vec![0u8; (box_size - hdr_len).min(262_144) as usize];
+            if file.read_exact(&mut moov).is_err() {
+                break;
+            }
+            if let Some((offsets, total_audio_bytes, sample_count)) =
+                extract_soun_sample_stats(&moov)
+            {
+                if sample_count == 0 || total_audio_bytes == 0 {
+                    return 0;
+                }
+                let mut payload = Vec::with_capacity(8192);
+                for off in offsets.into_iter().take(8) {
+                    if payload.len() as u64 >= total_audio_bytes {
+                        break;
+                    }
+                    if off < file_len && file.seek(SeekFrom::Start(off)).is_ok() {
+                        let remaining_audio =
+                            (total_audio_bytes.saturating_sub(payload.len() as u64)).min(2048);
+                        let to_read = (file_len - off).min(remaining_audio) as usize;
+                        if to_read == 0 {
+                            break;
+                        }
+                        let mut chunk = vec![0u8; to_read];
+                        if file.read_exact(&mut chunk).is_ok() {
+                            payload.extend_from_slice(&chunk);
+                        }
+                    }
+                }
+                if payload.len() < 4 || payload.iter().all(|&b| b == 0) {
+                    return 0;
+                }
+                let pcm_samples: Vec<i16> = payload
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                return compute_pcm_rms_dbfs(&pcm_samples);
+            }
+            return 0;
+        }
+        pos += box_size;
+    }
+    0
+}
+
+fn extract_soun_sample_stats(moov: &[u8]) -> Option<(Vec<u64>, u64, u32)> {
+    let mut mpos = 0usize;
+    while mpos + 8 <= moov.len() {
+        let msize = u32::from_be_bytes([moov[mpos], moov[mpos + 1], moov[mpos + 2], moov[mpos + 3]])
+            as usize;
+        let mtype = &moov[mpos + 4..mpos + 8];
+        if msize < 8 || mpos + msize > moov.len() {
+            break;
+        }
+        if mtype == b"trak" {
+            let trak = &moov[mpos + 8..mpos + msize];
+            if let Some(stats) = parse_soun_trak(trak) {
+                return Some(stats);
+            }
+        }
+        mpos += msize;
+    }
+    None
+}
+
+fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32)> {
+    let mut tpos = 0usize;
+    while tpos + 8 <= trak.len() {
+        let tsize = u32::from_be_bytes([trak[tpos], trak[tpos + 1], trak[tpos + 2], trak[tpos + 3]])
+            as usize;
+        let ttype = &trak[tpos + 4..tpos + 8];
+        if tsize < 8 || tpos + tsize > trak.len() {
+            break;
+        }
+        if ttype == b"mdia" {
+            let mdia = &trak[tpos + 8..tpos + tsize];
+            let mut is_soun = false;
+            let mut stbl_slice: Option<&[u8]> = None;
+            let mut dpos = 0usize;
+            while dpos + 8 <= mdia.len() {
+                let dsize = u32::from_be_bytes([
+                    mdia[dpos],
+                    mdia[dpos + 1],
+                    mdia[dpos + 2],
+                    mdia[dpos + 3],
+                ]) as usize;
+                let dtype = &mdia[dpos + 4..dpos + 8];
+                if dsize < 8 || dpos + dsize > mdia.len() {
+                    break;
+                }
+                let dbody = &mdia[dpos + 8..dpos + dsize];
+                if dtype == b"hdlr" && dbody.len() >= 12 && &dbody[8..12] == b"soun" {
+                    is_soun = true;
+                } else if dtype == b"minf" {
+                    let mut ipos = 0usize;
+                    while ipos + 8 <= dbody.len() {
+                        let isize = u32::from_be_bytes([
+                            dbody[ipos],
+                            dbody[ipos + 1],
+                            dbody[ipos + 2],
+                            dbody[ipos + 3],
+                        ]) as usize;
+                        let itype = &dbody[ipos + 4..ipos + 8];
+                        if isize < 8 || ipos + isize > dbody.len() {
+                            break;
+                        }
+                        if itype == b"stbl" {
+                            stbl_slice = Some(&dbody[ipos + 8..ipos + isize]);
+                        }
+                        ipos += isize;
+                    }
+                }
+                dpos += dsize;
+            }
+            if is_soun && let Some(stbl) = stbl_slice {
+                let mut offsets = Vec::new();
+                let mut total_bytes = 0u64;
+                let mut sample_count = 0u32;
+                let mut spos = 0usize;
+                while spos + 8 <= stbl.len() {
+                    let ssize = u32::from_be_bytes([
+                        stbl[spos],
+                        stbl[spos + 1],
+                        stbl[spos + 2],
+                        stbl[spos + 3],
+                    ]) as usize;
+                    let stype = &stbl[spos + 4..spos + 8];
+                    if ssize < 8 || spos + ssize > stbl.len() {
+                        break;
+                    }
+                    let sbody = &stbl[spos + 8..spos + ssize];
+                    if stype == b"stsz" && sbody.len() >= 12 {
+                        let default_size =
+                            u32::from_be_bytes([sbody[4], sbody[5], sbody[6], sbody[7]]);
+                        let count = u32::from_be_bytes([sbody[8], sbody[9], sbody[10], sbody[11]]);
+                        sample_count = count;
+                        if default_size > 0 {
+                            total_bytes = (default_size as u64) * (count as u64);
+                        } else {
+                            let mut bpos = 12usize;
+                            while bpos + 4 <= sbody.len() {
+                                let sz = u32::from_be_bytes([
+                                    sbody[bpos],
+                                    sbody[bpos + 1],
+                                    sbody[bpos + 2],
+                                    sbody[bpos + 3],
+                                ]) as u64;
+                                total_bytes += sz;
+                                bpos += 4;
+                            }
+                        }
+                    } else if stype == b"stco" && sbody.len() >= 8 {
+                        let count =
+                            u32::from_be_bytes([sbody[4], sbody[5], sbody[6], sbody[7]]) as usize;
+                        let mut bpos = 8usize;
+                        for _ in 0..count {
+                            if bpos + 4 > sbody.len() {
+                                break;
+                            }
+                            offsets.push(u32::from_be_bytes([
+                                sbody[bpos],
+                                sbody[bpos + 1],
+                                sbody[bpos + 2],
+                                sbody[bpos + 3],
+                            ]) as u64);
+                            bpos += 4;
+                        }
+                    } else if stype == b"co64" && sbody.len() >= 8 {
+                        let count =
+                            u32::from_be_bytes([sbody[4], sbody[5], sbody[6], sbody[7]]) as usize;
+                        let mut bpos = 8usize;
+                        for _ in 0..count {
+                            if bpos + 8 > sbody.len() {
+                                break;
+                            }
+                            offsets.push(u64::from_be_bytes([
+                                sbody[bpos],
+                                sbody[bpos + 1],
+                                sbody[bpos + 2],
+                                sbody[bpos + 3],
+                                sbody[bpos + 4],
+                                sbody[bpos + 5],
+                                sbody[bpos + 6],
+                                sbody[bpos + 7],
+                            ]));
+                            bpos += 8;
+                        }
+                    }
+                    spos += ssize;
+                }
+                return Some((offsets, total_bytes, sample_count));
             }
         }
         tpos += tsize;
@@ -494,18 +772,24 @@ impl RecordingEngine {
             .unwrap_or_else(|| unix_now_f64() - duration);
         let end_time = start_time + duration;
 
-        let (motion, objects, regions) = {
+        let (motion, objects, regions, ledger_dbfs) = {
             let ledger = self.activity_ledger.read().await;
             ledger
                 .get(camera)
-                .map(|ring| ring.aggregate_range(start_time, end_time))
-                .unwrap_or((0, 0, 0))
+                .map(|ring| ring.aggregate_range_with_audio(start_time, end_time))
+                .unwrap_or((0, 0, 0, 0))
+        };
+        let probed_dbfs = probe_mp4_audio_dbfs_fast(staged_path);
+        let dbfs = if ledger_dbfs != 0 {
+            ledger_dbfs
+        } else {
+            probed_dbfs
         };
 
         let should_keep = if policy.keep_continuous || policy.retain_mode == "all" {
             true
         } else if policy.keep_motion || policy.retain_mode == "motion" {
-            motion > 0 || objects > 0
+            motion > 0 || objects > 0 || (dbfs != 0 && dbfs > -45)
         } else {
             objects > 0
         };
@@ -556,15 +840,15 @@ impl RecordingEngine {
             duration,
             motion,
             objects,
-            dbfs: 0,
+            dbfs,
             segment_size: seg_size_mb,
             regions,
             motion_heatmap: None,
         })?;
 
         debug!(
-            "Recorded segment for {camera}: {:.2}s ({:.2} MB, motion={}, objects={})",
-            duration, seg_size_mb, motion, objects
+            "Recorded segment for {camera}: {:.2}s ({:.2} MB, motion={}, objects={}, dbfs={})",
+            duration, seg_size_mb, motion, objects, dbfs
         );
         Ok(())
     }
@@ -928,14 +1212,103 @@ mod tests {
     #[test]
     fn activity_ring_aggregates_and_expires_old_samples() {
         let mut ring = CameraActivityRing::default();
-        ring.record_sample(1000.0, 50, 1, 1);
-        ring.record_sample(1200.0, 80, 2, 1);
-        ring.record_sample(1350.0, 10, 0, 1);
+        ring.record_sample_with_audio(1000.0, 50, 1, 1, -40);
+        ring.record_sample_with_audio(1200.0, 80, 2, 1, -22);
+        ring.record_sample_with_audio(1350.0, 10, 0, 1, -35);
 
         // 1000.0 is expired (>300s before 1350.0)
-        let (m, o, _r) = ring.aggregate_range(900.0, 1400.0);
+        let (m, o, _r, dbfs) = ring.aggregate_range_with_audio(900.0, 1400.0);
         assert_eq!(m, 90);
         assert_eq!(o, 2);
+        assert_eq!(dbfs, -22);
+    }
+
+    #[test]
+    fn audio_rms_dbfs_and_mp4_probe_distinguish_silent_vs_active_segments() {
+        assert_eq!(compute_pcm_rms_dbfs(&[]), 0);
+        assert_eq!(compute_pcm_rms_dbfs(&[0i16; 1024]), 0);
+
+        let loud_samples = vec![8192i16; 1024]; // ~ -12 dBFS
+        let loud_db = compute_pcm_rms_dbfs(&loud_samples);
+        assert!(
+            (-15..0).contains(&loud_db),
+            "expected ~ -12 dBFS, got {loud_db}"
+        );
+
+        fn make_box(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let sz = (8 + body.len()) as u32;
+            let mut out = Vec::with_capacity(sz as usize);
+            out.extend_from_slice(&sz.to_be_bytes());
+            out.extend_from_slice(btype);
+            out.extend_from_slice(body);
+            out
+        }
+
+        // Build synthetic MP4 with `soun` trak + `mdat`
+        let build_synthetic_audio_mp4 = |pcm: &[i16]| -> Vec<u8> {
+            let mut mdat_body = Vec::with_capacity(pcm.len() * 2);
+            for &s in pcm {
+                mdat_body.extend_from_slice(&s.to_le_bytes());
+            }
+            let ftyp = make_box(b"ftyp", &[0u8; 16]);
+            let mdat_offset = (ftyp.len() + 8) as u32;
+            let mdat = make_box(b"mdat", &mdat_body);
+
+            let mut hdlr_body = vec![0u8; 12];
+            hdlr_body[8..12].copy_from_slice(b"soun");
+            let hdlr = make_box(b"hdlr", &hdlr_body);
+
+            let mut stsz_body = Vec::new();
+            stsz_body.extend_from_slice(&0u32.to_be_bytes()); // version/flags
+            stsz_body.extend_from_slice(&(mdat_body.len() as u32).to_be_bytes()); // default sample size
+            stsz_body.extend_from_slice(&1u32.to_be_bytes()); // sample count = 1
+            let stsz = make_box(b"stsz", &stsz_body);
+
+            let mut stco_body = Vec::new();
+            stco_body.extend_from_slice(&0u32.to_be_bytes()); // version/flags
+            stco_body.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+            stco_body.extend_from_slice(&mdat_offset.to_be_bytes());
+            let stco = make_box(b"stco", &stco_body);
+
+            let mut stbl_body = Vec::new();
+            stbl_body.extend_from_slice(&stsz);
+            stbl_body.extend_from_slice(&stco);
+            let stbl = make_box(b"stbl", &stbl_body);
+            let minf = make_box(b"minf", &stbl);
+
+            let mut mdia_body = Vec::new();
+            mdia_body.extend_from_slice(&hdlr);
+            mdia_body.extend_from_slice(&minf);
+            let mdia = make_box(b"mdia", &mdia_body);
+            let trak = make_box(b"trak", &mdia);
+            let moov = make_box(b"moov", &trak);
+
+            let mut file_bytes = Vec::new();
+            file_bytes.extend_from_slice(&ftyp);
+            file_bytes.extend_from_slice(&mdat);
+            file_bytes.extend_from_slice(&moov);
+            file_bytes
+        };
+
+        let tmp_dir = std::env::temp_dir().join(format!("ninjanvr-audio-test-{}", random_suffix()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let silent_path = tmp_dir.join("silent.mp4");
+        let active_path = tmp_dir.join("active.mp4");
+
+        std::fs::write(&silent_path, build_synthetic_audio_mp4(&vec![0i16; 512])).unwrap();
+        std::fs::write(
+            &active_path,
+            build_synthetic_audio_mp4(&vec![12000i16; 512]),
+        )
+        .unwrap();
+
+        assert_eq!(probe_mp4_audio_dbfs_fast(&silent_path), 0);
+        let probed_active = probe_mp4_audio_dbfs_fast(&active_path);
+        assert!(
+            (-15..0).contains(&probed_active),
+            "expected active dBFS in [-15, -1], got {probed_active}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]

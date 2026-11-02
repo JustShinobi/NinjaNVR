@@ -317,6 +317,7 @@ export interface RecordingSegment {
   duration: number;
   motion: number;
   objects: number;
+  dbfs?: number;
   segment_size: number;
 }
 
@@ -325,6 +326,7 @@ export interface RecordingHourSummary {
   events: number;
   motion: number;
   objects: number;
+  dbfs?: number;
   duration: number;
   start_ts?: number;
   end_ts?: number;
