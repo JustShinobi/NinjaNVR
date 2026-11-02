@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -11,7 +12,27 @@ use ninjanvr_db::{NinjaDatabase, RecordingRow};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
+
+/// Probes whether `media_dir` (`recordings/`, `clips/`, `exports/`) can be created and written to.
+/// Returns `Ok(())` if writable, or `Err(reason)` if the mount is missing, read-only, or permission-denied.
+pub fn probe_storage_writable(media_dir: &Path) -> std::result::Result<(), String> {
+    for sub in ["recordings", "clips", "exports"] {
+        let dir = media_dir.join(sub);
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            return Err(format!("failed to initialize {}: {err}", dir.display()));
+        }
+    }
+    let probe_file = media_dir.join("recordings").join(".ninjanvr_write_probe");
+    if let Err(err) = std::fs::write(&probe_file, b"ok") {
+        return Err(format!(
+            "recordings mount {} is not writable: {err}",
+            media_dir.display()
+        ));
+    }
+    let _ = std::fs::remove_file(&probe_file);
+    Ok(())
+}
 
 /// Resolves the `ffmpeg` binary path across container and host installations.
 pub fn resolve_ffmpeg_bin() -> PathBuf {
@@ -566,6 +587,8 @@ pub struct RecordingEngine {
     db: NinjaDatabase,
     media_dir: PathBuf,
     activity_ledger: SharedActivityLedger,
+    storage_degraded: Arc<AtomicBool>,
+    storage_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl RecordingEngine {
@@ -575,11 +598,38 @@ impl RecordingEngine {
         media_dir: PathBuf,
         activity_ledger: SharedActivityLedger,
     ) -> Self {
+        let (degraded, err_msg) = match probe_storage_writable(&media_dir) {
+            Ok(()) => (false, None),
+            Err(e) => {
+                warn!("Storage mount degraded at startup: {e}");
+                (true, Some(e))
+            }
+        };
         Self {
             config,
             db,
             media_dir,
             activity_ledger,
+            storage_degraded: Arc::new(AtomicBool::new(degraded)),
+            storage_error: Arc::new(std::sync::Mutex::new(err_msg)),
+        }
+    }
+
+    pub fn with_storage_state(
+        config: Arc<RwLock<NinjaConfig>>,
+        db: NinjaDatabase,
+        media_dir: PathBuf,
+        activity_ledger: SharedActivityLedger,
+        storage_degraded: Arc<AtomicBool>,
+        storage_error: Arc<std::sync::Mutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            config,
+            db,
+            media_dir,
+            activity_ledger,
+            storage_degraded,
+            storage_error,
         }
     }
 
@@ -619,6 +669,41 @@ impl RecordingEngine {
         tokio::spawn(async move {
             preview_engine.run_preview_generator_loop().await;
         });
+
+        let recovery_engine = self.clone();
+        tokio::spawn(async move {
+            recovery_engine.run_storage_recovery_probe_loop().await;
+        });
+    }
+
+    async fn run_storage_recovery_probe_loop(&self) {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            match probe_storage_writable(&self.media_dir) {
+                Ok(()) => {
+                    if self.storage_degraded.swap(false, Ordering::SeqCst) {
+                        info!(
+                            "Storage mount {} recovered; resuming normal recording operations",
+                            self.media_dir.display()
+                        );
+                    }
+                    if let Ok(mut guard) = self.storage_error.lock() {
+                        *guard = None;
+                    }
+                }
+                Err(err) => {
+                    if !self.storage_degraded.swap(true, Ordering::SeqCst) {
+                        warn!(
+                            "Storage mount {} entered degraded state: {err}",
+                            self.media_dir.display()
+                        );
+                    }
+                    if let Ok(mut guard) = self.storage_error.lock() {
+                        *guard = Some(err);
+                    }
+                }
+            }
+        }
     }
 
     async fn sweep_staging_dir(
@@ -657,14 +742,24 @@ impl RecordingEngine {
             .join("recordings")
             .join(".staging")
             .join(&camera);
-        if let Err(err) = std::fs::create_dir_all(&staging_dir) {
-            error!("Failed to create recording staging dir for {camera}: {err:#}");
-            return;
-        }
-
         let ffmpeg_bin = resolve_ffmpeg_bin();
 
         loop {
+            if let Err(err) = std::fs::create_dir_all(&staging_dir) {
+                self.storage_degraded.store(true, Ordering::SeqCst);
+                if let Ok(mut guard) = self.storage_error.lock() {
+                    *guard = Some(format!(
+                        "Failed to create recording staging dir {}: {err}",
+                        staging_dir.display()
+                    ));
+                }
+                warn!(
+                    "Storage unavailable for {camera} staging dir ({}); retrying in 30s",
+                    err
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                continue;
+            }
             self.sweep_staging_dir(&camera, &staging_dir, &policy).await;
 
             let out_pattern = staging_dir.join(format!("{camera}_%Y%m%d%H%M%S.mp4"));

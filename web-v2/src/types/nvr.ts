@@ -262,6 +262,8 @@ export interface NinjaStatsResponse {
     uptime: number;
     version: string;
     latest_version: string;
+    storage_degraded?: boolean;
+    storage_error?: string | null;
     storage: Record<string, StorageStatItem>;
     last_updated: number;
   };

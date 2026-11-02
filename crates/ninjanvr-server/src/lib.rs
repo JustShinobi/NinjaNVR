@@ -28,6 +28,7 @@ use ninjanvr_db::{EventFilter, ExportRow, NinjaDatabase, ReviewFilter, verify_pa
 use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{
     RecordingEngine, SharedActivityLedger, build_mp4_export_with_options, new_activity_ledger,
+    probe_storage_writable,
 };
 use pipeline::{SharedCameraMetrics, VisionPipeline};
 use serde::{Deserialize, Serialize};
@@ -258,6 +259,8 @@ pub struct AppState {
     pub log_hub: LogBufferHub,
     pub stats_history: Arc<RwLock<VecDeque<Value>>>,
     pub cpu_tracker: ProcCpuTracker,
+    pub storage_degraded: Arc<std::sync::atomic::AtomicBool>,
+    pub storage_error: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1404,6 +1407,27 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         obj.insert("min_shm".to_string(), json!(16));
     }
 
+    let (storage_degraded_val, storage_error_val) = match probe_storage_writable(&state.media_dir) {
+        Ok(()) => {
+            state
+                .storage_degraded
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut g) = state.storage_error.lock() {
+                *g = None;
+            }
+            (false, Value::Null)
+        }
+        Err(err) => {
+            state
+                .storage_degraded
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut g) = state.storage_error.lock() {
+                *g = Some(err.clone());
+            }
+            (true, json!(err))
+        }
+    };
+
     Json(json!({
         "cameras": cameras_stats,
         "detectors": detectors_stats,
@@ -1417,6 +1441,8 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
             "uptime": state.start_instant.elapsed().as_secs(),
             "version": NINJANVR_VERSION,
             "latest_version": NINJANVR_VERSION,
+            "storage_degraded": storage_degraded_val,
+            "storage_error": storage_error_val,
             "storage": {
                 "/media/frigate/recordings": stat_mount_mb(&rec_dir, "ext4"),
                 "/media/frigate/clips": stat_mount_mb(&clips_dir, "ext4"),
@@ -2504,7 +2530,41 @@ pub async fn new_app_state(
     spawn_go2rtc: bool,
 ) -> Result<AppState> {
     let cfg = NinjaConfig::load(config_path)?;
-    let db = NinjaDatabase::open(&cfg.database.path)?;
+    let (init_degraded, init_err) = match probe_storage_writable(&media_dir) {
+        Ok(()) => (false, None),
+        Err(err) => {
+            warn!(
+                "Storage mount {} is degraded at startup ({}); keeping Live Wall online",
+                media_dir.display(),
+                err
+            );
+            (true, Some(err))
+        }
+    };
+    let storage_degraded = Arc::new(std::sync::atomic::AtomicBool::new(init_degraded));
+    let storage_error = Arc::new(std::sync::Mutex::new(init_err));
+
+    let db = match NinjaDatabase::open(&cfg.database.path) {
+        Ok(d) => d,
+        Err(err) => {
+            warn!(
+                "Primary database path {} unavailable ({}); falling back to /tmp/ninjanvr-degraded.db",
+                cfg.database.path, err
+            );
+            storage_degraded.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut g) = storage_error.lock()
+                && g.is_none()
+            {
+                *g = Some(format!(
+                    "Primary DB path {} unavailable: {err}",
+                    cfg.database.path
+                ));
+            }
+            let fallback_db =
+                std::env::temp_dir().join(format!("ninjanvr-degraded-{}.db", std::process::id()));
+            NinjaDatabase::open(&fallback_db)?
+        }
+    };
     if let Some(generated_pw) = db.ensure_default_admin(cfg.auth.hash_iterations)? {
         info!(
             "Initialized default admin user (password length: {})",
@@ -2567,11 +2627,13 @@ pub async fn new_app_state(
     let go2rtc_supervisor = Arc::new(Go2RtcSupervisor::new(shared_cfg.clone()));
     if spawn_go2rtc {
         go2rtc_supervisor.clone().spawn_supervisor_task();
-        let rec_engine = Arc::new(RecordingEngine::new(
+        let rec_engine = Arc::new(RecordingEngine::with_storage_state(
             shared_cfg.clone(),
             db.clone(),
             media_dir.clone(),
             activity_ledger.clone(),
+            storage_degraded.clone(),
+            storage_error.clone(),
         ));
         rec_engine.start().await;
 
@@ -2629,6 +2691,8 @@ pub async fn new_app_state(
         log_hub,
         stats_history,
         cpu_tracker: ProcCpuTracker::default(),
+        storage_degraded,
+        storage_error,
     };
 
     // Seed 30 initial stats_history points so all 30 bars in /system#general and /system#cameras render with zero 0-padding
@@ -2977,6 +3041,50 @@ version: 0.18-0
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // 10. Test degraded storage mount guard: unwritable media_dir boots cleanly and reports storage_degraded=true
+        let blocked_media_path = tmp_dir.join("unwritable_mount_file");
+        std::fs::write(&blocked_media_path, b"not_a_directory").unwrap();
+        let degraded_state = new_app_state(
+            &cfg_path,
+            tmp_dir.join("web"),
+            blocked_media_path.clone(),
+            false,
+        )
+        .await
+        .expect("server must boot even when media_dir is unwritable");
+        let degraded_app = build_router(degraded_state);
+        let resp_deg = degraded_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_deg.status(), StatusCode::OK);
+        let deg_json: Value =
+            serde_json::from_slice(&to_bytes(resp_deg.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(deg_json["service"]["storage_degraded"], true);
+        assert!(deg_json["service"]["storage_error"].is_string());
+
+        // Auto-recovery when mount becomes a writable directory
+        std::fs::remove_file(&blocked_media_path).unwrap();
+        std::fs::create_dir_all(&blocked_media_path).unwrap();
+        let resp_rec = degraded_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let rec_json: Value =
+            serde_json::from_slice(&to_bytes(resp_rec.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(rec_json["service"]["storage_degraded"], false);
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

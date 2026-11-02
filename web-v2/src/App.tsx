@@ -813,6 +813,24 @@ export const App: React.FC = () => {
         </nav>
 
         <div className="nvr-header-right">
+          {stats?.service?.storage_degraded && (
+            <button
+              className="nvr-badge alert mono"
+              onClick={() => switchTab("system")}
+              title={
+                stats.service.storage_error ||
+                "Recordings storage mount is unavailable or read-only; Live Wall remains active"
+              }
+              style={{
+                cursor: "pointer",
+                padding: "3px 8px",
+                fontSize: "var(--text-xs)",
+                fontWeight: 700,
+              }}
+            >
+              STORAGE DEGRADED
+            </button>
+          )}
           <button
             className="nvr-telemetry-pill"
             onClick={() => switchTab("system")}
