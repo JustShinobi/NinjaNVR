@@ -87,9 +87,18 @@ pub struct ActivitySample {
 #[derive(Default)]
 pub struct CameraActivityRing {
     samples: VecDeque<ActivitySample>,
+    pub record_enabled: Option<bool>,
 }
 
 impl CameraActivityRing {
+    pub fn set_record_enabled(&mut self, enabled: bool) {
+        self.record_enabled = Some(enabled);
+    }
+
+    pub fn is_record_enabled(&self) -> bool {
+        self.record_enabled.unwrap_or(true)
+    }
+
     pub fn record_sample(
         &mut self,
         timestamp: f64,
@@ -884,6 +893,18 @@ impl RecordingEngine {
             .with_context(|| format!("missing staged segment {}", staged_path.display()))?;
         let size_bytes = meta.len();
         if size_bytes < 1024 {
+            let _ = std::fs::remove_file(staged_path);
+            return Ok(());
+        }
+
+        let record_allowed = {
+            let ledger = self.activity_ledger.read().await;
+            ledger
+                .get(camera)
+                .map(|r| r.is_record_enabled())
+                .unwrap_or(true)
+        };
+        if !record_allowed {
             let _ = std::fs::remove_file(staged_path);
             return Ok(());
         }

@@ -430,6 +430,33 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   <span className="nvr-badge">
                     AI {camStat?.detection_fps?.toFixed(1) || "0.0"} FPS
                   </span>
+                  {(
+                    [
+                      ["enabled", "EN", act?.config?.enabled ?? act?.enabled ?? true],
+                      ["detect", "DET", act?.config?.detect ?? true],
+                      ["record", "REC", act?.config?.record ?? true],
+                      ["alerts", "ALR", act?.config?.alerts ?? true],
+                    ] as Array<["enabled" | "detect" | "record" | "alerts", string, boolean]>
+                  ).map(([flagKey, shortLbl, isOn]) => (
+                    <button
+                      key={flagKey}
+                      type="button"
+                      className={`nvr-btn nvr-tile-action mono ${isOn ? "active" : ""}`}
+                      style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                      title={`Toggle ${flagKey} at runtime without server restart`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        fetch(`/api/${encodeURIComponent(cam)}/state`, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          credentials: "include",
+                          body: JSON.stringify({ [flagKey]: !isOn }),
+                        }).catch(() => {});
+                      }}
+                    >
+                      {shortLbl}:{isOn ? "ON" : "OFF"}
+                    </button>
+                  ))}
                   <button
                     className="nvr-btn nvr-tile-action mono"
                     style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}

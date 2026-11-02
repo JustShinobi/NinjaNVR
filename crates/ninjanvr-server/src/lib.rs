@@ -494,6 +494,10 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
             get(api_camera_recordings_summary),
         )
         .route("/{camera}/ptz/info", get(api_empty_object))
+        .route(
+            "/{camera}/state",
+            get(api_camera_state_get).post(api_camera_state_set),
+        )
         .route("/{camera}/latest.webp", get(api_camera_latest_frame))
         .route("/{camera}/latest.jpg", get(api_camera_latest_frame))
         .route("/labels", get(api_labels))
@@ -2487,6 +2491,46 @@ async fn api_empty_object() -> Json<Value> {
     Json(json!({}))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct SetCameraStateBody {
+    pub enabled: Option<bool>,
+    pub detect: Option<bool>,
+    pub record: Option<bool>,
+    pub alerts: Option<bool>,
+    pub snapshots: Option<bool>,
+}
+
+async fn api_camera_state_get(
+    State(state): State<AppState>,
+    AxumPath(camera): AxumPath<String>,
+) -> Json<Value> {
+    let flags = state.comms.get_camera_flags(&camera);
+    Json(serde_json::to_value(flags).unwrap_or_else(|_| json!({})))
+}
+
+async fn api_camera_state_set(
+    State(state): State<AppState>,
+    AxumPath(camera): AxumPath<String>,
+    Json(body): Json<SetCameraStateBody>,
+) -> Json<Value> {
+    let flags = state.comms.set_camera_flags(
+        &camera,
+        body.enabled,
+        body.detect,
+        body.record,
+        body.alerts,
+        body.snapshots,
+    );
+    state
+        .activity_ledger
+        .write()
+        .await
+        .entry(camera)
+        .or_default()
+        .set_record_enabled(flags.enabled && flags.record);
+    Json(serde_json::to_value(flags).unwrap_or_else(|_| json!({})))
+}
+
 async fn api_camera_latest_frame(
     State(state): State<AppState>,
     AxumPath(camera): AxumPath<String>,
@@ -2935,6 +2979,7 @@ pub async fn new_app_state(
 
     let detector = Arc::new(AiDetectorEngine::new(&cfg));
     let comms = Arc::new(CommsHub::with_mqtt(&cfg.mqtt));
+    comms.init_from_config(&cfg);
     if let Ok(saved_prof) = std::fs::read_to_string(config_dir.join(".active_profile"))
         && !saved_prof.trim().is_empty()
     {
@@ -3619,6 +3664,27 @@ version: 0.18-0
             serde_json::from_slice(&to_bytes(resp_prof_get.into_body(), 4096).await.unwrap())
                 .unwrap();
         assert_eq!(prof_json["active_profile"], "home");
+
+        // 15. Test GET/POST /api/:camera/state updates runtime camera flags dynamically
+        let resp_cam_state = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/state")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"detect":false,"alerts":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cam_state.status(), StatusCode::OK);
+        let state_json: Value =
+            serde_json::from_slice(&to_bytes(resp_cam_state.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(state_json["detect"], false);
+        assert_eq!(state_json["alerts"], false);
+        assert_eq!(state_json["record"], true);
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

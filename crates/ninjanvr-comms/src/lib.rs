@@ -15,6 +15,27 @@ pub struct WsMessage {
     pub payload: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraRuntimeFlags {
+    pub enabled: bool,
+    pub detect: bool,
+    pub record: bool,
+    pub alerts: bool,
+    pub snapshots: bool,
+}
+
+impl Default for CameraRuntimeFlags {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            detect: true,
+            record: true,
+            alerts: true,
+            snapshots: true,
+        }
+    }
+}
+
 fn default_camera_activity_entry() -> Value {
     json!({
         "enabled": true,
@@ -198,6 +219,97 @@ impl CommsHub {
             .clone()
     }
 
+    /// Initializes per-camera runtime flags from `NinjaConfig` so `/api/:camera/state`
+    /// and `/ws` snapshots reflect the configured defaults on startup.
+    pub fn init_from_config(&self, cfg: &ninjanvr_config::NinjaConfig) {
+        let mut map = self
+            .camera_states
+            .write()
+            .expect("camera_states lock poisoned");
+        for (cam_name, cam_cfg) in &cfg.cameras {
+            let entry = map
+                .entry(cam_name.clone())
+                .or_insert_with(default_camera_activity_entry);
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("enabled".to_string(), json!(cam_cfg.enabled));
+            }
+            if let Some(cfg_obj) = entry.get_mut("config").and_then(|c| c.as_object_mut()) {
+                cfg_obj.insert("enabled".to_string(), json!(cam_cfg.enabled));
+                cfg_obj.insert("detect".to_string(), json!(cam_cfg.detect.enabled));
+                cfg_obj.insert("record".to_string(), json!(cam_cfg.record.enabled));
+                cfg_obj.insert("alerts".to_string(), json!(cam_cfg.review.alerts.enabled));
+                cfg_obj.insert(
+                    "detections".to_string(),
+                    json!(cam_cfg.review.detections.enabled),
+                );
+                cfg_obj.insert("snapshots".to_string(), json!(cam_cfg.snapshots.enabled));
+                cfg_obj.insert("audio".to_string(), json!(cam_cfg.audio.enabled));
+            }
+        }
+    }
+
+    /// Returns the live runtime toggle flags (`enabled`, `detect`, `record`, `alerts`, `snapshots`) for `camera`.
+    pub fn get_camera_flags(&self, camera: &str) -> CameraRuntimeFlags {
+        let map = self
+            .camera_states
+            .read()
+            .expect("camera_states lock poisoned");
+        let Some(entry) = map.get(camera) else {
+            return CameraRuntimeFlags::default();
+        };
+        let cfg = &entry["config"];
+        CameraRuntimeFlags {
+            enabled: cfg["enabled"].as_bool().unwrap_or(true),
+            detect: cfg["detect"].as_bool().unwrap_or(true),
+            record: cfg["record"].as_bool().unwrap_or(true),
+            alerts: cfg["alerts"].as_bool().unwrap_or(true),
+            snapshots: cfg["snapshots"].as_bool().unwrap_or(true),
+        }
+    }
+
+    /// Updates one or more runtime toggle flags for `camera` and broadcasts the updated state over `/ws` and MQTT.
+    pub fn set_camera_flags(
+        &self,
+        camera: &str,
+        enabled: Option<bool>,
+        detect: Option<bool>,
+        record: Option<bool>,
+        alerts: Option<bool>,
+        snapshots: Option<bool>,
+    ) -> CameraRuntimeFlags {
+        if let Some(v) = enabled {
+            self.apply_set_command(
+                &format!("{camera}/enabled/set"),
+                if v { "ON" } else { "OFF" },
+            );
+        }
+        if let Some(v) = detect {
+            self.apply_set_command(
+                &format!("{camera}/detect/set"),
+                if v { "ON" } else { "OFF" },
+            );
+        }
+        if let Some(v) = record {
+            self.apply_set_command(
+                &format!("{camera}/recordings/set"),
+                if v { "ON" } else { "OFF" },
+            );
+        }
+        if let Some(v) = alerts {
+            self.apply_set_command(
+                &format!("{camera}/alerts/set"),
+                if v { "ON" } else { "OFF" },
+            );
+        }
+        if let Some(v) = snapshots {
+            self.apply_set_command(
+                &format!("{camera}/snapshots/set"),
+                if v { "ON" } else { "OFF" },
+            );
+        }
+        self.get_camera_flags(camera)
+    }
+
     /// Sets the active operational security profile (`"armed"`, `"home"`, `"disarmed"`)
     /// and broadcasts `profile/state` over MQTT and WebSocket.
     pub fn set_active_profile(&self, profile: &str) -> String {
@@ -272,13 +384,13 @@ impl CommsHub {
             let feature = parts[1];
             let is_on = payload.eq_ignore_ascii_case("ON") || payload.eq_ignore_ascii_case("true");
             let cfg_key = match feature {
-                "recordings" => Some("record"),
+                "recordings" | "record" => Some("record"),
                 "detect" => Some("detect"),
                 "enabled" => Some("enabled"),
                 "snapshots" => Some("snapshots"),
                 "audio" => Some("audio"),
-                "review_alerts" => Some("alerts"),
-                "review_detections" => Some("detections"),
+                "alerts" | "review_alerts" => Some("alerts"),
+                "detections" | "review_detections" => Some("detections"),
                 _ => None,
             };
             let snapshot_str = {
@@ -325,6 +437,7 @@ impl CommsHub {
                     ("enabled/state", "enabled"),
                     ("detect/state", "detect"),
                     ("recordings/state", "record"),
+                    ("alerts/state", "alerts"),
                     ("snapshots/state", "snapshots"),
                     ("audio/state", "audio"),
                 ] {

@@ -250,6 +250,18 @@ impl VisionPipeline {
                         );
                     }
 
+                    let rt_flags = self.comms.get_camera_flags(&camera);
+                    {
+                        let mut ledger = self.activity_ledger.write().await;
+                        ledger
+                            .entry(camera.clone())
+                            .or_default()
+                            .set_record_enabled(rt_flags.enabled && rt_flags.record);
+                    }
+                    if !rt_flags.enabled {
+                        continue;
+                    }
+
                     let yuv_frame = YuvFrame {
                         camera: cam_arc.clone(),
                         timestamp: now,
@@ -302,7 +314,11 @@ impl VisionPipeline {
                     }
 
                     // 1. SIMD Motion Detection on Y-plane
-                    let motion_boxes = motion_detector.detect(&yuv_frame);
+                    let motion_boxes = if rt_flags.enabled && rt_flags.detect {
+                        motion_detector.detect(&yuv_frame)
+                    } else {
+                        Vec::new()
+                    };
                     let motion_px: u32 = motion_boxes.iter().map(|b| b.area()).sum();
 
                     // 2. Dynamic Region Cropping & AI Object Detection (only when motion or non-stationary objects exist)
@@ -312,13 +328,17 @@ impl VisionPipeline {
                         tensor_buf.resize(needed_tensor_len, 0);
                     }
                     let tracked_boxes = tracker.non_stationary_boxes(&motion_boxes);
-                    let regions = compute_inference_regions(
-                        width,
-                        height,
-                        model_w.max(model_h),
-                        &motion_boxes,
-                        &tracked_boxes,
-                    );
+                    let regions = if rt_flags.enabled && rt_flags.detect {
+                        compute_inference_regions(
+                            width,
+                            height,
+                            model_w.max(model_h),
+                            &motion_boxes,
+                            &tracked_boxes,
+                        )
+                    } else {
+                        Vec::new()
+                    };
 
                     let mut raw_detections = Vec::new();
                     for region in &regions {
@@ -517,6 +537,7 @@ impl VisionPipeline {
         let clips_dir = self.media_dir.join("clips");
 
         let active_profile = self.comms.get_active_profile();
+        let cam_rt_flags = self.comms.get_camera_flags(camera);
         let camera_suppressed_in_profile = {
             let cfg_guard = self.config.read().await;
             cfg_guard
@@ -530,6 +551,8 @@ impl VisionPipeline {
                 })
                 .unwrap_or(false)
         };
+        let snapshots_active = cam_cfg.snapshots.enabled && cam_rt_flags.snapshots;
+        let record_active = cam_cfg.record.enabled && cam_rt_flags.record;
         for trk in active_tracks {
             let prev = track_snapshots.get(&trk.id);
             let is_new = prev.is_none();
@@ -569,7 +592,7 @@ impl VisionPipeline {
                         .ok()
                         .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
 
-                    if cam_cfg.snapshots.enabled {
+                    if snapshots_active {
                         let jpg_path = clips_dir.join(format!("{}.jpg", trk.id));
                         let webp_path = clips_dir.join(format!("{camera}-{}.webp", trk.id));
                         let full_img =
@@ -637,12 +660,16 @@ impl VisionPipeline {
 
                 let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
                 let norm_reg = trk.region.to_normalized(frame.width, frame.height);
-                let severity = compute_track_severity_for_profile(
-                    cam_cfg,
-                    trk,
-                    &active_profile,
-                    camera_suppressed_in_profile,
-                );
+                let severity = if !cam_rt_flags.alerts {
+                    "detection"
+                } else {
+                    compute_track_severity_for_profile(
+                        cam_cfg,
+                        trk,
+                        &active_profile,
+                        camera_suppressed_in_profile,
+                    )
+                };
                 let area = trk.bbox.area();
                 let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
 
@@ -653,8 +680,8 @@ impl VisionPipeline {
                     zones: json!(trk.entered_zones),
                     start_time: trk.start_time,
                     end_time: None,
-                    has_clip: cam_cfg.record.enabled,
-                    has_snapshot: cam_cfg.snapshots.enabled,
+                    has_clip: record_active,
+                    has_snapshot: snapshots_active,
                     plus_id: None,
                     retain_indefinitely: false,
                     sub_label: None,
@@ -717,12 +744,16 @@ impl VisionPipeline {
             }
 
             // Update or open ReviewSegment if enabled
-            let track_sev = compute_track_severity_for_profile(
-                cam_cfg,
-                trk,
-                &active_profile,
-                camera_suppressed_in_profile,
-            );
+            let track_sev = if !cam_rt_flags.alerts {
+                "detection"
+            } else {
+                compute_track_severity_for_profile(
+                    cam_cfg,
+                    trk,
+                    &active_profile,
+                    camera_suppressed_in_profile,
+                )
+            };
             let is_alert = track_sev == "alert";
             if !is_alert && !cam_cfg.review.detections.enabled {
                 continue;
@@ -795,12 +826,16 @@ impl VisionPipeline {
                 .unwrap_or(trk.top_score);
             let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
             let norm_reg = trk.region.to_normalized(frame.width, frame.height);
-            let severity = compute_track_severity_for_profile(
-                cam_cfg,
-                trk,
-                &active_profile,
-                camera_suppressed_in_profile,
-            );
+            let severity = if !cam_rt_flags.alerts {
+                "detection"
+            } else {
+                compute_track_severity_for_profile(
+                    cam_cfg,
+                    trk,
+                    &active_profile,
+                    camera_suppressed_in_profile,
+                )
+            };
             let area = trk.bbox.area();
             let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
             let ev_dto = EventDto {
@@ -810,8 +845,8 @@ impl VisionPipeline {
                 zones: json!(trk.entered_zones),
                 start_time: trk.start_time,
                 end_time: Some(trk.last_seen_time),
-                has_clip: cam_cfg.record.enabled,
-                has_snapshot: cam_cfg.snapshots.enabled,
+                has_clip: record_active,
+                has_snapshot: snapshots_active,
                 plus_id: None,
                 retain_indefinitely: false,
                 sub_label: None,
