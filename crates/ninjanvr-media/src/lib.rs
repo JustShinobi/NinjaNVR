@@ -1378,6 +1378,69 @@ pub fn migrate_hot_segments_to_cold(
     Ok(migrated)
 }
 
+/// Automatically exports/copies a high-severity Alert clip and its best snapshot
+/// into a secondary/offsite directory `target_dir/<YYYY-MM-DD>/<camera>_<ts>_<label>.mp4`.
+#[allow(clippy::too_many_arguments)]
+pub async fn backup_alert_clip(
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    target_dir: &Path,
+    camera: &str,
+    label: &str,
+    start_time: f64,
+    end_time: f64,
+    thumb_rel: Option<&str>,
+    include_snapshot: bool,
+) -> Result<PathBuf> {
+    let dt = Utc
+        .timestamp_opt(start_time as i64, 0)
+        .single()
+        .unwrap_or_else(Utc::now);
+    let date_dir = dt.format("%Y-%m-%d").to_string();
+    let day_dir = target_dir.join(&date_dir);
+    std::fs::create_dir_all(&day_dir)
+        .with_context(|| format!("failed to create alert backup dir {}", day_dir.display()))?;
+
+    let safe_label: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let stem = format!("{camera}_{}_{safe_label}", start_time as u64);
+    let out_mp4 = day_dir.join(format!("{stem}.mp4"));
+
+    let mut segments = db.query_recordings(camera, start_time, end_time)?;
+    if segments.is_empty() {
+        segments = db.query_recordings(camera, start_time - 15.0, end_time + 15.0)?;
+    }
+    let Some(first_seg) = segments.first() else {
+        anyhow::bail!("no recording segments found to back up for {camera}");
+    };
+    let src_disk = if let Some(rel) = first_seg.path.strip_prefix("/media/frigate/") {
+        media_dir.join(rel)
+    } else {
+        PathBuf::from(&first_seg.path)
+    };
+    std::fs::copy(&src_disk, &out_mp4)
+        .with_context(|| format!("failed to copy alert clip to {}", out_mp4.display()))?;
+
+    if include_snapshot && let Some(t_rel) = thumb_rel {
+        let thumb_disk = if let Some(rel) = t_rel.strip_prefix("/media/frigate/") {
+            media_dir.join(rel)
+        } else {
+            PathBuf::from(t_rel)
+        };
+        if thumb_disk.exists() {
+            let ext = thumb_disk
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("webp");
+            let _ = std::fs::copy(&thumb_disk, day_dir.join(format!("{stem}.{ext}")));
+        }
+    }
+
+    Ok(out_mp4)
+}
+
 /// Builds the FFmpeg CLI arguments used to remux/concatenate segments into an exported MP4 clip.
 /// When `include_audio` is `false`, `-an` is included to strip the audio stream for privacy compliance.
 pub fn build_mp4_export_ffmpeg_args(
@@ -1860,6 +1923,56 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].path, cold_seg_file.to_string_lossy());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn backup_alert_clip_copies_mp4_and_snapshot_to_secondary_target_dir() {
+        let root = std::env::temp_dir().join(format!("ninjanvr-backup-test-{}", random_suffix()));
+        let rec_dir = root.join("recordings/2026-11-01/12/front_door");
+        let rev_dir = root.join("clips/review");
+        let backup_dir = root.join("offsite_backup");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+        std::fs::create_dir_all(&rev_dir).unwrap();
+
+        let db = NinjaDatabase::open(root.join("frigate.db")).unwrap();
+        let seg_disk = rec_dir.join("00.00.mp4");
+        std::fs::write(&seg_disk, b"alert_mp4_bytes").unwrap();
+        let snap_disk = rev_dir.join("thumb-front_door-rev1.webp");
+        std::fs::write(&snap_disk, b"alert_webp_bytes").unwrap();
+
+        db.insert_recording(&RecordingRow {
+            id: "seg_bak_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/frigate/recordings/2026-11-01/12/front_door/00.00.mp4".to_string(),
+            start_time: 1730500000.0,
+            end_time: 1730500010.0,
+            duration: 10.0,
+            motion: 10,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 0.01,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        let backed_up_mp4 = backup_alert_clip(
+            &db,
+            &root,
+            &backup_dir,
+            "front_door",
+            "person",
+            1730500000.0,
+            1730500010.0,
+            Some("/media/frigate/clips/review/thumb-front_door-rev1.webp"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(backed_up_mp4.exists());
+        assert!(backed_up_mp4.with_extension("webp").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -381,6 +381,33 @@ impl Default for StorageTiersConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertBackupConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_dir: Option<PathBuf>,
+    #[serde(default = "default_backup_severities")]
+    pub severities: Vec<String>,
+    #[serde(default = "default_true")]
+    pub include_snapshot: bool,
+}
+
+fn default_backup_severities() -> Vec<String> {
+    vec!["alert".to_string()]
+}
+
+impl Default for AlertBackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_dir: None,
+            severities: default_backup_severities(),
+            include_snapshot: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -406,6 +433,8 @@ pub struct RecordConfig {
     pub preview: RecordPreviewConfig,
     #[serde(default)]
     pub storage_tiers: StorageTiersConfig,
+    #[serde(default)]
+    pub alert_backup: AlertBackupConfig,
 }
 
 fn default_expire_interval() -> u64 {
@@ -427,6 +456,7 @@ impl Default for RecordConfig {
             detections: RecordEventRetainConfig::default(),
             preview: RecordPreviewConfig::default(),
             storage_tiers: StorageTiersConfig::default(),
+            alert_backup: AlertBackupConfig::default(),
         }
     }
 }
@@ -983,6 +1013,9 @@ impl NinjaConfig {
             }
             if cam.objects.track.is_empty() {
                 cam.objects.track = cfg.objects.track.clone();
+            }
+            if !cam.record.alert_backup.enabled && cfg.record.alert_backup.enabled {
+                cam.record.alert_backup = cfg.record.alert_backup.clone();
             }
         }
 

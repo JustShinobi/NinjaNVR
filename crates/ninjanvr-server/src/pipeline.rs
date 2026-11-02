@@ -9,7 +9,7 @@ use ninjanvr_comms::SharedCommsHub;
 use ninjanvr_config::{CameraConfig, NinjaConfig};
 use ninjanvr_db::{EventDto, NinjaDatabase, ReviewItemDto};
 use ninjanvr_infer::AiDetectorEngine;
-use ninjanvr_media::{SharedActivityLedger, YuvFrame, resolve_ffmpeg_bin};
+use ninjanvr_media::{SharedActivityLedger, YuvFrame, backup_alert_clip, resolve_ffmpeg_bin};
 use ninjanvr_track::{ByteTracker, TrackedObject, TriggerProvenance, should_replace_snapshot};
 use ninjanvr_vision::{
     BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, check_frame_tamper,
@@ -872,6 +872,42 @@ impl VisionPipeline {
                 rev.prev_dto = Some(dto);
 
                 if is_expired {
+                    let bak_cfg = &cam_cfg.record.alert_backup;
+                    if bak_cfg.enabled
+                        && bak_cfg.severities.iter().any(|s| s == &rev.severity)
+                        && let Some(ref target_dir) = bak_cfg.target_dir
+                    {
+                        let db_clone = self.db.clone();
+                        let media_clone = self.media_dir.clone();
+                        let target_clone = target_dir.clone();
+                        let cam_owned = camera.to_string();
+                        let lbl_owned = rev
+                            .objects
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "alert".to_string());
+                        let s_ts = rev.start_time;
+                        let e_ts = rev.last_activity_time;
+                        let thumb_owned = rev.thumb_path.clone();
+                        let inc_snap = bak_cfg.include_snapshot;
+                        tokio::spawn(async move {
+                            if let Err(err) = backup_alert_clip(
+                                &db_clone,
+                                &media_clone,
+                                &target_clone,
+                                &cam_owned,
+                                &lbl_owned,
+                                s_ts,
+                                e_ts,
+                                Some(&thumb_owned),
+                                inc_snap,
+                            )
+                            .await
+                            {
+                                warn!("Alert clip backup failed for {cam_owned}: {err:#}");
+                            }
+                        });
+                    }
                     *active_review = None;
                 }
             }
