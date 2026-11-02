@@ -5,6 +5,10 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    ignore:
+      # hmac 0.13 migrated to digest 0.11 while pbkdf2 0.12 and sha2 0.10 still require digest 0.10
+      - dependency-name: "hmac"
+        versions: [">= 0.13.0, < 0.14.0"]
 
   - package-ecosystem: "npm"
     directory: "/web-v2"
