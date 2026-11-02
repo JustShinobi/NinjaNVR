@@ -11,11 +11,9 @@ import {
 } from "lucide-react";
 import { useI18n } from "./i18n";
 import {
-  CameraLiveActivity,
   EventItem,
   ExportItem,
   NinjaConfigResponse,
-  NinjaStatsResponse,
   RecordingDaySummary,
   RecordingSegment,
   ReviewItem,
@@ -28,71 +26,45 @@ import {
 } from "./components/VideoPlayers";
 import { TimelineScrubber } from "./components/TimelineScrubber";
 import { RecordingCalendarPopover } from "./components/RecordingCalendarPopover";
-
-type HudPosition = "bottom-right" | "top-right" | "top-left" | "bottom-left" | "hidden";
-
-type WorkspaceTab =
-  | "live"
-  | "sync"
-  | "review"
-  | "explore"
-  | "exports"
-  | "zones"
-  | "system";
-
-type LiveLayoutMode = "2x2" | "focus" | "single";
-
-function resolveInitialTab(): WorkspaceTab {
-  const path = window.location.pathname.toLowerCase();
-  if (path.startsWith("/sync")) return "sync";
-  if (path.startsWith("/review")) return "review";
-  if (path.startsWith("/explore")) return "explore";
-  if (path.startsWith("/export")) return "exports";
-  if (path.startsWith("/config") || path.startsWith("/settings")) return "zones";
-  if (path.startsWith("/system") || path.startsWith("/logs")) return "system";
-  return "live";
-}
-
-function formatTs(unixSec: number): string {
-  const d = new Date(unixSec * 1000);
-  return d.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-}
-
-function formatDateTime(unixSec: number): string {
-  const d = new Date(unixSec * 1000);
-  return d.toLocaleString([], {
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-}
-
-function formatRelTime(unixSec: number): string {
-  const diff = Math.max(0, Math.round(Date.now() / 1000 - unixSec));
-  if (diff < 60) return `${diff}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
-}
-
-function formatUptime(sec: number): string {
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  return `${h}h ${m}m ${s}s`;
-}
+import {
+  HudPosition,
+  WorkspaceTab,
+  formatDateTime,
+  formatRelTime,
+  formatTs,
+  formatUptime,
+} from "./utils/format";
+import { useNvrStore } from "./store/useNvrStore";
 
 export const App: React.FC = () => {
   const { t } = useI18n();
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>(resolveInitialTab);
+  const activeTab = useNvrStore((s) => s.activeTab);
+  const setActiveTab = useNvrStore((s) => s.setActiveTab);
+  const liveLayout = useNvrStore((s) => s.liveLayout);
+  const setLiveLayout = useNvrStore((s) => s.setLiveLayout);
+  const selectedCamera = useNvrStore((s) => s.selectedCamera);
+  const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
+  const hudPosition = useNvrStore((s) => s.hudPosition);
+  const setHudPosition = useNvrStore((s) => s.setHudPosition);
+  const useMainStream = useNvrStore((s) => s.useMainStream);
+  const setUseMainStream = useNvrStore((s) => s.setUseMainStream);
+  const showVectors = useNvrStore((s) => s.showVectors);
+  const setShowVectors = useNvrStore((s) => s.setShowVectors);
+  const timeShiftTs = useNvrStore((s) => s.timeShiftTs);
+  const setTimeShiftTs = useNvrStore((s) => s.setTimeShiftTs);
+  const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
+  const setPlaybackSpeed = useNvrStore((s) => s.setPlaybackSpeed);
+  const wsOnline = useNvrStore((s) => s.wsOnline);
+  const setWsOnline = useNvrStore((s) => s.setWsOnline);
+  const config = useNvrStore((s) => s.config);
+  const setConfig = useNvrStore((s) => s.setConfig);
+  const stats = useNvrStore((s) => s.stats);
+  const setStats = useNvrStore((s) => s.setStats);
+  const statsHistory = useNvrStore((s) => s.statsHistory);
+  const setStatsHistory = useNvrStore((s) => s.setStatsHistory);
+  const cameraActivity = useNvrStore((s) => s.cameraActivity);
+  const setCameraActivity = useNvrStore((s) => s.setCameraActivity);
+
   const [authChecked, setAuthChecked] = useState(false);
   const [authNeeded, setAuthNeeded] = useState(false);
   const [username, setUsername] = useState("admin");
@@ -100,34 +72,7 @@ export const App: React.FC = () => {
   const [loginPass, setLoginPass] = useState("");
   const [loginError, setLoginError] = useState<string | null>(null);
   const [loginBusy, setLoginBusy] = useState(false);
-
-  // Core NVR state
-  const [config, setConfig] = useState<NinjaConfigResponse | null>(null);
-  const [stats, setStats] = useState<NinjaStatsResponse | null>(null);
-  const [statsHistory, setStatsHistory] = useState<NinjaStatsResponse[]>([]);
-  const [wsOnline, setWsOnline] = useState(false);
-  const [cameraActivity, setCameraActivity] = useState<Record<string, CameraLiveActivity>>({});
   const [toastMsg, setToastMsg] = useState<string | null>(null);
-
-  // Live Matrix & Time-Shift state
-  const [liveLayout, setLiveLayout] = useState<LiveLayoutMode>("2x2");
-  const [selectedCamera, setSelectedCamera] = useState<string>("escritorio");
-  const [useMainStream, setUseMainStream] = useState(false);
-  const [showVectors, setShowVectors] = useState(false);
-  const [hudPosition, setHudPosition] = useState<HudPosition>(() => {
-    const saved = window.localStorage?.getItem("ninjanvr_hud_position");
-    if (
-      saved === "bottom-right" ||
-      saved === "top-right" ||
-      saved === "top-left" ||
-      saved === "bottom-left" ||
-      saved === "hidden"
-    ) {
-      return saved;
-    }
-    return "bottom-right";
-  });
-  const [timeShiftTs, setTimeShiftTs] = useState<number | null>(null);
   const [focusSegments, setFocusSegments] = useState<RecordingSegment[]>([]);
   const [globalDaysSummary, setGlobalDaysSummary] = useState<RecordingDaySummary[]>([]);
   const [hoveredAlertId, setHoveredAlertId] = useState<string | null>(null);
@@ -142,7 +87,6 @@ export const App: React.FC = () => {
     "unreviewed"
   );
   const [activeReview, setActiveReview] = useState<ReviewItem | null>(null);
-  const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
 
   // Sync Playback state
   const [syncMasterTs, setSyncMasterTs] = useState<number>(() => Math.floor(Date.now() / 1000) - 120);
@@ -195,19 +139,22 @@ export const App: React.FC = () => {
   );
 
   // Navigate tab + update browser URL cleanly
-  const switchTab = useCallback((tab: WorkspaceTab) => {
-    setActiveTab(tab);
-    const urlMap: Record<WorkspaceTab, string> = {
-      live: "/",
-      sync: "/sync",
-      review: "/review",
-      explore: "/explore",
-      exports: "/export",
-      zones: "/config",
-      system: "/system",
-    };
-    window.history.replaceState(null, "", urlMap[tab]);
-  }, []);
+  const switchTab = useCallback(
+    (tab: WorkspaceTab) => {
+      setActiveTab(tab);
+      const urlMap: Record<WorkspaceTab, string> = {
+        live: "/",
+        sync: "/sync",
+        review: "/review",
+        explore: "/explore",
+        exports: "/export",
+        zones: "/config",
+        system: "/system",
+      };
+      window.history.replaceState(null, "", urlMap[tab]);
+    },
+    [setActiveTab]
+  );
 
   // Fetch core bootstrap data
   const fetchCoreData = useCallback(async () => {
@@ -264,7 +211,15 @@ export const App: React.FC = () => {
     } catch {
       // network retry on next tick
     }
-  }, [selectedCamera, activeReview, reviewDateFilter]);
+  }, [
+    selectedCamera,
+    activeReview,
+    reviewDateFilter,
+    setConfig,
+    setSelectedCamera,
+    setStats,
+    setStatsHistory,
+  ]);
 
   useEffect(() => {
     fetchCoreData();
@@ -304,7 +259,7 @@ export const App: React.FC = () => {
       closed = true;
       ws.close();
     };
-  }, [authNeeded]);
+  }, [authChecked, authNeeded, setWsOnline, setCameraActivity]);
 
   // Fetch 24h recordings for the active timeline camera
   const timelineCam =
@@ -442,61 +397,70 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleMarkReviews = async (ids: string[], reviewed = true) => {
-    if (ids.length === 0) return;
-    await fetch("/api/reviews/viewed", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ ids, reviewed }),
-    });
-    setReviews((prev) =>
-      prev.map((r) => (ids.includes(r.id) ? { ...r, has_been_reviewed: reviewed } : r))
-    );
-    notify(`Marked ${ids.length} review item(s) as reviewed`);
-  };
+  const handleMarkReviews = useCallback(
+    async (ids: string[], reviewed = true) => {
+      if (ids.length === 0) return;
+      await fetch("/api/reviews/viewed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ ids, reviewed }),
+      });
+      setReviews((prev) =>
+        prev.map((r) => (ids.includes(r.id) ? { ...r, has_been_reviewed: reviewed } : r))
+      );
+      notify(`Marked ${ids.length} review item(s) as reviewed`);
+    },
+    [notify]
+  );
 
-  const handleDeleteReviews = async (ids: string[]) => {
-    if (ids.length === 0) return;
-    await fetch("/api/reviews/delete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ ids }),
-    });
-    setReviews((prev) => prev.filter((r) => !ids.includes(r.id)));
-    notify(`Deleted ${ids.length} review segment(s)`);
-  };
+  const handleDeleteReviews = useCallback(
+    async (ids: string[]) => {
+      if (ids.length === 0) return;
+      await fetch("/api/reviews/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ ids }),
+      });
+      setReviews((prev) => prev.filter((r) => !ids.includes(r.id)));
+      notify(`Deleted ${ids.length} review segment(s)`);
+    },
+    [notify]
+  );
 
-  const handleQuickExport = async (
-    camera: string,
-    startSec: number,
-    endSec: number,
-    label?: string
-  ): Promise<{ exportId?: string; videoUrl?: string } | void> => {
-    const s = Math.floor(startSec);
-    const e = Math.ceil(Math.max(endSec, startSec + 5));
-    const res = await fetch(`/api/export/${encodeURIComponent(camera)}/start/${s}/end/${e}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ name: label || `${camera} ${formatTs(s)}-${formatTs(e)}` }),
-    });
-    if (res.ok) {
-      const data = await res.json().catch(() => ({}));
-      notify(`MP4 clip ready for ${camera} (${formatTs(s)} - ${formatTs(e)})`);
-      const listRes = await fetch("/api/exports", { credentials: "include" });
-      if (listRes.ok) {
-        const arr: ExportItem[] = await listRes.json();
-        setExportsList(arr);
-        if (arr.length > 0) setActiveExportPreview(arr[0]);
+  const handleQuickExport = useCallback(
+    async (
+      camera: string,
+      startSec: number,
+      endSec: number,
+      label?: string
+    ): Promise<{ exportId?: string; videoUrl?: string } | void> => {
+      const s = Math.floor(startSec);
+      const e = Math.ceil(Math.max(endSec, startSec + 5));
+      const res = await fetch(`/api/export/${encodeURIComponent(camera)}/start/${s}/end/${e}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ name: label || `${camera} ${formatTs(s)}-${formatTs(e)}` }),
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        notify(`MP4 clip ready for ${camera} (${formatTs(s)} - ${formatTs(e)})`);
+        const listRes = await fetch("/api/exports", { credentials: "include" });
+        if (listRes.ok) {
+          const arr: ExportItem[] = await listRes.json();
+          setExportsList(arr);
+          if (arr.length > 0) setActiveExportPreview(arr[0]);
+        }
+        return {
+          exportId: data.export_id,
+          videoUrl: data.video_url || `/exports/${camera}_${s}_${e}.mp4`,
+        };
       }
-      return {
-        exportId: data.export_id,
-        videoUrl: data.video_url || `/exports/${camera}_${s}_${e}.mp4`,
-      };
-    }
-  };
+    },
+    [notify]
+  );
 
   const handleEventRetain = async (ev: EventItem) => {
     const next = !ev.retain_indefinitely;
@@ -635,7 +599,15 @@ export const App: React.FC = () => {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTab, activeReview, filteredReviews, switchTab]);
+  }, [
+    activeTab,
+    activeReview,
+    filteredReviews,
+    switchTab,
+    handleMarkReviews,
+    handleQuickExport,
+    setPlaybackSpeed,
+  ]);
 
   // Telemetry summary values
   const sysCpu = stats?.cpu_usages?.["frigate.full_system"]?.cpu || "6.5";
@@ -948,9 +920,7 @@ export const App: React.FC = () => {
                   style={{ height: 28, fontSize: "var(--text-xs)" }}
                   value={hudPosition}
                   onChange={(e) => {
-                    const next = e.target.value as HudPosition;
-                    setHudPosition(next);
-                    window.localStorage?.setItem("ninjanvr_hud_position", next);
+                    setHudPosition(e.target.value as HudPosition);
                   }}
                   title="Configure where camera info badges appear so they never cover camera OSD text"
                 >
