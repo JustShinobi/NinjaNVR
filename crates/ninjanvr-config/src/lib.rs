@@ -386,6 +386,10 @@ pub struct RecordConfig {
     pub enabled: bool,
     #[serde(default = "default_expire_interval")]
     pub expire_interval: u64,
+    #[serde(default)]
+    pub continuous_substream: bool,
+    #[serde(default)]
+    pub mode_tiering: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_size_gb: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -413,6 +417,8 @@ impl Default for RecordConfig {
         Self {
             enabled: true,
             expire_interval: default_expire_interval(),
+            continuous_substream: false,
+            mode_tiering: false,
             max_size_gb: None,
             min_free_gb: None,
             continuous: RecordDaysConfig::default(),

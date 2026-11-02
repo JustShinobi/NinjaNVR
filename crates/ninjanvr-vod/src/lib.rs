@@ -16,6 +16,15 @@ pub fn build_master_playlist() -> String {
 
 /// Generates a VOD media playlist (`index-v1-a1.m3u8`) from a slice of recording segments.
 pub fn build_media_playlist(segments: &[RecordingRow]) -> Result<String> {
+    build_media_playlist_with_resolutions(segments, None)
+}
+
+/// Generates a VOD media playlist (`index-v1-a1.m3u8`) supporting hybrid sub-stream / main-stream
+/// resolution switches via `#EXT-X-DISCONTINUITY` and updated `#EXT-X-MAP` tags.
+pub fn build_media_playlist_with_resolutions(
+    segments: &[RecordingRow],
+    resolutions: Option<&[(u32, u32)]>,
+) -> Result<String> {
     let max_dur = segments
         .iter()
         .map(|s| s.duration.ceil() as u64)
@@ -34,16 +43,40 @@ pub fn build_media_playlist(segments: &[RecordingRow]) -> Result<String> {
     ];
 
     let mut prev_end: Option<f64> = None;
+    let mut prev_res: Option<(u32, u32)> = None;
+    let mut prev_rate: Option<f64> = None;
     for (idx, seg) in segments.iter().enumerate() {
-        if let Some(pe) = prev_end
-            && (seg.start_time - pe).abs() > 1.5
-        {
-            lines.push("#EXT-X-DISCONTINUITY".to_string());
-        }
+        let cur_res = resolutions.and_then(|r| r.get(idx).copied());
         let dur = seg.duration.max(0.1);
+        let cur_rate = seg.segment_size / dur;
+
+        let time_gap = prev_end
+            .map(|pe| (seg.start_time - pe).abs() > 1.5)
+            .unwrap_or(false);
+        let res_changed = match (prev_res, cur_res) {
+            (Some(pr), Some(cr)) => pr != cr,
+            _ => false,
+        };
+        let tier_switched = match prev_rate {
+            Some(pr) if pr > 0.001 && cur_rate > 0.001 => {
+                (cur_rate / pr) > 3.2 || (pr / cur_rate) > 3.2
+            }
+            _ => false,
+        };
+
+        if time_gap || res_changed || tier_switched {
+            lines.push("#EXT-X-DISCONTINUITY".to_string());
+            if res_changed || tier_switched {
+                lines.push(format!("#EXT-X-MAP:URI=\"init-v1-a1.mp4?seg={}\"", idx + 1));
+            }
+        }
         lines.push(format!("#EXTINF:{dur:.3},"));
         lines.push(format!("seg-{}-v1-a1.m4s", idx + 1));
         prev_end = Some(seg.end_time);
+        if cur_res.is_some() {
+            prev_res = cur_res;
+        }
+        prev_rate = Some(cur_rate);
     }
 
     lines.push("#EXT-X-ENDLIST".to_string());
@@ -830,5 +863,43 @@ mod tests {
         assert!(init.len() > 64);
         assert!(m4s.ends_with(&video_sample));
         let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn hybrid_substream_and_mainstream_segments_emit_discontinuity_and_map_tags() {
+        let segs = vec![
+            RecordingRow {
+                id: "sub1".to_string(),
+                camera: "cam".to_string(),
+                path: "/sub1.mp4".to_string(),
+                start_time: 100.0,
+                end_time: 110.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 0.4, // 640x360 substream
+                regions: 0,
+                motion_heatmap: None,
+            },
+            RecordingRow {
+                id: "main2".to_string(),
+                camera: "cam".to_string(),
+                path: "/main2.mp4".to_string(),
+                start_time: 110.0,
+                end_time: 120.0,
+                duration: 10.0,
+                motion: 120,
+                objects: 1,
+                dbfs: 0,
+                segment_size: 4.5, // 1920x1080 main stream event
+                regions: 1,
+                motion_heatmap: None,
+            },
+        ];
+        let resolutions = [(640, 360), (1920, 1080)];
+        let m3u8 = build_media_playlist_with_resolutions(&segs, Some(&resolutions)).unwrap();
+        assert!(m3u8.contains("#EXT-X-DISCONTINUITY"));
+        assert!(m3u8.contains("#EXT-X-MAP:URI=\"init-v1-a1.mp4?seg=2\""));
     }
 }

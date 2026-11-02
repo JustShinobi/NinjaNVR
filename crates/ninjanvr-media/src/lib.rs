@@ -597,6 +597,7 @@ pub fn prune_empty_parent_dirs(file_path: &Path, stop_at: &Path) {
 pub struct CameraRecordPolicy {
     pub keep_continuous: bool,
     pub keep_motion: bool,
+    pub continuous_substream: bool,
     pub retain_mode: String,
 }
 
@@ -659,10 +660,18 @@ impl RecordingEngine {
                 .iter()
                 .filter(|(_, c)| c.enabled && c.record.enabled)
                 .filter_map(|(name, c)| {
-                    let input_url = cfg.camera_input_for_role(name, "record")?;
+                    let use_sub_default =
+                        c.record.continuous_substream || cfg.record.continuous_substream;
+                    let input_url = if use_sub_default && c.record.continuous.days == 0.0 {
+                        cfg.camera_input_for_role(name, "detect")
+                            .or_else(|| cfg.camera_input_for_role(name, "record"))?
+                    } else {
+                        cfg.camera_input_for_role(name, "record")?
+                    };
                     let policy = CameraRecordPolicy {
-                        keep_continuous: c.record.continuous.days > 0.0,
+                        keep_continuous: c.record.continuous.days > 0.0 || use_sub_default,
                         keep_motion: c.record.motion.days > 0.0,
+                        continuous_substream: use_sub_default,
                         retain_mode: c.record.alerts.retain.mode.clone(),
                     };
                     Some((name.clone(), input_url, policy))
