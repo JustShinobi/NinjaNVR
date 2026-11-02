@@ -1,5 +1,5 @@
 name: Feature Request
-description: Propose an enhancement for NinjaNVR engine, Console v2, or Tauri desktop client
+description: Propose an enhancement for NinjaNVR engine or Console v2
 title: "[Feat]: "
 labels: ["enhancement"]
 body:

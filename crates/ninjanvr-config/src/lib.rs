@@ -17,7 +17,10 @@ pub const DEFAULT_CONFIG_PATH: &str = "/config/config.yml";
 pub const DEFAULT_DB_PATH: &str = "/config/frigate.db";
 pub const DEFAULT_GO2RTC_SHM_PATH: &str = "/dev/shm/go2rtc.yaml";
 pub const DEFAULT_GO2RTC_HOMEKIT_PATH: &str = "/config/go2rtc_homekit.yml";
-pub const NINJANVR_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const NINJANVR_VERSION: &str = match option_env!("NINJANVR_RELEASE_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NinjaConfig {

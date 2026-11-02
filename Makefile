@@ -7,7 +7,7 @@ K3S_HOST      ?= localhost
 K8S_NAMESPACE ?= frigate
 K8S_DEPLOY    ?= frigate
 
-.PHONY: verify check privacy test build build-ui build-desktop image fast-ui logs status help
+.PHONY: verify check privacy test build build-ui image fast-ui logs status help
 
 verify:
 	./scripts/ci/verify
@@ -26,9 +26,6 @@ build-ui:
 
 build: build-ui
 	cargo build --release --bin ninjanvr
-
-build-desktop: build-ui
-	cargo build --release -p ninjanvr-desktop
 
 image:
 	docker build -t $(IMAGE) .

@@ -1,9 +1,9 @@
 # Repository Guidelines (AGENTS.md)
 
 ## Product Identity & Architecture
-**NinjaNVR** is an independent, ultra-low-footprint AI Network Video Recorder (NVR) and Tactical Video-Wall Console built in **Rust (Edition 2024)**, **React 19**, and **Tauri v2**.
+**NinjaNVR** is an independent, ultra-low-footprint AI Network Video Recorder (NVR) and Tactical Video-Wall Console built in **Rust (Edition 2024)** and **React 19 (`web-v2`)**.
 
-- **Not a Clone:** While NinjaNVR maintains backwards-compatible parsing for legacy `config.yml` files, SQLite schemas, and Home Assistant MQTT discovery topics to ease migration, it is an independent product. All new frontend and operator workflow development happens exclusively in **`web-v2/` (NinjaNVR Console v2)** and **`crates/ninjanvr-desktop/` (Tauri v2)**.
+- **Not a Clone:** While NinjaNVR maintains backwards-compatible parsing for legacy `config.yml` files, SQLite schemas, and Home Assistant MQTT discovery topics to ease migration, it is an independent product. All new frontend and operator workflow development happens exclusively in **`web-v2/` (NinjaNVR Console v2)**.
 - **Default UI:** `ninjanvr-server` serves **NinjaNVR Console (`v2`)** by default. `web/` (`v1`) is retained strictly as a read-only legacy compatibility bundle (`/api/ui/switch?target=v1`).
 
 ### Workspace Crates & Directories
@@ -16,7 +16,6 @@
 - `crates/ninjanvr-vod`: Pure-Rust ISO-BMFF fMP4 HLS VOD remuxer (`init-v1-a1.mp4` + `seg-N-v1-a1.m4s`).
 - `crates/ninjanvr-comms`: Real-time `/ws` WebSocket broadcaster and `rumqttc` MQTT publisher.
 - `crates/ninjanvr-server`: Axum HTTP (`:5000`) & TLS (`:8971`) server, JWT auth gate, `/api/*` handlers, and Dual-UI static/SPA router.
-- `crates/ninjanvr-desktop`: Tauri v2 native desktop shell (`tauri.conf.json`) packaging `web-v2/dist`.
 - `web-v2/`: Primary NinjaNVR Console (`v2`) React 19 + TypeScript + Vite SPA.
 - `web/`: Legacy Classic UI (`v1`) static fallback bundle.
 
@@ -37,14 +36,13 @@ Run all commands from the repository root:
   5. `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 build`
 - `make build-ui`: Type-checks and builds `web-v2/dist` (`< 2s`). Note: `web-v2/dist/` is gitignored and built automatically inside CI and the multi-stage `Dockerfile`.
 - `make build`: Builds both `web-v2/dist` and `target/release/ninjanvr`.
-- `make build-desktop`: Builds the Tauri v2 native desktop application (`ninjanvr-desktop`).
 - `make image`: Builds the multi-stage container image (`Dockerfile`) tagged with the current workspace version.
 - `make fast-ui`: Local development helper that hot-syncs `web-v2/dist` into the running K3s pod via `kubectl cp` for rapid visual preview.
 
 ### Versioning, Releases & GitOps Promotion (Two-Track: `dev` ➔ `main`)
 - **Default Branch (`dev`):** All day-to-day development and pull requests target `dev`.
 - **Atomic Conventional Commits:** Always create atomic commits using [Conventional Commits](https://www.conventionalcommits.org/) (`feat(scope):`, `fix(scope):`, `perf(scope):`, `refactor(scope):`, `docs(scope):`, `ci(scope):`, `chore(scope):`).
-- **Pre-Releases on `dev` (`.github/workflows/release.yml`):** Every push to `dev` automatically runs `./scripts/ci/cut-release`, which cuts an incremental SemVer Pre-Release (`v0.9.x-rc.N`), updates version manifests (`Cargo.toml`, `Cargo.lock`, `web-v2/package.json`, `crates/ninjanvr-desktop/tauri.conf.json`), creates a GitHub Pre-Release (`--prerelease`), publishes `ghcr.io/justshinobi/ninjanvr:v0.9.x-rc.N` + `:dev`, and bumps the GitOps manifest in `JustShinobi/k3s-gitops-prod` for immediate K3s validation.
+- **Pre-Releases on `dev` (`.github/workflows/release.yml`):** Every push to `dev` automatically runs `./scripts/ci/cut-release`, which cuts an incremental SemVer Pre-Release (`v0.9.x-rc.N`), updates version manifests (`Cargo.toml`, `Cargo.lock`, `web-v2/package.json`), creates a GitHub Pre-Release (`--prerelease`), publishes `ghcr.io/justshinobi/ninjanvr:v0.9.x-rc.N` + `:dev`, and bumps the GitOps manifest in `JustShinobi/k3s-gitops-prod` for immediate K3s validation.
 - **Condensed Stable Releases on `main`:** Merging `dev` into `main` automatically condenses all commits since the previous stable release into `CHANGELOG.md`, cuts the final stable tag (`v0.9.x` or `v1.0.0`), creates the `Latest` GitHub Release, publishes `:v0.9.x` + `:latest` to GHCR, promotes the stable tag to GitOps, and syncs `main` back into `dev`.
 
 ## Public Repository Privacy Guardrail

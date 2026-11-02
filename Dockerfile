@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+ARG NINJANVR_RELEASE_VERSION=""
+ENV NINJANVR_RELEASE_VERSION=${NINJANVR_RELEASE_VERSION}
 RUN cargo build --release --bin ninjanvr
 
 FROM ghcr.io/blakeblackshear/frigate:0.18.2 AS upstream-assets

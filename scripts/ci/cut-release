@@ -128,7 +128,7 @@ def update_version_manifests(next_version: str) -> list[str]:
         cargo_lock_path.write_text(cargo_lock_updated, encoding="utf-8")
         modified.append("Cargo.lock")
 
-    for json_file in ["web-v2/package.json", "crates/ninjanvr-desktop/tauri.conf.json"]:
+    for json_file in ["web-v2/package.json"]:
         p = Path(json_file)
         data = json.loads(p.read_text(encoding="utf-8"))
         data["version"] = next_version
@@ -177,8 +177,11 @@ def main() -> int:
         next_tag = f"v{next_version}"
         print(f"[dev pre-release] Cutting {next_tag} (commits since {last_any_tag}: {len(incremental_commits)})")
 
-        files_to_stage = update_version_manifests(next_version)
         _, release_notes = format_release_notes(incremental_commits)
+        run(["git", "config", "user.name", "github-actions[bot]"])
+        run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
+        run(["git", "tag", "-a", next_tag, "-m", f"chore(release): {next_tag}"])
+        run(["git", "push", "origin", next_tag])
     else:
         next_version = target_stable_version
         next_tag = f"v{next_version}"
@@ -203,16 +206,13 @@ def main() -> int:
         changelog_path.write_text(updated_changelog, encoding="utf-8")
         files_to_stage.append("CHANGELOG.md")
 
-    run(["git", "config", "user.name", "github-actions[bot]"])
-    run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
-    run(["git", "add", *files_to_stage])
-    run(["git", "commit", "-m", f"chore(release): {next_tag} [skip ci]"])
-    run(["git", "tag", "-a", next_tag, "-m", f"chore(release): {next_tag}"])
-    run(["git", "push", "origin", f"HEAD:{branch}"])
-    run(["git", "push", "origin", next_tag])
-
-    # When cutting a stable release on main, fast-forward/sync dev so dev gets the condensed CHANGELOG.md and version
-    if not is_prerelease:
+        run(["git", "config", "user.name", "github-actions[bot]"])
+        run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
+        run(["git", "add", *files_to_stage])
+        run(["git", "commit", "-m", f"chore(release): {next_tag} [skip ci]"])
+        run(["git", "tag", "-a", next_tag, "-m", f"chore(release): {next_tag}"])
+        run(["git", "push", "origin", f"HEAD:{branch}"])
+        run(["git", "push", "origin", next_tag])
         subprocess.run(["git", "push", "origin", "HEAD:refs/heads/dev"], check=False)
 
     notes_file = Path("/tmp/ninjanvr-release-notes.md")

@@ -10,11 +10,10 @@ members = [
     "crates/ninjanvr-vod",
     "crates/ninjanvr-comms",
     "crates/ninjanvr-server",
-    "crates/ninjanvr-desktop",
 ]
 
 [workspace.package]
-version = "0.9.2-rc.2"
+version = "0.9.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/JustShinobi/NinjaNVR"

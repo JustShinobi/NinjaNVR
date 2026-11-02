@@ -8,6 +8,8 @@
 /tmp/
 node_modules/
 **/node_modules/
+**/__pycache__/
+*.pyc
 web-v2/dist/
 DESIGN.md
 CLAUDE.md

@@ -5,7 +5,7 @@
 [![Container](https://img.shields.io/badge/ghcr.io-justshinobi%2Fninjanvr-blue?logo=docker)](https://github.com/JustShinobi/NinjaNVR/pkgs/container/ninjanvr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
 
-NinjaNVR is a network video recorder and operator console written in Rust (Edition 2024), React 19, and Tauri v2.
+NinjaNVR is a network video recorder and operator console written in Rust (Edition 2024) and React 19.
 
 It runs the entire NVR pipeline inside a single `ninjanvr` process paired with `go2rtc`: RTSP stream supervision, planar YUV420p SIMD motion detection, OpenVINO object detection, ByteTrack multi-object tracking, SQLite WAL persistence, on-the-fly ISO-BMFF fMP4/HLS remuxing, and an Axum HTTP/TLS server. On a 4-camera setup (1080p/4K record + 720p detect), total resident memory stays between 65 MiB and 95 MiB.
 
@@ -23,7 +23,7 @@ Decoded substream frames live in an in-process `Arc<YuvFrame>` ring pool rather 
 | Motion detection | Planar YUV420p SIMD engine (`< 0.15 ms/frame`), 3x3 Gaussian blur, EMA contrast cap, CCL |
 | Object detection | `libopenvino_c.so` C FFI (`SSDLite MobileNetV2`, `YOLOv10`, `YOLO11`) |
 | Object tracking | 2-stage `ByteTrack` (8-D Kalman filter) + stationary object heuristics + zone hysteresis |
-| Client | Web SPA (`web-v2`) and Tauri v2 desktop shell (`ninjanvr-desktop`) |
+| Client | Web SPA (`web-v2`, React 19 + TypeScript + Vite) |
 
 ### Workspace Layout
 
@@ -38,19 +38,17 @@ crates/
   ninjanvr-vod/       ISO-BMFF fMP4 HLS VOD remuxer
   ninjanvr-comms/     WebSocket (/ws) state hub and MQTT publisher
   ninjanvr-server/    Axum HTTP (:5000) and TLS (:8971) server
-  ninjanvr-desktop/   Tauri v2 native desktop client
 web-v2/               NinjaNVR Console (React 19 + TypeScript + Vite)
 web/                  Legacy v1 UI fallback bundle
 ```
 
-## Console and Desktop Client
+## Web Console (`web-v2`)
 
 The default interface (`web-v2`) is built for dark-room monitoring and keyboard-driven triage (`1-7` view switching, `J/K` event stepping, `R` mark reviewed, `E` clip export):
 
 - **Live Matrix and 4-Cam Sync:** Low-latency WebRTC/MSE live streams and lockstep multi-camera VOD playback.
 - **24h Timeline:** Mouse-wheel frame scrubbing, `Ctrl+Wheel` zoom, pointer drag panning, multi-day activity calendar, and hover storyboard previews.
 - **Review, Explore, and Exports:** Alert vs. detection filtering, AI bounding-box inspection, interactive polygon zone/mask editing, and direct MP4 range remuxing.
-- **Tauri v2 Desktop (`ninjanvr-desktop`):** Native desktop shell packaging `web-v2` for operator workstations.
 
 ## Usage
 
@@ -88,12 +86,6 @@ bun install --cwd web-v2 --frozen-lockfile
 make build
 
 ./target/release/ninjanvr --config ./config/config.example.yml
-```
-
-To build the native Tauri v2 desktop binary:
-
-```bash
-make build-desktop
 ```
 
 ## Migration and Compatibility

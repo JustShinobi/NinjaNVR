@@ -13,7 +13,6 @@ body:
       label: Component
       options:
         - NinjaNVR Console v2 (web-v2)
-        - Tauri v2 Desktop App (ninjanvr-desktop)
         - Server & API (ninjanvr-server / ninjanvr-comms)
         - Media & VOD Remuxer (ninjanvr-media / ninjanvr-vod)
         - Vision, AI Inference & Tracking (ninjanvr-vision / ninjanvr-infer / ninjanvr-track)
