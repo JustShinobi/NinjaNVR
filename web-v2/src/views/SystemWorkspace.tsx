@@ -46,7 +46,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
           <span>
             HARDWARE & PIPELINE TELEMETRY (UPTIME {formatUptime(stats?.service?.uptime || 0)})
           </span>
-          <span className="mono">{stats?.service?.version || "0.9.1"}</span>
+          <span className="mono">{stats?.service?.version || "—"}</span>
         </div>
         <div
           className="nvr-scroll-y"

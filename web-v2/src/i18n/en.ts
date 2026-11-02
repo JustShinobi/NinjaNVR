@@ -1,7 +1,7 @@
 export const en = {
   brand: {
-    name: "NINJANVR",
-    release: "CONSOLE v2.0",
+    name: "NinjaNVR",
+    release: "CONSOLE",
     engine: "RUST + OPENVINO",
   },
   nav: {

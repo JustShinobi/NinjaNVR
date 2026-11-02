@@ -87,6 +87,23 @@ impl BoundingBox {
         if union <= 0.0 { 0.0 } else { inter / union }
     }
 
+    pub fn intersection_over_min(&self, other: &Self) -> f32 {
+        let ix1 = self.x_min.max(other.x_min);
+        let iy1 = self.y_min.max(other.y_min);
+        let ix2 = self.x_max.min(other.x_max);
+        let iy2 = self.y_max.min(other.y_max);
+        if ix2 <= ix1 || iy2 <= iy1 {
+            return 0.0;
+        }
+        let inter = ((ix2 - ix1) as f32) * ((iy2 - iy1) as f32);
+        let min_area = self.area().min(other.area()) as f32;
+        if min_area <= 0.0 {
+            0.0
+        } else {
+            inter / min_area
+        }
+    }
+
     pub fn to_normalized(&self, frame_w: u32, frame_h: u32) -> [f64; 4] {
         let fw = frame_w.max(1) as f64;
         let fh = frame_h.max(1) as f64;
@@ -364,8 +381,11 @@ impl SimdMotionDetector {
                 self.smooth_min_v = raw_min as f32;
                 self.smooth_max_v = raw_max as f32;
             } else {
-                self.smooth_min_v = 0.90 * self.smooth_min_v + 0.10 * (raw_min as f32);
-                self.smooth_max_v = 0.90 * self.smooth_max_v + 0.10 * (raw_max as f32);
+                let c_alpha = self.config.frame_alpha.clamp(0.005, 0.25);
+                self.smooth_min_v =
+                    (1.0 - c_alpha) * self.smooth_min_v + c_alpha * (raw_min as f32);
+                self.smooth_max_v =
+                    (1.0 - c_alpha) * self.smooth_max_v + c_alpha * (raw_max as f32);
             }
 
             let min_v = self.smooth_min_v.round().clamp(0.0, 254.0) as u8;
@@ -436,19 +456,14 @@ impl SimdMotionDetector {
         // 8. Connected Components Labeling & BoundingBox extraction
         let motion_boxes = self.extract_connected_boxes();
 
-        // 9. Update background model
-        let f_alpha = self.config.frame_alpha.clamp(0.001, 0.5);
+        // 9. Update background model (`delta_alpha` = 0.2 default in Frigate config, so static changes settle in ~1.5s)
+        let bg_alpha = self.config.delta_alpha.clamp(0.05, 0.5);
+        for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
+            *avg = (1.0 - bg_alpha) * (*avg) + bg_alpha * (px as f32);
+        }
         if !motion_boxes.is_empty() {
             self.motion_frame_count += 1;
-            if self.motion_frame_count >= 10 {
-                for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
-                    *avg = (1.0 - f_alpha) * (*avg) + f_alpha * (px as f32);
-                }
-            }
         } else {
-            for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
-                *avg = (1.0 - f_alpha) * (*avg) + f_alpha * (px as f32);
-            }
             self.motion_frame_count = 0;
         }
 
@@ -604,6 +619,7 @@ impl SimdMotionDetector {
         }
 
         let min_area = self.config.contour_area;
+        let frame_area = self.frame_w.saturating_mul(self.frame_h).max(1);
         let mut boxes = Vec::new();
         for st in stats.into_iter().flatten() {
             if st.count >= min_area {
@@ -612,7 +628,16 @@ impl SimdMotionDetector {
                 let fx2 = ((st.x_max as f32 * self.scale_x).ceil() as u32).min(self.frame_w);
                 let fy2 = ((st.y_max as f32 * self.scale_y).ceil() as u32).min(self.frame_h);
                 if fx2 > fx1 && fy2 > fy1 {
-                    boxes.push(BoundingBox::new(fx1, fy1, fx2, fy2));
+                    let b = BoundingBox::new(fx1, fy1, fx2, fy2);
+                    // Suppress isolated 1-second camera OSD clock digit ticks in top/bottom margins
+                    let in_osd_band =
+                        fy2 <= (self.frame_h * 10) / 100 || fy1 >= (self.frame_h * 88) / 100;
+                    let is_osd_clock_tick = in_osd_band
+                        && b.height() <= (self.frame_h * 10) / 100
+                        && b.area().saturating_mul(200) <= frame_area;
+                    if !is_osd_clock_tick {
+                        boxes.push(b);
+                    }
                 }
             }
         }
@@ -1157,6 +1182,50 @@ mod tests {
         assert!(!boxes.is_empty());
         let regions = compute_inference_regions(320, 180, 160, &boxes, &[]);
         assert!(!regions.is_empty());
+
+        // Static scene change must settle back into avg_frame within ~12 frames (not 200+ frames)
+        let mut settled = false;
+        for _ in 0..14 {
+            if detector.detect(&motion_frame).is_empty() {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled);
+    }
+
+    #[test]
+    fn simd_motion_detector_ignores_corner_osd_clock_ticks() {
+        let cfg = MotionConfig::default();
+        let mut detector = SimdMotionDetector::new(1280, 720, cfg);
+        let base_bytes = vec![64u8; 1280 * 720 * 3 / 2];
+        let bg_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 1.0,
+            width: 1280,
+            height: 720,
+            data: Arc::new(base_bytes.clone()),
+        };
+        for _ in 0..32 {
+            assert!(detector.detect(&bg_frame).is_empty());
+        }
+
+        // Simulate a 30x30 OSD seconds digit flipping in the top-left corner (900 px² < 0.4% frame area)
+        let mut osd_bytes = base_bytes;
+        for y in 12..42 {
+            for x in 380..410 {
+                osd_bytes[y * 1280 + x] = 240;
+            }
+        }
+        let osd_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 2.0,
+            width: 1280,
+            height: 720,
+            data: Arc::new(osd_bytes),
+        };
+        let _ = detector.detect(&osd_frame);
+        assert!(detector.detect(&osd_frame).is_empty());
     }
 
     #[test]

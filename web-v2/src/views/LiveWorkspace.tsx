@@ -166,13 +166,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     const nowSec = Math.floor(Date.now() / 1000);
     for (const cam of cameraNames) {
       const act = cameraActivity[cam];
-      const camStat = stats?.cameras?.[cam];
       const objs = act?.objects || [];
       const activeNonStationary = objs.filter((o) => !o.stationary);
       // Ignore tiny < 3500 px² motion boxes caused by 1-second camera OSD clock digit ticks
-      const hasRealMotion =
-        Boolean(act?.motion && (act?.max_Area ?? 5000) >= 3500) ||
-        (camStat?.detection_fps ?? 0) >= 2.0;
+      const hasRealMotion = Boolean(act?.motion && (act?.max_Area ?? 5000) >= 3500);
 
       let matches = false;
       if (spotlightFilter === "all_activity") {
@@ -205,7 +202,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       prevMatchRef.current[cam] = matches;
     }
     setNowTick(nowSec);
-  }, [cameraActivity, stats, cameraNames, spotlightFilter]);
+  }, [cameraActivity, cameraNames, spotlightFilter]);
 
   useEffect(() => {
     if (liveLayout !== "spotlight") return;
@@ -563,9 +560,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             const camCfg = config?.cameras?.[cam];
             const camStat = stats?.cameras?.[cam];
             const act = cameraActivity[cam];
-            const hasPerson =
-              (act?.objects || []).length > 0 || (camStat?.detection_fps || 0) > 1.5;
-            const hasMotion = act?.motion || (camStat?.detection_fps || 0) > 0.2;
+            const activeLabels = Array.from(
+              new Set((act?.objects || []).map((o) => o.label.toUpperCase()))
+            );
+            const hasObjects = activeLabels.length > 0;
+            const hasMotion = Boolean(act?.motion && (act?.max_Area ?? 5000) >= 3500);
             const isTimelineCam = selectedCamera === cam;
             const isTimeShifted = isTimelineCam && timeShiftTs !== null;
 
@@ -612,8 +611,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     {camCfg?.detect?.width || 1280}×{camCfg?.detect?.height || 720} ·{" "}
                     {camStat?.camera_fps?.toFixed(1) || "5.0"} FPS
                   </span>
-                  {hasPerson && <span className="nvr-badge alert">PERSON</span>}
-                  {hasMotion && !hasPerson && (
+                  {hasObjects && (
+                    <span className="nvr-badge alert">{activeLabels.join(", ")}</span>
+                  )}
+                  {hasMotion && !hasObjects && (
                     <span className="nvr-badge motion">{t.live.motionActive}</span>
                   )}
                   {Boolean(act?.tamper) && (
@@ -864,6 +865,22 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   AI{" "}
                   {stats?.cameras?.[selectedCamera]?.detection_fps?.toFixed(1) || "0.0"} FPS
                 </span>
+                {(cameraActivity[selectedCamera]?.objects || []).length > 0 ? (
+                  <span className="nvr-badge alert">
+                    {Array.from(
+                      new Set(
+                        (cameraActivity[selectedCamera]?.objects || []).map((o) =>
+                          o.label.toUpperCase()
+                        )
+                      )
+                    ).join(", ")}
+                  </span>
+                ) : Boolean(
+                    cameraActivity[selectedCamera]?.motion &&
+                      (cameraActivity[selectedCamera]?.max_Area ?? 5000) >= 3500
+                  ) ? (
+                  <span className="nvr-badge motion">{t.live.motionActive}</span>
+                ) : null}
                 {Boolean(cameraActivity[selectedCamera]?.tamper) && (
                   <span className="nvr-badge alert mono">TAMPER</span>
                 )}
@@ -1059,7 +1076,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 const act = cameraActivity[cam];
                 const objs = act?.objects || [];
                 const hasObjects = objs.length > 0;
-                const hasMotion = Boolean(act?.motion);
+                const hasMotion = Boolean(act?.motion && (act?.max_Area ?? 5000) >= 3500);
                 const isSelected = selectedCamera === cam;
 
                 const coneFill = hasObjects

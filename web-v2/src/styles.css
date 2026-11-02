@@ -141,8 +141,8 @@ body,
 .nvr-brand-title {
   font-family: var(--font-mono);
   font-weight: 700;
-  font-size: 12.5px;
-  letter-spacing: 0.06em;
+  font-size: 13.5px;
+  letter-spacing: 0.02em;
   color: var(--text-primary);
 }
 

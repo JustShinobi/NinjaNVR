@@ -1,4 +1,4 @@
-# NinjaNVR
+# <img src="web-v2/public/favicon.svg" width="32" height="32" align="top" alt="NinjaNVR Icon" /> NinjaNVR
 
 [![CI](https://github.com/JustShinobi/NinjaNVR/actions/workflows/ci.yml/badge.svg)](https://github.com/JustShinobi/NinjaNVR/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/JustShinobi/NinjaNVR?include_prereleases&label=release)](https://github.com/JustShinobi/NinjaNVR/releases)

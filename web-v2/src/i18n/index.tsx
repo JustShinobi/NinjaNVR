@@ -5,8 +5,8 @@ export type SupportedLocale = "en" | "pt";
 
 const pt: TranslationDict = {
   brand: {
-    name: "NINJANVR",
-    release: "CONSOLE v2.0",
+    name: "NinjaNVR",
+    release: "CONSOLE",
     engine: "RUST + OPENVINO",
   },
   nav: {

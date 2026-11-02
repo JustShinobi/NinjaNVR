@@ -152,6 +152,7 @@ impl ByteTracker {
                 t.disappeared_frames <= 5
                     && (force_scan
                         || !t.stationary
+                        || t.disappeared_frames > 0
                         || motion_boxes.iter().any(|mb| mb.intersects(&t.bbox)))
             })
             .map(|t| t.bbox)
@@ -356,10 +357,11 @@ impl ByteTracker {
                         drop_unconfirmed = true;
                     } else {
                         let was_scanned = scanned_regions.iter().any(|r| r.intersects(&trk.bbox));
-                        if trk.stationary && !was_scanned {
-                            trk.disappeared_frames = 0;
-                        } else {
+                        if !trk.stationary || was_scanned {
                             trk.disappeared_frames += 1;
+                            if trk.stationary && trk.disappeared_frames >= 3 {
+                                trk.stationary = false;
+                            }
                         }
                     }
                 }
@@ -379,12 +381,12 @@ impl ByteTracker {
             if matched_high[d_idx] {
                 continue;
             }
-            // Skip if it heavily overlaps an already-active track of the same label
-            if self
-                .tracks
-                .values()
-                .any(|t| t.label == det.label && t.bbox.iou(&det.bbox) > 0.60)
-            {
+            // Skip if it heavily overlaps or is nested inside an already-active track of the same label
+            if self.tracks.values().any(|t| {
+                t.label == det.label
+                    && (t.bbox.iou(&det.bbox) > 0.55
+                        || t.bbox.intersection_over_min(&det.bbox) > 0.78)
+            }) {
                 continue;
             }
             let suffix = format!(

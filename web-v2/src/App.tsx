@@ -738,6 +738,12 @@ export const App: React.FC = () => {
   const sysMem = stats?.cpu_usages?.["frigate.full_system"]?.mem || "26.0";
   const inferMs = stats?.detectors?.detector01?.inference_speed?.toFixed(1) || "7.0";
   const totalFps = stats?.camera_fps?.toFixed(1) || "20.0";
+  const rawServerVer = stats?.service?.version?.trim() || "";
+  const displayVersion = rawServerVer
+    ? rawServerVer.startsWith("v")
+      ? rawServerVer
+      : `v${rawServerVer}`
+    : "";
 
   if (!authChecked) {
     return <div className="nvr-shell" />;
@@ -764,10 +770,16 @@ export const App: React.FC = () => {
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div className="nvr-brand-mark" />
+            <img
+              src="/favicon.svg?v=ninjanvr"
+              alt=""
+              width={26}
+              height={26}
+              style={{ flexShrink: 0 }}
+            />
             <div>
               <div className="nvr-brand-title">
-                {t.brand.name} // {t.brand.release}
+                {t.brand.name} // {displayVersion || t.brand.release}
               </div>
               <div className="nvr-brand-sub">{t.auth.title}</div>
             </div>
@@ -863,7 +875,13 @@ export const App: React.FC = () => {
     <div className="nvr-shell">
       <header className="nvr-header">
         <div className="nvr-brand">
-          <div className="nvr-brand-mark" />
+          <img
+            src="/favicon.svg?v=ninjanvr"
+            alt=""
+            width={24}
+            height={24}
+            style={{ flexShrink: 0 }}
+          />
           <div>
             <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
               <span className="nvr-brand-title">{t.brand.name}</span>
@@ -878,7 +896,7 @@ export const App: React.FC = () => {
                   borderRadius: 2,
                 }}
               >
-                v2.0
+                {displayVersion || t.brand.release}
               </span>
             </div>
             <div className="nvr-brand-sub">

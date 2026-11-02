@@ -994,10 +994,11 @@ pub fn nms_detections(
     });
     let mut kept: Vec<DetectionResult> = Vec::with_capacity(detections.len());
     for det in detections {
-        if !kept
-            .iter()
-            .any(|k| k.label == det.label && k.bbox.iou(&det.bbox) > iou_threshold)
-        {
+        if !kept.iter().any(|k| {
+            k.label == det.label
+                && (k.bbox.iou(&det.bbox) > iou_threshold
+                    || k.bbox.intersection_over_min(&det.bbox) > 0.80)
+        }) {
             kept.push(det);
         }
     }

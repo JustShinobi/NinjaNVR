@@ -216,7 +216,7 @@ impl VisionPipeline {
                 CameraRuntimeMetrics {
                     camera_fps: fps as f64,
                     process_fps: fps as f64,
-                    detection_fps: 1.2,
+                    detection_fps: 0.0,
                     pid: child_pid,
                     last_frame_ts: unix_now_f64(),
                     night_mode: false,
@@ -358,8 +358,12 @@ impl VisionPipeline {
                             &mut tensor_buf,
                         );
                         detect_calls += 1;
-                        let dets =
+                        let mut dets =
                             active_det.detect_region(&tensor_buf, *region, width, height, 0.40);
+                        dets.retain(|d| {
+                            motion_boxes.iter().any(|mb| mb.intersects(&d.bbox))
+                                || tracked_boxes.iter().any(|tb| tb.intersects(&d.bbox))
+                        });
                         raw_detections.extend(dets);
                     }
 
