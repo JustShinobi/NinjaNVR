@@ -1223,7 +1223,7 @@ name = "ninjanvr-db"
 version = "0.9.1"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "hmac",
  "pbkdf2",
@@ -1270,7 +1270,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-extra",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "futures-util",
