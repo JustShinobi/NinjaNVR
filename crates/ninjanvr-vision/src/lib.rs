@@ -97,6 +97,26 @@ impl BoundingBox {
             (self.height() as f64) / fh,
         ]
     }
+
+    /// Projects a bounding box from `(src_w, src_h)` (e.g., 640x360 detect substream)
+    /// onto `(dst_w, dst_h)` (e.g., 1920x1080 or 3840x2160 main stream).
+    pub fn project_to_resolution(
+        &self,
+        src_w: u32,
+        src_h: u32,
+        dst_w: u32,
+        dst_h: u32,
+    ) -> BoundingBox {
+        let sw = src_w.max(1) as f32;
+        let sh = src_h.max(1) as f32;
+        let dw = dst_w.max(1) as f32;
+        let dh = dst_h.max(1) as f32;
+        let x_min = ((self.x_min as f32 / sw) * dw).round().clamp(0.0, dw) as u32;
+        let y_min = ((self.y_min as f32 / sh) * dh).round().clamp(0.0, dh) as u32;
+        let x_max = ((self.x_max as f32 / sw) * dw).round().clamp(0.0, dw) as u32;
+        let y_max = ((self.y_max as f32 / sh) * dh).round().clamp(0.0, dh) as u32;
+        Self::new(x_min, y_min, x_max, y_max)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -831,6 +851,34 @@ pub fn encode_image_jpeg(img: &RgbImage) -> Result<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
+/// Draws 2px bounding boxes onto an existing `RgbImage` (e.g. a high-resolution main-stream frame).
+pub fn annotate_rgb_image_with_boxes(img: &mut RgbImage, boxes: &[(BoundingBox, [u8; 3])]) {
+    let w = img.width();
+    let h = img.height();
+    if w == 0 || h == 0 {
+        return;
+    }
+    for (bbox, color) in boxes {
+        let x1 = bbox.x_min.min(w - 1);
+        let y1 = bbox.y_min.min(h - 1);
+        let x2 = bbox.x_max.min(w - 1);
+        let y2 = bbox.y_max.min(h - 1);
+        let rgb = Rgb(*color);
+        for x in x1..=x2 {
+            for t in 0..2 {
+                img.put_pixel(x, (y1 + t).min(h - 1), rgb);
+                img.put_pixel(x, y2.saturating_sub(t), rgb);
+            }
+        }
+        for y in y1..=y2 {
+            for t in 0..2 {
+                img.put_pixel((x1 + t).min(w - 1), y, rgb);
+                img.put_pixel(x2.saturating_sub(t), y, rgb);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,5 +933,15 @@ mod tests {
         );
         assert!(poly.contains_point(25.0, 25.0));
         assert!(!poly.contains_point(75.0, 75.0));
+    }
+
+    #[test]
+    fn bounding_box_projects_accurately_from_substream_to_1080p_and_4k() {
+        let sub_box = BoundingBox::new(160, 90, 320, 270);
+        let hd_box = sub_box.project_to_resolution(640, 360, 1920, 1080);
+        assert_eq!(hd_box, BoundingBox::new(480, 270, 960, 810));
+
+        let uhd_box = sub_box.project_to_resolution(640, 360, 3840, 2160);
+        assert_eq!(uhd_box, BoundingBox::new(960, 540, 1920, 1620));
     }
 }

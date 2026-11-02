@@ -486,6 +486,10 @@ pub struct SnapshotsConfig {
     pub crop: bool,
     #[serde(default = "default_snapshot_quality")]
     pub quality: u8,
+    #[serde(default = "default_true")]
+    pub high_res: bool,
+    #[serde(default = "default_true")]
+    pub from_main_stream: bool,
 }
 
 fn default_snapshot_quality() -> u8 {
@@ -500,6 +504,8 @@ impl Default for SnapshotsConfig {
             bounding_box: true,
             crop: false,
             quality: default_snapshot_quality(),
+            high_res: true,
+            from_main_stream: true,
         }
     }
 }

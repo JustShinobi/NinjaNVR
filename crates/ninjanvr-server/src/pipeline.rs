@@ -12,8 +12,9 @@ use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{SharedActivityLedger, YuvFrame, resolve_ffmpeg_bin};
 use ninjanvr_track::{ByteTracker, TrackedObject};
 use ninjanvr_vision::{
-    BoundingBox, SimdMotionDetector, compute_inference_regions, crop_yuv420p_to_tensor_nhwc,
-    encode_image_jpeg, encode_image_webp, yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
+    BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, compute_inference_regions,
+    crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp, yuv420p_to_rgb_image,
+    yuv420p_to_rgb_image_scaled,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -493,10 +494,12 @@ impl VisionPipeline {
                         .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
 
                     if cam_cfg.snapshots.enabled {
+                        let jpg_path = clips_dir.join(format!("{}.jpg", trk.id));
+                        let webp_path = clips_dir.join(format!("{camera}-{}.webp", trk.id));
                         let full_img =
                             yuv420p_to_rgb_image(frame, None, &[(trk.bbox, [31, 119, 180])]);
                         if let Ok(jpg) = encode_image_jpeg(&full_img) {
-                            let _ = std::fs::write(clips_dir.join(format!("{}.jpg", trk.id)), jpg);
+                            let _ = std::fs::write(&jpg_path, jpg);
                         }
                         let thumb_img = yuv420p_to_rgb_image_scaled(
                             frame,
@@ -505,10 +508,53 @@ impl VisionPipeline {
                             Some(360),
                         );
                         if let Ok(webp) = encode_image_webp(&thumb_img) {
-                            let _ = std::fs::write(
-                                clips_dir.join(format!("{camera}-{}.webp", trk.id)),
-                                webp,
-                            );
+                            let _ = std::fs::write(&webp_path, webp);
+                        }
+
+                        // Async high-resolution main-stream snapshot upgrade via normalized bbox projection
+                        if cam_cfg.snapshots.high_res && cam_cfg.snapshots.from_main_stream {
+                            let cam_owned = camera.to_string();
+                            let det_bbox = trk.bbox;
+                            let det_w = frame.width;
+                            let det_h = frame.height;
+                            let draw_bbox = cam_cfg.snapshots.bounding_box;
+                            tokio::spawn(async move {
+                                let url =
+                                    format!("http://127.0.0.1:1984/api/frame.jpeg?src={cam_owned}");
+                                let Ok(client) = reqwest::Client::builder()
+                                    .timeout(std::time::Duration::from_millis(1500))
+                                    .build()
+                                else {
+                                    return;
+                                };
+                                if let Ok(resp) = client.get(&url).send().await
+                                    && resp.status().is_success()
+                                    && let Ok(bytes) = resp.bytes().await
+                                    && let Ok(dyn_img) = image::load_from_memory(&bytes)
+                                {
+                                    let mut hr_rgb = dyn_img.to_rgb8();
+                                    if hr_rgb.width() >= det_w && hr_rgb.height() >= det_h {
+                                        if draw_bbox {
+                                            let projected = det_bbox.project_to_resolution(
+                                                det_w,
+                                                det_h,
+                                                hr_rgb.width(),
+                                                hr_rgb.height(),
+                                            );
+                                            annotate_rgb_image_with_boxes(
+                                                &mut hr_rgb,
+                                                &[(projected, [31, 119, 180])],
+                                            );
+                                        }
+                                        if let Ok(hr_jpg) = encode_image_jpeg(&hr_rgb) {
+                                            let _ = std::fs::write(&jpg_path, hr_jpg);
+                                        }
+                                        if let Ok(hr_webp) = encode_image_webp(&hr_rgb) {
+                                            let _ = std::fs::write(&webp_path, hr_webp);
+                                        }
+                                    }
+                                }
+                            });
                         }
                     }
                 }
