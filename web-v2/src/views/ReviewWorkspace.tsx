@@ -70,6 +70,73 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
   const setPlaybackSpeed = useNvrStore((s) => s.setPlaybackSpeed);
   const [showForensic, setShowForensic] = React.useState(false);
+  const [excludeObjectFilter, setExcludeObjectFilter] = React.useState("none");
+  const [zoneFilter, setZoneFilter] = React.useState("all");
+  const [presetName, setPresetName] = React.useState("");
+  const [savedPresets, setSavedPresets] = React.useState<
+    Array<{
+      name: string;
+      camera: string;
+      severity: string;
+      object: string;
+      excludeObject: string;
+      zone: string;
+      status: "unreviewed" | "reviewed" | "all";
+    }>
+  >(() => {
+    try {
+      const raw = window.localStorage?.getItem("ninjanvr_saved_filters");
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const availableZones = React.useMemo(() => {
+    const set = new Set<string>();
+    for (const r of reviews) {
+      for (const z of r.data?.zones || []) {
+        if (z) set.add(z);
+      }
+    }
+    return Array.from(set).sort();
+  }, [reviews]);
+
+  const visibleFilteredReviews = React.useMemo(() => {
+    return filteredReviews.filter((r) => {
+      if (
+        excludeObjectFilter !== "none" &&
+        (r.data?.objects || []).some((o) => o.toLowerCase() === excludeObjectFilter)
+      ) {
+        return false;
+      }
+      if (zoneFilter !== "all" && !(r.data?.zones || []).includes(zoneFilter)) {
+        return false;
+      }
+      return true;
+    });
+  }, [filteredReviews, excludeObjectFilter, zoneFilter]);
+
+  const handleSavePreset = () => {
+    const label =
+      presetName.trim() ||
+      `${reviewCameraFilter === "all" ? "ALL" : reviewCameraFilter.toUpperCase()} · ${reviewSeverityFilter.toUpperCase()}`;
+    const next = [
+      ...savedPresets.filter((p) => p.name !== label),
+      {
+        name: label,
+        camera: reviewCameraFilter,
+        severity: reviewSeverityFilter,
+        object: reviewObjectFilter,
+        excludeObject: excludeObjectFilter,
+        zone: zoneFilter,
+        status: reviewStatusFilter,
+      },
+    ];
+    setSavedPresets(next);
+    window.localStorage?.setItem("ninjanvr_saved_filters", JSON.stringify(next));
+    setPresetName("");
+  };
 
   return (
     <>
@@ -113,6 +180,32 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
             <option value="audio">AUDIO</option>
           </select>
           <select
+            className="nvr-select mono"
+            aria-label="Exclude object class (NOT)"
+            value={excludeObjectFilter}
+            onChange={(e) => setExcludeObjectFilter(e.target.value)}
+            title="Boolean NOT filter: exclude review items containing this class"
+          >
+            <option value="none">NOT: NONE</option>
+            <option value="cat">NOT: CAT</option>
+            <option value="dog">NOT: DOG</option>
+            <option value="car">NOT: CAR</option>
+            <option value="person">NOT: PERSON</option>
+          </select>
+          <select
+            className="nvr-select mono"
+            aria-label="Filter review queue by zone"
+            value={zoneFilter}
+            onChange={(e) => setZoneFilter(e.target.value)}
+          >
+            <option value="all">ALL ZONES</option>
+            {availableZones.map((z) => (
+              <option key={z} value={z}>
+                ZONE: {z.toUpperCase()}
+              </option>
+            ))}
+          </select>
+          <select
             className="nvr-select"
             aria-label="Filter review queue by status"
             value={reviewStatusFilter}
@@ -137,6 +230,54 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
             }}
             onClear={() => setReviewDateFilter("")}
           />
+          <input
+            className="nvr-input mono"
+            style={{ width: 110, height: 26, fontSize: "var(--text-xs)" }}
+            placeholder="Preset name..."
+            aria-label="Filter preset name"
+            value={presetName}
+            onChange={(e) => setPresetName(e.target.value)}
+          />
+          <button
+            type="button"
+            className="nvr-btn mono"
+            style={{ height: 26, padding: "0 7px", fontSize: "var(--text-xs)" }}
+            onClick={handleSavePreset}
+          >
+            + Save Preset
+          </button>
+          {savedPresets.map((p) => (
+            <span key={p.name} style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+              <button
+                type="button"
+                className="nvr-btn mono"
+                style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                onClick={() => {
+                  setReviewCameraFilter(p.camera);
+                  setReviewSeverityFilter(p.severity);
+                  setReviewObjectFilter(p.object);
+                  setExcludeObjectFilter(p.excludeObject || "none");
+                  setZoneFilter(p.zone || "all");
+                  setReviewStatusFilter(p.status);
+                }}
+              >
+                {p.name}
+              </button>
+              <button
+                type="button"
+                className="nvr-btn danger mono"
+                style={{ height: 24, padding: "0 4px", fontSize: "var(--text-xs)" }}
+                title={`Delete preset ${p.name}`}
+                onClick={() => {
+                  const next = savedPresets.filter((x) => x.name !== p.name);
+                  setSavedPresets(next);
+                  window.localStorage?.setItem("ninjanvr_saved_filters", JSON.stringify(next));
+                }}
+              >
+                ×
+              </button>
+            </span>
+          ))}
           <span
             className="mono"
             style={{
@@ -145,7 +286,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
               whiteSpace: "nowrap",
             }}
           >
-            {filteredReviews.length} items
+            {visibleFilteredReviews.length} items
           </span>
         </div>
 
@@ -193,7 +334,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
             )}
           </div>
           <div className="nvr-scroll-y">
-            {filteredReviews.slice(0, 40).map((item) => {
+            {visibleFilteredReviews.slice(0, 40).map((item) => {
               const isSelected = activeReview?.id === item.id;
               const matchedExport = findMatchingExport(
                 exportsList,

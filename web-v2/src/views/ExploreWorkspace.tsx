@@ -60,6 +60,84 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 }) => {
   const { t } = useI18n();
   const [showForensic, setShowForensic] = React.useState(false);
+  const [excludeLabel, setExcludeLabel] = React.useState("none");
+  const [zoneFilter, setZoneFilter] = React.useState("all");
+  const [minScoreFilter, setMinScoreFilter] = React.useState(0);
+  const [stationaryFilter, setStationaryFilter] = React.useState<"all" | "moving" | "stationary">(
+    "all"
+  );
+  const [presetName, setPresetName] = React.useState("");
+  const [savedPresets, setSavedPresets] = React.useState<
+    Array<{
+      name: string;
+      camera: string;
+      label: string;
+      excludeLabel: string;
+      zone: string;
+      minScore: number;
+      stationary: "all" | "moving" | "stationary";
+      retainedOnly: boolean;
+    }>
+  >(() => {
+    try {
+      const raw = window.localStorage?.getItem("ninjanvr_explore_saved_filters");
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const availableZones = React.useMemo(() => {
+    const set = new Set<string>();
+    for (const ev of filteredEvents) {
+      for (const z of ev.zones || ev.data?.provenance?.zones || []) {
+        if (z) set.add(z);
+      }
+    }
+    return Array.from(set).sort();
+  }, [filteredEvents]);
+
+  const visibleEvents = React.useMemo(() => {
+    return filteredEvents.filter((ev) => {
+      if (excludeLabel !== "none" && ev.label.toLowerCase() === excludeLabel) {
+        return false;
+      }
+      if (zoneFilter !== "all") {
+        const zList = ev.zones || ev.data?.provenance?.zones || [];
+        if (!zList.includes(zoneFilter)) return false;
+      }
+      const sc = (ev.top_score ?? ev.data?.top_score ?? ev.score ?? 0.85) as number;
+      if (minScoreFilter > 0 && sc * 100 < minScoreFilter) {
+        return false;
+      }
+      const isStat = Boolean(ev.stationary ?? ev.data?.provenance?.stationary);
+      if (stationaryFilter === "moving" && isStat) return false;
+      if (stationaryFilter === "stationary" && !isStat) return false;
+      return true;
+    });
+  }, [filteredEvents, excludeLabel, zoneFilter, minScoreFilter, stationaryFilter]);
+
+  const handleSaveExplorePreset = () => {
+    const name =
+      presetName.trim() ||
+      `${exploreCamera === "all" ? "ALL" : exploreCamera.toUpperCase()} · ${exploreLabel.toUpperCase()}`;
+    const next = [
+      ...savedPresets.filter((p) => p.name !== name),
+      {
+        name,
+        camera: exploreCamera,
+        label: exploreLabel,
+        excludeLabel,
+        zone: zoneFilter,
+        minScore: minScoreFilter,
+        stationary: stationaryFilter,
+        retainedOnly: exploreRetainedOnly,
+      },
+    ];
+    setSavedPresets(next);
+    window.localStorage?.setItem("ninjanvr_explore_saved_filters", JSON.stringify(next));
+    setPresetName("");
+  };
 
   return (
     <>
@@ -99,6 +177,54 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
             <option value="car">CAR</option>
             <option value="audio">AUDIO</option>
           </select>
+          <select
+            className="nvr-select mono"
+            aria-label="Exclude objects by label (NOT)"
+            value={excludeLabel}
+            onChange={(e) => setExcludeLabel(e.target.value)}
+          >
+            <option value="none">NOT: NONE</option>
+            <option value="cat">NOT: CAT</option>
+            <option value="dog">NOT: DOG</option>
+            <option value="car">NOT: CAR</option>
+            <option value="person">NOT: PERSON</option>
+          </select>
+          <select
+            className="nvr-select mono"
+            aria-label="Filter objects by zone"
+            value={zoneFilter}
+            onChange={(e) => setZoneFilter(e.target.value)}
+          >
+            <option value="all">ALL ZONES</option>
+            {availableZones.map((z) => (
+              <option key={z} value={z}>
+                ZONE: {z.toUpperCase()}
+              </option>
+            ))}
+          </select>
+          <select
+            className="nvr-select mono"
+            aria-label="Filter by minimum confidence score"
+            value={minScoreFilter}
+            onChange={(e) => setMinScoreFilter(Number(e.target.value))}
+          >
+            <option value={0}>MIN SCORE: ANY</option>
+            <option value={70}>&ge; 70%</option>
+            <option value={80}>&ge; 80%</option>
+            <option value={90}>&ge; 90%</option>
+          </select>
+          <select
+            className="nvr-select mono"
+            aria-label="Filter by stationary state"
+            value={stationaryFilter}
+            onChange={(e) =>
+              setStationaryFilter(e.target.value as "all" | "moving" | "stationary")
+            }
+          >
+            <option value="all">ALL MOTION</option>
+            <option value="moving">MOVING ONLY</option>
+            <option value="stationary">STATIONARY ONLY</option>
+          </select>
           <button
             className={`nvr-btn ${exploreRetainedOnly ? "active" : ""}`}
             onClick={() => setExploreRetainedOnly((v) => !v)}
@@ -115,12 +241,64 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
             onSelectDate={(dateStr) => setReviewDateFilter(dateStr)}
             onClear={() => setReviewDateFilter("")}
           />
+          <input
+            className="nvr-input mono"
+            style={{ width: 110, height: 26, fontSize: "var(--text-xs)" }}
+            placeholder="Preset name..."
+            aria-label="Explore filter preset name"
+            value={presetName}
+            onChange={(e) => setPresetName(e.target.value)}
+          />
+          <button
+            type="button"
+            className="nvr-btn mono"
+            style={{ height: 26, padding: "0 7px", fontSize: "var(--text-xs)" }}
+            onClick={handleSaveExplorePreset}
+          >
+            + Save Preset
+          </button>
+          {savedPresets.map((p) => (
+            <span key={p.name} style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+              <button
+                type="button"
+                className="nvr-btn mono"
+                style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                onClick={() => {
+                  setExploreCamera(p.camera);
+                  setExploreLabel(p.label);
+                  setExcludeLabel(p.excludeLabel || "none");
+                  setZoneFilter(p.zone || "all");
+                  setMinScoreFilter(p.minScore || 0);
+                  setStationaryFilter(p.stationary || "all");
+                  setExploreRetainedOnly(Boolean(p.retainedOnly));
+                }}
+              >
+                {p.name}
+              </button>
+              <button
+                type="button"
+                className="nvr-btn danger mono"
+                style={{ height: 24, padding: "0 4px", fontSize: "var(--text-xs)" }}
+                title={`Delete preset ${p.name}`}
+                onClick={() => {
+                  const next = savedPresets.filter((x) => x.name !== p.name);
+                  setSavedPresets(next);
+                  window.localStorage?.setItem(
+                    "ninjanvr_explore_saved_filters",
+                    JSON.stringify(next)
+                  );
+                }}
+              >
+                ×
+              </button>
+            </span>
+          ))}
         </div>
         <span
           className="mono"
           style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
         >
-          {filteredEvents.length} tracked object events
+          {visibleEvents.length} tracked object events
         </span>
       </div>
 
@@ -131,7 +309,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
             <span className="mono">TOP 50</span>
           </div>
           <div className="nvr-scroll-y">
-            {filteredEvents.slice(0, 50).map((ev) => {
+            {visibleEvents.slice(0, 50).map((ev) => {
               const topScore = Math.round(
                 ((ev.top_score ?? ev.data?.top_score ?? ev.score ?? 0.85) as number) * 100
               );

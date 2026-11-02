@@ -101,9 +101,12 @@ pub struct ExportRow {
 pub struct ReviewFilter {
     pub cameras: Option<Vec<String>>,
     pub labels: Option<Vec<String>>,
+    pub exclude_labels: Option<Vec<String>>,
     pub zones: Option<Vec<String>>,
     pub reviewed: Option<bool>,
     pub severity: Option<String>,
+    pub min_score: Option<f64>,
+    pub stationary: Option<bool>,
     pub before: Option<f64>,
     pub after: Option<f64>,
     pub limit: Option<usize>,
@@ -113,9 +116,12 @@ pub struct ReviewFilter {
 pub struct EventFilter {
     pub cameras: Option<Vec<String>>,
     pub labels: Option<Vec<String>>,
+    pub exclude_labels: Option<Vec<String>>,
     pub zones: Option<Vec<String>>,
     pub sub_labels: Option<Vec<String>>,
     pub favorites: Option<bool>,
+    pub min_score: Option<f64>,
+    pub stationary: Option<bool>,
     pub before: Option<f64>,
     pub after: Option<f64>,
     pub limit: Option<usize>,
@@ -672,12 +678,38 @@ impl NinjaDatabase {
                     continue;
                 }
             }
+            if let Some(ref ex_labels) = filter.exclude_labels
+                && !ex_labels.is_empty()
+            {
+                let obj_excluded = json_array_matches_any(&item.data["objects"], ex_labels, true);
+                let audio_excluded = json_array_matches_any(&item.data["audio"], ex_labels, false);
+                if obj_excluded || audio_excluded {
+                    continue;
+                }
+            }
             if let Some(ref zones) = filter.zones
                 && !zones.is_empty()
                 && !zones.iter().any(|z| z == "all")
                 && !json_array_matches_any(&item.data["zones"], zones, false)
             {
                 continue;
+            }
+            if let Some(min_sc) = filter.min_score {
+                let sc = item.data["provenance"]["top_score"]
+                    .as_f64()
+                    .or_else(|| item.data["top_score"].as_f64())
+                    .unwrap_or(0.85);
+                if sc < min_sc {
+                    continue;
+                }
+            }
+            if let Some(req_stat) = filter.stationary {
+                let is_stat = item.data["provenance"]["stationary"]
+                    .as_bool()
+                    .unwrap_or(false);
+                if is_stat != req_stat {
+                    continue;
+                }
             }
             items.push(item);
             if items.len() >= requested_limit {
@@ -985,6 +1017,18 @@ impl NinjaDatabase {
                 .collect();
             sql.push_str(&format!(" AND label IN ({})", list.join(",")));
         }
+        if let Some(ref ex_labels) = filter.exclude_labels
+            && !ex_labels.is_empty()
+        {
+            let list: Vec<String> = ex_labels
+                .iter()
+                .map(|l| format!("'{}'", l.replace('\'', "")))
+                .collect();
+            sql.push_str(&format!(" AND label NOT IN ({})", list.join(",")));
+        }
+        if let Some(min_sc) = filter.min_score {
+            sql.push_str(&format!(" AND COALESCE(top_score, score, 0.0) >= {min_sc}"));
+        }
         if let Some(ref subs) = filter.sub_labels
             && !subs.is_empty()
             && !subs.iter().any(|s| s == "all")
@@ -1006,6 +1050,11 @@ impl NinjaDatabase {
             let zones_raw: Option<String> = row.get(3).ok();
             let box_raw: Option<String> = row.get(13).ok();
             let data_raw: Option<String> = row.get(14).ok();
+            let data_json = parse_json_or(data_raw, json!({}));
+            let is_stationary = data_json["provenance"]["stationary"]
+                .as_bool()
+                .or_else(|| data_json["stationary"].as_bool())
+                .unwrap_or(false);
 
             Ok(json!({
                 "id": row.get::<_, String>(0)?,
@@ -1022,7 +1071,8 @@ impl NinjaDatabase {
                 "top_score": row.get::<_, Option<f64>>(11).ok().flatten(),
                 "false_positive": row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v != 0),
                 "box": parse_json_or(box_raw, Value::Null),
-                "data": parse_json_or(data_raw, json!({})),
+                "stationary": is_stationary,
+                "data": data_json,
                 "thumbnail": row.get::<_, Option<String>>(15).ok().flatten()
             }))
         })?;
@@ -1036,6 +1086,12 @@ impl NinjaDatabase {
                 && !json_array_matches_any(&item["zones"], zones, false)
             {
                 continue;
+            }
+            if let Some(req_stat) = filter.stationary {
+                let is_stat = item["stationary"].as_bool().unwrap_or(false);
+                if is_stat != req_stat {
+                    continue;
+                }
             }
             out.push(item);
             if out.len() >= requested_limit {
@@ -2107,6 +2163,66 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        // Test combined boolean EventFilter (exclude_labels NOT, zones, min_score)
+        db.upsert_event(&EventDto {
+            id: "ev_person_driveway".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!(["driveway"]),
+            start_time: 1700000100.0,
+            end_time: Some(1700000110.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.91),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"score": 0.91, "top_score": 0.91}),
+            thumbnail: None,
+            area: Some(15000),
+            ratio: Some(0.5),
+            score: Some(0.91),
+            stationary: false,
+        })
+        .unwrap();
+        db.upsert_event(&EventDto {
+            id: "ev_cat_driveway".to_string(),
+            camera: "front_door".to_string(),
+            label: "cat".to_string(),
+            zones: json!(["driveway"]),
+            start_time: 1700000120.0,
+            end_time: Some(1700000125.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.82),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"score": 0.82, "top_score": 0.82}),
+            thumbnail: None,
+            area: Some(4000),
+            ratio: Some(1.0),
+            score: Some(0.82),
+            stationary: false,
+        })
+        .unwrap();
+
+        let filtered_evs = db
+            .query_events(&EventFilter {
+                zones: Some(vec!["driveway".to_string()]),
+                exclude_labels: Some(vec!["cat".to_string()]),
+                min_score: Some(0.85),
+                stationary: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(filtered_evs.len(), 1);
+        assert_eq!(filtered_evs[0]["id"], "ev_person_driveway");
 
         // User management CRUD & last-admin guardrails
         assert!(db.delete_user("admin").is_err());
