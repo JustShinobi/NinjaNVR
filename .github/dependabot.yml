@@ -6,11 +6,25 @@ updates:
       interval: "weekly"
     open-pull-requests-limit: 5
     ignore:
-      # hmac 0.13 migrated to digest 0.11 while pbkdf2 0.12 and sha2 0.10 still require digest 0.10
+      # RustCrypto digest 0.11 migration requires coordinated bump across hmac, sha2, and pbkdf2
       - dependency-name: "hmac"
         versions: [">= 0.13.0, < 0.14.0"]
+      - dependency-name: "sha2"
+        versions: [">= 0.11.0, < 0.12.0"]
+      - dependency-name: "pbkdf2"
+        versions: [">= 0.13.0, < 0.14.0"]
+      # Breaking API changes tracked for dedicated code migration
+      - dependency-name: "rcgen"
+        versions: [">= 0.14.0, < 0.15.0"]
+      - dependency-name: "rand"
+        versions: [">= 0.9.0"]
+      - dependency-name: "reqwest"
+        versions: [">= 0.13.0"]
+      # Keep tokio-tungstenite aligned with axum 0.8 (which depends on 0.29)
+      - dependency-name: "tokio-tungstenite"
+        versions: [">= 0.30.0"]
 
-  - package-ecosystem: "npm"
+  - package-ecosystem: "bun"
     directory: "/web-v2"
     schedule:
       interval: "weekly"
