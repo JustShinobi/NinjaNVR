@@ -425,7 +425,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/logs/{service}", get(api_service_logs))
         .route("/stats", get(api_stats))
         .route("/stats/history", get(api_stats_history))
-        .route("/metrics", get(api_stats))
+        .route("/metrics", get(api_prometheus_metrics))
         .route("/ai/context", get(api_ai_context))
         .route("/mcp", post(api_mcp_handler))
         .route("/debug/reprocess", post(api_debug_reprocess))
@@ -2191,6 +2191,141 @@ async fn api_stats_history(State(state): State<AppState>) -> Json<Value> {
     }
     let items: Vec<Value> = history.iter().cloned().collect();
     Json(Value::Array(items))
+}
+
+async fn api_prometheus_metrics(State(state): State<AppState>) -> Response {
+    let Json(stats_val) = api_stats(State(state.clone())).await;
+    let mut out = String::with_capacity(4096);
+
+    out.push_str("# HELP ninjanvr_camera_fps Per-camera frame rate by pipeline role.\n");
+    out.push_str("# TYPE ninjanvr_camera_fps gauge\n");
+    out.push_str(
+        "# HELP ninjanvr_camera_online Camera stream online status (1 = online, 0 = offline).\n",
+    );
+    out.push_str("# TYPE ninjanvr_camera_online gauge\n");
+
+    if let Some(cams) = stats_val.get("cameras").and_then(|v| v.as_object()) {
+        for (cam, c_stat) in cams {
+            let cam_fps = c_stat
+                .get("camera_fps")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let det_fps = c_stat
+                .get("detection_fps")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let proc_fps = c_stat
+                .get("process_fps")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(cam_fps);
+            let online = if cam_fps > 0.0 { 1 } else { 0 };
+            out.push_str(&format!(
+                "ninjanvr_camera_fps{{camera=\"{cam}\",role=\"camera\"}} {cam_fps:.2}\n"
+            ));
+            out.push_str(&format!(
+                "ninjanvr_camera_fps{{camera=\"{cam}\",role=\"detect\"}} {det_fps:.2}\n"
+            ));
+            out.push_str(&format!(
+                "ninjanvr_camera_fps{{camera=\"{cam}\",role=\"process\"}} {proc_fps:.2}\n"
+            ));
+            out.push_str(&format!(
+                "ninjanvr_camera_online{{camera=\"{cam}\"}} {online}\n"
+            ));
+        }
+    }
+
+    out.push_str(
+        "# HELP ninjanvr_detector_inference_ms AI detector inference latency in milliseconds.\n",
+    );
+    out.push_str("# TYPE ninjanvr_detector_inference_ms gauge\n");
+    if let Some(dets) = stats_val.get("detectors").and_then(|v| v.as_object()) {
+        for (det_name, d_stat) in dets {
+            let ms = d_stat
+                .get("inference_speed")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            out.push_str(&format!(
+                "ninjanvr_detector_inference_ms{{detector=\"{det_name}\"}} {ms:.2}\n"
+            ));
+        }
+    }
+
+    out.push_str("# HELP ninjanvr_storage_used_bytes Used bytes on storage mounts.\n");
+    out.push_str("# TYPE ninjanvr_storage_used_bytes gauge\n");
+    out.push_str("# HELP ninjanvr_storage_total_bytes Total bytes on storage mounts.\n");
+    out.push_str("# TYPE ninjanvr_storage_total_bytes gauge\n");
+    if let Some(storages) = stats_val
+        .get("service")
+        .and_then(|s| s.get("storage"))
+        .and_then(|v| v.as_object())
+    {
+        for (mount_path, st) in storages {
+            let label = if mount_path.contains("recordings") {
+                "recordings"
+            } else if mount_path.contains("clips") {
+                "clips"
+            } else if mount_path.contains("cache") {
+                "cache"
+            } else if mount_path.contains("shm") {
+                "shm"
+            } else {
+                mount_path.as_str()
+            };
+            let used_mb = st.get("used").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let total_mb = st.get("total").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let used_bytes = (used_mb * 1024.0 * 1024.0).round() as u64;
+            let total_bytes = (total_mb * 1024.0 * 1024.0).round() as u64;
+            out.push_str(&format!(
+                "ninjanvr_storage_used_bytes{{mount=\"{label}\"}} {used_bytes}\n"
+            ));
+            out.push_str(&format!(
+                "ninjanvr_storage_total_bytes{{mount=\"{label}\"}} {total_bytes}\n"
+            ));
+        }
+    }
+
+    let sys_cpu = stats_val
+        .get("cpu_usages")
+        .and_then(|c| c.get("frigate.full_system"))
+        .and_then(|f| f.get("cpu"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let sys_mem_pct = stats_val
+        .get("cpu_usages")
+        .and_then(|c| c.get("frigate.full_system"))
+        .and_then(|f| f.get("mem"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    out.push_str("# HELP ninjanvr_cpu_usage_percent Process CPU usage percentage.\n");
+    out.push_str("# TYPE ninjanvr_cpu_usage_percent gauge\n");
+    out.push_str(&format!("ninjanvr_cpu_usage_percent {sys_cpu:.2}\n"));
+    out.push_str("# HELP ninjanvr_memory_usage_bytes Process resident memory usage in bytes.\n");
+    out.push_str("# TYPE ninjanvr_memory_usage_bytes gauge\n");
+    out.push_str(&format!(
+        "ninjanvr_memory_usage_bytes {}\n",
+        (sys_mem_pct * 1024.0 * 1024.0).round() as u64
+    ));
+
+    out.push_str("# HELP ninjanvr_events_total Total persisted object detection events by camera and label.\n");
+    out.push_str("# TYPE ninjanvr_events_total counter\n");
+    if let Ok(ev_counts) = state.db.query_event_counts_by_camera_and_label() {
+        for (cam, lbl, cnt) in ev_counts {
+            out.push_str(&format!(
+                "ninjanvr_events_total{{camera=\"{cam}\",label=\"{lbl}\"}} {cnt}\n"
+            ));
+        }
+    }
+
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        out,
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -6281,6 +6416,44 @@ version: 0.18-0
                 .unwrap();
         assert_eq!(notif_json["success"], true);
         assert_eq!(notif_json["ws_delivered"], true);
+
+        // 25. Test Prometheus OpenMetrics exposition format at GET /api/metrics and SQLite run_maintenance()
+        state.db.run_maintenance().unwrap();
+        let resp_prom = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_prom.status(), StatusCode::OK);
+        assert!(
+            resp_prom
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .starts_with("text/plain; version=0.0.4")
+        );
+        let prom_body = String::from_utf8(
+            to_bytes(resp_prom.into_body(), 32768)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(prom_body.contains("ninjanvr_camera_fps{camera=\"front_door\",role=\"camera\"}"));
+        assert!(prom_body.contains("ninjanvr_camera_online{camera=\"front_door\"}"));
+        assert!(prom_body.contains("ninjanvr_detector_inference_ms{detector=\"detector01\"}"));
+        assert!(prom_body.contains("ninjanvr_storage_used_bytes{mount=\"recordings\"}"));
+        assert!(prom_body.contains("ninjanvr_cpu_usage_percent "));
+        assert!(prom_body.contains("ninjanvr_memory_usage_bytes "));
+        assert!(
+            prom_body.contains("ninjanvr_events_total{camera=\"front_door\",label=\"person\"}")
+        );
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

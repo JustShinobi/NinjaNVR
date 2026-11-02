@@ -1196,6 +1196,9 @@ impl RecordingEngine {
                 }
             }
 
+            // Periodic SQLite query-planner optimization & WAL checkpointing
+            let _ = self.db.run_maintenance();
+
             tokio::time::sleep(std::time::Duration::from_secs(expire_interval)).await;
         }
     }

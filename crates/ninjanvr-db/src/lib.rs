@@ -1612,6 +1612,34 @@ impl NinjaDatabase {
         )?)
     }
 
+    /// Executes SQLite query-planner optimization and bounded WAL checkpointing (`PRAGMA optimize`
+    /// and `PRAGMA wal_checkpoint(TRUNCATE)`).
+    pub fn run_maintenance(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
+    /// Returns total event counts grouped by `(camera, label)` for Prometheus `/api/metrics`.
+    pub fn query_event_counts_by_camera_and_label(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT camera, label, COUNT(*) FROM event GROUP BY camera, label ORDER BY camera, label",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn upsert_event(&self, ev: &EventDto) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let zones_str = serde_json::to_string(&ev.zones)?;
