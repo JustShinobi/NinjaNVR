@@ -123,6 +123,7 @@ export interface CameraLiveConfig {
   streams: Record<string, string>;
   height: number;
   quality: number;
+  rotate?: number;
 }
 
 export interface CameraMapPlacement {

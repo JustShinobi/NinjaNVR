@@ -1179,6 +1179,8 @@ pub struct CameraLiveConfig {
     pub height: u32,
     #[serde(default = "default_live_quality")]
     pub quality: u8,
+    #[serde(default)]
+    pub rotate: u16,
 }
 
 fn default_live_quality() -> u8 {
@@ -1191,6 +1193,7 @@ impl Default for CameraLiveConfig {
             streams: BTreeMap::new(),
             height: 720,
             quality: 8,
+            rotate: 0,
         }
     }
 }
@@ -1460,7 +1463,8 @@ impl NinjaConfig {
                     "live": {
                         "streams": cam.live.streams,
                         "height": cam.live.height,
-                        "quality": cam.live.quality
+                        "quality": cam.live.quality,
+                        "rotate": cam.live.rotate
                     },
                     "lpr": {
                         "enabled": false,

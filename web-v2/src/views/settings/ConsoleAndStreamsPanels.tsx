@@ -837,6 +837,51 @@ export const ChannelsStreamsSection: React.FC<{
                 </div>
               ))}
 
+              {/* Video Orientation / Corridor Mode Rotation Selector */}
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  padding: "6px 8px",
+                  background: "var(--bg-canvas)",
+                  border: "1px solid var(--border-hairline)",
+                  borderRadius: 3,
+                }}
+              >
+                <span className="mono" style={{ fontSize: "var(--text-xs)" }}>
+                  {isPt
+                    ? "ROTAÇÃO DE VÍDEO (MODO CORREDOR):"
+                    : "VIDEO ROTATION (CORRIDOR MODE):"}
+                </span>
+                <div style={{ display: "flex", gap: 4 }}>
+                  {([0, 90, 180, 270] as const).map((deg) => {
+                    const curRot = activeCamCfg.live?.rotate || 0;
+                    return (
+                      <button
+                        key={deg}
+                        type="button"
+                        className={`nvr-btn mono ${curRot === deg ? "active" : ""}`}
+                        style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                        onClick={() =>
+                          updateDraft((next) => {
+                            const cam = next.cameras[inspectorCam];
+                            if (!cam) return;
+                            if (!cam.live) {
+                              cam.live = { streams: {}, height: 720, quality: 8, rotate: deg };
+                            } else {
+                              cam.live.rotate = deg;
+                            }
+                          })
+                        }
+                      >
+                        {deg}°
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
               {/* Visual Stream Probe Summary Cards */}
               <div
                 className="mono"

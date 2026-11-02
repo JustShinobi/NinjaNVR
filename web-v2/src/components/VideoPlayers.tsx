@@ -589,6 +589,11 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const objectMasks = extractMaskPolygons(cameraConfig?.objects?.mask);
   const privacyMasks = extractMaskPolygons(cameraConfig?.privacy_mask);
   const zones = cameraConfig?.zones || {};
+  const rotateDeg = cameraConfig?.live?.rotate || 0;
+  const isCorridorRot = rotateDeg === 90 || rotateDeg === 270;
+  const rotateTransform = rotateDeg
+    ? `rotate(${rotateDeg}deg)${isCorridorRot ? " scale(0.5625)" : ""}`
+    : undefined;
 
   const handleCaptureLiveStill = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -663,6 +668,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             width: "100%",
             height: "100%",
             objectFit: "contain",
+            transform: rotateTransform,
             opacity: mseReady ? 0 : 1,
             filter: isOffline ? "grayscale(0.65) brightness(0.55)" : "none",
             transition: "opacity 0.2s ease, filter 0.2s ease",
@@ -703,6 +709,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             width: "100%",
             height: "100%",
             objectFit: "contain",
+            transform: rotateTransform,
             opacity: mseReady ? 1 : 0,
             transition: "opacity 0.2s ease",
             pointerEvents: "none",
@@ -880,6 +887,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const endedFiredRef = useRef(false);
+  const vodRotateDeg = useNvrStore(
+    (s) => s.config?.cameras?.[camera]?.live?.rotate || 0
+  );
+  const vodIsCorridorRot = vodRotateDeg === 90 || vodRotateDeg === 270;
+  const vodRotateTransform = vodRotateDeg
+    ? `rotate(${vodRotateDeg}deg)${vodIsCorridorRot ? " scale(0.5625)" : ""}`
+    : undefined;
   const [useFallbackMp4, setUseFallbackMp4] = useState(false);
   const [userMuted, setUserMuted] = useState<boolean>(() => {
     if (typeof window !== "undefined") {
@@ -1103,7 +1117,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
               onEnded();
             }
           }}
-          style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
+          style={{
+            width: "100%",
+            height: "100%",
+            objectFit: "contain",
+            transform: vodRotateTransform,
+            background: "#000",
+          }}
         />
         {vodFrameControls}
       </ZoomableVideoStage>
@@ -1132,7 +1152,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
             onEnded();
           }
         }}
-        style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
+        style={{
+          width: "100%",
+          height: "100%",
+          objectFit: "contain",
+          transform: vodRotateTransform,
+          background: "#000",
+        }}
       />
       {vodFrameControls}
     </ZoomableVideoStage>
