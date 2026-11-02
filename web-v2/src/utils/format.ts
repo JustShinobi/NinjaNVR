@@ -1,3 +1,5 @@
+import type { ExportItem } from "../types/nvr";
+
 export type HudPosition =
   | "bottom-right"
   | "top-right"
@@ -112,4 +114,36 @@ export function formatUptime(sec: number): string {
   const m = Math.floor((sec % 3600) / 60);
   const s = sec % 60;
   return `${h}h ${m}m ${s}s`;
+}
+
+export function findMatchingExport(
+  exportsList: ExportItem[],
+  camera: string,
+  startTime: number,
+  endTime: number | null
+): ExportItem | null {
+  if (!exportsList || exportsList.length === 0) return null;
+  const itemStart = Math.floor(startTime);
+  const itemEnd = Math.ceil(endTime && endTime > startTime ? endTime : startTime + 15);
+  for (const ex of exportsList) {
+    if (ex.camera !== camera) continue;
+    const parts = ex.id.split("_");
+    if (parts.length >= 3) {
+      const expStart = Number(parts[parts.length - 2]);
+      const expEnd = Number(parts[parts.length - 1]);
+      if (
+        Number.isFinite(expStart) &&
+        Number.isFinite(expEnd) &&
+        expEnd > 0 &&
+        expStart <= itemEnd &&
+        expEnd >= itemStart
+      ) {
+        return ex;
+      }
+    }
+    if (ex.name && ex.name.includes(String(itemStart))) {
+      return ex;
+    }
+  }
+  return null;
 }

@@ -1,13 +1,15 @@
 import React from "react";
 import { Camera, Play, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
-import { EventItem, RecordingDaySummary } from "../types/nvr";
-import { WorkspaceTab, formatDateTime } from "../utils/format";
+import { EventItem, ExportItem, RecordingDaySummary } from "../types/nvr";
+import { WorkspaceTab, findMatchingExport, formatDateTime } from "../utils/format";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 
 interface ExploreWorkspaceProps {
   cameraNames: string[];
   filteredEvents: EventItem[];
+  exportsList?: ExportItem[];
+  onOpenExport?: (exp: ExportItem) => void;
   exploreQuery: string;
   setExploreQuery: (q: string) => void;
   exploreCamera: string;
@@ -33,6 +35,8 @@ interface ExploreWorkspaceProps {
 export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   cameraNames,
   filteredEvents,
+  exportsList = [],
+  onOpenExport,
   exploreQuery,
   setExploreQuery,
   exploreCamera,
@@ -130,6 +134,12 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 ((ev.top_score ?? ev.data?.top_score ?? ev.score ?? 0.85) as number) * 100
               );
               const isSelected = selectedEvent?.id === ev.id;
+              const matchedExport = findMatchingExport(
+                exportsList,
+                ev.camera,
+                ev.start_time,
+                ev.end_time
+              );
               return (
                 <div
                   key={ev.id}
@@ -189,12 +199,40 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                         color: "var(--text-muted)",
                         marginTop: 3,
                         whiteSpace: "nowrap",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 6,
                       }}
                     >
-                      {formatDateTime(ev.start_time)} ·{" "}
-                      {ev.end_time
-                        ? `${Math.max(1, Math.round(ev.end_time - ev.start_time))}s`
-                        : t.explore.inProgress}
+                      <span>
+                        {formatDateTime(ev.start_time)} ·{" "}
+                        {ev.end_time
+                          ? `${Math.max(1, Math.round(ev.end_time - ev.start_time))}s`
+                          : t.explore.inProgress}
+                      </span>
+                      {matchedExport && (
+                        <button
+                          className="nvr-badge live mono"
+                          style={{
+                            height: 19,
+                            padding: "0 5px",
+                            fontSize: "var(--text-xs)",
+                            cursor: "pointer",
+                          }}
+                          title={`Open exported clip ${matchedExport.name}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (onOpenExport) {
+                              onOpenExport(matchedExport);
+                            } else {
+                              switchTab("exports");
+                            }
+                          }}
+                        >
+                          EXPORTED
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>

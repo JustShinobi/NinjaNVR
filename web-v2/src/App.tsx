@@ -143,11 +143,12 @@ export const App: React.FC = () => {
           revUrl = `/api/review?after=${dayStart}&before=${dayEnd}&limit=300`;
         }
       }
-      const [cfgRes, statsRes, histRes, revRes] = await Promise.all([
+      const [cfgRes, statsRes, histRes, revRes, expRes] = await Promise.all([
         fetch("/api/config", { credentials: "include" }),
         fetch("/api/stats", { credentials: "include" }),
         fetch("/api/stats/history", { credentials: "include" }),
         fetch(revUrl, { credentials: "include" }),
+        fetch("/api/exports", { credentials: "include" }),
       ]);
 
       if (cfgRes.status === 401 || statsRes.status === 401) {
@@ -185,6 +186,12 @@ export const App: React.FC = () => {
         if (!activeReview && revJson.length > 0) {
           setActiveReview(revJson[0]);
           setSyncMasterTs(Math.floor(revJson[0].start_time));
+        }
+      }
+      if (expRes.ok) {
+        const expJson: ExportItem[] = await expRes.json();
+        if (Array.isArray(expJson)) {
+          setExportsList(expJson);
         }
       }
     } catch {
@@ -910,6 +917,11 @@ export const App: React.FC = () => {
             cameraNames={cameraNames}
             reviews={reviews}
             filteredReviews={filteredReviews}
+            exportsList={exportsList}
+            onOpenExport={(ex) => {
+              setActiveExportPreview(ex);
+              switchTab("exports");
+            }}
             reviewCameraFilter={reviewCameraFilter}
             setReviewCameraFilter={setReviewCameraFilter}
             reviewSeverityFilter={reviewSeverityFilter}
@@ -936,6 +948,11 @@ export const App: React.FC = () => {
           <ExploreWorkspace
             cameraNames={cameraNames}
             filteredEvents={filteredEvents}
+            exportsList={exportsList}
+            onOpenExport={(ex) => {
+              setActiveExportPreview(ex);
+              switchTab("exports");
+            }}
             exploreQuery={exploreQuery}
             setExploreQuery={setExploreQuery}
             exploreCamera={exploreCamera}

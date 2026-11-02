@@ -2,8 +2,8 @@ import React from "react";
 import { Check, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
-import { RecordingDaySummary, RecordingSegment, ReviewItem } from "../types/nvr";
-import { WorkspaceTab, formatDateTime, formatRelTime } from "../utils/format";
+import { ExportItem, RecordingDaySummary, RecordingSegment, ReviewItem } from "../types/nvr";
+import { WorkspaceTab, findMatchingExport, formatDateTime, formatRelTime } from "../utils/format";
 import { VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
@@ -12,6 +12,8 @@ interface ReviewWorkspaceProps {
   cameraNames: string[];
   reviews: ReviewItem[];
   filteredReviews: ReviewItem[];
+  exportsList?: ExportItem[];
+  onOpenExport?: (exp: ExportItem) => void;
   reviewCameraFilter: string;
   setReviewCameraFilter: (cam: string) => void;
   reviewSeverityFilter: string;
@@ -42,6 +44,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   cameraNames,
   reviews,
   filteredReviews,
+  exportsList = [],
+  onOpenExport,
   reviewCameraFilter,
   setReviewCameraFilter,
   reviewSeverityFilter,
@@ -188,6 +192,12 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
           <div className="nvr-scroll-y">
             {filteredReviews.slice(0, 40).map((item) => {
               const isSelected = activeReview?.id === item.id;
+              const matchedExport = findMatchingExport(
+                exportsList,
+                item.camera,
+                item.start_time,
+                item.end_time
+              );
               const thumbUrl = item.thumb_path
                 ? item.thumb_path.replace("/media/frigate", "")
                 : `/api/${item.camera}/latest.webp`;
@@ -269,6 +279,28 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         {(item.data?.objects || ["motion"]).join(", ")}
                       </span>
                       <div className="nvr-row-actions">
+                        {matchedExport && (
+                          <button
+                            className="nvr-badge live mono"
+                            style={{
+                              height: 20,
+                              padding: "0 5px",
+                              fontSize: "var(--text-xs)",
+                              cursor: "pointer",
+                            }}
+                            title={`Open exported clip ${matchedExport.name}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (onOpenExport) {
+                                onOpenExport(matchedExport);
+                              } else {
+                                switchTab("exports");
+                              }
+                            }}
+                          >
+                            EXPORTED
+                          </button>
+                        )}
                         {!item.has_been_reviewed && (
                           <button
                             className="nvr-btn success"
