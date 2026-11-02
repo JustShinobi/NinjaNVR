@@ -589,7 +589,10 @@ export const App: React.FC = () => {
       if (exploreLabel !== "all" && ev.label !== exploreLabel) return false;
       if (exploreRetainedOnly && !ev.retain_indefinitely) return false;
       if (q) {
-        const hay = `${ev.id} ${ev.camera} ${ev.label} ${(ev.zones || []).join(" ")}`.toLowerCase();
+        const attrs = Array.isArray(ev.data?.attributes) ? ev.data.attributes.join(" ") : "";
+        const hay = `${ev.id} ${ev.camera} ${ev.label} ${ev.sub_label || ""} ${(
+          ev.zones || []
+        ).join(" ")} ${attrs}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;

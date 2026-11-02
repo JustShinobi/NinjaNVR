@@ -60,6 +60,50 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 }) => {
   const { t } = useI18n();
   const [showForensic, setShowForensic] = React.useState(false);
+  const [showDebugReplay, setShowDebugReplay] = React.useState(false);
+  const [debugMinScore, setDebugMinScore] = React.useState(0.5);
+  const [debugMinArea, setDebugMinArea] = React.useState(0);
+  const [debugBusy, setDebugBusy] = React.useState(false);
+  const [debugTrace, setDebugTrace] = React.useState<{
+    segments_analyzed: number;
+    frames: Array<{
+      ts: number;
+      motion_boxes: unknown[];
+      raw_detections: Array<{ label: string; score: number; area_px: number }>;
+      active_tracks: Array<{ label: string; score: number; area_px: number }>;
+      filtered_reasons: Array<{ label: string; score: number; area_px: number; reason: string }>;
+    }>;
+  } | null>(null);
+
+  const handleRunDebugReplay = async () => {
+    if (!selectedEvent) return;
+    setDebugBusy(true);
+    try {
+      const res = await fetch("/api/debug/reprocess", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          camera: selectedEvent.camera,
+          start_time: selectedEvent.start_time - 2,
+          end_time: (selectedEvent.end_time || selectedEvent.start_time + 15) + 2,
+          override_config: {
+            min_score: debugMinScore,
+            min_area: debugMinArea,
+          },
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDebugTrace(data);
+        setEventViewMode("clip");
+      }
+    } catch {
+      // ignore
+    } finally {
+      setDebugBusy(false);
+    }
+  };
   const [excludeLabel, setExcludeLabel] = React.useState("none");
   const [zoneFilter, setZoneFilter] = React.useState("all");
   const [minScoreFilter, setMinScoreFilter] = React.useState(0);
@@ -521,6 +565,19 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     Explain Alert
                   </button>
                   <button
+                    className={`nvr-btn mono ${showDebugReplay ? "active" : ""}`}
+                    onClick={() => {
+                      const next = !showDebugReplay;
+                      setShowDebugReplay(next);
+                      if (next && !debugTrace) {
+                        void handleRunDebugReplay();
+                      }
+                    }}
+                    title="Re-run recorded clip through motion + AI detector pipeline with custom thresholds"
+                  >
+                    Debug Replay
+                  </button>
+                  <button
                     className="nvr-btn danger"
                     aria-label="Delete tracked object event"
                     title="Delete tracked object event"
@@ -612,6 +669,115 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                       </>
                     );
                   })()}
+                </div>
+              )}
+
+              {showDebugReplay && (
+                <div
+                  className="mono"
+                  style={{
+                    background: "var(--bg-canvas)",
+                    borderBottom: "1px solid var(--border-strong)",
+                    padding: "8px 12px",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 8,
+                    fontSize: "var(--text-xs)",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      flexWrap: "wrap",
+                      gap: 10,
+                    }}
+                  >
+                    <strong style={{ color: "var(--signal-accent-text)" }}>
+                      RETROACTIVE DETECTION DEBUGGER // RE-RUN PIPELINE TRACE
+                    </strong>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                        Override Min Score:
+                        <input
+                          type="number"
+                          step="0.05"
+                          min="0.1"
+                          max="0.99"
+                          className="nvr-input mono"
+                          style={{ width: 64, height: 22 }}
+                          value={debugMinScore}
+                          onChange={(e) => setDebugMinScore(Number(e.target.value))}
+                        />
+                      </label>
+                      <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                        Override Min Area:
+                        <input
+                          type="number"
+                          step="100"
+                          min="0"
+                          className="nvr-input mono"
+                          style={{ width: 76, height: 22 }}
+                          value={debugMinArea}
+                          onChange={(e) => setDebugMinArea(Number(e.target.value))}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="nvr-btn primary mono"
+                        style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                        disabled={debugBusy}
+                        onClick={handleRunDebugReplay}
+                      >
+                        {debugBusy ? "Reprocessing..." : "Re-run Detection"}
+                      </button>
+                    </div>
+                  </div>
+                  {debugTrace && (
+                    <div
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 4,
+                        maxHeight: 110,
+                        overflowY: "auto",
+                      }}
+                    >
+                      {debugTrace.frames.map((f, idx) => (
+                        <div
+                          key={`${f.ts}-${idx}`}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 12,
+                            flexWrap: "wrap",
+                            padding: "2px 0",
+                            borderTop: "1px solid var(--border-hairline)",
+                          }}
+                        >
+                          <span>TS: {f.ts.toFixed(1)}s</span>
+                          <span>Motion Boxes: {f.motion_boxes.length}</span>
+                          <span style={{ color: "#34d399" }}>
+                            Confirmed Tracks:{" "}
+                            {f.active_tracks
+                              .map((t) => `${t.label} (${Math.round(t.score * 100)}%, ${t.area_px}px²)`)
+                              .join(", ") || "NONE"}
+                          </span>
+                          <span style={{ color: "#fca5a5" }}>
+                            Filtered/Rejected:{" "}
+                            {f.filtered_reasons
+                              .map(
+                                (r) =>
+                                  `${r.label} (${Math.round(r.score * 100)}% → ${r.reason})`
+                              )
+                              .join(", ") || "NONE"}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 

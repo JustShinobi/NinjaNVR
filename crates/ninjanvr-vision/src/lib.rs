@@ -948,6 +948,91 @@ pub fn is_monochrome_ir(yuv_data: &[u8], width: u32, height: u32) -> bool {
     (total_dev as f64 / samples as f64) < 3.0
 }
 
+/// Extracts a semantic dominant color attribute tag (`"color:white"`, `"color:black"`, `"color:gray"`,
+/// `"color:red"`, `"color:blue"`, `"color:green"`, `"color:yellow"`) from a YUV420p bounding box crop.
+pub fn classify_dominant_color_tag(
+    yuv_data: &[u8],
+    width: u32,
+    height: u32,
+    bbox: BoundingBox,
+) -> String {
+    let fw = width as usize;
+    let fh = height as usize;
+    let y_size = fw.saturating_mul(fh);
+    let uv_size = y_size / 4;
+    if fw == 0 || fh == 0 || yuv_data.len() < y_size + uv_size * 2 {
+        return "color:gray".to_string();
+    }
+
+    let y_plane = &yuv_data[..y_size];
+    let u_plane = &yuv_data[y_size..y_size + uv_size];
+    let v_plane = &yuv_data[y_size + uv_size..y_size + uv_size * 2];
+    let uv_stride = fw / 2;
+
+    let x1 = (bbox.x_min as usize).min(fw - 1);
+    let y1 = (bbox.y_min as usize).min(fh - 1);
+    let x2 = (bbox.x_max as usize).clamp(x1 + 1, fw);
+    let y2 = (bbox.y_max as usize).clamp(y1 + 1, fh);
+
+    let mut r_sum = 0u64;
+    let mut g_sum = 0u64;
+    let mut b_sum = 0u64;
+    let mut count = 0u64;
+    let step_y = ((y2 - y1) / 16).max(1);
+    let step_x = ((x2 - x1) / 16).max(1);
+
+    let mut sy = y1;
+    while sy < y2 {
+        let uv_y = (sy / 2).min(fh / 2 - 1);
+        let mut sx = x1;
+        while sx < x2 {
+            let uv_x = (sx / 2).min(uv_stride.saturating_sub(1));
+            let (r, g, b) = yuv_to_rgb_pixel(
+                y_plane[sy * fw + sx],
+                u_plane[uv_y * uv_stride + uv_x],
+                v_plane[uv_y * uv_stride + uv_x],
+            );
+            r_sum += r as u64;
+            g_sum += g as u64;
+            b_sum += b as u64;
+            count += 1;
+            sx += step_x;
+        }
+        sy += step_y;
+    }
+
+    if count == 0 {
+        return "color:gray".to_string();
+    }
+
+    let r = (r_sum / count) as i32;
+    let g = (g_sum / count) as i32;
+    let b = (b_sum / count) as i32;
+    let max_c = r.max(g).max(b);
+    let min_c = r.min(g).min(b);
+    let luma = (r * 299 + g * 587 + b * 114) / 1000;
+
+    if max_c - min_c < 28 {
+        if luma > 185 {
+            "color:white".to_string()
+        } else if luma < 55 {
+            "color:black".to_string()
+        } else {
+            "color:gray".to_string()
+        }
+    } else if r > g + 35 && r > b + 35 {
+        "color:red".to_string()
+    } else if b > r + 35 && b > g + 25 {
+        "color:blue".to_string()
+    } else if g > r + 30 && g > b + 30 {
+        "color:green".to_string()
+    } else if r > 160 && g > 140 && b < 95 {
+        "color:yellow".to_string()
+    } else {
+        "color:gray".to_string()
+    }
+}
+
 /// Draws 2px bounding boxes onto an existing `RgbImage` (e.g. a high-resolution main-stream frame).
 pub fn annotate_rgb_image_with_boxes(img: &mut RgbImage, boxes: &[(BoundingBox, [u8; 3])]) {
     let w = img.width();
@@ -1083,5 +1168,39 @@ mod tests {
         assert!(!rep_normal.is_tampered_or_blind);
         assert!(rep_normal.y_variance > 20.0);
         assert!(rep_normal.uniform_ratio < 0.30);
+    }
+
+    #[test]
+    fn classify_dominant_color_tag_identifies_white_black_and_red_crops() {
+        let w = 64u32;
+        let h = 64u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        let bbox = BoundingBox::new(8, 8, 56, 56);
+
+        // Bright white frame: Y=235, U=128, V=128
+        let mut white_buf = vec![235u8; y_len + uv_len * 2];
+        white_buf[y_len..].fill(128);
+        assert_eq!(
+            classify_dominant_color_tag(&white_buf, w, h, bbox),
+            "color:white"
+        );
+
+        // Dark black frame: Y=20, U=128, V=128
+        let mut black_buf = vec![20u8; y_len + uv_len * 2];
+        black_buf[y_len..].fill(128);
+        assert_eq!(
+            classify_dominant_color_tag(&black_buf, w, h, bbox),
+            "color:black"
+        );
+
+        // Saturated red frame: Y=90, U=90, V=240
+        let mut red_buf = vec![90u8; y_len + uv_len * 2];
+        red_buf[y_len..y_len + uv_len].fill(90);
+        red_buf[y_len + uv_len..].fill(240);
+        assert_eq!(
+            classify_dominant_color_tag(&red_buf, w, h, bbox),
+            "color:red"
+        );
     }
 }

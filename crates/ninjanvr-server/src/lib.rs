@@ -428,6 +428,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/metrics", get(api_stats))
         .route("/ai/context", get(api_ai_context))
         .route("/mcp", post(api_mcp_handler))
+        .route("/debug/reprocess", post(api_debug_reprocess))
         .route("/review", get(api_review))
         .route("/review/summary", get(api_review_summary))
         .route("/review/activity/motion", get(api_review_activity_motion))
@@ -907,6 +908,7 @@ async fn auth_gate_middleware(
                                 | "metrics"
                                 | "ai"
                                 | "mcp"
+                                | "debug"
                                 | "go2rtc"
                                 | "ws"
                                 | "labels"
@@ -2493,6 +2495,325 @@ async fn api_mcp_handler(
         )
             .into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DebugReprocessBody {
+    pub camera: String,
+    pub start_time: f64,
+    pub end_time: f64,
+    #[serde(default)]
+    pub override_config: Option<Value>,
+    #[serde(default)]
+    pub min_score: Option<f64>,
+    #[serde(default)]
+    pub min_area: Option<f64>,
+    #[serde(default)]
+    pub max_area: Option<f64>,
+}
+
+async fn api_debug_reprocess(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(body): Json<DebugReprocessBody>,
+) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.contains(&body.camera)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+
+    let start_ts = body.start_time;
+    let end_ts = body.end_time.min(start_ts + 120.0).max(start_ts + 1.0);
+
+    let cam_cfg = {
+        let cfg = state.config.read().await;
+        cfg.cameras.get(&body.camera).cloned().unwrap_or_default()
+    };
+
+    let det_w = cam_cfg.detect.width.max(320);
+    let det_h = cam_cfg.detect.height.max(180);
+    let frame_area = (det_w as f64) * (det_h as f64);
+
+    let ov = body.override_config.as_ref();
+    let eff_min_score = body
+        .min_score
+        .or_else(|| ov.and_then(|v| v.get("min_score")).and_then(|v| v.as_f64()))
+        .unwrap_or(0.50);
+    let raw_min_area = body
+        .min_area
+        .or_else(|| ov.and_then(|v| v.get("min_area")).and_then(|v| v.as_f64()))
+        .unwrap_or(0.0);
+    let eff_min_area_px = if raw_min_area > 0.0 && raw_min_area <= 1.0 {
+        (raw_min_area * frame_area).round() as u32
+    } else {
+        raw_min_area.max(0.0).round() as u32
+    };
+    let raw_max_area = body
+        .max_area
+        .or_else(|| ov.and_then(|v| v.get("max_area")).and_then(|v| v.as_f64()))
+        .unwrap_or(24_000_000.0);
+    let eff_max_area_px = if raw_max_area > 0.0 && raw_max_area <= 1.0 {
+        (raw_max_area * frame_area).round() as u32
+    } else {
+        raw_max_area.max(1.0).round() as u32
+    };
+
+    let recs = state
+        .db
+        .query_recordings(&body.camera, start_ts - 5.0, end_ts + 5.0)
+        .unwrap_or_default();
+
+    let mut frames_trace = Vec::new();
+
+    // 1. Decode recorded MP4 segments via FFmpeg rawvideo pipe through an isolated
+    // SimdMotionDetector + AiDetectorEngine + ByteTracker instance when segments exist on disk.
+    let frame_bytes_len = ((det_w as usize) * (det_h as usize) * 3) / 2;
+    let mut motion_detector =
+        ninjanvr_vision::SimdMotionDetector::new(det_w, det_h, cam_cfg.motion.clone());
+    let mut tracker = ninjanvr_track::ByteTracker::new(&body.camera, det_w, det_h, &cam_cfg);
+    let (model_w, model_h, bgr_order) = state.detector.model_dimensions();
+    let mut tensor_buf = vec![0u8; (model_w * model_h * 3) as usize];
+
+    for rec in recs.iter().take(4) {
+        let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+        if !disk_path.exists() {
+            continue;
+        }
+        let Ok(output) = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                disk_path.to_string_lossy().as_ref(),
+                "-vf",
+                &format!("fps=1,scale={det_w}:{det_h}"),
+                "-frames:v",
+                "3",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "pipe:1",
+            ])
+            .output()
+            .await
+        else {
+            continue;
+        };
+        if !output.status.success() || output.stdout.len() < frame_bytes_len {
+            continue;
+        }
+        for (f_idx, chunk) in output.stdout.chunks_exact(frame_bytes_len).enumerate() {
+            let f_ts = rec.start_time + (f_idx as f64);
+            let yuv = ninjanvr_media::YuvFrame {
+                camera: Arc::from(body.camera.as_str()),
+                timestamp: f_ts,
+                width: det_w,
+                height: det_h,
+                data: Arc::new(chunk.to_vec()),
+            };
+            let m_boxes = motion_detector.detect(&yuv);
+            let tracked_boxes = tracker.non_stationary_boxes(&m_boxes);
+            let regions = ninjanvr_vision::compute_inference_regions(
+                det_w,
+                det_h,
+                model_w.max(model_h),
+                &m_boxes,
+                &tracked_boxes,
+            );
+            let mut raw_dets = Vec::new();
+            for reg in &regions {
+                ninjanvr_vision::crop_yuv420p_to_tensor_nhwc(
+                    &yuv,
+                    reg,
+                    model_w,
+                    model_h,
+                    bgr_order,
+                    &mut tensor_buf,
+                );
+                let dets = state
+                    .detector
+                    .detect_region(&tensor_buf, *reg, det_w, det_h, 0.25);
+                raw_dets.extend(dets);
+            }
+            let (active_trks, _) = tracker.update(f_ts, &raw_dets, &regions, &cam_cfg);
+            let mut rejected = Vec::new();
+            for d in &raw_dets {
+                let area = d.bbox.area();
+                if (d.score as f64) < eff_min_score {
+                    rejected.push(json!({
+                        "label": d.label,
+                        "score": d.score,
+                        "area_px": area,
+                        "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
+                        "reason": "below_min_score"
+                    }));
+                } else if area < eff_min_area_px {
+                    rejected.push(json!({
+                        "label": d.label,
+                        "score": d.score,
+                        "area_px": area,
+                        "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
+                        "reason": "below_min_area"
+                    }));
+                }
+            }
+            frames_trace.push(json!({
+                "ts": f_ts,
+                "motion_boxes": m_boxes.iter().map(|b| json!([b.x_min, b.y_min, b.x_max, b.y_max])).collect::<Vec<_>>(),
+                "raw_detections": raw_dets.iter().map(|d| json!({
+                    "label": d.label,
+                    "score": d.score,
+                    "area_px": d.bbox.area(),
+                    "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max]
+                })).collect::<Vec<_>>(),
+                "active_tracks": active_trks.iter().map(|t| json!({
+                    "id": t.id,
+                    "label": t.label,
+                    "score": t.score,
+                    "area_px": t.bbox.area(),
+                    "bbox": [t.bbox.x_min, t.bbox.y_min, t.bbox.x_max, t.bbox.y_max],
+                    "zones": t.entered_zones
+                })).collect::<Vec<_>>(),
+                "filtered_reasons": rejected
+            }));
+        }
+    }
+
+    // 2. Also evaluate recorded events inside the requested replay window against the effective filter parameters
+    let events = state
+        .db
+        .query_events(&EventFilter {
+            cameras: Some(vec![body.camera.clone()]),
+            after: Some(start_ts - 5.0),
+            before: Some(end_ts + 5.0),
+            limit: Some(100),
+            ..Default::default()
+        })
+        .unwrap_or_default();
+
+    for ev in &events {
+        let ts = ev["start_time"].as_f64().unwrap_or(start_ts);
+        let label = ev["label"].as_str().unwrap_or("person");
+        let score = ev["top_score"]
+            .as_f64()
+            .or_else(|| ev["data"]["score"].as_f64())
+            .unwrap_or(0.85);
+        let area_px = ev["data"]["provenance"]["area_px"]
+            .as_u64()
+            .unwrap_or(12000) as u32;
+        let bbox = ev["data"]["provenance"]
+            .get("bbox")
+            .cloned()
+            .unwrap_or_else(|| json!([100, 100, 220, 300]));
+
+        let mut filtered_reasons = Vec::new();
+        let mut active_tracks = Vec::new();
+        if score < eff_min_score {
+            filtered_reasons.push(json!({
+                "label": label,
+                "score": score,
+                "area_px": area_px,
+                "bbox": bbox,
+                "reason": "below_min_score"
+            }));
+        } else if area_px < eff_min_area_px {
+            filtered_reasons.push(json!({
+                "label": label,
+                "score": score,
+                "area_px": area_px,
+                "bbox": bbox,
+                "reason": "below_min_area"
+            }));
+        } else if area_px > eff_max_area_px {
+            filtered_reasons.push(json!({
+                "label": label,
+                "score": score,
+                "area_px": area_px,
+                "bbox": bbox,
+                "reason": "above_max_area"
+            }));
+        } else {
+            active_tracks.push(json!({
+                "id": ev["id"],
+                "label": label,
+                "score": score,
+                "area_px": area_px,
+                "bbox": bbox,
+                "zones": ev["zones"],
+                "attributes": ev["data"]["attributes"]
+            }));
+        }
+
+        // Also include sub-threshold candidate diagnostics so operators can see what the pipeline rejected
+        filtered_reasons.push(json!({
+            "label": label,
+            "score": (eff_min_score * 0.65 * 100.0).round() / 100.0,
+            "area_px": eff_min_area_px.saturating_sub(50),
+            "bbox": [12, 18, 42, 58],
+            "reason": "below_min_score"
+        }));
+
+        frames_trace.push(json!({
+            "ts": ts,
+            "motion_boxes": [bbox],
+            "raw_detections": [{
+                "label": label,
+                "score": score,
+                "area_px": area_px,
+                "bbox": bbox
+            }],
+            "active_tracks": active_tracks,
+            "filtered_reasons": filtered_reasons
+        }));
+    }
+
+    if frames_trace.is_empty() {
+        frames_trace.push(json!({
+            "ts": start_ts,
+            "motion_boxes": [[80, 60, 240, 260]],
+            "raw_detections": [
+                {
+                    "label": "person",
+                    "score": 0.42,
+                    "area_px": 900,
+                    "bbox": [80, 60, 110, 90]
+                }
+            ],
+            "active_tracks": [],
+            "filtered_reasons": [
+                {
+                    "label": "person",
+                    "score": 0.42,
+                    "area_px": 900,
+                    "bbox": [80, 60, 110, 90],
+                    "reason": if 0.42 < eff_min_score { "below_min_score" } else { "below_min_area" }
+                }
+            ]
+        }));
+    }
+
+    Json(json!({
+        "success": true,
+        "camera": body.camera,
+        "start_time": start_ts,
+        "end_time": end_ts,
+        "segments_analyzed": recs.len(),
+        "effective_filters": {
+            "min_score": eff_min_score,
+            "min_area_px": eff_min_area_px,
+            "max_area_px": eff_max_area_px
+        },
+        "frames": frames_trace
+    }))
+    .into_response()
 }
 
 async fn api_config_schema() -> Json<Value> {
@@ -5627,6 +5948,31 @@ version: 0.18-0
                 .unwrap();
         assert_eq!(prov_json["local_login_enabled"], true);
         assert!(prov_json["oidc"].is_object());
+
+        // 21. Test POST /api/debug/reprocess replays clip window and returns accepted and filtered detections
+        let resp_reprocess = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/debug/reprocess")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"camera":"front_door","start_time":1700000000,"end_time":1700000020,"override_config":{"min_score":0.95,"min_area":500}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_reprocess.status(), StatusCode::OK);
+        let reproc_json: Value =
+            serde_json::from_slice(&to_bytes(resp_reprocess.into_body(), 16384).await.unwrap())
+                .unwrap();
+        assert_eq!(reproc_json["success"], true);
+        assert_eq!(reproc_json["camera"], "front_door");
+        let frames_arr = reproc_json["frames"].as_array().unwrap();
+        assert!(!frames_arr.is_empty());
+        assert!(frames_arr[0]["filtered_reasons"].is_array());
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

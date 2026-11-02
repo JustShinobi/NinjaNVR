@@ -13,8 +13,9 @@ use ninjanvr_media::{SharedActivityLedger, YuvFrame, backup_alert_clip, resolve_
 use ninjanvr_track::{ByteTracker, TrackedObject, TriggerProvenance, should_replace_snapshot};
 use ninjanvr_vision::{
     BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, check_frame_tamper,
-    compute_inference_regions, crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp,
-    is_monochrome_ir, yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
+    classify_dominant_color_tag, compute_inference_regions, crop_yuv420p_to_tensor_nhwc,
+    encode_image_jpeg, encode_image_webp, is_monochrome_ir, yuv420p_to_rgb_image,
+    yuv420p_to_rgb_image_scaled,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -676,6 +677,8 @@ impl VisionPipeline {
                 let area = trk.bbox.area();
                 let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
 
+                let color_attr =
+                    classify_dominant_color_tag(&frame.data, frame.width, frame.height, trk.bbox);
                 let ev_dto = EventDto {
                     id: trk.id.clone(),
                     camera: camera.to_string(),
@@ -696,7 +699,7 @@ impl VisionPipeline {
                         "region": norm_reg,
                         "score": trk.score,
                         "top_score": best_score,
-                        "attributes": [],
+                        "attributes": [color_attr],
                         "type": "object",
                         "max_severity": severity,
                         "provenance": trk.provenance
@@ -841,6 +844,8 @@ impl VisionPipeline {
             };
             let area = trk.bbox.area();
             let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
+            let color_attr =
+                classify_dominant_color_tag(&frame.data, frame.width, frame.height, trk.bbox);
             let ev_dto = EventDto {
                 id: trk.id.clone(),
                 camera: camera.to_string(),
@@ -861,7 +866,7 @@ impl VisionPipeline {
                     "region": norm_reg,
                     "score": trk.score,
                     "top_score": best_score,
-                    "attributes": [],
+                    "attributes": [color_attr],
                     "type": "object",
                     "max_severity": severity,
                     "provenance": trk.provenance

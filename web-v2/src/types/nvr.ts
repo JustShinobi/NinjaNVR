@@ -364,6 +364,7 @@ export interface EventItem {
     score?: number;
     top_score?: number;
     description?: string;
+    attributes?: string[];
     box?: [number, number, number, number];
     provenance?: TriggerProvenance | null;
   };
