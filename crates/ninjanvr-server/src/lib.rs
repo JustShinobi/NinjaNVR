@@ -1316,6 +1316,21 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         });
         let det_fps = m.map(|x| x.detection_fps).unwrap_or(0.0);
         let cam_pid = m.map(|x| x.pid).unwrap_or(pid);
+        let last_frame_ts = m
+            .map(|x| x.last_frame_ts)
+            .filter(|&ts| ts > 0.0)
+            .unwrap_or_else(|| {
+                let disk_latest = state
+                    .media_dir
+                    .join("clips")
+                    .join(format!("latest_{cam_name}.jpg"));
+                std::fs::metadata(&disk_latest)
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0)
+            });
         let (ff_cpu, _) = if cam_pid != pid {
             state.cpu_tracker.sample_pid(cam_pid, 1.8, 4.5)
         } else {
@@ -1332,6 +1347,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
                 "skipped_fps": 0.0,
                 "detection_fps": det_fps,
                 "detection_enabled": cam_cfg.detect.enabled,
+                "last_frame_ts": last_frame_ts,
                 "pid": pid,
                 "capture_pid": pid,
                 "ffmpeg_pid": cam_pid,
@@ -2239,8 +2255,57 @@ async fn api_camera_latest_frame(
     State(state): State<AppState>,
     AxumPath(camera): AxumPath<String>,
 ) -> Response {
+    let metric_ts = state
+        .camera_metrics
+        .read()
+        .await
+        .get(&camera)
+        .map(|m| m.last_frame_ts)
+        .unwrap_or(0.0);
+
+    let ts_hdr = header::HeaderName::from_static("x-last-frame-timestamp");
+
     if let Some(frame_bytes) = state.latest_frames.read().await.get(&camera).cloned() {
-        return ([(header::CONTENT_TYPE, "image/jpeg")], frame_bytes).into_response();
+        let ts = if metric_ts > 0.0 {
+            metric_ts as u64
+        } else {
+            unix_now()
+        };
+        return (
+            [
+                (header::CONTENT_TYPE, "image/jpeg".to_string()),
+                (ts_hdr, ts.to_string()),
+            ],
+            frame_bytes,
+        )
+            .into_response();
+    }
+
+    let disk_latest = state
+        .media_dir
+        .join("clips")
+        .join(format!("latest_{camera}.jpg"));
+    if let Ok(disk_bytes) = tokio::fs::read(&disk_latest).await
+        && !disk_bytes.is_empty()
+    {
+        let disk_ts = if metric_ts > 0.0 {
+            metric_ts as u64
+        } else {
+            std::fs::metadata(&disk_latest)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or_else(unix_now)
+        };
+        return (
+            [
+                (header::CONTENT_TYPE, "image/jpeg".to_string()),
+                (ts_hdr, disk_ts.to_string()),
+            ],
+            disk_bytes,
+        )
+            .into_response();
     }
 
     let url = format!(
@@ -2256,7 +2321,14 @@ async fn api_camera_latest_frame(
         && resp.status().is_success()
         && let Ok(bytes) = resp.bytes().await
     {
-        return ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response();
+        return (
+            [
+                (header::CONTENT_TYPE, "image/jpeg".to_string()),
+                (ts_hdr, unix_now().to_string()),
+            ],
+            bytes,
+        )
+            .into_response();
     }
 
     placeholder_jpeg_response()
@@ -3211,6 +3283,46 @@ version: 0.18-0
         assert_eq!(del_rec_json["deleted_segments"], 1);
         assert_eq!(del_rec_json["freed_bytes"], 1024);
         assert!(!disk_seg_1.exists());
+
+        // 12. Test GET /api/:camera/latest.jpg serves persisted last-online snapshot and X-Last-Frame-Timestamp header
+        let clips_dir = tmp_dir.join("clips");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        let disk_latest = clips_dir.join("latest_front_door.jpg");
+        let fake_jpeg = vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0xFF, 0xD9,
+        ];
+        std::fs::write(&disk_latest, &fake_jpeg).unwrap();
+        state.camera_metrics.write().await.insert(
+            "front_door".to_string(),
+            pipeline::CameraRuntimeMetrics {
+                camera_fps: 0.0,
+                process_fps: 0.0,
+                detection_fps: 0.0,
+                pid: 123,
+                last_frame_ts: 1730500123.0,
+            },
+        );
+
+        let resp_latest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/latest.jpg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_latest.status(), StatusCode::OK);
+        assert_eq!(
+            resp_latest
+                .headers()
+                .get("x-last-frame-timestamp")
+                .and_then(|v| v.to_str().ok()),
+            Some("1730500123")
+        );
+        let latest_body = to_bytes(resp_latest.into_body(), 4096).await.unwrap();
+        assert_eq!(&latest_body[..], &fake_jpeg[..]);
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

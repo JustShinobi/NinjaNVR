@@ -224,6 +224,7 @@ export interface CameraRuntimeStats {
   pid: number;
   capture_pid: number;
   ffmpeg_pid: number;
+  last_frame_ts?: number;
   ffmpeg_cpu?: string;
   capture_cpu?: string;
   detect_cpu?: string;

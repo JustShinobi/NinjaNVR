@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
 import { CameraConfig } from "../types/nvr";
+import { useNvrStore } from "../store/useNvrStore";
+import { formatRelTime, formatTs } from "../utils/format";
 
 interface ZoomableVideoStageProps {
   disabled?: boolean;
@@ -368,8 +370,18 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const [mseReady, setMseReady] = useState(false);
+  const [streamDisconnected, setStreamDisconnected] = useState(false);
+  const [headerLastSeenTs, setHeaderLastSeenTs] = useState<number>(0);
   const [posterTick, setPosterTick] = useState(() => Date.now());
   const [overlayBox, setOverlayBox] = useState<ContainedBox | null>(null);
+  const camStats = useNvrStore((s) => s.stats?.cameras?.[camera]);
+
+  const isOffline =
+    streamDisconnected || (camStats !== undefined && camStats.camera_fps === 0 && !mseReady);
+  const lastSeenTs =
+    (camStats?.last_frame_ts && camStats.last_frame_ts > 0
+      ? camStats.last_frame_ts
+      : headerLastSeenTs) || 0;
 
   const detW = cameraConfig?.detect?.width || 1280;
   const detH = cameraConfig?.detect?.height || 720;
@@ -403,14 +415,28 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     return () => ro.disconnect();
   }, [updateOverlayGeometry]);
 
-  // Periodic fallback snapshot refresh when MSE is still handshaking
+  // Periodic fallback snapshot refresh when MSE is still handshaking or camera is offline
   useEffect(() => {
     if (mseReady) return;
+    fetch(`/api/${encodeURIComponent(camera)}/latest.jpg`, {
+      method: "HEAD",
+      credentials: "include",
+    })
+      .then((res) => {
+        const hdr = res.headers.get("x-last-frame-timestamp");
+        if (hdr) {
+          const parsed = Number(hdr);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            setHeaderLastSeenTs(parsed);
+          }
+        }
+      })
+      .catch(() => {});
     const timer = window.setInterval(() => {
       setPosterTick(Date.now());
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [mseReady]);
+  }, [camera, mseReady]);
 
   useEffect(() => {
     const videoEl = videoRef.current;
@@ -431,6 +457,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     )}`;
 
     setMseReady(false);
+    setStreamDisconnected(false);
     mediaSource = new MediaSource();
     const objUrl = URL.createObjectURL(mediaSource);
     videoEl.src = objUrl;
@@ -468,6 +495,9 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
+        if (!closed) {
+          setStreamDisconnected(false);
+        }
         const codecs = [
           'video/mp4; codecs="avc1.640029,mp4a.40.2"',
           'video/mp4; codecs="avc1.64002A,mp4a.40.2"',
@@ -485,6 +515,20 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             value: codecs || "avc1.640029,avc1.4D401F,avc1.42E01E,mp4a.40.2",
           })
         );
+      };
+
+      ws.onerror = () => {
+        if (!closed) {
+          setMseReady(false);
+          setStreamDisconnected(true);
+        }
+      };
+
+      ws.onclose = () => {
+        if (!closed) {
+          setMseReady(false);
+          setStreamDisconnected(true);
+        }
       };
 
       ws.onmessage = (ev) => {
@@ -585,7 +629,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         <img
           ref={imgRef}
           className="nvr-cam-poster"
-          src={`/api/${camera}/latest.webp?height=360&cache=${posterTick}`}
+          src={`/api/${camera}/latest.jpg?height=360&cache=${posterTick}`}
           alt={camera}
           onLoad={updateOverlayGeometry}
           style={{
@@ -595,10 +639,36 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             height: "100%",
             objectFit: "contain",
             opacity: mseReady ? 0 : 1,
-            transition: "opacity 0.2s ease",
+            filter: isOffline ? "grayscale(0.65) brightness(0.55)" : "none",
+            transition: "opacity 0.2s ease, filter 0.2s ease",
             pointerEvents: "none",
           }}
         />
+        {isOffline && (
+          <div
+            className="mono"
+            style={{
+              position: "absolute",
+              left: 10,
+              bottom: 10,
+              zIndex: 10,
+              background: "rgba(9, 13, 20, 0.88)",
+              border: "1px solid var(--signal-alert)",
+              color: "var(--signal-alert-text)",
+              padding: "3px 8px",
+              borderRadius: 3,
+              fontSize: "var(--text-xs)",
+              fontWeight: 700,
+              fontVariantNumeric: "tabular-nums",
+              pointerEvents: "none",
+            }}
+          >
+            STREAM OFFLINE •{" "}
+            {lastSeenTs > 0
+              ? `LAST SEEN ${formatTs(lastSeenTs)} (${formatRelTime(lastSeenTs)})`
+              : "WAITING FOR SIGNAL"}
+          </div>
+        )}
         <video
           ref={videoRef}
           autoPlay

@@ -27,6 +27,7 @@ pub struct CameraRuntimeMetrics {
     pub process_fps: f64,
     pub detection_fps: f64,
     pub pid: u32,
+    pub last_frame_ts: f64,
 }
 
 pub type SharedCameraMetrics = Arc<RwLock<HashMap<String, CameraRuntimeMetrics>>>;
@@ -204,6 +205,7 @@ impl VisionPipeline {
                     process_fps: fps as f64,
                     detection_fps: 1.2,
                     pid: child_pid,
+                    last_frame_ts: unix_now_f64(),
                 },
             );
 
@@ -353,11 +355,22 @@ impl VisionPipeline {
                         let rgb =
                             yuv420p_to_rgb_image_scaled(&yuv_frame, None, &annotated, Some(360));
                         if let Ok(jpeg_bytes) = encode_image_jpeg(&rgb) {
+                            let clips_dir = self.media_dir.join("clips");
+                            if std::fs::create_dir_all(&clips_dir).is_ok() {
+                                let disk_latest = clips_dir.join(format!("latest_{camera}.jpg"));
+                                let _ = std::fs::write(&disk_latest, &jpeg_bytes);
+                            }
                             self.latest_frames
                                 .write()
                                 .await
                                 .insert(camera.clone(), jpeg_bytes);
                         }
+                        self.camera_metrics
+                            .write()
+                            .await
+                            .entry(camera.clone())
+                            .or_default()
+                            .last_frame_ts = now;
                     }
 
                     // 7. Persist Events, Timeline entries, and ReviewSegments
@@ -388,6 +401,7 @@ impl VisionPipeline {
                                 process_fps: c_fps,
                                 detection_fps: d_fps,
                                 pid: child_pid,
+                                last_frame_ts: now,
                             },
                         );
                         frame_count = 0;
@@ -397,6 +411,14 @@ impl VisionPipeline {
                 }
             }
 
+            {
+                let mut m_guard = self.camera_metrics.write().await;
+                if let Some(m) = m_guard.get_mut(&camera) {
+                    m.camera_fps = 0.0;
+                    m.process_fps = 0.0;
+                    m.detection_fps = 0.0;
+                }
+            }
             let _ = child.wait().await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
