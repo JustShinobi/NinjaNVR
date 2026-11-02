@@ -253,7 +253,6 @@ pub struct AppState {
     pub jwt_secret: String,
     pub start_instant: Instant,
     pub web_dir: PathBuf,
-    pub web_v2_dir: PathBuf,
     pub media_dir: PathBuf,
     pub latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     pub activity_ledger: SharedActivityLedger,
@@ -376,7 +375,6 @@ pub fn build_router(state: AppState) -> Router {
 
 pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
     let web_dir = state.web_dir.clone();
-    let web_v2_dir = state.web_v2_dir.clone();
 
     let clips_dir = state.media_dir.join("clips");
     let recordings_dir = state.media_dir.join("recordings");
@@ -607,9 +605,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
             get(vod_segment_m4s),
         )
         .route("/login", get(serve_login_page))
-        .nest_service("/assets", ServeDir::new(web_dir.join("assets")))
-        .nest_service("/locales", ServeDir::new(web_dir.join("locales")))
-        .nest_service("/assets-v2", ServeDir::new(web_v2_dir.join("assets-v2")))
+        .nest_service("/assets-v2", ServeDir::new(web_dir.join("assets-v2")))
         .fallback(get(serve_spa_fallback))
         .layer(CompressionLayer::new())
         // Binary media directories and MP4 share streams are mounted outside CompressionLayer so MP4/WebP files
@@ -626,39 +622,6 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .with_state(state)
 }
 
-fn should_serve_ui_v2(headers: &HeaderMap, jar: &CookieJar, uri: Option<&Uri>) -> bool {
-    if let Some(cookie) = jar.get("ninjanvr_ui") {
-        let val = cookie.value().trim();
-        if val.eq_ignore_ascii_case("v2") {
-            return true;
-        }
-        if val.eq_ignore_ascii_case("v1") {
-            return false;
-        }
-    }
-    for hdr_name in ["x-forwarded-host", "host"] {
-        if let Some(host) = headers.get(hdr_name).and_then(|v| v.to_str().ok()) {
-            let lower = host.to_ascii_lowercase();
-            if lower.contains("v1") || lower.contains("classic") || lower.contains("legacy") {
-                return false;
-            }
-            if lower.contains("beta") || lower.contains("v2") {
-                return true;
-            }
-        }
-    }
-    if let Some(auth) = uri.and_then(|u| u.authority()).map(|a| a.as_str()) {
-        let lower = auth.to_ascii_lowercase();
-        if lower.contains("v1") || lower.contains("classic") || lower.contains("legacy") {
-            return false;
-        }
-        if lower.contains("beta") || lower.contains("v2") {
-            return true;
-        }
-    }
-    true
-}
-
 #[derive(Debug, Deserialize, Default)]
 pub struct UiSwitchParams {
     pub target: Option<String>,
@@ -666,16 +629,13 @@ pub struct UiSwitchParams {
 }
 
 async fn api_ui_switch(Query(q): Query<UiSwitchParams>) -> Response {
-    let target = match q.target.as_deref() {
-        Some(t) if t.eq_ignore_ascii_case("v1") => "v1",
-        _ => "v2",
-    };
+    let _ = &q.target;
     let redirect_to = q
         .redirect
         .as_deref()
         .filter(|r| r.starts_with('/') && !r.starts_with("//"))
         .unwrap_or("/");
-    let cookie_val = format!("ninjanvr_ui={target}; Path=/; Max-Age=31536000; SameSite=Lax");
+    let cookie_val = "ninjanvr_ui=v2; Path=/; Max-Age=31536000; SameSite=Lax".to_string();
     (
         StatusCode::FOUND,
         [
@@ -686,50 +646,24 @@ async fn api_ui_switch(Query(q): Query<UiSwitchParams>) -> Response {
         .into_response()
 }
 
-async fn api_ui_version(headers: HeaderMap, jar: CookieJar, uri: Uri) -> Json<Value> {
-    let active = if should_serve_ui_v2(&headers, &jar, Some(&uri)) {
-        "v2"
-    } else {
-        "v1"
-    };
+async fn api_ui_version() -> Json<Value> {
     Json(json!({
-        "active": active,
-        "available": ["v1", "v2"]
+        "active": "v2",
+        "available": ["v2"]
     }))
 }
 
-async fn serve_login_page(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-    uri: Uri,
-) -> Response {
-    if should_serve_ui_v2(&headers, &jar, Some(&uri)) {
-        let v2_index = state.web_v2_dir.join("index.html");
-        if let Ok(html) = tokio::fs::read_to_string(&v2_index).await {
-            return Html(html).into_response();
-        }
-    }
-    let login_html = state.web_dir.join("login.html");
-    match tokio::fs::read_to_string(&login_html).await {
+async fn serve_login_page(State(state): State<AppState>) -> Response {
+    let index_path = state.web_dir.join("index.html");
+    match tokio::fs::read_to_string(&index_path).await {
         Ok(html) => Html(html).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
-async fn serve_spa_fallback(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-    uri: axum::http::Uri,
-) -> Response {
+async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let rel_path = uri.path().trim_start_matches('/');
-    let use_v2 = should_serve_ui_v2(&headers, &jar, Some(&uri));
-    let primary_dir = if use_v2 && state.web_v2_dir.join("index.html").exists() {
-        &state.web_v2_dir
-    } else {
-        &state.web_dir
-    };
+    let primary_dir = &state.web_dir;
 
     if !rel_path.is_empty() && !rel_path.contains("..") {
         let file_candidate = primary_dir.join(rel_path);
@@ -744,6 +678,7 @@ async fn serve_spa_fallback(
                 Some("ico") => "image/x-icon",
                 Some("webp") => "image/webp",
                 Some("json" | "webmanifest") => "application/json; charset=utf-8",
+                Some("txt") => "text/plain; charset=utf-8",
                 Some("html") => "text/html; charset=utf-8",
                 _ => "application/octet-stream",
             };
@@ -968,10 +903,7 @@ async fn auth_gate_middleware(
         }
     }
     let resp = next.run(req).await;
-    if !path.starts_with("/api/logs")
-        && !path.starts_with("/assets/")
-        && !path.starts_with("/assets-v2/")
-    {
+    if !path.starts_with("/api/logs") && !path.starts_with("/assets-v2/") {
         state
             .log_hub
             .push_nginx(&method, &path, resp.status().as_u16());
@@ -5500,19 +5432,16 @@ pub async fn new_app_state(
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    let raw_v2_dir = std::env::var("NINJANVR_WEB_V2_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            web_dir
-                .parent()
-                .map(|p| p.join("web-v2"))
-                .unwrap_or_else(|| PathBuf::from("/opt/ninjanvr/web-v2"))
-        });
-    let web_v2_dir = if raw_v2_dir.join("dist").join("index.html").exists() {
-        raw_v2_dir.join("dist")
+    let web_dir = if web_dir.join("dist").join("index.html").exists() {
+        web_dir.join("dist")
+    } else if !web_dir.join("index.html").exists()
+        && web_dir
+            .parent()
+            .is_some_and(|p| p.join("web-v2").join("index.html").exists())
+    {
+        web_dir.parent().unwrap().join("web-v2")
     } else {
-        raw_v2_dir
+        web_dir
     };
 
     let state = AppState {
@@ -5526,7 +5455,6 @@ pub async fn new_app_state(
         jwt_secret,
         start_instant: Instant::now(),
         web_dir,
-        web_v2_dir,
         media_dir,
         latest_frames,
         activity_ledger,
@@ -5591,17 +5519,10 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("frigate.db");
         let cfg_path = tmp_dir.join("config.yml");
-        let web_dir = tmp_dir.join("web");
+        let web_dir = tmp_dir.join("web-v2");
         std::fs::create_dir_all(&web_dir).unwrap();
         std::fs::write(
             web_dir.join("index.html"),
-            "<html><body>NinjaNVR UI v1</body></html>",
-        )
-        .unwrap();
-        let web_v2_dir = tmp_dir.join("web-v2");
-        std::fs::create_dir_all(&web_v2_dir).unwrap();
-        std::fs::write(
-            web_v2_dir.join("index.html"),
             "<html><body>NinjaNVR Console v2</body></html>",
         )
         .unwrap();
@@ -5682,7 +5603,7 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // 4. Test SPA index fallback (v2 by default, v1 via Cookie or Host)
+        // 4. Test SPA index fallback (always serves Console v2, even with legacy ninjanvr_ui=v1 cookie)
         let resp = app
             .clone()
             .oneshot(
@@ -5701,7 +5622,7 @@ version: 0.18-0
                 .contains("NinjaNVR Console v2")
         );
 
-        let resp_v1_cookie = app
+        let resp_legacy_cookie = app
             .clone()
             .oneshot(
                 Request::builder()
@@ -5712,19 +5633,21 @@ version: 0.18-0
             )
             .await
             .unwrap();
-        assert_eq!(resp_v1_cookie.status(), StatusCode::OK);
-        let body_v1 = to_bytes(resp_v1_cookie.into_body(), 4096).await.unwrap();
+        assert_eq!(resp_legacy_cookie.status(), StatusCode::OK);
+        let body_legacy = to_bytes(resp_legacy_cookie.into_body(), 4096)
+            .await
+            .unwrap();
         assert!(
-            std::str::from_utf8(&body_v1)
+            std::str::from_utf8(&body_legacy)
                 .unwrap()
-                .contains("NinjaNVR UI v1")
+                .contains("NinjaNVR Console v2")
         );
 
         let resp_switch = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/ui/switch?target=v2")
+                    .uri("/api/ui/switch?target=v1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -5891,7 +5814,7 @@ version: 0.18-0
         std::fs::write(&blocked_media_path, b"not_a_directory").unwrap();
         let degraded_state = new_app_state(
             &cfg_path,
-            tmp_dir.join("web"),
+            tmp_dir.join("web-v2"),
             blocked_media_path.clone(),
             false,
         )

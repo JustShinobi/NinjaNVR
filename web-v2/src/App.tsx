@@ -849,14 +849,7 @@ export const App: React.FC = () => {
               Sign in with {authProviders.oidc.provider_name || "SSO"} (OIDC)
             </a>
           )}
-          <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 6 }}>
-            <a
-              href="/api/ui/switch?target=v1"
-              className="mono"
-              style={{ color: "var(--text-muted)", fontSize: 11, textDecoration: "none" }}
-            >
-              ← {t.brand.classicSwitch}
-            </a>
+          <div style={{ display: "flex", justifyContent: "flex-end", paddingTop: 6 }}>
             <span className="mono" style={{ color: "var(--text-muted)", fontSize: 11 }}>
               {t.brand.engine}
             </span>
@@ -1070,15 +1063,6 @@ export const App: React.FC = () => {
             <span className="nvr-divider" aria-hidden="true" />
             <span>{totalFps} FPS</span>
           </button>
-
-          <a
-            href="/api/ui/switch?target=v1"
-            className="nvr-btn"
-            title={t.brand.classicSwitchHint}
-            style={{ textDecoration: "none" }}
-          >
-            {t.brand.classicSwitch}
-          </a>
         </div>
       </header>
 

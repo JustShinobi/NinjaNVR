@@ -3,8 +3,6 @@ export const en = {
     name: "NINJANVR",
     release: "CONSOLE v2.0",
     engine: "RUST + OPENVINO",
-    classicSwitch: "v1 UI",
-    classicSwitchHint: "Switch back to Frigate Classic UI (v1)",
   },
   nav: {
     live: "Live Matrix",
@@ -133,8 +131,6 @@ export interface TranslationDict {
     name: string;
     release: string;
     engine: string;
-    classicSwitch: string;
-    classicSwitchHint: string;
   };
   nav: {
     live: string;

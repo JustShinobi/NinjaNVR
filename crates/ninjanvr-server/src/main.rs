@@ -27,7 +27,9 @@ async fn main() -> Result<()> {
         std::env::var("CONFIG_FILE").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string()),
     );
     let mut web_dir = PathBuf::from(
-        std::env::var("NINJANVR_WEB_DIR").unwrap_or_else(|_| "/opt/ninjanvr/web".to_string()),
+        std::env::var("NINJANVR_WEB_V2_DIR")
+            .or_else(|_| std::env::var("NINJANVR_WEB_DIR"))
+            .unwrap_or_else(|_| "/opt/ninjanvr/web-v2".to_string()),
     );
     let mut media_dir = PathBuf::from(
         std::env::var("NINJANVR_MEDIA_DIR").unwrap_or_else(|_| "/media/frigate".to_string()),
@@ -83,8 +85,11 @@ async fn main() -> Result<()> {
     }
 
     if !web_dir.exists() {
-        let fallback = PathBuf::from("web");
-        if fallback.exists() {
+        let fallback_dist = PathBuf::from("web-v2/dist");
+        let fallback = PathBuf::from("web-v2");
+        if fallback_dist.exists() {
+            web_dir = fallback_dist;
+        } else if fallback.exists() {
             web_dir = fallback;
         }
     }

@@ -38,11 +38,10 @@ COPY --from=upstream-assets /usr/local/lib/python3.11/dist-packages/openvino/lib
 COPY --from=upstream-assets /usr/local/lib/python3.11/dist-packages/openvino/libs/libtbb.so.12 /usr/local/lib/ninjanvr/openvino/
 COPY --from=upstream-assets /usr/local/lib/python3.11/dist-packages/openvino/libs/libhwloc.so.15 /usr/local/lib/ninjanvr/openvino/
 COPY --from=builder /src/target/release/ninjanvr /usr/local/bin/ninjanvr
-COPY web /opt/ninjanvr/web
 COPY --from=ui-builder /src/web-v2/dist /opt/ninjanvr/web-v2
 
 ENV CONFIG_FILE=/config/config.yml
-ENV NINJANVR_WEB_DIR=/opt/ninjanvr/web
+ENV NINJANVR_WEB_DIR=/opt/ninjanvr/web-v2
 ENV NINJANVR_WEB_V2_DIR=/opt/ninjanvr/web-v2
 ENV NINJANVR_MEDIA_DIR=/media/frigate
 ENV NINJANVR_OPENVINO_LIB_DIR=/usr/local/lib/ninjanvr/openvino

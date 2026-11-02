@@ -10,7 +10,7 @@ async fn jwt_login_and_authenticated_cookie_roundtrip() {
     std::fs::create_dir_all(&tmp_dir).unwrap();
     let db_path = tmp_dir.join("frigate.db");
     let cfg_path = tmp_dir.join("config.yml");
-    let web_dir = tmp_dir.join("web");
+    let web_dir = tmp_dir.join("web-v2");
     std::fs::create_dir_all(&web_dir).unwrap();
 
     let yaml = format!(

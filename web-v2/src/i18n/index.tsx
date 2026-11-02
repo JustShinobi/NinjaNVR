@@ -8,8 +8,6 @@ const pt: TranslationDict = {
     name: "NINJANVR",
     release: "CONSOLE v2.0",
     engine: "RUST + OPENVINO",
-    classicSwitch: "UI v1",
-    classicSwitchHint: "Voltar para a interface clássica (v1)",
   },
   nav: {
     live: "Matriz Ao Vivo",

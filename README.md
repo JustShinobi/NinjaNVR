@@ -39,7 +39,6 @@ crates/
   ninjanvr-comms/     WebSocket (/ws) state hub and MQTT publisher
   ninjanvr-server/    Axum HTTP (:5000) and TLS (:8971) server
 web-v2/               NinjaNVR Console (React 19 + TypeScript + Vite)
-web/                  Legacy v1 UI fallback bundle
 ```
 
 ## Web Console (`web-v2`)
@@ -90,7 +89,7 @@ make build
 
 ## Migration and Compatibility
 
-NinjaNVR reads existing Frigate-style `config.yml` camera/detector definitions, mounts the same SQLite database schema (`recordings`, `event`, `reviewsegment`, `export`, `previews`, `user`), and publishes compatible Home Assistant MQTT topics. A legacy v1 UI fallback remains available at `/api/ui/switch?target=v1`.
+NinjaNVR reads existing Frigate-style `config.yml` camera/detector definitions, mounts the same SQLite database schema (`recordings`, `event`, `reviewsegment`, `export`, `previews`, `user`), and publishes compatible Home Assistant MQTT topics.
 
 ## Contributing
 

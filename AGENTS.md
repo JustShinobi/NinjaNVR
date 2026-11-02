@@ -3,8 +3,8 @@
 ## Product Identity & Architecture
 **NinjaNVR** is an independent, ultra-low-footprint AI Network Video Recorder (NVR) and Tactical Video-Wall Console built in **Rust (Edition 2024)** and **React 19 (`web-v2`)**.
 
-- **Not a Clone:** While NinjaNVR maintains backwards-compatible parsing for legacy `config.yml` files, SQLite schemas, and Home Assistant MQTT discovery topics to ease migration, it is an independent product. All new frontend and operator workflow development happens exclusively in **`web-v2/` (NinjaNVR Console v2)**.
-- **Default UI:** `ninjanvr-server` serves **NinjaNVR Console (`v2`)** by default. `web/` (`v1`) is retained strictly as a read-only legacy compatibility bundle (`/api/ui/switch?target=v1`).
+- **Not a Clone:** While NinjaNVR maintains backwards-compatible parsing for legacy `config.yml` files, SQLite schemas, and Home Assistant MQTT discovery topics to ease migration, it is an independent product. All frontend and operator workflow development happens in **`web-v2/` (NinjaNVR Console v2)**.
+- **Console UI:** `ninjanvr-server` serves **NinjaNVR Console (`v2`)** exclusively from `web-v2/`.
 
 ### Workspace Crates & Directories
 - `crates/ninjanvr-config`: YAML configuration parser, credential scrubber (`rtsp://*:*@...`), and `go2rtc` supervisor.
@@ -15,9 +15,8 @@
 - `crates/ninjanvr-track`: 2-stage `ByteTracker` with stationary object classification and polygon zone entry hysteresis.
 - `crates/ninjanvr-vod`: Pure-Rust ISO-BMFF fMP4 HLS VOD remuxer (`init-v1-a1.mp4` + `seg-N-v1-a1.m4s`).
 - `crates/ninjanvr-comms`: Real-time `/ws` WebSocket broadcaster and `rumqttc` MQTT publisher.
-- `crates/ninjanvr-server`: Axum HTTP (`:5000`) & TLS (`:8971`) server, JWT auth gate, `/api/*` handlers, and Dual-UI static/SPA router.
-- `web-v2/`: Primary NinjaNVR Console (`v2`) React 19 + TypeScript + Vite SPA.
-- `web/`: Legacy Classic UI (`v1`) static fallback bundle.
+- `crates/ninjanvr-server`: Axum HTTP (`:5000`) & TLS (`:8971`) server, JWT auth gate, `/api/*` handlers, and static/SPA router.
+- `web-v2/`: NinjaNVR Console (`v2`) React 19 + TypeScript + Vite SPA.
 
 ## UI v2 (`web-v2/`) Design & Engineering Guardrails
 - **Tactical Dark Surface:** Low-luminance dark palette (`color-scheme: dark`) defined via CSS custom properties in `web-v2/src/styles.css` (`--bg-deep`, `--bg-canvas`, `--bg-panel`, `--border-hairline`). Maintain WCAG AA contrast (`>= 4.5:1`) and never use font sizes below `11px` (`--text-xs`).
