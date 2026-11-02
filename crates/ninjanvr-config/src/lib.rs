@@ -611,9 +611,9 @@ impl Default for ObjectsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectFilterConfig {
     #[serde(default)]
-    pub min_area: u32,
+    pub min_area: f64,
     #[serde(default = "default_max_area")]
-    pub max_area: u32,
+    pub max_area: f64,
     #[serde(default)]
     pub min_ratio: f32,
     #[serde(default = "default_max_ratio")]
@@ -628,8 +628,28 @@ pub struct ObjectFilterConfig {
     pub mask: Value,
 }
 
-fn default_max_area() -> u32 {
-    24_000_000
+impl ObjectFilterConfig {
+    /// Resolves `(min_area_px, max_area_px)` for the given `(frame_w, frame_h)`,
+    /// treating values in `(0.0, 1.0]` as normalized fractions of `frame_w * frame_h`
+    /// and values `> 1.0` as absolute pixel areas.
+    pub fn resolve_area_bounds_px(&self, frame_w: u32, frame_h: u32) -> (u32, u32) {
+        let frame_area = (frame_w as f64) * (frame_h as f64);
+        let min_px = if self.min_area > 0.0 && self.min_area <= 1.0 {
+            (self.min_area * frame_area).round() as u32
+        } else {
+            self.min_area.max(0.0).round() as u32
+        };
+        let max_px = if self.max_area > 0.0 && self.max_area <= 1.0 {
+            (self.max_area * frame_area).round() as u32
+        } else {
+            self.max_area.max(1.0).round() as u32
+        };
+        (min_px, max_px)
+    }
+}
+
+fn default_max_area() -> f64 {
+    24_000_000.0
 }
 fn default_max_ratio() -> f32 {
     24_000_000.0
@@ -644,7 +664,7 @@ fn default_filter_min_score() -> f32 {
 impl Default for ObjectFilterConfig {
     fn default() -> Self {
         Self {
-            min_area: 0,
+            min_area: 0.0,
             max_area: default_max_area(),
             min_ratio: 0.0,
             max_ratio: default_max_ratio(),
@@ -779,6 +799,12 @@ pub struct ZoneConfig {
     pub inertia: u32,
     #[serde(default)]
     pub loitering_time: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_area: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_area: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<f32>,
 }
 
 fn default_zone_inertia() -> u32 {

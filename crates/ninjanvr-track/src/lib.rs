@@ -173,7 +173,8 @@ impl ByteTracker {
         }
         if let Some(f) = cfg.objects.filters.get(&det.label) {
             let area = det.bbox.area();
-            if area < f.min_area || area > f.max_area {
+            let (min_area_px, max_area_px) = f.resolve_area_bounds_px(self.frame_w, self.frame_h);
+            if area < min_area_px || area > max_area_px {
                 return true;
             }
             let ratio = (det.bbox.width() as f32) / (det.bbox.height().max(1) as f32);
@@ -187,14 +188,49 @@ impl ByteTracker {
         false
     }
 
-    fn evaluate_zones(&self, label: &str, bbox: &BoundingBox) -> Vec<String> {
+    fn evaluate_zones(
+        &self,
+        label: &str,
+        bbox: &BoundingBox,
+        score: f32,
+        cfg: &CameraConfig,
+    ) -> Vec<String> {
         let (bx, by) = bbox.bottom_center();
+        let area = bbox.area();
+        let frame_area = (self.frame_w as f64) * (self.frame_h as f64);
         let mut matched = Vec::new();
         for (zname, (poly, allowed_objs)) in &self.zones {
             if (!allowed_objs.is_empty() && !allowed_objs.iter().any(|o| o == label))
                 || !poly.contains_point(bx, by)
             {
                 continue;
+            }
+            if let Some(zcfg) = cfg.zones.get(zname) {
+                if let Some(min_sc) = zcfg.min_score
+                    && score < min_sc
+                {
+                    continue;
+                }
+                if let Some(min_a) = zcfg.min_area {
+                    let min_px = if min_a > 0.0 && min_a <= 1.0 {
+                        (min_a * frame_area).round() as u32
+                    } else {
+                        min_a.max(0.0).round() as u32
+                    };
+                    if area < min_px {
+                        continue;
+                    }
+                }
+                if let Some(max_a) = zcfg.max_area {
+                    let max_px = if max_a > 0.0 && max_a <= 1.0 {
+                        (max_a * frame_area).round() as u32
+                    } else {
+                        max_a.max(1.0).round() as u32
+                    };
+                    if area > max_px {
+                        continue;
+                    }
+                }
             }
             matched.push(zname.clone());
         }
@@ -356,7 +392,7 @@ impl ByteTracker {
                 (self.frame_seq as u32).wrapping_mul(0x9E37_79B9) ^ (d_idx as u32)
             );
             let id = format!("{frame_time:.6}-{suffix}");
-            let zones = self.evaluate_zones(&det.label, &det.bbox);
+            let zones = self.evaluate_zones(&det.label, &det.bbox, det.score, cfg);
             let (min_score_cfg, threshold_cfg) = cfg
                 .objects
                 .filters
@@ -428,7 +464,7 @@ impl ByteTracker {
         frame_time: f64,
         cfg: &CameraConfig,
     ) {
-        let zones = self.evaluate_zones(&det.label, &det.bbox);
+        let zones = self.evaluate_zones(&det.label, &det.bbox, det.score, cfg);
         let stationary_thresh = self.stationary_threshold;
         let frame_w = self.frame_w;
         let frame_h = self.frame_h;
@@ -864,5 +900,78 @@ mod tests {
         let _ = tracker.update(10.4, std::slice::from_ref(&det), &[reg], &cam_cfg);
         let (a4, _) = tracker.update(10.6, std::slice::from_ref(&det), &[reg], &cam_cfg);
         assert_eq!(a4.len(), 1);
+    }
+
+    #[test]
+    fn fractional_area_bounds_and_per_zone_overrides_filter_accurately() {
+        let mut cam_cfg = CameraConfig {
+            enabled: true,
+            ffmpeg: Default::default(),
+            live: Default::default(),
+            detect: Default::default(),
+            record: Default::default(),
+            snapshots: Default::default(),
+            motion: Default::default(),
+            objects: Default::default(),
+            review: Default::default(),
+            zones: Default::default(),
+            lines: Default::default(),
+        };
+        cam_cfg.detect.min_initialized = 1;
+        // 1% of 1000x1000 = 10,000 px² minimum
+        if let Some(person_f) = cam_cfg.objects.filters.get_mut("person") {
+            person_f.min_area = 0.01;
+            person_f.max_area = 0.50;
+        }
+        cam_cfg.zones.insert(
+            "foreground_driveway".to_string(),
+            ninjanvr_config::ZoneConfig {
+                coordinates: "0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0".into(),
+                objects: vec!["person".to_string()],
+                inertia: 1,
+                loitering_time: 0,
+                min_area: Some(0.05), // 5% of frame (50,000 px²) required to enter foreground zone
+                max_area: None,
+                min_score: Some(0.80),
+            },
+        );
+
+        let mut tracker = ByteTracker::new("front_door", 1000, 1000, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1000, 1000);
+
+        // 1. Box 50x50 = 2,500 px² (< 1% = 10,000 px²) -> rejected by camera fractional min_area
+        let tiny_det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.90,
+            bbox: BoundingBox::new(100, 100, 150, 150),
+            region: reg,
+        };
+        let (a_tiny, _) = tracker.update(1.0, &[tiny_det], &[reg], &cam_cfg);
+        assert!(a_tiny.is_empty());
+
+        // 2. Box 150x150 = 22,500 px² (>= 1% camera min_area, but < 5% zone min_area) -> tracked, but not in zone
+        let mid_det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.85,
+            bbox: BoundingBox::new(100, 100, 250, 250),
+            region: reg,
+        };
+        let (a_mid, _) = tracker.update(2.0, &[mid_det], &[reg], &cam_cfg);
+        assert_eq!(a_mid.len(), 1);
+        assert!(a_mid[0].zones.is_empty());
+
+        // 3. Box 300x300 = 90,000 px² (>= 5% zone min_area and score 0.88 >= 0.80) -> enters zone!
+        let large_det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.88,
+            bbox: BoundingBox::new(100, 100, 400, 400),
+            region: reg,
+        };
+        let (a_large, _) = tracker.update(3.0, &[large_det], &[reg], &cam_cfg);
+        assert!(
+            a_large
+                .iter()
+                .any(|t| t.zones.contains(&"foreground_driveway".to_string()))
+        );
     }
 }

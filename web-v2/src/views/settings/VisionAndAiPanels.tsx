@@ -55,7 +55,7 @@ export const VisionZonesMotionSection: React.FC<{
   const { locale } = useI18n();
   const isPt = locale === "pt";
   const [polyType, setPolyType] = useState<
-    "zone" | "tripwire" | "motion_mask" | "object_mask"
+    "zone" | "tripwire" | "motion_mask" | "object_mask" | "measure_box"
   >("zone");
   const [zoneNameInput, setZoneNameInput] = useState("entrada");
   const [zoneInertia, setZoneInertia] = useState(3);
@@ -273,6 +273,7 @@ export const VisionZonesMotionSection: React.FC<{
                   ["tripwire", isPt ? "Tripwire (Verde)" : "Tripwire (Green)"],
                   ["motion_mask", isPt ? "Másc. Mov (Verm)" : "Motion Mask (Red)"],
                   ["object_mask", isPt ? "Másc. Obj (Viol)" : "Object Mask (Violet)"],
+                  ["measure_box", isPt ? "Medir Caixa" : "Measure Box"],
                 ] as const
               ).map(([id, label]) => (
                 <button
@@ -286,6 +287,39 @@ export const VisionZonesMotionSection: React.FC<{
                 </button>
               ))}
             </div>
+
+            {polyType === "measure_box" && (
+              <div
+                className="mono"
+                style={{
+                  padding: "6px 8px",
+                  background: "var(--bg-deep)",
+                  border: "1px solid var(--signal-accent)",
+                  borderRadius: 2,
+                  fontSize: "var(--text-xs)",
+                  fontVariantNumeric: "tabular-nums",
+                  color: "var(--signal-accent-text)",
+                }}
+              >
+                {draftPoints.length >= 2 ? (
+                  (() => {
+                    const [a, b] = draftPoints.slice(-2);
+                    const wPx = Math.max(1, Math.round(Math.abs(b[0] - a[0]) * detW));
+                    const hPx = Math.max(1, Math.round(Math.abs(b[1] - a[1]) * detH));
+                    const areaPx = wPx * hPx;
+                    const areaPct = ((areaPx / Math.max(1, detW * detH)) * 100).toFixed(2);
+                    const ratio = (wPx / hPx).toFixed(2);
+                    return `Area: ${areaPx} px² (${areaPct}%) | Ratio: ${ratio} (${wPx}×${hPx})`;
+                  })()
+                ) : (
+                  <span>
+                    {isPt
+                      ? "Clique 2 cantos opostos no vídeo para medir Área (px & %) e Proporção..."
+                      : "Click 2 opposite corners on the video frame to measure Area (px & %) and Ratio..."}
+                  </span>
+                )}
+              </div>
+            )}
 
             {polyType === "tripwire" && (
               <div style={{ display: "flex", gap: 6, alignItems: "center" }}>

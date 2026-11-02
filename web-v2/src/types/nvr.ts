@@ -97,6 +97,9 @@ export interface ZoneConfig {
   objects?: string[];
   inertia?: number;
   loitering_time?: number;
+  min_area?: number;
+  max_area?: number;
+  min_score?: number;
 }
 
 export interface LineConfig {
