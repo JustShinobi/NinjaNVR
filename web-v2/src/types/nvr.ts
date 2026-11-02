@@ -213,8 +213,30 @@ export interface MqttConfig {
   stats_interval: number;
 }
 
+export interface OidcAuthConfig {
+  enabled: boolean;
+  provider_name?: string;
+  issuer_url?: string;
+  client_id?: string;
+  client_secret_env?: string;
+  scopes?: string[];
+  auto_redirect?: boolean;
+  username_claim?: string;
+  groups_claim?: string;
+  default_role?: string;
+}
+
+export interface ProxyAuthConfig {
+  enabled: boolean;
+  trusted_proxies?: string[];
+  user_header?: string;
+  groups_header?: string;
+  logout_url?: string;
+}
+
 export interface AuthConfig {
   enabled: boolean;
+  local_login_enabled?: boolean;
   reset_admin_password: boolean;
   cookie_name: string;
   cookie_secure: boolean;
@@ -223,6 +245,8 @@ export interface AuthConfig {
   hash_iterations: number;
   trusted_proxies: string[];
   admin_first_time_login?: boolean;
+  oidc?: OidcAuthConfig;
+  proxy?: ProxyAuthConfig;
 }
 
 export interface PeerNodeConfig {
