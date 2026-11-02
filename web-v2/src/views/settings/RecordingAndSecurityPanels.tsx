@@ -1896,6 +1896,21 @@ export const CommsAuthUsersSection: React.FC<{
                 }
               />
               <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                Auto-Redirect:
+              </span>
+              <ToggleSwitch
+                checked={Boolean(authCfg.oidc?.auto_redirect)}
+                label="Auto-Redirect to OIDC SSO"
+                onChange={(v) =>
+                  mutateAuth({
+                    oidc: {
+                      ...(authCfg.oidc || { enabled: true }),
+                      auto_redirect: v,
+                    },
+                  })
+                }
+              />
+              <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 ForwardAuth Proxy:
               </span>
               <ToggleSwitch

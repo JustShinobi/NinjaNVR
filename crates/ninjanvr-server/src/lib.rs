@@ -649,7 +649,8 @@ async fn api_ui_switch(Query(q): Query<UiSwitchParams>) -> Response {
 async fn api_ui_version() -> Json<Value> {
     Json(json!({
         "active": "v2",
-        "available": ["v2"]
+        "available": ["v2"],
+        "version": NINJANVR_VERSION
     }))
 }
 
@@ -666,7 +667,10 @@ async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri)
     let primary_dir = &state.web_dir;
 
     if !rel_path.is_empty() && !rel_path.contains("..") {
-        let file_candidate = primary_dir.join(rel_path);
+        let mut file_candidate = primary_dir.join(rel_path);
+        if rel_path == "favicon.ico" && !file_candidate.is_file() {
+            file_candidate = primary_dir.join("favicon.svg");
+        }
         if file_candidate.is_file()
             && let Ok(bytes) = tokio::fs::read(&file_candidate).await
         {
@@ -1097,8 +1101,34 @@ fn generate_pkce_pair() -> (String, String, String) {
     (state_str, verifier, challenge)
 }
 
+fn resolve_external_base_url(headers: &HeaderMap, uri: &Uri) -> String {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| uri.authority().map(|a| a.as_str()))
+        .unwrap_or("localhost:5000");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| uri.scheme_str())
+        .unwrap_or(
+            if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+                "http"
+            } else {
+                "https"
+            },
+        );
+    format!("{proto}://{host}")
+}
+
 async fn api_auth_oidc_login(
     State(state): State<AppState>,
+    uri: Uri,
     headers: HeaderMap,
     jar: CookieJar,
 ) -> Response {
@@ -1127,15 +1157,8 @@ async fn api_auth_oidc_login(
     }
 
     let (state_str, verifier, challenge) = generate_pkce_pair();
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost:5000");
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-    let redirect_uri = format!("{proto}://{host}/api/auth/oidc/callback");
+    let base_url = resolve_external_base_url(&headers, &uri);
+    let redirect_uri = format!("{base_url}/api/auth/oidc/callback");
 
     // Discover authorization_endpoint or fall back to standard /authorize
     let mut auth_endpoint = format!("{issuer}/authorize");
@@ -1165,7 +1188,10 @@ async fn api_auth_oidc_login(
         urlencoding_simple(&scope_str),
     );
 
-    let mut pkce_cookie = Cookie::new("ninjanvr_oidc_pkce", format!("{state_str}:{verifier}"));
+    let mut pkce_cookie = Cookie::new(
+        "ninjanvr_oidc_pkce",
+        format!("{state_str}:{verifier}:{redirect_uri}"),
+    );
     pkce_cookie.set_path("/");
     pkce_cookie.set_http_only(true);
     pkce_cookie.set_same_site(SameSite::Lax);
@@ -1193,6 +1219,7 @@ pub struct OidcCallbackQuery {
 
 async fn api_auth_oidc_callback(
     State(state): State<AppState>,
+    uri: Uri,
     headers: HeaderMap,
     jar: CookieJar,
     Query(q): Query<OidcCallbackQuery>,
@@ -1218,12 +1245,16 @@ async fn api_auth_oidc_callback(
         )
             .into_response();
     };
-    let Some((expected_state, code_verifier)) = pkce_cookie.value().split_once(':') else {
+    let Some((expected_state, rest_cookie)) = pkce_cookie.value().split_once(':') else {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "message": "Malformed OIDC PKCE cookie" })),
         )
             .into_response();
+    };
+    let (code_verifier, saved_redirect_uri) = match rest_cookie.split_once(':') {
+        Some((v, r)) => (v, Some(r.to_string())),
+        None => (rest_cookie, None),
     };
     if expected_state != returned_state {
         return (
@@ -1259,15 +1290,10 @@ async fn api_auth_oidc_callback(
     };
     let client_secret = std::env::var(&oidc_cfg.client_secret_env).unwrap_or_default();
 
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost:5000");
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("http");
-    let redirect_uri = format!("{proto}://{host}/api/auth/oidc/callback");
+    let redirect_uri = saved_redirect_uri.unwrap_or_else(|| {
+        let base_url = resolve_external_base_url(&headers, &uri);
+        format!("{base_url}/api/auth/oidc/callback")
+    });
 
     let mut token_endpoint = format!("{issuer}/oauth/v2/token");
     let mut userinfo_endpoint = format!("{issuer}/oidc/v1/userinfo");
@@ -1289,14 +1315,19 @@ async fn api_auth_oidc_callback(
             }
         }
 
-        let form_body = format!(
-            "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&client_secret={}&code_verifier={}",
+        let mut form_body = format!(
+            "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
             urlencoding_simple(code),
             urlencoding_simple(&redirect_uri),
             urlencoding_simple(&client_id),
-            urlencoding_simple(&client_secret),
             urlencoding_simple(code_verifier)
         );
+        if !client_secret.is_empty() {
+            form_body.push_str(&format!(
+                "&client_secret={}",
+                urlencoding_simple(&client_secret)
+            ));
+        }
         if let Ok(tok_resp) = client
             .post(&token_endpoint)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
