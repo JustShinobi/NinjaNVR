@@ -6,7 +6,9 @@ use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use ninjanvr_config::DEFAULT_CONFIG_PATH;
-use ninjanvr_server::{build_router_with_auth, generate_self_signed_tls_config, new_app_state};
+use ninjanvr_server::{
+    build_router_with_auth, generate_self_signed_tls_config_with_sans, new_app_state,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
@@ -99,6 +101,7 @@ async fn main() -> Result<()> {
     );
 
     let state = new_app_state(&config_path, web_dir, media_dir, spawn_go2rtc).await?;
+    let san_hosts = state.config.read().await.tls.san_hosts.clone();
     let app_http = build_router_with_auth(state.clone(), false);
     let app_https = build_router_with_auth(state, true);
 
@@ -115,7 +118,7 @@ async fn main() -> Result<()> {
     // 2. Run HTTPS server on :8971 (external authenticated TLS port)
     let https_addr = SocketAddr::from(([0, 0, 0, 0], https_port));
     let https_listener = TcpListener::bind(https_addr).await?;
-    let tls_config = generate_self_signed_tls_config()?;
+    let tls_config = generate_self_signed_tls_config_with_sans(&san_hosts)?;
     let tls_acceptor = TlsAcceptor::from(tls_config);
     info!("Listening on HTTPS https://{https_addr}");
 

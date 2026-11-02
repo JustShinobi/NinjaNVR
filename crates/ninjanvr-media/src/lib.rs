@@ -585,6 +585,72 @@ fn parse_staged_start_time(camera: &str, staged_path: &Path) -> Option<f64> {
     Some(ndt.and_utc().timestamp() as f64)
 }
 
+/// Builds the FFmpeg CLI arguments for segment recording, injecting `-itsoffset <sec>` and
+/// stream mapping when `audio_offset_ms != 0` to compensate for RTSP audio/video lip-sync drift.
+pub fn build_recorder_ffmpeg_args(
+    rtsp_url: &str,
+    out_pattern: &str,
+    audio_offset_ms: i32,
+) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-probesize".to_string(),
+        "32768".to_string(),
+        "-analyzeduration".to_string(),
+        "500000".to_string(),
+        "-threads".to_string(),
+        "1".to_string(),
+        "-rtsp_transport".to_string(),
+        "tcp".to_string(),
+        "-timeout".to_string(),
+        "10000000".to_string(),
+        "-i".to_string(),
+        rtsp_url.to_string(),
+    ];
+
+    if audio_offset_ms != 0 {
+        let offset_sec = (audio_offset_ms as f64) / 1000.0;
+        args.extend([
+            "-rtsp_transport".to_string(),
+            "tcp".to_string(),
+            "-timeout".to_string(),
+            "10000000".to_string(),
+            "-itsoffset".to_string(),
+            format!("{offset_sec:.3}"),
+            "-i".to_string(),
+            rtsp_url.to_string(),
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-map".to_string(),
+            "1:a:0?".to_string(),
+        ]);
+    }
+
+    args.extend([
+        "-f".to_string(),
+        "segment".to_string(),
+        "-segment_time".to_string(),
+        "10".to_string(),
+        "-segment_format".to_string(),
+        "mp4".to_string(),
+        "-reset_timestamps".to_string(),
+        "1".to_string(),
+        "-strftime".to_string(),
+        "1".to_string(),
+        "-segment_list".to_string(),
+        "pipe:1".to_string(),
+        "-segment_list_type".to_string(),
+        "csv".to_string(),
+        "-c:v".to_string(),
+        "copy".to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        out_pattern.to_string(),
+    ]);
+    args
+}
 /// Removes empty `<camera>`, `HH`, and `YYYY-MM-DD` parent directories after a segment file is deleted.
 pub fn prune_empty_parent_dirs(file_path: &Path, stop_at: &Path) {
     let mut cur = file_path.parent();
@@ -608,6 +674,7 @@ pub struct CameraRecordPolicy {
     pub keep_motion: bool,
     pub continuous_substream: bool,
     pub retain_mode: String,
+    pub audio_offset_ms: i32,
 }
 
 /// Manages direct segment recording and retention cleanup for all configured cameras.
@@ -682,6 +749,7 @@ impl RecordingEngine {
                         keep_motion: c.record.motion.days > 0.0,
                         continuous_substream: use_sub_default,
                         retain_mode: c.record.alerts.retain.mode.clone(),
+                        audio_offset_ms: c.ffmpeg.audio_offset_ms.unwrap_or(0),
                     };
                     Some((name.clone(), input_url, policy))
                 })
@@ -800,44 +868,14 @@ impl RecordingEngine {
             self.sweep_staging_dir(&camera, &staging_dir, &policy).await;
 
             let out_pattern = staging_dir.join(format!("{camera}_%Y%m%d%H%M%S.mp4"));
+            let ff_args = build_recorder_ffmpeg_args(
+                &rtsp_url,
+                out_pattern.to_string_lossy().as_ref(),
+                policy.audio_offset_ms,
+            );
             let mut cmd = Command::new(&ffmpeg_bin);
             cmd.env("TZ", "UTC")
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-probesize",
-                    "32768",
-                    "-analyzeduration",
-                    "500000",
-                    "-threads",
-                    "1",
-                    "-rtsp_transport",
-                    "tcp",
-                    "-timeout",
-                    "10000000",
-                    "-i",
-                    &rtsp_url,
-                    "-f",
-                    "segment",
-                    "-segment_time",
-                    "10",
-                    "-segment_format",
-                    "mp4",
-                    "-reset_timestamps",
-                    "1",
-                    "-strftime",
-                    "1",
-                    "-segment_list",
-                    "pipe:1",
-                    "-segment_list_type",
-                    "csv",
-                    "-c:v",
-                    "copy",
-                    "-c:a",
-                    "aac",
-                ])
-                .arg(out_pattern.to_string_lossy().as_ref())
+                .args(&ff_args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
@@ -1950,6 +1988,16 @@ mod tests {
         let args_stripped_audio =
             build_mp4_export_ffmpeg_args(list_path, 2.5, 16.0, false, out_path);
         assert!(args_stripped_audio.iter().any(|a| a == "-an"));
+
+        let rec_args_zero =
+            build_recorder_ffmpeg_args("rtsp://127.0.0.1:8554/cam", "/tmp/cam_%Y.mp4", 0);
+        assert!(!rec_args_zero.iter().any(|a| a == "-itsoffset"));
+
+        let rec_args_offset =
+            build_recorder_ffmpeg_args("rtsp://127.0.0.1:8554/cam", "/tmp/cam_%Y.mp4", -450);
+        assert!(rec_args_offset.iter().any(|a| a == "-itsoffset"));
+        assert!(rec_args_offset.iter().any(|a| a == "-0.450"));
+        assert!(rec_args_offset.iter().any(|a| a == "1:a:0?"));
     }
 
     #[test]

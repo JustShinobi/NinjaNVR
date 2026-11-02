@@ -84,11 +84,16 @@ fn default_true() -> bool {
 pub struct TlsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub san_hosts: Vec<String>,
 }
 
 impl Default for TlsConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            san_hosts: Vec::new(),
+        }
     }
 }
 
@@ -1186,6 +1191,8 @@ pub struct CameraFfmpegConfig {
     pub inputs: Vec<CameraFfmpegInput>,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub output_args: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_offset_ms: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1484,6 +1491,7 @@ impl NinjaConfig {
                         "retry_interval": 10.0,
                         "apple_compatibility": false,
                         "gpu": 0,
+                        "audio_offset_ms": cam.ffmpeg.audio_offset_ms,
                         "inputs": inputs_json
                     },
                     "live": {

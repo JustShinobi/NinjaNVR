@@ -5094,15 +5094,30 @@ async fn vod_segment_m4s(
 }
 
 pub fn generate_self_signed_tls_config() -> Result<Arc<rustls::ServerConfig>> {
+    generate_self_signed_tls_config_with_sans(&[])
+}
+
+pub fn generate_self_signed_tls_config_with_sans(
+    extra_sans: &[String],
+) -> Result<Arc<rustls::ServerConfig>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let subject_alt_names = vec![
+    let mut subject_alt_names = vec![
         "localhost".to_string(),
         "frigate".to_string(),
         "ninjanvr".to_string(),
         "127.0.0.1".to_string(),
+        "::1".to_string(),
     ];
-    let rcgen::CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(subject_alt_names)?;
+    for host in extra_sans {
+        let h = host.trim();
+        if !h.is_empty() && !subject_alt_names.iter().any(|s| s == h) {
+            subject_alt_names.push(h.to_string());
+        }
+    }
+    let mut params = rcgen::CertificateParams::new(subject_alt_names)?;
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    let signing_key = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&signing_key)?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert);
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
         rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
@@ -6453,6 +6468,17 @@ version: 0.18-0
         assert!(prom_body.contains("ninjanvr_memory_usage_bytes "));
         assert!(
             prom_body.contains("ninjanvr_events_total{camera=\"front_door\",label=\"person\"}")
+        );
+
+        // 26. Test Apple-compliant self-signed TLS certificate generation with custom SAN hosts
+        let tls_cfg = generate_self_signed_tls_config_with_sans(&[
+            "192.0.2.10".to_string(),
+            "nvr.example.com".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            tls_cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
