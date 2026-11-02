@@ -54,13 +54,14 @@ export const VisionZonesMotionSection: React.FC<{
 }) => {
   const { locale } = useI18n();
   const isPt = locale === "pt";
-  const [polyType, setPolyType] = useState<"zone" | "motion_mask" | "object_mask">(
-    "zone"
-  );
+  const [polyType, setPolyType] = useState<
+    "zone" | "tripwire" | "motion_mask" | "object_mask"
+  >("zone");
   const [zoneNameInput, setZoneNameInput] = useState("entrada");
   const [zoneInertia, setZoneInertia] = useState(3);
   const [zoneLoitering, setZoneLoitering] = useState(0);
   const [zoneObjects, setZoneObjects] = useState<string[]>(["person", "car"]);
+  const [lineDirection, setLineDirection] = useState<"any" | "a_to_b" | "b_to_a">("any");
 
   const camCfg = draftConfig.cameras?.[inspectorCam];
   const detW = camCfg?.detect?.width || 1280;
@@ -112,6 +113,40 @@ export const VisionZonesMotionSection: React.FC<{
       : "";
 
   const handleCommitPolygon = () => {
+    if (polyType === "tripwire") {
+      if (draftPoints.length < 2) {
+        notify("Plot at least 2 points on the camera preview for a directional tripwire");
+        return;
+      }
+      const lSlug = zoneNameInput
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, "_");
+      if (!lSlug || lSlug.length < 2) {
+        notify("Enter a tripwire ID with at least 2 characters");
+        return;
+      }
+      const [p1, p2] = draftPoints;
+      updateDraft((next) => {
+        const cam = next.cameras[inspectorCam];
+        if (!cam) return;
+        if (!cam.lines) cam.lines = {};
+        cam.lines[lSlug] = {
+          points: [
+            Number(p1[0].toFixed(4)),
+            Number(p1[1].toFixed(4)),
+            Number(p2[0].toFixed(4)),
+            Number(p2[1].toFixed(4)),
+          ],
+          direction: lineDirection,
+          objects: zoneObjects,
+        };
+      });
+      setDraftPoints([]);
+      notify(`Staged tripwire line '${lSlug}' (${lineDirection}) on ${inspectorCam}`);
+      return;
+    }
+
     if (draftPoints.length < 3) {
       notify(
         isPt
@@ -231,10 +266,11 @@ export const VisionZonesMotionSection: React.FC<{
               </span>
             </div>
 
-            <div style={{ display: "flex", gap: 4 }}>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
               {(
                 [
                   ["zone", isPt ? "Zona (Ciano)" : "Zone (Cyan)"],
+                  ["tripwire", isPt ? "Tripwire (Verde)" : "Tripwire (Green)"],
                   ["motion_mask", isPt ? "Másc. Mov (Verm)" : "Motion Mask (Red)"],
                   ["object_mask", isPt ? "Másc. Obj (Viol)" : "Object Mask (Violet)"],
                 ] as const
@@ -250,6 +286,32 @@ export const VisionZonesMotionSection: React.FC<{
                 </button>
               ))}
             </div>
+
+            {polyType === "tripwire" && (
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <input
+                  className="nvr-input mono"
+                  style={{ flex: 1, height: 24, fontSize: "var(--text-xs)" }}
+                  placeholder="Tripwire ID (e.g. driveway_line)"
+                  aria-label="Tripwire Name"
+                  value={zoneNameInput}
+                  onChange={(e) => setZoneNameInput(e.target.value)}
+                />
+                <select
+                  className="nvr-select mono"
+                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  aria-label="Tripwire Crossing Direction"
+                  value={lineDirection}
+                  onChange={(e) =>
+                    setLineDirection(e.target.value as "any" | "a_to_b" | "b_to_a")
+                  }
+                >
+                  <option value="any">Direction: ANY</option>
+                  <option value="a_to_b">Direction: A &rarr; B</option>
+                  <option value="b_to_a">Direction: B &rarr; A</option>
+                </select>
+              </div>
+            )}
 
             {polyType === "zone" && (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>

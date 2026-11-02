@@ -727,6 +727,44 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
                 />
               </g>
             ))}
+            {Object.entries(cameraConfig?.lines || {}).map(([lName, lCfg]) => {
+              const pts = lCfg.points || [0, 0, 0, 0];
+              const isNorm =
+                pts[0] <= 1.0 && pts[1] <= 1.0 && pts[2] <= 1.0 && pts[3] <= 1.0;
+              const x1 = Math.round((isNorm ? pts[0] : pts[0] / Math.max(1, detW)) * 1000);
+              const y1 = Math.round((isNorm ? pts[1] : pts[1] / Math.max(1, detH)) * 1000);
+              const x2 = Math.round((isNorm ? pts[2] : pts[2] / Math.max(1, detW)) * 1000);
+              const y2 = Math.round((isNorm ? pts[3] : pts[3] / Math.max(1, detH)) * 1000);
+              const mx = (x1 + x2) / 2;
+              const my = (y1 + y2) / 2;
+              const dx = x2 - x1;
+              const dy = y2 - y1;
+              const len = Math.hypot(dx, dy) || 1;
+              const sign = lCfg.direction === "b_to_a" ? -1 : 1;
+              const nx = (-dy / len) * 28 * sign;
+              const ny = (dx / len) * 28 * sign;
+              return (
+                <g key={`line-${lName}`}>
+                  <line
+                    x1={x1}
+                    y1={y1}
+                    x2={x2}
+                    y2={y2}
+                    stroke="#10b981"
+                    strokeWidth="4"
+                  />
+                  <line
+                    x1={mx}
+                    y1={my}
+                    x2={mx + nx}
+                    y2={my + ny}
+                    stroke="#34d399"
+                    strokeWidth="3"
+                  />
+                  <circle cx={mx + nx} cy={my + ny} r="5" fill="#10b981" />
+                </g>
+              );
+            })}
             {draftPoints && draftPoints.length > 0 && (
               <g>
                 <polygon

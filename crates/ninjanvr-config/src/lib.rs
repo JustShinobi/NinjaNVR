@@ -742,6 +742,26 @@ pub struct CameraConfig {
     pub review: ReviewConfig,
     #[serde(default)]
     pub zones: BTreeMap<String, ZoneConfig>,
+    #[serde(default)]
+    pub lines: BTreeMap<String, LineConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LineDirection {
+    #[default]
+    Any,
+    AToB,
+    BToA,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LineConfig {
+    pub points: [f32; 4],
+    #[serde(default)]
+    pub direction: LineDirection,
+    #[serde(default)]
+    pub objects: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

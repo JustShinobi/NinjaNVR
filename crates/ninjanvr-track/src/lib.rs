@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use ninjanvr_config::{CameraConfig, SnapshotSelectionPolicy};
+use ninjanvr_config::{CameraConfig, LineConfig, LineDirection, SnapshotSelectionPolicy};
 use ninjanvr_infer::{DetectionResult, nms_detections};
 use ninjanvr_vision::{BoundingBox, PolygonMask};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,10 @@ pub struct TrackedObject {
     pub stationary: bool,
     pub zones: Vec<String>,
     pub entered_zones: Vec<String>,
+    #[serde(default)]
+    pub crossed_lines: Vec<String>,
+    #[serde(default)]
+    pub prev_bottom_center: (f32, f32),
     pub has_snapshot: bool,
     pub vx: f32,
     pub vy: f32,
@@ -368,6 +372,8 @@ impl ByteTracker {
                     stationary: false,
                     entered_zones: zones.clone(),
                     zones,
+                    crossed_lines: Vec::new(),
+                    prev_bottom_center: det.bbox.bottom_center(),
                     has_snapshot: false,
                     vx: 0.0,
                     vy: 0.0,
@@ -416,6 +422,10 @@ impl ByteTracker {
                 trk.stationary = false;
             }
 
+            let prev_bc = trk.prev_bottom_center;
+            let new_bc = det.bbox.bottom_center();
+            trk.prev_bottom_center = new_bc;
+
             let is_new_top = det.score > trk.top_score;
             trk.bbox = det.bbox;
             trk.region = det.region;
@@ -430,6 +440,31 @@ impl ByteTracker {
             for z in zones {
                 if !trk.entered_zones.contains(&z) {
                     trk.entered_zones.push(z);
+                }
+            }
+
+            // Evaluate directional virtual tripwire crossings
+            for (line_name, line_cfg) in &cfg.lines {
+                if !line_cfg.objects.is_empty() && !line_cfg.objects.iter().any(|o| o == &det.label)
+                {
+                    continue;
+                }
+                let (l_start, l_end) = resolve_line_endpoints(line_cfg, frame_w, frame_h);
+                if let Some(cross_dir) = classify_segment_crossing(l_start, l_end, prev_bc, new_bc)
+                {
+                    let matches_dir = match line_cfg.direction {
+                        LineDirection::Any => true,
+                        LineDirection::AToB => cross_dir == LineDirection::AToB,
+                        LineDirection::BToA => cross_dir == LineDirection::BToA,
+                    };
+                    if matches_dir {
+                        if !trk.crossed_lines.contains(line_name) {
+                            trk.crossed_lines.push(line_name.clone());
+                        }
+                        if !trk.entered_zones.contains(line_name) {
+                            trk.entered_zones.push(line_name.clone());
+                        }
+                    }
                 }
             }
 
@@ -460,6 +495,60 @@ impl ByteTracker {
             trk.provenance.frames_tracked = trk.frames_tracked;
             trk.provenance.stationary = trk.stationary;
         }
+    }
+}
+
+fn resolve_line_endpoints(
+    line_cfg: &LineConfig,
+    frame_w: u32,
+    frame_h: u32,
+) -> ((f32, f32), (f32, f32)) {
+    let [mut x1, mut y1, mut x2, mut y2] = line_cfg.points;
+    if x1 <= 1.0 && y1 <= 1.0 && x2 <= 1.0 && y2 <= 1.0 {
+        x1 *= frame_w as f32;
+        y1 *= frame_h as f32;
+        x2 *= frame_w as f32;
+        y2 *= frame_h as f32;
+    }
+    ((x1, y1), (x2, y2))
+}
+
+fn cross_2d(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    ax * by - ay * bx
+}
+
+/// Tests whether trajectory segment `p_prev -> p_curr` intersects tripwire segment `l_start -> l_end`
+/// and returns the crossing direction (`AToB` when `(L_end - L_start) x (P_curr - P_prev) > 0`, else `BToA`).
+pub fn classify_segment_crossing(
+    l_start: (f32, f32),
+    l_end: (f32, f32),
+    p_prev: (f32, f32),
+    p_curr: (f32, f32),
+) -> Option<LineDirection> {
+    let lx = l_end.0 - l_start.0;
+    let ly = l_end.1 - l_start.1;
+    let px = p_curr.0 - p_prev.0;
+    let py = p_curr.1 - p_prev.1;
+
+    let denom = cross_2d(lx, ly, px, py);
+    if denom.abs() < 1e-5 {
+        return None;
+    }
+
+    // Solve L_start + t * L = P_prev + u * P
+    let dx = p_prev.0 - l_start.0;
+    let dy = p_prev.1 - l_start.1;
+    let t = cross_2d(dx, dy, px, py) / denom;
+    let u = cross_2d(dx, dy, lx, ly) / denom;
+
+    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+        if denom > 0.0 {
+            Some(LineDirection::AToB)
+        } else {
+            Some(LineDirection::BToA)
+        }
+    } else {
+        None
     }
 }
 
@@ -517,6 +606,7 @@ mod tests {
             objects: Default::default(),
             review: Default::default(),
             zones: Default::default(),
+            lines: Default::default(),
         };
         cam_cfg.detect.min_initialized = 2;
         cam_cfg.detect.stationary.threshold = 10;
@@ -617,5 +707,84 @@ mod tests {
             &empty,
             &z_driveway
         ));
+    }
+
+    #[test]
+    fn directional_tripwire_line_crossing_detects_a_to_b_b_to_a_and_non_crossing() {
+        let l_start = (100.0, 200.0);
+        let l_end = (500.0, 200.0);
+
+        // Moving downward across horizontal line (y: 150 -> 250): (400, 0) x (0, 100) = +40000 => AToB
+        assert_eq!(
+            classify_segment_crossing(l_start, l_end, (300.0, 150.0), (300.0, 250.0)),
+            Some(LineDirection::AToB)
+        );
+
+        // Moving upward across horizontal line (y: 250 -> 150): (400, 0) x (0, -100) = -40000 => BToA
+        assert_eq!(
+            classify_segment_crossing(l_start, l_end, (300.0, 250.0), (300.0, 150.0)),
+            Some(LineDirection::BToA)
+        );
+
+        // Parallel movement above line does not intersect
+        assert_eq!(
+            classify_segment_crossing(l_start, l_end, (150.0, 150.0), (450.0, 150.0)),
+            None
+        );
+
+        // Verify ByteTracker records crossed_lines and promotes to entered_zones
+        let mut cam_cfg = CameraConfig {
+            enabled: true,
+            ffmpeg: Default::default(),
+            live: Default::default(),
+            detect: Default::default(),
+            record: Default::default(),
+            snapshots: Default::default(),
+            motion: Default::default(),
+            objects: Default::default(),
+            review: Default::default(),
+            zones: Default::default(),
+            lines: Default::default(),
+        };
+        cam_cfg.detect.min_initialized = 2;
+        cam_cfg.lines.insert(
+            "driveway_entry".to_string(),
+            LineConfig {
+                points: [100.0, 200.0, 500.0, 200.0],
+                direction: LineDirection::AToB,
+                objects: vec!["person".to_string()],
+            },
+        );
+
+        let mut tracker = ByteTracker::new("front_door", 640, 360, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 640, 360);
+        // Frame 1: bottom_center at (300, 180)
+        let d1 = DetectionResult {
+            label: "person".to_string(),
+            score: 0.85,
+            bbox: BoundingBox::new(280, 100, 320, 180),
+            region: reg,
+        };
+        let _ = tracker.update(1000.0, &[d1], &[reg], &cam_cfg);
+
+        // Frame 2: bottom_center moves to (300, 230), crossing y=200 from A to B
+        let d2 = DetectionResult {
+            label: "person".to_string(),
+            score: 0.88,
+            bbox: BoundingBox::new(280, 150, 320, 230),
+            region: reg,
+        };
+        let (active, _) = tracker.update(1000.5, &[d2], &[reg], &cam_cfg);
+        assert_eq!(active.len(), 1);
+        assert!(
+            active[0]
+                .crossed_lines
+                .contains(&"driveway_entry".to_string())
+        );
+        assert!(
+            active[0]
+                .entered_zones
+                .contains(&"driveway_entry".to_string())
+        );
     }
 }

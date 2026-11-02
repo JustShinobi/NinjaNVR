@@ -99,6 +99,12 @@ export interface ZoneConfig {
   loitering_time?: number;
 }
 
+export interface LineConfig {
+  points: [number, number, number, number];
+  direction?: "any" | "a_to_b" | "b_to_a";
+  objects?: string[];
+}
+
 export interface CameraFfmpegInput {
   path: string;
   roles: string[];
@@ -125,6 +131,7 @@ export interface CameraConfig {
   motion: CameraMotionConfig;
   objects?: ObjectsConfig;
   zones: Record<string, ZoneConfig>;
+  lines?: Record<string, LineConfig>;
   record: RecordConfig;
   snapshots: SnapshotsConfig;
   review?: ReviewConfig;
