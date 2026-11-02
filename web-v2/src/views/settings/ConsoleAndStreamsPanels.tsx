@@ -363,6 +363,46 @@ export const ChannelsStreamsSection: React.FC<{
   const [newCamName, setNewCamName] = useState("");
   const [newCamMainUrl, setNewCamMainUrl] = useState("");
   const [newCamSubUrl, setNewCamSubUrl] = useState("");
+  const [probeBusy, setProbeBusy] = useState(false);
+  const [probeResult, setProbeResult] = useState<{
+    ok: boolean;
+    latency_ms: number;
+    streams: Array<{
+      codec_type?: string;
+      codec_name?: string;
+      codec_long_name?: string;
+      width?: number;
+      height?: number;
+      avg_frame_rate?: string;
+    }>;
+    error?: string | null;
+  } | null>(null);
+
+  const handleRunStreamProbe = async (customUrl?: string) => {
+    setProbeBusy(true);
+    try {
+      const res = await fetch("/api/streams/probe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          camera: inspectorCam,
+          url: customUrl || undefined,
+        }),
+      });
+      const data = await res.json();
+      setProbeResult(data);
+      if (data.ok) {
+        notify(`Stream probe succeeded (${data.latency_ms}ms)`);
+      } else {
+        notify(data.error || "Stream probe failed");
+      }
+    } catch {
+      notify("Failed to reach stream probe endpoint");
+    } finally {
+      setProbeBusy(false);
+    }
+  };
   const [newStreamName, setNewStreamName] = useState("");
   const [newStreamUrl, setNewStreamUrl] = useState("");
   const [showAllGo2rtc, setShowAllGo2rtc] = useState(false);
@@ -815,8 +855,74 @@ export const ChannelsStreamsSection: React.FC<{
                     ? `SONDA DE STREAM ATIVA (${inspectorCam.toUpperCase()})`
                     : `ACTIVE STREAM PROBE (${inspectorCam.toUpperCase()})`}
                 </span>
-                <span style={{ color: "var(--text-muted)" }}>FFPROBE</span>
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  disabled={probeBusy}
+                  onClick={() =>
+                    handleRunStreamProbe(activeCamCfg.ffmpeg?.inputs?.[0]?.path)
+                  }
+                >
+                  {probeBusy
+                    ? isPt
+                      ? "Testando..."
+                      : "Probing..."
+                    : isPt
+                    ? "Testar Stream"
+                    : "Test Stream"}
+                </button>
               </div>
+              {probeResult && (
+                <div
+                  className="mono"
+                  style={{
+                    padding: 8,
+                    background: "var(--bg-canvas)",
+                    border: `1px solid ${
+                      probeResult.ok ? "var(--signal-live)" : "var(--signal-alert)"
+                    }`,
+                    borderRadius: 3,
+                    fontSize: "var(--text-xs)",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 4,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      fontWeight: 700,
+                      color: probeResult.ok
+                        ? "var(--signal-live-text)"
+                        : "var(--signal-alert-text)",
+                    }}
+                  >
+                    <span>
+                      LIVE PROBE // {probeResult.ok ? "REACHABLE" : "UNREACHABLE"}
+                    </span>
+                    <span>{probeResult.latency_ms}ms</span>
+                  </div>
+                  {probeResult.error ? (
+                    <div style={{ color: "var(--signal-alert-text)" }}>
+                      {probeResult.error}
+                    </div>
+                  ) : (
+                    <div style={{ color: "var(--text-primary)" }}>
+                      {(probeResult.streams || [])
+                        .map((s) =>
+                          s.width && s.height
+                            ? `${(s.codec_name || s.codec_long_name || "H.264").toUpperCase()} ${
+                                s.width
+                              }×${s.height} @ ${s.avg_frame_rate || "N/A"}`
+                            : `${(s.codec_name || s.codec_long_name || "AAC").toUpperCase()} AUDIO`
+                        )
+                        .join(" · ") || "Stream connected"}
+                    </div>
+                  )}
+                </div>
+              )}
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
                 {(ffprobeInfo || []).map((probe, pIdx) => {
                   const streams = probe.stdout?.streams || [];
