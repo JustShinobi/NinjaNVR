@@ -141,7 +141,7 @@ impl VisionPipeline {
 
         let mut motion_detector = SimdMotionDetector::new(width, height, cam_cfg.motion.clone());
         let mut tracker = ByteTracker::new(&camera, width, height, &cam_cfg);
-        let (model_w, model_h, bgr_order) = self.detector.model_dimensions();
+        let (model_w, model_h, _) = self.detector.model_dimensions();
         let mut tensor_buf = vec![0u8; (model_w * model_h * 3) as usize];
         let mut active_review: Option<ActiveReviewState> = None;
         let mut track_snapshots: HashMap<String, TrackPersistSnapshot> = HashMap::new();
@@ -240,6 +240,11 @@ impl VisionPipeline {
                     let motion_px: u32 = motion_boxes.iter().map(|b| b.area()).sum();
 
                     // 2. Dynamic Region Cropping & AI Object Detection (only when motion or non-stationary objects exist)
+                    let (model_w, model_h, bgr_order) = self.detector.model_dimensions();
+                    let needed_tensor_len = (model_w * model_h * 3) as usize;
+                    if tensor_buf.len() != needed_tensor_len {
+                        tensor_buf.resize(needed_tensor_len, 0);
+                    }
                     let tracked_boxes = tracker.non_stationary_boxes(&motion_boxes);
                     let regions = compute_inference_regions(
                         width,

@@ -379,13 +379,21 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/profile", get(api_profile))
         .route("/profile/active", get(api_profile_active))
         .route("/profiles", get(api_profiles))
-        .route("/users", get(api_users))
+        .route("/users", get(api_users).post(api_user_create))
+        .route("/users/{username}", delete(api_user_delete))
+        .route("/users/{username}/password", put(api_user_password))
+        .route("/users/{username}/role", put(api_user_role))
         .route("/config", get(api_config))
         .route("/config/raw", get(api_config_raw))
         .route("/config/raw_paths", get(api_empty_array))
         .route("/config/save", post(api_config_save))
+        .route(
+            "/config/structured",
+            post(api_config_structured).put(api_config_structured),
+        )
         .route("/config/set", put(api_config_set))
         .route("/config/schema.json", get(api_config_schema))
+        .route("/detectors/catalog", get(api_detectors_catalog))
         .route("/ffmpeg/presets", get(api_ffmpeg_presets))
         .route("/ffprobe", get(api_ffprobe))
         .route("/keyframe_analysis", get(api_keyframe_analysis))
@@ -721,15 +729,31 @@ async fn auth_gate_middleware(
             let cfg = state.config.read().await;
             (cfg.auth.cookie_name.clone(), cfg.auth.enabled)
         };
-        if auth_enabled
-            && extract_authenticated_user(&state, &jar, req.headers(), &cookie_name, true).is_none()
-        {
-            state.log_hub.push_nginx(&method, &path, 401);
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "message": "Unauthorized" })),
-            )
-                .into_response();
+        if auth_enabled {
+            let Some((_user, role)) =
+                extract_authenticated_user(&state, &jar, req.headers(), &cookie_name, true)
+            else {
+                state.log_hub.push_nginx(&method, &path, 401);
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "message": "Unauthorized" })),
+                )
+                    .into_response();
+            };
+
+            let is_admin_only = path.starts_with("/api/config/save")
+                || path.starts_with("/api/config/structured")
+                || path.starts_with("/api/config/set")
+                || path.starts_with("/api/restart")
+                || (path.starts_with("/api/users") && method != "GET");
+            if is_admin_only && !role.eq_ignore_ascii_case("admin") {
+                state.log_hub.push_nginx(&method, &path, 403);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "message": "Admin role required" })),
+                )
+                    .into_response();
+            }
         }
     }
     let resp = next.run(req).await;
@@ -949,6 +973,128 @@ async fn api_users(State(state): State<AppState>) -> Json<Value> {
     Json(Value::Array(users))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateUserBody {
+    pub username: String,
+    pub password: String,
+    #[serde(default = "default_admin_role")]
+    pub role: String,
+}
+
+fn default_admin_role() -> String {
+    "admin".to_string()
+}
+
+async fn api_user_create(
+    State(state): State<AppState>,
+    Json(body): Json<CreateUserBody>,
+) -> Response {
+    let iterations = state.config.read().await.auth.hash_iterations;
+    match state
+        .db
+        .create_user(&body.username, &body.password, &body.role, iterations)
+    {
+        Ok(()) => Json(json!({
+            "success": true,
+            "message": format!("User '{}' created", body.username.trim()),
+            "users": state.db.list_users().unwrap_or_default()
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateUserPasswordBody {
+    pub password: String,
+}
+
+async fn api_user_password(
+    State(state): State<AppState>,
+    AxumPath(username): AxumPath<String>,
+    Json(body): Json<UpdateUserPasswordBody>,
+) -> Response {
+    let iterations = state.config.read().await.auth.hash_iterations;
+    match state
+        .db
+        .update_user_password(&username, &body.password, iterations)
+    {
+        Ok(true) => Json(json!({
+            "success": true,
+            "message": format!("Password updated for '{username}'")
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "User not found" })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateUserRoleBody {
+    pub role: String,
+}
+
+async fn api_user_role(
+    State(state): State<AppState>,
+    AxumPath(username): AxumPath<String>,
+    Json(body): Json<UpdateUserRoleBody>,
+) -> Response {
+    match state.db.update_user_role(&username, &body.role) {
+        Ok(true) => Json(json!({
+            "success": true,
+            "message": format!("Role updated for '{username}'"),
+            "users": state.db.list_users().unwrap_or_default()
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "User not found" })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_user_delete(
+    State(state): State<AppState>,
+    AxumPath(username): AxumPath<String>,
+) -> Response {
+    match state.db.delete_user(&username) {
+        Ok(true) => Json(json!({
+            "success": true,
+            "message": format!("User '{username}' deleted"),
+            "users": state.db.list_users().unwrap_or_default()
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "User not found" })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 async fn api_config(State(state): State<AppState>) -> Json<Value> {
     let cfg = state.config.read().await;
     Json(cfg.to_frigate_api_config())
@@ -972,6 +1118,7 @@ async fn api_config_save(State(state): State<AppState>, body: String) -> Respons
                     .into_response();
             }
             let _ = new_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH);
+            state.detector.reload(&new_cfg);
             *state.config.write().await = new_cfg;
             Json(json!({ "success": true, "message": "Config saved successfully" })).into_response()
         }
@@ -983,8 +1130,43 @@ async fn api_config_save(State(state): State<AppState>, body: String) -> Respons
     }
 }
 
+async fn api_config_structured(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let mut next_cfg = { state.config.read().await.clone() };
+    if let Err(err) = next_cfg.apply_structured_json(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": format!("{err:#}") })),
+        )
+            .into_response();
+    }
+    if let Err(err) = std::fs::write(&next_cfg.config_path, &next_cfg.raw_yaml) {
+        error!("Failed to persist structured config.yml: {err:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response();
+    }
+    let _ = next_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH);
+    state.detector.reload(&next_cfg);
+    let api_cfg = next_cfg.to_frigate_api_config();
+    let raw_yaml = next_cfg.raw_yaml.clone();
+    *state.config.write().await = next_cfg;
+    Json(json!({
+        "success": true,
+        "message": "Structured configuration saved",
+        "raw_yaml": raw_yaml,
+        "config": api_cfg
+    }))
+    .into_response()
+}
+
 async fn api_config_set() -> Json<Value> {
     Json(json!({ "success": true, "message": "Config updated" }))
+}
+
+async fn api_detectors_catalog(State(state): State<AppState>) -> Json<Value> {
+    Json(serde_json::to_value(state.detector.runtime_catalog()).unwrap_or_else(|_| json!({})))
 }
 
 async fn api_ffmpeg_presets() -> Json<Value> {
@@ -2675,7 +2857,92 @@ version: 0.18-0
         assert_eq!(resp_exp_err.status(), StatusCode::BAD_REQUEST);
         assert!(state.db.query_exports().unwrap().is_empty());
 
-        // 7. Test enforce_auth=true router blocks unauthenticated /api/config with 401
+        // 7. Test /api/config/structured preserves scrubbed credentials and persists config.yml
+        let mut cfg_patch = val.clone();
+        cfg_patch["cameras"]["front_door"]["detect"]["fps"] = json!(8);
+        let resp_struct = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/structured")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&cfg_patch).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_struct.status(), StatusCode::OK);
+        let struct_body: Value =
+            serde_json::from_slice(&to_bytes(resp_struct.into_body(), 65536).await.unwrap())
+                .unwrap();
+        assert_eq!(struct_body["success"], true);
+        assert_eq!(
+            struct_body["config"]["cameras"]["front_door"]["detect"]["fps"],
+            8
+        );
+        let on_disk_yaml = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(on_disk_yaml.contains("admin:supersecret@192.0.2.10:554/stream1"));
+
+        // 8. Test /api/users CRUD endpoints
+        let resp_create_user = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/users")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"username":"operator2","password":"strong-password","role":"viewer"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_create_user.status(), StatusCode::OK);
+
+        let resp_role = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/users/operator2/role")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"role":"admin"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_role.status(), StatusCode::OK);
+
+        let resp_pw = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/users/operator2/password")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"password":"updated-password"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_pw.status(), StatusCode::OK);
+
+        let resp_del_user = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/users/operator2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_del_user.status(), StatusCode::OK);
+
+        // 9. Test enforce_auth=true router blocks unauthenticated /api/config with 401
         let auth_app = build_router_with_auth(state, true);
         let resp = auth_app
             .clone()

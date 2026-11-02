@@ -745,14 +745,14 @@ fn default_zone_inertia() -> u32 {
 pub struct CameraFfmpegConfig {
     #[serde(default)]
     pub inputs: Vec<CameraFfmpegInput>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub output_args: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraFfmpegInput {
     pub path: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub input_args: Value,
     #[serde(default)]
     pub roles: Vec<String>,
@@ -961,6 +961,19 @@ impl NinjaConfig {
                         "mask": f.mask
                     }),
                 );
+            }
+            for (label, f) in &cam.objects.filters {
+                filters_json.entry(label.clone()).or_insert_with(|| {
+                    json!({
+                        "min_area": f.min_area,
+                        "max_area": f.max_area,
+                        "min_ratio": f.min_ratio,
+                        "max_ratio": f.max_ratio,
+                        "threshold": f.threshold,
+                        "min_score": f.min_score,
+                        "mask": f.mask
+                    })
+                });
             }
 
             cameras_json.insert(
@@ -1215,6 +1228,8 @@ impl NinjaConfig {
                 "port": self.mqtt.port,
                 "topic_prefix": self.mqtt.topic_prefix,
                 "client_id": self.mqtt.client_id,
+                "user": self.mqtt.user,
+                "has_password": self.mqtt.password.as_ref().is_some_and(|p| !p.is_empty()),
                 "stats_interval": self.mqtt.stats_interval,
                 "qos": 0
             },
@@ -1288,11 +1303,27 @@ impl NinjaConfig {
                 "height": self.detect.height,
                 "width": self.detect.width,
                 "fps": self.detect.fps,
+                "min_initialized": self.detect.min_initialized,
+                "max_disappeared": self.detect.max_disappeared,
                 "stationary": {
+                    "interval": self.detect.stationary.interval,
+                    "threshold": self.detect.stationary.threshold,
                     "max_frames": { "objects": {} },
-                    "classifier": true
+                    "classifier": self.detect.stationary.classifier
                 },
                 "annotation_offset": 0
+            },
+            "motion": {
+                "enabled": self.motion.enabled,
+                "threshold": self.motion.threshold,
+                "lightning_threshold": self.motion.lightning_threshold,
+                "improve_contrast": self.motion.improve_contrast,
+                "contour_area": self.motion.contour_area,
+                "delta_alpha": self.motion.delta_alpha,
+                "frame_alpha": self.motion.frame_alpha,
+                "frame_height": self.motion.frame_height,
+                "mask": self.motion.mask,
+                "mqtt_off_delay": 30
             },
             "ffmpeg": {
                 "path": "default",
@@ -1314,8 +1345,8 @@ impl NinjaConfig {
             },
             "objects": {
                 "track": self.objects.track,
-                "filters": {},
-                "mask": {},
+                "filters": serde_json::to_value(&self.objects.filters).unwrap_or_else(|_| json!({})),
+                "mask": self.objects.mask,
                 "genai": {
                     "enabled": false,
                     "use_snapshot": false,
@@ -1437,6 +1468,211 @@ impl NinjaConfig {
             "profiles": {},
             "plus": { "enabled": false }
         })
+    }
+
+    /// Collects all raw URL strings currently stored in `cameras.*.ffmpeg.inputs` and `go2rtc.streams`.
+    pub fn collect_original_urls(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for cam in self.cameras.values() {
+            for inp in &cam.ffmpeg.inputs {
+                if !inp.path.is_empty() {
+                    out.push(inp.path.clone());
+                }
+            }
+        }
+        fn collect_from_val(v: &Value, out: &mut Vec<String>) {
+            match v {
+                Value::String(s) if s.contains("://") => out.push(s.clone()),
+                Value::Array(arr) => {
+                    for item in arr {
+                        collect_from_val(item, out);
+                    }
+                }
+                Value::Object(map) => {
+                    for val in map.values() {
+                        collect_from_val(val, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for val in self.go2rtc.streams.values() {
+            collect_from_val(val, &mut out);
+        }
+        out
+    }
+
+    /// Serializes this `NinjaConfig` to a clean YAML string and validates it can be re-parsed.
+    pub fn to_clean_yaml(&self) -> Result<String> {
+        let yaml_str =
+            serde_yaml::to_string(self).context("failed to serialize NinjaConfig to YAML")?;
+        Ok(yaml_str)
+    }
+
+    /// Applies a partial or full structured JSON configuration update (from UI v2),
+    /// automatically preserving any scrubbed RTSP/MQTT credentials and refreshing `raw_yaml`.
+    pub fn apply_structured_json(&mut self, patch: &Value) -> Result<()> {
+        let originals = self.collect_original_urls();
+        let restored = restore_scrubbed_json(patch, &originals);
+        let Some(obj) = restored.as_object() else {
+            anyhow::bail!("structured config payload must be a JSON object");
+        };
+
+        if let Some(mqtt_val) = obj.get("mqtt") {
+            let prev_pass = self.mqtt.password.clone();
+            let clear_pass = mqtt_val
+                .get("clear_password")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut next_mqtt: MqttConfig =
+                serde_json::from_value(mqtt_val.clone()).context("invalid mqtt config")?;
+            if clear_pass {
+                next_mqtt.password = None;
+            } else if next_mqtt
+                .password
+                .as_deref()
+                .map(|p| p.is_empty() || p == "***")
+                .unwrap_or(true)
+            {
+                next_mqtt.password = prev_pass;
+            }
+            self.mqtt = next_mqtt;
+        }
+
+        if let Some(auth_val) = obj.get("auth") {
+            self.auth = serde_json::from_value(auth_val.clone()).context("invalid auth config")?;
+        }
+        if let Some(tls_val) = obj.get("tls") {
+            self.tls = serde_json::from_value(tls_val.clone()).context("invalid tls config")?;
+        }
+        if let Some(db_val) = obj.get("database") {
+            self.database =
+                serde_json::from_value(db_val.clone()).context("invalid database config")?;
+        }
+        if let Some(det_val) = obj.get("detectors") {
+            let next_dets: BTreeMap<String, DetectorEntryConfig> =
+                serde_json::from_value(det_val.clone()).context("invalid detectors config")?;
+            if !next_dets.is_empty() {
+                self.detectors = next_dets;
+            }
+        }
+        if let Some(model_val) = obj.get("model") {
+            self.model =
+                serde_json::from_value(model_val.clone()).context("invalid model config")?;
+        }
+        if let Some(detect_val) = obj.get("detect") {
+            self.detect =
+                serde_json::from_value(detect_val.clone()).context("invalid detect config")?;
+        }
+        if let Some(motion_val) = obj.get("motion") {
+            self.motion =
+                serde_json::from_value(motion_val.clone()).context("invalid motion config")?;
+        }
+        if let Some(objects_val) = obj.get("objects") {
+            self.objects =
+                serde_json::from_value(objects_val.clone()).context("invalid objects config")?;
+        }
+        if let Some(record_val) = obj.get("record") {
+            self.record =
+                serde_json::from_value(record_val.clone()).context("invalid record config")?;
+        }
+        if let Some(snap_val) = obj.get("snapshots") {
+            self.snapshots =
+                serde_json::from_value(snap_val.clone()).context("invalid snapshots config")?;
+        }
+        if let Some(rev_val) = obj.get("review") {
+            self.review =
+                serde_json::from_value(rev_val.clone()).context("invalid review config")?;
+        }
+        if let Some(go2rtc_val) = obj.get("go2rtc")
+            && let Some(streams_val) = go2rtc_val.get("streams")
+        {
+            self.go2rtc.streams = serde_json::from_value(streams_val.clone())
+                .context("invalid go2rtc.streams config")?;
+        }
+        if let Some(cams_val) = obj.get("cameras") {
+            let mut next_cams: BTreeMap<String, CameraConfig> =
+                serde_json::from_value(cams_val.clone()).context("invalid cameras config")?;
+            for (cam_name, cam) in next_cams.iter_mut() {
+                if cam.live.streams.is_empty() {
+                    cam.live
+                        .streams
+                        .insert("Stream 1".to_string(), format!("{cam_name}_sub"));
+                    cam.live
+                        .streams
+                        .insert("Stream 2".to_string(), cam_name.clone());
+                }
+                if cam.objects.track.is_empty() {
+                    cam.objects.track = self.objects.track.clone();
+                }
+            }
+            self.cameras = next_cams;
+        }
+
+        let clean_yaml = self.to_clean_yaml()?;
+        // Verify the generated YAML can be parsed back cleanly
+        let _ = Self::from_yaml_str(&clean_yaml, self.config_path.clone())?;
+        self.raw_yaml = clean_yaml;
+        Ok(())
+    }
+}
+
+/// Restores credentials into a scrubbed RTSP/HTTP URL (`rtsp://*:*@host/path`) if a matching original exists.
+pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
+    if !input.contains("://*:*@") && !input.contains("://*@") {
+        return input.to_string();
+    }
+    // 1. Exact scrubbed match
+    for orig in originals {
+        if scrub_rtsp_credentials(orig) == input {
+            return orig.clone();
+        }
+    }
+    // 2. Match by scheme + host authority if path was edited
+    if let Some(scheme_idx) = input.find("://") {
+        let after_scheme = &input[scheme_idx + 3..];
+        if let Some(at_idx) = after_scheme.find('@') {
+            let rest = &after_scheme[at_idx + 1..];
+            let host_end = rest.find(['/', '?', '#', ':']).unwrap_or(rest.len());
+            let target_host = &rest[..host_end];
+            for orig in originals {
+                if let Some(orig_scheme_idx) = orig.find("://") {
+                    let orig_after = &orig[orig_scheme_idx + 3..];
+                    let orig_auth_end =
+                        orig_after.find(['/', '?', '#']).unwrap_or(orig_after.len());
+                    let orig_auth = &orig_after[..orig_auth_end];
+                    if let Some(orig_at) = orig_auth.rfind('@') {
+                        let orig_creds = &orig_auth[..orig_at];
+                        let orig_host_part = &orig_auth[orig_at + 1..];
+                        let orig_host_end =
+                            orig_host_part.find(':').unwrap_or(orig_host_part.len());
+                        if &orig_host_part[..orig_host_end] == target_host {
+                            return format!("{}{}@{}", &input[..scheme_idx + 3], orig_creds, rest);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    input.to_string()
+}
+
+pub fn restore_scrubbed_json(val: &Value, originals: &[String]) -> Value {
+    match val {
+        Value::String(s) => Value::String(restore_scrubbed_url(s, originals)),
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|v| restore_scrubbed_json(v, originals))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k.clone(), restore_scrubbed_json(v, originals));
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
     }
 }
 
@@ -1621,5 +1857,64 @@ version: 0.18-0
             api_val["cameras"]["sala"]["record"]["continuous"]["days"],
             3.0
         );
+    }
+
+    #[test]
+    fn structured_update_preserves_scrubbed_credentials_and_roundtrips_yaml() {
+        let yaml = r#"
+mqtt:
+  enabled: true
+  host: 127.0.0.1
+  port: 1883
+  user: mqtt_admin
+  password: super_secret_mqtt_password
+cameras:
+  sala:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://camuser:campass@192.0.2.50:554/sub
+          roles: [detect]
+        - path: rtsp://camuser:campass@192.0.2.50:554/main
+          roles: [record]
+    detect:
+      width: 1280
+      height: 720
+      fps: 5
+go2rtc:
+  streams:
+    sala:
+      - rtsp://camuser:campass@192.0.2.50:554/main
+"#;
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let mut api_payload = cfg.to_frigate_api_config();
+
+        // Simulate UI v2 modifying camera detect FPS, adding a zone, and changing MQTT port
+        // while sending back the scrubbed URLs from GET /api/config
+        api_payload["mqtt"]["port"] = json!(1884);
+        api_payload["cameras"]["sala"]["detect"]["fps"] = json!(8);
+        api_payload["cameras"]["sala"]["zones"] = json!({
+            "porta": {
+                "coordinates": "0.1,0.1,0.5,0.1,0.5,0.8,0.1,0.8",
+                "objects": ["person"],
+                "inertia": 3,
+                "loitering_time": 0
+            }
+        });
+
+        cfg.apply_structured_json(&api_payload).unwrap();
+
+        assert_eq!(cfg.mqtt.port, 1884);
+        assert_eq!(
+            cfg.mqtt.password.as_deref(),
+            Some("super_secret_mqtt_password")
+        );
+        assert_eq!(cfg.cameras["sala"].detect.fps, 8);
+        assert!(cfg.cameras["sala"].zones.contains_key("porta"));
+        assert_eq!(
+            cfg.camera_input_for_role("sala", "record").as_deref(),
+            Some("rtsp://camuser:campass@192.0.2.50:554/main")
+        );
+        assert!(cfg.raw_yaml.contains("camuser:campass@192.0.2.50:554/main"));
     }
 }

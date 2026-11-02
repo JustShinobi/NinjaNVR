@@ -437,11 +437,13 @@ impl NinjaDatabase {
 
     pub fn list_users(&self) -> Result<Vec<Value>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare("SELECT username, role FROM user ORDER BY username")?;
+        let mut stmt =
+            conn.prepare("SELECT username, role, password_changed_at FROM user ORDER BY username")?;
         let rows = stmt.query_map([], |r| {
             Ok(json!({
                 "username": r.get::<_, String>(0)?,
                 "role": r.get::<_, Option<String>>(1)?.unwrap_or_else(|| "admin".to_string()),
+                "password_changed_at": r.get::<_, Option<String>>(2).ok().flatten(),
             }))
         })?;
         let mut out = Vec::new();
@@ -449,6 +451,131 @@ impl NinjaDatabase {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        role: &str,
+        iterations: u32,
+    ) -> Result<()> {
+        let trimmed = username.trim();
+        if trimmed.is_empty() || trimmed.len() > 30 {
+            anyhow::bail!("Username must be between 1 and 30 characters");
+        }
+        if !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        {
+            anyhow::bail!("Username may only contain letters, numbers, '_', '.', or '-'");
+        }
+        if password.is_empty() {
+            anyhow::bail!("Password cannot be empty");
+        }
+        let norm_role = match role.trim().to_ascii_lowercase().as_str() {
+            "viewer" => "viewer",
+            "admin" => "admin",
+            _ => anyhow::bail!("Role must be 'admin' or 'viewer'"),
+        };
+
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let exists: Option<String> = conn
+            .query_row(
+                "SELECT username FROM user WHERE username = ?1",
+                params![trimmed],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_some() {
+            anyhow::bail!("User '{trimmed}' already exists");
+        }
+
+        let pw_hash = hash_password(password, None, iterations.max(1000));
+        let now_str = Utc::now().to_rfc3339();
+        conn.execute(
+            r#"
+            INSERT INTO user (username, role, password_hash, notification_tokens, password_changed_at)
+            VALUES (?1, ?2, ?3, '[]', ?4)
+            "#,
+            params![trimmed, norm_role, pw_hash, now_str],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_user_password(
+        &self,
+        username: &str,
+        password: &str,
+        iterations: u32,
+    ) -> Result<bool> {
+        if password.is_empty() {
+            anyhow::bail!("Password cannot be empty");
+        }
+        let pw_hash = hash_password(password, None, iterations.max(1000));
+        let now_str = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            "UPDATE user SET password_hash = ?1, password_changed_at = ?2 WHERE username = ?3",
+            params![pw_hash, now_str, username.trim()],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn update_user_role(&self, username: &str, role: &str) -> Result<bool> {
+        let norm_role = match role.trim().to_ascii_lowercase().as_str() {
+            "viewer" => "viewer",
+            "admin" => "admin",
+            _ => anyhow::bail!("Role must be 'admin' or 'viewer'"),
+        };
+        let target = username.trim();
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        if norm_role != "admin" {
+            let other_admins: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM user WHERE COALESCE(role, 'admin') = 'admin' AND username != ?1",
+                params![target],
+                |r| r.get(0),
+            )?;
+            if other_admins == 0 {
+                anyhow::bail!("Cannot demote the last admin account");
+            }
+        }
+        let updated = conn.execute(
+            "UPDATE user SET role = ?1 WHERE username = ?2",
+            params![norm_role, target],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn delete_user(&self, username: &str) -> Result<bool> {
+        let target = username.trim();
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let target_role: Option<String> = conn
+            .query_row(
+                "SELECT COALESCE(role, 'admin') FROM user WHERE username = ?1",
+                params![target],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(role) = target_role else {
+            return Ok(false);
+        };
+        if role == "admin" {
+            let other_admins: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM user WHERE COALESCE(role, 'admin') = 'admin' AND username != ?1",
+                params![target],
+                |r| r.get(0),
+            )?;
+            if other_admins == 0 {
+                anyhow::bail!("Cannot delete the last admin account");
+            }
+        }
+        let _ = conn.execute(
+            "DELETE FROM userreviewstatus WHERE user_id = ?1",
+            params![target],
+        );
+        let deleted = conn.execute("DELETE FROM user WHERE username = ?1", params![target])?;
+        Ok(deleted > 0)
     }
 
     pub fn query_reviews(&self, filter: &ReviewFilter) -> Result<Vec<ReviewItemDto>> {
@@ -1873,6 +2000,27 @@ mod tests {
             .unwrap();
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].duration, 10.0);
+
+        // User management CRUD & last-admin guardrails
+        assert!(db.delete_user("admin").is_err());
+        assert!(db.update_user_role("admin", "viewer").is_err());
+
+        db.create_user("operator1", "op-pass-123", "viewer", 1000)
+            .unwrap();
+        let op1 = db.get_user("operator1").unwrap().unwrap();
+        assert_eq!(op1.role, "viewer");
+        assert!(verify_password("op-pass-123", &op1.password_hash));
+
+        assert!(
+            db.update_user_password("operator1", "new-pass-456", 1000)
+                .unwrap()
+        );
+        let op1_updated = db.get_user("operator1").unwrap().unwrap();
+        assert!(verify_password("new-pass-456", &op1_updated.password_hash));
+
+        assert!(db.update_user_role("operator1", "admin").unwrap());
+        assert!(db.delete_user("operator1").unwrap());
+        assert!(db.get_user("operator1").unwrap().is_none());
 
         let _ = std::fs::remove_file(&tmp);
     }
