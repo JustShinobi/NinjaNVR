@@ -457,6 +457,14 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [useFallbackMp4, setUseFallbackMp4] = useState(false);
+  const [userMuted, setUserMuted] = useState<boolean>(() => {
+    if (typeof window !== "undefined") {
+      const saved = window.sessionStorage?.getItem("ninjanvr_vod_muted");
+      if (saved === "false") return false;
+      if (saved === "true") return true;
+    }
+    return muted;
+  });
 
   const safeStart = Math.floor(startTime);
   const safeEnd = Math.ceil(Math.max(endTime, startTime + 12));
@@ -483,8 +491,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       hls.attachMedia(videoEl);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         videoEl.playbackRate = playbackRate;
+        videoEl.muted = userMuted;
         if (autoPlay) {
-          videoEl.play().catch(() => {});
+          videoEl.play().catch(() => {
+            videoEl.muted = true;
+            setUserMuted(true);
+            videoEl.play().catch(() => {});
+          });
         }
       });
       hls.on(Hls.Events.ERROR, (_ev, data) => {
@@ -521,8 +534,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         controls={controls}
         autoPlay={autoPlay}
         playsInline
-        muted={muted}
+        muted={userMuted}
         loop
+        onVolumeChange={(e) => {
+          const next = e.currentTarget.muted;
+          setUserMuted(next);
+          window.sessionStorage?.setItem("ninjanvr_vod_muted", String(next));
+        }}
         onTimeUpdate={(e) => onTimeUpdate?.(e.currentTarget.currentTime)}
         style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
       />
@@ -535,7 +553,12 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       controls={controls}
       autoPlay={autoPlay}
       playsInline
-      muted={muted}
+      muted={userMuted}
+      onVolumeChange={(e) => {
+        const next = e.currentTarget.muted;
+        setUserMuted(next);
+        window.sessionStorage?.setItem("ninjanvr_vod_muted", String(next));
+      }}
       onTimeUpdate={(e) => onTimeUpdate?.(e.currentTarget.currentTime)}
       style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
     />
