@@ -1499,7 +1499,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "ninjanvr-comms"
-version = "0.9.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "ninjanvr-config",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "ninjanvr-config"
-version = "0.9.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "ninjanvr-db"
-version = "0.9.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "ninjanvr-infer"
-version = "0.9.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "ninjanvr-media"
-version = "0.9.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1570,7 +1570,7 @@ dependencies = [
 
 [[package]]
 name = "ninjanvr-server"
-version = "0.9.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1610,7 +1610,7 @@ dependencies = [
 
 [[package]]
 name = "ninjanvr-track"
-version = "0.9.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "ninjanvr-config",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "ninjanvr-vision"
-version = "0.9.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "image",
@@ -1633,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "ninjanvr-vod"
-version = "0.9.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "bytes",
