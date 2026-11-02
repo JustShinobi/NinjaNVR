@@ -1,9 +1,9 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Camera, Check, Eye, Play } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
 import { RecordingSegment, ReviewItem } from "../types/nvr";
-import { HudPosition, formatTs } from "../utils/format";
+import { HudPosition, SpotlightFilter, formatTs } from "../utils/format";
 import { LiveMsePlayer, VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 
@@ -34,6 +34,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
   const liveLayout = useNvrStore((s) => s.liveLayout);
   const setLiveLayout = useNvrStore((s) => s.setLiveLayout);
+  const spotlightFilter = useNvrStore((s) => s.spotlightFilter);
+  const setSpotlightFilter = useNvrStore((s) => s.setSpotlightFilter);
+  const spotlightHoldSec = useNvrStore((s) => s.spotlightHoldSec);
   const selectedCamera = useNvrStore((s) => s.selectedCamera);
   const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
   const hudPosition = useNvrStore((s) => s.hudPosition);
@@ -49,6 +52,50 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const config = useNvrStore((s) => s.config);
   const stats = useNvrStore((s) => s.stats);
   const cameraActivity = useNvrStore((s) => s.cameraActivity);
+
+  const lastActiveRef = useRef<Record<string, number>>({});
+  const [nowTick, setNowTick] = useState<number>(() => Math.floor(Date.now() / 1000));
+
+  useEffect(() => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    for (const cam of cameraNames) {
+      const act = cameraActivity[cam];
+      if (!act) continue;
+      const objs = act.objects || [];
+      let matches = false;
+      if (spotlightFilter === "all_activity") {
+        matches = Boolean(act.motion) || objs.length > 0;
+      } else if (spotlightFilter === "objects") {
+        matches = objs.some((o) => !o.stationary);
+      } else if (spotlightFilter === "person") {
+        matches = objs.some((o) => o.label === "person" && !o.stationary);
+      } else if (spotlightFilter === "vehicle") {
+        matches = objs.some(
+          (o) =>
+            ["car", "truck", "motorcycle", "bicycle"].includes(o.label) && !o.stationary
+        );
+      }
+      if (matches) {
+        lastActiveRef.current[cam] = nowSec;
+      }
+    }
+    setNowTick(nowSec);
+  }, [cameraActivity, cameraNames, spotlightFilter]);
+
+  useEffect(() => {
+    if (liveLayout !== "spotlight") return;
+    const tmr = window.setInterval(() => {
+      setNowTick(Math.floor(Date.now() / 1000));
+    }, 1000);
+    return () => window.clearInterval(tmr);
+  }, [liveLayout]);
+
+  const spotlightPromotedCams = cameraNames.filter(
+    (cam) => nowTick - (lastActiveRef.current[cam] || 0) <= spotlightHoldSec
+  );
+  const spotlightActiveCams =
+    spotlightPromotedCams.length > 0 ? spotlightPromotedCams : [selectedCamera];
+  const spotlightIdleCams = cameraNames.filter((c) => !spotlightActiveCams.includes(c));
 
   return (
     <>
@@ -75,7 +122,39 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           >
             {t.live.singleFull}
           </button>
-          {liveLayout !== "2x2" && (
+          <button
+            className={`nvr-btn ${liveLayout === "spotlight" ? "active" : ""}`}
+            onClick={() => {
+              setLiveLayout("spotlight");
+              setTimeShiftTs(null);
+            }}
+            title="Zero-CPU Dynamic Birdseye: automatically enlarges cameras with active motion or tracked objects"
+          >
+            Spotlight
+          </button>
+          {liveLayout === "spotlight" && (
+            <>
+              <span className="nvr-divider" aria-hidden="true" />
+              {(
+                [
+                  ["all_activity", "All Motion"],
+                  ["objects", "Active Objects"],
+                  ["person", "Person Only"],
+                  ["vehicle", "Vehicles"],
+                ] as Array<[SpotlightFilter, string]>
+              ).map(([flt, lbl]) => (
+                <button
+                  key={flt}
+                  className={`nvr-btn mono ${spotlightFilter === flt ? "active" : ""}`}
+                  style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                  onClick={() => setSpotlightFilter(flt)}
+                >
+                  {lbl}
+                </button>
+              ))}
+            </>
+          )}
+          {liveLayout !== "2x2" && liveLayout !== "spotlight" && (
             <>
               <span className="nvr-divider" aria-hidden="true" />
               {cameraNames.map((cam) => (
@@ -405,6 +484,89 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               </div>
             );
           })}
+        </div>
+      )}
+
+      {liveLayout === "spotlight" && (
+        <div className="nvr-focus-layout">
+          <div
+            className={
+              spotlightActiveCams.length > 1 ? "nvr-matrix-2x2" : "nvr-focus-stage"
+            }
+            style={{ flex: 1, minHeight: 0 }}
+          >
+            {spotlightActiveCams.map((cam) => {
+              const camCfg = config?.cameras?.[cam];
+              const camStat = stats?.cameras?.[cam];
+              const act = cameraActivity[cam];
+              const activeLabels = (act?.objects || [])
+                .filter((o) => !o.stationary)
+                .map((o) => o.label.toUpperCase());
+              const isHeld = spotlightPromotedCams.includes(cam);
+              return (
+                <div
+                  key={cam}
+                  className="nvr-cam-tile"
+                  style={{
+                    flex: 1,
+                    outline: isHeld
+                      ? "1px solid var(--signal-alert)"
+                      : "1px solid var(--border-strong)",
+                    outlineOffset: -1,
+                  }}
+                >
+                  <LiveMsePlayer
+                    camera={cam}
+                    useMainStream={spotlightActiveCams.length === 1 || useMainStream}
+                    cameraConfig={camCfg}
+                    showVectors={showVectors}
+                    onClick={() => setSelectedCamera(cam)}
+                  />
+                  <div className={`nvr-cam-hud pos-${hudPosition}`}>
+                    <span className={`nvr-badge ${isHeld ? "alert" : "live"}`}>
+                      <span className={`nvr-dot ${isHeld ? "motion" : "live"}`} />
+                      SPOTLIGHT // {cam.toUpperCase()}
+                    </span>
+                    <span className="nvr-badge">
+                      {camStat?.camera_fps?.toFixed(1) || "5.0"} FPS
+                    </span>
+                    {activeLabels.length > 0 && (
+                      <span className="nvr-badge alert">
+                        {activeLabels.join(", ")}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {spotlightIdleCams.length > 0 && (
+            <div className="nvr-focus-dock">
+              {spotlightIdleCams.map((cam) => (
+                <div
+                  key={cam}
+                  className="nvr-cam-tile"
+                  style={{ height: "33.33%", minHeight: 140, opacity: 0.78 }}
+                >
+                  <LiveMsePlayer
+                    camera={cam}
+                    useMainStream={false}
+                    cameraConfig={config?.cameras?.[cam]}
+                    showVectors={showVectors}
+                    onClick={() => {
+                      lastActiveRef.current[cam] = Math.floor(Date.now() / 1000);
+                      setSelectedCamera(cam);
+                      setNowTick(Math.floor(Date.now() / 1000));
+                    }}
+                  />
+                  <div className={`nvr-cam-hud pos-${hudPosition}`}>
+                    <span className="nvr-badge mono">{cam.toUpperCase()} · STANDBY</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 

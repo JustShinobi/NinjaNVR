@@ -16,7 +16,8 @@ export type WorkspaceTab =
   | "zones"
   | "system";
 
-export type LiveLayoutMode = "2x2" | "focus" | "single";
+export type LiveLayoutMode = "2x2" | "focus" | "single" | "spotlight";
+export type SpotlightFilter = "all_activity" | "objects" | "person" | "vehicle";
 export type FirstWeekday = "sunday" | "monday";
 
 export function resolveInitialTab(): WorkspaceTab {
@@ -49,7 +50,12 @@ export function resolveInitialHudPosition(): HudPosition {
 export function resolveInitialLiveLayout(): LiveLayoutMode {
   if (typeof window === "undefined") return "2x2";
   const saved = window.localStorage?.getItem("ninjanvr_live_layout");
-  if (saved === "2x2" || saved === "focus" || saved === "single") {
+  if (
+    saved === "2x2" ||
+    saved === "focus" ||
+    saved === "single" ||
+    saved === "spotlight"
+  ) {
     return saved;
   }
   return "2x2";

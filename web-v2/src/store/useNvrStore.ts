@@ -8,6 +8,7 @@ import {
   FirstWeekday,
   HudPosition,
   LiveLayoutMode,
+  SpotlightFilter,
   WorkspaceTab,
   resolveInitialBool,
   resolveInitialFirstWeekday,
@@ -20,6 +21,8 @@ import {
 interface NvrRealtimeState {
   activeTab: WorkspaceTab;
   liveLayout: LiveLayoutMode;
+  spotlightFilter: SpotlightFilter;
+  spotlightHoldSec: number;
   selectedCamera: string;
   hudPosition: HudPosition;
   useMainStream: boolean;
@@ -36,6 +39,8 @@ interface NvrRealtimeState {
 
   setActiveTab: (tab: WorkspaceTab) => void;
   setLiveLayout: (layout: LiveLayoutMode) => void;
+  setSpotlightFilter: (filter: SpotlightFilter) => void;
+  setSpotlightHoldSec: (sec: number) => void;
   setSelectedCamera: (camera: string) => void;
   setHudPosition: (pos: HudPosition) => void;
   setUseMainStream: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
@@ -55,6 +60,8 @@ interface NvrRealtimeState {
 export const useNvrStore = create<NvrRealtimeState>((set) => ({
   activeTab: resolveInitialTab(),
   liveLayout: resolveInitialLiveLayout(),
+  spotlightFilter: "all_activity",
+  spotlightHoldSec: 15,
   selectedCamera: "escritorio",
   hudPosition: resolveInitialHudPosition(),
   useMainStream: resolveInitialBool("ninjanvr_use_main_stream", false),
@@ -76,6 +83,8 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
     }
     set({ liveLayout });
   },
+  setSpotlightFilter: (spotlightFilter) => set({ spotlightFilter }),
+  setSpotlightHoldSec: (spotlightHoldSec) => set({ spotlightHoldSec }),
   setSelectedCamera: (selectedCamera) => set({ selectedCamera }),
   setHudPosition: (hudPosition) => {
     if (typeof window !== "undefined") {
