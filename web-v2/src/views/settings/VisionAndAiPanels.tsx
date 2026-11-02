@@ -1700,6 +1700,61 @@ export const AiDetectionObjectsSection: React.FC<{
             />
           </div>
 
+          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt
+                  ? "Roteamento de Detector IA ([AI-07])"
+                  : "Assigned AI Detector Instance ([AI-07])"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Atribui esta câmera a um detector dedicado ou ao pool padrão."
+                  : "Routes this camera to a dedicated detector instance or the default pool."}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+              <select
+                className="nvr-select mono"
+                aria-label="Assigned AI Detector Instance"
+                value={activeDetect.detector || ""}
+                onChange={(e) =>
+                  updateDetect({ detector: e.target.value ? e.target.value : null })
+                }
+              >
+                <option value="">
+                  {isPt ? "Pool Padrão (Auto)" : "Default Pool (Auto)"}
+                </option>
+                {detKeys.map((dk) => (
+                  <option key={dk} value={dk}>
+                    {dk} ({draftConfig.detectors?.[dk]?.device || "CPU"})
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="nvr-btn mono"
+                style={{ height: 26, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                title="Add another detector worker instance to the pool"
+                onClick={() => {
+                  const nextIdx = detKeys.length + 1;
+                  const newKey = `detector0${nextIdx}`;
+                  updateDraft((next) => {
+                    if (!next.detectors) next.detectors = {};
+                    next.detectors[newKey] = {
+                      type: "openvino",
+                      device: "CPU",
+                    };
+                  });
+                  updateDetect({ detector: newKey });
+                  notify(`Added detector instance '${newKey}'`);
+                }}
+              >
+                + Detector
+              </button>
+            </div>
+          </div>
+
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             <div className="nvr-field-label">
               {isPt

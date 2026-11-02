@@ -6,6 +6,7 @@ export interface StationaryConfig {
 
 export interface CameraDetectConfig {
   enabled: boolean;
+  detector?: string | null;
   width: number;
   height: number;
   fps: number;
@@ -54,9 +55,29 @@ export interface RecordEventRetainConfig {
   retain: RetainPolicyConfig;
 }
 
+export interface StorageTiersConfig {
+  enabled: boolean;
+  hot_dir?: string | null;
+  cold_dir?: string | null;
+  migrate_after_hours?: number;
+}
+
+export interface AlertBackupConfig {
+  enabled: boolean;
+  target_dir?: string | null;
+  severities?: string[];
+  include_snapshot?: boolean;
+}
+
 export interface RecordConfig {
   enabled: boolean;
   expire_interval?: number;
+  continuous_substream?: boolean;
+  mode_tiering?: boolean;
+  max_size_gb?: number | null;
+  min_free_gb?: number | null;
+  storage_tiers?: StorageTiersConfig;
+  alert_backup?: AlertBackupConfig;
   continuous?: {
     days: number;
   };

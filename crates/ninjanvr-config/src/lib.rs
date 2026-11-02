@@ -1560,6 +1560,12 @@ impl NinjaConfig {
                         "enabled": cam.record.enabled,
                         "enabled_in_config": cam.record.enabled,
                         "expire_interval": cam.record.expire_interval,
+                        "continuous_substream": cam.record.continuous_substream,
+                        "mode_tiering": cam.record.mode_tiering,
+                        "max_size_gb": cam.record.max_size_gb,
+                        "min_free_gb": cam.record.min_free_gb,
+                        "storage_tiers": cam.record.storage_tiers,
+                        "alert_backup": cam.record.alert_backup,
                         "continuous": { "days": cam.record.continuous.days },
                         "motion": { "days": cam.record.motion.days },
                         "detections": {
@@ -1869,6 +1875,12 @@ impl NinjaConfig {
             "record": {
                 "enabled": self.record.enabled,
                 "expire_interval": self.record.expire_interval,
+                "continuous_substream": self.record.continuous_substream,
+                "mode_tiering": self.record.mode_tiering,
+                "max_size_gb": self.record.max_size_gb,
+                "min_free_gb": self.record.min_free_gb,
+                "storage_tiers": self.record.storage_tiers,
+                "alert_backup": self.record.alert_backup,
                 "continuous": { "days": self.record.continuous.days },
                 "motion": { "days": self.record.motion.days },
                 "detections": {

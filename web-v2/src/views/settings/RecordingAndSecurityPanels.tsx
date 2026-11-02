@@ -472,6 +472,222 @@ export const RecordingReviewSection: React.FC<{
               </div>
             </div>
           </div>
+
+          {/* [ST-03] Hybrid Dual-Stream Recording & [ST-02] Disk Quota Retention */}
+          <div
+            style={{
+              padding: 10,
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-accent-text)" }}>
+                {isPt
+                  ? "GRAVAÇÃO HÍBRIDA SUB/MAIN & COTA DE DISCO ([ST-02] / [ST-03])"
+                  : "HYBRID DUAL-STREAM & DISK QUOTA ([ST-02] / [ST-03])"}
+              </span>
+            </div>
+
+            <div className="nvr-field-row" style={{ padding: "2px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? "Gravação Contínua Híbrida (24/7 Substream + Eventos em Main)"
+                    : "Hybrid Dual-Stream (24/7 Substream + Main on Events)"}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Economiza até 80% de disco mantendo 24/7 no substream e promovendo eventos para 1080p/4K."
+                    : "Saves up to 80% disk space by keeping idle 24/7 segments on substream and retaining Main Stream on events."}
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={Boolean(activeRec.continuous_substream)}
+                label="Hybrid Dual-Stream Recording"
+                onChange={(v) => mutateRec((r) => (r.continuous_substream = v))}
+              />
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Cota Máxima de Disco (GB)" : "Max Disk Quota (GB)"}
+                </div>
+                <input
+                  type="number"
+                  min={0}
+                  step={5}
+                  placeholder={isPt ? "Ilimitado (0)" : "Unlimited (0)"}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeRec.max_size_gb ?? ""}
+                  onChange={(e) => {
+                    const val = e.target.value.trim();
+                    mutateRec((r) => {
+                      r.max_size_gb = val && Number(val) > 0 ? Number(val) : null;
+                    });
+                  }}
+                />
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Espaço Livre Mínimo (GB)" : "Min Free Space Guard (GB)"}
+                </div>
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  placeholder={isPt ? "Padrão (0)" : "Default (0)"}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeRec.min_free_gb ?? ""}
+                  onChange={(e) => {
+                    const val = e.target.value.trim();
+                    mutateRec((r) => {
+                      r.min_free_gb = val && Number(val) > 0 ? Number(val) : null;
+                    });
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* [ST-01] Hot-to-Cold Tiered Storage & [ST-06] Real-Time Alert Clip Backup */}
+          <div
+            style={{
+              padding: 10,
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-live-text)" }}>
+                {isPt
+                  ? "ARMAZENAMENTO EM CAMADAS HOT→COLD ([ST-01])"
+                  : "HOT-TO-COLD TIERED STORAGE ([ST-01])"}
+              </span>
+              <ToggleSwitch
+                checked={Boolean(activeRec.storage_tiers?.enabled)}
+                label="Enable Hot-to-Cold Tiered Storage"
+                onChange={(v) =>
+                  mutateRec((r) => {
+                    r.storage_tiers = {
+                      enabled: v,
+                      hot_dir: r.storage_tiers?.hot_dir || "/media/frigate/recordings",
+                      cold_dir: r.storage_tiers?.cold_dir || "/media/frigate/archive",
+                      migrate_after_hours: r.storage_tiers?.migrate_after_hours ?? 24,
+                    };
+                  })
+                }
+              />
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 8 }}>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Diretório Cold Archive (NAS/HDD)" : "Cold Archive Path (NAS/HDD)"}
+                </div>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  placeholder="/media/frigate/archive"
+                  value={activeRec.storage_tiers?.cold_dir || ""}
+                  onChange={(e) =>
+                    mutateRec((r) => {
+                      r.storage_tiers = {
+                        enabled: r.storage_tiers?.enabled ?? false,
+                        hot_dir: r.storage_tiers?.hot_dir,
+                        cold_dir: e.target.value || null,
+                        migrate_after_hours: r.storage_tiers?.migrate_after_hours ?? 24,
+                      };
+                    })
+                  }
+                />
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Migrar Após (Horas)" : "Migrate After (Hours)"}
+                </div>
+                <input
+                  type="number"
+                  min={1}
+                  max={720}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeRec.storage_tiers?.migrate_after_hours ?? 24}
+                  onChange={(e) =>
+                    mutateRec((r) => {
+                      r.storage_tiers = {
+                        enabled: r.storage_tiers?.enabled ?? false,
+                        hot_dir: r.storage_tiers?.hot_dir,
+                        cold_dir: r.storage_tiers?.cold_dir,
+                        migrate_after_hours: Number(e.target.value),
+                      };
+                    })
+                  }
+                />
+              </div>
+            </div>
+
+            <div
+              style={{
+                borderTop: "1px solid var(--border-hairline)",
+                paddingTop: 8,
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-alert-text)" }}>
+                {isPt
+                  ? "BACKUP EM TEMPO REAL DE CLIPES DE ALERTA ([ST-06])"
+                  : "REAL-TIME OFFSITE ALERT CLIP BACKUP ([ST-06])"}
+              </span>
+              <ToggleSwitch
+                checked={Boolean(activeRec.alert_backup?.enabled)}
+                label="Enable Real-Time Alert Backup"
+                onChange={(v) =>
+                  mutateRec((r) => {
+                    r.alert_backup = {
+                      enabled: v,
+                      target_dir: r.alert_backup?.target_dir || "/media/frigate/exports/backup",
+                      severities: r.alert_backup?.severities || ["alert"],
+                      include_snapshot: r.alert_backup?.include_snapshot ?? true,
+                    };
+                  })
+                }
+              />
+            </div>
+            <div>
+              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                {isPt ? "Diretório de Backup de Alertas" : "Alert Backup Target Directory"}
+              </div>
+              <input
+                className="nvr-input mono"
+                style={{ width: "100%", marginTop: 2 }}
+                placeholder="/media/frigate/exports/backup"
+                value={activeRec.alert_backup?.target_dir || ""}
+                onChange={(e) =>
+                  mutateRec((r) => {
+                    r.alert_backup = {
+                      enabled: r.alert_backup?.enabled ?? false,
+                      target_dir: e.target.value || null,
+                      severities: r.alert_backup?.severities || ["alert"],
+                      include_snapshot: r.alert_backup?.include_snapshot ?? true,
+                    };
+                  })
+                }
+              />
+            </div>
+          </div>
         </div>
       </div>
 
