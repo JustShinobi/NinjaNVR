@@ -590,9 +590,10 @@ export const App: React.FC = () => {
       if (exploreRetainedOnly && !ev.retain_indefinitely) return false;
       if (q) {
         const attrs = Array.isArray(ev.data?.attributes) ? ev.data.attributes.join(" ") : "";
+        const notes = ev.data?.notes || "";
         const hay = `${ev.id} ${ev.camera} ${ev.label} ${ev.sub_label || ""} ${(
           ev.zones || []
-        ).join(" ")} ${attrs}`.toLowerCase();
+        ).join(" ")} ${attrs} ${notes}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;

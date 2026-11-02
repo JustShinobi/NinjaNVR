@@ -1596,6 +1596,22 @@ impl NinjaDatabase {
         )?)
     }
 
+    pub fn set_event_notes(&self, id: &str, notes: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(conn.execute(
+            "UPDATE event SET data = json_set(COALESCE(data, '{}'), '$.notes', ?1) WHERE id = ?2",
+            params![notes, id],
+        )?)
+    }
+
+    pub fn set_review_notes(&self, id: &str, notes: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(conn.execute(
+            "UPDATE reviewsegment SET data = json_set(COALESCE(data, '{}'), '$.notes', ?1) WHERE id = ?2",
+            params![notes, id],
+        )?)
+    }
+
     pub fn upsert_event(&self, ev: &EventDto) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let zones_str = serde_json::to_string(&ev.zones)?;

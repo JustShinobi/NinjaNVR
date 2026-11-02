@@ -60,6 +60,28 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 }) => {
   const { t } = useI18n();
   const [showForensic, setShowForensic] = React.useState(false);
+  const [eventNoteDraft, setEventNoteDraft] = React.useState("");
+
+  React.useEffect(() => {
+    setEventNoteDraft(selectedEvent?.data?.notes || "");
+  }, [selectedEvent?.id, selectedEvent?.data?.notes]);
+
+  const handleSaveEventNote = async () => {
+    if (!selectedEvent) return;
+    const res = await fetch(`/api/events/${encodeURIComponent(selectedEvent.id)}/notes`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ notes: eventNoteDraft }),
+    });
+    if (res.ok) {
+      setSelectedEvent({
+        ...selectedEvent,
+        data: { ...(selectedEvent.data || {}), notes: eventNoteDraft },
+      });
+      notify("Saved forensic note on event");
+    }
+  };
   const [showDebugReplay, setShowDebugReplay] = React.useState(false);
   const [debugMinScore, setDebugMinScore] = React.useState(0.5);
   const [debugMinArea, setDebugMinArea] = React.useState(0);
@@ -802,6 +824,36 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     style={{ width: "100%", height: "100%", objectFit: "contain" }}
                   />
                 )}
+              </div>
+
+              <div
+                style={{
+                  padding: "6px 10px",
+                  background: "var(--bg-panel)",
+                  borderTop: "1px solid var(--border-hairline)",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  FORENSIC NOTE:
+                </span>
+                <input
+                  className="nvr-input mono"
+                  style={{ flex: 1, height: 26, fontSize: "var(--text-xs)" }}
+                  placeholder="Attach operator annotation (searchable in Explore)..."
+                  value={eventNoteDraft}
+                  onChange={(e) => setEventNoteDraft(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn primary mono"
+                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  onClick={handleSaveEventNote}
+                >
+                  Save Note
+                </button>
               </div>
             </>
           ) : (

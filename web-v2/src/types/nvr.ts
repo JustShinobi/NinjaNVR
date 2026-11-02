@@ -138,6 +138,7 @@ export interface CameraConfig {
   enabled: boolean;
   indoor?: boolean;
   webui_url?: string;
+  notes?: string;
   privacy_mask?: unknown;
   map?: CameraMapPlacement;
   ffmpeg?: CameraFfmpegConfig;
@@ -337,6 +338,7 @@ export interface ReviewItem {
     detections?: string[];
     audio?: string[];
     dbfs?: number;
+    notes?: string;
     provenance?: TriggerProvenance | null;
     metadata?: {
       potential_threat_level?: number;
@@ -366,6 +368,7 @@ export interface EventItem {
     score?: number;
     top_score?: number;
     description?: string;
+    notes?: string;
     attributes?: string[];
     box?: [number, number, number, number];
     provenance?: TriggerProvenance | null;

@@ -559,14 +559,39 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
             {activeCategory === "console" && <ConsoleUiSection notify={notify} />}
 
             {draftConfig && activeCategory === "channels" && (
-              <ChannelsStreamsSection
-                draftConfig={draftConfig}
-                updateDraft={updateDraft}
-                inspectorCam={inspectorCam}
-                setInspectorCam={switchInspectorCamera}
-                ffprobeInfo={ffprobeInfo}
-                notify={notify}
-              />
+              <>
+                <ChannelsStreamsSection
+                  draftConfig={draftConfig}
+                  updateDraft={updateDraft}
+                  inspectorCam={inspectorCam}
+                  setInspectorCam={switchInspectorCamera}
+                  ffprobeInfo={ffprobeInfo}
+                  notify={notify}
+                />
+                <div className="nvr-cfg-card" style={{ marginTop: 10 }}>
+                  <div className="nvr-cfg-card-header">
+                    <span>CAMERA TECHNICAL & MAINTENANCE NOTES // {inspectorCam.toUpperCase()}</span>
+                    <span className="mono">cameras.{inspectorCam}.notes</span>
+                  </div>
+                  <div className="nvr-cfg-card-body">
+                    <textarea
+                      className="nvr-input mono"
+                      rows={3}
+                      style={{ width: "100%", height: "auto", padding: 8, resize: "vertical" }}
+                      placeholder="PoE switch port, lens focal length, mounting height, or maintenance log..."
+                      value={draftConfig.cameras?.[inspectorCam]?.notes || ""}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        updateDraft((next) => {
+                          if (next.cameras[inspectorCam]) {
+                            next.cameras[inspectorCam].notes = val;
+                          }
+                        });
+                      }}
+                    />
+                  </div>
+                </div>
+              </>
             )}
 
             {draftConfig && activeCategory === "ai" && (

@@ -73,6 +73,27 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [excludeObjectFilter, setExcludeObjectFilter] = React.useState("none");
   const [zoneFilter, setZoneFilter] = React.useState("all");
   const [presetName, setPresetName] = React.useState("");
+  const [reviewNoteDraft, setReviewNoteDraft] = React.useState("");
+
+  React.useEffect(() => {
+    setReviewNoteDraft(activeReview?.data?.notes || "");
+  }, [activeReview?.id, activeReview?.data?.notes]);
+
+  const handleSaveReviewNote = async () => {
+    if (!activeReview) return;
+    const res = await fetch(`/api/review/${encodeURIComponent(activeReview.id)}/notes`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ notes: reviewNoteDraft }),
+    });
+    if (res.ok) {
+      setActiveReview({
+        ...activeReview,
+        data: { ...activeReview.data, notes: reviewNoteDraft },
+      });
+    }
+  };
   const [shareTtlSec, setShareTtlSec] = React.useState<number>(86400);
   const [shareCopied, setShareCopied] = React.useState(false);
   const [briefingActive, setBriefingActive] = React.useState(false);
@@ -840,6 +861,36 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   playbackRate={briefingActive ? briefingSpeed : playbackSpeed}
                   onEnded={briefingActive ? handleAdvanceBriefing : undefined}
                 />
+              </div>
+
+              <div
+                style={{
+                  padding: "6px 10px",
+                  background: "var(--bg-panel)",
+                  borderTop: "1px solid var(--border-hairline)",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                }}
+              >
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  FORENSIC NOTE:
+                </span>
+                <input
+                  className="nvr-input mono"
+                  style={{ flex: 1, height: 26, fontSize: "var(--text-xs)" }}
+                  placeholder="Attach operator annotation to this review segment..."
+                  value={reviewNoteDraft}
+                  onChange={(e) => setReviewNoteDraft(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn primary mono"
+                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  onClick={handleSaveReviewNote}
+                >
+                  Save Note
+                </button>
               </div>
 
               <TimelineScrubber

@@ -448,6 +448,10 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/review/{id}", get(api_review_by_id))
         .route("/review/{id}/preview", get(api_review_preview))
         .route("/review/{id}/viewed", delete(api_review_unview_one))
+        .route(
+            "/review/{id}/notes",
+            put(api_review_notes).post(api_review_notes),
+        )
         .route("/review_ids", get(api_review_ids))
         .route("/reviews", delete(api_reviews_delete))
         .route("/reviews/viewed", post(api_reviews_viewed))
@@ -469,6 +473,10 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/events/{id}/false_positive", put(api_event_false_positive))
         .route("/events/{id}/sub_label", post(api_event_sub_label))
         .route("/events/{id}/description", post(api_event_description))
+        .route(
+            "/events/{id}/notes",
+            put(api_event_notes).post(api_event_notes),
+        )
         .route("/events/{id}/thumbnail.webp", get(api_event_thumbnail_webp))
         .route("/events/{id}/thumbnail.jpg", get(api_event_thumbnail_jpg))
         .route("/events/{id}/snapshot.jpg", get(api_event_snapshot_jpg))
@@ -3530,6 +3538,55 @@ async fn api_event_description(
     Json(json!({ "success": true }))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct NotesBody {
+    #[serde(default)]
+    pub notes: String,
+}
+
+async fn api_event_notes(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<NotesBody>,
+) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && let Ok(Some(ev)) = state.db.get_event(&id)
+        && let Some(cam) = ev["camera"].as_str()
+        && !allowed.iter().any(|c| c == cam)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+    let updated = state.db.set_event_notes(&id, &body.notes).unwrap_or(0);
+    Json(json!({ "success": updated > 0, "notes": body.notes })).into_response()
+}
+
+async fn api_review_notes(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<NotesBody>,
+) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && let Ok(Some(rev)) = state.db.get_review_by_id(&id)
+        && !allowed.contains(&rev.camera)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+    let updated = state.db.set_review_notes(&id, &body.notes).unwrap_or(0);
+    Json(json!({ "success": updated > 0, "notes": body.notes })).into_response()
+}
+
 async fn api_event_thumbnail_webp(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -6117,6 +6174,53 @@ version: 0.18-0
             .await
             .unwrap();
         assert_eq!(resp_proxy_unconf.status(), StatusCode::NOT_FOUND);
+
+        // 23. Test forensic operator notes on Events (PUT /api/events/:id/notes) and Reviews (PUT /api/review/:id/notes)
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_note_test".to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!(["driveway"]),
+                start_time: 1700000100.0,
+                end_time: Some(1700000112.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.92),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.1, 0.1, 0.3, 0.5])),
+                data: json!({ "score": 0.92, "top_score": 0.92, "type": "object" }),
+                thumbnail: None,
+                area: Some(12000),
+                ratio: Some(0.5),
+                score: Some(0.92),
+                stationary: false,
+            })
+            .unwrap();
+        let resp_ev_notes = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/events/ev_note_test/notes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"notes":"Courier left parcel behind planter — verified by guard"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ev_notes.status(), StatusCode::OK);
+        let ev_with_note = state.db.get_event("ev_note_test").unwrap().unwrap();
+        assert_eq!(
+            ev_with_note["data"]["notes"],
+            "Courier left parcel behind planter — verified by guard"
+        );
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app
