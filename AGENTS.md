@@ -41,9 +41,11 @@ Run all commands from the repository root:
 - `make image`: Builds the multi-stage container image (`Dockerfile`) tagged with the current workspace version.
 - `make fast-ui`: Local development helper that hot-syncs `web-v2/dist` into the running K3s pod via `kubectl cp` for rapid visual preview.
 
-### Versioning, Releases & GitOps Promotion
+### Versioning, Releases & GitOps Promotion (Two-Track: `dev` ➔ `main`)
+- **Default Branch (`dev`):** All day-to-day development and pull requests target `dev`.
 - **Atomic Conventional Commits:** Always create atomic commits using [Conventional Commits](https://www.conventionalcommits.org/) (`feat(scope):`, `fix(scope):`, `perf(scope):`, `refactor(scope):`, `docs(scope):`, `ci(scope):`, `chore(scope):`).
-- **Automated Continuous Release (`.github/workflows/release.yml`):** Every push to `main` (after passing verification) automatically runs `./scripts/ci/cut-release`, which increments the version across `Cargo.toml`, `Cargo.lock`, `web-v2/package.json`, and `crates/ninjanvr-desktop/tauri.conf.json`, updates `CHANGELOG.md`, creates the Git tag (`v0.9.x`) and GitHub Release, publishes `ghcr.io/justshinobi/ninjanvr:v0.9.x` to GHCR, and bumps the GitOps manifest in `JustShinobi/k3s-gitops-prod` for ArgoCD rollout.
+- **Pre-Releases on `dev` (`.github/workflows/release.yml`):** Every push to `dev` automatically runs `./scripts/ci/cut-release`, which cuts an incremental SemVer Pre-Release (`v0.9.x-rc.N`), updates version manifests (`Cargo.toml`, `Cargo.lock`, `web-v2/package.json`, `crates/ninjanvr-desktop/tauri.conf.json`), creates a GitHub Pre-Release (`--prerelease`), publishes `ghcr.io/justshinobi/ninjanvr:v0.9.x-rc.N` + `:dev`, and bumps the GitOps manifest in `JustShinobi/k3s-gitops-prod` for immediate K3s validation.
+- **Condensed Stable Releases on `main`:** Merging `dev` into `main` automatically condenses all commits since the previous stable release into `CHANGELOG.md`, cuts the final stable tag (`v0.9.x` or `v1.0.0`), creates the `Latest` GitHub Release, publishes `:v0.9.x` + `:latest` to GHCR, promotes the stable tag to GitOps, and syncs `main` back into `dev`.
 
 ## Public Repository Privacy Guardrail
 - This repository (`https://github.com/JustShinobi/NinjaNVR`) is public open-source.

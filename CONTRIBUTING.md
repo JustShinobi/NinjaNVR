@@ -37,9 +37,16 @@ Thank you for your interest in contributing to **NinjaNVR**! This document outli
 
 ---
 
-## 📏 Commit Message Convention (Conventional Commits)
+## 📏 Branching & Commit Convention (`dev` ➔ `main`)
 
-NinjaNVR uses an automated continuous release pipeline (`./scripts/ci/cut-release` in `.github/workflows/release.yml`) to manage semantic versioning (`Cargo.toml`, `Cargo.lock`, `web-v2/package.json`, `crates/ninjanvr-desktop/tauri.conf.json`), `CHANGELOG.md` generation, and container publishing (`ghcr.io/justshinobi/ninjanvr`).
+NinjaNVR uses a two-track continuous release pipeline (`./scripts/ci/cut-release` in `.github/workflows/release.yml`):
+
+1. **`dev` Branch (Default / Pre-Release Track):**
+   - All pull requests and ongoing work target `dev`.
+   - Every push to `dev` automatically cuts an incremental Pre-Release (`vX.Y.Z-rc.N`), publishes `ghcr.io/justshinobi/ninjanvr:vX.Y.Z-rc.N` (and `:dev`), and creates a GitHub Pre-Release.
+2. **`main` Branch (Stable Release Track):**
+   - When a cycle on `dev` is ready for a stable release, `dev` is merged into `main`.
+   - Pushing to `main` automatically condenses all commits since the last stable release into `CHANGELOG.md`, cuts the stable tag (`vX.Y.Z`), publishes `ghcr.io/justshinobi/ninjanvr:vX.Y.Z` (and `:latest`), and syncs `main` back into `dev`.
 
 All commit messages and PR titles **must** follow [Conventional Commits](https://www.conventionalcommits.org/):
 

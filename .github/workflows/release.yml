@@ -3,11 +3,12 @@ name: Release & Container Publish
 on:
   push:
     branches:
+      - dev
       - main
   workflow_dispatch:
     inputs:
       publish_tag:
-        description: 'Optional explicit tag (e.g. v0.9.1) to build & publish manually'
+        description: 'Optional explicit tag (e.g. v0.9.2-rc.1 or v0.9.2) to build & publish manually'
         required: false
         type: string
 
@@ -17,12 +18,12 @@ permissions:
   packages: write
 
 concurrency:
-  group: release-main
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   cut-release:
-    name: Cut Release (Version, Tag & Changelog)
+    name: Cut Release (dev Pre-Release / main Stable)
     if: >-
       !startsWith(github.event.head_commit.message, 'chore(release):') &&
       (github.event_name == 'push' || inputs.publish_tag == '')
@@ -31,6 +32,8 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      channel_tag: ${{ steps.release.outputs.channel_tag }}
     steps:
       - name: Checkout repository with full history and tags
         uses: actions/checkout@v4
@@ -38,7 +41,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.PLATFORM_GITOPS_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Cut next SemVer release & update CHANGELOG.md
+      - name: Cut SemVer release (Pre-Release on dev, Stable on main)
         id: release
         env:
           GH_TOKEN: ${{ secrets.PLATFORM_GITOPS_TOKEN || secrets.GITHUB_TOKEN }}
@@ -59,16 +62,23 @@ jobs:
       image_tag: ${{ steps.resolve.outputs.tag }}
       image_digest: ${{ steps.build.outputs.digest }}
     steps:
-      - name: Resolve target release tag
+      - name: Resolve target release tag and channel
         id: resolve
         run: |
           if [ -n "${{ needs.cut-release.outputs.tag_name }}" ]; then
             TAG="${{ needs.cut-release.outputs.tag_name }}"
+            CHANNEL="${{ needs.cut-release.outputs.channel_tag }}"
           else
             TAG="${{ inputs.publish_tag }}"
+            if [[ "${TAG}" == *-* ]]; then
+              CHANNEL="dev"
+            else
+              CHANNEL="latest"
+            fi
           fi
-          echo "Resolved release tag: ${TAG}"
+          echo "Resolved release tag: ${TAG} (channel: ${CHANNEL})"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout release tag
         uses: actions/checkout@v4
@@ -93,9 +103,8 @@ jobs:
             ghcr.io/justshinobi/ninjanvr
           tags: |
             type=raw,value=${{ steps.resolve.outputs.tag }}
-            type=semver,pattern={{version}},value=${{ steps.resolve.outputs.tag }}
             type=sha,prefix=sha-
-            type=raw,value=latest
+            type=raw,value=${{ steps.resolve.outputs.channel }}
 
       - name: Build and push container image
         id: build
