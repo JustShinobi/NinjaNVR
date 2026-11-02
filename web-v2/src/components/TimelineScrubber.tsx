@@ -1447,7 +1447,18 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 key={z.min}
                 className={`nvr-btn mono ${zoomMin === z.min ? "active" : ""}`}
                 style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                onClick={() => setZoomMin(z.min)}
+                onClick={() => {
+                  setZoomMin(z.min);
+                  if (currentTs !== null) {
+                    const spanSec = z.min * 60;
+                    setCustomWinEnd(
+                      Math.max(
+                        dayBounds.dayStart + spanSec,
+                        Math.min(dayBounds.dayEnd, Math.round(currentTs + spanSec / 2))
+                      )
+                    );
+                  }
+                }}
               >
                 {z.label}
               </button>

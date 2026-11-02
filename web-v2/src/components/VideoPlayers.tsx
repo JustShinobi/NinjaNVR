@@ -590,6 +590,30 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const privacyMasks = extractMaskPolygons(cameraConfig?.privacy_mask);
   const zones = cameraConfig?.zones || {};
 
+  const handleCaptureLiveStill = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const vid = videoRef.current;
+    const img = imgRef.current;
+    const canvas = document.createElement("canvas");
+    if (vid && vid.videoWidth > 0 && vid.videoHeight > 0 && mseReady) {
+      canvas.width = vid.videoWidth;
+      canvas.height = vid.videoHeight;
+      const ctx = canvas.getContext("2d");
+      ctx?.drawImage(vid, 0, 0, canvas.width, canvas.height);
+    } else if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      const ctx = canvas.getContext("2d");
+      ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
+    } else {
+      return;
+    }
+    const link = document.createElement("a");
+    link.download = `${camera}_${Math.floor(Date.now() / 1000)}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  };
+
   return (
     <div
       ref={containerRef}
@@ -807,6 +831,24 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
           </svg>
         )}
       </ZoomableVideoStage>
+      <button
+        type="button"
+        className="nvr-btn nvr-tile-action mono"
+        style={{
+          position: "absolute",
+          top: 8,
+          left: 8,
+          zIndex: 14,
+          height: 22,
+          padding: "0 6px",
+          fontSize: "var(--text-xs)",
+          background: "rgba(9, 13, 20, 0.86)",
+        }}
+        title="Capture native-resolution PNG still frame"
+        onClick={handleCaptureLiveStill}
+      >
+        Capture Frame
+      </button>
     </div>
   );
 };
@@ -927,6 +969,102 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     }
   }, [playbackRate]);
 
+  const stepVodFrame = (dir: -1 | 1) => {
+    const vid = videoRef.current;
+    if (!vid) return;
+    vid.pause();
+    const frameDur = 1 / 15;
+    vid.currentTime = Math.max(0, vid.currentTime + dir * frameDur);
+  };
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      if (e.key === ",") {
+        e.preventDefault();
+        stepVodFrame(-1);
+      } else if (e.key === ".") {
+        e.preventDefault();
+        stepVodFrame(1);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  const handleCaptureVodStill = () => {
+    const vid = videoRef.current;
+    if (!vid || vid.videoWidth === 0 || vid.videoHeight === 0) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = vid.videoWidth;
+    canvas.height = vid.videoHeight;
+    const ctx = canvas.getContext("2d");
+    ctx?.drawImage(vid, 0, 0, canvas.width, canvas.height);
+    const ts = Math.floor(safeStart + (vid.currentTime || 0));
+    const link = document.createElement("a");
+    link.download = `${camera}_${ts}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  };
+
+  const vodFrameControls = (
+    <div
+      style={{
+        position: "absolute",
+        top: 8,
+        left: 8,
+        zIndex: 14,
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+      }}
+    >
+      <button
+        type="button"
+        className="nvr-btn mono"
+        style={{
+          height: 22,
+          padding: "0 6px",
+          fontSize: "var(--text-xs)",
+          background: "rgba(9, 13, 20, 0.88)",
+        }}
+        title="Step 1 frame backward (Hotkey: ,)"
+        onClick={() => stepVodFrame(-1)}
+      >
+        &lt; 1f
+      </button>
+      <button
+        type="button"
+        className="nvr-btn mono"
+        style={{
+          height: 22,
+          padding: "0 6px",
+          fontSize: "var(--text-xs)",
+          background: "rgba(9, 13, 20, 0.88)",
+        }}
+        title="Step 1 frame forward (Hotkey: .)"
+        onClick={() => stepVodFrame(1)}
+      >
+        1f &gt;
+      </button>
+      <button
+        type="button"
+        className="nvr-btn mono"
+        style={{
+          height: 22,
+          padding: "0 6px",
+          fontSize: "var(--text-xs)",
+          background: "rgba(9, 13, 20, 0.88)",
+        }}
+        title="Capture native-resolution PNG still frame"
+        onClick={handleCaptureVodStill}
+      >
+        Capture Frame
+      </button>
+    </div>
+  );
+
   const handleTimeUpdateInternal = (curSec: number, durSec: number) => {
     onTimeUpdate?.(curSec);
     if (!onEnded || endedFiredRef.current) return;
@@ -967,6 +1105,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           }}
           style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
         />
+        {vodFrameControls}
       </ZoomableVideoStage>
     );
   }
@@ -995,6 +1134,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         }}
         style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }}
       />
+      {vodFrameControls}
     </ZoomableVideoStage>
   );
 };
