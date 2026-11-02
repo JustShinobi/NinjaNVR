@@ -11,6 +11,8 @@ node_modules/
 **/__pycache__/
 *.pyc
 web-v2/dist/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
 DESIGN.md
 CLAUDE.md
 .agents/

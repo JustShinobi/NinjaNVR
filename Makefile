@@ -7,7 +7,7 @@ K3S_HOST      ?= localhost
 K8S_NAMESPACE ?= ninjanvr
 K8S_DEPLOY    ?= ninjanvr
 
-.PHONY: verify check privacy test build build-ui image fast-ui logs status help
+.PHONY: verify check privacy test build build-ui docs-dev docs-build image fast-ui logs status help
 
 verify:
 	./scripts/ci/verify
@@ -23,6 +23,12 @@ test:
 build-ui:
 	bun run --cwd web-v2 typecheck
 	bun run --cwd web-v2 build
+
+docs-dev:
+	bun run --cwd docs dev
+
+docs-build:
+	bun run --cwd docs build
 
 build: build-ui
 	cargo build --release --bin ninjanvr
