@@ -23,6 +23,16 @@ pub const NINJANVR_VERSION: &str = match option_env!("NINJANVR_RELEASE_VERSION")
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerNodeConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default, alias = "api_token_env")]
+    pub token_env: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileOverrideConfig {
     #[serde(default)]
     pub disabled_alerts_cameras: Vec<String>,
@@ -60,6 +70,8 @@ pub struct NinjaConfig {
     pub review: ReviewConfig,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileOverrideConfig>,
+    #[serde(default)]
+    pub peers: BTreeMap<String, PeerNodeConfig>,
     #[serde(default)]
     pub go2rtc: Go2RtcConfig,
     #[serde(default)]
@@ -1945,6 +1957,7 @@ impl NinjaConfig {
             },
             "camera_groups": {},
             "profiles": {},
+            "peers": self.peers,
             "plus": { "enabled": false }
         })
     }
@@ -2091,6 +2104,10 @@ impl NinjaConfig {
         if let Some(rev_val) = obj.get("review") {
             self.review =
                 serde_json::from_value(rev_val.clone()).context("invalid review config")?;
+        }
+        if let Some(peers_val) = obj.get("peers") {
+            self.peers =
+                serde_json::from_value(peers_val.clone()).context("invalid peers config")?;
         }
         if let Some(go2rtc_val) = obj.get("go2rtc")
             && let Some(streams_val) = go2rtc_val.get("streams")

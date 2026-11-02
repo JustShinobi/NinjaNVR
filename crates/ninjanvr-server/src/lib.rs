@@ -430,6 +430,11 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/mcp", post(api_mcp_handler))
         .route("/debug/reprocess", post(api_debug_reprocess))
         .route("/notifications/test", post(api_notifications_test))
+        .route("/federation/nodes", get(api_federation_nodes))
+        .route(
+            "/federation/{node}/{*path}",
+            get(api_federation_proxy).post(api_federation_proxy),
+        )
         .route(
             "/camera-proxy/{camera}",
             get(api_camera_proxy_root).post(api_camera_proxy_root),
@@ -932,6 +937,7 @@ async fn auth_gate_middleware(
                                 | "mcp"
                                 | "debug"
                                 | "notifications"
+                                | "federation"
                                 | "camera-proxy"
                                 | "go2rtc"
                                 | "ws"
@@ -3020,6 +3026,152 @@ async fn api_notifications_test(State(state): State<AppState>) -> Json<Value> {
         "camera": first_cam,
         "alert_id": test_id
     }))
+}
+
+async fn api_federation_nodes(State(state): State<AppState>) -> Json<Value> {
+    let (local_cams, peers) = {
+        let cfg = state.config.read().await;
+        let cams: Vec<String> = cfg.cameras.keys().cloned().collect();
+        (cams, cfg.peers.clone())
+    };
+
+    let mut nodes = vec![json!({
+        "id": "local",
+        "name": "local",
+        "primary": true,
+        "enabled": true,
+        "online": true,
+        "version": NINJANVR_VERSION,
+        "cameras": local_cams
+    })];
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok();
+
+    for (peer_id, peer_cfg) in peers {
+        let base_url = peer_cfg.url.trim().trim_end_matches('/').to_string();
+        let mut online = false;
+        let mut version = "unknown".to_string();
+        let mut peer_cams: Vec<String> = Vec::new();
+
+        if peer_cfg.enabled
+            && !base_url.is_empty()
+            && let Some(ref c) = client
+        {
+            let mut req = c.get(format!("{base_url}/api/stats"));
+            if !peer_cfg.token_env.trim().is_empty()
+                && let Ok(tok) = std::env::var(peer_cfg.token_env.trim())
+                && !tok.trim().is_empty()
+            {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {}", tok.trim()));
+            }
+            if let Ok(resp) = req.send().await
+                && resp.status().is_success()
+                && let Ok(stats_json) = resp.json::<Value>().await
+            {
+                online = true;
+                if let Some(v) = stats_json
+                    .get("service")
+                    .and_then(|s| s.get("version"))
+                    .and_then(|v| v.as_str())
+                {
+                    version = v.to_string();
+                }
+                if let Some(cams_obj) = stats_json.get("cameras").and_then(|v| v.as_object()) {
+                    peer_cams = cams_obj.keys().cloned().collect();
+                }
+            }
+        }
+
+        nodes.push(json!({
+            "id": peer_id,
+            "name": peer_id,
+            "primary": false,
+            "enabled": peer_cfg.enabled,
+            "online": online,
+            "url": base_url,
+            "version": version,
+            "cameras": peer_cams
+        }));
+    }
+
+    Json(json!({ "nodes": nodes }))
+}
+
+async fn api_federation_proxy(
+    State(state): State<AppState>,
+    AxumPath((node, subpath)): AxumPath<(String, String)>,
+    uri: Uri,
+) -> Response {
+    let peer_opt = {
+        let cfg = state.config.read().await;
+        cfg.peers.get(&node).cloned()
+    };
+    let Some(peer_cfg) = peer_opt.filter(|p| p.enabled && !p.url.trim().is_empty()) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "message": format!("Federated peer node '{node}' is not configured or disabled")
+            })),
+        )
+            .into_response();
+    };
+
+    let base_url = peer_cfg.url.trim().trim_end_matches('/');
+    let clean_sub = subpath.trim_start_matches('/');
+    let mut target_url = if clean_sub.starts_with("api/") || clean_sub == "api" {
+        format!("{base_url}/{clean_sub}")
+    } else {
+        format!("{base_url}/api/{clean_sub}")
+    };
+    if let Some(q) = uri.query()
+        && !q.is_empty()
+    {
+        target_url.push('?');
+        target_url.push_str(q);
+    }
+
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+
+    let mut req = client.get(&target_url);
+    if !peer_cfg.token_env.trim().is_empty()
+        && let Ok(tok) = std::env::var(peer_cfg.token_env.trim())
+        && !tok.trim().is_empty()
+    {
+        req = req.header(header::AUTHORIZATION, format!("Bearer {}", tok.trim()));
+    }
+
+    match req.send().await {
+        Ok(upstream) => {
+            let status =
+                StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let content_type = upstream
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            let body_bytes = upstream.bytes().await.unwrap_or_default().to_vec();
+            (status, [(header::CONTENT_TYPE, content_type)], body_bytes).into_response()
+        }
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "success": false,
+                "node": node,
+                "message": format!("Federated peer node '{node}' unreachable: {err}")
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn api_camera_proxy_subpath(
@@ -6480,6 +6632,39 @@ version: 0.18-0
             tls_cfg.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
+
+        // 27. Test Multi-Node Federation endpoints (/api/federation/nodes and /api/federation/:node/*)
+        let resp_fed_nodes = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/federation/nodes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_fed_nodes.status(), StatusCode::OK);
+        let fed_json: Value =
+            serde_json::from_slice(&to_bytes(resp_fed_nodes.into_body(), 8192).await.unwrap())
+                .unwrap();
+        let nodes_arr = fed_json["nodes"].as_array().unwrap();
+        assert!(!nodes_arr.is_empty());
+        assert_eq!(nodes_arr[0]["id"], "local");
+        assert_eq!(nodes_arr[0]["online"], true);
+
+        // Unconfigured federated peer node returns 404 Not Found
+        let resp_fed_unconf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/federation/unknown_peer/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_fed_unconf.status(), StatusCode::NOT_FOUND);
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app

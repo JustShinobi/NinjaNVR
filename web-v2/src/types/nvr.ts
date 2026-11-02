@@ -196,6 +196,12 @@ export interface AuthConfig {
   admin_first_time_login?: boolean;
 }
 
+export interface PeerNodeConfig {
+  enabled: boolean;
+  url: string;
+  token_env?: string;
+}
+
 export interface NinjaConfigResponse {
   version: string;
   safe_mode: boolean;
@@ -218,6 +224,7 @@ export interface NinjaConfigResponse {
   go2rtc?: {
     streams: Record<string, unknown>;
   };
+  peers?: Record<string, PeerNodeConfig>;
   cameras: Record<string, CameraConfig>;
 }
 

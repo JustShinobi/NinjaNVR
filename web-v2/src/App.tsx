@@ -70,6 +70,7 @@ export const App: React.FC = () => {
   const [, setUsername] = useState("admin");
   const [loginUser, setLoginUser] = useState("admin");
   const [userRole, setUserRole] = useState<string>("admin");
+  const [selectedNode, setSelectedNode] = useState<string>("local");
   const [authProviders, setAuthProviders] = useState<{
     local_login_enabled: boolean;
     oidc?: { enabled: boolean; provider_name: string; auto_redirect: boolean };
@@ -965,6 +966,26 @@ export const App: React.FC = () => {
         </nav>
 
         <div className="nvr-header-right">
+          {config?.peers && Object.keys(config.peers).length > 0 && (
+            <select
+              className="nvr-select mono"
+              aria-label="Federated NVR Node Selector"
+              style={{ height: 26, fontSize: "var(--text-xs)" }}
+              value={selectedNode}
+              onChange={(e) => setSelectedNode(e.target.value)}
+              title="Switch between local NVR node and federated peer NVR nodes"
+            >
+              <option value="all">NODE: ALL FEDERATED</option>
+              <option value="local">NODE: LOCAL (PRIMARY)</option>
+              {Object.entries(config.peers)
+                .filter(([, p]) => p.enabled)
+                .map(([peerId]) => (
+                  <option key={peerId} value={peerId}>
+                    NODE: {peerId.toUpperCase()}
+                  </option>
+                ))}
+            </select>
+          )}
           <div
             className="mono"
             style={{
