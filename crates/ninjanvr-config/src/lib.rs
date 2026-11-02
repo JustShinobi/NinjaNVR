@@ -563,9 +563,13 @@ pub struct StorageTiersConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_dir: Option<PathBuf>,
     #[serde(default = "default_migrate_after_hours")]
     pub migrate_after_hours: u32,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_camera_dir: BTreeMap<String, PathBuf>,
 }
 
 fn default_migrate_after_hours() -> u32 {
@@ -576,8 +580,10 @@ impl Default for StorageTiersConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            hot_dir: None,
             cold_dir: None,
             migrate_after_hours: default_migrate_after_hours(),
+            per_camera_dir: BTreeMap::new(),
         }
     }
 }
@@ -1610,7 +1616,8 @@ impl NinjaConfig {
                         "crop": cam.snapshots.crop,
                         "required_zones": [],
                         "retain": { "default": 10.0, "objects": {} },
-                        "quality": cam.snapshots.quality
+                        "quality": cam.snapshots.quality,
+                        "selection": cam.snapshots.selection
                     },
                     "timestamp_style": {
                         "position": "tl",

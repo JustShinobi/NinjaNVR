@@ -65,6 +65,7 @@ struct ActiveReviewState {
     id: String,
     start_time: f64,
     last_activity_time: f64,
+    last_backup_time: f64,
     severity: String,
     thumb_path: String,
     thumb_time: f64,
@@ -543,21 +544,31 @@ impl VisionPipeline {
 
         let active_profile = self.comms.get_active_profile();
         let cam_rt_flags = self.comms.get_camera_flags(camera);
-        let camera_suppressed_in_profile = {
+        let (camera_suppressed_in_profile, camera_record_disabled_in_profile) = {
             let cfg_guard = self.config.read().await;
-            cfg_guard
+            let prof_cfg = cfg_guard
                 .profiles
                 .get(&active_profile)
-                .or_else(|| cfg_guard.profiles.get(&active_profile.to_ascii_uppercase()))
+                .or_else(|| cfg_guard.profiles.get(&active_profile.to_ascii_uppercase()));
+            let sup_alerts = prof_cfg
                 .map(|p| {
                     p.disabled_alerts_cameras
                         .iter()
                         .any(|c| c == camera || c == "*")
                 })
-                .unwrap_or(false)
+                .unwrap_or(false);
+            let sup_rec = prof_cfg
+                .map(|p| {
+                    p.disabled_record_cameras
+                        .iter()
+                        .any(|c| c == camera || c == "*")
+                })
+                .unwrap_or(false);
+            (sup_alerts, sup_rec)
         };
         let snapshots_active = cam_cfg.snapshots.enabled && cam_rt_flags.snapshots;
-        let record_active = cam_cfg.record.enabled && cam_rt_flags.record;
+        let record_active =
+            cam_cfg.record.enabled && cam_rt_flags.record && !camera_record_disabled_in_profile;
         for trk in active_tracks {
             let prev = track_snapshots.get(&trk.id);
             let is_new = prev.is_none();
@@ -641,7 +652,6 @@ impl VisionPipeline {
                                 {
                                     let mut hr_rgb = dyn_img.to_rgb8();
                                     if hr_rgb.width() >= det_w && hr_rgb.height() >= det_h {
-                                        apply_privacy_masks_from_value(&mut hr_rgb, &priv_mask);
                                         if draw_bbox {
                                             let projected = det_bbox.project_to_resolution(
                                                 det_w,
@@ -654,6 +664,7 @@ impl VisionPipeline {
                                                 &[(projected, [31, 119, 180])],
                                             );
                                         }
+                                        apply_privacy_masks_from_value(&mut hr_rgb, &priv_mask);
                                         if let Ok(hr_jpg) = encode_image_jpeg(&hr_rgb) {
                                             let _ = std::fs::write(&jpg_path, hr_jpg);
                                         }
@@ -777,6 +788,7 @@ impl VisionPipeline {
                     id: rev_id,
                     start_time: now,
                     last_activity_time: now,
+                    last_backup_time: now,
                     severity: track_sev.to_string(),
                     thumb_path: thumb_rel,
                     thumb_time: now,
@@ -949,7 +961,9 @@ impl VisionPipeline {
                 rev.dirty = false;
                 rev.prev_dto = Some(dto);
 
-                if is_expired {
+                let reached_60s_checkpoint = (now - rev.last_backup_time) >= 60.0;
+                if is_expired || reached_60s_checkpoint {
+                    rev.last_backup_time = now;
                     let bak_cfg = &cam_cfg.record.alert_backup;
                     if bak_cfg.enabled
                         && bak_cfg.severities.iter().any(|s| s == &rev.severity)
@@ -986,6 +1000,8 @@ impl VisionPipeline {
                             }
                         });
                     }
+                }
+                if is_expired {
                     *active_review = None;
                 }
             }

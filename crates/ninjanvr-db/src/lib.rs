@@ -406,7 +406,65 @@ impl NinjaDatabase {
             "ALTER TABLE user ADD COLUMN allowed_cameras TEXT NOT NULL DEFAULT '*'",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE recordings ADD COLUMN stream_tier TEXT NOT NULL DEFAULT 'main'",
+            [],
+        );
         Ok(())
+    }
+
+    pub fn set_recording_stream_tier(&self, id: &str, tier: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(conn.execute(
+            "UPDATE recordings SET stream_tier = ?2 WHERE id = ?1",
+            params![id, tier],
+        )?)
+    }
+
+    pub fn delete_expired_idle_main_recordings(
+        &self,
+        camera: &str,
+        idle_main_cutoff: f64,
+    ) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut to_delete = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT r.id, r.path
+                FROM recordings r
+                WHERE r.camera = ?1
+                  AND r.end_time < ?2
+                  AND r.objects = 0
+                  AND r.motion = 0
+                  AND COALESCE(r.stream_tier, 'main') = 'main'
+                ORDER BY r.start_time ASC
+                LIMIT 200
+                "#,
+            )?;
+            let rows = stmt.query_map(params![camera, idle_main_cutoff], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                to_delete.push(r?);
+            }
+        }
+        let mut paths = Vec::new();
+        if !to_delete.is_empty() {
+            let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1")?;
+            for (id, path) in to_delete {
+                del_stmt.execute(params![id])?;
+                paths.push(path);
+            }
+        }
+        tx.commit()?;
+        Ok(paths)
+    }
+
+    pub fn delete_recording_by_id(&self, id: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(conn.execute("DELETE FROM recordings WHERE id = ?1", params![id])?)
     }
 
     pub fn ensure_default_admin(&self, iterations: u32) -> Result<Option<String>> {
@@ -1779,23 +1837,32 @@ impl NinjaDatabase {
         let cutoff = (Utc::now().timestamp() - 86400) as f64;
         let mut stmt = conn.prepare(
             r#"
-            SELECT camera, COALESCE(SUM(segment_size), 0.0), COALESCE(SUM(duration), 0.0)
+            SELECT
+                camera,
+                COALESCE(SUM(segment_size), 0.0),
+                COALESCE(SUM(duration), 0.0),
+                COALESCE(SUM(CASE WHEN start_time >= ?1 THEN segment_size ELSE 0.0 END), 0.0),
+                COALESCE(SUM(CASE WHEN start_time >= ?1 THEN duration ELSE 0.0 END), 0.0)
             FROM recordings
             GROUP BY camera
             "#,
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![cutoff], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, f64>(1)?,
                 r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, f64>(4)?,
             ))
         })?;
 
         let mut out = serde_json::Map::new();
         for r in rows {
-            let (cam, total_mb, dur_s) = r?;
-            let bw_mb_hr = if dur_s > 0.0 {
+            let (cam, total_mb, dur_s, rolling_24h_mb, rolling_24h_dur_s) = r?;
+            let bw_mb_hr = if rolling_24h_dur_s > 0.0 {
+                (rolling_24h_mb / (rolling_24h_dur_s / 3600.0) * 100.0).round() / 100.0
+            } else if dur_s > 0.0 {
                 (total_mb / (dur_s / 3600.0) * 100.0).round() / 100.0
             } else {
                 0.0
@@ -1809,7 +1876,6 @@ impl NinjaDatabase {
                 }),
             );
         }
-        let _ = cutoff;
         Ok(Value::Object(out))
     }
 
@@ -2186,13 +2252,82 @@ impl NinjaDatabase {
         {
             let mut stmt = tx.prepare(
                 r#"
-                SELECT id, path, COALESCE(segment_size, 0.0)
-                FROM recordings
-                WHERE camera = ?1
-                ORDER BY start_time ASC
+                SELECT r.id, r.path, COALESCE(r.segment_size, 0.0)
+                FROM recordings r
+                WHERE r.camera = ?1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM event e
+                      WHERE e.camera = r.camera
+                        AND e.retain_indefinitely = 1
+                        AND e.start_time <= r.end_time
+                        AND COALESCE(e.end_time, e.start_time + 30.0) >= r.start_time
+                  )
+                ORDER BY r.start_time ASC
                 "#,
             )?;
             let rows = stmt.query_map(params![camera], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2).unwrap_or(0.0),
+                ))
+            })?;
+            for r in rows {
+                let (id, path, sz) = r?;
+                to_delete.push((id, path));
+                accumulated_mb += sz.max(0.001);
+                if accumulated_mb >= excess_mb {
+                    break;
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        if !to_delete.is_empty() {
+            let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1")?;
+            for (id, path) in to_delete {
+                del_stmt.execute(params![id])?;
+                paths.push(path);
+            }
+        }
+        tx.commit()?;
+        Ok(paths)
+    }
+
+    pub fn delete_global_recordings_over_quota_mb(&self, max_size_mb: f64) -> Result<Vec<String>> {
+        if max_size_mb <= 0.0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let total_mb: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(segment_size), 0.0) FROM recordings",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0.0);
+        if total_mb <= max_size_mb {
+            return Ok(Vec::new());
+        }
+        let excess_mb = total_mb - max_size_mb;
+        let tx = conn.transaction()?;
+        let mut to_delete = Vec::new();
+        let mut accumulated_mb = 0.0;
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                SELECT r.id, r.path, COALESCE(r.segment_size, 0.0)
+                FROM recordings r
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM event e
+                    WHERE e.camera = r.camera
+                      AND e.retain_indefinitely = 1
+                      AND e.start_time <= r.end_time
+                      AND COALESCE(e.end_time, e.start_time + 30.0) >= r.start_time
+                )
+                ORDER BY r.start_time ASC
+                "#,
+            )?;
+            let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,

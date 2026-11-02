@@ -1563,6 +1563,7 @@ dependencies = [
  "image",
  "ninjanvr-config",
  "ninjanvr-db",
+ "nix",
  "rand 0.10.3",
  "serde_json",
  "tokio",

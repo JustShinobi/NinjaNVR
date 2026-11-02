@@ -29,7 +29,7 @@ use ninjanvr_config::{
 use ninjanvr_db::{EventFilter, ExportRow, NinjaDatabase, ReviewFilter, verify_password};
 use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{
-    RecordingEngine, SharedActivityLedger, build_mp4_export_with_options, new_activity_ledger,
+    RecordingEngine, SharedActivityLedger, build_mp4_export_with_privacy, new_activity_ledger,
     probe_storage_writable,
 };
 use pipeline::{SharedCameraMetrics, VisionPipeline};
@@ -3469,18 +3469,38 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
             total_bw_mb_hr += v["bandwidth"].as_f64().unwrap_or(0.0);
         }
     }
+    let global_quota_mb = cfg
+        .record
+        .max_size_gb
+        .or(cfg.record.alerts.retain.max_size_gb)
+        .map(|g| g * 1024.0);
+    let effective_pool_mb = global_quota_mb.map(|q| q.min(free_mb)).unwrap_or(free_mb);
     let estimated_retention_days = if total_bw_mb_hr > 0.1 {
-        ((free_mb / (total_bw_mb_hr * 24.0)) * 10.0).round() / 10.0
+        ((effective_pool_mb / (total_bw_mb_hr * 24.0)) * 10.0).round() / 10.0
     } else {
         14.0
     };
     if let Some(obj) = cam_storage.as_object_mut() {
-        for (_cam, v) in obj.iter_mut() {
+        for (cam_key, v) in obj.iter_mut() {
             let bw = v["bandwidth"].as_f64().unwrap_or(0.0);
-            let runway = if bw > 0.1 {
-                ((free_mb / (bw * 24.0)) * 10.0).round() / 10.0
+            let cam_quota_mb = cfg
+                .cameras
+                .get(cam_key)
+                .and_then(|c| {
+                    c.record
+                        .max_size_gb
+                        .or(c.record.alerts.retain.max_size_gb)
+                        .or(c.record.detections.retain.max_size_gb)
+                })
+                .map(|g| g * 1024.0);
+            let runway = if let Some(cq_mb) = cam_quota_mb {
+                if bw > 0.1 {
+                    ((cq_mb.min(free_mb) / (bw * 24.0)) * 10.0).round() / 10.0
+                } else {
+                    14.0
+                }
             } else {
-                14.0
+                estimated_retention_days
             };
             if let Some(m) = v.as_object_mut() {
                 m.insert("estimated_retention_days".to_string(), json!(runway));
@@ -4708,9 +4728,13 @@ async fn api_export_create(
     let db_clone = state.db.clone();
     let media_dir_clone = state.media_dir.clone();
     let id_clone = id.clone();
+    let privacy_mask = {
+        let cfg = state.config.read().await;
+        cfg.cameras.get(&camera).map(|c| c.privacy_mask.clone())
+    };
     let export_res = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        build_mp4_export_with_options(
+        build_mp4_export_with_privacy(
             &db_clone,
             &media_dir_clone,
             &id_clone,
@@ -4719,6 +4743,7 @@ async fn api_export_create(
             start,
             end,
             include_audio,
+            privacy_mask.as_ref(),
         ),
     )
     .await;
@@ -4943,12 +4968,28 @@ async fn api_camera_latest_frame(
         && resp.status().is_success()
         && let Ok(bytes) = resp.bytes().await
     {
+        let priv_mask = {
+            let cfg = state.config.read().await;
+            cfg.cameras.get(&camera).map(|c| c.privacy_mask.clone())
+        };
+        let out_bytes = if let Some(ref mask) = priv_mask
+            && !mask.is_null()
+            && let Ok(dyn_img) = image::load_from_memory(&bytes)
+        {
+            let mut rgb = dyn_img.to_rgb8();
+            ninjanvr_vision::apply_privacy_masks_from_value(&mut rgb, mask);
+            ninjanvr_vision::encode_image_jpeg(&rgb)
+                .map(axum::body::Bytes::from)
+                .unwrap_or(bytes)
+        } else {
+            bytes
+        };
         return (
             [
                 (header::CONTENT_TYPE, "image/jpeg".to_string()),
                 (ts_hdr, unix_now().to_string()),
             ],
-            bytes,
+            out_bytes,
         )
             .into_response();
     }
@@ -5177,7 +5218,18 @@ async fn vod_index_m3u8(
     if recs.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match ninjanvr_vod::build_media_playlist(&recs) {
+    let resolutions: Vec<(u32, u32)> = recs
+        .iter()
+        .map(|r| {
+            let disk_path = resolve_recording_disk_path(&state.media_dir, &r.path);
+            ninjanvr_vod::probe_mp4_resolution(&disk_path).unwrap_or(if r.objects > 0 {
+                (1920, 1080)
+            } else {
+                (640, 360)
+            })
+        })
+        .collect();
+    match ninjanvr_vod::build_media_playlist_with_resolutions(&recs, Some(&resolutions)) {
         Ok(m3u8) => (
             [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
             m3u8,
@@ -5187,12 +5239,19 @@ async fn vod_index_m3u8(
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct VodInitQuery {
+    pub seg: Option<usize>,
+}
+
 async fn vod_init_mp4(
     State(state): State<AppState>,
     AxumPath((camera, start, end)): AxumPath<(String, f64, f64)>,
+    Query(q): Query<VodInitQuery>,
 ) -> Response {
     let recs = existing_recordings_for_vod(&state, &camera, start, end);
-    for rec in recs {
+    let start_idx = q.seg.unwrap_or(1).saturating_sub(1);
+    for rec in recs.into_iter().skip(start_idx) {
         let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
         if let Ok(Ok(init_bytes)) =
             tokio::task::spawn_blocking(move || ninjanvr_vod::build_init_mp4(&disk_path)).await
@@ -5337,7 +5396,9 @@ pub async fn new_app_state(
     let detector = Arc::new(AiDetectorEngine::new(&cfg));
     let comms = Arc::new(CommsHub::with_mqtt(&cfg.mqtt));
     comms.init_from_config(&cfg);
-    if let Ok(saved_prof) = std::fs::read_to_string(config_dir.join(".active_profile"))
+    let profile_file = config_dir.join(".active_profile");
+    comms.set_profile_persist_path(profile_file.clone());
+    if let Ok(saved_prof) = std::fs::read_to_string(&profile_file)
         && !saved_prof.trim().is_empty()
     {
         comms.set_active_profile(saved_prof.trim());

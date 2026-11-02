@@ -13,5 +13,6 @@ chrono.workspace = true
 rand.workspace = true
 image.workspace = true
 serde_json.workspace = true
+nix.workspace = true
 ninjanvr-config = { path = "../ninjanvr-config" }
 ninjanvr-db = { path = "../ninjanvr-db" }

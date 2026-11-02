@@ -3,6 +3,32 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use ninjanvr_db::RecordingRow;
 
+/// Probes the `(width, height)` video dimensions from an MP4 file's `vide` `tkhd` box in pure Rust.
+pub fn probe_mp4_resolution(mp4_path: &Path) -> Option<(u32, u32)> {
+    let (moov_bytes, _) = read_moov_from_file(mp4_path).ok()?;
+    let moov_boxes = iter_boxes(&moov_bytes);
+    for b in &moov_boxes {
+        if &b.box_type == b"trak" {
+            let trak_boxes = iter_boxes(b.payload);
+            let tkhd = find_box(&trak_boxes, b"tkhd")?;
+            let mdia = find_box(&trak_boxes, b"mdia")?;
+            let mdia_boxes = iter_boxes(mdia);
+            let hdlr = find_box(&mdia_boxes, b"hdlr")?;
+            if hdlr.len() >= 12 && &hdlr[8..12] == b"vide" && tkhd.len() >= 84 {
+                let n = tkhd.len();
+                let w =
+                    u32::from_be_bytes([tkhd[n - 8], tkhd[n - 7], tkhd[n - 6], tkhd[n - 5]]) >> 16;
+                let h =
+                    u32::from_be_bytes([tkhd[n - 4], tkhd[n - 3], tkhd[n - 2], tkhd[n - 1]]) >> 16;
+                if w > 0 && h > 0 {
+                    return Some((w, h));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Generates a Frigate-compatible HLS master playlist (`master.m3u8`).
 pub fn build_master_playlist() -> String {
     [

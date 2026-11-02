@@ -774,7 +774,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
                 />
               </g>
             ))}
-            {Object.entries(cameraConfig?.lines || {}).map(([lName, lCfg]) => {
+            {showVectors &&
+              Object.entries(cameraConfig?.lines || {}).map(([lName, lCfg]) => {
               const pts = lCfg.points || [0, 0, 0, 0];
               const isNorm =
                 pts[0] <= 1.0 && pts[1] <= 1.0 && pts[2] <= 1.0 && pts[3] <= 1.0;

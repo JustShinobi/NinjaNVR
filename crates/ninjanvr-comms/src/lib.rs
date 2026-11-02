@@ -73,6 +73,7 @@ pub struct CommsHub {
     mqtt_tx: mpsc::UnboundedSender<(String, Vec<u8>, bool)>,
     camera_states: Arc<RwLock<BTreeMap<String, Value>>>,
     active_profile: Arc<RwLock<String>>,
+    profile_persist_path: Arc<RwLock<Option<std::path::PathBuf>>>,
 }
 
 impl Default for CommsHub {
@@ -90,6 +91,7 @@ impl CommsHub {
             mqtt_tx,
             camera_states: Arc::new(RwLock::new(BTreeMap::new())),
             active_profile: Arc::new(RwLock::new("armed".to_string())),
+            profile_persist_path: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -101,6 +103,7 @@ impl CommsHub {
             mqtt_tx,
             camera_states: Arc::new(RwLock::new(BTreeMap::new())),
             active_profile: Arc::new(RwLock::new("armed".to_string())),
+            profile_persist_path: Arc::new(RwLock::new(None)),
         };
         if mqtt_cfg.enabled {
             let cfg_clone = mqtt_cfg.clone();
@@ -313,13 +316,20 @@ impl CommsHub {
         self.get_camera_flags(camera)
     }
 
-    /// Sets the active operational security profile (`"armed"`, `"home"`, `"disarmed"`)
+    pub fn set_profile_persist_path(&self, path: std::path::PathBuf) {
+        if let Ok(mut g) = self.profile_persist_path.write() {
+            *g = Some(path);
+        }
+    }
+
+    /// Sets the active operational security profile (`"armed"`, `"home"`, `"disarmed"`, or custom profile)
     /// and broadcasts `profile/state` over MQTT and WebSocket.
     pub fn set_active_profile(&self, profile: &str) -> String {
-        let norm = match profile.trim().to_ascii_lowercase().as_str() {
-            "home" => "home".to_string(),
-            "disarmed" | "off" => "disarmed".to_string(),
-            _ => "armed".to_string(),
+        let trimmed = profile.trim().to_ascii_lowercase();
+        let norm = match trimmed.as_str() {
+            "" => "armed".to_string(),
+            "off" => "disarmed".to_string(),
+            other => other.to_string(),
         };
         {
             let mut g = self
@@ -327,6 +337,11 @@ impl CommsHub {
                 .write()
                 .expect("active_profile lock poisoned");
             *g = norm.clone();
+        }
+        if let Ok(guard) = self.profile_persist_path.read()
+            && let Some(ref p) = *guard
+        {
+            let _ = std::fs::write(p, &norm);
         }
         self.publish_topic("profile/state", norm.clone());
         norm

@@ -271,7 +271,16 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                     : "var(--text-primary)";
                   return (
                     <tr key={mPath}>
-                      <td>{mPath}</td>
+                      <td>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span>{mPath}</span>
+                          {st.mount_type === "cold_tier" || mPath.includes("cold") ? (
+                            <span className="nvr-badge mono">COLD ARCHIVE TIER</span>
+                          ) : mPath.includes("recordings") ? (
+                            <span className="nvr-badge live mono">HOT TIER</span>
+                          ) : null}
+                        </div>
+                      </td>
                       <td>{st.mount_type}</td>
                       <td>{(st.used / 1024).toFixed(1)} GB</td>
                       <td>{(st.total / 1024).toFixed(1)} GB</td>

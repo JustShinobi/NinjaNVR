@@ -241,6 +241,7 @@ export function buildCleanYamlFromDraft(
         bounding_box: cam.snapshots?.bounding_box ?? true,
         crop: cam.snapshots?.crop ?? false,
         quality: cam.snapshots?.quality ?? 70,
+        selection: cam.snapshots?.selection || "highest_confidence",
       },
       review: cam.review || {
         alerts: {
@@ -256,6 +257,8 @@ export function buildCleanYamlFromDraft(
         },
       },
       zones: cam.zones || {},
+      lines: cam.lines || {},
+      privacy_mask: cam.privacy_mask || [],
     };
   }
 
