@@ -97,6 +97,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
             <option value="cat">CAT</option>
             <option value="dog">DOG</option>
             <option value="car">CAR</option>
+            <option value="audio">AUDIO</option>
           </select>
           <button
             className={`nvr-btn ${exploreRetainedOnly ? "active" : ""}`}

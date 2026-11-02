@@ -509,7 +509,16 @@ export const App: React.FC = () => {
   const filteredReviews = useMemo(() => {
     return reviews.filter((r) => {
       if (reviewCameraFilter !== "all" && r.camera !== reviewCameraFilter) return false;
-      if (reviewSeverityFilter !== "all" && r.severity !== reviewSeverityFilter) return false;
+      if (reviewSeverityFilter !== "all") {
+        if (reviewSeverityFilter === "audio") {
+          const hasAudio =
+            (r.data?.audio && r.data.audio.length > 0) ||
+            (r.data?.objects || []).some((o) => o.toLowerCase() === "audio");
+          if (!hasAudio) return false;
+        } else if (r.severity !== reviewSeverityFilter) {
+          return false;
+        }
+      }
       if (
         reviewObjectFilter !== "all" &&
         !(r.data?.objects || []).some((o) => o.toLowerCase() === reviewObjectFilter)

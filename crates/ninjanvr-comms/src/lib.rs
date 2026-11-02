@@ -178,6 +178,15 @@ impl CommsHub {
         transitioned
     }
 
+    /// Publishes `<camera>/audio/dbfs` and `<camera>/audio/active` (`"ON"` / `"OFF"`) over MQTT and WebSocket.
+    pub fn publish_audio_activity(&self, camera: &str, dbfs: i64, active: bool) {
+        self.publish_topic(&format!("{camera}/audio/dbfs"), dbfs.to_string());
+        self.publish_topic(
+            &format!("{camera}/audio/active"),
+            if active { "ON" } else { "OFF" },
+        );
+    }
+
     /// Updates live motion/object activity for a camera and broadcasts `camera_activity` to `/ws`.
     pub fn update_camera_activity(
         &self,

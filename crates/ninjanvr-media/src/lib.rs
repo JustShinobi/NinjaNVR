@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::{NaiveDateTime, TimeZone, Utc};
-use ninjanvr_config::NinjaConfig;
-use ninjanvr_db::{NinjaDatabase, RecordingRow};
+use ninjanvr_config::{AudioConfig, NinjaConfig};
+use ninjanvr_db::{EventDto, NinjaDatabase, RecordingRow, ReviewItemDto};
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -316,6 +317,24 @@ pub fn compute_pcm_rms_dbfs(samples: &[i16]) -> i64 {
     }
     let db = (20.0 * rms.log10()).round() as i64;
     if db <= -90 { 0 } else { db.clamp(-89, -1) }
+}
+
+/// Evaluates whether a measured `dbfs` level triggers an acoustic detection event
+/// under the provided `AudioConfig`.
+pub fn check_acoustic_event_trigger(dbfs: i64, cfg: &AudioConfig) -> Option<String> {
+    if !cfg.enabled || dbfs == 0 {
+        return None;
+    }
+    if dbfs >= (cfg.min_volume_dbfs as i64) {
+        Some(
+            cfg.labels
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "audio".to_string()),
+        )
+    } else {
+        None
+    }
 }
 
 /// Probes an MP4 segment file in pure Rust without spawning `ffprobe` to extract
@@ -927,7 +946,7 @@ impl RecordingEngine {
         let id = format!("{:.1}-{}", start_time, random_suffix());
 
         self.db.insert_recording(&RecordingRow {
-            id,
+            id: id.clone(),
             camera: camera.to_string(),
             path: db_canonical_path,
             start_time,
@@ -940,6 +959,69 @@ impl RecordingEngine {
             regions,
             motion_heatmap: None,
         })?;
+
+        // Emit dedicated acoustic event and ReviewSegment when audio exceeds threshold
+        let audio_cfg = {
+            let cfg = self.config.read().await;
+            cfg.cameras
+                .get(camera)
+                .map(|c| {
+                    if c.audio.enabled {
+                        c.audio.clone()
+                    } else {
+                        cfg.audio.clone()
+                    }
+                })
+                .unwrap_or_else(|| cfg.audio.clone())
+        };
+        if let Some(audio_label) = check_acoustic_event_trigger(dbfs, &audio_cfg) {
+            let ev_id = format!("audio-{id}");
+            let _ = self.db.upsert_event(&EventDto {
+                id: ev_id.clone(),
+                camera: camera.to_string(),
+                label: "audio".to_string(),
+                zones: json!([]),
+                start_time,
+                end_time: Some(end_time),
+                has_clip: true,
+                has_snapshot: false,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: Some(audio_label.clone()),
+                top_score: Some(0.90),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({
+                    "type": "audio",
+                    "label": audio_label,
+                    "dbfs": dbfs,
+                    "score": 0.90,
+                    "top_score": 0.90
+                }),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.90),
+                stationary: false,
+            });
+            let _ = self.db.insert_review_segment(&ReviewItemDto {
+                id: format!("rev-{ev_id}"),
+                camera: camera.to_string(),
+                start_time,
+                end_time: Some(end_time),
+                severity: "detection".to_string(),
+                thumb_path: format!("/api/{camera}/latest.jpg"),
+                data: json!({
+                    "detections": [ev_id],
+                    "objects": ["audio"],
+                    "zones": [],
+                    "audio": [audio_label],
+                    "dbfs": dbfs,
+                    "thumb_time": start_time
+                }),
+                has_been_reviewed: false,
+            });
+        }
 
         debug!(
             "Recorded segment for {camera}: {:.2}s ({:.2} MB, motion={}, objects={}, dbfs={})",
@@ -1576,5 +1658,19 @@ mod tests {
         let args_stripped_audio =
             build_mp4_export_ffmpeg_args(list_path, 2.5, 16.0, false, out_path);
         assert!(args_stripped_audio.iter().any(|a| a == "-an"));
+    }
+
+    #[test]
+    fn acoustic_event_trigger_evaluates_dbfs_threshold() {
+        let mut cfg = AudioConfig::default();
+        assert_eq!(check_acoustic_event_trigger(-18, &cfg), None);
+        cfg.enabled = true;
+        cfg.min_volume_dbfs = -24;
+        assert_eq!(check_acoustic_event_trigger(0, &cfg), None);
+        assert_eq!(check_acoustic_event_trigger(-40, &cfg), None);
+        assert_eq!(
+            check_acoustic_event_trigger(-18, &cfg),
+            Some("audio".to_string())
+        );
     }
 }

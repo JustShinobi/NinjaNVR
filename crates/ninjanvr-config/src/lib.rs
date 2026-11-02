@@ -47,6 +47,8 @@ pub struct NinjaConfig {
     #[serde(default)]
     pub objects: ObjectsConfig,
     #[serde(default)]
+    pub audio: AudioConfig,
+    #[serde(default)]
     pub review: ReviewConfig,
     #[serde(default)]
     pub go2rtc: Go2RtcConfig,
@@ -747,6 +749,39 @@ pub struct Go2RtcConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_audio_min_volume_dbfs")]
+    pub min_volume_dbfs: i32,
+    #[serde(default = "default_audio_labels")]
+    pub labels: Vec<String>,
+}
+
+fn default_audio_min_volume_dbfs() -> i32 {
+    -24
+}
+
+fn default_audio_labels() -> Vec<String> {
+    vec![
+        "audio".to_string(),
+        "bark".to_string(),
+        "speech".to_string(),
+        "alarm".to_string(),
+    ]
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_volume_dbfs: default_audio_min_volume_dbfs(),
+            labels: default_audio_labels(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -765,11 +800,32 @@ pub struct CameraConfig {
     #[serde(default)]
     pub objects: ObjectsConfig,
     #[serde(default)]
+    pub audio: AudioConfig,
+    #[serde(default)]
     pub review: ReviewConfig,
     #[serde(default)]
     pub zones: BTreeMap<String, ZoneConfig>,
     #[serde(default)]
     pub lines: BTreeMap<String, LineConfig>,
+}
+
+impl Default for CameraConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ffmpeg: CameraFfmpegConfig::default(),
+            live: CameraLiveConfig::default(),
+            detect: DetectConfig::default(),
+            record: RecordConfig::default(),
+            snapshots: SnapshotsConfig::default(),
+            motion: MotionConfig::default(),
+            objects: ObjectsConfig::default(),
+            audio: AudioConfig::default(),
+            review: ReviewConfig::default(),
+            zones: BTreeMap::new(),
+            lines: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

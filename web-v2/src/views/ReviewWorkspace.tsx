@@ -97,6 +97,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
             <option value="all">{t.review.allSeverities}</option>
             <option value="alert">{t.review.alerts}</option>
             <option value="detection">{t.review.detections}</option>
+            <option value="audio">Audio Detections</option>
           </select>
           <select
             className="nvr-select"
@@ -109,6 +110,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
             <option value="cat">CAT</option>
             <option value="dog">DOG</option>
             <option value="car">CAR</option>
+            <option value="audio">AUDIO</option>
           </select>
           <select
             className="nvr-select"
@@ -280,6 +282,20 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         {(item.data?.objects || ["motion"]).join(", ")}
                       </span>
                       <div className="nvr-row-actions">
+                        {((item.data?.audio && item.data.audio.length > 0) ||
+                          (item.data?.objects || []).includes("audio")) && (
+                          <span
+                            className="nvr-badge mono"
+                            style={{
+                              height: 20,
+                              padding: "0 5px",
+                              fontSize: "var(--text-xs)",
+                              color: "var(--signal-accent-text)",
+                            }}
+                          >
+                            AUDIO
+                          </span>
+                        )}
                         {matchedExport && (
                           <button
                             className="nvr-badge live mono"

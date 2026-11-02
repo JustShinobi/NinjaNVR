@@ -1564,6 +1564,7 @@ dependencies = [
  "ninjanvr-config",
  "ninjanvr-db",
  "rand 0.10.3",
+ "serde_json",
  "tokio",
  "tracing",
 ]

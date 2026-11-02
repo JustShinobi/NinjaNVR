@@ -313,6 +313,8 @@ export interface ReviewItem {
     sub_labels?: string[];
     zones?: string[];
     detections?: string[];
+    audio?: string[];
+    dbfs?: number;
     provenance?: TriggerProvenance | null;
     metadata?: {
       potential_threat_level?: number;
