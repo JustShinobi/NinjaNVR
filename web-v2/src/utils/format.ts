@@ -16,7 +16,7 @@ export type WorkspaceTab =
   | "zones"
   | "system";
 
-export type LiveLayoutMode = "2x2" | "focus" | "single" | "spotlight";
+export type LiveLayoutMode = "2x2" | "focus" | "single" | "spotlight" | "map";
 export type SpotlightFilter = "all_activity" | "objects" | "person" | "vehicle";
 export type FirstWeekday = "sunday" | "monday";
 
@@ -54,7 +54,8 @@ export function resolveInitialLiveLayout(): LiveLayoutMode {
     saved === "2x2" ||
     saved === "focus" ||
     saved === "single" ||
-    saved === "spotlight"
+    saved === "spotlight" ||
+    saved === "map"
   ) {
     return saved;
   }

@@ -125,9 +125,19 @@ export interface CameraLiveConfig {
   quality: number;
 }
 
+export interface CameraMapPlacement {
+  x: number;
+  y: number;
+  angle_deg: number;
+  fov_deg: number;
+  range: number;
+}
+
 export interface CameraConfig {
   name?: string;
   enabled: boolean;
+  indoor?: boolean;
+  map?: CameraMapPlacement;
   ffmpeg?: CameraFfmpegConfig;
   live?: CameraLiveConfig;
   detect: CameraDetectConfig;

@@ -2,10 +2,32 @@ import React, { useEffect, useRef, useState } from "react";
 import { Camera, Check, Eye, Play } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
-import { RecordingSegment, ReviewItem } from "../types/nvr";
+import { CameraMapPlacement, RecordingSegment, ReviewItem } from "../types/nvr";
 import { HudPosition, SpotlightFilter, formatTs } from "../utils/format";
 import { LiveMsePlayer, VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
+
+function buildFovConeSvgPath(
+  cx: number,
+  cy: number,
+  angleDeg: number,
+  fovDeg: number,
+  radius: number
+): string {
+  const half = Math.max(10, Math.min(89, fovDeg / 2));
+  const startRad = ((angleDeg - half) * Math.PI) / 180;
+  const endRad = ((angleDeg + half) * Math.PI) / 180;
+  const x1 = cx + radius * Math.cos(startRad);
+  const y1 = cy + radius * Math.sin(startRad);
+  const x2 = cx + radius * Math.cos(endRad);
+  const y2 = cy + radius * Math.sin(endRad);
+  const largeArc = fovDeg > 180 ? 1 : 0;
+  return `M ${cx.toFixed(1)} ${cy.toFixed(1)} L ${x1.toFixed(1)} ${y1.toFixed(
+    1
+  )} A ${radius.toFixed(1)} ${radius.toFixed(1)} 0 ${largeArc} 1 ${x2.toFixed(
+    1
+  )} ${y2.toFixed(1)} Z`;
+}
 
 interface LiveWorkspaceProps {
   cameraNames: string[];
@@ -50,11 +72,85 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const setTimeShiftTs = useNvrStore((s) => s.setTimeShiftTs);
   const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
   const config = useNvrStore((s) => s.config);
+  const setConfig = useNvrStore((s) => s.setConfig);
   const stats = useNvrStore((s) => s.stats);
   const cameraActivity = useNvrStore((s) => s.cameraActivity);
 
   const lastActiveRef = useRef<Record<string, number>>({});
   const [nowTick, setNowTick] = useState<number>(() => Math.floor(Date.now() / 1000));
+  const [mapEditMode, setMapEditMode] = useState(false);
+  const [draggingCam, setDraggingCam] = useState<string | null>(null);
+  const [mapFloorplanUrl, setMapFloorplanUrl] = useState<string>(() => {
+    try {
+      return window.localStorage?.getItem("ninjanvr_floorplan_url") || "";
+    } catch {
+      return "";
+    }
+  });
+  const [mapPlacements, setMapPlacements] = useState<Record<string, CameraMapPlacement>>({});
+  const [mapSaveStatus, setMapSaveStatus] = useState<string | null>(null);
+  const mapSvgRef = useRef<SVGSVGElement | null>(null);
+
+  useEffect(() => {
+    if (mapEditMode) return;
+    setMapPlacements((prev) => {
+      const next = { ...prev };
+      cameraNames.forEach((cam, idx) => {
+        const cfgMap = config?.cameras?.[cam]?.map;
+        const defaultX = 0.22 + (idx % 3) * 0.28;
+        const defaultY = 0.28 + Math.floor(idx / 3) * 0.42;
+        if (cfgMap) {
+          next[cam] = {
+            x: cfgMap.x ?? defaultX,
+            y: cfgMap.y ?? defaultY,
+            angle_deg: cfgMap.angle_deg ?? idx * 90,
+            fov_deg: cfgMap.fov_deg ?? 90,
+            range: cfgMap.range ?? 0.25,
+          };
+        } else if (!next[cam]) {
+          next[cam] = {
+            x: defaultX,
+            y: defaultY,
+            angle_deg: idx * 90,
+            fov_deg: 90,
+            range: 0.25,
+          };
+        }
+      });
+      return next;
+    });
+  }, [cameraNames, config, mapEditMode]);
+
+  const handleSaveMapPlacements = async () => {
+    try {
+      const cfgRes = await fetch("/api/config", { credentials: "include" });
+      if (!cfgRes.ok) return;
+      const currentCfg = await cfgRes.json();
+      if (currentCfg && currentCfg.cameras) {
+        for (const [cam, placement] of Object.entries(mapPlacements)) {
+          if (currentCfg.cameras[cam]) {
+            currentCfg.cameras[cam].map = placement;
+          }
+        }
+        const saveRes = await fetch("/api/config/structured?save_option=saveonly", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ cameras: currentCfg.cameras }),
+        });
+        if (saveRes.ok) {
+          const savedData = await saveRes.json().catch(() => ({}));
+          if (savedData.config) {
+            setConfig(savedData.config);
+          }
+          setMapSaveStatus("Saved to config.yml");
+          window.setTimeout(() => setMapSaveStatus(null), 2500);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
 
   useEffect(() => {
     const nowSec = Math.floor(Date.now() / 1000);
@@ -132,6 +228,16 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           >
             Spotlight
           </button>
+          <button
+            className={`nvr-btn ${liveLayout === "map" ? "active" : ""}`}
+            onClick={() => {
+              setLiveLayout("map");
+              setTimeShiftTs(null);
+            }}
+            title="Interactive Tactical Map / Floorplan with FOV cones and real-time motion/object pulses"
+          >
+            Tactical Map
+          </button>
           {liveLayout === "spotlight" && (
             <>
               <span className="nvr-divider" aria-hidden="true" />
@@ -154,7 +260,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               ))}
             </>
           )}
-          {liveLayout !== "2x2" && liveLayout !== "spotlight" && (
+          {(liveLayout === "focus" || liveLayout === "single") && (
             <>
               <span className="nvr-divider" aria-hidden="true" />
               {cameraNames.map((cam) => (
@@ -678,6 +784,328 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 ))}
             </div>
           )}
+        </div>
+      )}
+
+      {liveLayout === "map" && (
+        <div
+          className="nvr-focus-layout"
+          style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 8, flex: 1, minHeight: 0 }}
+        >
+          <div
+            className="nvr-panel"
+            style={{
+              position: "relative",
+              display: "flex",
+              flexDirection: "column",
+              background: "var(--bg-deep)",
+              border: "1px solid var(--border-hairline)",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "6px 10px",
+                borderBottom: "1px solid var(--border-hairline)",
+                background: "var(--bg-panel)",
+                gap: 8,
+              }}
+            >
+              <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700 }}>
+                TACTICAL FLOORPLAN // SECTOR FOV CONES & LIVE ACTIVITY PULSE
+              </span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <input
+                  className="nvr-input mono"
+                  style={{ height: 24, width: 190, fontSize: "var(--text-xs)" }}
+                  placeholder="Floorplan SVG/PNG URL (optional)"
+                  value={mapFloorplanUrl}
+                  onChange={(e) => {
+                    setMapFloorplanUrl(e.target.value);
+                    window.localStorage?.setItem("ninjanvr_floorplan_url", e.target.value);
+                  }}
+                />
+                <button
+                  type="button"
+                  className={`nvr-btn mono ${mapEditMode ? "active" : ""}`}
+                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  onClick={() => setMapEditMode((v) => !v)}
+                >
+                  {mapEditMode ? "Lock Map" : "Edit Map"}
+                </button>
+                {mapEditMode && (
+                  <button
+                    type="button"
+                    className="nvr-btn primary mono"
+                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    onClick={handleSaveMapPlacements}
+                  >
+                    {mapSaveStatus || "Save Placement"}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <svg
+              ref={mapSvgRef}
+              viewBox="0 0 1000 600"
+              style={{
+                width: "100%",
+                height: "100%",
+                flex: 1,
+                userSelect: "none",
+                cursor: draggingCam ? "grabbing" : "default",
+                background:
+                  "radial-gradient(circle at 50% 50%, rgba(14, 165, 233, 0.06), rgba(7, 10, 15, 0.98))",
+              }}
+              onPointerMove={(e) => {
+                if (!mapEditMode || !draggingCam || !mapSvgRef.current) return;
+                const rect = mapSvgRef.current.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return;
+                const nx = Math.max(0.05, Math.min(0.95, (e.clientX - rect.left) / rect.width));
+                const ny = Math.max(0.05, Math.min(0.95, (e.clientY - rect.top) / rect.height));
+                setMapPlacements((prev) => ({
+                  ...prev,
+                  [draggingCam]: {
+                    ...(prev[draggingCam] || {
+                      x: nx,
+                      y: ny,
+                      angle_deg: 0,
+                      fov_deg: 90,
+                      range: 0.25,
+                    }),
+                    x: Number(nx.toFixed(3)),
+                    y: Number(ny.toFixed(3)),
+                  },
+                }));
+              }}
+              onPointerUp={() => setDraggingCam(null)}
+              onPointerLeave={() => setDraggingCam(null)}
+            >
+              <defs>
+                <pattern id="tacticalGrid" width="50" height="50" patternUnits="userSpaceOnUse">
+                  <path
+                    d="M 50 0 L 0 0 0 50"
+                    fill="none"
+                    stroke="rgba(148, 163, 184, 0.12)"
+                    strokeWidth="1"
+                  />
+                </pattern>
+              </defs>
+              <rect width="1000" height="600" fill="url(#tacticalGrid)" />
+              {mapFloorplanUrl && (
+                <image
+                  href={mapFloorplanUrl}
+                  x="40"
+                  y="30"
+                  width="920"
+                  height="540"
+                  preserveAspectRatio="xMidYMid meet"
+                  opacity="0.45"
+                />
+              )}
+              <rect
+                x="60"
+                y="45"
+                width="880"
+                height="510"
+                fill="none"
+                stroke="rgba(56, 189, 248, 0.25)"
+                strokeWidth="1.5"
+                strokeDasharray="6 4"
+              />
+
+              {cameraNames.map((cam) => {
+                const place = mapPlacements[cam] || {
+                  x: 0.5,
+                  y: 0.5,
+                  angle_deg: 0,
+                  fov_deg: 90,
+                  range: 0.25,
+                };
+                const cx = place.x * 1000;
+                const cy = place.y * 600;
+                const radius = Math.max(50, Math.min(450, place.range * 800));
+                const act = cameraActivity[cam];
+                const objs = act?.objects || [];
+                const hasObjects = objs.length > 0;
+                const hasMotion = Boolean(act?.motion);
+                const isSelected = selectedCamera === cam;
+
+                const coneFill = hasObjects
+                  ? "rgba(239, 68, 68, 0.30)"
+                  : hasMotion
+                  ? "rgba(245, 158, 11, 0.24)"
+                  : "rgba(56, 189, 248, 0.13)";
+                const coneStroke = hasObjects
+                  ? "#ef4444"
+                  : hasMotion
+                  ? "#f59e0b"
+                  : isSelected
+                  ? "#38bdf8"
+                  : "rgba(56, 189, 248, 0.45)";
+
+                return (
+                  <g
+                    key={cam}
+                    style={{ cursor: mapEditMode ? "grab" : "pointer" }}
+                    onPointerDown={(e) => {
+                      e.stopPropagation();
+                      setSelectedCamera(cam);
+                      if (mapEditMode) {
+                        setDraggingCam(cam);
+                      }
+                    }}
+                  >
+                    <path
+                      d={buildFovConeSvgPath(cx, cy, place.angle_deg, place.fov_deg, radius)}
+                      fill={coneFill}
+                      stroke={coneStroke}
+                      strokeWidth={isSelected ? 2 : 1.2}
+                    />
+                    {(hasObjects || hasMotion) && (
+                      <circle
+                        cx={cx}
+                        cy={cy}
+                        r={20}
+                        fill="none"
+                        stroke={coneStroke}
+                        strokeWidth="2"
+                        opacity="0.75"
+                      />
+                    )}
+                    <circle
+                      cx={cx}
+                      cy={cy}
+                      r={isSelected ? 9 : 7}
+                      fill={hasObjects ? "#ef4444" : hasMotion ? "#f59e0b" : "#0ea5e9"}
+                      stroke="#070a0f"
+                      strokeWidth="2"
+                    />
+                    <text
+                      x={cx + 12}
+                      y={cy + 4}
+                      fill="#f8fafc"
+                      fontSize="12"
+                      fontFamily="JetBrains Mono, monospace"
+                      fontWeight="700"
+                    >
+                      {cam.toUpperCase()}
+                    </text>
+                    {objs.slice(0, 2).map((obj, oIdx) => (
+                      <text
+                        key={`${obj.id}-${oIdx}`}
+                        x={cx + 12}
+                        y={cy + 19 + oIdx * 14}
+                        fill="#fca5a5"
+                        fontSize="11"
+                        fontFamily="JetBrains Mono, monospace"
+                      >
+                        {obj.label} {Math.round((obj.score || 0.85) * 100)}%
+                      </text>
+                    ))}
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
+
+          <div
+            className="nvr-panel"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 10,
+              padding: 10,
+              background: "var(--bg-panel)",
+              border: "1px solid var(--border-hairline)",
+            }}
+          >
+            <div
+              className="mono"
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                fontSize: "var(--text-xs)",
+                fontWeight: 700,
+              }}
+            >
+              <span>SECTOR FEED // {selectedCamera.toUpperCase()}</span>
+              <button
+                type="button"
+                className="nvr-btn mono"
+                style={{ height: 22, fontSize: "var(--text-xs)" }}
+                onClick={() => setLiveLayout("focus")}
+              >
+                Open Focus
+              </button>
+            </div>
+            <div className="nvr-cam-tile" style={{ height: 210, flexShrink: 0 }}>
+              <LiveMsePlayer
+                camera={selectedCamera}
+                useMainStream={false}
+                cameraConfig={config?.cameras?.[selectedCamera]}
+                showVectors={showVectors}
+              />
+            </div>
+
+            {mapPlacements[selectedCamera] && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  HEADING ANGLE: {Math.round(mapPlacements[selectedCamera].angle_deg)}°
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={360}
+                  value={mapPlacements[selectedCamera].angle_deg}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    setMapPlacements((prev) => ({
+                      ...prev,
+                      [selectedCamera]: { ...prev[selectedCamera], angle_deg: v },
+                    }));
+                  }}
+                />
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  FOV CONE ANGLE: {Math.round(mapPlacements[selectedCamera].fov_deg)}°
+                </div>
+                <input
+                  type="range"
+                  min={30}
+                  max={180}
+                  value={mapPlacements[selectedCamera].fov_deg}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    setMapPlacements((prev) => ({
+                      ...prev,
+                      [selectedCamera]: { ...prev[selectedCamera], fov_deg: v },
+                    }));
+                  }}
+                />
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  SECTOR RANGE: {Math.round(mapPlacements[selectedCamera].range * 100)}%
+                </div>
+                <input
+                  type="range"
+                  min={5}
+                  max={50}
+                  value={Math.round(mapPlacements[selectedCamera].range * 100)}
+                  onChange={(e) => {
+                    const v = Number(e.target.value) / 100;
+                    setMapPlacements((prev) => ({
+                      ...prev,
+                      [selectedCamera]: { ...prev[selectedCamera], range: v },
+                    }));
+                  }}
+                />
+              </div>
+            )}
+          </div>
         </div>
       )}
 

@@ -872,12 +872,52 @@ impl Default for AudioConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CameraMapPlacement {
+    #[serde(default = "default_map_coord")]
+    pub x: f32,
+    #[serde(default = "default_map_coord")]
+    pub y: f32,
+    #[serde(default)]
+    pub angle_deg: f32,
+    #[serde(default = "default_map_fov_deg")]
+    pub fov_deg: f32,
+    #[serde(default = "default_map_range")]
+    pub range: f32,
+}
+
+fn default_map_coord() -> f32 {
+    0.5
+}
+
+fn default_map_fov_deg() -> f32 {
+    90.0
+}
+
+fn default_map_range() -> f32 {
+    0.25
+}
+
+impl Default for CameraMapPlacement {
+    fn default() -> Self {
+        Self {
+            x: default_map_coord(),
+            y: default_map_coord(),
+            angle_deg: 0.0,
+            fov_deg: default_map_fov_deg(),
+            range: default_map_range(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub indoor: bool,
+    #[serde(default)]
+    pub map: CameraMapPlacement,
     #[serde(default)]
     pub ffmpeg: CameraFfmpegConfig,
     #[serde(default)]
@@ -907,6 +947,7 @@ impl Default for CameraConfig {
         Self {
             enabled: true,
             indoor: false,
+            map: CameraMapPlacement::default(),
             ffmpeg: CameraFfmpegConfig::default(),
             live: CameraLiveConfig::default(),
             detect: DetectConfig::default(),
@@ -1412,8 +1453,10 @@ impl NinjaConfig {
                         "dashboard": true,
                         "review": true
                     },
+                    "map": cam.map,
                     "profiles": {},
                     "zones": cam.zones,
+                    "lines": cam.lines,
                     "ffmpeg_cmds": []
                 }),
             );
@@ -2139,5 +2182,38 @@ go2rtc:
             Some("rtsp://camuser:campass@192.0.2.50:554/main")
         );
         assert!(cfg.raw_yaml.contains("camuser:campass@192.0.2.50:554/main"));
+
+        // Verify CameraMapPlacement roundtrips through structured JSON update and YAML
+        let map_patch = json!({
+            "cameras": {
+                "front_door": {
+                    "enabled": true,
+                    "map": {
+                        "x": 0.25,
+                        "y": 0.75,
+                        "angle_deg": 135.0,
+                        "fov_deg": 110.0,
+                        "range": 0.35
+                    },
+                    "ffmpeg": {
+                        "inputs": [
+                            {
+                                "path": "rtsp://*:*@192.0.2.50:554/main",
+                                "roles": ["record", "detect"]
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        cfg.apply_structured_json(&map_patch).unwrap();
+        let cam_map = cfg.cameras["front_door"].map;
+        assert!((cam_map.x - 0.25).abs() < 1e-4);
+        assert!((cam_map.y - 0.75).abs() < 1e-4);
+        assert!((cam_map.angle_deg - 135.0).abs() < 1e-4);
+        assert!((cam_map.fov_deg - 110.0).abs() < 1e-4);
+        assert!((cam_map.range - 0.35).abs() < 1e-4);
+        let api_json = cfg.to_frigate_api_config();
+        assert_eq!(api_json["cameras"]["front_door"]["map"]["fov_deg"], 110.0);
     }
 }

@@ -666,21 +666,7 @@ mod tests {
 
     #[test]
     fn bytetracker_tracks_across_high_and_low_score_frames_and_preserves_stationary() {
-        let mut cam_cfg = CameraConfig {
-            enabled: true,
-            indoor: false,
-            ffmpeg: Default::default(),
-            live: Default::default(),
-            detect: Default::default(),
-            record: Default::default(),
-            snapshots: Default::default(),
-            motion: Default::default(),
-            objects: Default::default(),
-            audio: Default::default(),
-            review: Default::default(),
-            zones: Default::default(),
-            lines: Default::default(),
-        };
+        let mut cam_cfg = CameraConfig::default();
         cam_cfg.detect.min_initialized = 2;
         cam_cfg.detect.stationary.threshold = 10;
 
@@ -806,21 +792,7 @@ mod tests {
         );
 
         // Verify ByteTracker records crossed_lines and promotes to entered_zones
-        let mut cam_cfg = CameraConfig {
-            enabled: true,
-            indoor: false,
-            ffmpeg: Default::default(),
-            live: Default::default(),
-            detect: Default::default(),
-            record: Default::default(),
-            snapshots: Default::default(),
-            motion: Default::default(),
-            objects: Default::default(),
-            audio: Default::default(),
-            review: Default::default(),
-            zones: Default::default(),
-            lines: Default::default(),
-        };
+        let mut cam_cfg = CameraConfig::default();
         cam_cfg.detect.min_initialized = 2;
         cam_cfg.lines.insert(
             "driveway_entry".to_string(),
@@ -865,21 +837,7 @@ mod tests {
 
     #[test]
     fn night_ir_mode_suppresses_transient_two_frame_spider_flashes() {
-        let mut cam_cfg = CameraConfig {
-            enabled: true,
-            indoor: false,
-            ffmpeg: Default::default(),
-            live: Default::default(),
-            detect: Default::default(),
-            record: Default::default(),
-            snapshots: Default::default(),
-            motion: Default::default(),
-            objects: Default::default(),
-            audio: Default::default(),
-            review: Default::default(),
-            zones: Default::default(),
-            lines: Default::default(),
-        };
+        let mut cam_cfg = CameraConfig::default();
         cam_cfg.detect.min_initialized = 2;
         cam_cfg.detect.min_initialized_night = Some(4);
 
@@ -910,21 +868,7 @@ mod tests {
 
     #[test]
     fn fractional_area_bounds_and_per_zone_overrides_filter_accurately() {
-        let mut cam_cfg = CameraConfig {
-            enabled: true,
-            indoor: false,
-            ffmpeg: Default::default(),
-            live: Default::default(),
-            detect: Default::default(),
-            record: Default::default(),
-            snapshots: Default::default(),
-            motion: Default::default(),
-            objects: Default::default(),
-            audio: Default::default(),
-            review: Default::default(),
-            zones: Default::default(),
-            lines: Default::default(),
-        };
+        let mut cam_cfg = CameraConfig::default();
         cam_cfg.detect.min_initialized = 1;
         // 1% of 1000x1000 = 10,000 px² minimum
         if let Some(person_f) = cam_cfg.objects.filters.get_mut("person") {
