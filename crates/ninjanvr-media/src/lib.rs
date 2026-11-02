@@ -1508,6 +1508,68 @@ pub fn build_mp4_export_ffmpeg_args(
     args
 }
 
+/// Converts a `privacy_mask` config value (normalized or pixel polygon strings) into an FFmpeg
+/// `drawbox` video filter expression (`drawbox=x=iw*0.2:y=ih*0.2:w=iw*0.6:h=ih*0.6:color=black@1.0:t=fill`)
+/// for redacting privacy regions during MP4 export transcoding.
+pub fn build_privacy_drawbox_filter(privacy_mask: &serde_json::Value) -> Option<String> {
+    let mut polys: Vec<String> = Vec::new();
+    match privacy_mask {
+        serde_json::Value::String(s) if !s.is_empty() => polys.push(s.clone()),
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                if let Some(s) = v.as_str()
+                    && !s.is_empty()
+                {
+                    polys.push(s.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut filters = Vec::new();
+    for poly in polys {
+        let nums: Vec<f32> = poly
+            .split(',')
+            .filter_map(|p| p.trim().parse::<f32>().ok())
+            .collect();
+        if nums.len() < 6 || !nums.len().is_multiple_of(2) {
+            continue;
+        }
+        let mut x_min = f32::MAX;
+        let mut y_min = f32::MAX;
+        let mut x_max = f32::MIN;
+        let mut y_max = f32::MIN;
+        for &[px, py] in nums.as_chunks::<2>().0 {
+            x_min = x_min.min(px);
+            y_min = y_min.min(py);
+            x_max = x_max.max(px);
+            y_max = y_max.max(py);
+        }
+        if x_max > x_min && y_max > y_min {
+            if x_max <= 1.0 && y_max <= 1.0 {
+                filters.push(format!(
+                    "drawbox=x=iw*{x_min:.3}:y=ih*{y_min:.3}:w=iw*{:.3}:h=ih*{:.3}:color=#0c0e12@1.0:t=fill",
+                    x_max - x_min,
+                    y_max - y_min
+                ));
+            } else {
+                filters.push(format!(
+                    "drawbox=x={}:y={}:w={}:h={}:color=#0c0e12@1.0:t=fill",
+                    x_min as u32,
+                    y_min as u32,
+                    (x_max - x_min) as u32,
+                    (y_max - y_min) as u32
+                ));
+            }
+        }
+    }
+    if filters.is_empty() {
+        None
+    } else {
+        Some(filters.join(","))
+    }
+}
+
 /// Concatenates recording segments in `[start, end]` into a single MP4 export file.
 pub async fn build_mp4_export(
     db: &NinjaDatabase,

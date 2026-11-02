@@ -138,6 +138,7 @@ export interface CameraConfig {
   enabled: boolean;
   indoor?: boolean;
   webui_url?: string;
+  privacy_mask?: unknown;
   map?: CameraMapPlacement;
   ffmpeg?: CameraFfmpegConfig;
   live?: CameraLiveConfig;

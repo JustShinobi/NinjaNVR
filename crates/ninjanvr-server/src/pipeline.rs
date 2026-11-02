@@ -12,10 +12,10 @@ use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{SharedActivityLedger, YuvFrame, backup_alert_clip, resolve_ffmpeg_bin};
 use ninjanvr_track::{ByteTracker, TrackedObject, TriggerProvenance, should_replace_snapshot};
 use ninjanvr_vision::{
-    BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, check_frame_tamper,
-    classify_dominant_color_tag, compute_inference_regions, crop_yuv420p_to_tensor_nhwc,
-    encode_image_jpeg, encode_image_webp, is_monochrome_ir, yuv420p_to_rgb_image,
-    yuv420p_to_rgb_image_scaled,
+    BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, apply_privacy_masks_from_value,
+    check_frame_tamper, classify_dominant_color_tag, compute_inference_regions,
+    crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp, is_monochrome_ir,
+    yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -445,8 +445,9 @@ impl VisionPipeline {
                             .iter()
                             .map(|t| (t.bbox, [31, 119, 180]))
                             .collect();
-                        let rgb =
+                        let mut rgb =
                             yuv420p_to_rgb_image_scaled(&yuv_frame, None, &annotated, Some(360));
+                        apply_privacy_masks_from_value(&mut rgb, &cam_cfg.privacy_mask);
                         if let Ok(jpeg_bytes) = encode_image_jpeg(&rgb) {
                             let clips_dir = self.media_dir.join("clips");
                             if std::fs::create_dir_all(&clips_dir).is_ok() {
@@ -599,17 +600,19 @@ impl VisionPipeline {
                     if snapshots_active {
                         let jpg_path = clips_dir.join(format!("{}.jpg", trk.id));
                         let webp_path = clips_dir.join(format!("{camera}-{}.webp", trk.id));
-                        let full_img =
+                        let mut full_img =
                             yuv420p_to_rgb_image(frame, None, &[(trk.bbox, [31, 119, 180])]);
+                        apply_privacy_masks_from_value(&mut full_img, &cam_cfg.privacy_mask);
                         if let Ok(jpg) = encode_image_jpeg(&full_img) {
                             let _ = std::fs::write(&jpg_path, jpg);
                         }
-                        let thumb_img = yuv420p_to_rgb_image_scaled(
+                        let mut thumb_img = yuv420p_to_rgb_image_scaled(
                             frame,
                             None,
                             &[(trk.bbox, [31, 119, 180])],
                             Some(360),
                         );
+                        apply_privacy_masks_from_value(&mut thumb_img, &cam_cfg.privacy_mask);
                         if let Ok(webp) = encode_image_webp(&thumb_img) {
                             let _ = std::fs::write(&webp_path, webp);
                         }
@@ -621,6 +624,7 @@ impl VisionPipeline {
                             let det_w = frame.width;
                             let det_h = frame.height;
                             let draw_bbox = cam_cfg.snapshots.bounding_box;
+                            let priv_mask = cam_cfg.privacy_mask.clone();
                             tokio::spawn(async move {
                                 let url =
                                     format!("http://127.0.0.1:1984/api/frame.jpeg?src={cam_owned}");
@@ -637,6 +641,7 @@ impl VisionPipeline {
                                 {
                                     let mut hr_rgb = dyn_img.to_rgb8();
                                     if hr_rgb.width() >= det_w && hr_rgb.height() >= det_h {
+                                        apply_privacy_masks_from_value(&mut hr_rgb, &priv_mask);
                                         if draw_bbox {
                                             let projected = det_bbox.project_to_resolution(
                                                 det_w,
@@ -811,12 +816,13 @@ impl VisionPipeline {
                 rev.thumb_time = now;
                 rev.provenance = Some(trk.provenance.clone());
                 let _ = std::fs::create_dir_all(&review_dir);
-                let rev_img = yuv420p_to_rgb_image_scaled(
+                let mut rev_img = yuv420p_to_rgb_image_scaled(
                     frame,
                     None,
                     &[(trk.bbox, [31, 119, 180])],
                     Some(180),
                 );
+                apply_privacy_masks_from_value(&mut rev_img, &cam_cfg.privacy_mask);
                 if let Ok(webp) = encode_image_webp(&rev_img) {
                     let fname = format!("thumb-{camera}-{}.webp", rev.id);
                     let _ = std::fs::write(review_dir.join(fname), webp);

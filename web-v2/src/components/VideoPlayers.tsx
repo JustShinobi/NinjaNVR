@@ -587,6 +587,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
 
   const masks = extractMaskPolygons(cameraConfig?.motion?.mask);
   const objectMasks = extractMaskPolygons(cameraConfig?.objects?.mask);
+  const privacyMasks = extractMaskPolygons(cameraConfig?.privacy_mask);
   const zones = cameraConfig?.zones || {};
 
   return (
@@ -683,7 +684,10 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             pointerEvents: "none",
           }}
         />
-        {(showVectors || (draftPoints && draftPoints.length > 0)) && overlayBox && (
+        {(showVectors ||
+          privacyMasks.length > 0 ||
+          (draftPoints && draftPoints.length > 0)) &&
+          overlayBox && (
           <svg
             viewBox="0 0 1000 1000"
             preserveAspectRatio="none"
@@ -697,7 +701,17 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
               zIndex: 4,
             }}
           >
-            {masks.map((m, idx) => (
+            {privacyMasks.map((m, idx) => (
+              <polygon
+                key={`privmask-${idx}`}
+                points={parsePolygonPoints(m, detW, detH)}
+                fill="#0c0e12"
+                stroke="#475569"
+                strokeWidth="2"
+              />
+            ))}
+            {showVectors &&
+              masks.map((m, idx) => (
               <polygon
                 key={`mask-${idx}`}
                 points={parsePolygonPoints(m, detW, detH)}
@@ -707,7 +721,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
                 strokeDasharray="8 4"
               />
             ))}
-            {objectMasks.map((m, idx) => (
+            {showVectors &&
+              objectMasks.map((m, idx) => (
               <polygon
                 key={`objmask-${idx}`}
                 points={parsePolygonPoints(m, detW, detH)}
@@ -717,7 +732,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
                 strokeDasharray="5 5"
               />
             ))}
-            {Object.entries(zones).map(([zName, zCfg]) => (
+            {showVectors &&
+              Object.entries(zones).map(([zName, zCfg]) => (
               <g key={`zone-${zName}`}>
                 <polygon
                   points={parsePolygonPoints(zCfg.coordinates, detW, detH)}

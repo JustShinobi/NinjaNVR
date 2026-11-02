@@ -55,7 +55,7 @@ export const VisionZonesMotionSection: React.FC<{
   const { locale } = useI18n();
   const isPt = locale === "pt";
   const [polyType, setPolyType] = useState<
-    "zone" | "tripwire" | "motion_mask" | "object_mask" | "measure_box"
+    "zone" | "tripwire" | "motion_mask" | "object_mask" | "privacy_mask" | "measure_box"
   >("zone");
   const [zoneNameInput, setZoneNameInput] = useState("entrada");
   const [zoneInertia, setZoneInertia] = useState(3);
@@ -190,6 +190,15 @@ export const VisionZonesMotionSection: React.FC<{
       });
       setDraftPoints([]);
       notify(`Staged motion mask polygon on ${inspectorCam}`);
+    } else if (polyType === "privacy_mask") {
+      updateDraft((next) => {
+        const cam = next.cameras[inspectorCam];
+        if (!cam) return;
+        const existing = extractMaskPolygons(cam.privacy_mask);
+        cam.privacy_mask = [...existing, coordStr];
+      });
+      setDraftPoints([]);
+      notify(`Staged permanent privacy mask polygon on ${inspectorCam}`);
     } else {
       updateDraft((next) => {
         const cam = next.cameras[inspectorCam];
@@ -205,6 +214,7 @@ export const VisionZonesMotionSection: React.FC<{
 
   const motionMasks = extractMaskPolygons(camCfg?.motion?.mask);
   const objectMasks = extractMaskPolygons(camCfg?.objects?.mask);
+  const privacyMasks = extractMaskPolygons(camCfg?.privacy_mask);
   const zonesMap = camCfg?.zones || {};
 
   const isIndoorMotion =
@@ -273,6 +283,7 @@ export const VisionZonesMotionSection: React.FC<{
                   ["tripwire", isPt ? "Tripwire (Verde)" : "Tripwire (Green)"],
                   ["motion_mask", isPt ? "Másc. Mov (Verm)" : "Motion Mask (Red)"],
                   ["object_mask", isPt ? "Másc. Obj (Viol)" : "Object Mask (Violet)"],
+                  ["privacy_mask", isPt ? "Másc. Privacidade" : "Privacy Mask"],
                   ["measure_box", isPt ? "Medir Caixa" : "Measure Box"],
                 ] as const
               ).map(([id, label]) => (
@@ -614,6 +625,55 @@ export const VisionZonesMotionSection: React.FC<{
                       }
                     >
                       <Trash2 size={11} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              {privacyMasks.map((m, idx) => (
+                <div
+                  key={`pm-${idx}`}
+                  style={{
+                    padding: 6,
+                    background: "var(--bg-canvas)",
+                    border: "1px solid #475569",
+                    borderRadius: 2,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 6,
+                  }}
+                >
+                  <div
+                    className="mono"
+                    style={{
+                      fontSize: "var(--text-xs)",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    <strong style={{ color: "#e2e8f0" }}>
+                      PRIVACY REDACT #{idx + 1}:
+                    </strong>{" "}
+                    {m}
+                  </div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <button
+                      type="button"
+                      className="nvr-btn danger"
+                      style={{ height: 20, padding: "0 5px" }}
+                      onClick={() =>
+                        updateDraft((next) => {
+                          const list = extractMaskPolygons(
+                            next.cameras[inspectorCam].privacy_mask
+                          );
+                          list.splice(idx, 1);
+                          next.cameras[inspectorCam].privacy_mask = list;
+                        })
+                      }
+                    >
+                      <Trash2 size={10} />
                     </button>
                   </div>
                 </div>

@@ -1061,6 +1061,8 @@ pub struct CameraConfig {
     pub indoor: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webui_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub privacy_mask: Value,
     #[serde(default)]
     pub map: CameraMapPlacement,
     #[serde(default)]
@@ -1093,6 +1095,7 @@ impl Default for CameraConfig {
             enabled: true,
             indoor: false,
             webui_url: None,
+            privacy_mask: Value::Null,
             map: CameraMapPlacement::default(),
             ffmpeg: CameraFfmpegConfig::default(),
             live: CameraLiveConfig::default(),
@@ -1600,6 +1603,7 @@ impl NinjaConfig {
                         "review": true
                     },
                     "webui_url": cam.webui_url,
+                    "privacy_mask": cam.privacy_mask,
                     "map": cam.map,
                     "profiles": {},
                     "zones": cam.zones,

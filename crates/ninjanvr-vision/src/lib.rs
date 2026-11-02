@@ -1033,6 +1033,34 @@ pub fn classify_dominant_color_tag(
     }
 }
 
+/// Permanently redacts all pixels inside `mask` on `img` with matte tactical dark `[12, 14, 18]`.
+pub fn apply_privacy_mask_rgb(img: &mut RgbImage, mask: &PolygonMask) {
+    if mask.is_empty() {
+        return;
+    }
+    let w = img.width();
+    let h = img.height();
+    let redact_px = Rgb([12, 14, 18]);
+    for y in 0..h {
+        let fy = y as f32;
+        for x in 0..w {
+            if mask.contains_point(x as f32, fy) {
+                img.put_pixel(x, y, redact_px);
+            }
+        }
+    }
+}
+
+/// Parses normalized or pixel `privacy_mask` polygon coordinates against `(img.width(), img.height())`
+/// and redacts all interior pixels to `[12, 14, 18]`.
+pub fn apply_privacy_masks_from_value(img: &mut RgbImage, mask_val: &Value) {
+    if mask_val.is_null() {
+        return;
+    }
+    let mask = PolygonMask::from_config_value(mask_val, img.width(), img.height());
+    apply_privacy_mask_rgb(img, &mask);
+}
+
 /// Draws 2px bounding boxes onto an existing `RgbImage` (e.g. a high-resolution main-stream frame).
 pub fn annotate_rgb_image_with_boxes(img: &mut RgbImage, boxes: &[(BoundingBox, [u8; 3])]) {
     let w = img.width();
@@ -1202,5 +1230,17 @@ mod tests {
             classify_dominant_color_tag(&red_buf, w, h, bbox),
             "color:red"
         );
+    }
+
+    #[test]
+    fn apply_privacy_mask_rgb_redacts_polygon_interior_to_matte_black() {
+        let mut img = RgbImage::from_pixel(100, 100, Rgb([240, 240, 240]));
+        let mask_val = serde_json::json!(["0.200,0.200,0.800,0.200,0.800,0.800,0.200,0.800"]);
+        apply_privacy_masks_from_value(&mut img, &mask_val);
+
+        // Interior pixel (50, 50) is permanently redacted to [12, 14, 18]
+        assert_eq!(*img.get_pixel(50, 50), Rgb([12, 14, 18]));
+        // Exterior pixel (5, 5) remains untouched [240, 240, 240]
+        assert_eq!(*img.get_pixel(5, 5), Rgb([240, 240, 240]));
     }
 }
