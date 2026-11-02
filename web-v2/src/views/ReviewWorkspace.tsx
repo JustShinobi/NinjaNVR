@@ -73,6 +73,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [excludeObjectFilter, setExcludeObjectFilter] = React.useState("none");
   const [zoneFilter, setZoneFilter] = React.useState("all");
   const [presetName, setPresetName] = React.useState("");
+  const [shareTtlSec, setShareTtlSec] = React.useState<number>(86400);
+  const [shareCopied, setShareCopied] = React.useState(false);
   const [savedPresets, setSavedPresets] = React.useState<
     Array<{
       name: string;
@@ -555,6 +557,41 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     }}
                   >
                     Open in 4-Cam Sync
+                  </button>
+                  <select
+                    className="nvr-select mono"
+                    aria-label="Share link expiration"
+                    style={{ height: 28, fontSize: "var(--text-xs)" }}
+                    value={shareTtlSec}
+                    onChange={(e) => setShareTtlSec(Number(e.target.value))}
+                  >
+                    <option value={3600}>TTL: 1h</option>
+                    <option value={86400}>TTL: 24h</option>
+                    <option value={604800}>TTL: 7d</option>
+                  </select>
+                  <button
+                    className="nvr-btn mono"
+                    onClick={async () => {
+                      const res = await fetch("/api/share", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        credentials: "include",
+                        body: JSON.stringify({
+                          kind: "review",
+                          target_id: activeReview.id,
+                          expires_in_sec: shareTtlSec,
+                        }),
+                      });
+                      const data = await res.json().catch(() => ({}));
+                      if (data.url) {
+                        navigator.clipboard?.writeText(`${window.location.origin}${data.url}`);
+                        setShareCopied(true);
+                        window.setTimeout(() => setShareCopied(false), 2000);
+                      }
+                    }}
+                    title="Copy HMAC-signed shareable link for this review event"
+                  >
+                    {shareCopied ? "Copied!" : "Share Link"}
                   </button>
                   <button
                     className="nvr-btn primary"

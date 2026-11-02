@@ -60,6 +60,32 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
 }) => {
   const { t } = useI18n();
   const [includeAudio, setIncludeAudio] = React.useState(true);
+  const [shareTtlSec, setShareTtlSec] = React.useState(86400);
+
+  const handleCopyShareLink = async (exportId: string) => {
+    try {
+      const res = await fetch("/api/share", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          kind: "export",
+          target_id: exportId,
+          expires_in_sec: shareTtlSec,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.url) {
+        const fullUrl = `${window.location.origin}${data.url}`;
+        await navigator.clipboard?.writeText(fullUrl);
+        notify(`Copied expiring share link (${shareTtlSec / 3600}h) to clipboard`);
+      } else {
+        notify("Failed to generate share link");
+      }
+    } catch {
+      notify("Failed to generate share link");
+    }
+  };
 
   return (
     <>
@@ -152,7 +178,20 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
         <div className="nvr-panel">
           <div className="nvr-panel-header">
             <span>{t.exports.archiveTitle}</span>
-            <span className="mono">{exportsList.length}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <select
+                className="nvr-select mono"
+                style={{ height: 20, fontSize: "var(--text-xs)" }}
+                aria-label="Share link expiration"
+                value={shareTtlSec}
+                onChange={(e) => setShareTtlSec(Number(e.target.value))}
+              >
+                <option value={3600}>Share TTL: 1h</option>
+                <option value={86400}>Share TTL: 24h</option>
+                <option value={604800}>Share TTL: 7d</option>
+              </select>
+              <span className="mono">{exportsList.length}</span>
+            </div>
           </div>
           <div className="nvr-scroll-y">
             {exportsList.map((ex) => (
@@ -201,6 +240,17 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                   </div>
                 </div>
                 <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                  <button
+                    className="nvr-btn mono"
+                    style={{ height: 26, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    title="Copy expiring HMAC-signed shareable link"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleCopyShareLink(ex.id);
+                    }}
+                  >
+                    Share Link
+                  </button>
                   <a
                     href={ex.video_path.replace("/media/frigate", "")}
                     download={`${ex.id}.mp4`}

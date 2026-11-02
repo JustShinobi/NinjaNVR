@@ -19,6 +19,7 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::Engine;
 use chrono::Local;
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use ninjanvr_comms::{CommsHub, SharedCommsHub};
 use ninjanvr_config::{
@@ -34,6 +35,7 @@ use ninjanvr_media::{
 use pipeline::{SharedCameraMetrics, VisionPipeline};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Sha256;
 use tokio::sync::{RwLock, broadcast};
 use tokio_tungstenite::tungstenite::protocol::Message as TungMsg;
 use tower_http::compression::CompressionLayer;
@@ -461,6 +463,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/recordings/storage", get(api_recordings_storage))
         .route("/exports", get(api_exports))
         .route("/exports/delete", post(api_exports_bulk_delete))
+        .route("/share", post(api_share_create))
         .route("/jobs/export", get(api_empty_array))
         .route("/cases", get(api_cases).post(api_case_create))
         .route(
@@ -521,6 +524,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
 
     Router::new()
         .nest("/api", api_router)
+        .route("/share/{token}", get(share_player_page))
         .route("/version", get(api_version))
         .route("/auth", get(api_auth_verify))
         .route("/logout", get(api_logout).post(api_logout))
@@ -573,8 +577,9 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .nest_service("/assets-v2", ServeDir::new(web_v2_dir.join("assets-v2")))
         .fallback(get(serve_spa_fallback))
         .layer(CompressionLayer::new())
-        // Binary media directories are mounted outside CompressionLayer so MP4/WebP files
+        // Binary media directories and MP4 share streams are mounted outside CompressionLayer so MP4/WebP files
         // always preserve exact Content-Length and Accept-Ranges: bytes without Brotli/Gzip chunking.
+        .route("/share/{token}/video.mp4", get(share_video_mp4))
         .nest_service("/clips", ServeDir::new(clips_dir))
         .nest_service("/recordings", ServeDir::new(recordings_dir))
         .nest_service("/exports", ServeDir::new(exports_dir))
@@ -862,6 +867,7 @@ async fn auth_gate_middleware(
                                 | "jobs"
                                 | "cases"
                                 | "preview"
+                                | "share"
                                 | "go2rtc"
                                 | "ws"
                                 | "labels"
@@ -2549,6 +2555,319 @@ async fn api_timeline(
     Json(Value::Array(items))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareTokenPayload {
+    pub k: String,
+    pub id: String,
+    pub exp: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateShareBody {
+    #[serde(default = "default_share_kind")]
+    pub kind: String,
+    pub target_id: String,
+    #[serde(default = "default_share_ttl")]
+    pub expires_in_sec: u64,
+}
+
+fn default_share_kind() -> String {
+    "export".to_string()
+}
+
+fn default_share_ttl() -> u64 {
+    86400
+}
+
+pub fn sign_share_token(secret: &str, payload: &ShareTokenPayload) -> String {
+    let json_bytes = serde_json::to_vec(payload).unwrap_or_default();
+    let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&json_bytes);
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+    mac.update(payload_b64.as_bytes());
+    let sig_bytes = mac.finalize().into_bytes();
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig_bytes);
+    format!("{payload_b64}.{sig_b64}")
+}
+
+pub fn verify_share_token(
+    secret: &str,
+    token: &str,
+    now_ts: u64,
+) -> std::result::Result<ShareTokenPayload, StatusCode> {
+    let Some((payload_b64, sig_b64)) = token.split_once('.') else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    let Ok(provided_sig) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64) else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+    mac.update(payload_b64.as_bytes());
+    if mac.verify_slice(&provided_sig).is_err() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let Ok(payload_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload_b64)
+    else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    let Ok(payload) = serde_json::from_slice::<ShareTokenPayload>(&payload_bytes) else {
+        return Err(StatusCode::FORBIDDEN);
+    };
+    if payload.exp <= now_ts {
+        return Err(StatusCode::GONE);
+    }
+    Ok(payload)
+}
+
+fn resolve_share_target_metadata(
+    state: &AppState,
+    kind: &str,
+    target_id: &str,
+) -> (Option<String>, String, Option<u64>) {
+    if kind == "export" {
+        if let Ok(exports) = state.db.query_exports()
+            && let Some(exp) = exports
+                .into_iter()
+                .find(|e| e["id"].as_str() == Some(target_id))
+        {
+            let cam = exp["camera"].as_str().map(|s| s.to_string());
+            let name = exp["name"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(target_id)
+                .to_string();
+            let date_ts = exp["date"].as_f64().map(|t| t as u64);
+            return (cam, name, date_ts);
+        }
+        let cam_prefix = target_id
+            .rsplitn(3, '_')
+            .nth(2)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        return (cam_prefix, target_id.to_string(), None);
+    }
+
+    if let Ok(Some(ev)) = state.db.get_event(target_id) {
+        let cam = ev["camera"].as_str().map(|s| s.to_string());
+        let label = ev["label"].as_str().unwrap_or("event");
+        let start = ev["start_time"].as_f64().map(|t| t as u64);
+        let title = format!("{} // {}", cam.as_deref().unwrap_or("camera"), label);
+        return (cam, title, start);
+    }
+
+    if let Ok(Some(rev)) = state.db.get_review_by_id(target_id) {
+        let cam = Some(rev.camera.clone());
+        let title = format!("{} // {}", rev.camera, rev.severity.to_ascii_uppercase());
+        return (cam, title, Some(rev.start_time as u64));
+    }
+
+    (None, target_id.to_string(), None)
+}
+
+async fn api_share_create(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(body): Json<CreateShareBody>,
+) -> Response {
+    let kind =
+        if body.kind.eq_ignore_ascii_case("event") || body.kind.eq_ignore_ascii_case("review") {
+            "event".to_string()
+        } else {
+            "export".to_string()
+        };
+    let (target_cam, _, _) = resolve_share_target_metadata(&state, &kind, &body.target_id);
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+        match target_cam {
+            Some(ref cam) if allowed.contains(cam) => {}
+            _ => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "success": false,
+                        "message": "Camera is not permitted for this user"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let exp = unix_now() + body.expires_in_sec.clamp(60, 86400 * 30);
+    let payload = ShareTokenPayload {
+        k: kind,
+        id: body.target_id.clone(),
+        exp,
+    };
+    let token = sign_share_token(&state.jwt_secret, &payload);
+    Json(json!({
+        "success": true,
+        "token": token,
+        "url": format!("/share/{token}"),
+        "video_url": format!("/share/{token}/video.mp4"),
+        "expires_at": exp
+    }))
+    .into_response()
+}
+
+async fn share_player_page(
+    State(state): State<AppState>,
+    AxumPath(token): AxumPath<String>,
+) -> Response {
+    let payload = match verify_share_token(&state.jwt_secret, &token, unix_now()) {
+        Ok(p) => p,
+        Err(status) => {
+            return (
+                status,
+                Json(json!({ "error": "Share link invalid or expired" })),
+            )
+                .into_response();
+        }
+    };
+    let (_, clip_title, clip_ts) = resolve_share_target_metadata(&state, &payload.k, &payload.id);
+    let ts_label = clip_ts
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "Timestamp recorded in clip".to_string());
+    let exp_label = chrono::DateTime::from_timestamp(payload.exp as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| payload.exp.to_string());
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en" style="color-scheme:dark;background:#070a0f;color:#e2e8f0;font-family:system-ui,sans-serif">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NinjaNVR Shared Clip // {clip_title}</title></head>
+<body style="margin:0;padding:24px;display:flex;flex-direction:column;align-items:center;gap:14px">
+  <div style="width:100%;max-width:960px;background:#0d121b;border:1px solid #1e293b;border-radius:4px;padding:16px">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;font-family:monospace;font-size:12px">
+      <div>
+        <div><strong>NINJANVR SHARED CLIP // {clip_title}</strong></div>
+        <div style="color:#94a3b8;font-size:11px;margin-top:2px">CLIP TIME: {ts_label} · EXPIRES: {exp_label}</div>
+      </div>
+      <a href="/share/{token}/video.mp4" download="{}.mp4" style="color:#38bdf8;text-decoration:none;border:1px solid #0284c7;padding:4px 10px;border-radius:3px">Download MP4</a>
+    </div>
+    <video src="/share/{token}/video.mp4" controls autoplay playsinline style="width:100%;max-height:72vh;object-fit:contain;background:#000"></video>
+  </div>
+</body>
+</html>"#,
+        payload.id
+    );
+    Html(html).into_response()
+}
+
+fn serve_mp4_bytes_with_range(bytes: Vec<u8>, headers: &HeaderMap) -> Response {
+    let total = bytes.len();
+    if total > 0
+        && let Some(range_val) = headers.get(header::RANGE).and_then(|v| v.to_str().ok())
+        && let Some(spec) = range_val.strip_prefix("bytes=")
+        && let Some((start_s, end_s)) = spec.split_once('-')
+        && let Ok(start) = start_s.trim().parse::<usize>()
+        && start < total
+    {
+        let end = end_s
+            .trim()
+            .parse::<usize>()
+            .map(|e| e.min(total - 1))
+            .unwrap_or(total - 1);
+        if start <= end {
+            let slice = bytes[start..=end].to_vec();
+            let content_range = format!("bytes {start}-{end}/{total}");
+            return (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, "video/mp4".to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::CONTENT_RANGE, content_range),
+                    (header::CONTENT_LENGTH, slice.len().to_string()),
+                ],
+                slice,
+            )
+                .into_response();
+        }
+    }
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "video/mp4".to_string()),
+            (header::ACCEPT_RANGES, "bytes".to_string()),
+            (header::CONTENT_LENGTH, total.to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn share_video_mp4(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(token): AxumPath<String>,
+) -> Response {
+    let payload = match verify_share_token(&state.jwt_secret, &token, unix_now()) {
+        Ok(p) => p,
+        Err(status) => {
+            return (
+                status,
+                Json(json!({ "error": "Share link invalid or expired" })),
+            )
+                .into_response();
+        }
+    };
+
+    if payload.k == "export" {
+        if let Ok(exports) = state.db.query_exports()
+            && let Some(exp) = exports
+                .into_iter()
+                .find(|e| e["id"].as_str() == Some(&payload.id))
+            && let Some(vp) = exp["video_path"].as_str()
+        {
+            let disk_path = resolve_recording_disk_path(&state.media_dir, vp);
+            if let Ok(bytes) = tokio::fs::read(&disk_path).await {
+                return serve_mp4_bytes_with_range(bytes, &headers);
+            }
+        }
+        let safe_id: String = payload
+            .id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+            .collect();
+        let file_path = state
+            .media_dir
+            .join("exports")
+            .join(format!("{safe_id}.mp4"));
+        if let Ok(bytes) = tokio::fs::read(&file_path).await {
+            return serve_mp4_bytes_with_range(bytes, &headers);
+        }
+    } else {
+        if let Ok(Some(ev)) = state.db.get_event(&payload.id) {
+            let cam = ev["camera"].as_str().unwrap_or("sala");
+            let start = ev["start_time"].as_f64().unwrap_or(0.0);
+            let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
+            if let Ok(recs) = state.db.query_recordings(cam, start - 10.0, end + 10.0) {
+                for rec in recs {
+                    let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+                    if let Ok(bytes) = tokio::fs::read(&disk_path).await {
+                        return serve_mp4_bytes_with_range(bytes, &headers);
+                    }
+                }
+            }
+        }
+        if let Ok(Some(rev)) = state.db.get_review_by_id(&payload.id) {
+            let cam = &rev.camera;
+            let start = rev.start_time;
+            let end = rev.end_time.unwrap_or(start + 15.0);
+            if let Ok(recs) = state.db.query_recordings(cam, start - 10.0, end + 10.0) {
+                for rec in recs {
+                    let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+                    if let Ok(bytes) = tokio::fs::read(&disk_path).await {
+                        return serve_mp4_bytes_with_range(bytes, &headers);
+                    }
+                }
+            }
+        }
+    }
+
+    StatusCode::NOT_FOUND.into_response()
+}
+
 async fn api_exports(State(state): State<AppState>) -> Json<Value> {
     let exports = state.db.query_exports().unwrap_or_default();
     Json(Value::Array(exports))
@@ -3994,6 +4313,104 @@ version: 0.18-0
             .await
             .unwrap();
         assert_eq!(resp_viewer_unauth_cam.status(), StatusCode::FORBIDDEN);
+
+        // 17. Test HMAC-signed shareable links (/api/share, /share/:token, /share/:token/video.mp4)
+        let resp_share = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"sample","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_share.status(), StatusCode::OK);
+        let share_json: Value =
+            serde_json::from_slice(&to_bytes(resp_share.into_body(), 4096).await.unwrap()).unwrap();
+        let share_token = share_json["token"].as_str().unwrap();
+
+        // Valid unauthenticated request to /share/:token and /share/:token/video.mp4 on auth_app
+        let resp_share_page = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_share_page.status(), StatusCode::OK);
+
+        let resp_share_vid = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_token}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_share_vid.status(), StatusCode::OK);
+
+        // HTTP Range request on /share/:token/video.mp4 returns 206 Partial Content
+        let resp_share_range = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_token}/video.mp4"))
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_share_range.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(
+            resp_share_range
+                .headers()
+                .contains_key(header::CONTENT_RANGE)
+        );
+
+        // Tampered signature is rejected with 403 Forbidden
+        let resp_tampered = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_token}tampered"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_tampered.status(), StatusCode::FORBIDDEN);
+
+        // Expired token is rejected with 410 Gone
+        let expired_tok = sign_share_token(
+            &state.jwt_secret,
+            &ShareTokenPayload {
+                k: "export".to_string(),
+                id: "sample".to_string(),
+                exp: 1000,
+            },
+        );
+        let resp_expired = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{expired_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_expired.status(), StatusCode::GONE);
 
         // Public bootstrap endpoint /api/auth/first_time_login remains accessible
         let resp = auth_app
