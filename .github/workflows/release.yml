@@ -5,6 +5,9 @@ on:
     branches:
       - dev
       - main
+    paths-ignore:
+      - '**.md'
+      - '.github/ISSUE_TEMPLATE/**'
   workflow_dispatch:
     inputs:
       publish_tag:
