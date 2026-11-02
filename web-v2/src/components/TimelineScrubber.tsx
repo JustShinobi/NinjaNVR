@@ -602,7 +602,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       candidates.push(Math.floor(r.start_time));
     }
     for (const s of windowSegments) {
-      const hasAudio = s.dbfs !== undefined && s.dbfs !== 0 && (s.dbfs < 0 ? s.dbfs > -65 : s.dbfs > 10);
+      const hasAudio =
+        s.dbfs !== undefined && s.dbfs !== 0 && (s.dbfs < 0 ? s.dbfs > -50 : s.dbfs > 10);
       if (s.objects > 0 || s.motion > 0 || hasAudio) {
         candidates.push(Math.floor(s.start_time));
       }
@@ -840,11 +841,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       ctx.fillStyle = "rgba(16, 185, 129, 0.42)";
       ctx.fillRect(x0, h - 5, segW, 5);
 
-      // Acoustic activity layer (cyan/emerald waveform bar when segment has non-zero dBFS above noise floor)
+      // Acoustic activity layer (cyan/emerald waveform bar when segment has non-zero dBFS above ambient noise floor)
       if (seg.dbfs !== undefined && seg.dbfs !== 0) {
         const normAudio =
           seg.dbfs < 0
-            ? Math.max(0, Math.min(1, (seg.dbfs + 75) / 70))
+            ? Math.max(0, Math.min(1, (seg.dbfs + 55) / 50))
             : Math.max(0, Math.min(1, seg.dbfs / 100));
         if (normAudio > 0.05) {
           const audioH = Math.max(4, Math.round(normAudio * 14));

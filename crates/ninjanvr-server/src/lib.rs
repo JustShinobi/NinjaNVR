@@ -4318,9 +4318,27 @@ async fn api_recordings_sync(State(state): State<AppState>) -> Json<Value> {
             resolve_recording_disk_path(&media_dir, db_path).exists()
         })
         .unwrap_or(0);
+    let legacy_dbfs = state
+        .db
+        .list_recordings_by_dbfs(-5, 500)
+        .unwrap_or_default();
+    let mut repaired_dbfs = 0usize;
+    for (id, db_path) in legacy_dbfs {
+        let disk_path = resolve_recording_disk_path(&media_dir, &db_path);
+        let next_dbfs = if disk_path.exists() {
+            let d = ninjanvr_media::probe_mp4_audio_dbfs_fast(&disk_path);
+            if d == -5 { 0 } else { d }
+        } else {
+            0
+        };
+        if state.db.update_recording_dbfs(&id, next_dbfs).is_ok() {
+            repaired_dbfs += 1;
+        }
+    }
     let duration_ms = started.elapsed().as_millis() as u64;
     Json(json!({
         "removed_orphans": removed_orphans,
+        "repaired_dbfs": repaired_dbfs,
         "duration_ms": duration_ms
     }))
 }

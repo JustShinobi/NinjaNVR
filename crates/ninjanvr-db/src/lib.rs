@@ -421,6 +421,33 @@ impl NinjaDatabase {
         )?)
     }
 
+    pub fn list_recordings_by_dbfs(
+        &self,
+        target_dbfs: i64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, path FROM recordings WHERE dbfs = ?1 ORDER BY start_time DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![target_dbfs, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn update_recording_dbfs(&self, id: &str, dbfs: i64) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(conn.execute(
+            "UPDATE recordings SET dbfs = ?2 WHERE id = ?1",
+            params![id, dbfs],
+        )?)
+    }
+
     pub fn delete_expired_idle_main_recordings(
         &self,
         camera: &str,

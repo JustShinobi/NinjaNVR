@@ -346,8 +346,39 @@ pub fn check_acoustic_event_trigger(dbfs: i64, cfg: &AudioConfig) -> Option<Stri
     }
 }
 
-/// Probes an MP4 segment file in pure Rust without spawning `ffprobe` to extract
-/// the acoustic RMS level in dBFS (`-89`..`-1` for active audio, `0` if silent or no `soun` track).
+fn decode_audio_dbfs_via_ffmpeg(path: &Path) -> i64 {
+    let output = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"])
+        .output();
+    let Ok(out) = output else {
+        return 0;
+    };
+    if !out.status.success() || out.stdout.len() < 4 {
+        return 0;
+    }
+    let pcm_samples: Vec<i16> = out
+        .stdout
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .copied()
+        .map(i16::from_le_bytes)
+        .collect();
+    compute_pcm_rms_dbfs(&pcm_samples)
+}
+
+/// Probes an MP4 segment file to extract the acoustic RMS level in dBFS
+/// (`-89`..`-1` for active audio, `0` if silent or no `soun` track).
+///
+/// First inspects the ISO-BMFF `moov` -> `soun` track in pure Rust (`< 0.05ms`):
+/// - If there is no `soun` track or `sample_count == 0`, returns `0` immediately without spawning FFmpeg.
+/// - If `stsd` indicates a compressed codec (`mp4a` AAC, `alaw`, `ulaw`, `Opus`, etc.), decodes the
+///   audio track to 8kHz mono `s16le` PCM via `ffmpeg` before computing RMS (avoiding raw compressed
+///   bitstream byte reinterpretation, whose uniform entropy always averages ~`-5 dBFS`).
+/// - If `stsd` is uncompressed PCM (or omitted in synthetic test containers), reads raw `s16le` samples
+///   directly from the `mdat` chunk offsets.
 pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -384,11 +415,14 @@ pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
             if file.read_exact(&mut moov).is_err() {
                 break;
             }
-            if let Some((offsets, total_audio_bytes, sample_count)) =
+            if let Some((offsets, total_audio_bytes, sample_count, is_compressed)) =
                 extract_soun_sample_stats(&moov)
             {
                 if sample_count == 0 || total_audio_bytes == 0 {
                     return 0;
+                }
+                if is_compressed {
+                    return decode_audio_dbfs_via_ffmpeg(path);
                 }
                 let mut payload = Vec::with_capacity(8192);
                 for off in offsets.into_iter().take(8) {
@@ -427,7 +461,7 @@ pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
     0
 }
 
-fn extract_soun_sample_stats(moov: &[u8]) -> Option<(Vec<u64>, u64, u32)> {
+fn extract_soun_sample_stats(moov: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
     let mut mpos = 0usize;
     while mpos + 8 <= moov.len() {
         let msize = u32::from_be_bytes([moov[mpos], moov[mpos + 1], moov[mpos + 2], moov[mpos + 3]])
@@ -447,7 +481,7 @@ fn extract_soun_sample_stats(moov: &[u8]) -> Option<(Vec<u64>, u64, u32)> {
     None
 }
 
-fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32)> {
+fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
     let mut tpos = 0usize;
     while tpos + 8 <= trak.len() {
         let tsize = u32::from_be_bytes([trak[tpos], trak[tpos + 1], trak[tpos + 2], trak[tpos + 3]])
@@ -500,6 +534,7 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32)> {
                 let mut offsets = Vec::new();
                 let mut total_bytes = 0u64;
                 let mut sample_count = 0u32;
+                let mut is_compressed = false;
                 let mut spos = 0usize;
                 while spos + 8 <= stbl.len() {
                     let ssize = u32::from_be_bytes([
@@ -513,7 +548,11 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32)> {
                         break;
                     }
                     let sbody = &stbl[spos + 8..spos + ssize];
-                    if stype == b"stsz" && sbody.len() >= 12 {
+                    if stype == b"stsd" && sbody.len() >= 16 {
+                        let fourcc = &sbody[12..16];
+                        is_compressed =
+                            !matches!(fourcc, b"sowt" | b"twos" | b"lpcm" | b"raw " | b"NONE");
+                    } else if stype == b"stsz" && sbody.len() >= 12 {
                         let default_size =
                             u32::from_be_bytes([sbody[4], sbody[5], sbody[6], sbody[7]]);
                         let count = u32::from_be_bytes([sbody[8], sbody[9], sbody[10], sbody[11]]);
@@ -572,7 +611,7 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32)> {
                     }
                     spos += ssize;
                 }
-                return Some((offsets, total_bytes, sample_count));
+                return Some((offsets, total_bytes, sample_count, is_compressed));
             }
         }
         tpos += tsize;
@@ -782,6 +821,39 @@ impl RecordingEngine {
         tokio::spawn(async move {
             recovery_engine.run_storage_recovery_probe_loop().await;
         });
+
+        let dbfs_repair_engine = self.clone();
+        tokio::spawn(async move {
+            dbfs_repair_engine.run_legacy_dbfs_repair_once().await;
+        });
+    }
+
+    async fn run_legacy_dbfs_repair_once(&self) {
+        loop {
+            let batch = self.db.list_recordings_by_dbfs(-5, 100).unwrap_or_default();
+            if batch.is_empty() {
+                break;
+            }
+            for (id, db_path) in batch {
+                let rel = db_path
+                    .strip_prefix("/media/frigate/")
+                    .unwrap_or(db_path.trim_start_matches('/'));
+                let disk_path = self.media_dir.join(rel);
+                let media_path = disk_path.clone();
+                let real_dbfs = tokio::task::spawn_blocking(move || {
+                    if media_path.exists() {
+                        let d = probe_mp4_audio_dbfs_fast(&media_path);
+                        if d == -5 { 0 } else { d }
+                    } else {
+                        0
+                    }
+                })
+                .await
+                .unwrap_or(0);
+                let _ = self.db.update_recording_dbfs(&id, real_dbfs);
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     async fn run_storage_recovery_probe_loop(&self) {
@@ -2108,6 +2180,41 @@ mod tests {
             (-15..0).contains(&probed_active),
             "expected active dBFS in [-15, -1], got {probed_active}"
         );
+
+        // Verify that a `stsd` box with `mp4a` (compressed AAC) sets `is_compressed = true`
+        // so compressed entropy bytes are never raw-cast as i16 PCM (which would yield -5 dBFS)
+        let mut stsd_body = vec![0u8; 24];
+        stsd_body[4..8].copy_from_slice(&1u32.to_be_bytes()); // entry count = 1
+        stsd_body[8..12].copy_from_slice(&16u32.to_be_bytes()); // entry size = 16
+        stsd_body[12..16].copy_from_slice(b"mp4a");
+        let stsd = make_box(b"stsd", &stsd_body);
+        let mut stsz_body = Vec::new();
+        stsz_body.extend_from_slice(&0u32.to_be_bytes());
+        stsz_body.extend_from_slice(&256u32.to_be_bytes());
+        stsz_body.extend_from_slice(&1u32.to_be_bytes());
+        let stsz = make_box(b"stsz", &stsz_body);
+        let mut stco_body = Vec::new();
+        stco_body.extend_from_slice(&0u32.to_be_bytes());
+        stco_body.extend_from_slice(&1u32.to_be_bytes());
+        stco_body.extend_from_slice(&24u32.to_be_bytes());
+        let stco = make_box(b"stco", &stco_body);
+        let mut stbl_body = Vec::new();
+        stbl_body.extend_from_slice(&stsd);
+        stbl_body.extend_from_slice(&stsz);
+        stbl_body.extend_from_slice(&stco);
+        let stbl = make_box(b"stbl", &stbl_body);
+        let minf = make_box(b"minf", &stbl);
+        let mut hdlr_body = vec![0u8; 12];
+        hdlr_body[8..12].copy_from_slice(b"soun");
+        let hdlr = make_box(b"hdlr", &hdlr_body);
+        let mut mdia_body = Vec::new();
+        mdia_body.extend_from_slice(&hdlr);
+        mdia_body.extend_from_slice(&minf);
+        let mdia = make_box(b"mdia", &mdia_body);
+        let trak = make_box(b"trak", &mdia);
+        let stats = extract_soun_sample_stats(&trak).expect("soun stats");
+        assert!(stats.3, "expected mp4a stsd to be marked as compressed");
+
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
