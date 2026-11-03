@@ -3405,5 +3405,28 @@ mod tests {
         let f_nested =
             build_privacy_drawbox_filter(&nested_mask).expect("nested object mask filter");
         assert!(f_nested.contains("drawbox=x=iw*0.200:y=ih*0.100:w=iw*0.200:h=ih*0.200"));
+
+        // parse_staged_start_time extracts exact UTC epoch from {camera}_%Y%m%d%H%M%S.mp4
+        let staged_ok =
+            Path::new("/media/recordings/.staging/front_door/front_door_20261102140510.mp4");
+        let expected_epoch = chrono::NaiveDate::from_ymd_opt(2026, 11, 2)
+            .unwrap()
+            .and_hms_opt(14, 5, 10)
+            .unwrap()
+            .and_utc()
+            .timestamp() as f64;
+        assert_eq!(
+            parse_staged_start_time("front_door", staged_ok),
+            Some(expected_epoch)
+        );
+        // Wrong camera prefix or malformed date returns None
+        assert_eq!(parse_staged_start_time("backyard", staged_ok), None);
+        assert_eq!(
+            parse_staged_start_time(
+                "front_door",
+                Path::new("/media/recordings/.staging/front_door/front_door_20269999999999.mp4")
+            ),
+            None
+        );
     }
 }

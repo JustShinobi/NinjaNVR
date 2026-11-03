@@ -6157,6 +6157,7 @@ mod tests {
         let distinct = db.list_distinct_sub_labels().unwrap();
         assert_eq!(distinct, vec!["Alice"]);
 
+        drop(db);
         let _ = std::fs::remove_file(&tmp);
     }
 }
