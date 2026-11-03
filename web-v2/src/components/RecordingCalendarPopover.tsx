@@ -267,7 +267,7 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
               fontSize: "var(--text-xs)",
               color: "var(--text-secondary)",
               padding: "4px 6px",
-              background: "var(--bg-deep)",
+              background: "var(--bg-subcard)",
               borderRadius: 2,
               border: "1px solid var(--border-hairline)",
             }}
@@ -361,14 +361,14 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
                       ? evCount > 0
                         ? "1px solid rgba(239, 68, 68, 0.55)"
                         : "1px solid rgba(16, 185, 129, 0.45)"
-                      : "1px solid rgba(255, 255, 255, 0.04)",
+                      : "1px solid var(--border-divider)",
                     background: isSelected
                       ? "rgba(14, 165, 233, 0.28)"
                       : hasRec
                       ? evCount > 0
                         ? "rgba(239, 68, 68, 0.14)"
                         : "rgba(16, 185, 129, 0.12)"
-                      : "var(--bg-deep)",
+                      : "var(--bg-subcard)",
                     color: hasRec ? "var(--text-primary)" : "var(--text-muted)",
                     opacity: hasRec ? 1 : 0.35,
                     cursor: hasRec ? "pointer" : "not-allowed",

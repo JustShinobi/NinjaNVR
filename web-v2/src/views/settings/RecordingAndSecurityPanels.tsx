@@ -280,17 +280,7 @@ export const RecordingReviewSection: React.FC<{
           </div>
 
           {/* Alerts Retention (Clean 2x2 Grid so labels never wrap and Retain Mode never clips) */}
-          <div
-            style={{
-              padding: 10,
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
+          <div className="nvr-subcard">
             <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-alert-text)" }}>
               {isPt ? "POLÍTICA DE RETENÇÃO DE ALERTAS" : "ALERT EVENT RETENTION POLICY"}
             </span>
@@ -376,17 +366,7 @@ export const RecordingReviewSection: React.FC<{
           </div>
 
           {/* Detections Retention (Clean 2x2 Grid) */}
-          <div
-            style={{
-              padding: 10,
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
+          <div className="nvr-subcard">
             <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-motion-text)" }}>
               {isPt
                 ? "POLÍTICA DE RETENÇÃO DE DETECÇÕES"
@@ -474,18 +454,8 @@ export const RecordingReviewSection: React.FC<{
           </div>
 
           {/* Hybrid Dual-Stream Recording & Disk Quota Retention */}
-          <div
-            style={{
-              padding: 10,
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div className="nvr-subcard">
+            <div className="nvr-subcard-header">
               <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-accent-text)" }}>
                 {isPt
                   ? "GRAVAÇÃO HÍBRIDA SUB/MAIN & COTA DE DISCO"
@@ -558,18 +528,8 @@ export const RecordingReviewSection: React.FC<{
           </div>
 
           {/* Cold Compaction (Background CRF Compression of Idle Segments) */}
-          <div
-            style={{
-              padding: 10,
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div className="nvr-subcard">
+            <div className="nvr-subcard-header">
               <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-accent-text)" }}>
                 {isPt
                   ? "COMPACTAÇÃO FRIA EM BACKGROUND (COLD COMPACTION)"
@@ -750,18 +710,8 @@ export const RecordingReviewSection: React.FC<{
           </div>
 
           {/* Hot-to-Cold Tiered Storage & Real-Time Alert Clip Backup */}
-          <div
-            style={{
-              padding: 10,
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div className="nvr-subcard">
+            <div className="nvr-subcard-header">
               <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-live-text)" }}>
                 {isPt
                   ? "ARMAZENAMENTO EM CAMADAS HOT→COLD"
@@ -1001,14 +951,12 @@ export const RecordingReviewSection: React.FC<{
           </div>
 
           <div
+            className="nvr-subcard"
             style={{
               display: "grid",
               gridTemplateColumns: "1fr 1fr 1fr",
               gap: 8,
               padding: "6px 8px",
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
             }}
           >
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
@@ -1045,17 +993,12 @@ export const RecordingReviewSection: React.FC<{
 
           {/* Review Alerts Classification */}
           <div
+            className="nvr-subcard"
             style={{
-              padding: 10,
-              background: "var(--bg-canvas)",
-              border: "1px solid rgba(239, 68, 68, 0.35)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
+              borderColor: "rgba(239, 68, 68, 0.35)",
             }}
           >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div className="nvr-subcard-header">
               <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-alert-text)" }}>
                 {isPt
                   ? `SEVERIDADE: ALERTAS (CORTE ${activeRev.alerts.cutoff_time}s)`
@@ -1152,17 +1095,12 @@ export const RecordingReviewSection: React.FC<{
 
           {/* Review Detections Classification */}
           <div
+            className="nvr-subcard"
             style={{
-              padding: 10,
-              background: "var(--bg-canvas)",
-              border: "1px solid rgba(245, 158, 11, 0.35)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
+              borderColor: "rgba(245, 158, 11, 0.35)",
             }}
           >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div className="nvr-subcard-header">
               <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-motion-text)" }}>
                 {isPt
                   ? `SEVERIDADE: DETECÇÕES (CORTE ${activeRev.detections.cutoff_time}s)`
@@ -1196,17 +1134,12 @@ export const RecordingReviewSection: React.FC<{
 
           {/* Acoustic Event Detections */}
           <div
+            className="nvr-subcard"
             style={{
-              padding: 10,
-              background: "var(--bg-canvas)",
-              border: "1px solid rgba(6, 182, 212, 0.45)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
+              borderColor: "rgba(6, 182, 212, 0.45)",
             }}
           >
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div className="nvr-subcard-header">
               <span
                 className="mono"
                 style={{
@@ -2414,13 +2347,10 @@ export const CommsAuthUsersSection: React.FC<{
 
           {federationStatus && (
             <pre
-              className="mono"
+              className="nvr-subcard mono"
               style={{
                 margin: 0,
                 padding: 8,
-                background: "var(--bg-canvas)",
-                border: "1px solid var(--border-hairline)",
-                borderRadius: 3,
                 fontSize: "var(--text-xs)",
                 maxHeight: 160,
                 overflowY: "auto",
