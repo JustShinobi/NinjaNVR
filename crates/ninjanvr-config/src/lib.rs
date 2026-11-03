@@ -67,6 +67,103 @@ impl Default for CameraUiConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanRoom {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub x: f32,
+    #[serde(default)]
+    pub y: f32,
+    #[serde(default = "default_floorplan_room_dim")]
+    pub w: f32,
+    #[serde(default = "default_floorplan_room_dim")]
+    pub h: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+fn default_floorplan_room_dim() -> f32 {
+    0.2
+}
+
+impl Default for FloorplanRoom {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            x: 0.0,
+            y: 0.0,
+            w: default_floorplan_room_dim(),
+            h: default_floorplan_room_dim(),
+            color: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct FloorplanWall {
+    #[serde(default)]
+    pub points: [f32; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloorplanConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_data_url: Option<String>,
+    #[serde(default = "default_floorplan_opacity")]
+    pub opacity: f32,
+    #[serde(default)]
+    pub rooms: Vec<FloorplanRoom>,
+    #[serde(default)]
+    pub walls: Vec<FloorplanWall>,
+}
+
+fn default_floorplan_opacity() -> f32 {
+    0.45
+}
+
+impl Default for FloorplanConfig {
+    fn default() -> Self {
+        Self {
+            background_data_url: None,
+            opacity: default_floorplan_opacity(),
+            rooms: Vec::new(),
+            walls: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiConfig {
+    #[serde(default = "default_ui_time_format")]
+    pub time_format: String,
+    #[serde(default = "default_ui_unit_system")]
+    pub unit_system: String,
+    #[serde(default)]
+    pub floorplan: FloorplanConfig,
+}
+
+fn default_ui_time_format() -> String {
+    "browser".to_string()
+}
+
+fn default_ui_unit_system() -> String {
+    "metric".to_string()
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            time_format: default_ui_time_format(),
+            unit_system: default_ui_unit_system(),
+            floorplan: FloorplanConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NinjaConfig {
     #[serde(default = "default_version")]
@@ -101,6 +198,8 @@ pub struct NinjaConfig {
     pub peers: BTreeMap<String, PeerNodeConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub camera_groups: BTreeMap<String, CameraGroupConfig>,
+    #[serde(default)]
+    pub ui: UiConfig,
     #[serde(default)]
     pub go2rtc: Go2RtcConfig,
     #[serde(default)]
@@ -1904,8 +2003,14 @@ impl NinjaConfig {
             },
             "tls": { "enabled": self.tls.enabled },
             "ui": {
-                "time_format": "browser",
-                "unit_system": "metric"
+                "time_format": self.ui.time_format,
+                "unit_system": self.ui.unit_system,
+                "floorplan": {
+                    "background_data_url": self.ui.floorplan.background_data_url,
+                    "opacity": self.ui.floorplan.opacity,
+                    "rooms": self.ui.floorplan.rooms,
+                    "walls": self.ui.floorplan.walls
+                }
             },
             "detectors": detectors_json,
             "model": {
@@ -2300,6 +2405,41 @@ impl NinjaConfig {
         if let Some(groups_val) = obj.get("camera_groups") {
             self.camera_groups = serde_json::from_value(groups_val.clone())
                 .context("invalid camera_groups config")?;
+        }
+        if let Some(ui_val) = obj.get("ui") {
+            let prev_time_format = self.ui.time_format.clone();
+            let prev_unit_system = self.ui.unit_system.clone();
+            let mut next_ui: UiConfig =
+                serde_json::from_value(ui_val.clone()).context("invalid ui config")?;
+            if ui_val.get("time_format").is_none() {
+                next_ui.time_format = prev_time_format;
+            }
+            if ui_val.get("unit_system").is_none() {
+                next_ui.unit_system = prev_unit_system;
+            }
+            if next_ui
+                .floorplan
+                .background_data_url
+                .as_ref()
+                .is_some_and(|s| s.trim().is_empty())
+            {
+                next_ui.floorplan.background_data_url = None;
+            }
+            next_ui.floorplan.opacity = next_ui.floorplan.opacity.clamp(0.10, 1.0);
+            self.ui = next_ui;
+        }
+        if let Some(fp_val) = obj.get("floorplan") {
+            let mut next_fp: FloorplanConfig =
+                serde_json::from_value(fp_val.clone()).context("invalid floorplan config")?;
+            if next_fp
+                .background_data_url
+                .as_ref()
+                .is_some_and(|s| s.trim().is_empty())
+            {
+                next_fp.background_data_url = None;
+            }
+            next_fp.opacity = next_fp.opacity.clamp(0.10, 1.0);
+            self.ui.floorplan = next_fp;
         }
         if let Some(go2rtc_val) = obj.get("go2rtc")
             && let Some(streams_val) = go2rtc_val.get("streams")
@@ -3611,5 +3751,94 @@ version: 0.18-0
             cfg.snapshots.selection,
             SnapshotSelectionPolicy::BestAttribute
         );
+    }
+
+    #[test]
+    fn floorplan_config_rooms_walls_opacity_and_background_roundtrip_yaml_and_json() {
+        let yaml = r##"
+ui:
+  floorplan:
+    opacity: 0.45
+    background_data_url: "data:image/svg+xml;base64,PHN2Zy8+"
+    rooms:
+      - id: "escritorio"
+        label: "ESCRITÓRIO"
+        x: 0.08
+        y: 0.10
+        w: 0.38
+        h: 0.36
+        color: "#0ea5e9"
+    walls:
+      - points: [0.08, 0.46, 0.46, 0.46]
+version: 0.18-0
+"##;
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert!((cfg.ui.floorplan.opacity - 0.45).abs() < 1e-4);
+        assert_eq!(
+            cfg.ui.floorplan.background_data_url.as_deref(),
+            Some("data:image/svg+xml;base64,PHN2Zy8+")
+        );
+        assert_eq!(cfg.ui.floorplan.rooms.len(), 1);
+        assert_eq!(cfg.ui.floorplan.rooms[0].id, "escritorio");
+        assert_eq!(cfg.ui.floorplan.rooms[0].label, "ESCRITÓRIO");
+        assert!((cfg.ui.floorplan.rooms[0].x - 0.08).abs() < 1e-4);
+        assert!((cfg.ui.floorplan.rooms[0].y - 0.10).abs() < 1e-4);
+        assert!((cfg.ui.floorplan.rooms[0].w - 0.38).abs() < 1e-4);
+        assert!((cfg.ui.floorplan.rooms[0].h - 0.36).abs() < 1e-4);
+        assert_eq!(cfg.ui.floorplan.rooms[0].color.as_deref(), Some("#0ea5e9"));
+        assert_eq!(cfg.ui.floorplan.walls.len(), 1);
+        assert_eq!(cfg.ui.floorplan.walls[0].points, [0.08, 0.46, 0.46, 0.46]);
+
+        let api_val = cfg.to_api_value();
+        assert_eq!(api_val["ui"]["floorplan"]["rooms"][0]["id"], "escritorio");
+        assert_eq!(
+            api_val["ui"]["floorplan"]["rooms"][0]["label"],
+            "ESCRITÓRIO"
+        );
+        assert_eq!(
+            api_val["ui"]["floorplan"]["walls"][0]["points"],
+            json!([0.08_f32, 0.46_f32, 0.46_f32, 0.46_f32])
+        );
+
+        let patch = json!({
+            "ui": {
+                "floorplan": {
+                    "background_data_url": "data:image/png;base64,iVBORw0KGgo=",
+                    "opacity": 0.72,
+                    "rooms": [
+                        {
+                            "id": "sala",
+                            "label": "SALA",
+                            "x": 0.10,
+                            "y": 0.15,
+                            "w": 0.45,
+                            "h": 0.40,
+                            "color": "#38bdf8"
+                        },
+                        {
+                            "id": "cozinha",
+                            "label": "COZINHA",
+                            "x": 0.55,
+                            "y": 0.15,
+                            "w": 0.35,
+                            "h": 0.40
+                        }
+                    ],
+                    "walls": [
+                        { "points": [0.55, 0.15, 0.55, 0.55] }
+                    ]
+                }
+            }
+        });
+        cfg.apply_structured_json(&patch).unwrap();
+        assert!((cfg.ui.floorplan.opacity - 0.72).abs() < 1e-4);
+        assert_eq!(cfg.ui.floorplan.rooms.len(), 2);
+        assert_eq!(cfg.ui.floorplan.rooms[0].id, "sala");
+        assert_eq!(cfg.ui.floorplan.rooms[1].id, "cozinha");
+        assert_eq!(cfg.ui.floorplan.walls[0].points, [0.55, 0.15, 0.55, 0.55]);
+
+        let roundtripped =
+            NinjaConfig::from_yaml_str(&cfg.raw_yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(roundtripped.ui.floorplan, cfg.ui.floorplan);
     }
 }

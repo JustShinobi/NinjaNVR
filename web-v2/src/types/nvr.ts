@@ -174,6 +174,33 @@ export interface CameraMapPlacement {
   range: number;
 }
 
+export interface FloorplanRoom {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  color?: string | null;
+}
+
+export interface FloorplanWall {
+  points: [number, number, number, number];
+}
+
+export interface FloorplanConfig {
+  background_data_url?: string | null;
+  opacity: number;
+  rooms: FloorplanRoom[];
+  walls: FloorplanWall[];
+}
+
+export interface UiConfig {
+  time_format?: string;
+  unit_system?: string;
+  floorplan?: FloorplanConfig;
+}
+
 export interface CameraUiConfig {
   order?: number;
   dashboard?: boolean;
@@ -327,6 +354,7 @@ export interface NinjaConfigResponse {
   };
   peers?: Record<string, PeerNodeConfig>;
   camera_groups?: Record<string, CameraGroupConfig>;
+  ui?: UiConfig;
   cameras: Record<string, CameraConfig>;
 }
 

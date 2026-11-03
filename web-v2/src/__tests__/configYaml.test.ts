@@ -418,4 +418,68 @@ go2rtc:
       })
     ).toBe("LICENSE_PLATE 94% · 2400px²");
   });
+
+  test("serializes ui.floorplan (rooms, walls, opacity, background_data_url) and camera.map placements", () => {
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      ui: {
+        time_format: "browser",
+        unit_system: "metric",
+        floorplan: {
+          background_data_url: "data:image/svg+xml;base64,PHN2Zy8+",
+          opacity: 0.45,
+          rooms: [
+            {
+              id: "escritorio",
+              label: "ESCRITÓRIO",
+              x: 0.08,
+              y: 0.1,
+              w: 0.38,
+              h: 0.36,
+              color: "#0ea5e9",
+            },
+          ],
+          walls: [{ points: [0.08, 0.46, 0.46, 0.46] }],
+        },
+      },
+      cameras: {
+        escritorio_cam: {
+          enabled: true,
+          map: {
+            x: 0.22,
+            y: 0.18,
+            angle_deg: 135,
+            fov_deg: 95,
+            range: 0.32,
+          },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {},
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+      },
+    };
+
+    const yamlText = buildCleanYamlFromDraft(draft, "");
+    expect(yamlText).toContain("ui:");
+    expect(yamlText).toContain("floorplan:");
+    expect(yamlText).toContain('background_data_url: "data:image/svg+xml;base64,PHN2Zy8+"');
+    expect(yamlText).toContain("opacity: 0.45");
+    expect(yamlText).toContain("id: escritorio");
+    expect(yamlText).toContain("label: ESCRITÓRIO");
+    expect(yamlText).toContain("x: 0.08");
+    expect(yamlText).toContain("y: 0.1");
+    expect(yamlText).toContain("w: 0.38");
+    expect(yamlText).toContain("h: 0.36");
+    expect(yamlText).toContain('color: "#0ea5e9"');
+    expect(yamlText).toContain("walls:");
+    expect(yamlText).toContain("points:");
+    expect(yamlText).toContain("0.46");
+    expect(yamlText).toContain("map:");
+    expect(yamlText).toContain("angle_deg: 135");
+    expect(yamlText).toContain("fov_deg: 95");
+    expect(yamlText).toContain("range: 0.32");
+  });
 });
