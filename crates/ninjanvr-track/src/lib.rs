@@ -612,6 +612,7 @@ impl ByteTracker {
         let frame_h = self.frame_h;
         for attr_det in attribute_dets {
             let is_face = attr_det.label.eq_ignore_ascii_case("face");
+            let is_plate = attr_det.label.eq_ignore_ascii_case("license_plate");
             let mut best_tid: Option<String> = None;
             let mut best_containment = 0.60f32;
             let mut best_parent_score = -1.0f32;
@@ -622,8 +623,10 @@ impl ByteTracker {
                 }
                 let parent_eligible = if is_face {
                     trk.label == "person"
-                } else {
+                } else if is_plate {
                     is_vehicle_label(&trk.label)
+                } else {
+                    is_vehicle_label(&trk.label) || trk.label == "person"
                 };
                 if !parent_eligible {
                     continue;
@@ -677,6 +680,7 @@ impl ByteTracker {
         let stationary_thresh = self.stationary_threshold;
         let frame_w = self.frame_w;
         let frame_h = self.frame_h;
+        let eff_min_init = self.effective_min_initialized();
         let (min_score_cfg, threshold_cfg) = cfg
             .objects
             .filters
@@ -686,8 +690,13 @@ impl ByteTracker {
         if let Some(trk) = self.tracks.get_mut(tid) {
             let (old_cx, old_cy) = trk.bbox.center();
             let (new_cx, new_cy) = det.bbox.center();
-            let dx = new_cx - old_cx;
-            let dy = new_cy - old_cy;
+            let was_predicted =
+                trk.disappeared_frames > 0 && (trk.vx.abs() > 0.5 || trk.vy.abs() > 0.5);
+            let (dx, dy) = if was_predicted {
+                ((new_cx - old_cx) + trk.vx, (new_cy - old_cy) + trk.vy)
+            } else {
+                (new_cx - old_cx, new_cy - old_cy)
+            };
             trk.vx = 0.7 * trk.vx + 0.3 * dx;
             trk.vy = 0.7 * trk.vy + 0.3 * dy;
 
@@ -751,7 +760,7 @@ impl ByteTracker {
                 }
             }
 
-            if is_new_top || trk.frames_tracked == self.min_initialized {
+            if is_new_top || trk.frames_tracked == eff_min_init {
                 let frame_area = (frame_w.saturating_mul(frame_h)).max(1) as f32;
                 let area_px = det.bbox.area();
                 let area_pct = ((area_px as f32 / frame_area) * 10000.0).round() / 100.0;
@@ -1733,5 +1742,171 @@ mod tests {
         assert!(a_gate[0].zones.contains(&"global_perimeter".to_string()));
         assert!(a_gate[0].zones.contains(&"entry_gate_zone".to_string()));
         assert!(!a_gate[0].zones.contains(&"driveway_zone".to_string()));
+    }
+
+    #[test]
+    fn attribute_quality_and_label_classifiers_handle_vehicles_carriers_and_zero_frames() {
+        for v in [
+            "car",
+            "truck",
+            "bus",
+            "motorcycle",
+            "bicycle",
+            "garbage_truck",
+            "school_bus",
+        ] {
+            assert!(is_vehicle_label(v), "{v} must be classified as vehicle");
+        }
+        for non_v in ["person", "dog", "cat", "face", "license_plate"] {
+            assert!(
+                !is_vehicle_label(non_v),
+                "{non_v} must not be classified as vehicle"
+            );
+        }
+
+        assert!(!is_delivery_logo_label("face"));
+        assert!(!is_delivery_logo_label("FACE"));
+        assert!(!is_delivery_logo_label("license_plate"));
+        assert!(!is_delivery_logo_label("License_Plate"));
+        assert!(is_delivery_logo_label("correios"));
+        assert!(is_delivery_logo_label("amazon"));
+        assert!(is_delivery_logo_label("mercadolivre"));
+
+        // compute_attribute_quality = score * sqrt(area_px / (frame_w * frame_h))
+        // For 100x100 = 10_000 px inside 1000x1000 = 1_000_000 px -> sqrt(0.01) = 0.1
+        let q = compute_attribute_quality(0.80, 10_000, 1000, 1000);
+        assert!((q - 0.08).abs() < 1e-5);
+
+        // Division-by-zero guard when frame_w or frame_h is 0
+        let q_zero = compute_attribute_quality(0.90, 100, 0, 0);
+        assert!(q_zero.is_finite() && q_zero > 0.0);
+    }
+
+    #[test]
+    fn byte_tracker_enforces_object_masks_aspect_ratio_filters_and_duplicate_suppression() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.width = 1000;
+        cam_cfg.detect.height = 1000;
+        cam_cfg.detect.min_initialized = 1;
+        cam_cfg.objects.track = vec!["person".to_string()];
+        // Global object mask covering the top-left quadrant [0,0 -> 500,500]
+        cam_cfg.objects.mask = "0.0,0.0,0.5,0.0,0.5,0.5,0.0,0.5".into();
+
+        let filter = ninjanvr_config::ObjectFilterConfig {
+            min_ratio: 0.3,
+            max_ratio: 1.2,
+            ..Default::default()
+        };
+        cam_cfg.objects.filters.insert("person".to_string(), filter);
+
+        let mut tracker = ByteTracker::new("mask_cam", 1000, 1000, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1000, 1000);
+
+        // 1. Detection whose bottom_center (250, 400) is inside the object mask -> suppressed
+        let masked_det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.92,
+            bbox: BoundingBox::new(200, 200, 300, 400),
+            region: reg,
+        };
+        // 2. Detection with wide aspect ratio (width 400 / height 100 = 4.0 > max_ratio 1.2) -> suppressed
+        let wide_det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.92,
+            bbox: BoundingBox::new(500, 600, 900, 700),
+            region: reg,
+        };
+        // 3. Valid detection outside mask with ratio 100 / 200 = 0.5 and duplicate overlapping box
+        let valid_det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.91,
+            bbox: BoundingBox::new(600, 600, 700, 800),
+            region: reg,
+        };
+        let duplicate_det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.86,
+            bbox: BoundingBox::new(605, 605, 695, 795),
+            region: reg,
+        };
+
+        let (active, ended) = tracker.update(
+            1.0,
+            &[masked_det, wide_det, valid_det, duplicate_det],
+            &[reg],
+            &cam_cfg,
+        );
+        assert!(ended.is_empty());
+        assert_eq!(
+            active.len(),
+            1,
+            "only the unmasked, valid-ratio primary detection should initialize a track"
+        );
+        assert_eq!(active[0].bbox, BoundingBox::new(600, 600, 700, 800));
+    }
+
+    #[test]
+    fn occluded_moving_track_preserves_velocity_without_false_motionless_and_attaches_person_courier_logo()
+     {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.width = 1000;
+        cam_cfg.detect.height = 1000;
+        cam_cfg.detect.min_initialized = 1;
+        cam_cfg.objects.track = vec!["person".to_string()];
+
+        let mut tracker = ByteTracker::new("street", 1000, 1000, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1000, 1000);
+
+        // Frame 1: person at x=100..200
+        let det1 = DetectionResult {
+            label: "person".to_string(),
+            score: 0.90,
+            bbox: BoundingBox::new(100, 300, 200, 600),
+            region: reg,
+        };
+        let (a1, _) = tracker.update(1.0, &[det1], &[reg], &cam_cfg);
+        assert_eq!(a1.len(), 1);
+
+        // Frame 2: person moves +40px right to x=140..240 -> establishes positive vx
+        let det2 = DetectionResult {
+            label: "person".to_string(),
+            score: 0.91,
+            bbox: BoundingBox::new(140, 300, 240, 600),
+            region: reg,
+        };
+        let (a2, _) = tracker.update(2.0, &[det2], &[reg], &cam_cfg);
+        let vx_after_f2 = a2[0].vx;
+        assert!(vx_after_f2 > 10.0);
+        assert_eq!(a2[0].motionless_count, 0);
+
+        // Frame 3: brief 1-frame occlusion (no detections inside scanned region)
+        let _ = tracker.update(3.0, &[], &[reg], &cam_cfg);
+
+        // Frame 4: person re-detected moving right at x=180..280 along with a "correios" courier logo inside person bbox
+        let det4_person = DetectionResult {
+            label: "person".to_string(),
+            score: 0.92,
+            bbox: BoundingBox::new(180, 300, 280, 600),
+            region: reg,
+        };
+        let det4_logo = DetectionResult {
+            label: "correios".to_string(),
+            score: 0.85,
+            bbox: BoundingBox::new(200, 380, 260, 440),
+            region: reg,
+        };
+        let (a4, _) = tracker.update(4.0, &[det4_person, det4_logo], &[reg], &cam_cfg);
+        assert_eq!(a4.len(), 1);
+        assert!(
+            a4[0].vx >= vx_after_f2,
+            "velocity must not decay when re-matching an occluded moving track (vx={} vs {})",
+            a4[0].vx,
+            vx_after_f2
+        );
+        assert_eq!(
+            a4[0].motionless_count, 0,
+            "moving track re-matched at predicted position must not increment motionless_count"
+        );
+        assert_eq!(a4[0].inferred_sub_label.as_deref(), Some("correios"));
     }
 }
