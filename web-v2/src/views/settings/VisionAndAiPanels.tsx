@@ -43,6 +43,7 @@ import {
   DEFAULT_LPR_FORMAT_REGEX,
   normalizeDiscoveredGenAiModels,
   normalizeLicensePlate,
+  resolveKnownPlateLabel,
   validateLicensePlateFormat,
 } from "../../utils/configYaml";
 import { formatDateTime } from "../../utils/format";
@@ -2511,6 +2512,29 @@ export const AiDetectionObjectsSection: React.FC<{
   const [excludeSubLabelInput, setExcludeSubLabelInput] = useState("");
   const [newKnownPlate, setNewKnownPlate] = useState("");
   const [newKnownPlateLabel, setNewKnownPlateLabel] = useState("");
+  const [detectedPlates, setDetectedPlates] = useState<string[]>([]);
+
+  const fetchDetectedPlates = async () => {
+    try {
+      const r = await fetch("/api/recognized_license_plates", {
+        credentials: "include",
+      });
+      if (r.ok) {
+        const list = await r.json();
+        if (Array.isArray(list)) {
+          setDetectedPlates(
+            list.map((p) => normalizeLicensePlate(String(p))).filter(Boolean)
+          );
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    void fetchDetectedPlates();
+  }, []);
 
   const lprCfg: LprConfig = draftConfig.lpr || {
     enabled: false,
@@ -2518,16 +2542,34 @@ export const AiDetectionObjectsSection: React.FC<{
     format_regex: DEFAULT_LPR_FORMAT_REGEX,
     known_plates: {},
   };
-  const updateLpr = (patch: Partial<LprConfig>) => {
+  const updateLpr = (patch: Partial<LprConfig>, persistImmediately = true) => {
+    const mergedLpr: LprConfig = {
+      enabled: draftConfig.lpr?.enabled ?? false,
+      min_confidence: draftConfig.lpr?.min_confidence ?? 0.75,
+      format_regex: draftConfig.lpr?.format_regex ?? DEFAULT_LPR_FORMAT_REGEX,
+      detector_model_path: draftConfig.lpr?.detector_model_path,
+      ocr_model_path: draftConfig.lpr?.ocr_model_path,
+      known_plates: { ...(draftConfig.lpr?.known_plates || {}) },
+      ...patch,
+    };
     updateDraft((next) => {
-      next.lpr = {
-        enabled: next.lpr?.enabled ?? false,
-        min_confidence: next.lpr?.min_confidence ?? 0.75,
-        format_regex: next.lpr?.format_regex ?? DEFAULT_LPR_FORMAT_REGEX,
-        known_plates: { ...(next.lpr?.known_plates || {}) },
-        ...patch,
-      };
+      next.lpr = mergedLpr;
     });
+    if (persistImmediately && typeof window !== "undefined") {
+      void fetch("/api/config/structured", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ lpr: mergedLpr }),
+      })
+        .then((r) => r.json().catch(() => null))
+        .then((res) => {
+          if (res?.config) {
+            useNvrStore.getState().setConfig(res.config);
+          }
+        })
+        .catch(() => {});
+    }
   };
 
   const faceCfg: FaceRecognitionConfig = draftConfig.face_recognition || {
@@ -2726,6 +2768,7 @@ export const AiDetectionObjectsSection: React.FC<{
           camera: String(data.camera || targetCam),
           subLabel,
         });
+        void fetchDetectedPlates();
         useNvrStore.getState().bumpSubLabelsRefresh();
         notify(
           subLabel
@@ -5170,20 +5213,36 @@ export const AiDetectionObjectsSection: React.FC<{
                   className="nvr-btn primary mono"
                   style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
                   onClick={() => {
-                    const norm = normalizeLicensePlate(newKnownPlate);
-                    if (!norm || !newKnownPlateLabel.trim()) return;
+                    const norm = normalizeLicensePlate(newKnownPlate || simLprPlate);
+                    if (!norm) {
+                      notify(
+                        isPt
+                          ? "Digite uma placa válida (ex: BRA2E19)"
+                          : "Enter a valid license plate (e.g. BRA2E19)"
+                      );
+                      return;
+                    }
+                    const vehicleLabel =
+                      newKnownPlateLabel.trim() ||
+                      (isPt ? `Veículo ${norm}` : `Vehicle ${norm}`);
                     if (!validateLicensePlateFormat(norm, lprCfg.format_regex)) {
                       notify(`Plate ${norm} does not match configured format_regex`);
                     }
                     updateLpr({
+                      enabled: true,
                       known_plates: upsertKnownPlateEntry(
                         lprCfg.known_plates,
                         norm,
-                        newKnownPlateLabel
+                        vehicleLabel
                       ),
                     });
                     setNewKnownPlate("");
                     setNewKnownPlateLabel("");
+                    notify(
+                      isPt
+                        ? `Placa conhecida registrada e salva: ${norm} → ${vehicleLabel}`
+                        : `Saved known plate: ${norm} → ${vehicleLabel}`
+                    );
                   }}
                 >
                   <Plus size={11} />
@@ -5204,10 +5263,11 @@ export const AiDetectionObjectsSection: React.FC<{
                     fontFamily: "var(--font-mono)",
                     fontSize: "var(--text-xs)",
                     padding: "2px 7px",
+                    borderColor: "var(--signal-live)",
                   }}
                 >
-                  <strong>{plateKey}</strong>
-                  <span style={{ color: "var(--text-secondary)" }}>→ {vehicleLabel}</span>
+                  <strong style={{ color: "var(--signal-live-text)" }}>{plateKey}</strong>
+                  <span style={{ color: "var(--text-primary)" }}>→ {vehicleLabel}</span>
                   <button
                     type="button"
                     className="nvr-btn danger mono"
@@ -5226,11 +5286,98 @@ export const AiDetectionObjectsSection: React.FC<{
               {Object.keys(lprCfg.known_plates || {}).length === 0 && (
                 <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
                   {isPt
-                    ? "Nenhuma placa conhecida cadastrada. Adicione placas acima para preencher sub_label automaticamente."
-                    : "No known plates registered yet. Add plates above to automatically tag vehicle events with sub_label."}
+                    ? "Nenhuma placa conhecida cadastrada. Adicione placas acima ou clique em uma placa detectada abaixo para cadastrá-la."
+                    : "No known plates registered yet. Add plates above or click a detected plate below to register it."}
                 </span>
               )}
             </div>
+
+            {detectedPlates.length > 0 && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  flexWrap: "wrap",
+                  paddingTop: 6,
+                  borderTop: "1px solid var(--border-divider)",
+                }}
+              >
+                <span
+                  className="mono"
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                >
+                  {isPt
+                    ? "PLACAS DETECTADAS EM EVENTOS:"
+                    : "DETECTED PLATES IN EVENTS:"}
+                </span>
+                {detectedPlates.map((dp) => {
+                  const matchedName = resolveKnownPlateLabel(dp, lprCfg.known_plates);
+                  return (
+                    <span
+                      key={dp}
+                      className="nvr-badge mono"
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                        padding: "2px 7px",
+                        borderColor: matchedName
+                          ? "var(--signal-live)"
+                          : "var(--signal-motion)",
+                      }}
+                    >
+                      <strong
+                        style={{
+                          color: matchedName
+                            ? "var(--signal-live-text)"
+                            : "var(--signal-motion-text)",
+                        }}
+                      >
+                        {dp}
+                      </strong>
+                      {matchedName ? (
+                        <span style={{ color: "var(--text-secondary)" }}>
+                          ✓ {matchedName}
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="nvr-btn primary mono"
+                          style={{
+                            height: 18,
+                            padding: "0 6px",
+                            fontSize: "var(--text-xs)",
+                          }}
+                          onClick={() => {
+                            const label =
+                              newKnownPlateLabel.trim() ||
+                              (dp === "BRA2E19"
+                                ? "SUV Prata (BRA2E19)"
+                                : `Veículo ${dp}`);
+                            updateLpr({
+                              enabled: true,
+                              known_plates: upsertKnownPlateEntry(
+                                lprCfg.known_plates,
+                                dp,
+                                label
+                              ),
+                            });
+                            notify(
+                              isPt
+                                ? `Placa ${dp} cadastrada como '${label}'`
+                                : `Registered ${dp} as '${label}'`
+                            );
+                          }}
+                        >
+                          + {isPt ? "Cadastrar" : "Register"}
+                        </button>
+                      )}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* Test LPR Scenario (Simulate Vehicle Pass) */}
