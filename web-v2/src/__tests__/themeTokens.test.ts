@@ -204,6 +204,13 @@ describe("themeTokens colorimetric utilities & cross-monitor invariants (#88)", 
       /\.nvr-input,\s*\.nvr-select,\s*textarea\s*\{[^}]*background:\s*var\(--bg-input\);\s*border:\s*1px solid var\(--border-input\)/
     );
 
+    // Root document allows normal text selection while interactive controls/drag surfaces disable accidental selection
+    const rootHtmlBlock = cssText.match(/html,\s*body,\s*#root\s*\{[^}]*\}/)?.[0] || "";
+    expect(rootHtmlBlock).not.toContain("user-select: none");
+    expect(cssText).toMatch(/\.nvr-btn\s*\{[^}]*user-select:\s*none/);
+    expect(cssText).toMatch(/\.nvr-nav-btn\s*\{[^}]*user-select:\s*none/);
+    expect(cssText).toMatch(/\.nvr-timeline-bar\s*\{[^}]*user-select:\s*none/);
+
     expect(extractRootCssVariables("body { color: red; }")).toEqual({});
   });
 
