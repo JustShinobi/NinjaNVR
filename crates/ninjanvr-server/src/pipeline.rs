@@ -137,6 +137,7 @@ pub struct VisionPipeline {
     pub camera_metrics: SharedCameraMetrics,
     pub media_dir: PathBuf,
     pub log_hub: crate::LogBufferHub,
+    pub ptz_active_presets: Arc<RwLock<HashMap<String, Option<String>>>>,
 }
 
 impl VisionPipeline {
@@ -298,6 +299,11 @@ impl VisionPipeline {
                     };
                     let is_night_ir = is_frame_night_ir(&yuv_frame.data, width, height);
                     tracker.set_night_mode(is_night_ir);
+                    if let Some(active_preset_opt) =
+                        self.ptz_active_presets.read().await.get(&camera).cloned()
+                    {
+                        tracker.set_active_preset(active_preset_opt.as_deref());
+                    }
 
                     let _ = self.evaluate_camera_tamper(
                         &camera,
@@ -1734,6 +1740,7 @@ mod tests {
             camera_metrics: Arc::new(RwLock::new(HashMap::new())),
             media_dir,
             log_hub: crate::LogBufferHub::new(),
+            ptz_active_presets: Arc::new(RwLock::new(HashMap::new())),
         };
         (pipeline, tmp_dir)
     }

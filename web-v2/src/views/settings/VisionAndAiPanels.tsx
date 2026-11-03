@@ -1949,7 +1949,7 @@ export const AiDetectionObjectsSection: React.FC<{
     ambiguous_score_min: 0.45,
     ambiguous_score_max: 0.72,
     auto_suppress_false_positives: true,
-    timeout_ms: 5000,
+    timeout_ms: 30000,
   };
 
   const [genaiModels, setGenaiModels] = useState<string[]>([]);

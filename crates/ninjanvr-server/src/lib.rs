@@ -891,7 +891,8 @@ async fn auth_gate_middleware(
                     let target_cam = if let Some(ref qc) = query_cam {
                         Some(qc.as_str())
                     } else if let Some(rest) = path.strip_prefix("/vod/") {
-                        rest.split('/').next()
+                        let vod_rest = rest.strip_prefix("clip/").unwrap_or(rest);
+                        vod_rest.split('/').next()
                     } else if let Some(rest) = path.strip_prefix("/api/") {
                         let first = rest.split('/').next().unwrap_or("");
                         if matches!(
@@ -938,10 +939,23 @@ async fn auth_gate_middleware(
                                 | "go2rtc"
                                 | "ws"
                                 | "labels"
+                                | "sub_labels"
+                                | "audio_labels"
+                                | "recognized_license_plates"
+                                | "classification"
+                                | "genai"
+                                | "plus"
+                                | "faces"
                         ) {
                             None
                         } else if first == "export" || first == "vod" {
-                            rest.split('/').nth(1)
+                            let after_first = rest
+                                .strip_prefix(first)
+                                .unwrap_or("")
+                                .trim_start_matches('/');
+                            let after_clip =
+                                after_first.strip_prefix("clip/").unwrap_or(after_first);
+                            after_clip.split('/').next()
                         } else {
                             Some(first)
                         }
@@ -1025,7 +1039,7 @@ async fn api_auth_providers(State(state): State<AppState>) -> Json<Value> {
         "enabled": cfg.auth.enabled,
         "local_login_enabled": cfg.auth.local_login_enabled,
         "oidc": {
-            "enabled": oidc_ready || oidc.enabled,
+            "enabled": oidc_ready,
             "provider_name": oidc.provider_name,
             "auto_redirect": oidc.auto_redirect
         },
@@ -4644,7 +4658,8 @@ async fn api_event_verify_ai(
     match verify_event_with_genai(&state, &id).await {
         Ok(res) => Json(res).into_response(),
         Err(err) => {
-            let msg = err.to_string();
+            let api_key = state.config.read().await.genai.resolve_api_key();
+            let msg = scrub_genai_secret_in_error(format!("{err:#}"), &api_key);
             let status = if msg.contains("not found") {
                 StatusCode::NOT_FOUND
             } else {
@@ -4653,6 +4668,41 @@ async fn api_event_verify_ai(
             (status, Json(json!({ "success": false, "message": msg }))).into_response()
         }
     }
+}
+
+fn scrub_genai_secret_in_error(raw: String, api_key: &str) -> String {
+    let trimmed = api_key.trim();
+    if !trimmed.is_empty() && trimmed != "***" && trimmed != "*" {
+        raw.replace(trimmed, "***")
+    } else {
+        raw
+    }
+}
+
+fn extract_gemini_candidate_text(resp_val: &Value) -> Option<&str> {
+    if let Some(parts) = resp_val
+        .pointer("/candidates/0/content/parts")
+        .and_then(|v| v.as_array())
+    {
+        if let Some(text) = parts
+            .iter()
+            .rev()
+            .filter(|p| p.get("thought").and_then(|t| t.as_bool()) != Some(true))
+            .find_map(|p| p.get("text").and_then(|t| t.as_str()))
+        {
+            return Some(text);
+        }
+        if let Some(text) = parts
+            .iter()
+            .rev()
+            .find_map(|p| p.get("text").and_then(|t| t.as_str()))
+        {
+            return Some(text);
+        }
+    }
+    resp_val
+        .pointer("/candidates/0/content/parts/0/text")
+        .and_then(|v| v.as_str())
 }
 
 fn strip_markdown_json_fence(raw: &str) -> &str {
@@ -4673,10 +4723,7 @@ fn strip_markdown_json_fence(raw: &str) -> &str {
 fn parse_ai_judge_json_verdict(resp_val: &Value) -> Result<(bool, f64, String)> {
     let candidate: Value = if resp_val.get("is_true_positive").is_some() {
         resp_val.clone()
-    } else if let Some(text) = resp_val
-        .pointer("/candidates/0/content/parts/0/text")
-        .and_then(|v| v.as_str())
-    {
+    } else if let Some(text) = extract_gemini_candidate_text(resp_val) {
         serde_json::from_str(strip_markdown_json_fence(text))
             .context("invalid JSON in Gemini response text")?
     } else if let Some(text) = resp_val
@@ -4748,6 +4795,10 @@ pub async fn verify_event_with_genai_components(
     let clips_dir = media_dir.join("clips");
     let candidates = [
         (
+            clips_dir.join(format!("{event_id}-clean.jpg")),
+            "image/jpeg",
+        ),
+        (
             clips_dir.join(format!("{camera}-{event_id}-clean.webp")),
             "image/webp",
         ),
@@ -4756,10 +4807,6 @@ pub async fn verify_event_with_genai_components(
             "image/webp",
         ),
         (clips_dir.join(format!("{event_id}.jpg")), "image/jpeg"),
-        (
-            clips_dir.join(format!("{event_id}-clean.jpg")),
-            "image/jpeg",
-        ),
     ];
 
     let mut img_b64: Option<String> = None;
@@ -4795,7 +4842,11 @@ pub async fn verify_event_with_genai_components(
     }
     let provider = genai.provider.trim().to_ascii_lowercase();
     let api_key = genai.resolve_api_key();
-    let timeout_ms = genai.timeout_ms.clamp(500, 60_000);
+    let timeout_ms = if genai.timeout_ms <= 5_000 {
+        30_000
+    } else {
+        genai.timeout_ms.clamp(5_000, 60_000)
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()?;
@@ -5381,10 +5432,7 @@ fn parse_ai_auto_annotations(
         || resp_val.get("objects").is_some()
     {
         resp_val.clone()
-    } else if let Some(text) = resp_val
-        .pointer("/candidates/0/content/parts/0/text")
-        .and_then(|v| v.as_str())
-    {
+    } else if let Some(text) = extract_gemini_candidate_text(resp_val) {
         serde_json::from_str(strip_markdown_json_fence(text))
             .context("invalid JSON in Gemini auto-annotate response")?
     } else if let Some(text) = resp_val
@@ -5573,7 +5621,11 @@ pub async fn auto_annotate_dataset_sample(
     }
     let provider = genai.provider.trim().to_ascii_lowercase();
     let api_key = genai.resolve_api_key();
-    let timeout_ms = genai.timeout_ms.clamp(500, 60_000);
+    let timeout_ms = if genai.timeout_ms <= 5_000 {
+        30_000
+    } else {
+        genai.timeout_ms.clamp(5_000, 60_000)
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()?;
@@ -5718,7 +5770,8 @@ async fn api_dataset_sample_auto_annotate(
     match auto_annotate_dataset_sample(&state, &id).await {
         Ok(updated) => Json(sample_dto_to_response_json(&updated)).into_response(),
         Err(err) => {
-            let msg = err.to_string();
+            let api_key = state.config.read().await.genai.resolve_api_key();
+            let msg = scrub_genai_secret_in_error(format!("{err:#}"), &api_key);
             let status = if msg.contains("not found") {
                 StatusCode::NOT_FOUND
             } else {
@@ -7263,6 +7316,8 @@ async fn share_player_page(
         }
     };
     let (_, clip_title, clip_ts) = resolve_share_target_metadata(&state, &payload.k, &payload.id);
+    let safe_title = xml_escape_simple(&clip_title);
+    let safe_id = xml_escape_simple(&payload.id);
     let ts_label = clip_ts
         .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
@@ -7273,21 +7328,20 @@ async fn share_player_page(
     let html = format!(
         r#"<!doctype html>
 <html lang="en" style="color-scheme:dark;background:#070a0f;color:#e2e8f0;font-family:system-ui,sans-serif">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NinjaNVR Shared Clip // {clip_title}</title></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>NinjaNVR Shared Clip // {safe_title}</title></head>
 <body style="margin:0;padding:24px;display:flex;flex-direction:column;align-items:center;gap:14px">
   <div style="width:100%;max-width:960px;background:#0d121b;border:1px solid #1e293b;border-radius:4px;padding:16px">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px;font-family:monospace;font-size:12px">
       <div>
-        <div><strong>NINJANVR SHARED CLIP // {clip_title}</strong></div>
+        <div><strong>NINJANVR SHARED CLIP // {safe_title}</strong></div>
         <div style="color:#94a3b8;font-size:11px;margin-top:2px">CLIP TIME: {ts_label} · EXPIRES: {exp_label}</div>
       </div>
-      <a href="/share/{token}/video.mp4" download="{}.mp4" style="color:#38bdf8;text-decoration:none;border:1px solid #0284c7;padding:4px 10px;border-radius:3px">Download MP4</a>
+      <a href="/share/{token}/video.mp4" download="{safe_id}.mp4" style="color:#38bdf8;text-decoration:none;border:1px solid #0284c7;padding:4px 10px;border-radius:3px">Download MP4</a>
     </div>
     <video src="/share/{token}/video.mp4" controls autoplay playsinline style="width:100%;max-height:72vh;object-fit:contain;background:#000"></video>
   </div>
 </body>
-</html>"#,
-        payload.id
+</html>"#
     );
     Html(html).into_response()
 }
@@ -7417,8 +7471,72 @@ async fn api_cases(State(state): State<AppState>) -> Json<Value> {
     Json(Value::Array(cases))
 }
 
-async fn api_case_create() -> Json<Value> {
-    Json(json!({ "success": true }))
+#[derive(Debug, Default, Deserialize)]
+pub struct CreateCaseBody {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub event_ids: Vec<String>,
+    #[serde(default)]
+    pub export_ids: Vec<String>,
+}
+
+async fn api_case_create(State(state): State<AppState>, body: Bytes) -> Response {
+    if body.is_empty() {
+        return Json(json!({ "success": true })).into_response();
+    }
+    let parsed: CreateCaseBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "message": format!("Invalid case payload: {err}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    let name = parsed
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Investigation Case");
+    let case_id = parsed
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "case_{}_{:08x}",
+                chrono::Utc::now().timestamp_millis(),
+                rand::random::<u32>()
+            )
+        });
+    match state.db.create_case(
+        &case_id,
+        name,
+        parsed.description.as_deref(),
+        &parsed.event_ids,
+        &parsed.export_ids,
+    ) {
+        Ok(case_val) => Json(json!({
+            "success": true,
+            "id": case_id,
+            "case": case_val
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 fn default_export_include_audio() -> bool {
@@ -9160,6 +9278,22 @@ pub async fn new_app_state(
     let camera_metrics: SharedCameraMetrics = Arc::new(RwLock::new(HashMap::new()));
     let stats_history: Arc<RwLock<VecDeque<Value>>> = Arc::new(RwLock::new(VecDeque::new()));
     let go2rtc_supervisor = Arc::new(Go2RtcSupervisor::new(shared_cfg.clone()));
+    let mut initial_ptz_presets = HashMap::new();
+    {
+        let cfg_guard = shared_cfg.read().await;
+        for (cam_name, cam_cfg) in &cfg_guard.cameras {
+            let init_preset = cam_cfg
+                .onvif
+                .return_preset
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            initial_ptz_presets.insert(cam_name.clone(), init_preset);
+        }
+    }
+    let ptz_active_presets = Arc::new(RwLock::new(initial_ptz_presets));
+
     if spawn_go2rtc {
         go2rtc_supervisor.clone().spawn_supervisor_task();
         let rec_engine = Arc::new(RecordingEngine::with_storage_state(
@@ -9182,6 +9316,7 @@ pub async fn new_app_state(
             camera_metrics: camera_metrics.clone(),
             media_dir: media_dir.clone(),
             log_hub: log_hub.clone(),
+            ptz_active_presets: ptz_active_presets.clone(),
         });
         vision_pipeline.start().await;
     }
@@ -9202,21 +9337,6 @@ pub async fn new_app_state(
     } else {
         web_dir
     };
-
-    let mut initial_ptz_presets = HashMap::new();
-    {
-        let cfg_guard = shared_cfg.read().await;
-        for (cam_name, cam_cfg) in &cfg_guard.cameras {
-            let init_preset = cam_cfg
-                .onvif
-                .return_preset
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            initial_ptz_presets.insert(cam_name.clone(), init_preset);
-        }
-    }
 
     let state = AppState {
         config: shared_cfg,
@@ -9239,7 +9359,7 @@ pub async fn new_app_state(
         cpu_tracker: ProcCpuTracker::default(),
         storage_degraded,
         storage_error,
-        ptz_active_presets: Arc::new(RwLock::new(initial_ptz_presets)),
+        ptz_active_presets,
     };
 
     // Seed 30 initial stats_history points so all 30 bars in /system#general and /system#cameras render with zero 0-padding
@@ -12185,7 +12305,78 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_del.status(), StatusCode::OK);
 
+        // 5. Verify Gemini thinking-model multi-part payload parsing (thought part + JSON answer part)
+        let gemini_thinking_payload = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {
+                            "thought": true,
+                            "text": "The user wants me to inspect the office camera image for false positives..."
+                        },
+                        {
+                            "text": "{\"is_true_positive\": false, \"confidence\": 0.99, \"reason\": \"Empty office room; draped jacket on chair triggered false detection.\"}",
+                            "thoughtSignature": "sig_test_123"
+                        }
+                    ]
+                }
+            }]
+        });
+        let (tp, conf, reason) = parse_ai_judge_json_verdict(&gemini_thinking_payload).unwrap();
+        assert!(!tp);
+        assert!((conf - 0.99).abs() < 1e-6);
+        assert!(reason.contains("Empty office room"));
+
+        let gemini_thinking_annotations = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {
+                            "thought": true,
+                            "text": "Detecting objects in frame..."
+                        },
+                        {
+                            "text": "{\"detections\": [{\"label\": \"person\", \"bbox\": [0.1, 0.2, 0.5, 0.8], \"score\": 0.93}]}"
+                        }
+                    ]
+                }
+            }]
+        });
+        let parsed_boxes =
+            parse_ai_auto_annotations(&gemini_thinking_annotations, 1280, 720).unwrap();
+        assert_eq!(parsed_boxes.len(), 1);
+        assert_eq!(parsed_boxes[0].label, "person");
+
+        // 6. Verify error chain includes root cause while scrubbing secret API keys
         mock_srv.abort();
+        {
+            let mut cfg = state.config.write().await;
+            cfg.genai.provider = "gemini".to_string();
+            cfg.genai.model = "gemini-3.8-flash".to_string();
+            cfg.genai.api_key = Some("AIzaSySuperSecretTestKey999".to_string());
+            cfg.genai.base_url = Some("http://127.0.0.1:1".to_string());
+        }
+        let resp_err = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/events/ev_gemini_fp/verify-ai")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_err.status(), StatusCode::BAD_GATEWAY);
+        let err_json: Value =
+            serde_json::from_slice(&to_bytes(resp_err.into_body(), 8192).await.unwrap()).unwrap();
+        let err_msg = err_json["message"].as_str().unwrap_or("");
+        assert!(err_msg.contains("Gemini Vision API request failed:"));
+        assert!(
+            !err_msg.contains("AIzaSySuperSecretTestKey999"),
+            "API key must be scrubbed from error output: {err_msg}"
+        );
+
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
@@ -13144,6 +13335,436 @@ version: 0.18-0
                 .ends_with("ninjanvr_custom_yolo11s.onnx")),
             "GET /api/detectors/catalog must list uploaded model in discovered_models"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn evaluate_system_heuristics_detects_duplicate_rtsp_aspect_cpu_storage_retention_audio_and_quality_drift()
+     {
+        let yaml = r#"
+go2rtc:
+  streams:
+    cam_a_main: "rtsp://admin:pass1@192.0.2.10:554/stream1#video=copy"
+    cam_a_dup: "rtsp://viewer:pass2@192.0.2.10:554/stream1"
+    cam_local: "rtsp://127.0.0.1:8554/cam_a_main"
+cameras:
+  cam_a:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/cam_a_main
+          roles: [record, detect, audio]
+    detect:
+      width: 640
+      height: 480
+    record:
+      enabled: true
+      continuous:
+        days: 7
+      preview:
+        quality: very_high
+    snapshots:
+      quality: 95
+  cam_b:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/cam_b_main
+          roles: [record, detect]
+    detect:
+      width: 1280
+      height: 720
+    record:
+      enabled: true
+      continuous:
+        days: 2
+      preview:
+        quality: medium
+    snapshots:
+      quality: 100
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let mut cam_stats = serde_json::Map::new();
+        cam_stats.insert("cam_a".to_string(), json!({ "ffmpeg_cpu": "3.6" }));
+        cam_stats.insert("cam_b".to_string(), json!({ "ffmpeg_cpu": "0.5" }));
+
+        let rec_mount = json!({
+            "total": 100_000.0,
+            "used": 96_000.0,
+            "free": 4_000.0
+        });
+
+        let alerts = evaluate_system_heuristics(&cfg, &cam_stats, &rec_mount, 1.5);
+        let ids: Vec<&str> = alerts.iter().map(|a| a.id.as_str()).collect();
+        assert!(
+            ids.contains(&"duplicate_rtsp_producer_cam_a_dup")
+                || ids.contains(&"duplicate_rtsp_producer_cam_a_main")
+        );
+        assert!(ids.contains(&"detect_aspect_mismatch_cam_a"));
+        assert!(!ids.contains(&"detect_aspect_mismatch_cam_b"));
+        assert!(ids.contains(&"detect_ffmpeg_cpu_cam_a"));
+        assert!(ids.contains(&"storage_capacity_unbounded"));
+        assert!(ids.contains(&"retention_runway_asymmetry"));
+        assert!(ids.contains(&"audio_role_disabled_mismatch"));
+        assert!(ids.contains(&"camera_quality_drift"));
+
+        let storage_alert = alerts
+            .iter()
+            .find(|a| a.id == "storage_capacity_unbounded")
+            .unwrap();
+        assert_eq!(storage_alert.severity, "critical");
+
+        let log_hub = LogBufferHub::new();
+        emit_heuristics_to_logs(&log_hub, &alerts);
+        let (total_logged, logged) = log_hub.query_lines("ninjanvr", None, None);
+        assert_eq!(total_logged, alerts.len());
+        assert_eq!(logged.len(), alerts.len());
+        assert!(
+            logged
+                .iter()
+                .any(|l| l.contains("ERROR") && l.contains("storage_capacity_unbounded"))
+        );
+    }
+
+    #[test]
+    fn crc32_and_zip_archive_roundtrip_and_corruption_detection() {
+        // IEEE 802.3 standard check value for "123456789"
+        assert_eq!(crc32_ieee(b""), 0x0000_0000);
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+
+        let entries = vec![
+            (
+                "data.yaml".to_string(),
+                b"nc: 15\nnames: [person]\n".to_vec(),
+            ),
+            (
+                "labels/train/sample1.txt".to_string(),
+                b"0 0.5 0.5 0.2 0.4\n".to_vec(),
+            ),
+        ];
+        let mut archive = build_zip_archive(&entries);
+        let parsed = parse_zip_archive(&archive).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed["data.yaml"], b"nc: 15\nnames: [person]\n");
+        assert_eq!(parsed["labels/train/sample1.txt"], b"0 0.5 0.5 0.2 0.4\n");
+
+        // Reject too-small buffer and missing EOCD
+        assert!(parse_zip_archive(b"short").is_err());
+        assert!(parse_zip_archive(&[0u8; 32]).is_err());
+
+        // Corrupt a payload byte inside the first file -> must fail with CRC32 mismatch
+        let first_data_offset = 30 + "data.yaml".len();
+        archive[first_data_offset] ^= 0xFF;
+        let err = parse_zip_archive(&archive).unwrap_err().to_string();
+        assert!(err.contains("CRC32 mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn onvif_endpoint_resolver_soap_builders_fault_and_preset_parsers_and_ptz_vectors() {
+        let mut onvif = ninjanvr_config::OnvifCameraConfig::default();
+        assert_eq!(resolve_onvif_ptz_endpoint(&onvif), None);
+
+        onvif.host = Some("192.0.2.25".to_string());
+        onvif.port = 8080;
+        assert_eq!(
+            resolve_onvif_ptz_endpoint(&onvif).as_deref(),
+            Some("http://192.0.2.25:8080/onvif/ptz_service")
+        );
+
+        onvif.host = Some("192.0.2.25:8899".to_string());
+        assert_eq!(
+            resolve_onvif_ptz_endpoint(&onvif).as_deref(),
+            Some("http://192.0.2.25:8899/onvif/ptz_service")
+        );
+
+        onvif.host = Some("[::1]".to_string());
+        onvif.port = 80;
+        assert_eq!(
+            resolve_onvif_ptz_endpoint(&onvif).as_deref(),
+            Some("http://[::1]:80/onvif/ptz_service")
+        );
+
+        onvif.host = Some("https://cam.example.invalid/custom/ptz/".to_string());
+        assert_eq!(
+            resolve_onvif_ptz_endpoint(&onvif).as_deref(),
+            Some("https://cam.example.invalid/custom/ptz")
+        );
+
+        // XML escaping in SOAP envelope credentials and anonymous header when user is None
+        let anon_soap = build_onvif_stop_soap("Profile_1", true, false, None, None);
+        assert!(anon_soap.contains("<s:Header/>"));
+        let auth_soap = build_onvif_goto_preset_soap(
+            "Profile&1",
+            "Preset<Home>",
+            Some(2.5),
+            Some("admin"),
+            Some("p&w<\"'"),
+        );
+        assert!(auth_soap.contains("<wsse:Username>admin</wsse:Username>"));
+        assert!(auth_soap.contains("<wsse:Password>p&amp;w&lt;&quot;&apos;</wsse:Password>"));
+        assert!(auth_soap.contains("<tptz:ProfileToken>Profile&amp;1</tptz:ProfileToken>"));
+        assert!(auth_soap.contains("<tptz:PresetToken>Preset&lt;Home&gt;</tptz:PresetToken>"));
+        assert!(auth_soap.contains("<tt:PanTilt x=\"1.0000\" y=\"1.0000\"/>"));
+
+        // PtzMoveBody directional vectors and speed clamping
+        let move_ul = PtzMoveBody {
+            action: Some("up_left".to_string()),
+            direction: None,
+            mode: Some(" relative ".to_string()),
+            pan: None,
+            tilt: None,
+            zoom: None,
+            speed: Some(0.4),
+            timeout_sec: None,
+            timeout_ms: None,
+            profile_token: None,
+        };
+        assert_eq!(move_ul.resolve_vectors(), (-0.4, 0.4, 0.0));
+        assert!(move_ul.is_relative());
+
+        // SOAP fault extraction and preset XML parsing (both self-closing and nested tags)
+        assert_eq!(
+            extract_onvif_soap_fault("<s:Envelope><s:Body><Ok/></s:Body></s:Envelope>"),
+            None
+        );
+        assert_eq!(
+            extract_onvif_soap_fault(
+                "<s:Fault><faultstring>ActionNotSupported</faultstring></s:Fault>"
+            )
+            .as_deref(),
+            Some("ActionNotSupported")
+        );
+        let presets_xml = r#"
+        <tptz:GetPresetsResponse>
+            <tptz:Preset token="p1"><tt:Name>Front Gate</tt:Name></tptz:Preset>
+            <tptz:Preset token="p2"/>
+            <Preset><token>p3</token><Name>Driveway</Name></Preset>
+        </tptz:GetPresetsResponse>
+        "#;
+        let presets = parse_onvif_presets_xml(presets_xml);
+        assert_eq!(presets.len(), 3);
+        assert_eq!(presets[0].token, "p1");
+        assert_eq!(presets[0].name, "Front Gate");
+        assert_eq!(presets[1].token, "p2");
+        assert_eq!(presets[1].name, "p2");
+        assert_eq!(presets[2].token, "p3");
+        assert_eq!(presets[2].name, "Driveway");
+    }
+
+    #[test]
+    fn yolo_coordinate_normalization_and_cidr_ipv6_matching_edge_cases() {
+        // Reversed and out-of-bounds coordinates are clamped and converted to (cx, cy, w, h)
+        let (cx, cy, w, h) = xyxy_to_yolo_normalized(0.8, 0.9, 0.2, 0.1);
+        assert_eq!((cx, cy, w, h), (0.5, 0.5, 0.6, 0.8));
+
+        // Zero-area point box clamps width/height to 0.001
+        let (_, _, zw, zh) = xyxy_to_yolo_normalized(0.5, 0.5, 0.5, 0.5);
+        assert_eq!((zw, zh), (0.001, 0.001));
+
+        // event_box_to_yolo_normalized: all-zero fallback and [x, y, w, h] branch when b[2] <= b[0]
+        assert_eq!(
+            event_box_to_yolo_normalized([0.0, 0.0, 0.0, 0.0]),
+            (0.5, 0.5, 0.25, 0.4)
+        );
+        assert_eq!(
+            event_box_to_yolo_normalized([0.6, 0.5, 0.2, 0.3]),
+            (0.7, 0.65, 0.2, 0.3)
+        );
+
+        // IPv6 CIDR, /0 wildcard, bare IP, and invalid prefix handling
+        assert!(ip_matches_cidr("2001:db8::dead:beef", "2001:db8::/32"));
+        assert!(!ip_matches_cidr("2001:db9::1", "2001:db8::/32"));
+        assert!(ip_matches_cidr("::1", "::/0"));
+        assert!(ip_matches_cidr("198.51.100.7", "0.0.0.0/0"));
+        assert!(ip_matches_cidr("198.51.100.7", "198.51.100.7"));
+        assert!(!ip_matches_cidr("198.51.100.7", "198.51.100.0/33"));
+        assert!(!ip_matches_cidr("::1", "::1/129"));
+        assert!(!ip_matches_cidr("198.51.100.7", "2001:db8::/32"));
+
+        // scope_cameras_filter intersection and empty-intersection sentinel
+        assert_eq!(
+            scope_cameras_filter(
+                Some(vec!["cam1".to_string(), "cam2".to_string()]),
+                Some(vec!["cam2".to_string(), "cam3".to_string()])
+            ),
+            Some(vec!["cam2".to_string()])
+        );
+        assert_eq!(
+            scope_cameras_filter(
+                Some(vec!["cam1".to_string()]),
+                Some(vec!["cam2".to_string()])
+            ),
+            Some(vec!["__none__".to_string()])
+        );
+        assert_eq!(
+            scope_cameras_filter(None, Some(vec![])),
+            Some(vec!["__none__".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn server_bugfixes_case_persistence_camera_scoped_global_routes_vod_clip_and_oidc_ready()
+    {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-srv-bugfixes-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let yaml = format!(
+            r#"
+version: 0.18-0
+database:
+  path: {}
+auth:
+  enabled: true
+  oidc:
+    enabled: true
+    issuer_url: ""
+    client_id: ""
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/front_door
+          roles: [record, detect]
+  backyard:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/backyard
+          roles: [record, detect]
+"#,
+            db_path.display()
+        );
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let state = new_app_state(&cfg_path, tmp_dir.join("web"), tmp_dir.join("media"), false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_user_with_cameras("scoped_op", "pass1234", "operator", "front_door", 1_000)
+            .unwrap();
+        let app = build_router_with_auth(state.clone(), true);
+
+        // 1. /api/auth/providers must report oidc.enabled == false when issuer_url / client_id are blank
+        let resp_prov = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_prov.status(), StatusCode::OK);
+        let prov_json: Value =
+            serde_json::from_slice(&to_bytes(resp_prov.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(prov_json["oidc"]["enabled"], false);
+
+        // 2. Create a camera-scoped operator token restricted to "front_door"
+        let now = chrono::Utc::now().timestamp() as u64;
+        let scoped_claims = JwtClaims {
+            sub: "scoped_op".to_string(),
+            role: "operator".to_string(),
+            allowed_cameras: Some("front_door".to_string()),
+            iat: now,
+            exp: now + 3600,
+        };
+        let scoped_jwt = jsonwebtoken::encode(
+            &Header::default(),
+            &scoped_claims,
+            &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let auth_hdr = format!("Bearer {scoped_jwt}");
+
+        // Camera-scoped user can access global endpoints (/api/sub_labels, /api/recognized_license_plates, /api/faces)
+        // and their permitted camera's /vod/clip/front_door/... route
+        for uri in [
+            "/api/sub_labels",
+            "/api/recognized_license_plates",
+            "/api/faces",
+            "/vod/clip/front_door/start/100/end/200/master.m3u8",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, &auth_hdr)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "camera-scoped user must be permitted to access {uri}"
+            );
+        }
+
+        // Camera-scoped user is blocked from /vod/clip/backyard/... (403 Forbidden)
+        let resp_forbidden = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/vod/clip/backyard/start/100/end/200/master.m3u8")
+                    .header(header::AUTHORIZATION, &auth_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_forbidden.status(), StatusCode::FORBIDDEN);
+
+        // 3. POST /api/cases persists case to SQLite and GET /api/cases returns it
+        let case_payload = json!({
+            "id": "case_incident_42",
+            "name": "Perimeter Breach",
+            "description": "Night motion near gate",
+            "event_ids": ["ev_101"],
+            "export_ids": ["exp_202"]
+        });
+        let resp_case_post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cases")
+                    .header(header::AUTHORIZATION, &auth_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&case_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_case_post.status(), StatusCode::OK);
+
+        let resp_cases_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cases")
+                    .header(header::AUTHORIZATION, &auth_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cases_get.status(), StatusCode::OK);
+        let cases_list: Value =
+            serde_json::from_slice(&to_bytes(resp_cases_get.into_body(), 16384).await.unwrap())
+                .unwrap();
+        let cases_arr = cases_list.as_array().unwrap();
+        assert_eq!(cases_arr.len(), 1);
+        assert_eq!(cases_arr[0]["id"], "case_incident_42");
+        assert_eq!(cases_arr[0]["name"], "Perimeter Breach");
+        assert_eq!(cases_arr[0]["event_ids"], json!(["ev_101"]));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
