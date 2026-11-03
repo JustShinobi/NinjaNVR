@@ -1439,6 +1439,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       ? spotlightTrail[spotlightTrail.length - 1].cam
       : selectedCamera);
 
+  const lastLayoutSwitchMsRef = useRef<number>(0);
+
   const stageDescriptors = computeLiveStageDescriptors({
     liveLayout,
     visibleMatrixCams,
@@ -1942,6 +1944,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             const isGrid = descriptor.role === "grid";
 
             const handleTileActivate = (isDoubleClick = false) => {
+              const nowMs = Date.now();
+              if (nowMs - lastLayoutSwitchMsRef.current < 320) {
+                return;
+              }
               const action = resolveTileClickAction({
                 liveLayout,
                 role: descriptor.role,
@@ -1954,7 +1960,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 action.shouldPrewarmMainStream
               );
               if (liveLayout === "spotlight" && isDock) {
-                const ts = Math.floor(Date.now() / 1000);
+                const ts = Math.floor(nowMs / 1000);
                 lastActiveRef.current[cam] = ts;
                 lastSurgeRef.current[cam] = ts;
                 setNowTick(ts);
@@ -1963,7 +1969,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 setSelectedCamera(action.nextSelectedCamera);
               }
               if (action.nextLayout !== liveLayout) {
+                lastLayoutSwitchMsRef.current = nowMs;
                 setLiveLayout(action.nextLayout);
+              } else if (isDock && action.promotedToFocus) {
+                lastLayoutSwitchMsRef.current = nowMs;
               }
             };
 
@@ -1988,7 +1997,6 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     : undefined
                 }
                 onDoubleClick={() => handleTileActivate(true)}
-                onClick={isDock ? () => handleTileActivate(false) : undefined}
               >
                 {isGrid && isTimelineCam && visibleMatrixCams.length > 1 && (
                   <div className="nvr-timeline-reticle" aria-hidden="true">
@@ -2015,6 +2023,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     src={`/api/${encodeURIComponent(realCam)}/latest.webp?height=360`}
                     alt={`${cam} dock snapshot`}
                     loading="lazy"
+                    onClick={() => handleTileActivate(false)}
                   />
                 ) : (
                   <LiveMsePlayer
@@ -2022,7 +2031,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     useMainStream={descriptor.useMainStream}
                     cameraConfig={camCfg}
                     showVectors={showVectors}
-                    onClick={() => handleTileActivate(false)}
+                    onClick={
+                      isHero ? undefined : () => handleTileActivate(false)
+                    }
                   />
                 )}
 

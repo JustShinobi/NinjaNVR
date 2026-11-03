@@ -10141,73 +10141,129 @@ async fn ws_go2rtc_proxy(
 
 async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) {
     let stream_src = mse_hub::extract_stream_src_from_query(&query);
+
+    // If a stream `src` is specified, use MseStreamHub's shared single-upstream publisher
+    // so the instant GOP burst and all subsequent live fragments share a continuous tfdt timeline.
+    if let Some(ref src) = stream_src {
+        let (mut client_sink, mut client_stream) = client_ws.split();
+
+        // Wait briefly for client MSE handshake (or proceed immediately if none arrives within 40ms)
+        match tokio::time::timeout(Duration::from_millis(40), client_stream.next()).await {
+            Ok(Some(Ok(AxumWsMsg::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return,
+            _ => {}
+        }
+
+        let Some(mut sub) = state
+            .mse_hub
+            .subscribe_client(&state.go2rtc_ws_base, src)
+            .await
+        else {
+            return;
+        };
+
+        let mut last_sent_seq = 0u64;
+        let mut sent_init = false;
+        if let Some(burst) = sub.burst.take() {
+            if client_sink
+                .send(AxumWsMsg::Text(burst.codec_msg.into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if client_sink
+                .send(AxumWsMsg::Binary(burst.init_segment))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            for frag in burst.gop_fragments {
+                if client_sink.send(AxumWsMsg::Binary(frag)).await.is_err() {
+                    return;
+                }
+            }
+            last_sent_seq = burst.last_seq;
+            sent_init = true;
+        }
+
+        loop {
+            tokio::select! {
+                client_msg = client_stream.next() => {
+                    match client_msg {
+                        Some(Ok(AxumWsMsg::Ping(p))) => {
+                            if client_sink.send(AxumWsMsg::Pong(p)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(AxumWsMsg::Close(_))) | Some(Err(_)) | None => break,
+                        _ => {}
+                    }
+                }
+                live_pkt = sub.rx.recv() => {
+                    match live_pkt {
+                        Ok(mse_hub::MseLivePacket::Codec(c)) => {
+                            if !sent_init && client_sink.send(AxumWsMsg::Text(c.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(mse_hub::MseLivePacket::Init(b)) => {
+                            if !sent_init {
+                                if client_sink.send(AxumWsMsg::Binary(b)).await.is_err() {
+                                    break;
+                                }
+                                sent_init = true;
+                            }
+                        }
+                        Ok(mse_hub::MseLivePacket::Fragment { seq, bytes }) => {
+                            if seq <= last_sent_seq {
+                                continue;
+                            }
+                            if !sent_init
+                                && let Some(burst) = state.mse_hub.get_fresh_burst(src).await
+                            {
+                                if client_sink.send(AxumWsMsg::Text(burst.codec_msg.into())).await.is_err() {
+                                    break;
+                                }
+                                if client_sink.send(AxumWsMsg::Binary(burst.init_segment)).await.is_err() {
+                                    break;
+                                }
+                                for frag in burst.gop_fragments {
+                                    if client_sink.send(AxumWsMsg::Binary(frag)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                last_sent_seq = burst.last_seq;
+                                sent_init = true;
+                                continue;
+                            }
+                            last_sent_seq = seq;
+                            if client_sink.send(AxumWsMsg::Binary(bytes)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     let target_url = if query.is_empty() {
         format!("{}/api/ws", state.go2rtc_ws_base)
     } else {
         format!("{}/api/ws?{query}", state.go2rtc_ws_base)
     };
 
-    let (mut client_sink, mut client_stream) = client_ws.split();
-
-    // Wait briefly for client MSE handshake (or proceed immediately if none arrives within 40ms)
-    let first_client_msg =
-        match tokio::time::timeout(Duration::from_millis(40), client_stream.next()).await {
-            Ok(Some(Ok(msg))) => Some(msg),
-            Ok(Some(Err(_))) | Ok(None) => return,
-            Err(_) => None,
-        };
-
-    // Instant GOP Burst: if MseStreamHub holds a fresh GOP cache for this stream,
-    // immediately push codec_msg, init_segment, and the cached GOP fragments to the client.
-    let mut burst_sent = false;
-    if let Some(ref src) = stream_src
-        && let Some(burst) = state.mse_hub.get_fresh_burst(src).await
-    {
-        if client_sink
-            .send(AxumWsMsg::Text(burst.codec_msg.into()))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        if client_sink
-            .send(AxumWsMsg::Binary(burst.init_segment))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        for frag in burst.gop_fragments {
-            if client_sink.send(AxumWsMsg::Binary(frag)).await.is_err() {
-                return;
-            }
-        }
-        burst_sent = true;
-    }
-
     let Ok((upstream_ws, _)) = tokio_tungstenite::connect_async(&target_url).await else {
-        if !burst_sent {
-            warn!("Failed to connect upstream go2rtc WS at {target_url}");
-        }
+        warn!("Failed to connect upstream go2rtc WS at {target_url}");
         return;
     };
 
+    let (mut client_sink, mut client_stream) = client_ws.split();
     let (mut up_sink, mut up_stream) = upstream_ws.split();
-
-    if let Some(msg) = first_client_msg {
-        let out = match msg {
-            AxumWsMsg::Text(t) => Some(TungMsg::Text(t.to_string().into())),
-            AxumWsMsg::Binary(b) => Some(TungMsg::Binary(b)),
-            AxumWsMsg::Ping(p) => Some(TungMsg::Ping(p)),
-            AxumWsMsg::Pong(p) => Some(TungMsg::Pong(p)),
-            AxumWsMsg::Close(_) => return,
-        };
-        if let Some(m) = out
-            && up_sink.send(m).await.is_err()
-        {
-            return;
-        }
-    }
 
     let c2u = async {
         while let Some(Ok(msg)) = client_stream.next().await {
@@ -10225,32 +10281,10 @@ async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) 
     };
 
     let u2c = async {
-        let mut skip_until_next_sync = burst_sent;
         while let Some(Ok(msg)) = up_stream.next().await {
             let out = match msg {
-                TungMsg::Text(t) => {
-                    if let Some(ref src) = stream_src {
-                        state.mse_hub.ingest_upstream_text(src, t.as_str()).await;
-                    }
-                    if burst_sent && t.contains("\"type\"") && t.contains("\"mse\"") {
-                        continue;
-                    }
-                    AxumWsMsg::Text(t.to_string().into())
-                }
-                TungMsg::Binary(b) => {
-                    if let Some(ref src) = stream_src {
-                        state.mse_hub.ingest_upstream_binary(src, b.clone()).await;
-                    }
-                    if skip_until_next_sync {
-                        if ninjanvr_vod::is_fmp4_init_segment(&b) {
-                            continue;
-                        }
-                        if ninjanvr_vod::is_fmp4_sync_fragment(&b) {
-                            skip_until_next_sync = false;
-                        }
-                    }
-                    AxumWsMsg::Binary(b)
-                }
+                TungMsg::Text(t) => AxumWsMsg::Text(t.to_string().into()),
+                TungMsg::Binary(b) => AxumWsMsg::Binary(b),
                 TungMsg::Ping(p) => AxumWsMsg::Ping(p),
                 TungMsg::Pong(p) => AxumWsMsg::Pong(p),
                 TungMsg::Close(_) => break,
@@ -10592,6 +10626,23 @@ pub async fn new_app_state(
             ptz_active_presets: ptz_active_presets.clone(),
         });
         vision_pipeline.start().await;
+
+        let warm_hub = mse_hub.clone();
+        let warm_cfg = shared_cfg.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let enabled_cams: Vec<String> = {
+                let g = warm_cfg.read().await;
+                g.cameras
+                    .iter()
+                    .filter(|(_, c)| c.enabled)
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            };
+            warm_hub
+                .start_persistent_camera_streams("ws://127.0.0.1:1984", enabled_cams)
+                .await;
+        });
     }
 
     let _ = rustls::crypto::ring::default_provider().install_default();

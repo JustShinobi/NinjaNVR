@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  coalesceArrayBuffers,
   computeLiveEdgeSeekTarget,
   DualSlotMachine,
   LiveFrameBridge,
@@ -184,5 +185,15 @@ describe("msePlayerEngine (#91 [UX-16])", () => {
     expect(computeLiveEdgeSeekTarget(0, 5.0, 4.4, false)).toBeNull();
     // Steady-state playback with drift > 1.8s snaps to bufferedEnd - 0.15 = 4.85
     expect(computeLiveEdgeSeekTarget(0, 5.0, 2.5, false)).toBeCloseTo(4.85, 3);
+  });
+
+  test("coalesce_array_buffers_merges_gop_burst_chunks_in_order", () => {
+    expect(coalesceArrayBuffers([])).toBeNull();
+    const c1 = new Uint8Array([1, 2, 3]).buffer;
+    const c2 = new Uint8Array([4, 5]).buffer;
+    const c3 = new Uint8Array([6, 7, 8, 9]).buffer;
+    const merged = coalesceArrayBuffers([c1, c2, c3]);
+    expect(merged).not.toBeNull();
+    expect(Array.from(new Uint8Array(merged!))).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
   });
 });

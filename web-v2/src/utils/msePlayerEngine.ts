@@ -420,3 +420,24 @@ export function computeLiveEdgeSeekTarget(
   }
   return null;
 }
+
+/**
+ * Coalesces a batch of queued fMP4 binary chunks (`init_segment` + `moof+mdat` fragments)
+ * into a single contiguous `ArrayBuffer` so an entire GOP burst can be appended to
+ * `SourceBuffer` in a single `appendBuffer` call instead of dozens of async `updateend` cycles.
+ */
+export function coalesceArrayBuffers(chunks: ArrayBuffer[]): ArrayBuffer | null {
+  if (chunks.length === 0) return null;
+  if (chunks.length === 1) return chunks[0];
+  let totalBytes = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    totalBytes += chunks[i].byteLength;
+  }
+  const merged = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    merged.set(new Uint8Array(chunks[i]), offset);
+    offset += chunks[i].byteLength;
+  }
+  return merged.buffer;
+}

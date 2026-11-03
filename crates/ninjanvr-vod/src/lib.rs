@@ -898,14 +898,15 @@ fn parse_tfhd_track_and_default_flags(tfhd: &[u8]) -> (Option<u32>, Option<u32>)
 }
 
 /// Returns `true` if `buf` is an ISO-BMFF fMP4 media fragment (`moof` + `mdat`) whose video track
-/// (`track_id == 1` or first `traf` with `trun`) begins with an IDR Sync Sample (Keyframe).
+/// (`track_id == 1`, or a `traf` with no `track_id`) begins with an IDR Sync Sample (Keyframe).
+/// Standalone audio fragments (`track_id > 1`, e.g. `track_id == 2`) return `false` so AAC sync
+/// packets never evict the cached video keyframe in `MseGopCache`.
 pub fn is_fmp4_sync_fragment(buf: &[u8]) -> bool {
     let top_boxes = iter_boxes(buf);
     let Some(moof) = find_box(&top_boxes, b"moof") else {
         return false;
     };
     let moof_boxes = iter_boxes(moof);
-    let mut first_traf_sync: Option<bool> = None;
     for b in &moof_boxes {
         if &b.box_type != b"traf" {
             continue;
@@ -914,20 +915,17 @@ pub fn is_fmp4_sync_fragment(buf: &[u8]) -> bool {
         let (track_id, default_flags) = find_box(&traf_boxes, b"tfhd")
             .map(parse_tfhd_track_and_default_flags)
             .unwrap_or((None, None));
+        if matches!(track_id, Some(id) if id != 1) {
+            continue;
+        }
         let Some(trun) = find_box(&traf_boxes, b"trun") else {
             continue;
         };
-        let Some(is_sync) = parse_trun_first_sample_is_sync(trun, default_flags) else {
-            continue;
-        };
-        if track_id == Some(1) {
+        if let Some(is_sync) = parse_trun_first_sample_is_sync(trun, default_flags) {
             return is_sync;
         }
-        if first_traf_sync.is_none() {
-            first_traf_sync = Some(is_sync);
-        }
     }
-    first_traf_sync.unwrap_or(false)
+    false
 }
 
 #[cfg(test)]
@@ -1641,6 +1639,11 @@ mod tests {
         let delta_frag = build_fragment(1, 0x0101_0000);
         assert!(!is_fmp4_init_segment(&delta_frag));
         assert!(!is_fmp4_sync_fragment(&delta_frag));
+
+        // 3b. Standalone audio moof+mdat (track_id = 2, flags = 0x0200_0000) must NOT be classified as a video sync keyframe
+        let audio_frag = build_fragment(2, 0x0200_0000);
+        assert!(!is_fmp4_init_segment(&audio_frag));
+        assert!(!is_fmp4_sync_fragment(&audio_frag));
 
         // 4. Test first-sample-flags-present (0x000004) & tfhd default-sample-flags-present (0x000020)
         let mut trun_first_flag_body = Vec::new();
