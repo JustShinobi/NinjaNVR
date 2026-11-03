@@ -103,9 +103,7 @@ function buildClientFallbackHeuristics(
   }
 
   // 3. Storage capacity & retention runway
-  const recSt =
-    stats?.service?.storage?.["/media/ninjanvr/recordings"] ||
-    stats?.service?.storage?.["/media/frigate/recordings"];
+  const recSt = stats?.service?.storage?.["/media/ninjanvr/recordings"];
   const estDays = stats?.service?.estimated_retention_days ?? 14;
   if (recSt && recSt.total > 0) {
     const usedPct = (recSt.used / recSt.total) * 100;
