@@ -2118,11 +2118,13 @@ pub fn compute_fallback_face_embedding(data: &[u8]) -> Vec<f32> {
                 out[idx * 2 + 1] = grad_y + 0.65 * yb_centered - 0.35 * y_centered;
             }
         }
-        l2_normalize_embedding(&mut out);
-        return out;
+        if out.iter().any(|&v| v.abs() > 1e-6) {
+            l2_normalize_embedding(&mut out);
+            return out;
+        }
     }
 
-    // Fallback content digest for non-image byte buffers using 64-bit SplitMix/FNV mixing
+    // Fallback content digest for non-image byte buffers (or uniform solid-color frames) using 64-bit SplitMix/FNV mixing
     let mut base_hash: u64 = 0xcbf2_9ce4_8422_2325;
     for (idx, &b) in data.iter().enumerate() {
         base_hash ^= (b as u64).wrapping_add((idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
@@ -2744,6 +2746,21 @@ fn parse_regex_sequence(chars: &[char], pos: &mut usize) -> RegexNode {
                 let mut ranges = Vec::new();
                 let mut single_chars = Vec::new();
                 while *pos < chars.len() && chars[*pos] != ']' {
+                    if chars[*pos] == '\\' && *pos + 1 < chars.len() {
+                        let esc = chars[*pos + 1];
+                        if esc == 'd' {
+                            *pos += 2;
+                            ranges.push(('0', '9'));
+                            continue;
+                        } else if esc == 'w' {
+                            *pos += 2;
+                            ranges.push(('0', '9'));
+                            ranges.push(('A', 'Z'));
+                            ranges.push(('a', 'z'));
+                            single_chars.push('_');
+                            continue;
+                        }
+                    }
                     let c1 = if chars[*pos] == '\\' && *pos + 1 < chars.len() {
                         *pos += 1;
                         chars[*pos]
@@ -2751,9 +2768,19 @@ fn parse_regex_sequence(chars: &[char], pos: &mut usize) -> RegexNode {
                         chars[*pos]
                     };
                     *pos += 1;
-                    if *pos + 1 < chars.len() && chars[*pos] == '-' && chars[*pos + 1] != ']' {
+                    let has_range = *pos + 1 < chars.len()
+                        && chars[*pos] == '-'
+                        && chars[*pos + 1] != ']'
+                        && !(chars[*pos + 1] == '\\'
+                            && matches!(chars.get(*pos + 2), Some('d' | 'w')));
+                    if has_range {
                         *pos += 1;
-                        let c2 = chars[*pos];
+                        let c2 = if chars[*pos] == '\\' && *pos + 1 < chars.len() {
+                            *pos += 1;
+                            chars[*pos]
+                        } else {
+                            chars[*pos]
+                        };
                         *pos += 1;
                         ranges.push((c1, c2));
                     } else {
@@ -4423,5 +4450,63 @@ detectors:
         assert!(!tmp.join("Erik").exists());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn lpr_regex_quantifiers_alternation_negated_classes_and_char_weighted_voting() {
+        // 1. Quantifiers (?, +, *, {n}, {min,max}, {min,}), non-capturing groups (?:...),
+        // negated classes [^...], and \d / \w inside character classes
+        let pattern = r"^(?:BR)?[A-Z]{3}[\d][A-Z\d]\d{2,3}[^0-9]?$";
+        assert!(validate_license_plate("BRA2E19", Some(pattern)));
+        assert!(validate_license_plate("BRABC1234X", Some(pattern)));
+        assert!(!validate_license_plate("1234567", Some(pattern)));
+        assert!(!validate_license_plate("BRA2E19999", Some(pattern)));
+
+        // Alternation and +, * quantifiers
+        let alt_pat = r"^([A-Z]+\d*|\d+[A-Z]{2})$";
+        assert!(validate_license_plate("MOTO", Some(alt_pat)));
+        assert!(validate_license_plate("1234AB", Some(alt_pat)));
+        assert!(!validate_license_plate("12A34", Some(alt_pat)));
+
+        // Empty or wildcard regex accepts any non-empty alphanumeric plate and rejects empty string
+        assert!(validate_license_plate("ABC1D23", None));
+        assert!(validate_license_plate("ABC1D23", Some("   ")));
+        assert!(!validate_license_plate("---", None));
+
+        // 2. Character-by-character confidence-weighted voting (with_char_confidences)
+        // Frame 1 has high confidence on prefix "BRA2" and low confidence on suffix "000"
+        // Frame 2 has low confidence on prefix "XXX2" and high confidence on suffix "E19"
+        let r1 = OcrPlateRead::with_char_confidences(
+            "BRA2000",
+            0.78,
+            vec![0.98, 0.97, 0.96, 0.95, 0.15, 0.15, 0.15],
+        );
+        let r2 = OcrPlateRead::with_char_confidences(
+            "XXX2E19",
+            0.78,
+            vec![0.12, 0.12, 0.12, 0.94, 0.96, 0.97, 0.98],
+        );
+        let mut lpr_cfg = LprConfig {
+            min_confidence: 0.75,
+            format_regex: Some(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$".to_string()),
+            ..Default::default()
+        };
+        lpr_cfg
+            .known_plates
+            .insert("BRA2E19".to_string(), "Fleet Truck #04".to_string());
+
+        let voted = vote_license_plate_reads(&[r1, r2], &lpr_cfg).expect("char-weighted consensus");
+        assert_eq!(voted.plate, "BRA2E19");
+        assert_eq!(voted.sub_label.as_deref(), Some("Fleet Truck #04"));
+        assert_eq!(voted.votes, 2);
+        assert!(voted.confidence >= 0.90);
+
+        // 3. Edge cases: [A-\d] (literal '-' before \d does not form a bogus 'A'..='\\' range)
+        // and uniform solid-color image embedding norm == 1.0
+        assert!(validate_license_plate("A901", Some(r"^[A-\d]{4}$")));
+        assert!(!validate_license_plate("B901", Some(r"^[A-\d]{4}$")));
+        let solid_black_rgb = vec![0u8; 112 * 112 * 3];
+        let emb_black = extract_face_embedding(&solid_black_rgb);
+        assert!((cosine_similarity(&emb_black, &emb_black) - 1.0).abs() < 1e-5);
     }
 }
