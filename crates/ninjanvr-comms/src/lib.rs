@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ninjanvr_config::MqttConfig;
 use rumqttc::{
@@ -46,6 +46,8 @@ fn default_camera_activity_entry() -> Value {
         "night_mode": false,
         "tamper": false,
         "motion": false,
+        "audio_dbfs": -90,
+        "audio_active": false,
         "objects": [],
         "count": 0,
         "max_Area": 0,
@@ -208,13 +210,38 @@ impl CommsHub {
         transitioned
     }
 
-    /// Publishes `<camera>/audio/dbfs` and `<camera>/audio/active` (`"ON"` / `"OFF"`) over MQTT and WebSocket.
+    /// Publishes `<camera>/audio/dbfs` and `<camera>/audio/active` (`"ON"` / `"OFF"`) over MQTT and WebSocket,
+    /// and updates `audio_dbfs` and `audio_active` inside the `camera_activity` snapshot.
     pub fn publish_audio_activity(&self, camera: &str, dbfs: i64, active: bool) {
+        let snapshot_str = {
+            let mut map = self
+                .camera_states
+                .write()
+                .expect("camera_states lock poisoned");
+            let entry = map
+                .entry(camera.to_string())
+                .or_insert_with(default_camera_activity_entry);
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("audio_dbfs".to_string(), json!(dbfs));
+                obj.insert("audio_active".to_string(), json!(active));
+            }
+            serde_json::to_string(&*map).unwrap_or_else(|_| "{}".to_string())
+        };
         self.publish_topic(&format!("{camera}/audio/dbfs"), dbfs.to_string());
         self.publish_topic(
             &format!("{camera}/audio/active"),
             if active { "ON" } else { "OFF" },
         );
+        self.publish_ws_only("camera_activity", snapshot_str);
+    }
+
+    /// Returns a cloned JSON snapshot of all current camera activity states.
+    pub fn get_camera_activity_snapshot(&self) -> Value {
+        let map = self
+            .camera_states
+            .read()
+            .expect("camera_states lock poisoned");
+        serde_json::to_value(&*map).unwrap_or_else(|_| json!({}))
     }
 
     /// Returns the currently active operational security profile (`"armed"`, `"home"`, or `"disarmed"`).
@@ -317,6 +344,19 @@ impl CommsHub {
     }
 
     pub fn set_profile_persist_path(&self, path: std::path::PathBuf) {
+        if let Ok(saved) = std::fs::read_to_string(&path) {
+            let trimmed = saved.trim().to_ascii_lowercase();
+            if !trimmed.is_empty() {
+                let norm = if trimmed == "off" {
+                    "disarmed".to_string()
+                } else {
+                    trimmed
+                };
+                if let Ok(mut g) = self.active_profile.write() {
+                    *g = norm;
+                }
+            }
+        }
         if let Ok(mut g) = self.profile_persist_path.write() {
             *g = Some(path);
         }
@@ -341,6 +381,9 @@ impl CommsHub {
         if let Ok(guard) = self.profile_persist_path.read()
             && let Some(ref p) = *guard
         {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::write(p, &norm);
         }
         self.publish_topic("profile/state", norm.clone());
@@ -603,9 +646,273 @@ async fn run_mqtt_loop(
 
 pub type SharedCommsHub = Arc<CommsHub>;
 
+const DEFAULT_ACTIVITY_LEDGER_CAPACITY: usize = 300;
+const ACTIVITY_LEDGER_WINDOW_SECS: f64 = 300.0;
+const DEFAULT_MAX_LOG_LINES: usize = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ActivitySample {
+    pub timestamp: f64,
+    pub motion_px: u32,
+    pub active_objects: u32,
+    pub regions: u32,
+    pub dbfs: i64,
+}
+
+#[derive(Clone)]
+pub struct ActivityLedger {
+    rings: Arc<RwLock<HashMap<String, VecDeque<ActivitySample>>>>,
+    max_samples: usize,
+}
+
+impl Default for ActivityLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActivityLedger {
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_ACTIVITY_LEDGER_CAPACITY)
+    }
+
+    pub fn with_capacity(max_samples: usize) -> Self {
+        Self {
+            rings: Arc::new(RwLock::new(HashMap::new())),
+            max_samples: max_samples.max(1),
+        }
+    }
+
+    pub fn record_sample(
+        &self,
+        camera: &str,
+        timestamp: f64,
+        motion_px: u32,
+        active_objects: u32,
+        regions: u32,
+    ) {
+        self.record_sample_with_audio(camera, timestamp, motion_px, active_objects, regions, 0);
+    }
+
+    pub fn record_sample_with_audio(
+        &self,
+        camera: &str,
+        timestamp: f64,
+        motion_px: u32,
+        active_objects: u32,
+        regions: u32,
+        dbfs: i64,
+    ) {
+        let mut guard = self.rings.write().expect("activity_ledger lock poisoned");
+        let q = guard.entry(camera.to_string()).or_default();
+        q.push_back(ActivitySample {
+            timestamp,
+            motion_px,
+            active_objects,
+            regions,
+            dbfs,
+        });
+        let cutoff = timestamp - ACTIVITY_LEDGER_WINDOW_SECS;
+        while let Some(front) = q.front() {
+            if front.timestamp < cutoff || q.len() > self.max_samples {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn sample_count(&self, camera: &str) -> usize {
+        let guard = self.rings.read().expect("activity_ledger lock poisoned");
+        guard.get(camera).map_or(0, VecDeque::len)
+    }
+
+    pub fn samples(&self, camera: &str) -> Vec<ActivitySample> {
+        let guard = self.rings.read().expect("activity_ledger lock poisoned");
+        guard
+            .get(camera)
+            .map(|q| q.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn aggregate_range(&self, camera: &str, start_time: f64, end_time: f64) -> (i64, i64, i64) {
+        let (m, o, r, _) = self.aggregate_range_with_audio(camera, start_time, end_time);
+        (m, o, r)
+    }
+
+    pub fn aggregate_range_with_audio(
+        &self,
+        camera: &str,
+        start_time: f64,
+        end_time: f64,
+    ) -> (i64, i64, i64, i64) {
+        let guard = self.rings.read().expect("activity_ledger lock poisoned");
+        let Some(q) = guard.get(camera) else {
+            return (0, 0, 0, 0);
+        };
+        let mut motion_sum = 0i64;
+        let mut obj_sum = 0i64;
+        let mut reg_sum = 0i64;
+        let mut peak_dbfs = 0i64;
+        for s in q {
+            if s.timestamp >= start_time && s.timestamp <= end_time {
+                motion_sum += s.motion_px as i64;
+                obj_sum += s.active_objects as i64;
+                reg_sum += s.regions as i64;
+                if s.dbfs != 0 && (peak_dbfs == 0 || s.dbfs > peak_dbfs) {
+                    peak_dbfs = s.dbfs;
+                }
+            }
+        }
+        (motion_sum, obj_sum, reg_sum, peak_dbfs)
+    }
+}
+
+fn format_utc_timestamps() -> (String, String, String) {
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let nanos = dur.subsec_nanos();
+    let millis = nanos / 1_000_000;
+    let days = secs.div_euclid(86400);
+    let day_secs = secs.rem_euclid(86400);
+    let hh = day_secs / 3600;
+    let mm = (day_secs % 3600) / 60;
+    let ss = day_secs % 60;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    let outer = format!("{year:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}.{nanos:09}");
+    let inner = format!("{year:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}");
+    let short_ms = format!("{hh:02}:{mm:02}:{ss:02}.{millis:03}");
+    (outer, inner, short_ms)
+}
+
+#[derive(Clone)]
+pub struct LogBufferHub {
+    buffers: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
+    stream_tx: broadcast::Sender<(String, String)>,
+    max_lines: usize,
+}
+
+impl Default for LogBufferHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogBufferHub {
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_LOG_LINES)
+    }
+
+    pub fn with_capacity(max_lines: usize) -> Self {
+        let (stream_tx, _) = broadcast::channel(256);
+        let mut map = HashMap::new();
+        map.insert("ninjanvr".to_string(), VecDeque::new());
+        map.insert("go2rtc".to_string(), VecDeque::new());
+        map.insert("nginx".to_string(), VecDeque::new());
+        Self {
+            buffers: Arc::new(Mutex::new(map)),
+            stream_tx,
+            max_lines: max_lines.max(1),
+        }
+    }
+
+    pub fn push_ninjanvr(&self, severity: &str, section: &str, message: &str) {
+        let (outer_ts, inner_ts, _) = format_utc_timestamps();
+        let sev_pad = format!("{:<7}", severity.to_ascii_uppercase());
+        let sec_pad = format!("{:<30}", section);
+        let line = format!("{outer_ts}  [{inner_ts}] {sec_pad} {sev_pad} : {message}");
+        self.push_raw("ninjanvr", line);
+    }
+
+    pub fn push_go2rtc(&self, level: &str, section: &str, message: &str) {
+        let (outer_ts, _, short_ms) = format_utc_timestamps();
+        let line = format!("{outer_ts}  {short_ms} {level} [{section}] {message}");
+        self.push_raw("go2rtc", line);
+    }
+
+    pub fn push_nginx(&self, method: &str, path: &str, status: u16) {
+        let (outer_ts, inner_ts, _) = format_utc_timestamps();
+        let line = format!(
+            "{outer_ts}  127.0.0.1 - - [{inner_ts} +0000] \"{method} {path} HTTP/1.1\" {status} 0 \"-\" \"NinjaNVR\""
+        );
+        self.push_raw("nginx", line);
+    }
+
+    pub fn push_raw(&self, service: &str, line: impl Into<String>) {
+        let line = line.into();
+        {
+            let mut guard = self.buffers.lock().expect("log mutex poisoned");
+            let q = guard.entry(service.to_string()).or_default();
+            q.push_back(line.clone());
+            while q.len() > self.max_lines {
+                q.pop_front();
+            }
+        }
+        let _ = self.stream_tx.send((service.to_string(), line));
+    }
+
+    pub fn get_logs(&self, service: &str) -> Vec<String> {
+        self.query_lines(service, None, None).1
+    }
+
+    pub fn query_lines(
+        &self,
+        service: &str,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> (usize, Vec<String>) {
+        let guard = self.buffers.lock().expect("log mutex poisoned");
+        let Some(q) = guard.get(service) else {
+            return (0, Vec::new());
+        };
+        let total = q.len();
+        if total == 0 {
+            return (0, Vec::new());
+        }
+        let start_idx = match start {
+            Some(s) if s < 0 => total.saturating_sub((-s) as usize),
+            Some(s) => (s as usize).min(total),
+            None => 0,
+        };
+        let end_idx = match end {
+            Some(e) if e >= 0 => (e as usize).min(total),
+            _ => total,
+        };
+        if start_idx >= end_idx {
+            return (total, Vec::new());
+        }
+        let slice = q
+            .iter()
+            .skip(start_idx)
+            .take(end_idx - start_idx)
+            .cloned()
+            .collect();
+        (total, slice)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<(String, String)> {
+        self.stream_tx.subscribe()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ninjanvr_config::NinjaConfig;
+    use std::path::PathBuf;
 
     #[tokio::test]
     async fn comms_hub_broadcasts_topics_and_updates_camera_activity() {
@@ -662,5 +969,338 @@ mod tests {
         assert!(cfg.should_use_tls());
         let opts_tls = build_mqtt_options(&cfg);
         assert!(matches!(opts_tls.transport(), Transport::Tls(_)));
+    }
+
+    #[tokio::test]
+    async fn init_from_config_and_apply_set_command_update_flags_and_broadcast_ws() {
+        let yaml = r#"
+cameras:
+  porch:
+    enabled: true
+    detect:
+      enabled: true
+    record:
+      enabled: false
+    review:
+      alerts:
+        enabled: true
+      detections:
+        enabled: false
+    snapshots:
+      enabled: false
+  garage:
+    enabled: false
+    detect:
+      enabled: false
+    record:
+      enabled: true
+    review:
+      alerts:
+        enabled: false
+    snapshots:
+      enabled: true
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let hub = CommsHub::new();
+        hub.init_from_config(&cfg);
+
+        // 1. Verify initial CameraRuntimeFlags populated from config
+        assert_eq!(
+            hub.get_camera_flags("porch"),
+            CameraRuntimeFlags {
+                enabled: true,
+                detect: true,
+                record: false,
+                alerts: true,
+                snapshots: false,
+            }
+        );
+        assert_eq!(
+            hub.get_camera_flags("garage"),
+            CameraRuntimeFlags {
+                enabled: false,
+                detect: false,
+                record: true,
+                alerts: false,
+                snapshots: true,
+            }
+        );
+        assert_eq!(
+            hub.get_camera_flags("unknown_cam"),
+            CameraRuntimeFlags::default()
+        );
+
+        let mut rx = hub.subscribe_ws();
+
+        // 2. Test apply_set_command for detect, record, alerts, snapshots, and enabled
+        // across both ON/OFF and true/false payloads
+        let cases = [
+            ("porch/detect/set", "OFF", "porch/detect/state", "OFF"),
+            ("porch/record/set", "ON", "porch/record/state", "ON"),
+            ("porch/alerts/set", "false", "porch/alerts/state", "OFF"),
+            ("porch/snapshots/set", "true", "porch/snapshots/state", "ON"),
+            ("porch/enabled/set", "OFF", "porch/enabled/state", "OFF"),
+        ];
+
+        for (cmd_topic, cmd_payload, expected_state_topic, expected_state_payload) in cases {
+            hub.apply_set_command(cmd_topic, cmd_payload);
+
+            let state_msg: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(state_msg.topic, expected_state_topic);
+            assert_eq!(state_msg.payload, expected_state_payload);
+
+            let activity_msg: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            assert_eq!(activity_msg.topic, "camera_activity");
+        }
+
+        assert_eq!(
+            hub.get_camera_flags("porch"),
+            CameraRuntimeFlags {
+                enabled: false,
+                detect: false,
+                record: true,
+                alerts: false,
+                snapshots: true,
+            }
+        );
+
+        // Re-enable using true/ON and verify set_camera_flags helper
+        hub.apply_set_command("porch/enabled/set", "true");
+        let _ = rx.recv().await.unwrap();
+        let _ = rx.recv().await.unwrap();
+        hub.apply_set_command("porch/detect/set", "ON");
+        let _ = rx.recv().await.unwrap();
+        let _ = rx.recv().await.unwrap();
+        hub.apply_set_command("porch/record/set", "false");
+        let _ = rx.recv().await.unwrap();
+        let _ = rx.recv().await.unwrap();
+        hub.apply_set_command("porch/alerts/set", "ON");
+        let _ = rx.recv().await.unwrap();
+        let _ = rx.recv().await.unwrap();
+        hub.apply_set_command("porch/snapshots/set", "OFF");
+        let _ = rx.recv().await.unwrap();
+        let _ = rx.recv().await.unwrap();
+
+        assert_eq!(
+            hub.get_camera_flags("porch"),
+            CameraRuntimeFlags {
+                enabled: true,
+                detect: true,
+                record: false,
+                alerts: true,
+                snapshots: false,
+            }
+        );
+
+        let updated_flags = hub.set_camera_flags(
+            "porch",
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
+        );
+        assert_eq!(
+            updated_flags,
+            CameraRuntimeFlags {
+                enabled: false,
+                detect: false,
+                record: true,
+                alerts: false,
+                snapshots: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn tamper_and_availability_deduplicate_transitions_and_audio_updates_snapshot() {
+        let hub = CommsHub::new();
+        let mut rx = hub.subscribe_ws();
+
+        // 1. set_camera_tamper deduplication: OFF -> ON emits once; repeated ON returns false; ON -> OFF emits recovery
+        assert!(!hub.set_camera_tamper("alley", false));
+        assert!(hub.set_camera_tamper("alley", true));
+
+        let tamper_on: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(tamper_on.topic, "alley/tamper");
+        assert_eq!(tamper_on.payload, "ON");
+        let act_on: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(act_on.topic, "camera_activity");
+        let act_on_val: Value = serde_json::from_str(&act_on.payload).unwrap();
+        assert_eq!(act_on_val["alley"]["tamper"], true);
+
+        // Repeated true is deduplicated
+        assert!(!hub.set_camera_tamper("alley", true));
+        assert!(rx.try_recv().is_err());
+
+        // Recovery transition ON -> OFF
+        assert!(hub.set_camera_tamper("alley", false));
+        let tamper_off: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(tamper_off.topic, "alley/tamper");
+        assert_eq!(tamper_off.payload, "OFF");
+        let act_off: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        let act_off_val: Value = serde_json::from_str(&act_off.payload).unwrap();
+        assert_eq!(act_off_val["alley"]["tamper"], false);
+        assert!(!hub.set_camera_tamper("alley", false));
+
+        // 2. set_camera_availability deduplication
+        assert!(!hub.set_camera_availability("alley", true));
+        assert!(hub.set_camera_availability("alley", false));
+        let avail_off: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(avail_off.topic, "alley/available");
+        assert_eq!(avail_off.payload, "offline");
+        let status_off: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(status_off.topic, "alley/status");
+        assert_eq!(status_off.payload, "offline");
+        let _ = rx.recv().await.unwrap();
+        assert!(!hub.set_camera_availability("alley", false));
+        assert!(rx.try_recv().is_err());
+
+        assert!(hub.set_camera_availability("alley", true));
+        let avail_on: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(avail_on.topic, "alley/available");
+        assert_eq!(avail_on.payload, "online");
+        let status_on: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(status_on.topic, "alley/status");
+        assert_eq!(status_on.payload, "online");
+        let _ = rx.recv().await.unwrap();
+        assert!(!hub.set_camera_availability("alley", true));
+
+        // 3. publish_audio_activity updates audio_dbfs and audio_active in camera_activity snapshot
+        hub.publish_audio_activity("alley", -24, true);
+        let dbfs_msg: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(dbfs_msg.topic, "alley/audio/dbfs");
+        assert_eq!(dbfs_msg.payload, "-24");
+        let active_msg: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(active_msg.topic, "alley/audio/active");
+        assert_eq!(active_msg.payload, "ON");
+        let audio_act: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(audio_act.topic, "camera_activity");
+        let audio_snap: Value = serde_json::from_str(&audio_act.payload).unwrap();
+        assert_eq!(audio_snap["alley"]["audio_dbfs"], -24);
+        assert_eq!(audio_snap["alley"]["audio_active"], true);
+
+        let direct_snap = hub.get_camera_activity_snapshot();
+        assert_eq!(direct_snap["alley"]["audio_dbfs"], -24);
+        assert_eq!(direct_snap["alley"]["audio_active"], true);
+
+        // 4. Verify publish_json, publish_mqtt_bytes, update_camera_activity_with_night, and with_mqtt
+        hub.publish_json("stats", &json!({"uptime": 42}));
+        let stats_msg: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(stats_msg.topic, "stats");
+        assert!(stats_msg.payload.contains("\"uptime\":42"));
+
+        hub.publish_mqtt_bytes("alley/snapshot", vec![0xFF, 0xD8, 0xFF], true);
+        hub.update_camera_activity_with_night("alley", true, vec![], 500, true);
+        let night_msg: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(night_msg.topic, "camera_activity");
+        let night_snap: Value = serde_json::from_str(&night_msg.payload).unwrap();
+        assert_eq!(night_snap["alley"]["night_mode"], true);
+
+        let disabled_mqtt_hub = CommsHub::with_mqtt(&MqttConfig::default());
+        assert_eq!(disabled_mqtt_hub.get_active_profile(), "armed");
+    }
+
+    #[test]
+    fn profile_persistence_writes_and_restores_active_profile_from_disk() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_profile_test_{}", std::process::id()));
+        let profile_path = tmp_dir.join(".active_profile");
+
+        let hub1 = CommsHub::new();
+        hub1.set_profile_persist_path(profile_path.clone());
+        assert_eq!(hub1.set_active_profile("home"), "home");
+        assert_eq!(
+            std::fs::read_to_string(&profile_path).unwrap().trim(),
+            "home"
+        );
+
+        // Restoring into a fresh CommsHub instance via set_profile_persist_path
+        let hub2 = CommsHub::new();
+        hub2.set_profile_persist_path(profile_path.clone());
+        assert_eq!(hub2.get_active_profile(), "home");
+
+        // Verify normalization of "off" -> "disarmed" and "" -> "armed"
+        assert_eq!(hub2.set_active_profile("OFF"), "disarmed");
+        assert_eq!(
+            std::fs::read_to_string(&profile_path).unwrap().trim(),
+            "disarmed"
+        );
+        let hub3 = CommsHub::new();
+        hub3.set_profile_persist_path(profile_path.clone());
+        assert_eq!(hub3.get_active_profile(), "disarmed");
+        assert_eq!(hub3.set_active_profile("   "), "armed");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn activity_ledger_evicts_ring_buffer_and_log_buffer_hub_filters_services() {
+        // 1. ActivityLedger ring-buffer capacity eviction and window eviction
+        let ledger = ActivityLedger::with_capacity(3);
+        ledger.record_sample_with_audio("front_door", 1000.0, 10, 1, 1, -45);
+        ledger.record_sample_with_audio("front_door", 1001.0, 20, 2, 1, -30);
+        ledger.record_sample_with_audio("front_door", 1002.0, 30, 3, 2, -20);
+        assert_eq!(ledger.sample_count("front_door"), 3);
+
+        // 4th sample exceeds capacity 3 -> evicts oldest (1000.0)
+        ledger.record_sample_with_audio("front_door", 1003.0, 40, 4, 2, -15);
+        assert_eq!(ledger.sample_count("front_door"), 3);
+        let samples = ledger.samples("front_door");
+        assert_eq!(samples[0].timestamp, 1001.0);
+        assert_eq!(samples[2].timestamp, 1003.0);
+
+        let (motion_sum, obj_sum, reg_sum, peak_dbfs) =
+            ledger.aggregate_range_with_audio("front_door", 1000.0, 1003.0);
+        assert_eq!(motion_sum, 20 + 30 + 40);
+        assert_eq!(obj_sum, 2 + 3 + 4);
+        assert_eq!(reg_sum, 1 + 2 + 2);
+        assert_eq!(peak_dbfs, -15);
+
+        // Advancing timestamp by > 300s evicts stale samples older than cutoff
+        ledger.record_sample("front_door", 1400.0, 5, 0, 1);
+        assert_eq!(ledger.sample_count("front_door"), 1);
+        assert_eq!(
+            ledger.aggregate_range("front_door", 1390.0, 1410.0),
+            (5, 0, 1)
+        );
+
+        // 2. LogBufferHub push_ninjanvr, push_go2rtc, push_nginx, capacity eviction, and service filtering
+        let log_hub = LogBufferHub::with_capacity(3);
+        let mut log_rx = log_hub.subscribe();
+
+        log_hub.push_ninjanvr("info", "ninjanvr.pipeline", "Pipeline started");
+        log_hub.push_ninjanvr("warn", "ninjanvr.storage", "High disk watermark");
+        log_hub.push_go2rtc("INF", "rtsp", "listen addr=:8554");
+        log_hub.push_nginx("GET", "/api/config", 200);
+
+        let (svc1, line1) = log_rx.recv().await.unwrap();
+        assert_eq!(svc1, "ninjanvr");
+        assert!(line1.contains("Pipeline started"));
+        assert!(line1.contains("INFO"));
+
+        let nvr_logs = log_hub.get_logs("ninjanvr");
+        assert_eq!(nvr_logs.len(), 2);
+        assert!(nvr_logs[0].contains("ninjanvr.pipeline"));
+        assert!(nvr_logs[1].contains("ninjanvr.storage"));
+
+        let go2rtc_logs = log_hub.get_logs("go2rtc");
+        assert_eq!(go2rtc_logs.len(), 1);
+        assert!(go2rtc_logs[0].contains("[rtsp] listen addr=:8554"));
+
+        let nginx_logs = log_hub.get_logs("nginx");
+        assert_eq!(nginx_logs.len(), 1);
+        assert!(nginx_logs[0].contains("\"GET /api/config HTTP/1.1\" 200"));
+
+        assert!(log_hub.get_logs("unknown_service").is_empty());
+
+        // Test LogBufferHub ring-buffer eviction when exceeding capacity (3)
+        log_hub.push_ninjanvr("info", "ninjanvr.3", "msg 3");
+        log_hub.push_ninjanvr("info", "ninjanvr.4", "msg 4");
+        let (total, tail) = log_hub.query_lines("ninjanvr", Some(-2), None);
+        assert_eq!(total, 3);
+        assert_eq!(tail.len(), 2);
+        assert!(tail[0].contains("msg 3"));
+        assert!(tail[1].contains("msg 4"));
     }
 }
