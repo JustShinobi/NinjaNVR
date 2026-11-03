@@ -103,10 +103,14 @@ impl Default for FloorplanRoom {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct FloorplanWall {
     #[serde(default)]
     pub points: [f32; 4],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,6 +119,10 @@ pub struct FloorplanConfig {
     pub background_data_url: Option<String>,
     #[serde(default = "default_floorplan_opacity")]
     pub opacity: f32,
+    #[serde(default = "default_floorplan_width_m")]
+    pub width_m: f32,
+    #[serde(default = "default_floorplan_height_m")]
+    pub height_m: f32,
     #[serde(default)]
     pub rooms: Vec<FloorplanRoom>,
     #[serde(default)]
@@ -125,11 +133,21 @@ fn default_floorplan_opacity() -> f32 {
     0.45
 }
 
+fn default_floorplan_width_m() -> f32 {
+    20.0
+}
+
+fn default_floorplan_height_m() -> f32 {
+    12.0
+}
+
 impl Default for FloorplanConfig {
     fn default() -> Self {
         Self {
             background_data_url: None,
             opacity: default_floorplan_opacity(),
+            width_m: default_floorplan_width_m(),
+            height_m: default_floorplan_height_m(),
             rooms: Vec::new(),
             walls: Vec::new(),
         }
@@ -256,18 +274,20 @@ impl GenAiConfig {
         if let Some(ref key) = self.api_key {
             let trimmed = key.trim();
             if !trimmed.is_empty() && trimmed != "***" && trimmed != "*" {
-                if let Some(env_name) = trimmed.strip_prefix('$')
-                    && let Ok(val) = std::env::var(env_name.trim())
-                    && !val.trim().is_empty()
-                {
-                    return val.trim().to_string();
+                if let Some(env_name) = trimmed.strip_prefix('$') {
+                    if let Ok(val) = std::env::var(env_name.trim())
+                        && !val.trim().is_empty()
+                    {
+                        return val.trim().to_string();
+                    }
+                } else {
+                    if let Ok(val) = std::env::var(trimmed)
+                        && !val.trim().is_empty()
+                    {
+                        return val.trim().to_string();
+                    }
+                    return trimmed.to_string();
                 }
-                if let Ok(val) = std::env::var(trimmed)
-                    && !val.trim().is_empty()
-                {
-                    return val.trim().to_string();
-                }
-                return trimmed.to_string();
             }
         }
         let env_var = self.api_key_env.trim();
@@ -1833,6 +1853,7 @@ impl NinjaConfig {
                 .insert("detector01".to_string(), DetectorEntryConfig::default());
         }
 
+        let raw_doc: Value = serde_yaml::from_str(raw_yaml).unwrap_or(Value::Null);
         cfg.objects.normalize_standalone_tracked_attributes();
         cfg.ui.theme = normalize_ui_theme(&cfg.ui.theme);
 
@@ -1845,11 +1866,28 @@ impl NinjaConfig {
                     .streams
                     .insert("Stream 2".to_string(), cam_name.clone());
             }
-            if cam.objects.track.is_empty() {
+            let has_explicit_cam_track = raw_doc
+                .get("cameras")
+                .and_then(|c| c.get(cam_name.as_str()))
+                .and_then(|c| c.get("objects"))
+                .and_then(|o| o.get("track"))
+                .is_some();
+            if cam.objects.track.is_empty()
+                || (!has_explicit_cam_track
+                    && cam.objects.track == default_tracked_objects()
+                    && cfg.objects.track != default_tracked_objects())
+            {
                 cam.objects.track = cfg.objects.track.clone();
             }
+            let has_explicit_cam_attrs = raw_doc
+                .get("cameras")
+                .and_then(|c| c.get(cam_name.as_str()))
+                .and_then(|c| c.get("objects"))
+                .and_then(|o| o.get("attribute_labels"))
+                .is_some();
             if cam.objects.attribute_labels.is_empty()
-                || (cam.objects.attribute_labels == default_attribute_labels()
+                || (!has_explicit_cam_attrs
+                    && cam.objects.attribute_labels == default_attribute_labels()
                     && cfg.objects.attribute_labels != default_attribute_labels())
             {
                 cam.objects.attribute_labels = cfg.objects.attribute_labels.clone();
@@ -2031,6 +2069,7 @@ impl NinjaConfig {
                         "min_ratio": f.min_ratio,
                         "max_ratio": f.max_ratio,
                         "threshold": f.threshold,
+                        "night_threshold": f.night_threshold,
                         "min_score": f.min_score,
                         "mask": f.mask
                     }),
@@ -2044,6 +2083,7 @@ impl NinjaConfig {
                         "min_ratio": f.min_ratio,
                         "max_ratio": f.max_ratio,
                         "threshold": f.threshold,
+                        "night_threshold": f.night_threshold,
                         "min_score": f.min_score,
                         "mask": f.mask
                     })
@@ -2056,6 +2096,7 @@ impl NinjaConfig {
                     "name": cam_name,
                     "enabled": cam.enabled,
                     "enabled_in_config": cam.enabled,
+                    "indoor": cam.indoor,
                     "type": "generic",
                     "best_image_timeout": 60,
                     "audio": {
@@ -2179,7 +2220,9 @@ impl NinjaConfig {
                             "post_capture": cam.record.detections.post_capture,
                             "retain": {
                                 "days": cam.record.detections.retain.days,
-                                "mode": cam.record.detections.retain.mode
+                                "mode": cam.record.detections.retain.mode,
+                                "max_size_gb": cam.record.detections.retain.max_size_gb,
+                                "min_free_gb": cam.record.detections.retain.min_free_gb
                             }
                         },
                         "alerts": {
@@ -2187,7 +2230,9 @@ impl NinjaConfig {
                             "post_capture": cam.record.alerts.post_capture,
                             "retain": {
                                 "days": cam.record.alerts.retain.days,
-                                "mode": cam.record.alerts.retain.mode
+                                "mode": cam.record.alerts.retain.mode,
+                                "max_size_gb": cam.record.alerts.retain.max_size_gb,
+                                "min_free_gb": cam.record.alerts.retain.min_free_gb
                             }
                         },
                         "export": {
@@ -2371,7 +2416,10 @@ impl NinjaConfig {
                 },
                 "version_check": false
             },
-            "tls": { "enabled": self.tls.enabled },
+            "tls": {
+                "enabled": self.tls.enabled,
+                "san_hosts": self.tls.san_hosts
+            },
             "ui": {
                 "time_format": self.ui.time_format,
                 "unit_system": self.ui.unit_system,
@@ -2380,6 +2428,8 @@ impl NinjaConfig {
                 "floorplan": {
                     "background_data_url": self.ui.floorplan.background_data_url,
                     "opacity": self.ui.floorplan.opacity,
+                    "width_m": self.ui.floorplan.width_m,
+                    "height_m": self.ui.floorplan.height_m,
                     "rooms": self.ui.floorplan.rooms,
                     "walls": self.ui.floorplan.walls
                 }
@@ -2515,7 +2565,9 @@ impl NinjaConfig {
                     "post_capture": self.record.detections.post_capture,
                     "retain": {
                         "days": self.record.detections.retain.days,
-                        "mode": self.record.detections.retain.mode
+                        "mode": self.record.detections.retain.mode,
+                        "max_size_gb": self.record.detections.retain.max_size_gb,
+                        "min_free_gb": self.record.detections.retain.min_free_gb
                     }
                 },
                 "alerts": {
@@ -2523,7 +2575,9 @@ impl NinjaConfig {
                     "post_capture": self.record.alerts.post_capture,
                     "retain": {
                         "days": self.record.alerts.retain.days,
-                        "mode": self.record.alerts.retain.mode
+                        "mode": self.record.alerts.retain.mode,
+                        "max_size_gb": self.record.alerts.retain.max_size_gb,
+                        "min_free_gb": self.record.alerts.retain.min_free_gb
                     }
                 },
                 "export": {
@@ -2743,7 +2797,13 @@ impl NinjaConfig {
                 serde_json::from_value(proxy_val.clone()).context("invalid proxy config")?;
         }
         if let Some(tls_val) = obj.get("tls") {
-            self.tls = serde_json::from_value(tls_val.clone()).context("invalid tls config")?;
+            let prev_san_hosts = self.tls.san_hosts.clone();
+            let mut next_tls: TlsConfig =
+                serde_json::from_value(tls_val.clone()).context("invalid tls config")?;
+            if tls_val.get("san_hosts").is_none() {
+                next_tls.san_hosts = prev_san_hosts;
+            }
+            self.tls = next_tls;
         }
         if let Some(db_val) = obj.get("database") {
             self.database =
@@ -2871,6 +2931,8 @@ impl NinjaConfig {
                     next_ui.floorplan.background_data_url = None;
                 }
                 next_ui.floorplan.opacity = next_ui.floorplan.opacity.clamp(0.10, 1.0);
+                next_ui.floorplan.width_m = next_ui.floorplan.width_m.clamp(2.0, 500.0);
+                next_ui.floorplan.height_m = next_ui.floorplan.height_m.clamp(2.0, 500.0);
             }
             self.ui = next_ui;
         }
@@ -2885,6 +2947,8 @@ impl NinjaConfig {
                 next_fp.background_data_url = None;
             }
             next_fp.opacity = next_fp.opacity.clamp(0.10, 1.0);
+            next_fp.width_m = next_fp.width_m.clamp(2.0, 500.0);
+            next_fp.height_m = next_fp.height_m.clamp(2.0, 500.0);
             self.ui.floorplan = next_fp;
         }
         if let Some(go2rtc_val) = obj.get("go2rtc")
@@ -2955,10 +3019,28 @@ impl NinjaConfig {
                         .streams
                         .insert("Stream 2".to_string(), cam_name.clone());
                 }
-                if cam.objects.track.is_empty() {
+                let has_explicit_cam_track = cams_val
+                    .get(cam_name)
+                    .and_then(|c| c.get("objects"))
+                    .and_then(|o| o.get("track"))
+                    .is_some();
+                if cam.objects.track.is_empty()
+                    || (!has_explicit_cam_track
+                        && cam.objects.track == default_tracked_objects()
+                        && self.objects.track != default_tracked_objects())
+                {
                     cam.objects.track = self.objects.track.clone();
                 }
-                if cam.objects.attribute_labels.is_empty() {
+                let has_explicit_cam_attrs = cams_val
+                    .get(cam_name)
+                    .and_then(|c| c.get("objects"))
+                    .and_then(|o| o.get("attribute_labels"))
+                    .is_some();
+                if cam.objects.attribute_labels.is_empty()
+                    || (!has_explicit_cam_attrs
+                        && cam.objects.attribute_labels == default_attribute_labels()
+                        && self.objects.attribute_labels != default_attribute_labels())
+                {
                     cam.objects.attribute_labels = self.objects.attribute_labels.clone();
                 }
                 if cam.review.alerts.sub_labels.is_empty()
@@ -3195,6 +3277,7 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
             (chunk, "")
         };
         let trimmed_start = line_body.trim_start();
+        let mut replaced = false;
         for secret_key in ["password:", "api_key:"] {
             if let Some(after_key) = trimmed_start.strip_prefix(secret_key) {
                 let leading_ws = &line_body[..line_body.len() - trimmed_start.len()];
@@ -3209,13 +3292,12 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
                     scrubbed_lines.push_str(secret_key);
                     scrubbed_lines.push_str(" \"***\"");
                     scrubbed_lines.push_str(newline);
+                    replaced = true;
                     break;
                 }
             }
         }
-        if scrubbed_lines.ends_with(&format!(" \"***\"{newline}"))
-            && (trimmed_start.starts_with("password:") || trimmed_start.starts_with("api_key:"))
-        {
+        if replaced {
             continue;
         }
         scrubbed_lines.push_str(chunk);
@@ -4927,5 +5009,266 @@ version: 0.18-0
                 .unwrap();
         assert_eq!(reparsed.ui.theme, "system");
         assert!(!reparsed.ui.high_contrast);
+    }
+
+    #[test]
+    fn mqtt_should_use_tls_evaluates_explicit_override_port_and_ca_certs() {
+        let mut mqtt = MqttConfig::default();
+        assert_eq!(mqtt.port, 1883);
+        assert!(!mqtt.should_use_tls());
+
+        // Port 8883 enables TLS by default when tls_enabled is None
+        mqtt.port = 8883;
+        assert!(mqtt.should_use_tls());
+
+        // Explicit tls_enabled: Some(false) overrides port 8883 and tls_ca_certs
+        mqtt.tls_enabled = Some(false);
+        mqtt.tls_ca_certs = Some(PathBuf::from("/etc/ssl/certs/ca.pem"));
+        assert!(!mqtt.should_use_tls());
+
+        // Explicit tls_enabled: Some(true) enables TLS on port 1883 without CA certs
+        mqtt.port = 1883;
+        mqtt.tls_ca_certs = None;
+        mqtt.tls_enabled = Some(true);
+        assert!(mqtt.should_use_tls());
+
+        // tls_ca_certs: Some(...) enables TLS when tls_enabled is None on port 1883
+        mqtt.tls_enabled = None;
+        mqtt.tls_ca_certs = Some(PathBuf::from("/etc/ssl/certs/ca.pem"));
+        assert!(mqtt.should_use_tls());
+    }
+
+    #[test]
+    fn genai_has_api_key_and_resolve_api_key_handle_masks_and_env_vars() {
+        let mut genai = GenAiConfig::default();
+        assert!(!genai.has_api_key());
+
+        for blank_or_masked in ["", "   ", "***", "*", " *** "] {
+            genai.api_key = Some(blank_or_masked.to_string());
+            assert!(
+                !genai.has_api_key(),
+                "masked or blank key '{blank_or_masked}' must not report has_api_key"
+            );
+        }
+
+        genai.api_key = Some("sk-direct-key-123".to_string());
+        assert!(genai.has_api_key());
+        assert_eq!(genai.resolve_api_key(), "sk-direct-key-123");
+
+        let env_name = format!("NINJANVR_TEST_GENAI_KEY_{}", std::process::id());
+        // SAFETY: Test-scoped unique environment variable name not read concurrently by other threads.
+        unsafe {
+            std::env::set_var(&env_name, "  sk-from-env-456  ");
+        }
+
+        // $ENV_VAR syntax in api_key
+        genai.api_key = Some(format!("${env_name}"));
+        assert_eq!(genai.resolve_api_key(), "sk-from-env-456");
+
+        // Bare ENV_VAR name in api_key
+        genai.api_key = Some(env_name.clone());
+        assert_eq!(genai.resolve_api_key(), "sk-from-env-456");
+
+        // Masked api_key ("***") falls back to api_key_env
+        genai.api_key = Some("***".to_string());
+        genai.api_key_env = env_name.clone();
+        assert_eq!(genai.resolve_api_key(), "sk-from-env-456");
+
+        unsafe {
+            std::env::remove_var(&env_name);
+        }
+        genai.api_key = None;
+        assert_eq!(genai.resolve_api_key(), "");
+    }
+
+    #[test]
+    fn onvif_config_deserializes_legacy_autotracking_map_and_detects_configuration_state() {
+        let def = OnvifCameraConfig::default();
+        assert!(def.is_unconfigured());
+        assert!(!def.is_configured());
+
+        // Whitespace-only host is still not configured
+        let blank_host = OnvifCameraConfig {
+            host: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert!(blank_host.is_unconfigured());
+        assert!(!blank_host.is_configured());
+
+        // Custom port marks it non-default (not unconfigured), even before host is set
+        let custom_port = OnvifCameraConfig {
+            port: 8899,
+            ..Default::default()
+        };
+        assert!(!custom_port.is_unconfigured());
+        assert!(!custom_port.is_configured());
+
+        // Legacy Frigate-style map: autotracking: { enabled: true }
+        let legacy_true: OnvifCameraConfig = serde_yaml::from_str(
+            r#"
+host: 192.0.2.50
+port: 8000
+autotracking:
+  enabled: true
+"#,
+        )
+        .unwrap();
+        assert!(legacy_true.autotracking);
+        assert!(legacy_true.is_configured());
+        assert!(!legacy_true.is_unconfigured());
+
+        // Legacy map with enabled: false and non-boolean fallback
+        let legacy_false: OnvifCameraConfig = serde_yaml::from_str(
+            r#"
+autotracking:
+  enabled: false
+"#,
+        )
+        .unwrap();
+        assert!(!legacy_false.autotracking);
+
+        let invalid_type: OnvifCameraConfig = serde_yaml::from_str("autotracking: 42\n").unwrap();
+        assert!(!invalid_type.autotracking);
+    }
+
+    #[test]
+    fn scrub_and_restore_json_value_preserves_nested_structures_and_credentials() {
+        let originals = vec![
+            "rtsp://admin:s3cr3t@192.0.2.10:554/cam/realmonitor?channel=1&subtype=0".to_string(),
+            "rtsps://oper:p%40ss@192.0.2.11:322/live/main".to_string(),
+        ];
+        let payload = json!({
+            "cameras": {
+                "gate": {
+                    "enabled": true,
+                    "fps": 15,
+                    "inputs": [
+                        { "path": originals[0], "roles": ["record"] },
+                        { "path": "rtsp://127.0.0.1:8554/gate_sub", "roles": ["detect"] }
+                    ]
+                }
+            },
+            "go2rtc": {
+                "streams": {
+                    "gate_main": [originals[0], "ffmpeg:gate_main#audio=aac"],
+                    "patio_tls": originals[1]
+                }
+            }
+        });
+
+        let scrubbed = scrub_json_value(&payload);
+        let scrubbed_str = serde_json::to_string(&scrubbed).unwrap();
+        assert!(!scrubbed_str.contains("s3cr3t"));
+        assert!(!scrubbed_str.contains("p%40ss"));
+        assert!(scrubbed_str.contains("rtsp://*:*@192.0.2.10:554"));
+        assert!(scrubbed_str.contains("rtsps://*:*@192.0.2.11:322"));
+        assert_eq!(scrubbed["cameras"]["gate"]["fps"], 15);
+
+        let restored = restore_scrubbed_json(&scrubbed, &originals);
+        assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn config_bugfixes_inherit_global_track_preserve_roundtrip_fields_and_scrub_consecutive_secrets()
+     {
+        let yaml = r#"
+tls:
+  enabled: true
+  san_hosts:
+    - nvr.local
+objects:
+  track:
+    - person
+    - car
+    - dog
+record:
+  detections:
+    retain:
+      days: 14
+      mode: motion
+      max_size_gb: 120.5
+      min_free_gb: 25.0
+  alerts:
+    retain:
+      days: 30
+      mode: all
+      max_size_gb: 80.0
+      min_free_gb: 15.0
+cameras:
+  cam_inherited:
+    enabled: true
+    indoor: true
+    objects:
+      filters:
+        person:
+          threshold: 0.72
+          night_threshold: 0.61
+  cam_explicit:
+    enabled: true
+    objects:
+      track:
+        - person
+"#;
+        let mut cfg =
+            NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config_bugfixes.yml")).unwrap();
+
+        // 1. Camera without explicit objects.track inherits global [person, car, dog],
+        // while camera with explicit [person] keeps [person]
+        assert_eq!(
+            cfg.cameras["cam_inherited"].objects.track,
+            vec!["person".to_string(), "car".to_string(), "dog".to_string()]
+        );
+        assert_eq!(
+            cfg.cameras["cam_explicit"].objects.track,
+            vec!["person".to_string()]
+        );
+
+        // 2. Round-trip through to_api_value() -> apply_structured_json() preserves
+        // night_threshold, indoor, tls.san_hosts, and retain.{max_size_gb, min_free_gb}
+        let api_val = cfg.to_api_value();
+        assert_eq!(api_val["cameras"]["cam_inherited"]["indoor"], true);
+        let api_nt =
+            api_val["cameras"]["cam_inherited"]["objects"]["filters"]["person"]["night_threshold"]
+                .as_f64()
+                .unwrap();
+        assert!((api_nt - 0.61).abs() < 1e-5);
+        assert_eq!(api_val["tls"]["san_hosts"], json!(["nvr.local"]));
+        assert_eq!(
+            api_val["record"]["detections"]["retain"]["max_size_gb"],
+            120.5
+        );
+        assert_eq!(
+            api_val["record"]["detections"]["retain"]["min_free_gb"],
+            25.0
+        );
+
+        cfg.apply_structured_json(&api_val).unwrap();
+        assert!(cfg.cameras["cam_inherited"].indoor);
+        let roundtrip_nt = cfg.cameras["cam_inherited"].objects.filters["person"]
+            .night_threshold
+            .unwrap();
+        assert!((roundtrip_nt - 0.61).abs() < 1e-5);
+        assert_eq!(cfg.tls.san_hosts, vec!["nvr.local".to_string()]);
+        assert_eq!(cfg.record.detections.retain.max_size_gb, Some(120.5));
+        assert_eq!(cfg.record.detections.retain.min_free_gb, Some(25.0));
+        assert_eq!(cfg.record.alerts.retain.max_size_gb, Some(80.0));
+        assert_eq!(cfg.record.alerts.retain.min_free_gb, Some(15.0));
+
+        // 3. scrub_yaml_credentials preserves an empty api_key/password line immediately following a scrubbed line
+        let raw_with_consecutive = "mqtt:\n  password: super_secret\ngenai:\n  api_key: \"\"\n";
+        let scrubbed_yaml = scrub_yaml_credentials(raw_with_consecutive);
+        assert!(scrubbed_yaml.contains("password: \"***\""));
+        assert!(
+            scrubbed_yaml.contains("api_key: \"\""),
+            "empty api_key line after a scrubbed password line must not be dropped: {scrubbed_yaml}"
+        );
+
+        // 4. GenAiConfig::resolve_api_key with unset $ENV_VAR falls back to api_key_env / empty string
+        let unset_genai = GenAiConfig {
+            api_key: Some("$NINJANVR_DEFINITELY_UNSET_VAR_999999".to_string()),
+            api_key_env: "NINJANVR_DEFINITELY_UNSET_ENV_999999".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(unset_genai.resolve_api_key(), "");
     }
 }
