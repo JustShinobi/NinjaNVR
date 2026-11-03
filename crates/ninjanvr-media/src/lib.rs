@@ -2473,6 +2473,17 @@ pub async fn build_mp4_export_with_privacy(
     res
 }
 
+pub fn build_export_temp_paths(
+    exports_dir: &Path,
+    export_id: &str,
+    nonce: u64,
+) -> (PathBuf, PathBuf) {
+    let tmp_out_file = exports_dir.join(format!(".{export_id}.{nonce:016x}.tmp.mp4"));
+    let list_file =
+        std::env::temp_dir().join(format!("ninjanvr-export-{export_id}-{nonce:016x}.txt"));
+    (tmp_out_file, list_file)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_mp4_export_inner(
     db: &NinjaDatabase,
@@ -2485,6 +2496,17 @@ async fn build_mp4_export_inner(
     include_audio: bool,
     privacy_mask: Option<&serde_json::Value>,
 ) -> Result<()> {
+    struct ExportTempGuard {
+        tmp_out_file: PathBuf,
+        list_file: PathBuf,
+    }
+    impl Drop for ExportTempGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.list_file);
+            let _ = std::fs::remove_file(&self.tmp_out_file);
+        }
+    }
+
     let mut segments = db.query_recordings(camera, start_time, end_time)?;
     if segments.is_empty() {
         segments = db.query_recordings(camera, start_time - 15.0, end_time + 15.0)?;
@@ -2498,27 +2520,36 @@ async fn build_mp4_export_inner(
     std::fs::create_dir_all(&exports_dir)?;
     std::fs::create_dir_all(&clips_dir)?;
 
+    let nonce: u64 = rand::random();
     let out_file = exports_dir.join(format!("{export_id}.mp4"));
-    let tmp_out_file = exports_dir.join(format!(".{export_id}.tmp.mp4"));
+    let (tmp_out_file, list_file) = build_export_temp_paths(&exports_dir, export_id, nonce);
     let thumb_file = clips_dir.join(format!("{export_id}.webp"));
-    let list_file = std::env::temp_dir().join(format!("ninjanvr-export-{export_id}.txt"));
+    let _temp_guard = ExportTempGuard {
+        tmp_out_file: tmp_out_file.clone(),
+        list_file: list_file.clone(),
+    };
 
     let mut list_content = String::new();
     let mut existing_paths = Vec::new();
     let mut first_seg_start = None;
+    let canon_media_dir = std::fs::canonicalize(media_dir).ok();
     for seg in &segments {
         let local_path = if let Some(rel) = strip_media_root(&seg.path) {
             media_dir.join(rel)
         } else {
             PathBuf::from(&seg.path)
         };
-        if local_path.exists() {
+        if let (Some(root_canon), Ok(seg_canon)) =
+            (&canon_media_dir, std::fs::canonicalize(&local_path))
+            && seg_canon.starts_with(root_canon)
+            && seg_canon.is_file()
+        {
             if first_seg_start.is_none() {
                 first_seg_start = Some(seg.start_time);
             }
-            let escaped = local_path.to_string_lossy().replace('\'', "'\\''");
+            let escaped = seg_canon.to_string_lossy().replace('\'', "'\\''");
             list_content.push_str(&format!("file '{escaped}'\n"));
-            existing_paths.push(local_path);
+            existing_paths.push(seg_canon);
         }
     }
 
@@ -2581,7 +2612,9 @@ async fn build_mp4_export_inner(
     } else {
         "scale=320:-1".to_string()
     };
-    let thumb_status = Command::new(&ffmpeg_bin)
+    let mut thumb_cmd = Command::new(&ffmpeg_bin);
+    thumb_cmd.kill_on_drop(true);
+    let thumb_status = thumb_cmd
         .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
         .arg(&out_file)
         .args(["-frames:v", "1", "-vf", &thumb_vf])
@@ -3277,6 +3310,33 @@ mod tests {
         );
         assert!(!root.join("exports/exp_valid_mask.mp4").exists());
         assert!(db.get_export_by_id("exp_valid_mask").unwrap().is_none());
+
+        // 3. Unique per-invocation temp paths & cleanup of .tmp.mp4 and ninjanvr-export-*.txt on error/completion
+        let exports_dir = root.join("exports");
+        let (tmp1, list1) =
+            build_export_temp_paths(&exports_dir, "exp_concurrent", 0x1122334455667788);
+        let (tmp2, list2) =
+            build_export_temp_paths(&exports_dir, "exp_concurrent", 0x99aabbccddeeff00);
+        assert_ne!(tmp1, tmp2);
+        assert_ne!(list1, list2);
+        assert_eq!(
+            tmp1.file_name().unwrap().to_str().unwrap(),
+            ".exp_concurrent.1122334455667788.tmp.mp4"
+        );
+        assert_eq!(
+            list1.file_name().unwrap().to_str().unwrap(),
+            "ninjanvr-export-exp_concurrent-1122334455667788.txt"
+        );
+
+        let leftover_tmps: Vec<_> = std::fs::read_dir(&exports_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp.mp4"))
+            .collect();
+        assert!(
+            leftover_tmps.is_empty(),
+            "all .tmp.mp4 files must be cleaned up on error"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
