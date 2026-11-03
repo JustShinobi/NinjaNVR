@@ -532,7 +532,10 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/review/summary", get(api_review_summary))
         .route("/review/activity/motion", get(api_review_activity_motion))
         .route("/review/event/{event_id}", get(api_review_by_event_id))
-        .route("/review/{id}", get(api_review_by_id))
+        .route(
+            "/review/{id}",
+            get(api_review_by_id).delete(api_review_delete),
+        )
         .route("/review/{id}/preview", get(api_review_preview))
         .route("/review/{id}/viewed", delete(api_review_unview_one))
         .route(
@@ -2105,12 +2108,15 @@ async fn api_user_delete(
     AxumPath(username): AxumPath<String>,
 ) -> Response {
     match state.db.delete_user(&username) {
-        Ok(true) => Json(json!({
-            "success": true,
-            "message": format!("User '{username}' deleted"),
-            "users": state.db.list_users().unwrap_or_default()
-        }))
-        .into_response(),
+        Ok(true) => {
+            let _ = state.db.revoke_share_links_by_creator(&username);
+            Json(json!({
+                "success": true,
+                "message": format!("User '{username}' deleted"),
+                "users": state.db.list_users().unwrap_or_default()
+            }))
+            .into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "success": false, "message": "User not found" })),
@@ -4685,11 +4691,23 @@ pub struct DeleteIdsBody {
     pub ids: Vec<String>,
 }
 
+async fn api_review_delete(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Json<Value> {
+    let _ = state.db.delete_reviews(std::slice::from_ref(&id));
+    let _ = state.db.revoke_share_links_for_target(None, &id);
+    Json(json!({ "success": true }))
+}
+
 async fn api_reviews_delete(
     State(state): State<AppState>,
     Json(body): Json<DeleteIdsBody>,
 ) -> Json<Value> {
     let _ = state.db.delete_reviews(&body.ids);
+    for id in &body.ids {
+        let _ = state.db.revoke_share_links_for_target(None, id);
+    }
     Json(json!({ "success": true }))
 }
 
@@ -4768,6 +4786,7 @@ async fn api_event_delete(
     AxumPath(id): AxumPath<String>,
 ) -> Json<Value> {
     let _ = state.db.delete_event(&id);
+    let _ = state.db.revoke_share_links_for_target(None, &id);
     Json(json!({ "success": true }))
 }
 
@@ -4789,6 +4808,9 @@ async fn api_events_bulk_delete(
         body.ids
     };
     let _ = state.db.delete_events_bulk(&ids);
+    for id in &ids {
+        let _ = state.db.revoke_share_links_for_target(None, id);
+    }
     Json(json!({ "success": true }))
 }
 
@@ -7824,10 +7846,24 @@ pub fn verify_share_token(
     let Ok(payload) = serde_json::from_slice::<ShareTokenPayload>(&payload_bytes) else {
         return Err(StatusCode::FORBIDDEN);
     };
+    if !matches!(payload.k.as_str(), "export" | "review" | "event") {
+        return Err(StatusCode::FORBIDDEN);
+    }
     if payload.exp <= now_ts {
         return Err(StatusCode::GONE);
     }
     Ok(payload)
+}
+
+fn is_disallowed_export_fallback_id(id: &str) -> bool {
+    id.is_empty()
+        || id.starts_with('.')
+        || id.starts_with("share_redacted_")
+        || id.starts_with("share_clip_")
+        || id.contains("..")
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 fn resolve_share_target_metadata(
@@ -7846,12 +7882,7 @@ fn resolve_share_target_metadata(
             let date_ts = exp["date"].as_f64().map(|t| t as u64);
             return (cam, name, date_ts, true);
         }
-        let is_safe_id = !target_id.is_empty()
-            && target_id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-            && !target_id.contains("..");
-        if is_safe_id
+        if !is_disallowed_export_fallback_id(target_id)
             && state
                 .media_dir
                 .join("exports")
@@ -7870,32 +7901,54 @@ fn resolve_share_target_metadata(
 
     if kind == "review" {
         if let Ok(Some(rev)) = state.db.get_review_by_id(target_id) {
+            if rev.camera.trim().is_empty() {
+                return (None, target_id.to_string(), None, false);
+            }
             let cam = Some(rev.camera.clone());
             let title = format!("{} // {}", rev.camera, rev.severity.to_ascii_uppercase());
             return (cam, title, Some(rev.start_time as u64), true);
         }
         if let Ok(Some(ev)) = state.db.get_event(target_id) {
-            let cam = ev["camera"].as_str().map(|s| s.to_string());
+            let Some(cam_str) = ev["camera"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return (None, target_id.to_string(), None, false);
+            };
+            let cam = Some(cam_str.to_string());
             let label = ev["label"].as_str().unwrap_or("event");
             let start = ev["start_time"].as_f64().map(|t| t as u64);
-            let title = format!("{} // {}", cam.as_deref().unwrap_or("camera"), label);
+            let title = format!("{cam_str} // {label}");
             return (cam, title, start, true);
         }
         return (None, target_id.to_string(), None, false);
     }
 
-    if let Ok(Some(ev)) = state.db.get_event(target_id) {
-        let cam = ev["camera"].as_str().map(|s| s.to_string());
-        let label = ev["label"].as_str().unwrap_or("event");
-        let start = ev["start_time"].as_f64().map(|t| t as u64);
-        let title = format!("{} // {}", cam.as_deref().unwrap_or("camera"), label);
-        return (cam, title, start, true);
-    }
+    if kind == "event" {
+        if let Ok(Some(ev)) = state.db.get_event(target_id) {
+            let Some(cam_str) = ev["camera"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return (None, target_id.to_string(), None, false);
+            };
+            let cam = Some(cam_str.to_string());
+            let label = ev["label"].as_str().unwrap_or("event");
+            let start = ev["start_time"].as_f64().map(|t| t as u64);
+            let title = format!("{cam_str} // {label}");
+            return (cam, title, start, true);
+        }
 
-    if let Ok(Some(rev)) = state.db.get_review_by_id(target_id) {
-        let cam = Some(rev.camera.clone());
-        let title = format!("{} // {}", rev.camera, rev.severity.to_ascii_uppercase());
-        return (cam, title, Some(rev.start_time as u64), true);
+        if let Ok(Some(rev)) = state.db.get_review_by_id(target_id) {
+            if rev.camera.trim().is_empty() {
+                return (None, target_id.to_string(), None, false);
+            }
+            let cam = Some(rev.camera.clone());
+            let title = format!("{} // {}", rev.camera, rev.severity.to_ascii_uppercase());
+            return (cam, title, Some(rev.start_time as u64), true);
+        }
     }
 
     (None, target_id.to_string(), None, false)
@@ -7991,7 +8044,7 @@ async fn api_share_create(
 
     let now = unix_now();
     let exp = now + body.expires_in_sec.clamp(60, 86400 * 30);
-    let jti = format!("shr_{}_{:08x}", now, rand::random::<u32>());
+    let jti = format!("shr_{}_{:032x}", now, rand::random::<u128>());
     let created_by = {
         let cfg = state.config.read().await;
         extract_authenticated_user(
@@ -8004,7 +8057,7 @@ async fn api_share_create(
         .map(|(u, _)| u)
         .unwrap_or_else(|| "admin".to_string())
     };
-    let _ = state.db.insert_share_link(
+    if let Err(err) = state.db.insert_share_link(
         &jti,
         &kind,
         &body.target_id,
@@ -8012,7 +8065,17 @@ async fn api_share_create(
         &created_by,
         now as f64,
         exp as f64,
-    );
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "error": "Failed to persist share link",
+                "message": format!("Failed to persist share link: {err}")
+            })),
+        )
+            .into_response();
+    }
     let payload = ShareTokenPayload {
         k: kind,
         id: body.target_id.clone(),
@@ -8032,11 +8095,75 @@ async fn api_share_create(
     .into_response()
 }
 
+fn verify_share_jti(
+    state: &AppState,
+    payload: &ShareTokenPayload,
+    now_ts: u64,
+) -> std::result::Result<(), (StatusCode, &'static str)> {
+    let Some(ref jti) = payload.jti else {
+        return Ok(());
+    };
+    let link = match state.db.get_share_link(jti) {
+        Ok(Some(link)) => link,
+        Ok(None) => {
+            return Err((StatusCode::GONE, "Share link has been revoked"));
+        }
+        Err(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to verify share link state",
+            ));
+        }
+    };
+    if link["revoked"].as_bool().unwrap_or(false) {
+        return Err((StatusCode::GONE, "Share link has been revoked"));
+    }
+    if link["expires_at"]
+        .as_f64()
+        .is_some_and(|exp| (exp as u64) <= now_ts)
+    {
+        return Err((StatusCode::GONE, "Share link has expired"));
+    }
+    if link["kind"].as_str() != Some(payload.k.as_str())
+        || link["target_id"].as_str() != Some(payload.id.as_str())
+        || link["camera"].as_str() != payload.cam.as_deref()
+    {
+        return Err((StatusCode::FORBIDDEN, "Share link payload mismatch"));
+    }
+    if let Some(created_by) = link["created_by"].as_str()
+        && !created_by.is_empty()
+        && !created_by.eq_ignore_ascii_case("admin")
+        && !created_by.starts_with("token:")
+        && let Ok(Some(db_u)) = state.db.get_user(created_by)
+        && !db_u.role.eq_ignore_ascii_case("admin")
+    {
+        let raw_cams = db_u.allowed_cameras.trim();
+        if !raw_cams.is_empty() && raw_cams != "*" {
+            let allowed: Vec<&str> = raw_cams
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let cam_ok = link["camera"]
+                .as_str()
+                .is_some_and(|c| allowed.contains(&c));
+            if !cam_ok {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Share link creator camera access revoked",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn share_player_page(
     State(state): State<AppState>,
     AxumPath(token): AxumPath<String>,
 ) -> Response {
-    let payload = match verify_share_token(&state.jwt_secret, &token, unix_now()) {
+    let now_ts = unix_now();
+    let payload = match verify_share_token(&state.jwt_secret, &token, now_ts) {
         Ok(p) => p,
         Err(status) => {
             return (
@@ -8046,14 +8173,8 @@ async fn share_player_page(
                 .into_response();
         }
     };
-    if let Some(ref jti) = payload.jti
-        && state.db.is_share_link_revoked(jti).unwrap_or(false)
-    {
-        return (
-            StatusCode::GONE,
-            Json(json!({ "error": "Share link has been revoked" })),
-        )
-            .into_response();
+    if let Err((status, msg)) = verify_share_jti(&state, &payload, now_ts) {
+        return (status, Json(json!({ "error": msg }))).into_response();
     }
     if payload.k != "export"
         && let (Ok(Some(rev)), Ok(Some(ev))) = (
@@ -8298,7 +8419,8 @@ async fn share_video_mp4(
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
 ) -> Response {
-    let payload = match verify_share_token(&state.jwt_secret, &token, unix_now()) {
+    let now_ts = unix_now();
+    let payload = match verify_share_token(&state.jwt_secret, &token, now_ts) {
         Ok(p) => p,
         Err(status) => {
             return (
@@ -8308,14 +8430,8 @@ async fn share_video_mp4(
                 .into_response();
         }
     };
-    if let Some(ref jti) = payload.jti
-        && state.db.is_share_link_revoked(jti).unwrap_or(false)
-    {
-        return (
-            StatusCode::GONE,
-            Json(json!({ "error": "Share link has been revoked" })),
-        )
-            .into_response();
+    if let Err((status, msg)) = verify_share_jti(&state, &payload, now_ts) {
+        return (status, Json(json!({ "error": msg }))).into_response();
     }
 
     let safe_id: String = payload
@@ -8343,7 +8459,7 @@ async fn share_video_mp4(
                 }
             }
         }
-        if !payload.id.is_empty() && payload.id == safe_id && !payload.id.contains("..") {
+        if !is_disallowed_export_fallback_id(&payload.id) && payload.id == safe_id {
             if let Some(ref token_cam) = payload.cam
                 && let Some(cam_prefix) =
                     payload.id.rsplitn(3, '_').nth(2).filter(|s| !s.is_empty())
@@ -8363,7 +8479,7 @@ async fn share_video_mp4(
                 return resp;
             }
         }
-    } else {
+    } else if payload.k == "review" || payload.k == "event" {
         if let (Ok(Some(rev)), Ok(Some(ev))) = (
             state.db.get_review_by_id(&payload.id),
             state.db.get_event(&payload.id),
@@ -8378,21 +8494,27 @@ async fn share_video_mp4(
         let mut resolved_target: Option<(String, f64, f64)> = None;
         if payload.k == "review" {
             if let Ok(Some(rev)) = state.db.get_review_by_id(&payload.id) {
-                if let Some(ref token_cam) = payload.cam
-                    && token_cam != &rev.camera
-                {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({ "error": "Share link camera mismatch" })),
-                    )
-                        .into_response();
+                if !rev.camera.trim().is_empty() {
+                    if let Some(ref token_cam) = payload.cam
+                        && token_cam != &rev.camera
+                    {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "error": "Share link camera mismatch" })),
+                        )
+                            .into_response();
+                    }
+                    let end = rev.end_time.unwrap_or(rev.start_time + 15.0);
+                    resolved_target = Some((rev.camera, rev.start_time, end));
                 }
-                let end = rev.end_time.unwrap_or(rev.start_time + 15.0);
-                resolved_target = Some((rev.camera, rev.start_time, end));
-            } else if let Ok(Some(ev)) = state.db.get_event(&payload.id) {
-                let cam = ev["camera"].as_str().unwrap_or("sala").to_string();
+            } else if let Ok(Some(ev)) = state.db.get_event(&payload.id)
+                && let Some(cam) = ev["camera"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            {
                 if let Some(ref token_cam) = payload.cam
-                    && token_cam != &cam
+                    && token_cam != cam
                 {
                     return (
                         StatusCode::FORBIDDEN,
@@ -8402,23 +8524,30 @@ async fn share_video_mp4(
                 }
                 let start = ev["start_time"].as_f64().unwrap_or(0.0);
                 let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
-                resolved_target = Some((cam, start, end));
+                resolved_target = Some((cam.to_string(), start, end));
             }
         } else if let Ok(Some(ev)) = state.db.get_event(&payload.id) {
-            let cam = ev["camera"].as_str().unwrap_or("sala").to_string();
-            if let Some(ref token_cam) = payload.cam
-                && token_cam != &cam
+            if let Some(cam) = ev["camera"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
             {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "Share link camera mismatch" })),
-                )
-                    .into_response();
+                if let Some(ref token_cam) = payload.cam
+                    && token_cam != cam
+                {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": "Share link camera mismatch" })),
+                    )
+                        .into_response();
+                }
+                let start = ev["start_time"].as_f64().unwrap_or(0.0);
+                let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
+                resolved_target = Some((cam.to_string(), start, end));
             }
-            let start = ev["start_time"].as_f64().unwrap_or(0.0);
-            let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
-            resolved_target = Some((cam, start, end));
-        } else if let Ok(Some(rev)) = state.db.get_review_by_id(&payload.id) {
+        } else if let Ok(Some(rev)) = state.db.get_review_by_id(&payload.id)
+            && !rev.camera.trim().is_empty()
+        {
             if let Some(ref token_cam) = payload.cam
                 && token_cam != &rev.camera
             {
@@ -8720,6 +8849,7 @@ async fn api_export_delete(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    let _ = state.db.revoke_share_links_for_target(Some("export"), &id);
     if let Ok(Some((vpath, tpath))) = state.db.delete_export(&id) {
         let _ = tokio::fs::remove_file(resolve_recording_disk_path(&state.media_dir, &vpath)).await;
         let _ = tokio::fs::remove_file(resolve_recording_disk_path(&state.media_dir, &tpath)).await;
@@ -8759,6 +8889,7 @@ async fn api_exports_bulk_delete(
         }
     }
     for id in body.ids {
+        let _ = state.db.revoke_share_links_for_target(Some("export"), &id);
         if let Ok(Some((vpath, tpath))) = state.db.delete_export(&id) {
             let _ =
                 tokio::fs::remove_file(resolve_recording_disk_path(&state.media_dir, &vpath)).await;
@@ -17330,6 +17461,814 @@ cameras:
             Some(Vec::new()),
             "deleted local user must fail closed even when SQLite user table is empty"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn security_share_link_phase1_jti_allowlist_kind_validation_and_lifecycle_revocation_work()
+     {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ninjanvr_sec_share_phase1_{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let cfg_path = tmp_dir.join("config.yml");
+        let web_dir = tmp_dir.join("web-v2");
+        let media_dir = tmp_dir.join("media");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
+
+        let yaml = format!(
+            r#"
+version: 0.18-0
+database:
+  path: {}
+auth:
+  enabled: true
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/front_door
+          roles: [record, detect]
+  backyard:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/backyard
+          roles: [record, detect]
+  sala:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/sala
+          roles: [record, detect]
+"#,
+            db_path.display()
+        );
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+            .await
+            .unwrap();
+        let auth_app = build_router_with_auth(state.clone(), true);
+
+        let now = unix_now();
+        let make_jwt = |sub: &str, role: &str, allowed_cameras: Option<&str>| -> String {
+            let claims = JwtClaims {
+                sub: sub.to_string(),
+                role: role.to_string(),
+                allowed_cameras: allowed_cameras.map(|s| s.to_string()),
+                iat: now,
+                exp: now + 3600,
+            };
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            )
+            .unwrap()
+        };
+
+        state
+            .db
+            .create_user_with_cameras(
+                "op_lifecycle",
+                "pass1234",
+                "operator",
+                "front_door,backyard",
+                1000,
+            )
+            .unwrap();
+        state
+            .db
+            .create_user_with_cameras("op_to_delete", "pass1234", "operator", "front_door", 1000)
+            .unwrap();
+
+        let admin_hdr = format!("Bearer {}", make_jwt("admin", "admin", Some("*")));
+        let op_lifecycle_hdr = format!(
+            "Bearer {}",
+            make_jwt("op_lifecycle", "operator", Some("front_door,backyard"))
+        );
+        let op_del_hdr = format!(
+            "Bearer {}",
+            make_jwt("op_to_delete", "operator", Some("front_door"))
+        );
+
+        let exports_dir = media_dir.join("exports");
+        let rec_fd_dir = media_dir.join("recordings/2026-11-03/12/front_door");
+        let rec_sala_dir = media_dir.join("recordings/2026-11-03/12/sala");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        std::fs::create_dir_all(&rec_fd_dir).unwrap();
+        std::fs::create_dir_all(&rec_sala_dir).unwrap();
+
+        let mp4_payload: Vec<u8> = (0u8..64u8).collect();
+        std::fs::write(exports_dir.join("exp_fd_1.mp4"), &mp4_payload).unwrap();
+        std::fs::write(exports_dir.join("exp_fd_2.mp4"), &mp4_payload).unwrap();
+        std::fs::write(exports_dir.join("share_redacted_ev_secret.mp4"), b"SECRET").unwrap();
+        std::fs::write(exports_dir.join("share_clip_ev_secret.mp4"), b"SECRET").unwrap();
+        std::fs::write(exports_dir.join(".hidden_export.mp4"), b"SECRET").unwrap();
+        std::fs::write(rec_fd_dir.join("00.00.mp4"), &mp4_payload).unwrap();
+        std::fs::write(rec_sala_dir.join("00.00.mp4"), b"SALA_FALLBACK_LEAK").unwrap();
+
+        for exp_id in ["exp_fd_1", "exp_fd_2", "exp_fd_keep"] {
+            std::fs::write(exports_dir.join(format!("{exp_id}.mp4")), &mp4_payload).unwrap();
+            state
+                .db
+                .insert_export(&ExportRow {
+                    id: exp_id.to_string(),
+                    camera: "front_door".to_string(),
+                    name: format!("Export {exp_id}"),
+                    date: 1700000100.0,
+                    video_path: format!("/media/ninjanvr/exports/{exp_id}.mp4"),
+                    thumb_path: format!("/media/ninjanvr/clips/{exp_id}.webp"),
+                    in_progress: false,
+                })
+                .unwrap();
+        }
+
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "rec_fd_1".to_string(),
+                camera: "front_door".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-03/12/front_door/00.00.mp4".to_string(),
+                start_time: 1000.0,
+                end_time: 1010.0,
+                duration: 10.0,
+                motion: 5,
+                objects: 1,
+                dbfs: -20,
+                segment_size: 0.1,
+                regions: 1,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "rec_sala_1".to_string(),
+                camera: "sala".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-03/12/sala/00.00.mp4".to_string(),
+                start_time: 1000.0,
+                end_time: 1010.0,
+                duration: 10.0,
+                motion: 5,
+                objects: 1,
+                dbfs: -20,
+                segment_size: 0.1,
+                regions: 1,
+                motion_heatmap: None,
+            })
+            .unwrap();
+
+        for ev_id in ["ev_p1_1", "ev_p1_2"] {
+            state
+                .db
+                .upsert_event(&ninjanvr_db::EventDto {
+                    id: ev_id.to_string(),
+                    camera: "front_door".to_string(),
+                    label: "person".to_string(),
+                    zones: json!([]),
+                    start_time: 1000.0,
+                    end_time: Some(1008.0),
+                    has_clip: true,
+                    has_snapshot: true,
+                    plus_id: None,
+                    retain_indefinitely: false,
+                    sub_label: None,
+                    top_score: Some(0.9),
+                    false_positive: Some(false),
+                    box_coords: None,
+                    data: json!({}),
+                    thumbnail: None,
+                    area: None,
+                    ratio: None,
+                    score: Some(0.9),
+                    stationary: false,
+                })
+                .unwrap();
+        }
+
+        // Event with empty camera must NOT fall back to "sala"
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_empty_cam".to_string(),
+                camera: String::new(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: 1000.0,
+                end_time: Some(1008.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.9),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({}),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.9),
+                stationary: false,
+            })
+            .unwrap();
+
+        for rev_id in ["rev_p1_1", "rev_p1_2"] {
+            state
+                .db
+                .insert_review_segment(&ninjanvr_db::ReviewItemDto {
+                    id: rev_id.to_string(),
+                    camera: "front_door".to_string(),
+                    start_time: 1000.0,
+                    end_time: Some(1008.0),
+                    severity: "alert".to_string(),
+                    thumb_path: format!(
+                        "/media/ninjanvr/clips/review/thumb-front_door-{rev_id}.webp"
+                    ),
+                    data: json!({}),
+                    has_been_reviewed: false,
+                })
+                .unwrap();
+        }
+
+        // =========================================================================
+        // 1. High-entropy 128-bit JTI & Fail-Closed Allowlist Verification (Finding 3)
+        // =========================================================================
+        let resp_create = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &op_lifecycle_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_fd_keep","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_create.status(), StatusCode::OK);
+        let create_json: Value =
+            serde_json::from_slice(&to_bytes(resp_create.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let jti = create_json["id"].as_str().unwrap().to_string();
+        let token = create_json["token"].as_str().unwrap().to_string();
+        let parts: Vec<&str> = jti.split('_').collect();
+        assert_eq!(parts.len(), 3, "JTI must have shr_<ts>_<32hex> format");
+        assert_eq!(parts[0], "shr");
+        assert_eq!(
+            parts[2].len(),
+            32,
+            "JTI random suffix must be 32 hex chars (128 bits)"
+        );
+        assert!(
+            parts[2]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+
+        // Unregistered JTI (not present in share_link table) -> 410 GONE
+        let unregistered_jti_tok = sign_share_token(
+            &state.jwt_secret,
+            &ShareTokenPayload {
+                k: "export".to_string(),
+                id: "exp_fd_keep".to_string(),
+                exp: now + 3600,
+                cam: Some("front_door".to_string()),
+                jti: Some("shr_1700000000_0123456789abcdef0123456789abcdef".to_string()),
+            },
+        );
+        for uri in [
+            format!("/share/{unregistered_jti_tok}"),
+            format!("/share/{unregistered_jti_tok}/video.mp4"),
+        ] {
+            let r = auth_app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::GONE,
+                "unregistered JTI must return 410 GONE on {uri}"
+            );
+        }
+
+        // Expired DB row (`expires_at <= now_ts`) even if signed payload.exp is in the future -> 410 GONE
+        state
+            .db
+            .insert_share_link(
+                "shr_db_expired_0001",
+                "export",
+                "exp_fd_keep",
+                Some("front_door"),
+                "admin",
+                (now - 7200) as f64,
+                (now - 10) as f64,
+            )
+            .unwrap();
+        let db_expired_tok = sign_share_token(
+            &state.jwt_secret,
+            &ShareTokenPayload {
+                k: "export".to_string(),
+                id: "exp_fd_keep".to_string(),
+                exp: now + 3600,
+                cam: Some("front_door".to_string()),
+                jti: Some("shr_db_expired_0001".to_string()),
+            },
+        );
+        for uri in [
+            format!("/share/{db_expired_tok}"),
+            format!("/share/{db_expired_tok}/video.mp4"),
+        ] {
+            let r = auth_app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::GONE,
+                "DB-expired JTI must return 410 GONE on {uri}"
+            );
+        }
+
+        // Payload mismatch against DB record (kind, target_id, or camera) -> 403 FORBIDDEN
+        for mismatched_payload in [
+            ShareTokenPayload {
+                k: "event".to_string(),
+                id: "exp_fd_keep".to_string(),
+                exp: now + 3600,
+                cam: Some("front_door".to_string()),
+                jti: Some(jti.clone()),
+            },
+            ShareTokenPayload {
+                k: "export".to_string(),
+                id: "exp_fd_1".to_string(),
+                exp: now + 3600,
+                cam: Some("front_door".to_string()),
+                jti: Some(jti.clone()),
+            },
+            ShareTokenPayload {
+                k: "export".to_string(),
+                id: "exp_fd_keep".to_string(),
+                exp: now + 3600,
+                cam: Some("backyard".to_string()),
+                jti: Some(jti.clone()),
+            },
+        ] {
+            let bad_tok = sign_share_token(&state.jwt_secret, &mismatched_payload);
+            for uri in [
+                format!("/share/{bad_tok}"),
+                format!("/share/{bad_tok}/video.mp4"),
+            ] {
+                let r = auth_app
+                    .clone()
+                    .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    r.status(),
+                    StatusCode::FORBIDDEN,
+                    "DB/payload mismatch must return 403 FORBIDDEN on {uri}"
+                );
+            }
+        }
+
+        // =========================================================================
+        // 2. Strict Kind Validation, No 'sala' Fallback, Block Internal Export Prefixes (Finding 7)
+        // =========================================================================
+        for invalid_kind in ["recording", "clip", "unknown", ""] {
+            let invalid_kind_tok = sign_share_token(
+                &state.jwt_secret,
+                &ShareTokenPayload {
+                    k: invalid_kind.to_string(),
+                    id: "exp_fd_keep".to_string(),
+                    exp: now + 3600,
+                    cam: Some("front_door".to_string()),
+                    jti: None,
+                },
+            );
+            assert_eq!(
+                verify_share_token(&state.jwt_secret, &invalid_kind_tok, now).unwrap_err(),
+                StatusCode::FORBIDDEN
+            );
+            for uri in [
+                format!("/share/{invalid_kind_tok}"),
+                format!("/share/{invalid_kind_tok}/video.mp4"),
+            ] {
+                let r = auth_app
+                    .clone()
+                    .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::FORBIDDEN);
+            }
+        }
+
+        // Event with empty camera does NOT fall back to "sala"
+        let (_, _, _, empty_cam_exists) =
+            resolve_share_target_metadata(&state, "event", "ev_empty_cam");
+        assert!(!empty_cam_exists);
+        for kind in ["event", "review"] {
+            let empty_cam_tok = sign_share_token(
+                &state.jwt_secret,
+                &ShareTokenPayload {
+                    k: kind.to_string(),
+                    id: "ev_empty_cam".to_string(),
+                    exp: now + 3600,
+                    cam: None,
+                    jti: None,
+                },
+            );
+            for uri in [
+                format!("/share/{empty_cam_tok}"),
+                format!("/share/{empty_cam_tok}/video.mp4"),
+            ] {
+                let r = auth_app
+                    .clone()
+                    .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    r.status(),
+                    StatusCode::NOT_FOUND,
+                    "empty-camera event must fail closed with 404 on {uri}"
+                );
+            }
+        }
+
+        // Internal prefixes ("share_redacted_", "share_clip_", ".") blocked in export disk-fallback
+        for blocked_id in [
+            "share_redacted_ev_secret",
+            "share_clip_ev_secret",
+            ".hidden_export",
+        ] {
+            let (_, _, _, exists) = resolve_share_target_metadata(&state, "export", blocked_id);
+            assert!(
+                !exists,
+                "internal/hidden export disk artifact {blocked_id} must be rejected"
+            );
+            let blocked_tok = sign_share_token(
+                &state.jwt_secret,
+                &ShareTokenPayload {
+                    k: "export".to_string(),
+                    id: blocked_id.to_string(),
+                    exp: now + 3600,
+                    cam: None,
+                    jti: None,
+                },
+            );
+            for uri in [
+                format!("/share/{blocked_tok}"),
+                format!("/share/{blocked_tok}/video.mp4"),
+            ] {
+                let r = auth_app
+                    .clone()
+                    .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    r.status(),
+                    StatusCode::NOT_FOUND,
+                    "internal export fallback {blocked_id} must return 404 on {uri}"
+                );
+            }
+        }
+
+        // =========================================================================
+        // 3. Creator Permission Coupling & Target/User Deletion Revocation (Finding 8)
+        // =========================================================================
+        // Initially `token` created by `op_lifecycle` (allowed: front_door,backyard) works (200 OK)
+        for uri in [
+            format!("/share/{token}"),
+            format!("/share/{token}/video.mp4"),
+        ] {
+            let r = auth_app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+
+        // Restrict `op_lifecycle` to only `backyard` -> `token` for `front_door` must return 403 FORBIDDEN
+        state
+            .db
+            .update_user_allowed_cameras("op_lifecycle", "backyard")
+            .unwrap();
+        for uri in [
+            format!("/share/{token}"),
+            format!("/share/{token}/video.mp4"),
+        ] {
+            let r = auth_app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::FORBIDDEN,
+                "revoking creator camera permission must return 403 on {uri}"
+            );
+        }
+        // Restore `op_lifecycle` camera permission -> 200 OK again
+        state
+            .db
+            .update_user_allowed_cameras("op_lifecycle", "front_door,backyard")
+            .unwrap();
+
+        // Helper to create a share link as a specific user
+        let create_share = |hdr: String, kind: &str, target_id: &str| {
+            let app = auth_app.clone();
+            let body_str = json!({
+                "kind": kind,
+                "target_id": target_id,
+                "expires_in_sec": 3600
+            })
+            .to_string();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/share")
+                            .header(header::AUTHORIZATION, hdr)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body_str))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let j: Value =
+                    serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap())
+                        .unwrap();
+                (
+                    j["id"].as_str().unwrap().to_string(),
+                    j["token"].as_str().unwrap().to_string(),
+                )
+            }
+        };
+
+        // Single export delete revokes its share link
+        let (jti_exp1, tok_exp1) = create_share(admin_hdr.clone(), "export", "exp_fd_1").await;
+        let del_exp1 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/export/exp_fd_1")
+                    .header(header::AUTHORIZATION, &admin_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_exp1.status(), StatusCode::OK);
+        assert!(state.db.is_share_link_revoked(&jti_exp1).unwrap());
+        let r_exp1 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_exp1}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_exp1.status(), StatusCode::GONE);
+
+        // Bulk export delete revokes its share link
+        let (jti_exp2, tok_exp2) = create_share(admin_hdr.clone(), "export", "exp_fd_2").await;
+        let del_exp2 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/exports/delete")
+                    .header(header::AUTHORIZATION, &admin_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ids":["exp_fd_2"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_exp2.status(), StatusCode::OK);
+        assert!(state.db.is_share_link_revoked(&jti_exp2).unwrap());
+        let r_exp2 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_exp2}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_exp2.status(), StatusCode::GONE);
+
+        // Single event delete & bulk event delete revoke share links
+        let (jti_ev1, tok_ev1) = create_share(admin_hdr.clone(), "event", "ev_p1_1").await;
+        let (jti_ev2, tok_ev2) = create_share(admin_hdr.clone(), "event", "ev_p1_2").await;
+        let del_ev1 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/events/ev_p1_1")
+                    .header(header::AUTHORIZATION, &admin_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_ev1.status(), StatusCode::OK);
+        assert!(state.db.is_share_link_revoked(&jti_ev1).unwrap());
+        assert_eq!(
+            auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{tok_ev1}"))
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::GONE
+        );
+
+        let del_ev2 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/events")
+                    .header(header::AUTHORIZATION, &admin_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"event_ids":["ev_p1_2"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_ev2.status(), StatusCode::OK);
+        assert!(state.db.is_share_link_revoked(&jti_ev2).unwrap());
+        assert_eq!(
+            auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{tok_ev2}/video.mp4"))
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::GONE
+        );
+
+        // Single review delete & bulk review delete revoke share links
+        let (jti_rev1, tok_rev1) = create_share(admin_hdr.clone(), "review", "rev_p1_1").await;
+        let (jti_rev2, tok_rev2) = create_share(admin_hdr.clone(), "review", "rev_p1_2").await;
+        let del_rev1 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/review/rev_p1_1")
+                    .header(header::AUTHORIZATION, &admin_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_rev1.status(), StatusCode::OK);
+        assert!(state.db.is_share_link_revoked(&jti_rev1).unwrap());
+        assert_eq!(
+            auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{tok_rev1}"))
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::GONE
+        );
+
+        let del_rev2 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/reviews/delete")
+                    .header(header::AUTHORIZATION, &admin_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ids":["rev_p1_2"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_rev2.status(), StatusCode::OK);
+        assert!(state.db.is_share_link_revoked(&jti_rev2).unwrap());
+        assert_eq!(
+            auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{tok_rev2}/video.mp4"))
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::GONE
+        );
+
+        // User deletion via DELETE /api/users/{username} revokes all share links created by that user
+        let (jti_user_del, tok_user_del) =
+            create_share(op_del_hdr.clone(), "export", "exp_fd_keep").await;
+        assert!(!state.db.is_share_link_revoked(&jti_user_del).unwrap());
+        let resp_del_user = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/users/op_to_delete")
+                    .header(header::AUTHORIZATION, &admin_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_del_user.status(), StatusCode::OK);
+        assert!(state.db.is_share_link_revoked(&jti_user_del).unwrap());
+        for uri in [
+            format!("/share/{tok_user_del}"),
+            format!("/share/{tok_user_del}/video.mp4"),
+        ] {
+            let r = auth_app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::GONE);
+        }
+
+        // Finally, if the `share_link` table is unavailable/dropped, `POST /api/share`, `/share/{token}`,
+        // and `/share/{token}/video.mp4` all fail closed with 500 INTERNAL_SERVER_ERROR
+        state.db.execute_batch("DROP TABLE share_link;").unwrap();
+        let resp_create_db_err = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_fd_keep","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_create_db_err.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        for uri in [
+            format!("/share/{token}"),
+            format!("/share/{token}/video.mp4"),
+        ] {
+            let r = auth_app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DB error during JTI lookup must fail closed with 500 on {uri}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

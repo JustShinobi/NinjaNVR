@@ -445,6 +445,13 @@ impl NinjaDatabase {
         &self.path
     }
 
+    #[doc(hidden)]
+    pub fn execute_batch(&self, sql: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute_batch(sql)?;
+        Ok(())
+    }
+
     pub fn init_schema(&self) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute_batch(
@@ -3662,6 +3669,34 @@ impl NinjaDatabase {
         Ok(updated > 0)
     }
 
+    pub fn revoke_share_links_for_target(
+        &self,
+        kind: Option<&str>,
+        target_id: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = match kind {
+            Some(k) => conn.execute(
+                "UPDATE share_link SET revoked = 1 WHERE kind = ?1 AND target_id = ?2",
+                params![k, target_id],
+            )?,
+            None => conn.execute(
+                "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
+                params![target_id],
+            )?,
+        };
+        Ok(updated)
+    }
+
+    pub fn revoke_share_links_by_creator(&self, created_by: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            "UPDATE share_link SET revoked = 1 WHERE created_by = ?1",
+            params![created_by.trim()],
+        )?;
+        Ok(updated)
+    }
+
     pub fn is_share_link_revoked(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let revoked: Option<i64> = conn
@@ -6384,6 +6419,59 @@ mod tests {
             db.get_share_link("sl_1").unwrap().unwrap()["revoked"],
             false
         );
+
+        // 6. Bulk revocation by target (with Some(kind) and None) and by creator
+        db.insert_share_link(
+            "sl_3",
+            "review",
+            "exp_share_1",
+            Some("front_door"),
+            "operator2",
+            1900.0,
+            3600.0,
+        )
+        .unwrap();
+        assert_eq!(
+            db.revoke_share_links_for_target(Some("event"), "exp_share_1")
+                .unwrap(),
+            0
+        );
+        assert!(!db.is_share_link_revoked("sl_1").unwrap());
+        assert!(!db.is_share_link_revoked("sl_3").unwrap());
+
+        assert_eq!(
+            db.revoke_share_links_for_target(Some("export"), "exp_share_1")
+                .unwrap(),
+            1
+        );
+        assert!(db.is_share_link_revoked("sl_1").unwrap());
+        assert!(!db.is_share_link_revoked("sl_3").unwrap());
+
+        // Reset sl_1 and test kind = None revoking across all kinds for target_id
+        db.insert_share_link(
+            "sl_1",
+            "export",
+            "exp_share_1",
+            Some("front_door"),
+            "admin",
+            1950.0,
+            3600.0,
+        )
+        .unwrap();
+        assert_eq!(
+            db.revoke_share_links_for_target(None, "exp_share_1")
+                .unwrap(),
+            2
+        );
+        assert!(db.is_share_link_revoked("sl_1").unwrap());
+        assert!(db.is_share_link_revoked("sl_3").unwrap());
+        assert!(!db.is_share_link_revoked("sl_2").unwrap());
+
+        // Revoke by creator
+        assert_eq!(db.revoke_share_links_by_creator("unknown_op").unwrap(), 0);
+        assert!(!db.is_share_link_revoked("sl_2").unwrap());
+        assert_eq!(db.revoke_share_links_by_creator("operator1").unwrap(), 1);
+        assert!(db.is_share_link_revoked("sl_2").unwrap());
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);
