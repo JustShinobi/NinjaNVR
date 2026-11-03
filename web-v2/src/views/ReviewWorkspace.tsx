@@ -4,6 +4,7 @@ import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
 import { ExportItem, RecordingDaySummary, RecordingSegment, ReviewItem } from "../types/nvr";
 import { WorkspaceTab, findMatchingExport, formatDateTime, formatRelTime } from "../utils/format";
+import { buildSharePublicUrl } from "../utils/shareLinks";
 import { VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
@@ -95,12 +96,29 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     const firstSub = activeReview?.data?.sub_labels?.[0] || "";
     setReviewFaceDraft(firstSub && firstSub !== "unknown" ? firstSub : "");
     setReviewPlateDraft(activeReview?.data?.recognized_license_plates?.[0] || "");
+    if (shareCopiedTimerRef.current !== null) {
+      window.clearTimeout(shareCopiedTimerRef.current);
+      shareCopiedTimerRef.current = null;
+    }
+    setShareError(null);
+    setShareFallbackUrl(null);
+    setShareCopied(false);
+    setShareCreating(false);
   }, [
     activeReview?.id,
     activeReview?.data?.notes,
     activeReview?.data?.sub_labels,
     activeReview?.data?.recognized_license_plates,
   ]);
+
+  React.useEffect(() => {
+    return () => {
+      if (shareCopiedTimerRef.current !== null) {
+        window.clearTimeout(shareCopiedTimerRef.current);
+        shareCopiedTimerRef.current = null;
+      }
+    };
+  }, []);
 
   React.useEffect(() => {
     if (!lastDeletedFaceProfile?.name || !activeReview) return;
@@ -199,6 +217,10 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   };
   const [shareTtlSec, setShareTtlSec] = React.useState<number>(86400);
   const [shareCopied, setShareCopied] = React.useState(false);
+  const [shareError, setShareError] = React.useState<string | null>(null);
+  const [shareFallbackUrl, setShareFallbackUrl] = React.useState<string | null>(null);
+  const [shareCreating, setShareCreating] = React.useState(false);
+  const shareCopiedTimerRef = React.useRef<number | null>(null);
   const [briefingActive, setBriefingActive] = React.useState(false);
   const [briefingSpeed, setBriefingSpeed] = React.useState<1 | 2 | 4>(2);
   const [briefingAutoMark, setBriefingAutoMark] = React.useState(true);
@@ -866,28 +888,80 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     <option value={604800}>TTL: 7d</option>
                   </select>
                   <button
-                    className="nvr-btn mono"
+                    className={`nvr-btn mono ${shareError ? "danger" : shareCopied ? "success" : ""}`}
+                    disabled={shareCreating}
                     onClick={async () => {
-                      const res = await fetch("/api/share", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        credentials: "include",
-                        body: JSON.stringify({
-                          kind: "review",
-                          target_id: activeReview.id,
-                          expires_in_sec: shareTtlSec,
-                        }),
-                      });
-                      const data = await res.json().catch(() => ({}));
-                      if (data.url) {
-                        navigator.clipboard?.writeText(`${window.location.origin}${data.url}`);
-                        setShareCopied(true);
-                        window.setTimeout(() => setShareCopied(false), 2000);
+                      if (shareCreating) return;
+                      if (shareCopiedTimerRef.current !== null) {
+                        window.clearTimeout(shareCopiedTimerRef.current);
+                        shareCopiedTimerRef.current = null;
+                      }
+                      setShareError(null);
+                      setShareFallbackUrl(null);
+                      setShareCopied(false);
+                      setShareCreating(true);
+                      try {
+                        const res = await fetch("/api/share", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          credentials: "include",
+                          body: JSON.stringify({
+                            kind: "review",
+                            target_id: activeReview.id,
+                            expires_in_sec: shareTtlSec,
+                          }),
+                        });
+                        const data = await res.json().catch(() => ({}));
+                        if (!res.ok || !(data?.url || data?.token)) {
+                          const errMsg =
+                            (typeof data?.message === "string" && data.message) ||
+                            (typeof data?.error === "string" && data.error) ||
+                            `${t.review.shareError} (${res.status})`;
+                          setShareError(errMsg);
+                          setShareCopied(false);
+                          return;
+                        }
+                        const fullUrl = buildSharePublicUrl(
+                          window.location.origin,
+                          data.url || data.token
+                        );
+                        setShareFallbackUrl(fullUrl);
+                        let copiedOk = false;
+                        if (
+                          typeof navigator !== "undefined" &&
+                          navigator.clipboard &&
+                          typeof navigator.clipboard.writeText === "function"
+                        ) {
+                          try {
+                            await navigator.clipboard.writeText(fullUrl);
+                            copiedOk = true;
+                          } catch {
+                            copiedOk = false;
+                          }
+                        }
+                        if (copiedOk) {
+                          setShareCopied(true);
+                          shareCopiedTimerRef.current = window.setTimeout(() => {
+                            setShareCopied(false);
+                            shareCopiedTimerRef.current = null;
+                          }, 2000);
+                        } else {
+                          setShareCopied(false);
+                        }
+                      } catch {
+                        setShareError(t.review.shareError);
+                        setShareCopied(false);
+                      } finally {
+                        setShareCreating(false);
                       }
                     }}
                     title="Copy HMAC-signed shareable link for this review event"
                   >
-                    {shareCopied ? "Copied!" : "Share Link"}
+                    {shareError
+                      ? t.review.shareError
+                      : shareCopied
+                        ? t.review.shareCopiedBtn
+                        : t.review.shareLinkBtn}
                   </button>
                   <button
                     className="nvr-btn primary"
@@ -911,6 +985,59 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   </button>
                 </div>
               </div>
+
+              {(shareError || shareFallbackUrl) && (
+                <div
+                  className="mono"
+                  style={{
+                    background: "var(--bg-subcard)",
+                    borderBottom: "1px solid var(--border-hairline)",
+                    padding: "6px 12px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 8,
+                    fontSize: "var(--text-xs)",
+                  }}
+                >
+                  {shareError ? (
+                    <span className="nvr-badge alert" role="alert">
+                      {shareError}
+                    </span>
+                  ) : (
+                    shareFallbackUrl && (
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          flex: 1,
+                          minWidth: 0,
+                        }}
+                      >
+                        <span style={{ color: "var(--text-secondary)", flexShrink: 0 }}>
+                          {t.review.shareManualCopyHint}
+                        </span>
+                        <input
+                          type="text"
+                          readOnly
+                          className="nvr-input mono"
+                          aria-label="Generated review share link URL"
+                          value={shareFallbackUrl}
+                          onFocus={(e) => e.currentTarget.select()}
+                          onClick={(e) => e.currentTarget.select()}
+                          style={{
+                            flex: 1,
+                            minWidth: 0,
+                            height: 24,
+                            fontSize: "var(--text-xs)",
+                          }}
+                        />
+                      </div>
+                    )
+                  )}
+                </div>
+              )}
 
               {showForensic && (
                 <div

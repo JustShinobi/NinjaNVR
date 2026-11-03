@@ -796,6 +796,22 @@ export interface ExportItem {
   in_progress: boolean;
 }
 
+export interface ShareLinkItem {
+  id: string;
+  kind: "export" | "review" | "event" | string;
+  target_id: string;
+  camera: string | null;
+  created_by: string;
+  created_at: number;
+  expires_at: number;
+  revoked: boolean;
+  access_count?: number;
+  last_accessed_at?: number | null;
+  max_views?: number | null;
+  token?: string | null;
+  url?: string | null;
+}
+
 export interface CameraLiveActivity {
   enabled?: boolean;
   night_mode?: boolean;
