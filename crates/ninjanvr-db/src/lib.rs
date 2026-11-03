@@ -632,7 +632,10 @@ impl NinjaDatabase {
                 "created_by" TEXT NOT NULL,
                 "created_at" REAL NOT NULL,
                 "expires_at" REAL NOT NULL,
-                "revoked" INTEGER NOT NULL DEFAULT 0
+                "revoked" INTEGER NOT NULL DEFAULT 0,
+                "access_count" INTEGER NOT NULL DEFAULT 0,
+                "last_accessed_at" REAL NULL,
+                "max_views" INTEGER NULL
             );
             CREATE INDEX IF NOT EXISTS "idx_share_link_target" ON "share_link" ("kind", "target_id");
             "#,
@@ -654,6 +657,18 @@ impl NinjaDatabase {
             [],
         );
         let _ = conn.execute("ALTER TABLE event ADD COLUMN sub_label_score REAL", []);
+        let _ = conn.execute(
+            "ALTER TABLE share_link ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE share_link ADD COLUMN last_accessed_at REAL NULL",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE share_link ADD COLUMN max_views INTEGER NULL",
+            [],
+        );
         Ok(())
     }
 
@@ -3590,6 +3605,9 @@ impl NinjaDatabase {
             "created_at": r.get::<_, f64>(5).unwrap_or(0.0),
             "expires_at": r.get::<_, f64>(6).unwrap_or(0.0),
             "revoked": r.get::<_, i64>(7).unwrap_or(0) != 0,
+            "access_count": r.get::<_, i64>(8).unwrap_or(0),
+            "last_accessed_at": r.get::<_, Option<f64>>(9).ok().flatten(),
+            "max_views": r.get::<_, Option<i64>>(10).ok().flatten(),
         }))
     }
 
@@ -3604,15 +3622,41 @@ impl NinjaDatabase {
         created_at: f64,
         expires_at: f64,
     ) -> Result<Value> {
+        self.insert_share_link_with_options(
+            id, kind, target_id, camera, created_by, created_at, expires_at, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_share_link_with_options(
+        &self,
+        id: &str,
+        kind: &str,
+        target_id: &str,
+        camera: Option<&str>,
+        created_by: &str,
+        created_at: f64,
+        expires_at: f64,
+        max_views: Option<u64>,
+    ) -> Result<Value> {
+        let max_views_i64 = max_views.map(|v| v.min(i64::MAX as u64) as i64);
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
             r#"
             INSERT OR REPLACE INTO share_link (
-                id, kind, target_id, camera, created_by, created_at, expires_at, revoked
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+                id, kind, target_id, camera, created_by, created_at, expires_at,
+                revoked, access_count, last_accessed_at, max_views
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, NULL, ?8)
             "#,
             params![
-                id, kind, target_id, camera, created_by, created_at, expires_at
+                id,
+                kind,
+                target_id,
+                camera,
+                created_by,
+                created_at,
+                expires_at,
+                max_views_i64
             ],
         )?;
         Ok(json!({
@@ -3623,7 +3667,10 @@ impl NinjaDatabase {
             "created_by": created_by,
             "created_at": created_at,
             "expires_at": expires_at,
-            "revoked": false
+            "revoked": false,
+            "access_count": 0,
+            "last_accessed_at": Value::Null,
+            "max_views": max_views_i64
         }))
     }
 
@@ -3632,7 +3679,8 @@ impl NinjaDatabase {
         let row = conn
             .query_row(
                 r#"
-                SELECT id, kind, target_id, camera, created_by, created_at, expires_at, revoked
+                SELECT id, kind, target_id, camera, created_by, created_at, expires_at,
+                       revoked, access_count, last_accessed_at, max_views
                 FROM share_link
                 WHERE id = ?1
                 "#,
@@ -3647,9 +3695,11 @@ impl NinjaDatabase {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, kind, target_id, camera, created_by, created_at, expires_at, revoked
+            SELECT id, kind, target_id, camera, created_by, created_at, expires_at,
+                   revoked, access_count, last_accessed_at, max_views
             FROM share_link
             ORDER BY created_at DESC
+            LIMIT 500
             "#,
         )?;
         let rows = stmt.query_map([], Self::map_share_link_row)?;
@@ -3658,6 +3708,31 @@ impl NinjaDatabase {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn record_share_link_access(&self, id: &str, accessed_at: f64) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            r#"
+            UPDATE share_link
+            SET access_count = access_count + 1,
+                last_accessed_at = ?2
+            WHERE id = ?1
+              AND revoked = 0
+              AND (max_views IS NULL OR access_count < max_views)
+            "#,
+            params![id, accessed_at],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn prune_expired_share_links(&self, before_ts: f64) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let deleted = conn.execute(
+            "DELETE FROM share_link WHERE expires_at <= ?1",
+            params![before_ts],
+        )?;
+        Ok(deleted)
     }
 
     pub fn revoke_share_link(&self, id: &str) -> Result<bool> {
@@ -6472,6 +6547,93 @@ mod tests {
         assert!(!db.is_share_link_revoked("sl_2").unwrap());
         assert_eq!(db.revoke_share_links_by_creator("operator1").unwrap(), 1);
         assert!(db.is_share_link_revoked("sl_2").unwrap());
+
+        // 7. Access counter, last_accessed_at, max_views, prune_expired_share_links, and LIMIT 500
+        assert!(!db.record_share_link_access("sl_missing", 2100.0).unwrap());
+        assert!(!db.record_share_link_access("sl_2", 2100.0).unwrap()); // sl_2 is revoked
+
+        let s_views = db
+            .insert_share_link_with_options(
+                "sl_views_2",
+                "export",
+                "exp_share_1",
+                Some("front_door"),
+                "admin",
+                2000.0,
+                5000.0,
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(s_views["access_count"], 0);
+        assert!(s_views["last_accessed_at"].is_null());
+        assert_eq!(s_views["max_views"], 2);
+
+        // View 1 succeeds
+        assert!(db.record_share_link_access("sl_views_2", 2100.5).unwrap());
+        let after_v1 = db.get_share_link("sl_views_2").unwrap().unwrap();
+        assert_eq!(after_v1["access_count"], 1);
+        assert_eq!(after_v1["last_accessed_at"], 2100.5);
+        assert_eq!(after_v1["max_views"], 2);
+
+        // View 2 succeeds
+        assert!(db.record_share_link_access("sl_views_2", 2200.25).unwrap());
+        let after_v2 = db.get_share_link("sl_views_2").unwrap().unwrap();
+        assert_eq!(after_v2["access_count"], 2);
+        assert_eq!(after_v2["last_accessed_at"], 2200.25);
+
+        // View 3 fails (max_views = 2 reached) and does not mutate access_count or last_accessed_at
+        assert!(!db.record_share_link_access("sl_views_2", 2300.0).unwrap());
+        let after_v3 = db.get_share_link("sl_views_2").unwrap().unwrap();
+        assert_eq!(after_v3["access_count"], 2);
+        assert_eq!(after_v3["last_accessed_at"], 2200.25);
+
+        // Unlimited link (max_views = None) increments without cap until revoked
+        db.insert_share_link(
+            "sl_unlim",
+            "export",
+            "exp_share_1",
+            Some("front_door"),
+            "admin",
+            2050.0,
+            6000.0,
+        )
+        .unwrap();
+        for i in 1..=5 {
+            assert!(
+                db.record_share_link_access("sl_unlim", 2100.0 + i as f64)
+                    .unwrap()
+            );
+        }
+        let unlim_row = db.get_share_link("sl_unlim").unwrap().unwrap();
+        assert_eq!(unlim_row["access_count"], 5);
+        assert_eq!(unlim_row["last_accessed_at"], 2105.0);
+        assert!(unlim_row["max_views"].is_null());
+
+        // Prune expired share links (expires_at <= 3600.0 removes sl_1, sl_2, sl_3)
+        let pruned = db.prune_expired_share_links(3600.0).unwrap();
+        assert_eq!(pruned, 3);
+        assert!(db.get_share_link("sl_1").unwrap().is_none());
+        assert!(db.get_share_link("sl_2").unwrap().is_none());
+        assert!(db.get_share_link("sl_3").unwrap().is_none());
+        assert!(db.get_share_link("sl_views_2").unwrap().is_some());
+        assert!(db.get_share_link("sl_unlim").unwrap().is_some());
+
+        // Cap list_share_links at 500 rows
+        for idx in 0..510 {
+            db.insert_share_link(
+                &format!("sl_bulk_{idx:04}"),
+                "export",
+                "exp_share_1",
+                Some("front_door"),
+                "admin",
+                3000.0 + idx as f64,
+                9000.0,
+            )
+            .unwrap();
+        }
+        let capped_list = db.list_share_links().unwrap();
+        assert_eq!(capped_list.len(), 500);
+        assert_eq!(capped_list[0]["id"], "sl_bulk_0509");
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);

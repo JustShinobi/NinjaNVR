@@ -285,6 +285,7 @@ pub struct AppState {
     pub storage_error: Arc<std::sync::Mutex<Option<String>>>,
     pub ptz_active_presets: Arc<RwLock<HashMap<String, Option<String>>>>,
     pub share_clip_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    pub share_page_video_credits: Arc<std::sync::Mutex<HashMap<String, usize>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -417,11 +418,24 @@ pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
     let mut bytes = [0u8; 64];
     rand::fill(&mut bytes);
     let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let _ = std::fs::write(&secret_path, &secret);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&secret_path)
+        {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            let _ = file.write_all(secret.as_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(&secret_path, &secret);
     }
     secret
 }
@@ -7800,6 +7814,8 @@ pub struct CreateShareBody {
     pub target_id: String,
     #[serde(default = "default_share_ttl")]
     pub expires_in_sec: u64,
+    #[serde(default)]
+    pub max_views: Option<u64>,
 }
 
 fn default_share_kind() -> String {
@@ -7984,12 +8000,61 @@ async fn api_share_list(
     Json(Value::Array(links))
 }
 
+fn verify_cookie_csrf_origin(headers: &HeaderMap) -> bool {
+    let has_bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| {
+            let trimmed = s.trim_start();
+            trimmed.starts_with("Bearer ") || trimmed.starts_with("bearer ")
+        });
+    if has_bearer {
+        return true;
+    }
+    let Some(origin_val) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin_str) = origin_val.to_str() else {
+        return false;
+    };
+    let origin_trimmed = origin_str.trim();
+    if origin_trimmed.is_empty() || origin_trimmed.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    let Some((_, after_scheme)) = origin_trimmed.split_once("://") else {
+        return false;
+    };
+    let origin_host = after_scheme.split('/').next().unwrap_or("").trim();
+    if origin_host.is_empty() {
+        return false;
+    }
+    let Some(req_host) = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    origin_host.eq_ignore_ascii_case(req_host)
+}
+
 async fn api_share_revoke(
     State(state): State<AppState>,
     jar: CookieJar,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let Some(link) = state.db.get_share_link(&id).ok().flatten() else {
         return (
             StatusCode::NOT_FOUND,
@@ -8013,6 +8078,9 @@ async fn api_share_revoke(
         }
     }
     let _ = state.db.revoke_share_link(&id);
+    if let Ok(mut map) = state.share_page_video_credits.lock() {
+        map.remove(&id);
+    }
     if let Some(target_id) = link["target_id"].as_str() {
         cleanup_share_clip_artifacts(&state.media_dir, target_id);
     }
@@ -8025,6 +8093,16 @@ async fn api_share_create(
     headers: HeaderMap,
     Json(body): Json<CreateShareBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let kind = if body.kind.eq_ignore_ascii_case("review") {
         "review".to_string()
     } else if body.kind.eq_ignore_ascii_case("event") {
@@ -8061,6 +8139,7 @@ async fn api_share_create(
 
     let now = unix_now();
     let exp = now + body.expires_in_sec.clamp(60, 86400 * 30);
+    let clamped_max_views = body.max_views.map(|v| v.max(1));
     let jti = format!("shr_{}_{:032x}", now, rand::random::<u128>());
     let created_by = {
         let cfg = state.config.read().await;
@@ -8074,7 +8153,7 @@ async fn api_share_create(
         .map(|(u, _)| u)
         .unwrap_or_else(|| "admin".to_string())
     };
-    if let Err(err) = state.db.insert_share_link(
+    if let Err(err) = state.db.insert_share_link_with_options(
         &jti,
         &kind,
         &body.target_id,
@@ -8082,6 +8161,7 @@ async fn api_share_create(
         &created_by,
         now as f64,
         exp as f64,
+        clamped_max_views,
     ) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -8101,15 +8181,35 @@ async fn api_share_create(
         jti: Some(jti.clone()),
     };
     let token = sign_share_token(&state.jwt_secret, &payload);
-    Json(json!({
+    let mut resp_json = json!({
         "success": true,
         "id": jti,
         "token": token,
         "url": format!("/share/{token}"),
         "video_url": format!("/share/{token}/video.mp4"),
         "expires_at": exp
-    }))
-    .into_response()
+    });
+    if let Some(mv) = clamped_max_views {
+        resp_json["max_views"] = json!(mv);
+    }
+    Json(resp_json).into_response()
+}
+
+fn is_initial_or_unranged_video_request(headers: &HeaderMap) -> bool {
+    let Some(range_val) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let Some(spec) = range_val.strip_prefix("bytes=") else {
+        return true;
+    };
+    let Some((start_s, _)) = spec.split_once('-') else {
+        return true;
+    };
+    match start_s.trim().parse::<u64>() {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(_) => true,
+    }
 }
 
 fn verify_share_jti(
@@ -8117,8 +8217,18 @@ fn verify_share_jti(
     payload: &ShareTokenPayload,
     now_ts: u64,
 ) -> std::result::Result<(), (StatusCode, &'static str)> {
+    verify_share_jti_with_view_mode(state, payload, now_ts, true, true).map(|_| ())
+}
+
+fn verify_share_jti_with_view_mode(
+    state: &AppState,
+    payload: &ShareTokenPayload,
+    now_ts: u64,
+    is_initial_request: bool,
+    is_player_page: bool,
+) -> std::result::Result<bool, (StatusCode, &'static str)> {
     let Some(ref jti) = payload.jti else {
-        return Ok(());
+        return Ok(false);
     };
     let link = match state.db.get_share_link(jti) {
         Ok(Some(link)) => link,
@@ -8140,6 +8250,29 @@ fn verify_share_jti(
         .is_some_and(|exp| (exp as u64) <= now_ts)
     {
         return Err((StatusCode::GONE, "Share link has expired"));
+    }
+    let access_count = link["access_count"].as_i64().unwrap_or(0);
+    let has_page_credit = !is_player_page
+        && is_initial_request
+        && access_count > 0
+        && state
+            .share_page_video_credits
+            .lock()
+            .ok()
+            .and_then(|map| map.get(jti).copied())
+            .unwrap_or(0)
+            > 0;
+    let count_view = if is_player_page {
+        true
+    } else if has_page_credit {
+        false
+    } else {
+        is_initial_request || access_count == 0
+    };
+    if let Some(max_v) = link["max_views"].as_i64()
+        && ((count_view && access_count >= max_v) || (!count_view && access_count > max_v))
+    {
+        return Err((StatusCode::GONE, "Share link view limit reached"));
     }
     if link["kind"].as_str() != Some(payload.k.as_str())
         || link["target_id"].as_str() != Some(payload.id.as_str())
@@ -8172,7 +8305,66 @@ fn verify_share_jti(
             }
         }
     }
-    Ok(())
+    Ok(count_view)
+}
+
+fn record_share_access_or_gone(
+    state: &AppState,
+    payload: &ShareTokenPayload,
+    count_view: bool,
+    is_initial_video: bool,
+    is_player_page: bool,
+    now_ts: u64,
+    resp: Response,
+) -> Response {
+    let Some(ref jti) = payload.jti else {
+        return resp;
+    };
+    if !is_player_page && is_initial_video {
+        let consumed_credit = state
+            .share_page_video_credits
+            .lock()
+            .ok()
+            .and_then(|mut map| {
+                if let Some(c) = map.get_mut(jti)
+                    && *c > 0
+                {
+                    *c -= 1;
+                    if *c == 0 {
+                        map.remove(jti);
+                    }
+                    Some(true)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(false);
+        if consumed_credit {
+            return resp;
+        }
+    }
+    if count_view || (!is_player_page && is_initial_video) {
+        match state.db.record_share_link_access(jti, now_ts as f64) {
+            Ok(true) => {
+                if is_player_page && let Ok(mut map) = state.share_page_video_credits.lock() {
+                    *map.entry(jti.clone()).or_insert(0) += 1;
+                }
+                resp
+            }
+            Ok(false) => (
+                StatusCode::GONE,
+                Json(json!({ "error": "Share link view limit reached or revoked" })),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to record share link access" })),
+            )
+                .into_response(),
+        }
+    } else {
+        resp
+    }
 }
 
 async fn share_player_page(
@@ -8253,7 +8445,7 @@ async fn share_player_page(
 </body>
 </html>"#
     );
-    (
+    let resp = (
         [
             (
                 header::CONTENT_SECURITY_POLICY,
@@ -8263,10 +8455,23 @@ async fn share_player_page(
             (header::REFERRER_POLICY, "no-referrer"),
             (header::X_FRAME_OPTIONS, "DENY"),
             (header::CACHE_CONTROL, "private, no-store"),
+            (
+                header::HeaderName::from_static("cross-origin-resource-policy"),
+                "same-origin",
+            ),
         ],
         Html(html),
     )
-        .into_response()
+        .into_response();
+    record_share_access_or_gone(
+        &state,
+        &payload,
+        payload.jti.is_some(),
+        false,
+        true,
+        now_ts,
+        resp,
+    )
 }
 
 pub fn serve_mp4_bytes_with_range(bytes: Vec<u8>, headers: &HeaderMap) -> Response {
@@ -8301,6 +8506,10 @@ pub fn serve_mp4_bytes_with_range(bytes: Vec<u8>, headers: &HeaderMap) -> Respon
                     (header::REFERRER_POLICY, "no-referrer".to_string()),
                     (header::X_FRAME_OPTIONS, "DENY".to_string()),
                     (header::CACHE_CONTROL, "private, no-store".to_string()),
+                    (
+                        header::HeaderName::from_static("cross-origin-resource-policy"),
+                        "same-origin".to_string(),
+                    ),
                 ],
                 slice,
             )
@@ -8322,6 +8531,10 @@ pub fn serve_mp4_bytes_with_range(bytes: Vec<u8>, headers: &HeaderMap) -> Respon
             (header::REFERRER_POLICY, "no-referrer".to_string()),
             (header::X_FRAME_OPTIONS, "DENY".to_string()),
             (header::CACHE_CONTROL, "private, no-store".to_string()),
+            (
+                header::HeaderName::from_static("cross-origin-resource-policy"),
+                "same-origin".to_string(),
+            ),
         ],
         bytes,
     )
@@ -8380,6 +8593,10 @@ async fn serve_mp4_file_with_range(disk_path: &Path, headers: &HeaderMap) -> Opt
                         (header::REFERRER_POLICY, "no-referrer".to_string()),
                         (header::X_FRAME_OPTIONS, "DENY".to_string()),
                         (header::CACHE_CONTROL, "private, no-store".to_string()),
+                        (
+                            header::HeaderName::from_static("cross-origin-resource-policy"),
+                            "same-origin".to_string(),
+                        ),
                     ],
                     Body::from_stream(stream),
                 )
@@ -8415,6 +8632,10 @@ async fn serve_mp4_file_with_range(disk_path: &Path, headers: &HeaderMap) -> Opt
                 (header::REFERRER_POLICY, "no-referrer".to_string()),
                 (header::X_FRAME_OPTIONS, "DENY".to_string()),
                 (header::CACHE_CONTROL, "private, no-store".to_string()),
+                (
+                    header::HeaderName::from_static("cross-origin-resource-policy"),
+                    "same-origin".to_string(),
+                ),
             ],
             Body::from_stream(stream),
         )
@@ -8493,9 +8714,14 @@ async fn share_video_mp4(
                 .into_response();
         }
     };
-    if let Err((status, msg)) = verify_share_jti(&state, &payload, now_ts) {
-        return (status, Json(json!({ "error": msg }))).into_response();
-    }
+    let is_initial = is_initial_or_unranged_video_request(&headers);
+    let count_view =
+        match verify_share_jti_with_view_mode(&state, &payload, now_ts, is_initial, false) {
+            Ok(cv) => cv,
+            Err((status, msg)) => {
+                return (status, Json(json!({ "error": msg }))).into_response();
+            }
+        };
 
     let safe_id: String = payload
         .id
@@ -8520,7 +8746,9 @@ async fn share_video_mp4(
                 if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &disk_path)
                     && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
                 {
-                    return resp;
+                    return record_share_access_or_gone(
+                        &state, &payload, count_view, is_initial, false, now_ts, resp,
+                    );
                 }
             }
         }
@@ -8543,7 +8771,9 @@ async fn share_video_mp4(
             if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &file_path)
                 && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
             {
-                return resp;
+                return record_share_access_or_gone(
+                    &state, &payload, count_view, is_initial, false, now_ts, resp,
+                );
             }
         }
     } else if payload.k == "review" || payload.k == "event" {
@@ -8700,7 +8930,9 @@ async fn share_video_mp4(
                     ensure_path_within_media_dir(&state.media_dir, &redacted_path)
                     && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
                 {
-                    return resp;
+                    return record_share_access_or_gone(
+                        &state, &payload, count_view, is_initial, false, now_ts, resp,
+                    );
                 }
                 return StatusCode::NOT_FOUND.into_response();
             }
@@ -8775,14 +9007,18 @@ async fn share_video_mp4(
                 if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &clip_path)
                     && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
                 {
-                    return resp;
+                    return record_share_access_or_gone(
+                        &state, &payload, count_view, is_initial, false, now_ts, resp,
+                    );
                 }
                 return StatusCode::NOT_FOUND.into_response();
             }
 
             for safe_path in recs {
                 if let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await {
-                    return resp;
+                    return record_share_access_or_gone(
+                        &state, &payload, count_view, is_initial, false, now_ts, resp,
+                    );
                 }
             }
         }
@@ -10986,6 +11222,7 @@ pub async fn new_app_state(
         storage_error,
         ptz_active_presets,
         share_clip_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        share_page_video_credits: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
     // Seed 30 initial stats_history points so all 30 bars in /system#general and /system#cameras render with zero 0-padding
@@ -19049,6 +19286,466 @@ cameras:
             .unwrap();
         assert_eq!(resp_del_rev.status(), StatusCode::OK);
         assert!(!r_mp4.exists() && !r_hash.exists() && !c_mp4.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn security_share_link_phase3_corp_csrf_max_views_and_audit_tracking_work() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ninjanvr_sec_share_phase3_{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let cfg_path = tmp_dir.join("config.yml");
+        let web_dir = tmp_dir.join("web-v2");
+        let media_dir = tmp_dir.join("media");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
+
+        let yaml = format!(
+            r#"
+version: 0.18-0
+database:
+  path: {}
+auth:
+  enabled: true
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/front_door
+          roles: [record, detect]
+"#,
+            db_path.display()
+        );
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+            .await
+            .unwrap();
+        let auth_app = build_router_with_auth(state.clone(), true);
+
+        // Verify .jwt_secret was atomically created with mode 0o600
+        let jwt_secret_path = tmp_dir.join(".jwt_secret");
+        assert!(jwt_secret_path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&jwt_secret_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let now = unix_now();
+        let admin_jwt = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &JwtClaims {
+                sub: "admin".to_string(),
+                role: "admin".to_string(),
+                allowed_cameras: Some("*".to_string()),
+                iat: now,
+                exp: now + 3600,
+            },
+            &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let admin_bearer = format!("Bearer {admin_jwt}");
+        let admin_cookie = format!("ninjanvr_token={admin_jwt}");
+
+        let exports_dir = media_dir.join("exports");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        let mp4_payload: Vec<u8> = (0u8..64u8).collect();
+        let exp_file = exports_dir.join("exp_p3_1.mp4");
+        std::fs::write(&exp_file, &mp4_payload).unwrap();
+        state
+            .db
+            .insert_export(&ExportRow {
+                id: "exp_p3_1".to_string(),
+                camera: "front_door".to_string(),
+                name: "Phase 3 Export".to_string(),
+                date: 1700000100.0,
+                video_path: "/media/ninjanvr/exports/exp_p3_1.mp4".to_string(),
+                thumb_path: "/media/ninjanvr/clips/exp_p3_1.webp".to_string(),
+                in_progress: false,
+            })
+            .unwrap();
+
+        // =========================================================================
+        // 1. Cross-Origin-Resource-Policy: same-origin on bytes/file range helpers
+        // =========================================================================
+        let empty_hdrs = HeaderMap::new();
+        let mut range_hdrs = HeaderMap::new();
+        range_hdrs.insert(header::RANGE, "bytes=0-15".parse().unwrap());
+
+        let bytes_200 = serve_mp4_bytes_with_range(mp4_payload.clone(), &empty_hdrs);
+        assert_eq!(
+            bytes_200
+                .headers()
+                .get("cross-origin-resource-policy")
+                .unwrap(),
+            "same-origin"
+        );
+        let bytes_206 = serve_mp4_bytes_with_range(mp4_payload.clone(), &range_hdrs);
+        assert_eq!(
+            bytes_206
+                .headers()
+                .get("cross-origin-resource-policy")
+                .unwrap(),
+            "same-origin"
+        );
+
+        let file_200 = serve_mp4_file_with_range(&exp_file, &empty_hdrs)
+            .await
+            .unwrap();
+        assert_eq!(
+            file_200
+                .headers()
+                .get("cross-origin-resource-policy")
+                .unwrap(),
+            "same-origin"
+        );
+        let file_206 = serve_mp4_file_with_range(&exp_file, &range_hdrs)
+            .await
+            .unwrap();
+        assert_eq!(
+            file_206
+                .headers()
+                .get("cross-origin-resource-policy")
+                .unwrap(),
+            "same-origin"
+        );
+
+        // =========================================================================
+        // 2. Cookie CSRF Origin Guard on POST /api/share and DELETE /api/share/{id}
+        // =========================================================================
+        // 2a. Cookie auth + mismatched Origin -> 403 FORBIDDEN on POST /api/share
+        for (origin_val, host_opt) in [
+            ("https://evil.example", Some("nvr.local:5000")),
+            ("http://nvr.local:8971", Some("nvr.local:5000")),
+            ("null", Some("nvr.local:5000")),
+            ("https://nvr.local:5000", None),
+        ] {
+            let mut req_b = Request::builder()
+                .method("POST")
+                .uri("/api/share")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::ORIGIN, origin_val)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(h) = host_opt {
+                req_b = req_b.header(header::HOST, h);
+            }
+            let r = auth_app
+                .clone()
+                .oneshot(
+                    req_b
+                        .body(Body::from(
+                            r#"{"kind":"export","target_id":"exp_p3_1","expires_in_sec":3600}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::FORBIDDEN,
+                "cookie POST /api/share with Origin={origin_val} Host={host_opt:?} must return 403"
+            );
+        }
+
+        // 2b. Cookie auth + matching Origin (scheme-agnostic host:port) -> 200 OK
+        let resp_cookie_ok = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, "https://nvr.local:5000")
+                    .header(header::HOST, "nvr.local:5000")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_p3_1","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cookie_ok.status(), StatusCode::OK);
+        let cookie_share_json: Value =
+            serde_json::from_slice(&to_bytes(resp_cookie_ok.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let cookie_share_id = cookie_share_json["id"].as_str().unwrap().to_string();
+        assert!(cookie_share_json.get("max_views").is_none());
+
+        // 2c. Cookie auth + mismatched Origin on DELETE /api/share/{id} -> 403 FORBIDDEN (link stays unrevoked)
+        let resp_del_csrf = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/share/{cookie_share_id}"))
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, "https://evil.example")
+                    .header(header::HOST, "nvr.local:5000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_del_csrf.status(), StatusCode::FORBIDDEN);
+        assert!(!state.db.is_share_link_revoked(&cookie_share_id).unwrap());
+
+        // 2d. Cookie auth + matching Origin on DELETE /api/share/{id} -> 200 OK
+        let resp_del_cookie_ok = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/share/{cookie_share_id}"))
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, "http://nvr.local:5000")
+                    .header(header::HOST, "nvr.local:5000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_del_cookie_ok.status(), StatusCode::OK);
+        assert!(state.db.is_share_link_revoked(&cookie_share_id).unwrap());
+
+        // =========================================================================
+        // 3. Max-Views Enforcement, Access Counter, and Last-Accessed Timestamp
+        // =========================================================================
+        // Create a link with max_views: 2 (Bearer auth works even with cross-origin Origin header)
+        let resp_mv2 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::ORIGIN, "https://cli-client.example")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_p3_1","expires_in_sec":3600,"max_views":2}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_mv2.status(), StatusCode::OK);
+        let mv2_json: Value =
+            serde_json::from_slice(&to_bytes(resp_mv2.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(mv2_json["max_views"], 2);
+        let mv2_id = mv2_json["id"].as_str().unwrap().to_string();
+        let mv2_tok = mv2_json["token"].as_str().unwrap().to_string();
+
+        let db_before = state.db.get_share_link(&mv2_id).unwrap().unwrap();
+        assert_eq!(db_before["access_count"], 0);
+        assert!(db_before["last_accessed_at"].is_null());
+        assert_eq!(db_before["max_views"], 2);
+
+        // View 1: GET /share/{token} (share_player_page) -> 200 OK + CORP: same-origin, access_count = 1
+        let v1_resp = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{mv2_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v1_resp.status(), StatusCode::OK);
+        assert_eq!(
+            v1_resp
+                .headers()
+                .get("cross-origin-resource-policy")
+                .unwrap(),
+            "same-origin"
+        );
+        let db_v1 = state.db.get_share_link(&mv2_id).unwrap().unwrap();
+        assert_eq!(db_v1["access_count"], 1);
+        assert!(db_v1["last_accessed_at"].as_f64().unwrap() >= now as f64);
+
+        // Embedded <video> initial request after View 1 player page consumes the page credit (access_count stays 1)
+        let v1_video_resp = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{mv2_tok}/video.mp4"))
+                    .header(header::RANGE, "bytes=0-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v1_video_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            state.db.get_share_link(&mv2_id).unwrap().unwrap()["access_count"],
+            1
+        );
+
+        // View 2: Standalone initial GET /share/{token}/video.mp4 with Range: bytes=0-15 -> 206 Partial Content, access_count = 2
+        let v2_resp = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{mv2_tok}/video.mp4"))
+                    .header(header::RANGE, "bytes=0-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v2_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            v2_resp
+                .headers()
+                .get("cross-origin-resource-policy")
+                .unwrap(),
+            "same-origin"
+        );
+        let db_v2 = state.db.get_share_link(&mv2_id).unwrap().unwrap();
+        assert_eq!(db_v2["access_count"], 2);
+
+        // Mid-stream chunk: Range: bytes=16-63 succeeds (206) without incrementing access_count beyond 2
+        let mid_resp = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{mv2_tok}/video.mp4"))
+                    .header(header::RANGE, "bytes=16-63")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mid_resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            state.db.get_share_link(&mv2_id).unwrap().unwrap()["access_count"],
+            2
+        );
+
+        // View 3 (exceeding max_views = 2): both /share/{token} and /share/{token}/video.mp4 return 410 GONE
+        for uri in [
+            format!("/share/{mv2_tok}"),
+            format!("/share/{mv2_tok}/video.mp4"),
+        ] {
+            let r = auth_app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::GONE,
+                "exhausted max_views link must return 410 GONE on {uri}"
+            );
+        }
+        assert_eq!(
+            state.db.get_share_link(&mv2_id).unwrap().unwrap()["access_count"],
+            2
+        );
+
+        // Single-use link (max_views: 0 clamped to 1) end-to-end player + embedded <video> playback
+        let resp_mv0 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_p3_1","expires_in_sec":3600,"max_views":0}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_mv0.status(), StatusCode::OK);
+        let mv0_json: Value =
+            serde_json::from_slice(&to_bytes(resp_mv0.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(mv0_json["max_views"], 1);
+        let mv1_id = mv0_json["id"].as_str().unwrap().to_string();
+        let mv1_tok = mv0_json["token"].as_str().unwrap().to_string();
+
+        // 1) GET /share/{token} succeeds (200 OK) and sets access_count == 1
+        let mv1_page = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{mv1_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mv1_page.status(), StatusCode::OK);
+        assert_eq!(
+            state.db.get_share_link(&mv1_id).unwrap().unwrap()["access_count"],
+            1
+        );
+
+        // 2) Embedded <video> initial request (Range: bytes=0-15) and mid-stream chunk (Range: bytes=16-63) succeed with access_count == 1
+        for range_spec in ["bytes=0-15", "bytes=16-63"] {
+            let r = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{mv1_tok}/video.mp4"))
+                        .header(header::RANGE, range_spec)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::PARTIAL_CONTENT,
+                "max_views=1 embedded video request with {range_spec} must succeed"
+            );
+            assert_eq!(
+                state.db.get_share_link(&mv1_id).unwrap().unwrap()["access_count"],
+                1
+            );
+        }
+
+        // 3) Subsequent second GET /share/{token} and subsequent second initial GET /share/{token}/video.mp4 both return 410 GONE
+        for uri in [
+            format!("/share/{mv1_tok}"),
+            format!("/share/{mv1_tok}/video.mp4"),
+        ] {
+            let r = auth_app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::GONE,
+                "second visit to max_views=1 link must return 410 GONE on {uri}"
+            );
+        }
+        let r_range0_again = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{mv1_tok}/video.mp4"))
+                    .header(header::RANGE, "bytes=0-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_range0_again.status(), StatusCode::GONE);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
