@@ -230,4 +230,42 @@ describe("liveStageLayout (#92 [UX-17])", () => {
       shouldPrewarmMainStream: true,
     });
   });
+
+  test("simulated_100_camera_fleet_caps_focus_hero_span_and_4x4_grid_decoders", () => {
+    const fleet100 = Array.from({ length: 100 }, (_, i) =>
+      i < 4 ? `cam_${i + 1}` : `cam_${(i % 4) + 1}_sim_${String(i - 3).padStart(2, "0")}`
+    );
+
+    // 1. In Focus mode with 100 cameras, Hero gridRow span is capped at 6 (never 1 / span 99)
+    const focus100 = computeLiveStageDescriptors({
+      liveLayout: "focus",
+      visibleMatrixCams: fleet100.slice(0, 16),
+      groupCams: fleet100,
+      selectedCamera: fleet100[0],
+      hoveredDockCam: null,
+      useMainStream: false,
+      timeShiftTs: null,
+    });
+    const heroStyle = resolvePersistentTileStyle("focus", focus100[0]);
+    expect(heroStyle?.gridRow).toBe("1 / span 6");
+    const containerStyle = resolvePersistentStageContainerStyle("focus", focus100, "4x4");
+    expect(containerStyle?.gridTemplateRows).toBe("repeat(6, minmax(0, 1fr))");
+    expect(resolvePersistentTileStyle("focus", focus100[7])?.display).toBe("none");
+
+    // 2. In 4x4 Grid (16 simulated tiles), MSE decoders are capped at 8 + hovered/selected
+    const page2Cams = fleet100.slice(16, 32); // all *_sim_* clones
+    const grid16 = computeLiveStageDescriptors({
+      liveLayout: "2x2",
+      visibleMatrixCams: page2Cams,
+      groupCams: fleet100,
+      selectedCamera: page2Cams[0],
+      hoveredDockCam: page2Cams[12],
+      useMainStream: false,
+      timeShiftTs: null,
+    });
+    // First 8 tiles + hovered tile #12 use "mse", remaining 7 simulated tiles use "snapshot"
+    expect(grid16.slice(0, 8).every((d) => d.renderMode === "mse")).toBe(true);
+    expect(grid16[12].renderMode).toBe("mse");
+    expect(grid16[10].renderMode).toBe("snapshot");
+  });
 });

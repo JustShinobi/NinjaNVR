@@ -1316,12 +1316,12 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   }, [cameraActivity, cameraNames, spotlightFilter]);
 
   useEffect(() => {
-    if (liveLayout !== "spotlight") return;
+    if (liveLayout !== "spotlight" && simulatedFleetCount <= 0) return;
     const tmr = window.setInterval(() => {
       setNowTick(Math.floor(Date.now() / 1000));
-    }, 1000);
+    }, 1500);
     return () => window.clearInterval(tmr);
-  }, [liveLayout]);
+  }, [liveLayout, simulatedFleetCount]);
 
   const groupCams = useMemo(() => {
     const resolved = resolveOrderedDashboardCameras(
@@ -1441,10 +1441,19 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
   const lastLayoutSwitchMsRef = useRef<number>(0);
 
+  const stageGroupCams =
+    groupCams.length > MAX_DOCK_LIVE_DECODERS + 1 &&
+    visibleMatrixCams.length > 0
+      ? [
+          ...visibleMatrixCams,
+          ...groupCams.filter((c) => !visibleMatrixCams.includes(c)),
+        ]
+      : groupCams;
+
   const stageDescriptors = computeLiveStageDescriptors({
     liveLayout,
     visibleMatrixCams,
-    groupCams,
+    groupCams: stageGroupCams,
     selectedCamera,
     spotlightHeroCam,
     spotlightPromotedCams,
@@ -1989,10 +1998,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 }`}
                 style={resolvePersistentTileStyle(liveLayout, descriptor)}
                 onPointerEnter={
-                  isDock ? () => setHoveredDockCam(cam) : undefined
+                  isDock || isGrid ? () => setHoveredDockCam(cam) : undefined
                 }
                 onPointerLeave={
-                  isDock
+                  isDock || isGrid
                     ? () => setHoveredDockCam((c) => (c === cam ? null : c))
                     : undefined
                 }
@@ -2020,7 +2029,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 ) : descriptor.renderMode === "snapshot" ? (
                   <img
                     className="nvr-cam-poster"
-                    src={`/api/${encodeURIComponent(realCam)}/latest.webp?height=360`}
+                    src={`/api/${encodeURIComponent(realCam)}/latest.webp?height=360&cache=${nowTick}`}
                     alt={`${cam} dock snapshot`}
                     loading="lazy"
                     onClick={() => handleTileActivate(false)}

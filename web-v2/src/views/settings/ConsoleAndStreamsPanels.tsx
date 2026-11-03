@@ -352,17 +352,34 @@ export const ConsoleUiSection: React.FC<{
                 </button>
               ))}
               {simulatedFleetCount > 0 && (
-                <button
-                  type="button"
-                  className="nvr-btn danger mono"
-                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)", fontWeight: 700 }}
-                  onClick={() => {
-                    setSimulatedFleetCount(0);
-                    notify(`Restored ${realCameraCount} physical cameras`);
-                  }}
-                >
-                  Exit Simulation (Restore {realCameraCount} Cameras)
-                </button>
+                <>
+                  <button
+                    type="button"
+                    className="nvr-btn primary mono"
+                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)", fontWeight: 700 }}
+                    onClick={() => {
+                      useNvrStore.getState().setActiveTab("live");
+                      if (typeof window !== "undefined") {
+                        window.history.replaceState(null, "", "/");
+                      }
+                    }}
+                  >
+                    {isPt
+                      ? `Abrir Matriz Ao Vivo (${simulatedFleetCount} Cams) →`
+                      : `Open Live Matrix (${simulatedFleetCount} Cams) →`}
+                  </button>
+                  <button
+                    type="button"
+                    className="nvr-btn danger mono"
+                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)", fontWeight: 700 }}
+                    onClick={() => {
+                      setSimulatedFleetCount(0);
+                      notify(`Restored ${realCameraCount} physical cameras`);
+                    }}
+                  >
+                    Exit Simulation (Restore {realCameraCount} Cameras)
+                  </button>
+                </>
               )}
             </div>
           </div>

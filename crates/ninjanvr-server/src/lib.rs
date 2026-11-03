@@ -10202,23 +10202,7 @@ async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) 
                 }
                 live_pkt = sub.rx.recv() => {
                     match live_pkt {
-                        Ok(mse_hub::MseLivePacket::Codec(c)) => {
-                            if !sent_init && client_sink.send(AxumWsMsg::Text(c.into())).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(mse_hub::MseLivePacket::Init(b)) => {
-                            if !sent_init {
-                                if client_sink.send(AxumWsMsg::Binary(b)).await.is_err() {
-                                    break;
-                                }
-                                sent_init = true;
-                            }
-                        }
-                        Ok(mse_hub::MseLivePacket::Fragment { seq, bytes }) => {
-                            if seq <= last_sent_seq {
-                                continue;
-                            }
+                        Ok(mse_hub::MseLivePacket::Codec(_)) | Ok(mse_hub::MseLivePacket::Init(_)) => {
                             if !sent_init
                                 && let Some(burst) = state.mse_hub.get_fresh_burst(src).await
                             {
@@ -10235,6 +10219,28 @@ async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) 
                                 }
                                 last_sent_seq = burst.last_seq;
                                 sent_init = true;
+                            }
+                        }
+                        Ok(mse_hub::MseLivePacket::Fragment { seq, bytes }) => {
+                            if !sent_init {
+                                if let Some(burst) = state.mse_hub.get_fresh_burst(src).await {
+                                    if client_sink.send(AxumWsMsg::Text(burst.codec_msg.into())).await.is_err() {
+                                        break;
+                                    }
+                                    if client_sink.send(AxumWsMsg::Binary(burst.init_segment)).await.is_err() {
+                                        break;
+                                    }
+                                    for frag in burst.gop_fragments {
+                                        if client_sink.send(AxumWsMsg::Binary(frag)).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    last_sent_seq = burst.last_seq;
+                                    sent_init = true;
+                                }
+                                continue;
+                            }
+                            if seq <= last_sent_seq {
                                 continue;
                             }
                             last_sent_seq = seq;
@@ -10626,23 +10632,6 @@ pub async fn new_app_state(
             ptz_active_presets: ptz_active_presets.clone(),
         });
         vision_pipeline.start().await;
-
-        let warm_hub = mse_hub.clone();
-        let warm_cfg = shared_cfg.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let enabled_cams: Vec<String> = {
-                let g = warm_cfg.read().await;
-                g.cameras
-                    .iter()
-                    .filter(|(_, c)| c.enabled)
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            };
-            warm_hub
-                .start_persistent_camera_streams("ws://127.0.0.1:1984", enabled_cams)
-                .await;
-        });
     }
 
     let _ = rustls::crypto::ring::default_provider().install_default();

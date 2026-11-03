@@ -18,7 +18,11 @@ import {
   formatTs,
   resolveHeaderTelemetryMeta,
 } from "./utils/format";
-import { expandSimulatedFleet, useNvrStore } from "./store/useNvrStore";
+import {
+  expandSimulatedFleet,
+  resolveRealCameraSource,
+  useNvrStore,
+} from "./store/useNvrStore";
 import { LiveWorkspace } from "./views/LiveWorkspace";
 import { SyncWorkspace } from "./views/SyncWorkspace";
 import { ReviewWorkspace } from "./views/ReviewWorkspace";
@@ -247,7 +251,11 @@ export const App: React.FC = () => {
         const cfgJson: NinjaConfigResponse = await cfgRes.json();
         setConfig(cfgJson);
         const cams = Object.keys(cfgJson.cameras || {});
-        if (cams.length > 0 && !cams.includes(selectedCamera)) {
+        const baseSelected = resolveRealCameraSource(
+          selectedCamera,
+          cfgJson.cameras
+        );
+        if (cams.length > 0 && !cams.includes(baseSelected)) {
           setSelectedCamera(cams[0]);
         }
         if (cams.length > 0 && !cams.includes(inspectorCam)) {

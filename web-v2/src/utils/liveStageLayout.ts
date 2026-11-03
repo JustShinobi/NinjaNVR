@@ -8,6 +8,7 @@ export type StageTileRole = "grid" | "hero" | "dock";
 export type StageTileRenderMode = "mse" | "vod" | "snapshot";
 
 export const DEFAULT_MAX_DOCK_LIVE_DECODERS = 6;
+export const DEFAULT_MAX_GRID_LIVE_DECODERS = 8;
 
 export interface LiveStageTileDescriptor {
   camera: string;
@@ -31,6 +32,7 @@ export interface ComputeLiveStageDescriptorsParams {
   useMainStream: boolean;
   timeShiftTs: number | null;
   maxDockLiveDecoders?: number;
+  maxGridLiveDecoders?: number;
 }
 
 function buildCanonicalCameraList(primaryList: string[], heroCam: string): string[] {
@@ -67,16 +69,26 @@ export function computeLiveStageDescriptors(
     useMainStream,
     timeShiftTs,
     maxDockLiveDecoders = DEFAULT_MAX_DOCK_LIVE_DECODERS,
+    maxGridLiveDecoders = DEFAULT_MAX_GRID_LIVE_DECODERS,
   } = params;
 
   if (liveLayout === "2x2") {
-    return visibleMatrixCams.map((cam) => {
+    return visibleMatrixCams.map((cam, idx) => {
       const isTimelineSelected = cam === selectedCamera;
       const isTimeShifted = isTimelineSelected && timeShiftTs !== null;
+      const isLiveGridTile =
+        idx < maxGridLiveDecoders ||
+        isTimelineSelected ||
+        hoveredDockCam === cam ||
+        !/_sim_\d+$/.test(cam);
       return {
         camera: cam,
         role: "grid",
-        renderMode: isTimeShifted ? "vod" : "mse",
+        renderMode: isTimeShifted
+          ? "vod"
+          : isLiveGridTile
+          ? "mse"
+          : "snapshot",
         useMainStream,
         dockIndex: -1,
         dockTotal: 0,
@@ -260,14 +272,14 @@ export function resolvePersistentStageContainerStyle(
       gridTemplateRows: "minmax(0, 1fr)",
     };
   }
-  const rows = Math.max(1, dockCount);
+  const visibleRows = Math.min(
+    DEFAULT_MAX_DOCK_LIVE_DECODERS,
+    Math.max(1, dockCount)
+  );
   return {
     gridTemplateColumns: "minmax(0, 1fr) 310px",
-    gridTemplateRows:
-      rows <= 4
-        ? `repeat(${rows}, minmax(0, 1fr))`
-        : `repeat(${rows}, minmax(140px, 1fr))`,
-    overflowY: rows > 4 ? "auto" : "hidden",
+    gridTemplateRows: `repeat(${visibleRows}, minmax(0, 1fr))`,
+    overflow: "hidden",
   };
 }
 
@@ -278,11 +290,14 @@ export function resolvePersistentTileStyle(
   if (liveLayout === "2x2" || liveLayout === "single") {
     return undefined;
   }
-  const rows = Math.max(1, descriptor.dockTotal);
+  const visibleRows = Math.min(
+    DEFAULT_MAX_DOCK_LIVE_DECODERS,
+    Math.max(1, descriptor.dockTotal)
+  );
   if (descriptor.role === "hero") {
     return {
       gridColumn: 1,
-      gridRow: `1 / span ${rows}`,
+      gridRow: `1 / span ${visibleRows}`,
       ...(descriptor.isSpotlightHeld
         ? {
             outline: "1px solid var(--signal-alert)",
@@ -292,10 +307,15 @@ export function resolvePersistentTileStyle(
     };
   }
   if (descriptor.role === "dock") {
+    if (descriptor.dockIndex >= DEFAULT_MAX_DOCK_LIVE_DECODERS) {
+      return {
+        display: "none",
+      };
+    }
     return {
       gridColumn: 2,
       gridRow: descriptor.dockIndex + 1,
-      minHeight: 140,
+      minHeight: 0,
       opacity: liveLayout === "spotlight" ? 0.84 : 1,
       cursor: "pointer",
     };

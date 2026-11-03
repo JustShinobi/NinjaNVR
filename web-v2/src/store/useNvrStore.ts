@@ -407,8 +407,18 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
         !s.config?.camera_groups?.[s.activeCameraGroup]
           ? "all"
           : s.activeCameraGroup;
+      const nextDensity: MatrixDensity =
+        simulatedFleetCount >= 36
+          ? "4x4"
+          : simulatedFleetCount >= 12
+          ? "3x3"
+          : "2x2";
+      const nextLayout: LiveLayoutMode =
+        simulatedFleetCount > 0 ? "2x2" : s.liveLayout;
       return {
         simulatedFleetCount,
+        liveLayout: nextLayout,
+        matrixDensity: nextDensity,
         matrixPage: 0,
         selectedCamera: nextSelected,
         activeCameraGroup: nextGroup,
