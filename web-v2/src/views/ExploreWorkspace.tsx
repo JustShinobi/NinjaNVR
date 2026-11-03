@@ -189,6 +189,38 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const [showForensic, setShowForensic] = React.useState(false);
   const [eventNoteDraft, setEventNoteDraft] = React.useState("");
   const [aiVerifyBusy, setAiVerifyBusy] = React.useState(false);
+  const [datasetAddBusy, setDatasetAddBusy] = React.useState(false);
+  const [addedDatasetIds, setAddedDatasetIds] = React.useState<Record<string, boolean>>({});
+
+  const handleAddToDataset = async () => {
+    if (!selectedEvent || datasetAddBusy) return;
+    setDatasetAddBusy(true);
+    try {
+      const res = await fetch(
+        `/api/dataset/samples/from-event/${encodeURIComponent(selectedEvent.id)}`,
+        {
+          method: "POST",
+          credentials: "include",
+        }
+      );
+      const data = await res.json().catch(() => null);
+      if (res.ok && data) {
+        setAddedDatasetIds((prev) => ({ ...prev, [selectedEvent.id]: true }));
+        const split = data.split || data.sample?.split || "train";
+        notify(
+          `Added event #${selectedEvent.id.slice(-8)} clean frame to Active Learning Dataset (split: ${String(
+            split
+          ).toUpperCase()})`
+        );
+      } else {
+        notify(data?.message || "Failed to add event snapshot to training dataset");
+      }
+    } catch {
+      notify("Network error while adding event snapshot to training dataset");
+    } finally {
+      setDatasetAddBusy(false);
+    }
+  };
 
   const handleToggleFalsePositive = async () => {
     if (!selectedEvent) return;
@@ -1002,6 +1034,18 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   >
                     <Sparkles size={12} />
                     {aiVerifyBusy ? "Verifying..." : "Verify with AI"}
+                  </button>
+                  <button
+                    className={`nvr-btn mono ${addedDatasetIds[selectedEvent.id] ? "active" : ""}`}
+                    disabled={datasetAddBusy}
+                    onClick={handleAddToDataset}
+                    title="Add clean event frame and normalized YOLO bounding box to Active Learning Dataset Studio"
+                  >
+                    {datasetAddBusy
+                      ? "Adding..."
+                      : addedDatasetIds[selectedEvent.id]
+                      ? "Added to Dataset ✓"
+                      : "Add to Training Dataset"}
                   </button>
                   <button
                     className="nvr-btn"

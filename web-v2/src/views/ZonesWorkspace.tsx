@@ -22,6 +22,7 @@ import {
 } from "./settings/ConsoleAndStreamsPanels";
 import {
   AiDetectionObjectsSection,
+  DatasetStudioSection,
   VisionZonesMotionSection,
 } from "./settings/VisionAndAiPanels";
 import {
@@ -34,6 +35,7 @@ export type SettingsCategory =
   | "channels"
   | "vision"
   | "ai"
+  | "dataset"
   | "recording"
   | "security"
   | "yaml";
@@ -260,22 +262,29 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
       icon: <Cpu size={14} />,
     },
     {
-      id: "recording",
+      id: "dataset",
       num: "05",
+      title: isPt ? "Estúdio de Dataset IA" : "AI Dataset Studio",
+      sub: isPt ? "Auto-Labeler YOLO & .onnx" : "YOLO Auto-Labeler & .onnx",
+      icon: <Cpu size={14} />,
+    },
+    {
+      id: "recording",
+      num: "06",
       title: isPt ? "Gravação & Revisão" : "Recording & Review",
       sub: isPt ? "Retenção & Regras de Alerta" : "Retention & Alert Rules",
       icon: <HardDrive size={14} />,
     },
     {
       id: "security",
-      num: "06",
+      num: "07",
       title: isPt ? "Comms, Auth & Usuários" : "Comms, Auth & Users",
       sub: isPt ? "MQTT, TLS & Contas" : "MQTT, TLS & Accounts",
       icon: <Shield size={14} />,
     },
     {
       id: "yaml",
-      num: "07",
+      num: "08",
       title: "Raw config.yml",
       sub: isPt ? "Editor YAML Direto" : "Direct YAML Studio",
       icon: <FileCode size={14} />,
@@ -583,6 +592,8 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 notify={notify}
               />
             )}
+
+            {activeCategory === "dataset" && <DatasetStudioSection notify={notify} />}
 
             {draftConfig && activeCategory === "recording" && (
               <RecordingReviewSection

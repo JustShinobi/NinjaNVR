@@ -323,6 +323,71 @@ export interface DetectorRuntimeCatalog {
   out_floats: number;
   avg_inference_ms: number;
   devices: DetectorDeviceStatus[];
+  discovered_models?: Array<{ path: string; arch: string }>;
+}
+
+export interface DatasetAnnotationBox {
+  class_id: number;
+  label: string;
+  cx: number;
+  cy: number;
+  w: number;
+  h: number;
+  score?: number;
+  source?: "event" | "manual" | "ai_teacher" | string;
+}
+
+export interface DatasetSampleItem {
+  id: string;
+  event_id?: string | null;
+  camera: string;
+  split: "train" | "val" | string;
+  sample_kind: "true_positive" | "hard_negative" | "ai_annotated" | string;
+  image_path: string;
+  width: number;
+  height: number;
+  annotations: DatasetAnnotationBox[];
+  verified: boolean;
+  night_mode: boolean;
+  created_at: number;
+  image_url?: string;
+}
+
+export interface DatasetSummaryResponse {
+  total_samples: number;
+  true_positive_count: number;
+  hard_negative_count: number;
+  ai_annotated_count: number;
+  positive_samples?: number;
+  train_count: number;
+  val_count: number;
+  verified_count: number;
+  unverified_count: number;
+  night_mode_count: number;
+  total_annotations: number;
+  positive_ratio: number;
+  hard_negative_ratio: number;
+  target_positive_ratio?: number;
+  target_hard_negative_ratio?: number;
+  by_camera: Record<string, number>;
+  by_class: Record<string, number>;
+  classes: string[];
+  ready_for_export: boolean;
+}
+
+export interface ModelUploadPayload {
+  filename: string;
+  model_base64: string;
+  weights_filename?: string;
+  weights_base64?: string;
+  labelmap_filename?: string;
+  labelmap?: string;
+  model_type?: "yolo-generic" | "yolox" | "ssd" | string;
+  width?: number;
+  height?: number;
+  input_tensor?: "nchw" | "nhwc" | string;
+  input_pixel_format?: "rgb" | "bgr" | string;
+  activate?: boolean;
 }
 
 export interface DetectorEntryConfig {

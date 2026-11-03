@@ -20,11 +20,15 @@ import { useNvrStore } from "../../store/useNvrStore";
 import {
   CameraDetectConfig,
   CameraMotionConfig,
+  DatasetAnnotationBox,
+  DatasetSampleItem,
+  DatasetSummaryResponse,
   EnrolledFaceProfileItem,
   FaceRecognitionConfig,
   FalsePositiveSignatureItem,
   GenAiConfig,
   LprConfig,
+  ModelUploadPayload,
   NinjaConfigResponse,
   ObjectFilterConfig,
   StateRoiConfig,
@@ -36,6 +40,162 @@ import {
 } from "../../utils/configYaml";
 import { formatDateTime } from "../../utils/format";
 import { ToggleSwitch } from "./ConsoleAndStreamsPanels";
+
+export const NINJANVR_SECURITY_CLASSES = [
+  "person",
+  "face",
+  "car",
+  "motorcycle",
+  "bicycle",
+  "truck",
+  "bus",
+  "license_plate",
+  "dog",
+  "cat",
+  "bird",
+  "package",
+  "waste_bin",
+  "backpack",
+  "umbrella",
+] as const;
+
+function round6(v: number): number {
+  const clamped = Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
+  return Math.round(clamped * 1_000_000) / 1_000_000;
+}
+
+export function xyxyToYoloNormalized(
+  box: [number, number, number, number]
+): { cx: number; cy: number; w: number; h: number } {
+  const xmin = Math.max(0, Math.min(1, Math.min(box[0], box[2])));
+  const xmax = Math.max(0, Math.min(1, Math.max(box[0], box[2])));
+  const ymin = Math.max(0, Math.min(1, Math.min(box[1], box[3])));
+  const ymax = Math.max(0, Math.min(1, Math.max(box[1], box[3])));
+  const w = Math.max(0.001, Math.min(1, xmax - xmin));
+  const h = Math.max(0.001, Math.min(1, ymax - ymin));
+  const cx = (xmin + xmax) / 2;
+  const cy = (ymin + ymax) / 2;
+  return {
+    cx: round6(cx),
+    cy: round6(cy),
+    w: round6(w),
+    h: round6(h),
+  };
+}
+
+export function yoloNormalizedToXyxy(box: {
+  cx: number;
+  cy: number;
+  w: number;
+  h: number;
+}): [number, number, number, number] {
+  const x1 = round6(box.cx - box.w / 2);
+  const y1 = round6(box.cy - box.h / 2);
+  const x2 = round6(box.cx + box.w / 2);
+  const y2 = round6(box.cy + box.h / 2);
+  return [x1, y1, x2, y2];
+}
+
+export function formatYoloAnnotationLine(ann: DatasetAnnotationBox): string {
+  const cid = Math.max(
+    0,
+    Math.min(NINJANVR_SECURITY_CLASSES.length - 1, Math.trunc(ann.class_id))
+  );
+  return `${cid} ${ann.cx.toFixed(6)} ${ann.cy.toFixed(6)} ${ann.w.toFixed(6)} ${ann.h.toFixed(6)}`;
+}
+
+export interface DatasetReadinessMetrics {
+  totalSamples: number;
+  positiveCount: number;
+  hardNegativeCount: number;
+  positivePct: number;
+  hardNegativePct: number;
+  trainCount: number;
+  valCount: number;
+  trainPct: number;
+  valPct: number;
+  verifiedCount: number;
+  verifiedPct: number;
+  balanceScorePct: number;
+  isBalanced: boolean;
+}
+
+export function computeDatasetReadinessMetrics(
+  summary?: Partial<DatasetSummaryResponse> | null
+): DatasetReadinessMetrics {
+  const tp = Math.max(0, Number(summary?.true_positive_count ?? 0));
+  const ai = Math.max(0, Number(summary?.ai_annotated_count ?? 0));
+  const hn = Math.max(0, Number(summary?.hard_negative_count ?? 0));
+  const positiveCount = tp + ai;
+  const totalSamples = Math.max(
+    0,
+    Number(summary?.total_samples ?? positiveCount + hn)
+  );
+  const positivePct =
+    totalSamples > 0 ? Math.round((positiveCount / totalSamples) * 100) : 0;
+  const hardNegativePct =
+    totalSamples > 0 ? Math.max(0, 100 - positivePct) : 0;
+  const trainCount = Math.max(0, Number(summary?.train_count ?? 0));
+  const valCount = Math.max(0, Number(summary?.val_count ?? 0));
+  const trainPct =
+    totalSamples > 0 ? Math.round((trainCount / totalSamples) * 100) : 0;
+  const valPct = totalSamples > 0 ? Math.max(0, 100 - trainPct) : 0;
+  const verifiedCount = Math.max(0, Number(summary?.verified_count ?? 0));
+  const verifiedPct =
+    totalSamples > 0 ? Math.round((verifiedCount / totalSamples) * 100) : 0;
+  const deviationFrom80 = Math.abs(positivePct - 80);
+  const balanceScorePct =
+    totalSamples > 0
+      ? Math.max(0, Math.min(100, Math.round(100 - deviationFrom80 * 1.25)))
+      : 0;
+  const isBalanced =
+    totalSamples > 0 &&
+    positivePct >= 70 &&
+    positivePct <= 90 &&
+    hardNegativePct >= 10 &&
+    hardNegativePct <= 30;
+
+  return {
+    totalSamples,
+    positiveCount,
+    hardNegativeCount: hn,
+    positivePct,
+    hardNegativePct,
+    trainCount,
+    valCount,
+    trainPct,
+    valPct,
+    verifiedCount,
+    verifiedPct,
+    balanceScorePct,
+    isBalanced,
+  };
+}
+
+export function buildModelUploadPayload(params: {
+  filename: string;
+  modelBase64: string;
+  labelmap?: string;
+  modelType?: string;
+  width?: number;
+  height?: number;
+  inputTensor?: string;
+  inputPixelFormat?: string;
+}): ModelUploadPayload {
+  const cleanName = params.filename.trim() || "custom_yolo11s.onnx";
+  return {
+    filename: cleanName,
+    model_base64: params.modelBase64,
+    labelmap:
+      params.labelmap?.trim() || NINJANVR_SECURITY_CLASSES.join("\n"),
+    model_type: params.modelType || "yolo-generic",
+    width: params.width || 640,
+    height: params.height || 640,
+    input_tensor: params.inputTensor || "nchw",
+    input_pixel_format: params.inputPixelFormat || "rgb",
+    activate: true,
+  };
+}
 
 export function formatDhash64Hex(dhash?: number | null): string {
   if (dhash === null || dhash === undefined || Number.isNaN(Number(dhash))) {
@@ -4543,6 +4703,694 @@ export const AiDetectionObjectsSection: React.FC<{
               )}
             </div>
           )}
+        </div>
+      </div>
+
+      {/* Self-Hosted Active Learning Dataset Studio & Model Hot-Reload */}
+      <div style={{ gridColumn: "1 / -1" }}>
+        <DatasetStudioSection notify={notify} />
+      </div>
+    </div>
+  );
+};
+
+export const DatasetStudioSection: React.FC<{
+  notify: (msg: string) => void;
+}> = ({ notify }) => {
+  const { locale } = useI18n();
+  const isPt = locale === "pt";
+  const [summary, setSummary] = useState<DatasetSummaryResponse | null>(null);
+  const [samples, setSamples] = useState<DatasetSampleItem[]>([]);
+  const [selectedSampleId, setSelectedSampleId] = useState<string | null>(null);
+  const [filterKind, setFilterKind] = useState<string>("all");
+  const [activeClassId, setActiveClassId] = useState<number>(0);
+  const [drawStart, setDrawStart] = useState<[number, number] | null>(null);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [uploadFilename, setUploadFilename] = useState("ninjanvr_yolo11s.onnx");
+  const [uploadBase64, setUploadBase64] = useState("");
+  const [uploadWidth, setUploadWidth] = useState(640);
+  const [uploadHeight, setUploadHeight] = useState(640);
+
+  const loadDatasetState = async () => {
+    try {
+      const [sumRes, listRes] = await Promise.all([
+        fetch("/api/dataset/summary", { credentials: "include" }),
+        fetch(
+          filterKind === "all"
+            ? "/api/dataset/samples"
+            : `/api/dataset/samples?sample_kind=${encodeURIComponent(filterKind)}`,
+          { credentials: "include" }
+        ),
+      ]);
+      if (sumRes.ok) {
+        const sumData = await sumRes.json();
+        setSummary(sumData);
+      }
+      if (listRes.ok) {
+        const listData = await listRes.json();
+        const rows: DatasetSampleItem[] = Array.isArray(listData)
+          ? listData
+          : Array.isArray(listData?.items)
+          ? listData.items
+          : [];
+        setSamples(rows);
+        if (rows.length > 0 && !rows.some((r) => r.id === selectedSampleId)) {
+          setSelectedSampleId(rows[0].id);
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    void loadDatasetState();
+  }, [filterKind]);
+
+  const selectedSample =
+    samples.find((s) => s.id === selectedSampleId) || samples[0] || null;
+  const readiness = computeDatasetReadinessMetrics(summary);
+
+  const handleUpdateSample = async (
+    sample: DatasetSampleItem,
+    patch: {
+      annotations?: DatasetAnnotationBox[];
+      verified?: boolean;
+      split?: string;
+    }
+  ) => {
+    const res = await fetch(
+      `/api/dataset/samples/${encodeURIComponent(sample.id)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(patch),
+      }
+    );
+    if (res.ok) {
+      const updated = await res.json();
+      const item: DatasetSampleItem = updated.sample || updated;
+      setSamples((prev) => prev.map((s) => (s.id === item.id ? item : s)));
+      void loadDatasetState();
+    }
+  };
+
+  const handleAutoAnnotateSample = async (sampleId: string) => {
+    setBusyAction(`auto-${sampleId}`);
+    try {
+      const res = await fetch(
+        `/api/dataset/samples/${encodeURIComponent(sampleId)}/auto-annotate`,
+        {
+          method: "POST",
+          credentials: "include",
+        }
+      );
+      const data = await res.json().catch(() => null);
+      if (res.ok && data) {
+        const item: DatasetSampleItem = data.sample || data;
+        setSamples((prev) => prev.map((s) => (s.id === item.id ? item : s)));
+        notify(
+          `AI Teacher generated ${(item.annotations || []).length} YOLO boxes on ${sampleId}`
+        );
+        void loadDatasetState();
+      } else {
+        notify(data?.message || "Vision AI auto-annotation failed");
+      }
+    } catch {
+      notify("Network error during Vision AI auto-annotation");
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleBatchAutoAnnotate = async () => {
+    setBusyAction("batch-auto");
+    try {
+      const res = await fetch("/api/dataset/auto-annotate", {
+        method: "POST",
+        credentials: "include",
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data) {
+        notify(
+          `Batch AI Teacher auto-annotated ${data.annotated_count ?? 0} unverified samples`
+        );
+        void loadDatasetState();
+      } else {
+        notify(data?.message || "Batch AI auto-annotation failed");
+      }
+    } catch {
+      notify("Network error during batch AI auto-annotation");
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleDeleteSample = async (sampleId: string) => {
+    const res = await fetch(
+      `/api/dataset/samples/${encodeURIComponent(sampleId)}`,
+      {
+        method: "DELETE",
+        credentials: "include",
+      }
+    );
+    if (res.ok) {
+      setSamples((prev) => prev.filter((s) => s.id !== sampleId));
+      notify(`Deleted dataset sample ${sampleId}`);
+      void loadDatasetState();
+    }
+  };
+
+  const handleUploadModel = async () => {
+    setBusyAction("upload-model");
+    try {
+      const payload = buildModelUploadPayload({
+        filename: uploadFilename,
+        modelBase64: uploadBase64 || btoa("ONNX_CUSTOM_MODEL"),
+        width: uploadWidth,
+        height: uploadHeight,
+      });
+      const res = await fetch("/api/detectors/models/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success) {
+        notify(
+          `Uploaded '${data.filename}' (${data.width}×${data.height}) and hot-reloaded AiDetectorEngine`
+        );
+      } else {
+        notify(data?.message || "Model upload failed");
+      }
+    } catch {
+      notify("Network error uploading custom detector model");
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleSvgClick = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!selectedSample) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const nx = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const ny = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+    if (!drawStart) {
+      setDrawStart([nx, ny]);
+      return;
+    }
+    const [x1, y1] = drawStart;
+    setDrawStart(null);
+    const yolo = xyxyToYoloNormalized([x1, y1, nx, ny]);
+    const label = NINJANVR_SECURITY_CLASSES[activeClassId] || "person";
+    const nextBox: DatasetAnnotationBox = {
+      class_id: activeClassId,
+      label,
+      cx: yolo.cx,
+      cy: yolo.cy,
+      w: yolo.w,
+      h: yolo.h,
+      score: 1.0,
+      source: "manual",
+    };
+    void handleUpdateSample(selectedSample, {
+      annotations: [...(selectedSample.annotations || []), nextBox],
+    });
+  };
+
+  return (
+    <div className="nvr-cfg-card">
+      <div className="nvr-cfg-card-header">
+        <span>
+          {isPt
+            ? "ESTÚDIO DE DATASET & APRENDIZADO ATIVO (DESTILAÇÃO PROFESSOR-ALUNO YOLO)"
+            : "ACTIVE LEARNING DATASET STUDIO & TEACHER-STUDENT YOLO DISTILLATION"}
+        </span>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className="nvr-btn mono"
+            style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+            disabled={busyAction === "batch-auto"}
+            onClick={() => void handleBatchAutoAnnotate()}
+          >
+            <Sparkles size={11} />
+            {busyAction === "batch-auto"
+              ? "Auto-Annotating..."
+              : "Batch Auto-Annotate Unverified"}
+          </button>
+          <a
+            href="/api/dataset/export.zip"
+            download="ninjanvr-yolo-dataset.zip"
+            className="nvr-btn primary mono"
+            style={{
+              height: 22,
+              padding: "0 8px",
+              fontSize: "var(--text-xs)",
+              textDecoration: "none",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Export YOLO Dataset (.zip)
+          </a>
+        </div>
+      </div>
+
+      <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
+        {/* Readiness Gauges */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+            gap: 8,
+          }}
+        >
+          <div
+            className="mono"
+            style={{
+              padding: 8,
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              fontSize: "var(--text-xs)",
+            }}
+          >
+            <div style={{ color: "var(--text-secondary)" }}>TOTAL SAMPLES</div>
+            <div style={{ fontSize: "var(--text-md)", fontWeight: 700, marginTop: 2 }}>
+              {readiness.totalSamples} FRAMES · {summary?.total_annotations ?? 0} BOXES
+            </div>
+            <div style={{ color: "var(--text-muted)", marginTop: 2 }}>
+              Verified: {readiness.verifiedCount} ({readiness.verifiedPct}%)
+            </div>
+          </div>
+
+          <div
+            className="mono"
+            style={{
+              padding: 8,
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              fontSize: "var(--text-xs)",
+            }}
+          >
+            <div style={{ color: "var(--text-secondary)" }}>
+              TP vs HARD NEGATIVES (TARGET 80% / 20%)
+            </div>
+            <div style={{ fontSize: "var(--text-md)", fontWeight: 700, marginTop: 2 }}>
+              {readiness.positivePct}% TP ({readiness.positiveCount}) /{" "}
+              {readiness.hardNegativePct}% BG ({readiness.hardNegativeCount})
+            </div>
+            <div style={{ color: "var(--text-muted)", marginTop: 2 }}>
+              Balance Score: {readiness.balanceScorePct}%{" "}
+              {readiness.isBalanced ? "· OPTIMAL" : "· COLLECT MORE"}
+            </div>
+          </div>
+
+          <div
+            className="mono"
+            style={{
+              padding: 8,
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              fontSize: "var(--text-xs)",
+            }}
+          >
+            <div style={{ color: "var(--text-secondary)" }}>
+              STRATIFIED SPLIT (80/20 HASH)
+            </div>
+            <div style={{ fontSize: "var(--text-md)", fontWeight: 700, marginTop: 2 }}>
+              TRAIN: {readiness.trainCount} ({readiness.trainPct}%) · VAL:{" "}
+              {readiness.valCount} ({readiness.valPct}%)
+            </div>
+            <div style={{ color: "var(--text-muted)", marginTop: 2 }}>
+              Night IR Frames: {summary?.night_mode_count ?? 0}
+            </div>
+          </div>
+
+          <div
+            className="mono"
+            style={{
+              padding: 8,
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              fontSize: "var(--text-xs)",
+            }}
+          >
+            <div style={{ color: "var(--text-secondary)" }}>PER-CAMERA DISTRIBUTION</div>
+            <div
+              style={{
+                display: "flex",
+                gap: 4,
+                flexWrap: "wrap",
+                marginTop: 4,
+              }}
+            >
+              {Object.entries(summary?.by_camera || {}).map(([cam, cnt]) => (
+                <span key={cam} className="nvr-badge mono">
+                  {cam.toUpperCase()}: {cnt}
+                </span>
+              ))}
+              {Object.keys(summary?.by_camera || {}).length === 0 && (
+                <span style={{ color: "var(--text-muted)" }}>No camera samples yet</span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Sample Grid + Interactive SVG Bounding-Box Overlay Editor */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "290px minmax(0, 1fr)",
+            gap: 10,
+            minHeight: 280,
+          }}
+        >
+          <div
+            style={{
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              padding: 8,
+              display: "flex",
+              flexDirection: "column",
+              gap: 6,
+            }}
+          >
+            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+              <select
+                className="nvr-select mono"
+                aria-label="Filter dataset samples by kind"
+                style={{ flex: 1, height: 24, fontSize: "var(--text-xs)" }}
+                value={filterKind}
+                onChange={(e) => setFilterKind(e.target.value)}
+              >
+                <option value="all">ALL SAMPLES ({samples.length})</option>
+                <option value="true_positive">TRUE POSITIVES</option>
+                <option value="ai_annotated">AI ANNOTATED</option>
+                <option value="hard_negative">HARD NEGATIVES (BG)</option>
+              </select>
+            </div>
+
+            <div
+              className="nvr-scroll-y"
+              style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 240 }}
+            >
+              {samples.map((s) => {
+                const isSel = selectedSample?.id === s.id;
+                return (
+                  <div
+                    key={s.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setSelectedSampleId(s.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        setSelectedSampleId(s.id);
+                      }
+                    }}
+                    className="mono"
+                    style={{
+                      padding: 6,
+                      background: isSel
+                        ? "rgba(14, 165, 233, 0.14)"
+                        : "var(--bg-panel)",
+                      border: `1px solid ${
+                        isSel ? "var(--signal-accent)" : "var(--border-hairline)"
+                      }`,
+                      borderRadius: 3,
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: 6,
+                      fontSize: "var(--text-xs)",
+                    }}
+                  >
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 700 }}>
+                        {s.camera.toUpperCase()} · {s.split.toUpperCase()}
+                      </div>
+                      <div style={{ color: "var(--text-muted)" }}>
+                        {s.sample_kind.toUpperCase()} · {(s.annotations || []).length} boxes
+                      </div>
+                    </div>
+                    <span className={`nvr-badge ${s.verified ? "live" : ""}`}>
+                      {s.verified ? "VERIFIED" : "DRAFT"}
+                    </span>
+                  </div>
+                );
+              })}
+              {samples.length === 0 && (
+                <div
+                  className="mono"
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)", padding: 8 }}
+                >
+                  Mark events as False Positive or click &quot;Add to Training Dataset&quot; in
+                  Explore to populate frames.
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Interactive SVG Bounding-Box Stage */}
+          <div
+            style={{
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              padding: 8,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 6,
+                flexWrap: "wrap",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700 }}>
+                  CLASS (0..14):
+                </span>
+                <select
+                  className="nvr-select mono"
+                  aria-label="YOLO Security Class Selector"
+                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  value={activeClassId}
+                  onChange={(e) => setActiveClassId(Number(e.target.value))}
+                >
+                  {NINJANVR_SECURITY_CLASSES.map((cls, idx) => (
+                    <option key={cls} value={idx}>
+                      {idx}: {cls}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {selectedSample && (
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <button
+                    type="button"
+                    className={`nvr-btn mono ${selectedSample.verified ? "active" : ""}`}
+                    style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    onClick={() =>
+                      void handleUpdateSample(selectedSample, {
+                        verified: !selectedSample.verified,
+                      })
+                    }
+                  >
+                    {selectedSample.verified ? "Verified ✓" : "Verify"}
+                  </button>
+                  <button
+                    type="button"
+                    className="nvr-btn mono"
+                    style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    disabled={busyAction === `auto-${selectedSample.id}`}
+                    onClick={() => void handleAutoAnnotateSample(selectedSample.id)}
+                  >
+                    <Sparkles size={11} />
+                    Auto-Annotate with AI
+                  </button>
+                  <button
+                    type="button"
+                    className="nvr-btn danger mono"
+                    style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                    aria-label="Delete dataset sample"
+                    onClick={() => void handleDeleteSample(selectedSample.id)}
+                  >
+                    <Trash2 size={11} />
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {selectedSample ? (
+              <div
+                style={{
+                  position: "relative",
+                  height: 210,
+                  background: "var(--bg-deep)",
+                  border: "1px solid var(--border-hairline)",
+                  borderRadius: 3,
+                  overflow: "hidden",
+                }}
+              >
+                <img
+                  src={`/api/dataset/samples/${encodeURIComponent(
+                    selectedSample.id
+                  )}/image.webp`}
+                  alt={selectedSample.id}
+                  style={{
+                    width: "100%",
+                    height: "100%",
+                    objectFit: "contain",
+                    display: "block",
+                  }}
+                />
+                <svg
+                  viewBox="0 0 1000 1000"
+                  preserveAspectRatio="none"
+                  onClick={handleSvgClick}
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    width: "100%",
+                    height: "100%",
+                    cursor: "crosshair",
+                  }}
+                >
+                  {(selectedSample.annotations || []).map((ann, idx) => {
+                    const [x1, y1, x2, y2] = yoloNormalizedToXyxy(ann);
+                    return (
+                      <g key={`${ann.class_id}-${idx}`}>
+                        <rect
+                          x={x1 * 1000}
+                          y={y1 * 1000}
+                          width={(x2 - x1) * 1000}
+                          height={(y2 - y1) * 1000}
+                          fill="rgba(14, 165, 233, 0.16)"
+                          stroke="#38bdf8"
+                          strokeWidth={4}
+                        />
+                        <text
+                          x={x1 * 1000 + 8}
+                          y={Math.max(24, y1 * 1000 + 22)}
+                          fill="#f8fafc"
+                          fontSize={22}
+                          fontFamily="monospace"
+                        >
+                          {ann.class_id}:{ann.label} ({ann.cx.toFixed(2)},{ann.cy.toFixed(2)})
+                        </text>
+                      </g>
+                    );
+                  })}
+                </svg>
+              </div>
+            ) : (
+              <div
+                className="mono"
+                style={{
+                  height: 180,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  color: "var(--text-muted)",
+                  fontSize: "var(--text-xs)",
+                }}
+              >
+                Select a dataset sample to inspect or draw normalized YOLO bounding boxes.
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Zero-Downtime Custom Model Upload & Hot-Reload Bar */}
+        <div
+          style={{
+            padding: 8,
+            background: "var(--bg-canvas)",
+            border: "1px solid var(--border-hairline)",
+            borderRadius: 3,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            flexWrap: "wrap",
+            gap: 8,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700 }}>
+              HOT-RELOAD FINE-TUNED MODEL:
+            </span>
+            <input
+              type="file"
+              accept=".onnx,.xml,.bin"
+              aria-label="Select custom .onnx or .xml model file"
+              className="mono"
+              style={{ fontSize: "var(--text-xs)" }}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                setUploadFilename(file.name);
+                const reader = new FileReader();
+                reader.onload = () => {
+                  if (typeof reader.result === "string") {
+                    setUploadBase64(reader.result);
+                  }
+                };
+                reader.readAsDataURL(file);
+              }}
+            />
+            <input
+              type="text"
+              className="nvr-input mono"
+              aria-label="Custom model filename"
+              style={{ width: 170, height: 24, fontSize: "var(--text-xs)" }}
+              value={uploadFilename}
+              onChange={(e) => setUploadFilename(e.target.value)}
+            />
+            <select
+              className="nvr-select mono"
+              aria-label="Model input dimensions"
+              style={{ height: 24, fontSize: "var(--text-xs)" }}
+              value={`${uploadWidth}x${uploadHeight}`}
+              onChange={(e) => {
+                const [w, h] = e.target.value.split("x").map(Number);
+                setUploadWidth(w || 640);
+                setUploadHeight(h || 640);
+              }}
+            >
+              <option value="640x640">640×640 (YOLOv8/v11)</option>
+              <option value="320x320">320×320 (YOLOX Edge)</option>
+              <option value="300x300">300×300 (SSD)</option>
+            </select>
+          </div>
+
+          <button
+            type="button"
+            className="nvr-btn success mono"
+            style={{ height: 24, padding: "0 10px", fontSize: "var(--text-xs)" }}
+            disabled={busyAction === "upload-model"}
+            onClick={() => void handleUploadModel()}
+          >
+            {busyAction === "upload-model"
+              ? "Uploading & Reloading..."
+              : "Upload Trained .onnx Model & Hot-Reload"}
+          </button>
         </div>
       </div>
     </div>
