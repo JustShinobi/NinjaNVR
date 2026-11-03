@@ -315,7 +315,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               className={`nvr-settings-nav-item ${isActive ? "active" : ""}`}
               onClick={() => selectCategory(cat.id)}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 9, minWidth: 0, flex: 1 }}>
                 <span
                   className="mono"
                   style={{
@@ -324,11 +324,12 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                       ? "var(--signal-accent-text)"
                       : "var(--text-muted)",
                     fontWeight: 700,
+                    flexShrink: 0,
                   }}
                 >
                   {cat.num}
                 </span>
-                <div>
+                <div style={{ minWidth: 0, flex: 1 }}>
                   <div
                     style={{
                       fontSize: "var(--text-sm)",
@@ -336,6 +337,9 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                       color: isActive
                         ? "var(--text-primary)"
                         : "var(--text-secondary)",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
                     }}
                   >
                     {cat.title}
@@ -345,6 +349,9 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                     style={{
                       fontSize: "var(--text-xs)",
                       color: "var(--text-muted)",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
                     }}
                   >
                     {cat.sub}
@@ -557,7 +564,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                   ffprobeInfo={ffprobeInfo}
                   notify={notify}
                 />
-                <div className="nvr-cfg-card" style={{ marginTop: 10 }}>
+                <div className="nvr-cfg-card">
                   <div className="nvr-cfg-card-header">
                     <span>CAMERA TECHNICAL & MAINTENANCE NOTES // {inspectorCam.toUpperCase()}</span>
                     <span className="mono">cameras.{inspectorCam}.notes</span>

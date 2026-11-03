@@ -934,10 +934,16 @@ export const RecordingReviewSection: React.FC<{
                     (s.selection = e.target.value as
                       | "best_overall"
                       | "best_in_zone"
-                      | "first_trigger")
+                      | "first_trigger"
+                      | "best_attribute")
                 )
               }
             >
+              <option value="best_attribute">
+                {isPt
+                  ? "Melhor Atributo (Face / Placa) (best_attribute)"
+                  : "Best Attribute (Face / Plate) (best_attribute)"}
+              </option>
               <option value="best_in_zone">
                 {isPt ? "Melhor na Zona (best_in_zone)" : "Best in Zone (best_in_zone)"}
               </option>
@@ -1980,226 +1986,225 @@ export const CommsAuthUsersSection: React.FC<{
               Generate API Token
             </button>
           </div>
-        </div>
 
-        <div
-          style={{
-            marginTop: 18,
-            paddingTop: 14,
-            borderTop: "1px solid var(--border-hairline)",
-            display: "flex",
-            flexDirection: "column",
-            gap: 10,
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <strong className="mono" style={{ fontSize: 12, color: "var(--text-primary)" }}>
-              {isPt
-                ? "SSO OPENID CONNECT (AUTHELIA / ZITADEL) & FORWARDAUTH"
-                : "OPENID CONNECT (OIDC) SSO & TRUSTED-PROXY FORWARDAUTH"}
-            </strong>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                OIDC SSO:
-              </span>
-              <ToggleSwitch
-                checked={Boolean(authCfg.oidc?.enabled)}
-                label="Enable OIDC SSO"
-                onChange={(v) =>
-                  mutateAuth({
-                    oidc: {
-                      enabled: v,
-                      provider_name: authCfg.oidc?.provider_name || "Zitadel",
-                      issuer_url: authCfg.oidc?.issuer_url || "",
-                      client_id: authCfg.oidc?.client_id || "",
-                      client_secret_env:
-                        authCfg.oidc?.client_secret_env || "NINJANVR_OIDC_CLIENT_SECRET",
-                      auto_redirect: authCfg.oidc?.auto_redirect ?? false,
-                      default_role: authCfg.oidc?.default_role || "viewer",
-                    },
-                  })
-                }
-              />
-              <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Auto-Redirect:
-              </span>
-              <ToggleSwitch
-                checked={Boolean(authCfg.oidc?.auto_redirect)}
-                label="Auto-Redirect to OIDC SSO"
-                onChange={(v) =>
-                  mutateAuth({
-                    oidc: {
-                      ...(authCfg.oidc || { enabled: true }),
-                      auto_redirect: v,
-                    },
-                  })
-                }
-              />
-              <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                ForwardAuth Proxy:
-              </span>
-              <ToggleSwitch
-                checked={Boolean(authCfg.proxy?.enabled)}
-                label="Enable Trusted-Proxy ForwardAuth"
-                onChange={(v) =>
-                  mutateAuth({
-                    proxy: {
-                      enabled: v,
-                      trusted_proxies: authCfg.proxy?.trusted_proxies || ["127.0.0.1/32"],
-                      user_header: authCfg.proxy?.user_header || "Remote-User",
-                      groups_header: authCfg.proxy?.groups_header || "Remote-Groups",
-                      logout_url: authCfg.proxy?.logout_url || "",
-                    },
-                  })
-                }
-              />
+          <div
+            className="nvr-subcard"
+            style={{
+              marginTop: 4,
+              display: "flex",
+              flexDirection: "column",
+              gap: 10,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+              <strong className="mono" style={{ fontSize: 12, color: "var(--text-primary)" }}>
+                {isPt
+                  ? "SSO OPENID CONNECT (AUTHELIA / ZITADEL) & FORWARDAUTH"
+                  : "OPENID CONNECT (OIDC) SSO & TRUSTED-PROXY FORWARDAUTH"}
+              </strong>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  OIDC SSO:
+                </span>
+                <ToggleSwitch
+                  checked={Boolean(authCfg.oidc?.enabled)}
+                  label="Enable OIDC SSO"
+                  onChange={(v) =>
+                    mutateAuth({
+                      oidc: {
+                        enabled: v,
+                        provider_name: authCfg.oidc?.provider_name || "Zitadel",
+                        issuer_url: authCfg.oidc?.issuer_url || "",
+                        client_id: authCfg.oidc?.client_id || "",
+                        client_secret_env:
+                          authCfg.oidc?.client_secret_env || "NINJANVR_OIDC_CLIENT_SECRET",
+                        auto_redirect: authCfg.oidc?.auto_redirect ?? false,
+                        default_role: authCfg.oidc?.default_role || "viewer",
+                      },
+                    })
+                  }
+                />
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  Auto-Redirect:
+                </span>
+                <ToggleSwitch
+                  checked={Boolean(authCfg.oidc?.auto_redirect)}
+                  label="Auto-Redirect to OIDC SSO"
+                  onChange={(v) =>
+                    mutateAuth({
+                      oidc: {
+                        ...(authCfg.oidc || { enabled: true }),
+                        auto_redirect: v,
+                      },
+                    })
+                  }
+                />
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  ForwardAuth Proxy:
+                </span>
+                <ToggleSwitch
+                  checked={Boolean(authCfg.proxy?.enabled)}
+                  label="Enable Trusted-Proxy ForwardAuth"
+                  onChange={(v) =>
+                    mutateAuth({
+                      proxy: {
+                        enabled: v,
+                        trusted_proxies: authCfg.proxy?.trusted_proxies || ["127.0.0.1/32"],
+                        user_header: authCfg.proxy?.user_header || "Remote-User",
+                        groups_header: authCfg.proxy?.groups_header || "Remote-Groups",
+                        logout_url: authCfg.proxy?.logout_url || "",
+                      },
+                    })
+                  }
+                />
+              </div>
             </div>
-          </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1.6fr 1.2fr 0.8fr", gap: 8 }}>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Provider Name
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.6fr) minmax(0, 1.2fr) minmax(0, 0.8fr)", gap: 8 }}>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  Provider Name
+                </div>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  placeholder="Zitadel / Authelia"
+                  value={authCfg.oidc?.provider_name || "SSO"}
+                  onChange={(e) =>
+                    mutateAuth({
+                      oidc: {
+                        ...(authCfg.oidc || { enabled: false }),
+                        provider_name: e.target.value,
+                      },
+                    })
+                  }
+                />
               </div>
-              <input
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                placeholder="Zitadel / Authelia"
-                value={authCfg.oidc?.provider_name || "SSO"}
-                onChange={(e) =>
-                  mutateAuth({
-                    oidc: {
-                      ...(authCfg.oidc || { enabled: false }),
-                      provider_name: e.target.value,
-                    },
-                  })
-                }
-              />
-            </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                OIDC Issuer URL
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  OIDC Issuer URL
+                </div>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  placeholder="https://auth.example.com"
+                  value={authCfg.oidc?.issuer_url || ""}
+                  onChange={(e) =>
+                    mutateAuth({
+                      oidc: {
+                        ...(authCfg.oidc || { enabled: false }),
+                        issuer_url: e.target.value,
+                      },
+                    })
+                  }
+                />
               </div>
-              <input
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                placeholder="https://auth.example.com"
-                value={authCfg.oidc?.issuer_url || ""}
-                onChange={(e) =>
-                  mutateAuth({
-                    oidc: {
-                      ...(authCfg.oidc || { enabled: false }),
-                      issuer_url: e.target.value,
-                    },
-                  })
-                }
-              />
-            </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                OIDC Client ID
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  OIDC Client ID
+                </div>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  placeholder="ninjanvr-web"
+                  value={authCfg.oidc?.client_id || ""}
+                  onChange={(e) =>
+                    mutateAuth({
+                      oidc: {
+                        ...(authCfg.oidc || { enabled: false }),
+                        client_id: e.target.value,
+                      },
+                    })
+                  }
+                />
               </div>
-              <input
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                placeholder="ninjanvr-web"
-                value={authCfg.oidc?.client_id || ""}
-                onChange={(e) =>
-                  mutateAuth({
-                    oidc: {
-                      ...(authCfg.oidc || { enabled: false }),
-                      client_id: e.target.value,
-                    },
-                  })
-                }
-              />
-            </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Default Role
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  Default Role
+                </div>
+                <select
+                  className="nvr-select mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={authCfg.oidc?.default_role || "viewer"}
+                  onChange={(e) =>
+                    mutateAuth({
+                      oidc: {
+                        ...(authCfg.oidc || { enabled: false }),
+                        default_role: e.target.value,
+                      },
+                    })
+                  }
+                >
+                  <option value="viewer">viewer</option>
+                  <option value="operator">operator</option>
+                  <option value="admin">admin</option>
+                </select>
               </div>
-              <select
-                className="nvr-select mono"
-                style={{ width: "100%", marginTop: 2 }}
-                value={authCfg.oidc?.default_role || "viewer"}
-                onChange={(e) =>
-                  mutateAuth({
-                    oidc: {
-                      ...(authCfg.oidc || { enabled: false }),
-                      default_role: e.target.value,
-                    },
-                  })
-                }
-              >
-                <option value="viewer">viewer</option>
-                <option value="operator">operator</option>
-                <option value="admin">admin</option>
-              </select>
             </div>
-          </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr", gap: 8 }}>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                Trusted Proxy CIDRs (comma-separated)
-              </div>
-              <input
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                placeholder="127.0.0.1/32, 10.42.0.0/16"
-                value={(authCfg.proxy?.trusted_proxies || authCfg.trusted_proxies || []).join(", ")}
-                onChange={(e) => {
-                  const list = e.target.value
-                    .split(",")
-                    .map((s) => s.trim())
-                    .filter(Boolean);
-                  mutateAuth({
-                    trusted_proxies: list,
-                    proxy: {
-                      ...(authCfg.proxy || { enabled: false }),
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr)", gap: 8 }}>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  Trusted Proxy CIDRs (comma-separated)
+                </div>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  placeholder="127.0.0.1/32, 10.42.0.0/16"
+                  value={(authCfg.proxy?.trusted_proxies || authCfg.trusted_proxies || []).join(", ")}
+                  onChange={(e) => {
+                    const list = e.target.value
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean);
+                    mutateAuth({
                       trusted_proxies: list,
-                    },
-                  });
-                }}
-              />
-            </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                ForwardAuth User Header
+                      proxy: {
+                        ...(authCfg.proxy || { enabled: false }),
+                        trusted_proxies: list,
+                      },
+                    });
+                  }}
+                />
               </div>
-              <input
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                placeholder="Remote-User"
-                value={authCfg.proxy?.user_header || "Remote-User"}
-                onChange={(e) =>
-                  mutateAuth({
-                    proxy: {
-                      ...(authCfg.proxy || { enabled: false }),
-                      user_header: e.target.value,
-                    },
-                  })
-                }
-              />
-            </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                ForwardAuth Groups Header
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  ForwardAuth User Header
+                </div>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  placeholder="Remote-User"
+                  value={authCfg.proxy?.user_header || "Remote-User"}
+                  onChange={(e) =>
+                    mutateAuth({
+                      proxy: {
+                        ...(authCfg.proxy || { enabled: false }),
+                        user_header: e.target.value,
+                      },
+                    })
+                  }
+                />
               </div>
-              <input
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                placeholder="Remote-Groups"
-                value={authCfg.proxy?.groups_header || "Remote-Groups"}
-                onChange={(e) =>
-                  mutateAuth({
-                    proxy: {
-                      ...(authCfg.proxy || { enabled: false }),
-                      groups_header: e.target.value,
-                    },
-                  })
-                }
-              />
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  ForwardAuth Groups Header
+                </div>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  placeholder="Remote-Groups"
+                  value={authCfg.proxy?.groups_header || "Remote-Groups"}
+                  onChange={(e) =>
+                    mutateAuth({
+                      proxy: {
+                        ...(authCfg.proxy || { enabled: false }),
+                        groups_header: e.target.value,
+                      },
+                    })
+                  }
+                />
+              </div>
             </div>
           </div>
         </div>

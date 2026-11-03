@@ -744,7 +744,13 @@ export const VisionZonesMotionSection: React.FC<{
               </span>
             </div>
 
-            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(105px, 1fr))",
+                gap: 4,
+              }}
+            >
               {(
                 [
                   ["zone", isPt ? "Zona (Ciano)" : "Zone (Cyan)"],
@@ -760,7 +766,12 @@ export const VisionZonesMotionSection: React.FC<{
                   key={id}
                   type="button"
                   className={`nvr-btn ${polyType === id ? "active" : ""}`}
-                  style={{ flex: 1, height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                  style={{
+                    height: 24,
+                    padding: "0 6px",
+                    fontSize: "var(--text-xs)",
+                    minWidth: 0,
+                  }}
                   onClick={() => setPolyType(id)}
                 >
                   {label}
@@ -770,7 +781,7 @@ export const VisionZonesMotionSection: React.FC<{
 
             {polyType === "state_roi" && (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1.4fr", gap: 6 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.4fr)", gap: 6 }}>
                   <div>
                     <div
                       className="mono"
@@ -818,7 +829,7 @@ export const VisionZonesMotionSection: React.FC<{
                     />
                   </div>
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "1.4fr 0.8fr 0.8fr 1fr 0.9fr", gap: 6 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 1fr)", gap: 6 }}>
                   <div>
                     <div
                       className="mono"
@@ -839,6 +850,28 @@ export const VisionZonesMotionSection: React.FC<{
                       onChange={(e) => setRoiClassesInput(e.target.value)}
                     />
                   </div>
+                  <div>
+                    <div
+                      className="mono"
+                      style={{
+                        fontSize: "var(--text-xs)",
+                        color: "var(--text-secondary)",
+                        marginBottom: 2,
+                      }}
+                    >
+                      {isPt ? "Estado Anômalo" : "Anomaly State"}
+                    </div>
+                    <input
+                      className="nvr-input mono"
+                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                      placeholder="open (optional)"
+                      aria-label="State ROI Anomaly State"
+                      value={roiAnomalyState}
+                      onChange={(e) => setRoiAnomalyState(e.target.value)}
+                    />
+                  </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6 }}>
                   <div>
                     <div
                       className="mono"
@@ -881,26 +914,6 @@ export const VisionZonesMotionSection: React.FC<{
                       aria-label="State ROI Hysteresis Frames"
                       value={roiHysteresis}
                       onChange={(e) => setRoiHysteresis(Math.max(1, Number(e.target.value)))}
-                    />
-                  </div>
-                  <div>
-                    <div
-                      className="mono"
-                      style={{
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-secondary)",
-                        marginBottom: 2,
-                      }}
-                    >
-                      {isPt ? "Estado Anômalo" : "Anomaly State"}
-                    </div>
-                    <input
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
-                      placeholder="open (optional)"
-                      aria-label="State ROI Anomaly State"
-                      value={roiAnomalyState}
-                      onChange={(e) => setRoiAnomalyState(e.target.value)}
                     />
                   </div>
                   <div>
@@ -2510,6 +2523,7 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
             <select
               className="nvr-select mono"
+              style={{ width: 310, maxWidth: "100%" }}
               aria-label="Inference Runtime Backend"
               value={
                 (primaryDet.type || "openvino").toLowerCase() === "onnxruntime" ||
@@ -2540,13 +2554,13 @@ export const AiDetectionObjectsSection: React.FC<{
             >
               <option value="openvino">
                 {isPt
-                  ? "OpenVINO C-API — x86_64 CPU / Intel iGPU / NPU (Padrão)"
-                  : "OpenVINO C-API — x86_64 CPU / Intel iGPU / NPU (Default)"}
+                  ? "OpenVINO — CPU / Intel iGPU / NPU"
+                  : "OpenVINO — CPU / Intel iGPU / NPU"}
               </option>
               <option value="onnxruntime">
                 {isPt
-                  ? "ONNX Runtime C-API — NVIDIA CUDA / TensorRT / ROCm / ARM64"
-                  : "ONNX Runtime C-API — NVIDIA CUDA / TensorRT / ROCm / ARM64"}
+                  ? "ONNX Runtime — CUDA / TensorRT / ROCm / ARM64"
+                  : "ONNX Runtime — CUDA / TensorRT / ROCm / ARM64"}
               </option>
             </select>
           </div>
@@ -2565,6 +2579,7 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
             <select
               className="nvr-select mono"
+              style={{ width: 310, maxWidth: "100%" }}
               aria-label="OpenVINO Execution Device"
               value={primaryDet.device || "CPU"}
               onChange={(e) => {
@@ -2629,6 +2644,7 @@ export const AiDetectionObjectsSection: React.FC<{
               justifyContent: "space-between",
               height: 24,
               fontSize: "var(--text-xs)",
+              marginTop: "auto",
             }}
             onClick={() => setShowAdvancedModel((v) => !v)}
           >
@@ -2642,7 +2658,7 @@ export const AiDetectionObjectsSection: React.FC<{
 
           {showAdvancedModel && (
             <div className="nvr-subcard">
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 6 }}>
                 <div>
                   <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                     Width
@@ -2796,9 +2812,10 @@ export const AiDetectionObjectsSection: React.FC<{
                   : "Routes this camera to a dedicated detector instance or the default pool."}
               </div>
             </div>
-            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+            <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0, maxWidth: "100%" }}>
               <select
                 className="nvr-select mono"
+                style={{ width: 220, maxWidth: "100%" }}
                 aria-label="Assigned AI Detector Instance"
                 value={activeDetect.detector || ""}
                 onChange={(e) =>
@@ -2819,7 +2836,7 @@ export const AiDetectionObjectsSection: React.FC<{
               <button
                 type="button"
                 className="nvr-btn mono"
-                style={{ height: 26, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                style={{ height: 28, padding: "0 8px", fontSize: "var(--text-xs)" }}
                 title="Add another detector worker instance to the pool"
                 onClick={() => {
                   const nextIdx = detKeys.length + 1;
@@ -2840,15 +2857,22 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
           </div>
 
-          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            <div className="nvr-field-label">
-              {isPt
-                ? "Resolução do Substream de Detecção"
-                : "Substream Detection Resolution"}
+          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt
+                  ? "Resolução do Substream de Detecção"
+                  : "Substream Detection Resolution"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Resolução de decodificação para movimento e detecção de objetos."
+                  : "Decode resolution for motion and AI object detection pipeline."}
+              </div>
             </div>
             <select
               className="nvr-select mono"
-              style={{ width: "100%" }}
+              style={{ width: 310, maxWidth: "100%" }}
               aria-label="Substream Detection Resolution"
               value={isCustomResolution || !isStandardRes ? "custom" : currentResPreset}
               onChange={(e) => {
@@ -2886,56 +2910,59 @@ export const AiDetectionObjectsSection: React.FC<{
                   : `Custom Resolution (${activeDetect.width}×${activeDetect.height})...`}
               </option>
             </select>
-
-            {(isCustomResolution || !isStandardRes) && (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 4 }}>
-                <div>
-                  <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                    {isPt ? "Largura (px)" : "Width (px)"}
-                  </div>
-                  <input
-                    type="number"
-                    min={160}
-                    max={3840}
-                    step={4}
-                    className="nvr-input mono"
-                    style={{ width: "100%", marginTop: 2 }}
-                    value={activeDetect.width}
-                    onChange={(e) => updateDetect({ width: Number(e.target.value) })}
-                  />
-                </div>
-                <div>
-                  <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                    {isPt ? "Altura (px)" : "Height (px)"}
-                  </div>
-                  <input
-                    type="number"
-                    min={120}
-                    max={2160}
-                    step={4}
-                    className="nvr-input mono"
-                    style={{ width: "100%", marginTop: 2 }}
-                    value={activeDetect.height}
-                    onChange={(e) => updateDetect({ height: Number(e.target.value) })}
-                  />
-                </div>
-              </div>
-            )}
           </div>
+
+          {(isCustomResolution || !isStandardRes) && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Largura (px)" : "Width (px)"}
+                </div>
+                <input
+                  type="number"
+                  min={160}
+                  max={3840}
+                  step={4}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeDetect.width}
+                  onChange={(e) => updateDetect({ width: Number(e.target.value) })}
+                />
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Altura (px)" : "Height (px)"}
+                </div>
+                <input
+                  type="number"
+                  min={120}
+                  max={2160}
+                  step={4}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeDetect.height}
+                  onChange={(e) => updateDetect({ height: Number(e.target.value) })}
+                />
+              </div>
+            </div>
+          )}
 
           {/* 1-Click Tracking Sensitivity Presets */}
           <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", fontWeight: 700 }}>
             {isPt ? "PERFIL DE RESPOSTA DO RASTREADOR" : "TRACKING RESPONSIVENESS PRESET"}
           </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6 }}>
             <button
               type="button"
               className={`nvr-btn ${activeTrackPreset === "balanced" ? "active" : ""}`}
               style={{
                 height: "auto",
+                minWidth: 0,
                 padding: "6px 8px",
                 flexDirection: "column",
                 alignItems: "flex-start",
+                textAlign: "left",
+                whiteSpace: "normal",
                 gap: 2,
               }}
               onClick={() =>
@@ -2960,9 +2987,12 @@ export const AiDetectionObjectsSection: React.FC<{
               className={`nvr-btn ${activeTrackPreset === "fast" ? "active" : ""}`}
               style={{
                 height: "auto",
+                minWidth: 0,
                 padding: "6px 8px",
                 flexDirection: "column",
                 alignItems: "flex-start",
+                textAlign: "left",
+                whiteSpace: "normal",
                 gap: 2,
               }}
               onClick={() =>
@@ -2987,9 +3017,12 @@ export const AiDetectionObjectsSection: React.FC<{
               className={`nvr-btn ${activeTrackPreset === "strict" ? "active" : ""}`}
               style={{
                 height: "auto",
+                minWidth: 0,
                 padding: "6px 8px",
                 flexDirection: "column",
                 alignItems: "flex-start",
+                textAlign: "left",
+                whiteSpace: "normal",
                 gap: 2,
               }}
               onClick={() =>
@@ -3019,6 +3052,7 @@ export const AiDetectionObjectsSection: React.FC<{
               justifyContent: "space-between",
               height: 24,
               fontSize: "var(--text-xs)",
+              marginTop: "auto",
             }}
             onClick={() => setShowAdvancedByteTrack((v) => !v)}
           >
@@ -3036,7 +3070,7 @@ export const AiDetectionObjectsSection: React.FC<{
               style={{
                 padding: 8,
                 display: "grid",
-                gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr",
+                gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
                 gap: 6,
               }}
             >
@@ -3222,17 +3256,17 @@ export const AiDetectionObjectsSection: React.FC<{
                 </span>
               </div>
 
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                 <span
                   className="mono"
-                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}
                 >
                   {isPt ? "Política de Snapshot:" : "Snapshot Selection Policy:"}
                 </span>
                 <select
                   className="nvr-select mono"
                   aria-label="Snapshot Selection Policy"
-                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  style={{ height: 24, width: 248, maxWidth: "100%", fontSize: "var(--text-xs)" }}
                   value={activeSnapshotSelection}
                   onChange={(e) =>
                     updateSnapshotSelection(
@@ -3247,7 +3281,7 @@ export const AiDetectionObjectsSection: React.FC<{
                   <option value="best_attribute">
                     {isPt
                       ? "Melhor Atributo (Face / Placa) (best_attribute)"
-                      : "Best Attribute (Face / License Plate) (best_attribute)"}
+                      : "Best Attribute (Face / Plate) (best_attribute)"}
                   </option>
                   <option value="best_in_zone">
                     {isPt ? "Melhor na Zona (best_in_zone)" : "Best in Zone (best_in_zone)"}
@@ -3302,7 +3336,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 ))}
               </div>
 
-              <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+              <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
                 <button
                   type="button"
                   className={`nvr-btn ${activeConfPreset === "permissive" ? "active" : ""}`}
@@ -3336,7 +3370,7 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
               <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
                 <div className="nvr-field-meta">
                   <div className="nvr-field-label">
@@ -3415,7 +3449,7 @@ export const AiDetectionObjectsSection: React.FC<{
               <div
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "repeat(4, 1fr)",
+                  gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
                   gap: 8,
                   paddingTop: 2,
                 }}
@@ -3527,7 +3561,7 @@ export const AiDetectionObjectsSection: React.FC<{
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "1fr 1.2fr 1.2fr 1.6fr",
+              gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1.2fr) minmax(0, 1.6fr)",
               gap: 8,
             }}
           >
@@ -3637,7 +3671,7 @@ export const AiDetectionObjectsSection: React.FC<{
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "1fr 1fr",
+              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
               gap: 12,
               paddingTop: 4,
             }}
@@ -3687,7 +3721,7 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
             <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
               <div className="nvr-field-meta">
                 <div className="nvr-field-label mono">
@@ -3910,9 +3944,9 @@ export const AiDetectionObjectsSection: React.FC<{
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "1.2fr 0.8fr 1.4fr",
+              gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 0.8fr) minmax(0, 1.4fr)",
               gap: 10,
-              alignItems: "center",
+              alignItems: "end",
             }}
           >
             <div>
@@ -4180,7 +4214,7 @@ export const AiDetectionObjectsSection: React.FC<{
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "1fr 1fr",
+              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
               gap: 12,
               alignItems: "center",
             }}
@@ -4235,7 +4269,7 @@ export const AiDetectionObjectsSection: React.FC<{
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "2fr 1fr 1fr",
+              gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr)",
               gap: 10,
               alignItems: "end",
             }}
@@ -4491,13 +4525,14 @@ export const AiDetectionObjectsSection: React.FC<{
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "1fr 1.4fr 1.2fr 0.7fr 0.7fr 0.9fr 0.9fr auto",
+              gridTemplateColumns:
+                "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1.2fr) minmax(0, 0.7fr) minmax(0, 0.7fr) minmax(0, 0.9fr) minmax(0, 0.9fr) auto",
               gap: 6,
               alignItems: "end",
             }}
           >
             <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
                 ROI ID
               </div>
               <input
@@ -4510,7 +4545,7 @@ export const AiDetectionObjectsSection: React.FC<{
               />
             </div>
             <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
                 Crop [x1,y1,x2,y2]
               </div>
               <input
@@ -4523,7 +4558,7 @@ export const AiDetectionObjectsSection: React.FC<{
               />
             </div>
             <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
                 States
               </div>
               <input
@@ -4536,7 +4571,7 @@ export const AiDetectionObjectsSection: React.FC<{
               />
             </div>
             <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
                 Interval (s)
               </div>
               <input
@@ -4551,7 +4586,7 @@ export const AiDetectionObjectsSection: React.FC<{
               />
             </div>
             <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
                 Hysteresis
               </div>
               <input
@@ -4566,7 +4601,7 @@ export const AiDetectionObjectsSection: React.FC<{
               />
             </div>
             <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
                 Anomaly State
               </div>
               <input
@@ -4579,7 +4614,7 @@ export const AiDetectionObjectsSection: React.FC<{
               />
             </div>
             <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
                 Timeout (s)
               </div>
               <input

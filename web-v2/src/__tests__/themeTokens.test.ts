@@ -490,4 +490,25 @@ describe("themeTokens colorimetric utilities & cross-monitor invariants (#88)", 
     expect(useNvrStore.getState().themeMode).toBe("system");
     expect(useNvrStore.getState().highContrast).toBe(false);
   });
+
+  test("Settings workbench grid and field-row layout guards prevent column collapse and control overflow", async () => {
+    const cssText = await readSrcFile("../styles.css");
+
+    // 2-column balanced grid prevents auto-fit 4-column collapse when spanning (1 / -1) cards exist below
+    expect(cssText).toMatch(
+      /\.nvr-card-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/
+    );
+    expect(cssText).toMatch(
+      /\.nvr-cfg-card\s*\{[^}]*min-width:\s*0;[\s\S]*?overflow:\s*hidden/
+    );
+    expect(cssText).toMatch(
+      /\.nvr-field-row\s*\{[^}]*flex-wrap:\s*wrap/
+    );
+    expect(cssText).toMatch(
+      /\.nvr-field-meta\s*\{[^}]*min-width:\s*200px/
+    );
+    expect(cssText).toMatch(
+      /\.nvr-field-label\s+svg\s*\{[^}]*flex-shrink:\s*0/
+    );
+  });
 });
