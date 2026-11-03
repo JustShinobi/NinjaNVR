@@ -9,6 +9,7 @@ import { TimelineScrubber } from "../components/TimelineScrubber";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import {
   applyReviewSubLabelUpdate,
+  clearFaceProfileFromReviews,
   formatDetectedAttributePill,
   formatEventLabelWithSubLabel,
   formatLicensePlateBadge,
@@ -86,6 +87,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [reviewNoteDraft, setReviewNoteDraft] = React.useState("");
   const [reviewFaceDraft, setReviewFaceDraft] = React.useState("");
   const [reviewPlateDraft, setReviewPlateDraft] = React.useState("");
+  const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
+  const bumpSubLabelsRefresh = useNvrStore((s) => s.bumpSubLabelsRefresh);
 
   React.useEffect(() => {
     setReviewNoteDraft(activeReview?.data?.notes || "");
@@ -99,10 +102,28 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     activeReview?.data?.recognized_license_plates,
   ]);
 
-  const handleAssignReviewFace = async () => {
+  React.useEffect(() => {
+    if (!lastDeletedFaceProfile?.name || !activeReview) return;
+    const deletedLower = lastDeletedFaceProfile.name.trim().toLowerCase();
+    if (
+      (activeReview.data?.sub_labels || []).some(
+        (s) => s.trim().toLowerCase() === deletedLower
+      )
+    ) {
+      const [cleared] = clearFaceProfileFromReviews(
+        [activeReview],
+        lastDeletedFaceProfile.name
+      );
+      setActiveReview(cleared);
+      setReviewFaceDraft("");
+    }
+  }, [lastDeletedFaceProfile, activeReview, setActiveReview]);
+
+  const handleAssignReviewFace = async (overrideName?: string | null) => {
     if (!activeReview) return;
     const detId = activeReview.data?.detections?.[0] || activeReview.id;
-    const clean = reviewFaceDraft.trim() || null;
+    const raw = overrideName !== undefined ? overrideName : reviewFaceDraft;
+    const clean = raw && raw.trim().length > 0 ? raw.trim() : null;
     const res = await fetch(`/api/events/${encodeURIComponent(detId)}/sub_label`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -116,6 +137,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         clean
       );
       setActiveReview(updated);
+      bumpSubLabelsRefresh();
     }
   };
 
@@ -1117,6 +1139,20 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 >
                   Enroll Face
                 </button>
+                {(activeReview.data?.sub_labels?.length ?? 0) > 0 && (
+                  <button
+                    type="button"
+                    className="nvr-btn danger mono"
+                    style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                    aria-label="Clear or unassign review face sub-label"
+                    onClick={() => {
+                      setReviewFaceDraft("");
+                      void handleAssignReviewFace(null);
+                    }}
+                  >
+                    Clear / Unassign Face
+                  </button>
+                )}
                 <span className="nvr-divider" aria-hidden="true" />
                 <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   LICENSE PLATE:

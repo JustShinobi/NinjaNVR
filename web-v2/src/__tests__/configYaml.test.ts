@@ -14,6 +14,8 @@ import {
 import {
   applyEventSubLabelUpdate,
   applyReviewSubLabelUpdate,
+  clearFaceProfileFromEvents,
+  clearFaceProfileFromReviews,
   formatAiVerificationBadge,
   formatDetectedAttributePill,
   formatEventLabelWithSubLabel,
@@ -23,11 +25,15 @@ import {
 import {
   TacticalPtzHudOverlay,
   buildPtzMovePayload,
+  expandSimulatedFleet,
   formatRoiStateBadge,
   isCameraPtzEnabled,
   resolveCameraPtzPresets,
   resolveCameraRoiStateBadges,
+  resolveRealCameraSource,
+  SIMULATED_FLEET_GROUPS,
 } from "../views/LiveWorkspace";
+import { useNvrStore } from "../store/useNvrStore";
 import {
   buildModelUploadPayload,
   computeDatasetReadinessMetrics,
@@ -42,7 +48,9 @@ import {
   parseRoiClassesInput,
   parseRoiCropInput,
   removeKnownPlateEntry,
+  slugifyRoiLocationName,
   STANDARD_LABELS,
+  STATE_ROI_SCENARIO_PRESETS,
   toggleAttributeLabelList,
   toggleSubLabelRuleList,
   upsertKnownPlateEntry,
@@ -1122,5 +1130,130 @@ cameras:
     expect(yamlText).toContain("unit_system: metric");
     expect(yamlText).toContain("theme: light");
     expect(yamlText).toContain("high_contrast: true");
+  });
+
+  test("clears deleted face profile sub_labels from events and reviews case-insensitively and validates State ROI presets (#56, #58)", () => {
+    const eventsAfterDelete = clearFaceProfileFromEvents(
+      [
+        {
+          id: "ev_erik",
+          camera: "escritorio",
+          label: "person",
+          sub_label: "Erik",
+          sub_label_score: 0.92,
+          zones: [],
+          start_time: 1000,
+          end_time: 1005,
+          top_score: 0.95,
+          score: 0.95,
+          has_clip: true,
+          has_snapshot: true,
+          retain_indefinitely: false,
+          false_positive: false,
+          box: null,
+          data: { sub_label: "Erik", sub_label_score: 0.92 },
+        },
+        {
+          id: "ev_alice",
+          camera: "sala",
+          label: "person",
+          sub_label: "Alice",
+          sub_label_score: 0.88,
+          zones: [],
+          start_time: 1010,
+          end_time: 1015,
+          top_score: 0.91,
+          score: 0.91,
+          has_clip: true,
+          has_snapshot: true,
+          retain_indefinitely: false,
+          false_positive: false,
+          box: null,
+          data: { sub_label: "Alice", sub_label_score: 0.88 },
+        },
+      ],
+      "eRIK"
+    );
+    expect(eventsAfterDelete[0].sub_label).toBeNull();
+    expect(eventsAfterDelete[0].sub_label_score).toBeNull();
+    expect(eventsAfterDelete[0].data?.sub_label).toBeNull();
+    expect(eventsAfterDelete[1].sub_label).toBe("Alice");
+
+    const reviewsAfterDelete = clearFaceProfileFromReviews(
+      [
+        {
+          id: "rev_erik",
+          camera: "escritorio",
+          start_time: 1000,
+          end_time: 1010,
+          severity: "alert",
+          thumb_path: "/thumb.webp",
+          has_been_reviewed: false,
+          data: {
+            objects: ["person"],
+            sub_labels: ["Erik"],
+            sub_label_score: 0.92,
+          },
+        },
+      ],
+      "ERIK"
+    );
+    expect(reviewsAfterDelete[0].data.sub_labels).toEqual([]);
+    expect(reviewsAfterDelete[0].data.sub_label_score).toBeNull();
+
+    // State ROI scenario presets & location name slugification (#58)
+    expect(slugifyRoiLocationName("Porta do Escritório")).toBe("porta_do_escritorio");
+    expect(slugifyRoiLocationName("Portão da Garagem #1")).toBe("portao_da_garagem_1");
+    expect(STATE_ROI_SCENARIO_PRESETS.map((p) => p.id)).toEqual([
+      "door_gate",
+      "parking_spot",
+      "package_area",
+      "fixed_object",
+      "custom",
+    ]);
+  });
+
+  test("expands simulated camera fleet (12 / 36 / 100 channels) and resolves real physical camera sources (#72)", () => {
+    const baseCams = ["escritorio", "sala", "quarto", "cozinha"];
+    expect(resolveRealCameraSource("escritorio", baseCams)).toBe("escritorio");
+    expect(resolveRealCameraSource("escritorio_sim_01", baseCams)).toBe("escritorio");
+    expect(resolveRealCameraSource("sala_sim_02", baseCams)).toBe("sala");
+    expect(resolveRealCameraSource("quarto_sim_07", baseCams)).toBe("quarto");
+    expect(
+      resolveRealCameraSource("cozinha_sim_04", {
+        escritorio: {},
+        sala: {},
+        quarto: {},
+        cozinha: {},
+      })
+    ).toBe("cozinha");
+
+    const fleet12 = expandSimulatedFleet(baseCams, {}, {}, 12);
+    expect(fleet12.cameraNames.length).toBe(12);
+    expect(fleet12.cameraNames.slice(0, 6)).toEqual([
+      "escritorio",
+      "sala",
+      "quarto",
+      "cozinha",
+      "escritorio_sim_01",
+      "sala_sim_02",
+    ]);
+    for (const grp of SIMULATED_FLEET_GROUPS) {
+      expect(fleet12.cameraGroups[grp]).toBeDefined();
+      expect(fleet12.cameraGroups[grp].cameras.length).toBe(3);
+    }
+
+    const fleet36 = expandSimulatedFleet(baseCams, {}, {}, 36);
+    expect(fleet36.cameraNames.length).toBe(36);
+    expect(fleet36.cameraGroups["Interno"].cameras.length).toBe(9);
+
+    const fleet100 = expandSimulatedFleet(baseCams, {}, {}, 100);
+    expect(fleet100.cameraNames.length).toBe(100);
+    expect(fleet100.cameraGroups["Estacionamento"].cameras.length).toBe(25);
+
+    useNvrStore.getState().setSimulatedFleetCount(36);
+    expect(useNvrStore.getState().simulatedFleetCount).toBe(36);
+    useNvrStore.getState().setSimulatedFleetCount(0);
+    expect(useNvrStore.getState().simulatedFleetCount).toBe(0);
   });
 });

@@ -3,8 +3,10 @@ import Hls from "hls.js";
 import { Camera, ChevronLeft, ChevronRight, Mic, MicOff } from "lucide-react";
 import { useI18n } from "../i18n";
 import { CameraConfig } from "../types/nvr";
-import { useNvrStore } from "../store/useNvrStore";
+import { resolveRealCameraSource, useNvrStore } from "../store/useNvrStore";
 import { formatRelTime, formatTs, resolveEffectiveTheme } from "../utils/format";
+
+export { resolveRealCameraSource };
 import { resolveCanvasThemePalette } from "../utils/themeTokens";
 
 export interface PushToTalkTrackLike {
@@ -785,7 +787,11 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const [posterTick, setPosterTick] = useState(() => Date.now());
   const [overlayBox, setOverlayBox] = useState<ContainedBox | null>(null);
   const [pttState, setPttState] = useState<PushToTalkState>("idle");
-  const camStats = useNvrStore((s) => s.stats?.cameras?.[camera]);
+  const configuredCameras = useNvrStore((s) => s.config?.cameras);
+  const realCamera = resolveRealCameraSource(camera, configuredCameras);
+  const camStats = useNvrStore(
+    (s) => s.stats?.cameras?.[camera] ?? s.stats?.cameras?.[realCamera]
+  );
 
   const isOffline =
     streamDisconnected || (camStats !== undefined && camStats.camera_fps === 0 && !mseReady);
@@ -829,7 +835,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   // Periodic fallback snapshot refresh when MSE is still handshaking or camera is offline
   useEffect(() => {
     if (mseReady) return;
-    fetch(`/api/${encodeURIComponent(camera)}/latest.jpg`, {
+    fetch(`/api/${encodeURIComponent(realCamera)}/latest.jpg`, {
       method: "HEAD",
       credentials: "include",
     })
@@ -847,7 +853,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       setPosterTick(Date.now());
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [camera, mseReady]);
+  }, [realCamera, mseReady]);
 
   useEffect(() => {
     const videoEl = videoRef.current;
@@ -861,7 +867,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     let sourceBuffer: SourceBuffer | null = null;
     const queue: ArrayBuffer[] = [];
 
-    const streamSrc = useMainStream ? camera : `${camera}_sub`;
+    const streamSrc = useMainStream ? realCamera : `${realCamera}_sub`;
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${proto}//${window.location.host}/live/mse/api/ws?src=${encodeURIComponent(
       streamSrc
@@ -994,7 +1000,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       }
       URL.revokeObjectURL(objUrl);
     };
-  }, [camera, useMainStream, updateOverlayGeometry]);
+  }, [realCamera, useMainStream, updateOverlayGeometry]);
 
   const masks = extractMaskPolygons(cameraConfig?.motion?.mask);
   const objectMasks = extractMaskPolygons(cameraConfig?.objects?.mask);
@@ -1121,7 +1127,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         <img
           ref={imgRef}
           className="nvr-cam-poster"
-          src={`/api/${camera}/latest.jpg?height=360&cache=${posterTick}`}
+          src={`/api/${encodeURIComponent(realCamera)}/latest.jpg?height=360&cache=${posterTick}`}
           alt={camera}
           onLoad={updateOverlayGeometry}
           style={{

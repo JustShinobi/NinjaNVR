@@ -1,7 +1,20 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Camera, Check, ChevronLeft, ChevronRight, Eye, Play, RefreshCw } from "lucide-react";
 import { useI18n } from "../i18n";
-import { useNvrStore } from "../store/useNvrStore";
+import {
+  expandSimulatedFleet,
+  resolveRealCameraSource,
+  SIMULATED_FLEET_GROUPS,
+  SimulatedFleetCount,
+  useNvrStore,
+} from "../store/useNvrStore";
+
+export {
+  expandSimulatedFleet,
+  resolveRealCameraSource,
+  SIMULATED_FLEET_GROUPS,
+  type SimulatedFleetCount,
+};
 import {
   CameraConfig,
   CameraGroupConfig,
@@ -897,6 +910,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const timeShiftTs = useNvrStore((s) => s.timeShiftTs);
   const setTimeShiftTs = useNvrStore((s) => s.setTimeShiftTs);
   const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
+  const simulatedFleetCount = useNvrStore((s) => s.simulatedFleetCount);
+  const setSimulatedFleetCount = useNvrStore((s) => s.setSimulatedFleetCount);
   const themeMode = useNvrStore((s) => s.themeMode);
   const highContrast = useNvrStore((s) => s.highContrast);
   const effectiveTheme = resolveEffectiveTheme(themeMode);
@@ -908,6 +923,20 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const setConfig = useNvrStore((s) => s.setConfig);
   const stats = useNvrStore((s) => s.stats);
   const cameraActivity = useNvrStore((s) => s.cameraActivity);
+
+  const fleet = useMemo(
+    () =>
+      expandSimulatedFleet(
+        cameraNames,
+        config?.cameras,
+        config?.camera_groups,
+        simulatedFleetCount
+      ),
+    [cameraNames, config?.cameras, config?.camera_groups, simulatedFleetCount]
+  );
+  const effectiveCameraNames = fleet.cameraNames;
+  const effectiveCamerasConfig = fleet.camerasConfig;
+  const effectiveCameraGroups = fleet.cameraGroups;
 
   const lastActiveRef = useRef<Record<string, number>>({});
   const lastSurgeRef = useRef<Record<string, number>>({});
@@ -1087,11 +1116,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     if (mapEditMode) return;
     setMapPlacements((prev) => {
       const next = { ...prev };
-      cameraNames.forEach((cam, idx) => {
-        const cfgMap = config?.cameras?.[cam]?.map;
+      effectiveCameraNames.forEach((cam, idx) => {
+        const cfgMap = effectiveCamerasConfig?.[cam]?.map;
         const fallbackPlacement = computeDefaultMapPlacement(
           idx,
-          cameraNames.length
+          effectiveCameraNames.length
         );
         const isUnconfiguredDefault =
           cfgMap &&
@@ -1112,7 +1141,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       });
       return next;
     });
-  }, [cameraNames, config, mapEditMode]);
+  }, [effectiveCameraNames, effectiveCamerasConfig, mapEditMode]);
 
   const handleFloorplanFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1242,15 +1271,20 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
   const groupCams = useMemo(() => {
     const resolved = resolveOrderedDashboardCameras(
-      cameraNames,
-      config?.cameras,
+      effectiveCameraNames,
+      effectiveCamerasConfig,
       activeCameraGroup,
-      config?.camera_groups
+      effectiveCameraGroups
     );
     return resolved.length > 0 || activeCameraGroup !== "all"
       ? resolved
-      : cameraNames;
-  }, [cameraNames, config?.cameras, activeCameraGroup, config?.camera_groups]);
+      : effectiveCameraNames;
+  }, [
+    effectiveCameraNames,
+    effectiveCamerasConfig,
+    activeCameraGroup,
+    effectiveCameraGroups,
+  ]);
 
   const { visibleMatrixCams, totalPages, safePage } = useMemo(
     () => sliceMatrixPage(groupCams, matrixPage, matrixDensity),
@@ -1272,12 +1306,12 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   ]);
 
   const cameraGroupEntries = useMemo(() => {
-    if (!config?.camera_groups) return [];
-    return Object.entries(config.camera_groups).sort(
+    if (!effectiveCameraGroups) return [];
+    return Object.entries(effectiveCameraGroups).sort(
       ([aKey, aVal], [bKey, bVal]) =>
         ((aVal.order ?? 0) - (bVal.order ?? 0)) || aKey.localeCompare(bKey)
     );
-  }, [config?.camera_groups]);
+  }, [effectiveCameraGroups]);
 
   const spotlightPromotedCams = [...groupCams]
     .filter((cam) => nowTick - (lastActiveRef.current[cam] || 0) <= spotlightHoldSec)
@@ -1381,7 +1415,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
                 onClick={() => setActiveCameraGroup("all")}
               >
-                ALL ({cameraNames.length})
+                ALL ({effectiveCameraNames.length})
               </button>
               {cameraGroupEntries.map(([gName, gCfg]) => (
                 <button
@@ -1523,7 +1557,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 cameras={groupCams}
                 selectedCamera={selectedCamera}
                 onSelect={setSelectedCamera}
-                cameraGroups={config?.camera_groups}
+                cameraGroups={effectiveCameraGroups}
                 cameraStats={stats?.cameras}
                 cameraActivity={cameraActivity}
                 ariaLabel="Focus camera selector"
@@ -1533,6 +1567,50 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <div
+            className="mono"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 3,
+              background: "var(--bg-subcard)",
+              border: "1px solid var(--border-strong)",
+              borderRadius: 3,
+              padding: "1px 4px",
+              fontSize: "var(--text-xs)",
+            }}
+            aria-label="Simulate Fleet (12 / 36 / 100 Cams)"
+          >
+            <span style={{ color: "var(--text-secondary)", padding: "0 2px" }}>
+              Simulate Fleet:
+            </span>
+            {([12, 36, 100] as const).map((cnt) => (
+              <button
+                key={cnt}
+                type="button"
+                className={`nvr-btn mono ${simulatedFleetCount === cnt ? "active" : ""}`}
+                style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                aria-label={`Simulate Fleet ${cnt} Cams`}
+                title={`Clone configured cameras to ${cnt} virtual channels`}
+                onClick={() =>
+                  setSimulatedFleetCount(simulatedFleetCount === cnt ? 0 : cnt)
+                }
+              >
+                {cnt} Cams
+              </button>
+            ))}
+          </div>
+          {simulatedFleetCount > 0 && (
+            <button
+              type="button"
+              className="nvr-btn danger mono"
+              style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)", fontWeight: 700 }}
+              aria-label={`Exit Simulation (Restore ${cameraNames.length || 4} Cameras)`}
+              onClick={() => setSimulatedFleetCount(0)}
+            >
+              Exit Simulation (Restore {cameraNames.length || 4} Cameras)
+            </button>
+          )}
           <select
             className="nvr-select mono"
             aria-label="Camera HUD badge position"
@@ -1732,9 +1810,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       {liveLayout === "2x2" && (
         <div className={`nvr-matrix-${matrixDensity}`}>
           {visibleMatrixCams.map((cam) => {
-            const camCfg = config?.cameras?.[cam];
-            const camStat = stats?.cameras?.[cam];
-            const act = cameraActivity[cam];
+            const realCam = resolveRealCameraSource(
+              cam,
+              config?.cameras || cameraNames
+            );
+            const camCfg = effectiveCamerasConfig?.[cam] ?? config?.cameras?.[realCam];
+            const camStat = stats?.cameras?.[cam] ?? stats?.cameras?.[realCam];
+            const act = cameraActivity[cam] ?? cameraActivity[realCam];
             const activeLabels = Array.from(
               new Set((act?.objects || []).map((o) => o.label.toUpperCase()))
             );
@@ -1754,7 +1836,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               >
                 {isTimeShifted && timeShiftTs !== null ? (
                   <VodHlsPlayer
-                    camera={cam}
+                    camera={realCam}
                     startTime={timeShiftTs}
                     endTime={timeShiftTs + 180}
                     playbackRate={playbackSpeed}
@@ -1849,7 +1931,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       title={`Toggle ${flagKey} at runtime without server restart`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        fetch(`/api/${encodeURIComponent(cam)}/state`, {
+                        fetch(`/api/${encodeURIComponent(realCam)}/state`, {
                           method: "POST",
                           headers: { "Content-Type": "application/json" },
                           credentials: "include",
@@ -1894,9 +1976,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   >
                     Expand
                   </button>
-                  {!isTimeShifted && <PushToTalkButton camera={cam} height={22} />}
+                  {!isTimeShifted && <PushToTalkButton camera={realCam} height={22} />}
                   <a
-                    href={`/api/${cam}/latest.jpg`}
+                    href={`/api/${encodeURIComponent(realCam)}/latest.jpg`}
                     download={`${cam}-snapshot.jpg`}
                     className="nvr-btn nvr-tile-action"
                     style={{
@@ -1912,9 +1994,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     <Camera size={11} />
                   </a>
                   <TacticalPtzHudOverlay
-                    camera={cam}
+                    camera={realCam}
                     cameraConfig={camCfg}
-                    ptzInfo={ptzInfoByCam[cam]}
+                    ptzInfo={ptzInfoByCam[realCam]}
                     onPtzUpdate={handlePtzUpdate}
                   />
                 </div>
@@ -1933,9 +2015,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             style={{ flex: 1, minHeight: 0 }}
           >
             {spotlightActiveCams.map((cam) => {
-              const camCfg = config?.cameras?.[cam];
-              const camStat = stats?.cameras?.[cam];
-              const act = cameraActivity[cam];
+              const realCam = resolveRealCameraSource(
+                cam,
+                config?.cameras || cameraNames
+              );
+              const camCfg = effectiveCamerasConfig?.[cam] ?? config?.cameras?.[realCam];
+              const camStat = stats?.cameras?.[cam] ?? stats?.cameras?.[realCam];
+              const act = cameraActivity[cam] ?? cameraActivity[realCam];
               const activeLabels = (act?.objects || [])
                 .filter((o) => !o.stationary)
                 .map((o) => o.label.toUpperCase());
@@ -2006,9 +2092,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       </span>
                     )}
                     <TacticalPtzHudOverlay
-                      camera={cam}
+                      camera={realCam}
                       cameraConfig={camCfg}
-                      ptzInfo={ptzInfoByCam[cam]}
+                      ptzInfo={ptzInfoByCam[realCam]}
                       onPtzUpdate={handlePtzUpdate}
                     />
                   </div>
@@ -2020,6 +2106,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           {spotlightIdleCams.length > 0 && (
             <div className="nvr-focus-dock">
               {spotlightIdleCams.map((cam, idx) => {
+                const realCam = resolveRealCameraSource(
+                  cam,
+                  config?.cameras || cameraNames
+                );
                 const tileMode = resolveDockTileMode(
                   idx,
                   cam,
@@ -2049,14 +2139,16 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       <LiveMsePlayer
                         camera={cam}
                         useMainStream={false}
-                        cameraConfig={config?.cameras?.[cam]}
+                        cameraConfig={
+                          effectiveCamerasConfig?.[cam] ?? config?.cameras?.[realCam]
+                        }
                         showVectors={showVectors}
                         onClick={promoteCam}
                       />
                     ) : (
                       <img
                         className="nvr-cam-poster"
-                        src={`/api/${encodeURIComponent(cam)}/latest.webp`}
+                        src={`/api/${encodeURIComponent(realCam)}/latest.webp`}
                         alt={`${cam} standby snapshot`}
                         loading="lazy"
                       />
@@ -2066,7 +2158,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         {cam.toUpperCase()} · {tileMode === "mse" ? "STANDBY" : "SNAPSHOT"}
                       </span>
                       {Boolean(
-                        cameraActivity[cam]?.night_mode || stats?.cameras?.[cam]?.night_mode
+                        cameraActivity[cam]?.night_mode ||
+                          cameraActivity[realCam]?.night_mode ||
+                          stats?.cameras?.[cam]?.night_mode ||
+                          stats?.cameras?.[realCam]?.night_mode
                       ) && <span className="nvr-badge mono">IR NIGHT</span>}
                     </div>
                   </div>
@@ -2092,12 +2187,23 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 <LiveMsePlayer
                   camera={selectedCamera}
                   useMainStream={true}
-                  cameraConfig={config?.cameras?.[selectedCamera]}
+                  cameraConfig={
+                    effectiveCamerasConfig?.[selectedCamera] ??
+                    config?.cameras?.[
+                      resolveRealCameraSource(
+                        selectedCamera,
+                        config?.cameras || cameraNames
+                      )
+                    ]
+                  }
                   showVectors={showVectors}
                 />
               ) : (
                 <VodHlsPlayer
-                  camera={selectedCamera}
+                  camera={resolveRealCameraSource(
+                    selectedCamera,
+                    config?.cameras || cameraNames
+                  )}
                   startTime={timeShiftTs}
                   endTime={timeShiftTs + 180}
                   playbackRate={playbackSpeed}
@@ -2114,9 +2220,26 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     : `${t.live.timeShiftBadge} @ ${formatTs(timeShiftTs)}`}
                 </span>
                 <span className="nvr-badge">
-                  {stats?.cameras?.[selectedCamera]?.camera_fps?.toFixed(1) || "5.0"} FPS ·
-                  AI{" "}
-                  {stats?.cameras?.[selectedCamera]?.detection_fps?.toFixed(1) || "0.0"} FPS
+                  {(
+                    stats?.cameras?.[selectedCamera]?.camera_fps ??
+                    stats?.cameras?.[
+                      resolveRealCameraSource(
+                        selectedCamera,
+                        config?.cameras || cameraNames
+                      )
+                    ]?.camera_fps
+                  )?.toFixed(1) || "5.0"}{" "}
+                  FPS · AI{" "}
+                  {(
+                    stats?.cameras?.[selectedCamera]?.detection_fps ??
+                    stats?.cameras?.[
+                      resolveRealCameraSource(
+                        selectedCamera,
+                        config?.cameras || cameraNames
+                      )
+                    ]?.detection_fps
+                  )?.toFixed(1) || "0.0"}{" "}
+                  FPS
                 </span>
                 {(cameraActivity[selectedCamera]?.objects || []).length > 0 ? (
                   <span className="nvr-badge alert">
@@ -2142,7 +2265,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     stats?.cameras?.[selectedCamera]?.night_mode
                 ) && <span className="nvr-badge mono">IR NIGHT</span>}
                 {resolveCameraRoiStateBadges(
-                  config?.cameras?.[selectedCamera],
+                  effectiveCamerasConfig?.[selectedCamera] ??
+                    config?.cameras?.[
+                      resolveRealCameraSource(
+                        selectedCamera,
+                        config?.cameras || cameraNames
+                      )
+                    ],
                   cameraActivity[selectedCamera],
                   stats?.cameras?.[selectedCamera]
                 ).map((badge) => (
@@ -2163,7 +2292,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   </span>
                 ))}
                 {timeShiftTs === null ? (
-                  <PushToTalkButton camera={selectedCamera} height={22} />
+                  <PushToTalkButton
+                    camera={resolveRealCameraSource(
+                      selectedCamera,
+                      config?.cameras || cameraNames
+                    )}
+                    height={22}
+                  />
                 ) : (
                   <button
                     className="nvr-btn success"
@@ -2174,9 +2309,27 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   </button>
                 )}
                 <TacticalPtzHudOverlay
-                  camera={selectedCamera}
-                  cameraConfig={config?.cameras?.[selectedCamera]}
-                  ptzInfo={ptzInfoByCam[selectedCamera]}
+                  camera={resolveRealCameraSource(
+                    selectedCamera,
+                    config?.cameras || cameraNames
+                  )}
+                  cameraConfig={
+                    effectiveCamerasConfig?.[selectedCamera] ??
+                    config?.cameras?.[
+                      resolveRealCameraSource(
+                        selectedCamera,
+                        config?.cameras || cameraNames
+                      )
+                    ]
+                  }
+                  ptzInfo={
+                    ptzInfoByCam[
+                      resolveRealCameraSource(
+                        selectedCamera,
+                        config?.cameras || cameraNames
+                      )
+                    ]
+                  }
                   onPtzUpdate={handlePtzUpdate}
                 />
               </div>
@@ -2186,6 +2339,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           {liveLayout === "focus" && (
             <div className="nvr-focus-dock">
               {focusDockCams.map((cam, idx) => {
+                const realCam = resolveRealCameraSource(
+                  cam,
+                  config?.cameras || cameraNames
+                );
                 const tileMode = resolveDockTileMode(
                   idx,
                   cam,
@@ -2208,14 +2365,16 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       <LiveMsePlayer
                         camera={cam}
                         useMainStream={false}
-                        cameraConfig={config?.cameras?.[cam]}
+                        cameraConfig={
+                          effectiveCamerasConfig?.[cam] ?? config?.cameras?.[realCam]
+                        }
                         showVectors={showVectors}
                         onClick={() => setSelectedCamera(cam)}
                       />
                     ) : (
                       <img
                         className="nvr-cam-poster"
-                        src={`/api/${encodeURIComponent(cam)}/latest.webp`}
+                        src={`/api/${encodeURIComponent(realCam)}/latest.webp`}
                         alt={`${cam} dock snapshot`}
                         loading="lazy"
                       />
@@ -2224,7 +2383,12 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       <span className="nvr-badge live">{cam.toUpperCase()}</span>
                       <span className="nvr-badge">
                         {tileMode === "mse"
-                          ? `${stats?.cameras?.[cam]?.camera_fps?.toFixed(1) || "5.0"} FPS`
+                          ? `${
+                              (
+                                stats?.cameras?.[cam]?.camera_fps ??
+                                stats?.cameras?.[realCam]?.camera_fps
+                              )?.toFixed(1) || "5.0"
+                            } FPS`
                           : "WEBP"}
                       </span>
                     </div>

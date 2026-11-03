@@ -2252,6 +2252,34 @@ impl FaceGallery {
         Ok(gallery)
     }
 
+    /// Resolves an existing canonical profile key matching `clean_name` case-insensitively
+    /// (checking in-memory profiles first, then subdirectories inside `faces_dir`).
+    pub fn resolve_canonical_name(&self, clean_name: &str, faces_dir: Option<&Path>) -> String {
+        if let Some(existing) = self
+            .profiles
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(clean_name))
+        {
+            return existing.clone();
+        }
+        if let Some(dir) = faces_dir.or(self.loaded_dir.as_deref())
+            && dir.exists()
+            && let Ok(entries) = std::fs::read_dir(dir)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && let Some(raw_name) = path.file_name().and_then(|s| s.to_str())
+                    && let Some(sanitized) = sanitize_face_profile_name(raw_name)
+                    && sanitized.eq_ignore_ascii_case(clean_name)
+                {
+                    return sanitized;
+                }
+            }
+        }
+        clean_name.to_string()
+    }
+
     /// Synchronizes enrolled face profiles from `{faces_dir}/<name>/*.{jpg,jpeg,webp,png,bin}`
     /// while preserving any in-memory embeddings already enrolled during the current session.
     pub fn sync_from_dir(&mut self, faces_dir: &Path) -> Result<()> {
@@ -2274,6 +2302,12 @@ impl FaceGallery {
             let Some(name) = sanitize_face_profile_name(raw_name) else {
                 continue;
             };
+            let canonical_key = self
+                .profiles
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(&name))
+                .cloned()
+                .unwrap_or(name);
             let Ok(files) = std::fs::read_dir(&path) else {
                 continue;
             };
@@ -2309,8 +2343,8 @@ impl FaceGallery {
                     }
                 }
                 if !embs.is_empty() {
-                    self.profiles.insert(name.clone(), embs);
-                    self.sample_files.insert(name, names);
+                    self.profiles.insert(canonical_key.clone(), embs);
+                    self.sample_files.insert(canonical_key, names);
                 }
             }
         }
@@ -2324,12 +2358,13 @@ impl FaceGallery {
         if embedding.is_empty() {
             return;
         }
+        let canonical = self.resolve_canonical_name(&clean_name, None);
         l2_normalize_embedding(&mut embedding);
-        let list = self.profiles.entry(clean_name.clone()).or_default();
+        let list = self.profiles.entry(canonical.clone()).or_default();
         list.push(embedding);
         let idx = list.len();
         self.sample_files
-            .entry(clean_name)
+            .entry(canonical)
             .or_default()
             .push(format!("sample_{idx}.bin"));
     }
@@ -2350,7 +2385,8 @@ impl FaceGallery {
     ) -> Result<(PathBuf, Vec<f32>)> {
         let clean_name = sanitize_face_profile_name(name)
             .ok_or_else(|| anyhow!("invalid face profile name '{name}'"))?;
-        let person_dir = faces_dir.as_ref().join(&clean_name);
+        let canonical_name = self.resolve_canonical_name(&clean_name, Some(faces_dir.as_ref()));
+        let person_dir = faces_dir.as_ref().join(&canonical_name);
         std::fs::create_dir_all(&person_dir)?;
 
         let safe_stem: String = file_stem
@@ -2366,7 +2402,7 @@ impl FaceGallery {
         let filename = format!("{stem}.{clean_ext}");
         let file_path = person_dir.join(&filename);
         let payload = if image_bytes.is_empty() {
-            format!("face-profile:{clean_name}:{stem}").into_bytes()
+            format!("face-profile:{canonical_name}:{stem}").into_bytes()
         } else {
             image_bytes.to_vec()
         };
@@ -2374,10 +2410,10 @@ impl FaceGallery {
 
         let emb = extract_face_embedding(&payload);
         self.profiles
-            .entry(clean_name.clone())
+            .entry(canonical_name.clone())
             .or_default()
             .push(emb.clone());
-        let files_entry = self.sample_files.entry(clean_name).or_default();
+        let files_entry = self.sample_files.entry(canonical_name).or_default();
         if !files_entry.contains(&filename) {
             files_entry.push(filename);
         }
@@ -2388,8 +2424,22 @@ impl FaceGallery {
         let Some(clean_name) = sanitize_face_profile_name(name) else {
             return Ok(false);
         };
-        let removed_mem = self.profiles.remove(&clean_name).is_some();
-        self.sample_files.remove(&clean_name);
+        let matching_keys: Vec<String> = self
+            .profiles
+            .keys()
+            .chain(self.sample_files.keys())
+            .filter(|k| k.eq_ignore_ascii_case(&clean_name))
+            .cloned()
+            .collect();
+        let mut removed_mem = false;
+        for key in matching_keys {
+            if self.profiles.remove(&key).is_some() {
+                removed_mem = true;
+            }
+            if self.sample_files.remove(&key).is_some() {
+                removed_mem = true;
+            }
+        }
 
         let mut removed_disk = false;
         if let Some(dir) = faces_dir.or(self.loaded_dir.as_deref()) {
@@ -2397,6 +2447,22 @@ impl FaceGallery {
             if target.exists() {
                 std::fs::remove_dir_all(&target)?;
                 removed_disk = true;
+            }
+            if dir.exists()
+                && let Ok(entries) = std::fs::read_dir(dir)
+            {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir()
+                        && let Some(raw_name) = path.file_name().and_then(|s| s.to_str())
+                        && (raw_name.eq_ignore_ascii_case(&clean_name)
+                            || sanitize_face_profile_name(raw_name)
+                                .is_some_and(|s| s.eq_ignore_ascii_case(&clean_name)))
+                    {
+                        std::fs::remove_dir_all(&path)?;
+                        removed_disk = true;
+                    }
+                }
             }
         }
         Ok(removed_mem || removed_disk)
@@ -4321,5 +4387,41 @@ detectors:
             Arc::ptr_eq(&from_pool, &from_default),
             "DetectorPool must share Arc<AiDetectorEngine> instances rather than loading models twice"
         );
+    }
+
+    #[test]
+    fn face_gallery_enrolls_and_removes_profiles_case_insensitively() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr-face-case-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut gallery = FaceGallery::new();
+        let (p1, _) = gallery
+            .enroll_to_dir(&tmp, "Erik", "sample1", "jpg", b"erik-face-1")
+            .unwrap();
+        assert!(p1.exists());
+
+        // Enrolling "eRIK" resolves to canonical "Erik" instead of creating a duplicate profile
+        let (p2, _) = gallery
+            .enroll_to_dir(&tmp, "eRIK", "sample2", "jpg", b"erik-face-2")
+            .unwrap();
+        assert!(p2.exists());
+        let profiles = gallery.list_profiles(Some(&tmp));
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "Erik");
+        assert_eq!(profiles[0].sample_count, 2);
+
+        // Removing "ERIK" removes canonical "Erik" in memory and on disk
+        let removed = gallery.remove_profile(Some(&tmp), "ERIK").unwrap();
+        assert!(removed);
+        assert!(gallery.list_profiles(Some(&tmp)).is_empty());
+        assert!(!tmp.join("Erik").exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import {
+  CameraConfig,
+  CameraGroupConfig,
   CameraLiveActivity,
   NinjaConfigResponse,
   NinjaStatsResponse,
@@ -22,6 +24,152 @@ import {
   resolveInitialTab,
   resolveInitialThemeMode,
 } from "../utils/format";
+
+export type SimulatedFleetCount = 0 | 12 | 36 | 100;
+
+export const SIMULATED_FLEET_GROUPS = [
+  "Interno",
+  "Perímetro",
+  "Andar 1",
+  "Estacionamento",
+] as const;
+
+export function resolveInitialSimulatedFleetCount(): SimulatedFleetCount {
+  try {
+    if (typeof window !== "undefined") {
+      const raw = Number(
+        window.localStorage?.getItem("ninjanvr_simulated_fleet_count") || "0"
+      );
+      if (raw === 12 || raw === 36 || raw === 100) {
+        return raw;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return 0;
+}
+
+/**
+ * Resolves a simulated camera clone name (e.g. `escritorio_sim_01`, `sala_sim_02`)
+ * back to its underlying real physical camera so `<LiveMsePlayer>` and snapshot URLs
+ * (`/api/:cam/latest.webp`) stream real live MSE video and snapshots without touching `config.yml`.
+ */
+export function resolveRealCameraSource(
+  cameraName: string,
+  configuredCameras?: Record<string, unknown> | string[] | null
+): string {
+  const realList: string[] = Array.isArray(configuredCameras)
+    ? configuredCameras.filter(Boolean)
+    : configuredCameras && typeof configuredCameras === "object"
+    ? Object.keys(configuredCameras)
+    : [];
+
+  const clean = (cameraName || "").trim();
+  if (!clean) {
+    return realList[0] || "escritorio";
+  }
+  if (realList.includes(clean)) {
+    return clean;
+  }
+
+  const simMatch = clean.match(/^(.+)_sim_(\d+)$/);
+  if (simMatch) {
+    const baseName = simMatch[1];
+    const simIdx = Math.max(0, parseInt(simMatch[2], 10) - 1);
+    if (realList.length === 0 || realList.includes(baseName)) {
+      return baseName;
+    }
+    return realList[simIdx % realList.length];
+  }
+
+  if (realList.length > 0) {
+    const prefixHit = realList.find((rc) => clean.startsWith(`${rc}_sim_`));
+    if (prefixHit) return prefixHit;
+    return realList[0];
+  }
+
+  return clean;
+}
+
+export interface ExpandedSimulatedFleet {
+  cameraNames: string[];
+  camerasConfig: Record<string, CameraConfig>;
+  cameraGroups: Record<string, CameraGroupConfig>;
+}
+
+/**
+ * Dynamically expands the real configured cameras into `simulatedFleetCount` virtual channels
+ * (e.g. `escritorio_sim_01`, `sala_sim_02`, ...) and populates tactical `camera_groups`
+ * (`Interno`, `Perímetro`, `Andar 1`, `Estacionamento`) in memory.
+ */
+export function expandSimulatedFleet(
+  realCameraNames: string[],
+  camerasConfig?: Record<string, CameraConfig> | null,
+  cameraGroups?: Record<string, CameraGroupConfig> | null,
+  simulatedFleetCount: SimulatedFleetCount = 0
+): ExpandedSimulatedFleet {
+  const baseCams =
+    realCameraNames.length > 0
+      ? realCameraNames
+      : ["escritorio", "sala", "quarto", "cozinha"];
+  const baseCfgMap: Record<string, CameraConfig> = { ...(camerasConfig || {}) };
+  const baseGroups: Record<string, CameraGroupConfig> = {
+    ...(cameraGroups || {}),
+  };
+
+  if (!simulatedFleetCount || simulatedFleetCount <= 0) {
+    return {
+      cameraNames: baseCams,
+      camerasConfig: baseCfgMap,
+      cameraGroups: baseGroups,
+    };
+  }
+
+  const expandedNames: string[] = [];
+  const expandedCfg: Record<string, CameraConfig> = { ...baseCfgMap };
+
+  for (let i = 0; i < simulatedFleetCount; i++) {
+    const sourceCam = baseCams[i % baseCams.length];
+    const camName =
+      i < baseCams.length
+        ? sourceCam
+        : `${sourceCam}_sim_${String(i - baseCams.length + 1).padStart(2, "0")}`;
+    expandedNames.push(camName);
+
+    const srcCfg = baseCfgMap[sourceCam];
+    if (srcCfg) {
+      expandedCfg[camName] = {
+        ...srcCfg,
+        name: camName,
+        enabled: true,
+        ui: {
+          ...(srcCfg.ui || {}),
+          order: i + 1,
+          dashboard: true,
+        },
+      };
+    }
+  }
+
+  const expandedGroups: Record<string, CameraGroupConfig> = { ...baseGroups };
+  SIMULATED_FLEET_GROUPS.forEach((groupName, gIdx) => {
+    const groupCams = expandedNames.filter(
+      (_, idx) => idx % SIMULATED_FLEET_GROUPS.length === gIdx
+    );
+    expandedGroups[groupName] = {
+      order: gIdx + 1,
+      icon: "camera",
+      cameras: groupCams,
+    };
+  });
+
+  return {
+    cameraNames: expandedNames,
+    camerasConfig: expandedCfg,
+    cameraGroups: expandedGroups,
+  };
+}
 
 interface NvrRealtimeState {
   activeTab: WorkspaceTab;
@@ -47,6 +195,9 @@ interface NvrRealtimeState {
   highContrast: boolean;
   timeShiftTs: number | null;
   playbackSpeed: number;
+  simulatedFleetCount: SimulatedFleetCount;
+  lastDeletedFaceProfile: { name: string; ts: number } | null;
+  subLabelsRefreshTick: number;
   wsOnline: boolean;
   config: NinjaConfigResponse | null;
   stats: NinjaStatsResponse | null;
@@ -78,6 +229,9 @@ interface NvrRealtimeState {
   setHighContrast: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
   setTimeShiftTs: (ts: number | null) => void;
   setPlaybackSpeed: (spd: number) => void;
+  setSimulatedFleetCount: (count: SimulatedFleetCount) => void;
+  recordDeletedFaceProfile: (name: string) => void;
+  bumpSubLabelsRefresh: () => void;
   resetUiPreferences: () => void;
   setWsOnline: (online: boolean) => void;
   setConfig: (config: NinjaConfigResponse | null) => void;
@@ -110,6 +264,9 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   highContrast: resolveInitialBool("ninjanvr_high_contrast", false),
   timeShiftTs: null,
   playbackSpeed: resolveInitialPlaybackSpeed(),
+  simulatedFleetCount: resolveInitialSimulatedFleetCount(),
+  lastDeletedFaceProfile: null,
+  subLabelsRefreshTick: 0,
   wsOnline: false,
   config: null,
   stats: null,
@@ -227,6 +384,43 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
     }
     set({ playbackSpeed });
   },
+  setSimulatedFleetCount: (simulatedFleetCount) => {
+    if (typeof window !== "undefined") {
+      if (simulatedFleetCount > 0) {
+        window.localStorage?.setItem(
+          "ninjanvr_simulated_fleet_count",
+          String(simulatedFleetCount)
+        );
+      } else {
+        window.localStorage?.removeItem("ninjanvr_simulated_fleet_count");
+      }
+    }
+    set((s) => {
+      const nextSelected =
+        simulatedFleetCount === 0
+          ? resolveRealCameraSource(s.selectedCamera, s.config?.cameras)
+          : s.selectedCamera;
+      const nextGroup =
+        simulatedFleetCount === 0 &&
+        s.activeCameraGroup !== "all" &&
+        !s.config?.camera_groups?.[s.activeCameraGroup]
+          ? "all"
+          : s.activeCameraGroup;
+      return {
+        simulatedFleetCount,
+        matrixPage: 0,
+        selectedCamera: nextSelected,
+        activeCameraGroup: nextGroup,
+      };
+    });
+  },
+  recordDeletedFaceProfile: (name) =>
+    set((s) => ({
+      lastDeletedFaceProfile: { name: name.trim(), ts: Date.now() },
+      subLabelsRefreshTick: s.subLabelsRefreshTick + 1,
+    })),
+  bumpSubLabelsRefresh: () =>
+    set((s) => ({ subLabelsRefreshTick: s.subLabelsRefreshTick + 1 })),
   resetUiPreferences: () => {
     if (typeof window !== "undefined") {
       [
@@ -242,6 +436,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
         "ninjanvr_theme_mode",
         "ninjanvr_high_contrast",
         "ninjanvr_playback_speed",
+        "ninjanvr_simulated_fleet_count",
       ].forEach((k) => window.localStorage?.removeItem(k));
     }
     applyThemeToDocument("dark", false);
@@ -263,6 +458,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       themeMode: "dark",
       highContrast: false,
       playbackSpeed: 1,
+      simulatedFleetCount: 0,
     });
   },
   setWsOnline: (wsOnline) => set({ wsOnline }),

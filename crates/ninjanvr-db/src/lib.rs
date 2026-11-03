@@ -2377,6 +2377,80 @@ impl NinjaDatabase {
         Ok(out)
     }
 
+    /// Clears `sub_label`, `sub_label_score`, and `data.sub_label` on all events matching
+    /// `profile_name` case-insensitively, and removes the deleted profile's `sub_label` from
+    /// all referencing `reviewsegment` rows.
+    pub fn clear_face_profile_sub_labels(&self, profile_name: &str) -> Result<usize> {
+        let clean = profile_name.trim();
+        if clean.is_empty() {
+            return Ok(0);
+        }
+
+        let matching_event_ids: Vec<String> = {
+            let conn = self.conn.lock().expect("db mutex poisoned");
+            let mut stmt = conn.prepare(
+                "SELECT id FROM event
+                 WHERE LOWER(TRIM(COALESCE(sub_label, ''))) = LOWER(TRIM(?1))
+                    OR LOWER(TRIM(COALESCE(json_extract(data, '$.sub_label'), ''))) = LOWER(TRIM(?1))",
+            )?;
+            let rows = stmt.query_map(params![clean], |r| r.get::<_, String>(0))?;
+            rows.flatten().collect()
+        };
+
+        let mut cleared_events = 0usize;
+        for ev_id in &matching_event_ids {
+            cleared_events += self.set_event_sub_label_with_score(ev_id, None, None)?;
+        }
+
+        // Also scrub any reviewsegment rows whose `data.sub_labels` still contains `clean` case-insensitively
+        {
+            let conn = self.conn.lock().expect("db mutex poisoned");
+            let like_pattern = format!("%{}%", clean.to_lowercase().replace('"', ""));
+            let mut stmt =
+                conn.prepare("SELECT id, data FROM reviewsegment WHERE LOWER(data) LIKE ?1")?;
+            let rev_rows: Vec<(String, String)> = stmt
+                .query_map(params![like_pattern], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    ))
+                })?
+                .flatten()
+                .collect();
+            drop(stmt);
+
+            for (rev_id, raw_data) in rev_rows {
+                let mut data_val = parse_json_or(Some(raw_data), json!({}));
+                let Some(obj) = data_val.as_object_mut() else {
+                    continue;
+                };
+                let Some(arr) = obj.get("sub_labels").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                let prev_len = arr.len();
+                let filtered: Vec<String> = arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .filter(|s| !s.trim().eq_ignore_ascii_case(clean))
+                    .collect();
+                if filtered.len() != prev_len {
+                    if filtered.is_empty() {
+                        obj.remove("sub_label_score");
+                    }
+                    obj.insert("sub_labels".to_string(), json!(filtered));
+                    if let Ok(new_data) = serde_json::to_string(&data_val) {
+                        let _ = conn.execute(
+                            "UPDATE reviewsegment SET data = ?1 WHERE id = ?2",
+                            params![new_data, rev_id],
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(cleared_events)
+    }
+
     pub fn set_event_description(&self, id: &str, description: &str) -> Result<usize> {
         let Some(mut ev) = self.get_event(id)? else {
             return Ok(0);
@@ -5998,6 +6072,91 @@ mod tests {
         );
 
         drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn clear_face_profile_sub_labels_removes_sub_labels_from_events_and_reviews_case_insensitively()
+    {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_clear_face_sub_labels_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        for (ev_id, sub) in [
+            ("ev_erik_1", "Erik"),
+            ("ev_erik_2", "eRIK"),
+            ("ev_alice_1", "Alice"),
+        ] {
+            db.upsert_event(&EventDto {
+                id: ev_id.to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!(["porch"]),
+                start_time: 1000.0,
+                end_time: Some(1005.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: Some(sub.to_string()),
+                top_score: Some(0.91),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.1, 0.1, 0.4, 0.8])),
+                data: json!({
+                    "box": [0.1, 0.1, 0.4, 0.8],
+                    "sub_label": sub,
+                    "sub_label_score": 0.88
+                }),
+                thumbnail: None,
+                area: Some(10000),
+                ratio: Some(0.5),
+                score: Some(0.91),
+                stationary: false,
+            })
+            .unwrap();
+        }
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_erik_1".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb.webp".to_string(),
+            data: json!({
+                "detections": ["ev_erik_1", "ev_erik_2"],
+                "objects": ["person"],
+                "sub_labels": ["Erik"],
+                "sub_label_score": 0.88,
+                "zones": ["porch"]
+            }),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        let cleared = db.clear_face_profile_sub_labels("ERIK").unwrap();
+        assert_eq!(cleared, 2);
+
+        let ev1 = db.get_event("ev_erik_1").unwrap().unwrap();
+        assert!(ev1["sub_label"].is_null());
+        assert!(ev1["sub_label_score"].is_null());
+        assert!(ev1["data"]["sub_label"].is_null());
+
+        let ev2 = db.get_event("ev_erik_2").unwrap().unwrap();
+        assert!(ev2["sub_label"].is_null());
+
+        let ev_alice = db.get_event("ev_alice_1").unwrap().unwrap();
+        assert_eq!(ev_alice["sub_label"], "Alice");
+
+        let rev = db.get_review_by_id("rev_erik_1").unwrap().unwrap();
+        assert_eq!(rev.data["sub_labels"], json!([]));
+        assert!(rev.data.get("sub_label_score").is_none());
+
+        let distinct = db.list_distinct_sub_labels().unwrap();
+        assert_eq!(distinct, vec!["Alice"]);
+
         let _ = std::fs::remove_file(&tmp);
     }
 }

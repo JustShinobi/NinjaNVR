@@ -457,6 +457,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/ai/context", get(api_ai_context))
         .route("/mcp", post(api_mcp_handler))
         .route("/debug/reprocess", post(api_debug_reprocess))
+        .route("/debug/lpr-simulate", post(api_debug_lpr_simulate))
         .route("/notifications/test", post(api_notifications_test))
         .route("/federation/nodes", get(api_federation_nodes))
         .route(
@@ -3073,6 +3074,334 @@ async fn api_debug_reprocess(
             "max_area_px": eff_max_area_px
         },
         "frames": frames_trace
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct DebugLprSimulateBody {
+    #[serde(default)]
+    pub camera: Option<String>,
+    #[serde(default)]
+    pub plate: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub score: Option<f32>,
+}
+
+fn render_synthetic_mercosul_vehicle_frame(plate: &str) -> image::RgbImage {
+    let width = 640u32;
+    let height = 360u32;
+    let mut img = image::RgbImage::new(width, height);
+
+    // Asphalt road background with subtle gradient
+    for y in 0..height {
+        let luma = (22 + (y * 18) / height) as u8;
+        for x in 0..width {
+            img.put_pixel(
+                x,
+                y,
+                image::Rgb([luma, luma.saturating_add(4), luma.saturating_add(10)]),
+            );
+        }
+    }
+
+    // Vehicle chassis silhouette [140, 80, 500, 310]
+    for y in 80..310 {
+        for x in 140..500 {
+            let color = if y < 145 {
+                [38, 52, 74] // windshield
+            } else {
+                [56, 74, 98] // bumper / hood
+            };
+            img.put_pixel(x, y, image::Rgb(color));
+        }
+    }
+
+    // Headlights
+    for y in 175..210 {
+        for x in 155..205 {
+            img.put_pixel(x, y, image::Rgb([245, 240, 200]));
+        }
+        for x in 435..485 {
+            img.put_pixel(x, y, image::Rgb([245, 240, 200]));
+        }
+    }
+
+    // Mercosul License Plate Banner [245, 225, 395, 275]
+    // Top Mercosul blue strip (y: 225..237) + white body (y: 237..275)
+    for y in 225..275 {
+        for x in 245..395 {
+            let border = x <= 246 || x >= 393 || y <= 226 || y >= 273;
+            let px = if border {
+                [20, 28, 42]
+            } else if y < 237 {
+                [0, 51, 153]
+            } else {
+                [242, 245, 250]
+            };
+            img.put_pixel(x, y, image::Rgb(px));
+        }
+    }
+
+    // Render deterministic character blocks across the white plate region for each character of `plate`
+    let chars: Vec<char> = plate.chars().take(8).collect();
+    for (idx, ch) in chars.iter().enumerate() {
+        let x0 = 254 + (idx as u32) * 18;
+        let seed = (*ch as u32).wrapping_mul(31);
+        for dy in 0..24u32 {
+            for dx in 0..12u32 {
+                if x0 + dx < 390 {
+                    let stroke = !(3..=9).contains(&dx)
+                        || !(3..=20).contains(&dy)
+                        || seed.wrapping_add(dx * 7 + dy * 13).is_multiple_of(5);
+                    if stroke {
+                        img.put_pixel(x0 + dx, 242 + dy, image::Rgb([18, 22, 30]));
+                    }
+                }
+            }
+        }
+    }
+
+    img
+}
+
+async fn api_debug_lpr_simulate(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(body): Json<DebugLprSimulateBody>,
+) -> Response {
+    let (camera, lpr_cfg) = {
+        let cfg = state.config.read().await;
+        let requested_cam = body
+            .camera
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                cfg.cameras
+                    .iter()
+                    .find(|(_, c)| c.enabled)
+                    .map(|(k, _)| k.clone())
+            })
+            .or_else(|| cfg.cameras.keys().next().cloned())
+            .unwrap_or_else(|| "escritorio".to_string());
+        (requested_cam, cfg.lpr.clone())
+    };
+
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.contains(&camera)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+
+    let raw_plate = body
+        .plate
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("BRA2E19");
+    let norm_plate = {
+        let n = ninjanvr_infer::normalize_license_plate(raw_plate);
+        if n.is_empty() {
+            "BRA2E19".to_string()
+        } else {
+            n
+        }
+    };
+    let label = body
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("car")
+        .to_string();
+    let score = body.score.unwrap_or(0.94).clamp(0.1, 0.999);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let ev_id = format!("{now:.6}-lpr{:04x}", rand::random::<u16>());
+    let rev_id = format!("{now:.6}-rev{:04x}", rand::random::<u16>());
+
+    let mut eff_lpr_cfg = lpr_cfg.clone();
+    eff_lpr_cfg.enabled = true;
+    eff_lpr_cfg.min_confidence = eff_lpr_cfg.min_confidence.min(score);
+
+    let valid_format =
+        ninjanvr_infer::validate_license_plate(&norm_plate, eff_lpr_cfg.format_regex.as_deref());
+
+    let mut voter = ninjanvr_infer::LprTrackVoter::new(12);
+    let mut consensus = None;
+    for frame_idx in 0..3 {
+        let frame_conf = (score - (frame_idx as f32) * 0.01).clamp(0.5, 0.999);
+        let read = ninjanvr_infer::OcrPlateRead::new(norm_plate.clone(), frame_conf);
+        let _ = state
+            .detector
+            .record_lpr_track_read(&ev_id, read.clone(), &eff_lpr_cfg);
+        consensus = voter.record_read(&ev_id, read, &eff_lpr_cfg);
+    }
+    let _ = state.detector.finalize_lpr_track(&ev_id, &eff_lpr_cfg);
+
+    let matched_sub_label = consensus
+        .as_ref()
+        .and_then(|c| c.sub_label.clone())
+        .or_else(|| ninjanvr_infer::lookup_known_plate(&norm_plate, &eff_lpr_cfg.known_plates));
+    let votes = consensus.as_ref().map(|c| c.votes).unwrap_or(3);
+    let consensus_conf = consensus.as_ref().map(|c| c.confidence).unwrap_or(score);
+
+    // Generate synthetic 640x360 vehicle + Mercosul plate frame and write snapshot/review artifacts
+    let clean_img = render_synthetic_mercosul_vehicle_frame(&norm_plate);
+    let mut annotated_img = clean_img.clone();
+    let veh_bbox = ninjanvr_vision::BoundingBox::new(140, 80, 500, 310);
+    let plate_bbox = ninjanvr_vision::BoundingBox::new(245, 225, 395, 275);
+    ninjanvr_vision::annotate_rgb_image_with_boxes(
+        &mut annotated_img,
+        &[(veh_bbox, [31, 119, 180]), (plate_bbox, [16, 185, 129])],
+    );
+
+    let clips_dir = state.media_dir.join("clips");
+    let review_dir = clips_dir.join("review");
+    let _ = std::fs::create_dir_all(&review_dir);
+
+    let jpg_path = clips_dir.join(format!("{ev_id}.jpg"));
+    let webp_path = clips_dir.join(format!("{camera}-{ev_id}.webp"));
+    let clean_webp_path = clips_dir.join(format!("{camera}-{ev_id}-clean.webp"));
+    let rev_thumb_path = review_dir.join(format!("thumb-{camera}-{rev_id}.webp"));
+
+    let mut thumb_b64 = None;
+    if let Ok(clean_webp) = ninjanvr_vision::encode_image_webp(&clean_img) {
+        let _ = std::fs::write(&clean_webp_path, clean_webp);
+    }
+    if let Ok(jpg_bytes) = ninjanvr_vision::encode_image_jpeg(&annotated_img) {
+        let _ = std::fs::write(&jpg_path, jpg_bytes);
+    }
+    if let Ok(webp_bytes) = ninjanvr_vision::encode_image_webp(&annotated_img) {
+        thumb_b64 = Some(base64::engine::general_purpose::STANDARD.encode(&webp_bytes));
+        let _ = std::fs::write(&webp_path, &webp_bytes);
+        let _ = std::fs::write(&rev_thumb_path, &webp_bytes);
+    }
+
+    let norm_box = veh_bbox.to_normalized(640, 360);
+    let norm_plate_box = plate_bbox.to_normalized(640, 360);
+    let mut attr_tags = vec!["license_plate".to_string(), norm_plate.clone()];
+    if let Some(ref sl) = matched_sub_label {
+        attr_tags.push(sl.clone());
+    }
+    let detected_attrs = json!([
+        {
+            "label": "license_plate",
+            "score": score,
+            "bbox": [plate_bbox.x_min, plate_bbox.y_min, plate_bbox.x_max, plate_bbox.y_max],
+            "norm_bbox": norm_plate_box,
+            "area_px": plate_bbox.area()
+        }
+    ]);
+
+    let ev_dto = ninjanvr_db::EventDto {
+        id: ev_id.clone(),
+        camera: camera.clone(),
+        label: label.clone(),
+        zones: json!([]),
+        start_time: now,
+        end_time: Some(now + 6.0),
+        has_clip: false,
+        has_snapshot: true,
+        plus_id: None,
+        retain_indefinitely: false,
+        sub_label: matched_sub_label.clone(),
+        top_score: Some(score as f64),
+        false_positive: Some(false),
+        box_coords: Some(json!(norm_box)),
+        data: json!({
+            "box": norm_box,
+            "region": [0.0, 0.0, 1.0, 1.0],
+            "score": score,
+            "top_score": score,
+            "sub_label": matched_sub_label,
+            "sub_label_score": matched_sub_label.as_ref().map(|_| score),
+            "attributes": attr_tags,
+            "detected_attributes": detected_attrs,
+            "license_plate_box": norm_plate_box,
+            "recognized_license_plate": norm_plate,
+            "lpr_votes": votes,
+            "lpr_confidence": consensus_conf,
+            "type": "object",
+            "max_severity": "alert"
+        }),
+        thumbnail: thumb_b64,
+        area: Some(veh_bbox.area()),
+        ratio: Some((veh_bbox.width() as f32) / (veh_bbox.height().max(1) as f32)),
+        score: Some(score),
+        stationary: false,
+    };
+
+    let _ = state.db.upsert_event(&ev_dto);
+    let _ = state.db.set_event_license_plate(&ev_id, Some(&norm_plate));
+    if let Some(ref sl) = matched_sub_label {
+        let _ = state
+            .db
+            .set_event_sub_label_with_score(&ev_id, Some(sl), Some(score as f64));
+    }
+
+    let rev_dto = ninjanvr_db::ReviewItemDto {
+        id: rev_id.clone(),
+        camera: camera.clone(),
+        start_time: now,
+        end_time: Some(now + 6.0),
+        severity: "alert".to_string(),
+        thumb_path: format!("/media/ninjanvr/clips/review/thumb-{camera}-{rev_id}.webp"),
+        data: json!({
+            "detections": [ev_id],
+            "objects": [label],
+            "sub_labels": matched_sub_label.iter().cloned().collect::<Vec<_>>(),
+            "sub_label_score": matched_sub_label.as_ref().map(|_| score),
+            "detected_attributes": detected_attrs,
+            "recognized_license_plates": [norm_plate],
+            "zones": [],
+            "thumb_time": now
+        }),
+        has_been_reviewed: false,
+    };
+    let _ = state.db.insert_review_segment(&rev_dto);
+
+    state.comms.publish_json(
+        "events",
+        &json!({
+            "type": "new",
+            "before": ev_dto,
+            "after": ev_dto
+        }),
+    );
+    state.comms.publish_json(
+        "reviews",
+        &json!({
+            "type": "new",
+            "before": rev_dto,
+            "after": rev_dto
+        }),
+    );
+
+    Json(json!({
+        "success": true,
+        "event_id": ev_id,
+        "review_id": rev_id,
+        "camera": camera,
+        "plate": norm_plate,
+        "valid_format": valid_format,
+        "votes": votes,
+        "confidence": consensus_conf,
+        "sub_label": matched_sub_label,
+        "label": label,
+        "score": score
     }))
     .into_response()
 }
@@ -6459,23 +6788,26 @@ async fn api_face_enroll(
         .enroll_face_profile(&faces_dir, &clean_name, &sample_id, &payload_bytes)
     {
         Ok((saved_path, emb)) => {
-            if let Some(ev_id) = event_to_assign {
-                let _ =
-                    state
-                        .db
-                        .set_event_sub_label_with_score(&ev_id, Some(&clean_name), Some(1.0));
-            }
             let profiles = state.detector.list_face_profiles(&faces_dir);
-            let sample_count = profiles
+            let matched_profile = profiles
                 .iter()
-                .find(|p| p.name == clean_name)
-                .map(|p| p.sample_count)
-                .unwrap_or(1);
+                .find(|p| p.name.eq_ignore_ascii_case(&clean_name));
+            let canonical_name = matched_profile
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| clean_name.clone());
+            let sample_count = matched_profile.map(|p| p.sample_count).unwrap_or(1);
+            if let Some(ev_id) = event_to_assign {
+                let _ = state.db.set_event_sub_label_with_score(
+                    &ev_id,
+                    Some(&canonical_name),
+                    Some(1.0),
+                );
+            }
             (
                 StatusCode::OK,
                 Json(json!({
                     "success": true,
-                    "name": clean_name,
+                    "name": canonical_name,
                     "sample_count": sample_count,
                     "embedding_dim": emb.len(),
                     "path": saved_path.to_string_lossy()
@@ -6507,10 +6839,15 @@ async fn api_face_delete(
         .detector
         .delete_face_profile(&faces_dir, &clean_name)
         .unwrap_or(false);
+    let cleared_events = state
+        .db
+        .clear_face_profile_sub_labels(&clean_name)
+        .unwrap_or(0);
     Json(json!({
         "success": true,
         "name": clean_name,
-        "deleted": deleted
+        "deleted": deleted,
+        "cleared_events": cleared_events
     }))
     .into_response()
 }
@@ -12830,6 +13167,11 @@ version: 0.18-0
             serde_json::from_slice(&to_bytes(del_resp.into_body(), 65536).await.unwrap()).unwrap();
         assert_eq!(del_json["success"], true);
         assert_eq!(del_json["deleted"], true);
+        assert_eq!(del_json["cleared_events"], 1);
+
+        let ev_cleared = state.db.get_event("ev_person_bruno").unwrap().unwrap();
+        assert!(ev_cleared["sub_label"].is_null());
+        assert!(ev_cleared["sub_label_score"].is_null());
 
         let list_after = app
             .oneshot(
@@ -13765,6 +14107,94 @@ cameras:
         assert_eq!(cases_arr[0]["id"], "case_incident_42");
         assert_eq!(cases_arr[0]["name"], "Perimeter Breach");
         assert_eq!(cases_arr[0]["event_ids"], json!(["ev_101"]));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn debug_lpr_simulate_creates_searchable_plate_event_and_snapshots() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-lpr-sim-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "version: 0.18-0\ndatabase:\n  path: {}\nlpr:\n  enabled: true\n  known_plates:\n    BRA2E19: \"Carro do Erik\"\ncameras:\n  portao:\n    enabled: true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let media_dir = tmp_dir.join("media");
+        let state = new_app_state(&cfg_path, tmp_dir.join("web"), media_dir.clone(), false)
+            .await
+            .unwrap();
+        let app = build_router(state.clone());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/debug/lpr-simulate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"camera":"portao","plate":"bra-2e19","label":"car","score":0.95}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sim_json: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 32768).await.unwrap()).unwrap();
+        assert_eq!(sim_json["success"], true);
+        assert_eq!(sim_json["camera"], "portao");
+        assert_eq!(sim_json["plate"], "BRA2E19");
+        assert_eq!(sim_json["sub_label"], "Carro do Erik");
+        assert_eq!(sim_json["votes"], 3);
+
+        let ev_id = sim_json["event_id"].as_str().unwrap();
+        let rev_id = sim_json["review_id"].as_str().unwrap();
+
+        // Verify snapshots and review thumbnails were written to disk
+        let clips_dir = media_dir.join("clips");
+        assert!(clips_dir.join(format!("{ev_id}.jpg")).exists());
+        assert!(clips_dir.join(format!("portao-{ev_id}.webp")).exists());
+        assert!(
+            clips_dir
+                .join(format!("portao-{ev_id}-clean.webp"))
+                .exists()
+        );
+        assert!(
+            clips_dir
+                .join("review")
+                .join(format!("thumb-portao-{rev_id}.webp"))
+                .exists()
+        );
+
+        // Verify event is searchable by recognized_license_plate via GET /api/events
+        let search_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events?recognized_license_plate=BRA2E19")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(search_resp.status(), StatusCode::OK);
+        let events_json: Value =
+            serde_json::from_slice(&to_bytes(search_resp.into_body(), 65536).await.unwrap())
+                .unwrap();
+        let events_arr = events_json.as_array().unwrap();
+        assert_eq!(events_arr.len(), 1);
+        assert_eq!(events_arr[0]["id"], ev_id);
+        assert_eq!(events_arr[0]["sub_label"], "Carro do Erik");
+        assert_eq!(events_arr[0]["data"]["recognized_license_plate"], "BRA2E19");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

@@ -1,11 +1,15 @@
 import React, { useEffect, useState } from "react";
 import {
+  Box,
+  Car,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   Copy,
   Cpu,
+  DoorOpen,
   Edit3,
+  Package,
   Plus,
   Sparkles,
   Trash2,
@@ -306,6 +310,113 @@ export function parseRoiClassesInput(rawClasses: string): string[] {
   return parsed.length >= 2 ? Array.from(new Set(parsed)) : ["closed", "open"];
 }
 
+export function slugifyRoiLocationName(raw: string): string {
+  return (raw || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+export type StateRoiPresetId =
+  | "door_gate"
+  | "parking_spot"
+  | "package_area"
+  | "fixed_object"
+  | "custom";
+
+export interface StateRoiScenarioPreset {
+  id: StateRoiPresetId;
+  defaultName: string;
+  classes: string;
+  anomalyState: string;
+  anomalyTimeoutSec: number;
+  intervalSec: number;
+  hysteresis: number;
+  titleEn: string;
+  titlePt: string;
+  descEn: string;
+  descPt: string;
+}
+
+export const STATE_ROI_SCENARIO_PRESETS: StateRoiScenarioPreset[] = [
+  {
+    id: "door_gate",
+    defaultName: "gate",
+    classes: "closed, open",
+    anomalyState: "open",
+    anomalyTimeoutSec: 300,
+    intervalSec: 5,
+    hysteresis: 3,
+    titleEn: "Door / Gate",
+    titlePt: "Porta / Portão",
+    descEn: "closed ↔ open · Alert open 5m",
+    descPt: "closed ↔ open · Alerta aberto 5m",
+  },
+  {
+    id: "parking_spot",
+    defaultName: "parking_spot",
+    classes: "empty, occupied",
+    anomalyState: "",
+    anomalyTimeoutSec: 300,
+    intervalSec: 5,
+    hysteresis: 3,
+    titleEn: "Parking / Garage Spot",
+    titlePt: "Vaga / Garagem",
+    descEn: "empty ↔ occupied · Status badge",
+    descPt: "empty ↔ occupied · Crachá no vídeo",
+  },
+  {
+    id: "package_area",
+    defaultName: "delivery_area",
+    classes: "empty, package_present",
+    anomalyState: "package_present",
+    anomalyTimeoutSec: 60,
+    intervalSec: 5,
+    hysteresis: 3,
+    titleEn: "Package / Delivery Area",
+    titlePt: "Área de Entregas / Pacotes",
+    descEn: "empty ↔ package_present · Alert",
+    descPt: "empty ↔ package_present · Alerta",
+  },
+  {
+    id: "fixed_object",
+    defaultName: "equipment",
+    classes: "present, missing",
+    anomalyState: "missing",
+    anomalyTimeoutSec: 60,
+    intervalSec: 5,
+    hysteresis: 3,
+    titleEn: "Fixed Object / Equipment",
+    titlePt: "Objeto Fixo / Equipamento",
+    descEn: "present ↔ missing · Alert 1m",
+    descPt: "present ↔ missing · Alerta 1m",
+  },
+  {
+    id: "custom",
+    defaultName: "custom_roi",
+    classes: "closed, open",
+    anomalyState: "open",
+    anomalyTimeoutSec: 300,
+    intervalSec: 5,
+    hysteresis: 3,
+    titleEn: "Custom States",
+    titlePt: "Estados Customizados",
+    descEn: "Define your own state classes",
+    descPt: "Defina seus próprios estados",
+  },
+];
+
+export const ROI_ALERT_DURATION_PILLS: Array<{ sec: number; label: string }> = [
+  { sec: 30, label: "30s" },
+  { sec: 60, label: "1m" },
+  { sec: 300, label: "5m" },
+  { sec: 900, label: "15m" },
+  { sec: 1800, label: "30m" },
+];
+
 export function buildStateRoiConfig(params: {
   cropInput: string;
   classesInput: string;
@@ -503,6 +614,19 @@ export const VisionZonesMotionSection: React.FC<{
   const [roiHysteresis, setRoiHysteresis] = useState(3);
   const [roiAnomalyState, setRoiAnomalyState] = useState("open");
   const [roiAnomalyTimeoutSec, setRoiAnomalyTimeoutSec] = useState(300);
+  const [roiScenario, setRoiScenario] = useState<StateRoiPresetId>("door_gate");
+
+  const applyZoneRoiPreset = (preset: StateRoiScenarioPreset) => {
+    setRoiScenario(preset.id);
+    if (preset.id !== "custom") {
+      setZoneNameInput(preset.defaultName);
+      setRoiClassesInput(preset.classes);
+      setRoiAnomalyState(preset.anomalyState);
+      setRoiAnomalyTimeoutSec(preset.anomalyTimeoutSec);
+      setRoiIntervalSec(preset.intervalSec);
+      setRoiHysteresis(preset.hysteresis);
+    }
+  };
 
   const camCfg = draftConfig.cameras?.[inspectorCam];
   const detW = camCfg?.detect?.width || 1280;
@@ -555,10 +679,7 @@ export const VisionZonesMotionSection: React.FC<{
 
   const handleCommitPolygon = () => {
     if (polyType === "state_roi") {
-      const rSlug = zoneNameInput
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9_]/g, "_");
+      const rSlug = slugifyRoiLocationName(zoneNameInput);
       if (!rSlug || rSlug.length < 2) {
         notify("Enter an ROI ID with at least 2 characters");
         return;
@@ -782,56 +903,115 @@ export const VisionZonesMotionSection: React.FC<{
             </div>
 
             {polyType === "state_roi" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.4fr)", gap: 6 }}>
-                  <div>
-                    <div
-                      className="mono"
-                      style={{
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-secondary)",
-                        marginBottom: 2,
-                      }}
-                    >
-                      {isPt ? "ID do ROI" : "ROI ID"}
-                    </div>
-                    <input
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
-                      placeholder="e.g. gate or parking_spot"
-                      aria-label="State ROI Name"
-                      value={zoneNameInput}
-                      onChange={(e) => setZoneNameInput(e.target.value)}
-                    />
-                  </div>
-                  <div>
-                    <div
-                      className="mono"
-                      style={{
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-secondary)",
-                        marginBottom: 2,
-                      }}
-                    >
-                      {isPt ? "Crop Normalizado [x1,y1,x2,y2]" : "Normalized Crop [x1,y1,x2,y2]"}
-                    </div>
-                    <input
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
-                      placeholder="0.250,0.250,0.750,0.750"
-                      aria-label="State ROI Crop Coordinates"
-                      value={
-                        draftPoints.length >= 2
-                          ? parseRoiCropInput(roiCropInput, draftPoints)
-                              .map((v) => v.toFixed(3))
-                              .join(",")
-                          : roiCropInput
-                      }
-                      onChange={(e) => setRoiCropInput(e.target.value)}
-                    />
-                  </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <div
+                  className="mono"
+                  style={{
+                    fontSize: "var(--text-xs)",
+                    fontWeight: 700,
+                    color: "var(--signal-motion-text)",
+                  }}
+                >
+                  {isPt
+                    ? "PASSO 1 — O QUE VOCÊ QUER MONITORAR?"
+                    : "STEP 1 — WHAT DO YOU WANT TO MONITOR?"}
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 1fr)", gap: 6 }}>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))",
+                    gap: 5,
+                  }}
+                >
+                  {STATE_ROI_SCENARIO_PRESETS.map((preset) => {
+                    const active = roiScenario === preset.id;
+                    const IconComp =
+                      preset.id === "door_gate"
+                        ? DoorOpen
+                        : preset.id === "parking_spot"
+                        ? Car
+                        : preset.id === "package_area"
+                        ? Package
+                        : preset.id === "fixed_object"
+                        ? Box
+                        : Edit3;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        className={`nvr-btn ${active ? "active" : ""}`}
+                        style={{
+                          height: "auto",
+                          padding: "6px 8px",
+                          flexDirection: "column",
+                          alignItems: "flex-start",
+                          textAlign: "left",
+                          gap: 2,
+                          minWidth: 0,
+                        }}
+                        onClick={() => applyZoneRoiPreset(preset)}
+                      >
+                        <span
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: 5,
+                            fontWeight: 700,
+                            fontSize: "var(--text-xs)",
+                          }}
+                        >
+                          <IconComp size={12} />
+                          {isPt ? preset.titlePt : preset.titleEn}
+                        </span>
+                        <span
+                          className="mono"
+                          style={{
+                            fontSize: "var(--text-xs)",
+                            color: "var(--text-muted)",
+                          }}
+                        >
+                          {isPt ? preset.descPt : preset.descEn}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div>
+                  <div
+                    className="mono"
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      fontSize: "var(--text-xs)",
+                      color: "var(--text-secondary)",
+                      marginBottom: 2,
+                    }}
+                  >
+                    <span>
+                      {isPt
+                        ? "PASSO 2 — NOME DO LOCAL (Location Name)"
+                        : "STEP 2 — LOCATION NAME"}
+                    </span>
+                    <span>
+                      ID: <strong>{slugifyRoiLocationName(zoneNameInput) || "gate"}</strong>
+                    </span>
+                  </div>
+                  <input
+                    className="nvr-input mono"
+                    style={{ width: "100%", height: 26, fontSize: "var(--text-xs)" }}
+                    placeholder={
+                      isPt
+                        ? "Ex: Porta do Escritório, Portão da Garagem"
+                        : "e.g. Porta do Escritório, Portão da Garagem"
+                    }
+                    aria-label="State ROI Name"
+                    value={zoneNameInput}
+                    onChange={(e) => setZoneNameInput(e.target.value)}
+                  />
+                </div>
+
+                {roiScenario === "custom" && (
                   <div>
                     <div
                       className="mono"
@@ -841,108 +1021,301 @@ export const VisionZonesMotionSection: React.FC<{
                         marginBottom: 2,
                       }}
                     >
-                      {isPt ? "Estados (Classes)" : "States (Classes)"}
+                      {isPt ? "Estados Customizados (separados por vírgula)" : "Custom States (comma-separated)"}
                     </div>
                     <input
                       className="nvr-input mono"
                       style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
                       placeholder="closed, open"
-                      aria-label="State ROI Classes"
                       value={roiClassesInput}
                       onChange={(e) => setRoiClassesInput(e.target.value)}
                     />
                   </div>
-                  <div>
+                )}
+
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <div
+                    className="mono"
+                    style={{
+                      fontSize: "var(--text-xs)",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    {isPt ? "REGRA DE ALERTA (Alert Rule):" : "ALERT RULE:"}
+                  </div>
+                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className={`nvr-btn mono ${!roiAnomalyState.trim() ? "active" : ""}`}
+                      style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                      onClick={() => setRoiAnomalyState("")}
+                    >
+                      {isPt
+                        ? "Apenas Crachá (Sem Alerta)"
+                        : "Status Badge Only (No Alert)"}
+                    </button>
+                    {parseRoiClassesInput(roiClassesInput).map((st) => {
+                      const isSel =
+                        roiAnomalyState.trim().toLowerCase() === st.toLowerCase();
+                      return (
+                        <button
+                          key={st}
+                          type="button"
+                          className={`nvr-btn mono ${isSel ? "active" : ""}`}
+                          style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                          onClick={() => setRoiAnomalyState(st)}
+                        >
+                          {isPt ? `Alertar quando '${st}'` : `Alert when ${st}`}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {roiAnomalyState.trim() && (
                     <div
-                      className="mono"
                       style={{
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-secondary)",
-                        marginBottom: 2,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 4,
+                        flexWrap: "wrap",
                       }}
                     >
-                      {isPt ? "Estado Anômalo" : "Anomaly State"}
+                      <span
+                        className="mono"
+                        style={{
+                          fontSize: "var(--text-xs)",
+                          color: "var(--text-muted)",
+                        }}
+                      >
+                        {isPt ? "Após:" : "For:"}
+                      </span>
+                      {ROI_ALERT_DURATION_PILLS.map((pill) => (
+                        <button
+                          key={pill.sec}
+                          type="button"
+                          className={`nvr-btn mono ${
+                            roiAnomalyTimeoutSec === pill.sec ? "active" : ""
+                          }`}
+                          style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                          onClick={() => setRoiAnomalyTimeoutSec(pill.sec)}
+                        >
+                          {pill.label}
+                        </button>
+                      ))}
                     </div>
-                    <input
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
-                      placeholder="open (optional)"
-                      aria-label="State ROI Anomaly State"
-                      value={roiAnomalyState}
-                      onChange={(e) => setRoiAnomalyState(e.target.value)}
-                    />
-                  </div>
+                  )}
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6 }}>
-                  <div>
-                    <div
-                      className="mono"
-                      style={{
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-secondary)",
-                        marginBottom: 2,
-                      }}
-                    >
-                      {isPt ? "Intervalo (s)" : "Interval (s)"}
-                    </div>
-                    <input
-                      type="number"
-                      min={1}
-                      max={300}
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
-                      aria-label="State ROI Interval Seconds"
-                      value={roiIntervalSec}
-                      onChange={(e) => setRoiIntervalSec(Math.max(1, Number(e.target.value)))}
-                    />
-                  </div>
-                  <div>
-                    <div
-                      className="mono"
-                      style={{
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-secondary)",
-                        marginBottom: 2,
-                      }}
-                    >
-                      {isPt ? "Histerese" : "Hysteresis"}
-                    </div>
-                    <input
-                      type="number"
-                      min={1}
-                      max={30}
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
-                      aria-label="State ROI Hysteresis Frames"
-                      value={roiHysteresis}
-                      onChange={(e) => setRoiHysteresis(Math.max(1, Number(e.target.value)))}
-                    />
-                  </div>
-                  <div>
-                    <div
-                      className="mono"
-                      style={{
-                        fontSize: "var(--text-xs)",
-                        color: "var(--text-secondary)",
-                        marginBottom: 2,
-                      }}
-                    >
-                      {isPt ? "Timeout (s)" : "Timeout (s)"}
-                    </div>
-                    <input
-                      type="number"
-                      min={5}
-                      max={86400}
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
-                      aria-label="State ROI Anomaly Timeout Seconds"
-                      value={roiAnomalyTimeoutSec}
-                      onChange={(e) =>
-                        setRoiAnomalyTimeoutSec(Math.max(1, Number(e.target.value)))
-                      }
-                    />
-                  </div>
+
+                <div
+                  className="mono"
+                  style={{
+                    padding: "5px 8px",
+                    borderRadius: 2,
+                    fontSize: "var(--text-xs)",
+                    background:
+                      draftPoints.length >= 2
+                        ? "rgba(16, 185, 129, 0.14)"
+                        : "var(--bg-input)",
+                    border:
+                      draftPoints.length >= 2
+                        ? "1px solid rgba(16, 185, 129, 0.45)"
+                        : "1px solid var(--border-divider)",
+                    color:
+                      draftPoints.length >= 2
+                        ? "var(--signal-live-text)"
+                        : "var(--signal-motion-text)",
+                  }}
+                >
+                  {draftPoints.length >= 2
+                    ? isPt
+                      ? "✓ Área selecionada no vídeo (Pronto para salvar)"
+                      : "Area selected on video (Ready to save)"
+                    : isPt
+                    ? "Clique 2 ou 4 cantos no vídeo para marcar a área a monitorar"
+                    : "Click 2 or 4 corners on the video to mark the area to monitor"}
                 </div>
+
+                <details
+                  style={{
+                    background: "var(--bg-input)",
+                    border: "1px solid var(--border-divider)",
+                    borderRadius: 2,
+                    padding: "4px 6px",
+                  }}
+                >
+                  <summary
+                    className="mono"
+                    style={{
+                      cursor: "pointer",
+                      fontSize: "var(--text-xs)",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    Advanced Technical Tuning / Coordenadas &amp; Histerese
+                  </summary>
+                  <div
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 6,
+                      marginTop: 6,
+                    }}
+                  >
+                    <div>
+                      <div
+                        className="mono"
+                        style={{
+                          fontSize: "var(--text-xs)",
+                          color: "var(--text-secondary)",
+                          marginBottom: 2,
+                        }}
+                      >
+                        {isPt ? "Crop Normalizado [x1,y1,x2,y2]" : "Normalized Crop [x1,y1,x2,y2]"}
+                      </div>
+                      <input
+                        className="nvr-input mono"
+                        style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                        placeholder="0.250,0.250,0.750,0.750"
+                        aria-label="State ROI Crop Coordinates"
+                        value={
+                          draftPoints.length >= 2
+                            ? parseRoiCropInput(roiCropInput, draftPoints)
+                                .map((v) => v.toFixed(3))
+                                .join(",")
+                            : roiCropInput
+                        }
+                        onChange={(e) => setRoiCropInput(e.target.value)}
+                      />
+                    </div>
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 1fr)",
+                        gap: 6,
+                      }}
+                    >
+                      <div>
+                        <div
+                          className="mono"
+                          style={{
+                            fontSize: "var(--text-xs)",
+                            color: "var(--text-secondary)",
+                            marginBottom: 2,
+                          }}
+                        >
+                          {isPt ? "Estados (Classes)" : "States (Classes)"}
+                        </div>
+                        <input
+                          className="nvr-input mono"
+                          style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                          placeholder="closed, open"
+                          aria-label="State ROI Classes"
+                          value={roiClassesInput}
+                          onChange={(e) => setRoiClassesInput(e.target.value)}
+                        />
+                      </div>
+                      <div>
+                        <div
+                          className="mono"
+                          style={{
+                            fontSize: "var(--text-xs)",
+                            color: "var(--text-secondary)",
+                            marginBottom: 2,
+                          }}
+                        >
+                          {isPt ? "Estado Anômalo" : "Anomaly State"}
+                        </div>
+                        <input
+                          className="nvr-input mono"
+                          style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                          placeholder="open (optional)"
+                          aria-label="State ROI Anomaly State"
+                          value={roiAnomalyState}
+                          onChange={(e) => setRoiAnomalyState(e.target.value)}
+                        />
+                      </div>
+                    </div>
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+                        gap: 6,
+                      }}
+                    >
+                      <div>
+                        <div
+                          className="mono"
+                          style={{
+                            fontSize: "var(--text-xs)",
+                            color: "var(--text-secondary)",
+                            marginBottom: 2,
+                          }}
+                        >
+                          {isPt ? "Intervalo (s)" : "Interval (s)"}
+                        </div>
+                        <input
+                          type="number"
+                          min={1}
+                          max={300}
+                          className="nvr-input mono"
+                          style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                          aria-label="State ROI Interval Seconds"
+                          value={roiIntervalSec}
+                          onChange={(e) =>
+                            setRoiIntervalSec(Math.max(1, Number(e.target.value)))
+                          }
+                        />
+                      </div>
+                      <div>
+                        <div
+                          className="mono"
+                          style={{
+                            fontSize: "var(--text-xs)",
+                            color: "var(--text-secondary)",
+                            marginBottom: 2,
+                          }}
+                        >
+                          {isPt ? "Histerese" : "Hysteresis"}
+                        </div>
+                        <input
+                          type="number"
+                          min={1}
+                          max={30}
+                          className="nvr-input mono"
+                          style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                          aria-label="State ROI Hysteresis Frames"
+                          value={roiHysteresis}
+                          onChange={(e) =>
+                            setRoiHysteresis(Math.max(1, Number(e.target.value)))
+                          }
+                        />
+                      </div>
+                      <div>
+                        <div
+                          className="mono"
+                          style={{
+                            fontSize: "var(--text-xs)",
+                            color: "var(--text-secondary)",
+                            marginBottom: 2,
+                          }}
+                        >
+                          {isPt ? "Timeout (s)" : "Timeout (s)"}
+                        </div>
+                        <input
+                          type="number"
+                          min={5}
+                          max={86400}
+                          className="nvr-input mono"
+                          style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                          aria-label="State ROI Anomaly Timeout Seconds"
+                          value={roiAnomalyTimeoutSec}
+                          onChange={(e) =>
+                            setRoiAnomalyTimeoutSec(Math.max(1, Number(e.target.value)))
+                          }
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </details>
               </div>
             )}
 
@@ -1125,23 +1498,25 @@ export const VisionZonesMotionSection: React.FC<{
               </div>
             )}
 
-            <div
-              className="mono"
-              style={{
-                fontSize: "var(--text-xs)",
-                color: "var(--signal-motion-text)",
-                wordBreak: currentCoordStr ? "break-all" : "normal",
-                padding: "4px 6px",
-                background: "var(--bg-input)",
-                border: "1px solid var(--border-divider)",
-                borderRadius: 2,
-              }}
-            >
-              {currentCoordStr ||
-                (isPt
-                  ? "Clique 3+ pontos no vídeo ao lado ou use o preset Relógio OSD..."
-                  : "Click 3+ points on the live preview or use OSD Clock preset...")}
-            </div>
+            {polyType !== "state_roi" && (
+              <div
+                className="mono"
+                style={{
+                  fontSize: "var(--text-xs)",
+                  color: "var(--signal-motion-text)",
+                  wordBreak: currentCoordStr ? "break-all" : "normal",
+                  padding: "4px 6px",
+                  background: "var(--bg-input)",
+                  border: "1px solid var(--border-divider)",
+                  borderRadius: 2,
+                }}
+              >
+                {currentCoordStr ||
+                  (isPt
+                    ? "Clique 3+ pontos no vídeo ao lado para desenhar o polígono..."
+                    : "Click 3+ points on the live preview to plot polygon...")}
+              </div>
+            )}
 
             <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
               <button
@@ -1150,26 +1525,39 @@ export const VisionZonesMotionSection: React.FC<{
                 style={{ height: 24, fontSize: "var(--text-xs)" }}
                 onClick={handleCommitPolygon}
               >
-                <Plus size={11} />
-                {isPt
-                  ? `Adicionar ${polyType === "zone" ? "Zona" : "Máscara"}`
-                  : `Stage ${polyType === "zone" ? "Zone" : "Mask"}`}
+                {polyType === "state_roi"
+                  ? isPt
+                    ? "+ Salvar Monitoramento de Área"
+                    : "+ Save State Monitor"
+                  : polyType === "zone"
+                  ? isPt
+                    ? "+ Adicionar Zona"
+                    : "+ Stage Zone"
+                  : polyType === "tripwire"
+                  ? isPt
+                    ? "+ Adicionar Tripwire"
+                    : "+ Stage Tripwire"
+                  : isPt
+                  ? "+ Adicionar Máscara"
+                  : "+ Stage Mask"}
               </button>
-              <button
-                type="button"
-                className="nvr-btn"
-                style={{ height: 24, fontSize: "var(--text-xs)" }}
-                onClick={() =>
-                  setDraftPoints([
-                    [0.01, 0.01],
-                    [0.34, 0.01],
-                    [0.34, 0.08],
-                    [0.01, 0.08],
-                  ])
-                }
-              >
-                {isPt ? "Preset Relógio OSD" : "OSD Clock Preset"}
-              </button>
+              {polyType === "motion_mask" && (
+                <button
+                  type="button"
+                  className="nvr-btn"
+                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  onClick={() =>
+                    setDraftPoints([
+                      [0.01, 0.01],
+                      [0.34, 0.01],
+                      [0.34, 0.08],
+                      [0.01, 0.08],
+                    ])
+                  }
+                >
+                  {isPt ? "Preset Relógio OSD" : "OSD Clock Preset"}
+                </button>
+              )}
               <button
                 type="button"
                 className="nvr-btn"
@@ -2239,8 +2627,18 @@ export const AiDetectionObjectsSection: React.FC<{
         credentials: "include",
       });
       if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setEnrolledProfiles((prev) =>
+          prev.filter((p) => p.name.trim().toLowerCase() !== name.trim().toLowerCase())
+        );
+        useNvrStore.getState().recordDeletedFaceProfile(name);
         await refreshEnrolledFaces();
-        notify(`Removed face profile '${name}' from gallery`);
+        const clearedCount = Number(data?.cleared_events || 0);
+        notify(
+          clearedCount > 0
+            ? `Removed face profile '${name}' from gallery and cleared ${clearedCount} event(s)`
+            : `Removed face profile '${name}' from gallery`
+        );
       }
     } catch {
       // ignore
@@ -2254,6 +2652,76 @@ export const AiDetectionObjectsSection: React.FC<{
   const [newRoiHysteresis, setNewRoiHysteresis] = useState(3);
   const [newRoiAnomalyState, setNewRoiAnomalyState] = useState("open");
   const [newRoiAnomalyTimeoutSec, setNewRoiAnomalyTimeoutSec] = useState(300);
+  const [newRoiScenario, setNewRoiScenario] = useState<StateRoiPresetId>("door_gate");
+
+  const [simLprCamera, setSimLprCamera] = useState<string>(inspectorCam || "escritorio");
+  const [simLprPlate, setSimLprPlate] = useState<string>("BRA2E19");
+  const [simLprBusy, setSimLprBusy] = useState<boolean>(false);
+  const [simLprLastResult, setSimLprLastResult] = useState<{
+    eventId: string;
+    plate: string;
+    camera: string;
+    subLabel?: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    if (inspectorCam) {
+      setSimLprCamera(inspectorCam);
+    }
+  }, [inspectorCam]);
+
+  const handleSimulateLprPass = async () => {
+    if (simLprBusy) return;
+    setSimLprBusy(true);
+    try {
+      const targetCam =
+        simLprCamera ||
+        inspectorCam ||
+        Object.keys(draftConfig.cameras || {})[0] ||
+        "escritorio";
+      const plateVal = normalizeLicensePlate(simLprPlate) || "BRA2E19";
+      const res = await fetch("/api/debug/lpr-simulate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          camera: targetCam,
+          plate: plateVal,
+          label: "car",
+          score: 0.94,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success) {
+        const subLabel =
+          data.sub_label ||
+          lprCfg.known_plates?.[plateVal] ||
+          null;
+        setSimLprLastResult({
+          eventId: String(data.event_id || ""),
+          plate: String(data.plate || plateVal),
+          camera: String(data.camera || targetCam),
+          subLabel,
+        });
+        useNvrStore.getState().bumpSubLabelsRefresh();
+        notify(
+          subLabel
+            ? `Simulated LPR detection: ${data.plate} → ${subLabel} on ${targetCam} (Event #${String(
+                data.event_id || ""
+              ).slice(-8)})`
+            : `Simulated LPR detection: ${data.plate} on ${targetCam} (Event #${String(
+                data.event_id || ""
+              ).slice(-8)})`
+        );
+      } else {
+        notify(data?.message || "Failed to simulate LPR vehicle pass");
+      }
+    } catch {
+      notify("Failed to simulate LPR vehicle pass");
+    } finally {
+      setSimLprBusy(false);
+    }
+  };
 
   const detKeys = Object.keys(draftConfig.detectors || { detector01: {} });
   const primaryDetKey = detKeys[0] || "detector01";
@@ -4741,6 +5209,115 @@ export const AiDetectionObjectsSection: React.FC<{
               )}
             </div>
           </div>
+
+          {/* Test LPR Scenario (Simulate Vehicle Pass) */}
+          <div className="nvr-subcard" style={{ padding: "8px 10px", gap: 8 }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: 8,
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: "var(--text-xs)",
+                    fontWeight: 700,
+                    color: "var(--signal-live-text)",
+                  }}
+                >
+                  {isPt
+                    ? "TESTAR CENÁRIO LPR (SIMULAR PASSAGEM DE VEÍCULO)"
+                    : "TEST LPR SCENARIO (SIMULATE VEHICLE PASS)"}
+                </span>
+                <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt
+                    ? "Gera um frame sintético Mercosul, executa votação multi-frame LprTrackVoter + lookup known_plates e grava o evento no Explore/Review."
+                    : "Generates a synthetic Mercosul plate frame, runs LprTrackVoter multi-frame consensus + known_plates lookup, and persists the event."}
+                </span>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <select
+                  className="nvr-select mono"
+                  aria-label="Simulate LPR Camera"
+                  style={{ height: 26, fontSize: "var(--text-xs)" }}
+                  value={simLprCamera}
+                  onChange={(e) => setSimLprCamera(e.target.value)}
+                >
+                  {(Object.keys(draftConfig.cameras || {}).length > 0
+                    ? Object.keys(draftConfig.cameras || {})
+                    : [inspectorCam || "escritorio"]
+                  ).map((c) => (
+                    <option key={c} value={c}>
+                      {c.toUpperCase()}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  className="nvr-input mono"
+                  aria-label="Simulate LPR Plate"
+                  style={{
+                    width: 110,
+                    height: 26,
+                    fontSize: "var(--text-xs)",
+                    fontFamily: "var(--font-mono)",
+                  }}
+                  placeholder="BRA2E19"
+                  value={simLprPlate}
+                  onChange={(e) => setSimLprPlate(e.target.value.toUpperCase())}
+                />
+                {(["BRA2E19", "ABC1D23", "XYZ9876"] as const).map((presetPlate) => (
+                  <button
+                    key={presetPlate}
+                    type="button"
+                    className={`nvr-btn mono ${
+                      normalizeLicensePlate(simLprPlate) === presetPlate ? "active" : ""
+                    }`}
+                    style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    onClick={() => setSimLprPlate(presetPlate)}
+                  >
+                    {presetPlate}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  className="nvr-btn success mono"
+                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  disabled={simLprBusy}
+                  onClick={() => void handleSimulateLprPass()}
+                >
+                  {simLprBusy
+                    ? isPt
+                      ? "Simulando..."
+                      : "Simulating..."
+                    : isPt
+                    ? "Simular Detecção de Placa Agora"
+                    : "Simulate Plate Detection Now"}
+                </button>
+              </div>
+            </div>
+            {simLprLastResult && (
+              <div
+                className="mono"
+                style={{
+                  fontSize: "var(--text-xs)",
+                  color: "var(--signal-live-text)",
+                }}
+              >
+                ✓ Simulated Event #{simLprLastResult.eventId.slice(-8)} on{" "}
+                {simLprLastResult.camera.toUpperCase()} · Plate:{" "}
+                <strong>{simLprLastResult.plate}</strong>
+                {simLprLastResult.subLabel
+                  ? ` · Matched Known Vehicle: ${simLprLastResult.subLabel}`
+                  : ""}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -4758,165 +5335,190 @@ export const AiDetectionObjectsSection: React.FC<{
             {isPt ? "ROIS CONFIGURADOS" : "CONFIGURED ROIS"}
           </span>
         </div>
-        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-            <span
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div
               className="mono"
-              style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
-            >
-              {isPt ? "PRESETS RÁPIDOS:" : "QUICK PRESETS:"}
-            </span>
-            <button
-              type="button"
-              className="nvr-btn mono"
-              style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
-              onClick={() => {
-                setNewRoiName("gate");
-                setNewRoiClasses("closed, open");
-                setNewRoiAnomalyState("open");
-                setNewRoiAnomalyTimeoutSec(300);
-                setNewRoiHysteresis(3);
-                setNewRoiIntervalSec(5);
-              }}
-            >
-              {isPt ? "Portão (closed/open · alerta 300s)" : "Gate (closed/open · 300s alert)"}
-            </button>
-            <button
-              type="button"
-              className="nvr-btn mono"
-              style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
-              onClick={() => {
-                setNewRoiName("parking_spot");
-                setNewRoiClasses("empty, occupied");
-                setNewRoiAnomalyState("occupied");
-                setNewRoiAnomalyTimeoutSec(600);
-                setNewRoiHysteresis(3);
-                setNewRoiIntervalSec(5);
+              style={{
+                fontSize: "var(--text-xs)",
+                fontWeight: 700,
+                color: "var(--signal-motion-text)",
               }}
             >
               {isPt
-                ? "Vaga Estacionamento (empty/occupied)"
-                : "Parking Spot (empty/occupied)"}
-            </button>
+                ? "PASSO 1 — O QUE VOCÊ QUER MONITORAR?"
+                : "STEP 1 — WHAT DO YOU WANT TO MONITOR?"}
+            </div>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(175px, 1fr))",
+                gap: 6,
+              }}
+            >
+              {STATE_ROI_SCENARIO_PRESETS.map((preset) => {
+                const active = newRoiScenario === preset.id;
+                const IconComp =
+                  preset.id === "door_gate"
+                    ? DoorOpen
+                    : preset.id === "parking_spot"
+                    ? Car
+                    : preset.id === "package_area"
+                    ? Package
+                    : preset.id === "fixed_object"
+                    ? Box
+                    : Edit3;
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    className={`nvr-btn ${active ? "active" : ""}`}
+                    style={{
+                      height: "auto",
+                      padding: "6px 8px",
+                      flexDirection: "column",
+                      alignItems: "flex-start",
+                      textAlign: "left",
+                      gap: 2,
+                      minWidth: 0,
+                    }}
+                    onClick={() => {
+                      setNewRoiScenario(preset.id);
+                      if (preset.id !== "custom") {
+                        setNewRoiName(preset.defaultName);
+                        setNewRoiClasses(preset.classes);
+                        setNewRoiAnomalyState(preset.anomalyState);
+                        setNewRoiAnomalyTimeoutSec(preset.anomalyTimeoutSec);
+                        setNewRoiIntervalSec(preset.intervalSec);
+                        setNewRoiHysteresis(preset.hysteresis);
+                      }
+                    }}
+                  >
+                    <span
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 5,
+                        fontWeight: 700,
+                        fontSize: "var(--text-xs)",
+                      }}
+                    >
+                      <IconComp size={12} />
+                      {isPt ? preset.titlePt : preset.titleEn}
+                    </span>
+                    <span
+                      className="mono"
+                      style={{
+                        fontSize: "var(--text-xs)",
+                        color: "var(--text-muted)",
+                      }}
+                    >
+                      {isPt ? preset.descPt : preset.descEn}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           <div
             style={{
               display: "grid",
-              gridTemplateColumns:
-                "minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 1.2fr) minmax(0, 0.7fr) minmax(0, 0.7fr) minmax(0, 0.9fr) minmax(0, 0.9fr) auto",
-              gap: 6,
+              gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 1.8fr) auto",
+              gap: 10,
               alignItems: "end",
             }}
           >
             <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
-                ROI ID
+              <div
+                className="mono"
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  fontSize: "var(--text-xs)",
+                  color: "var(--text-secondary)",
+                }}
+              >
+                <span>
+                  {isPt ? "PASSO 2 — NOME DO LOCAL" : "STEP 2 — LOCATION NAME"}
+                </span>
+                <span>
+                  ID: <strong>{slugifyRoiLocationName(newRoiName) || "gate"}</strong>
+                </span>
               </div>
               <input
                 className="nvr-input mono"
                 style={{ width: "100%", marginTop: 2 }}
                 aria-label="ROI Classifier Name"
-                placeholder="gate"
+                placeholder={
+                  isPt
+                    ? "Ex: Porta do Escritório, Portão da Garagem"
+                    : "e.g. Porta do Escritório, Portão da Garagem"
+                }
                 value={newRoiName}
                 onChange={(e) => setNewRoiName(e.target.value)}
               />
             </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
-                Crop [x1,y1,x2,y2]
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <div
+                className="mono"
+                style={{
+                  fontSize: "var(--text-xs)",
+                  color: "var(--text-secondary)",
+                }}
+              >
+                {isPt ? "REGRA DE ALERTA:" : "ALERT RULE:"}
               </div>
-              <input
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                aria-label="ROI Normalized Crop"
-                placeholder="0.200,0.300,0.650,0.850"
-                value={newRoiCrop}
-                onChange={(e) => setNewRoiCrop(e.target.value)}
-              />
-            </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
-                States
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+                <button
+                  type="button"
+                  className={`nvr-btn mono ${!newRoiAnomalyState.trim() ? "active" : ""}`}
+                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  onClick={() => setNewRoiAnomalyState("")}
+                >
+                  {isPt
+                    ? "Apenas Crachá (Sem Alerta)"
+                    : "Status Badge Only (No Alert)"}
+                </button>
+                {parseRoiClassesInput(newRoiClasses).map((st) => {
+                  const isSel =
+                    newRoiAnomalyState.trim().toLowerCase() === st.toLowerCase();
+                  return (
+                    <button
+                      key={st}
+                      type="button"
+                      className={`nvr-btn mono ${isSel ? "active" : ""}`}
+                      style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      onClick={() => setNewRoiAnomalyState(st)}
+                    >
+                      {isPt ? `Alertar quando '${st}'` : `Alert when ${st}`}
+                    </button>
+                  );
+                })}
+                {newRoiAnomalyState.trim() &&
+                  ROI_ALERT_DURATION_PILLS.map((pill) => (
+                    <button
+                      key={pill.sec}
+                      type="button"
+                      className={`nvr-btn mono ${
+                        newRoiAnomalyTimeoutSec === pill.sec ? "active" : ""
+                      }`}
+                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                      onClick={() => setNewRoiAnomalyTimeoutSec(pill.sec)}
+                    >
+                      {pill.label}
+                    </button>
+                  ))}
               </div>
-              <input
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                aria-label="ROI State Classes"
-                placeholder="closed, open"
-                value={newRoiClasses}
-                onChange={(e) => setNewRoiClasses(e.target.value)}
-              />
             </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
-                Interval (s)
-              </div>
-              <input
-                type="number"
-                min={1}
-                max={300}
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                aria-label="ROI Evaluation Interval"
-                value={newRoiIntervalSec}
-                onChange={(e) => setNewRoiIntervalSec(Math.max(1, Number(e.target.value)))}
-              />
-            </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
-                Hysteresis
-              </div>
-              <input
-                type="number"
-                min={1}
-                max={30}
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                aria-label="ROI Hysteresis Frames"
-                value={newRoiHysteresis}
-                onChange={(e) => setNewRoiHysteresis(Math.max(1, Number(e.target.value)))}
-              />
-            </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
-                Anomaly State
-              </div>
-              <input
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                aria-label="ROI Anomaly State"
-                placeholder="open"
-                value={newRoiAnomalyState}
-                onChange={(e) => setNewRoiAnomalyState(e.target.value)}
-              />
-            </div>
-            <div>
-              <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
-                Timeout (s)
-              </div>
-              <input
-                type="number"
-                min={5}
-                max={86400}
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 2 }}
-                aria-label="ROI Anomaly Timeout"
-                value={newRoiAnomalyTimeoutSec}
-                onChange={(e) =>
-                  setNewRoiAnomalyTimeoutSec(Math.max(1, Number(e.target.value)))
-                }
-              />
-            </div>
+
             <button
               type="button"
               className="nvr-btn success mono"
-              style={{ height: 28, padding: "0 10px", fontSize: "var(--text-xs)" }}
+              style={{ height: 28, padding: "0 12px", fontSize: "var(--text-xs)" }}
               onClick={() => {
-                const slug = newRoiName
-                  .trim()
-                  .toLowerCase()
-                  .replace(/[^a-z0-9_]/g, "_");
+                const slug = slugifyRoiLocationName(newRoiName);
                 if (!slug || slug.length < 2) {
                   notify("Enter a valid ROI ID with at least 2 characters");
                   return;
@@ -4938,10 +5540,146 @@ export const AiDetectionObjectsSection: React.FC<{
                 notify(`Added ROI state classifier '${slug}' on ${inspectorCam}`);
               }}
             >
-              <Plus size={11} />
-              {isPt ? "Salvar ROI" : "Add ROI"}
+              {isPt ? "+ Salvar Monitoramento de Área" : "+ Save State Monitor"}
             </button>
           </div>
+
+          {newRoiScenario === "custom" && (
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt
+                  ? "Estados Customizados (separados por vírgula)"
+                  : "Custom States (comma-separated)"}
+              </div>
+              <input
+                className="nvr-input mono"
+                style={{ width: "100%", marginTop: 2 }}
+                placeholder="closed, open"
+                value={newRoiClasses}
+                onChange={(e) => setNewRoiClasses(e.target.value)}
+              />
+            </div>
+          )}
+
+          <details
+            style={{
+              background: "var(--bg-input)",
+              border: "1px solid var(--border-divider)",
+              borderRadius: 2,
+              padding: "5px 8px",
+            }}
+          >
+            <summary
+              className="mono"
+              style={{
+                cursor: "pointer",
+                fontSize: "var(--text-xs)",
+                color: "var(--text-secondary)",
+              }}
+            >
+              Advanced Technical Tuning / Coordenadas &amp; Histerese
+            </summary>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns:
+                  "minmax(0, 1.4fr) minmax(0, 1.2fr) minmax(0, 0.7fr) minmax(0, 0.7fr) minmax(0, 0.9fr) minmax(0, 0.9fr)",
+                gap: 6,
+                alignItems: "end",
+                marginTop: 6,
+              }}
+            >
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+                  Normalized Crop [x1,y1,x2,y2]
+                </div>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  aria-label="ROI Normalized Crop"
+                  placeholder="0.200,0.300,0.650,0.850"
+                  value={newRoiCrop}
+                  onChange={(e) => setNewRoiCrop(e.target.value)}
+                />
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+                  States (Classes)
+                </div>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  aria-label="ROI State Classes"
+                  placeholder="closed, open"
+                  value={newRoiClasses}
+                  onChange={(e) => setNewRoiClasses(e.target.value)}
+                />
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+                  Interval (s)
+                </div>
+                <input
+                  type="number"
+                  min={1}
+                  max={300}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  aria-label="ROI Evaluation Interval"
+                  value={newRoiIntervalSec}
+                  onChange={(e) => setNewRoiIntervalSec(Math.max(1, Number(e.target.value)))}
+                />
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+                  Hysteresis
+                </div>
+                <input
+                  type="number"
+                  min={1}
+                  max={30}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  aria-label="ROI Hysteresis Frames"
+                  value={newRoiHysteresis}
+                  onChange={(e) => setNewRoiHysteresis(Math.max(1, Number(e.target.value)))}
+                />
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+                  Anomaly State
+                </div>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  aria-label="ROI Anomaly State"
+                  placeholder="open"
+                  value={newRoiAnomalyState}
+                  onChange={(e) => setNewRoiAnomalyState(e.target.value)}
+                />
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+                  Timeout (s)
+                </div>
+                <input
+                  type="number"
+                  min={5}
+                  max={86400}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  aria-label="ROI Anomaly Timeout"
+                  value={newRoiAnomalyTimeoutSec}
+                  onChange={(e) =>
+                    setNewRoiAnomalyTimeoutSec(Math.max(1, Number(e.target.value)))
+                  }
+                />
+              </div>
+            </div>
+          </details>
 
           {Object.entries(draftConfig.cameras?.[inspectorCam]?.state_rois || {}).length > 0 && (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>

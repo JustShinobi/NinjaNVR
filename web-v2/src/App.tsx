@@ -20,7 +20,11 @@ import { useNvrStore } from "./store/useNvrStore";
 import { LiveWorkspace } from "./views/LiveWorkspace";
 import { SyncWorkspace } from "./views/SyncWorkspace";
 import { ReviewWorkspace } from "./views/ReviewWorkspace";
-import { ExploreWorkspace } from "./views/ExploreWorkspace";
+import {
+  ExploreWorkspace,
+  clearFaceProfileFromEvents,
+  clearFaceProfileFromReviews,
+} from "./views/ExploreWorkspace";
 import { ExportsWorkspace } from "./views/ExportsWorkspace";
 import { ZonesWorkspace } from "./views/ZonesWorkspace";
 import { SystemWorkspace } from "./views/SystemWorkspace";
@@ -73,6 +77,8 @@ export const App: React.FC = () => {
   const setStats = useNvrStore((s) => s.setStats);
   const setStatsHistory = useNvrStore((s) => s.setStatsHistory);
   const setCameraActivity = useNvrStore((s) => s.setCameraActivity);
+  const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
+  const subLabelsRefreshTick = useNvrStore((s) => s.subLabelsRefreshTick);
 
   const [authChecked, setAuthChecked] = useState(false);
   const [authNeeded, setAuthNeeded] = useState(false);
@@ -342,6 +348,21 @@ export const App: React.FC = () => {
           if (p === "armed" || p === "home" || p === "disarmed") {
             setSecurityProfile(p);
           }
+        } else if (msg.topic === "events" && msg.payload) {
+          const parsed =
+            typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
+          if ((parsed?.type === "new" || parsed?.type === "update") && parsed?.after?.id) {
+            const evItem: EventItem = parsed.after;
+            setEvents((prev) => {
+              const idx = prev.findIndex((x) => x.id === evItem.id);
+              if (idx >= 0) {
+                const copy = [...prev];
+                copy[idx] = evItem;
+                return copy;
+              }
+              return [evItem, ...prev];
+            });
+          }
         } else if (msg.topic === "reviews" && msg.payload) {
           const parsed =
             typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
@@ -498,8 +519,29 @@ export const App: React.FC = () => {
     rawYaml,
     selectedEvent,
     reviewDateFilter,
+    subLabelsRefreshTick,
     stats?.service?.last_updated,
   ]);
+
+  useEffect(() => {
+    if (!lastDeletedFaceProfile?.name) return;
+    setEvents((prev) => clearFaceProfileFromEvents(prev, lastDeletedFaceProfile.name));
+    setSelectedEvent((curr) =>
+      curr ? clearFaceProfileFromEvents([curr], lastDeletedFaceProfile.name)[0] : null
+    );
+    setReviews((prev) => clearFaceProfileFromReviews(prev, lastDeletedFaceProfile.name));
+    setActiveReview((curr) =>
+      curr ? clearFaceProfileFromReviews([curr], lastDeletedFaceProfile.name)[0] : null
+    );
+    fetch("/api/events?limit=120", { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((arr: EventItem[] | null) => {
+        if (Array.isArray(arr)) {
+          setEvents(arr);
+        }
+      })
+      .catch(() => {});
+  }, [lastDeletedFaceProfile]);
 
   // Actions
   const handleLogin = async (e: React.FormEvent) => {

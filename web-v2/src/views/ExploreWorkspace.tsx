@@ -1,6 +1,7 @@
 import React from "react";
 import { Camera, Play, Sparkles, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
+import { useNvrStore } from "../store/useNvrStore";
 import {
   AiVerificationResult,
   DetectedAttribute,
@@ -104,11 +105,11 @@ export function applyEventSubLabelUpdate(
     return {
       ...ev,
       sub_label: clean,
-      sub_label_score: score ?? ev.sub_label_score ?? null,
+      sub_label_score: clean ? score ?? ev.sub_label_score ?? null : null,
       data: {
         ...(ev.data || {}),
         sub_label: clean,
-        sub_label_score: score ?? ev.data?.sub_label_score ?? null,
+        sub_label_score: clean ? score ?? ev.data?.sub_label_score ?? null : null,
       },
     };
   });
@@ -127,6 +128,50 @@ export function applyReviewSubLabelUpdate(
       data: {
         ...(rev.data || {}),
         sub_labels: clean ? [clean] : [],
+        ...(clean ? {} : { sub_label_score: null }),
+      },
+    };
+  });
+}
+
+export function clearFaceProfileFromEvents(
+  events: EventItem[],
+  profileName: string
+): EventItem[] {
+  const target = profileName.trim().toLowerCase();
+  if (!target) return events;
+  return events.map((ev) => {
+    const evSub = (ev.sub_label || ev.data?.sub_label || "").trim().toLowerCase();
+    if (evSub !== target) return ev;
+    return {
+      ...ev,
+      sub_label: null,
+      sub_label_score: null,
+      data: {
+        ...(ev.data || {}),
+        sub_label: null,
+        sub_label_score: null,
+      },
+    };
+  });
+}
+
+export function clearFaceProfileFromReviews(
+  reviews: ReviewItem[],
+  profileName: string
+): ReviewItem[] {
+  const target = profileName.trim().toLowerCase();
+  if (!target) return reviews;
+  return reviews.map((rev) => {
+    const subs = rev.data?.sub_labels || [];
+    if (!subs.some((s) => s.trim().toLowerCase() === target)) return rev;
+    const remaining = subs.filter((s) => s.trim().toLowerCase() !== target);
+    return {
+      ...rev,
+      data: {
+        ...(rev.data || {}),
+        sub_labels: remaining,
+        ...(remaining.length === 0 ? { sub_label_score: null } : {}),
       },
     };
   });
@@ -295,6 +340,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const [enrolledFaces, setEnrolledFaces] = React.useState<EnrolledFaceProfileItem[]>([]);
   const [eventPlateDraft, setEventPlateDraft] = React.useState("");
   const [plateFilter, setPlateFilter] = React.useState("");
+  const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
+  const subLabelsRefreshTick = useNvrStore((s) => s.subLabelsRefreshTick);
+  const bumpSubLabelsRefresh = useNvrStore((s) => s.bumpSubLabelsRefresh);
 
   React.useEffect(() => {
     setEventNoteDraft(selectedEvent?.data?.notes || "");
@@ -318,7 +366,28 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         if (d) setEnrolledFaces(parseFacesApiResponse(d));
       })
       .catch(() => {});
-  }, []);
+  }, [subLabelsRefreshTick]);
+
+  React.useEffect(() => {
+    if (!lastDeletedFaceProfile?.name) return;
+    const deletedLower = lastDeletedFaceProfile.name.trim().toLowerCase();
+    setEnrolledFaces((prev) =>
+      prev.filter((p) => p.name.trim().toLowerCase() !== deletedLower)
+    );
+    if (
+      selectedEvent &&
+      (selectedEvent.sub_label || selectedEvent.data?.sub_label || "")
+        .trim()
+        .toLowerCase() === deletedLower
+    ) {
+      const [cleared] = clearFaceProfileFromEvents(
+        [selectedEvent],
+        lastDeletedFaceProfile.name
+      );
+      setSelectedEvent(cleared);
+      setFaceNameDraft("");
+    }
+  }, [lastDeletedFaceProfile, selectedEvent, setSelectedEvent]);
 
   const handleAssignFaceSubLabel = async (overrideName?: string | null) => {
     if (!selectedEvent) return;
@@ -340,6 +409,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         clean
       );
       setSelectedEvent(updated);
+      bumpSubLabelsRefresh();
       notify(clean ? `Assigned face name '${clean}' to event` : "Cleared event sub-label");
     }
   };
@@ -1453,6 +1523,20 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 >
                   Enroll Face
                 </button>
+                {(selectedEvent.sub_label || selectedEvent.data?.sub_label) && (
+                  <button
+                    type="button"
+                    className="nvr-btn danger mono"
+                    style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                    aria-label="Clear or unassign face sub-label"
+                    onClick={() => {
+                      setFaceNameDraft("");
+                      void handleAssignFaceSubLabel(null);
+                    }}
+                  >
+                    Clear / Unassign Face
+                  </button>
+                )}
                 <span className="nvr-divider" aria-hidden="true" />
                 <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   LICENSE PLATE:

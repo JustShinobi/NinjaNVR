@@ -59,6 +59,11 @@ export const ConsoleUiSection: React.FC<{
   const setThemeMode = useNvrStore((s) => s.setThemeMode);
   const highContrast = useNvrStore((s) => s.highContrast);
   const setHighContrast = useNvrStore((s) => s.setHighContrast);
+  const simulatedFleetCount = useNvrStore((s) => s.simulatedFleetCount);
+  const setSimulatedFleetCount = useNvrStore((s) => s.setSimulatedFleetCount);
+  const realCameraCount = useNvrStore(
+    (s) => Object.keys(s.config?.cameras || {}).length || 4
+  );
   const resetUiPreferences = useNvrStore((s) => s.resetUiPreferences);
 
   return (
@@ -297,6 +302,55 @@ export const ConsoleUiSection: React.FC<{
                 }}
                 label="Browser Web Notifications"
               />
+            </div>
+          </div>
+
+          <div className="nvr-field-row">
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt
+                  ? "Simulador de Frota de Câmeras (12 / 36 / 100 Canais)"
+                  : "Simulate Fleet (12 / 36 / 100 Cams)"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Clona as câmeras reais na memória do navegador (com grupos Interno, Perímetro, Andar 1, Estacionamento) sem alterar o config.yml."
+                  : "Clones configured physical cameras in browser memory (with Interno, Perímetro, Andar 1, Estacionamento groups) without modifying config.yml."}
+              </div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              {([12, 36, 100] as const).map((cnt) => (
+                <button
+                  key={cnt}
+                  type="button"
+                  className={`nvr-btn mono ${simulatedFleetCount === cnt ? "active" : ""}`}
+                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  onClick={() => {
+                    const next = simulatedFleetCount === cnt ? 0 : cnt;
+                    setSimulatedFleetCount(next);
+                    notify(
+                      next > 0
+                        ? `Simulated ${next}-camera fleet activated`
+                        : `Restored ${realCameraCount} physical cameras`
+                    );
+                  }}
+                >
+                  {cnt} Cams
+                </button>
+              ))}
+              {simulatedFleetCount > 0 && (
+                <button
+                  type="button"
+                  className="nvr-btn danger mono"
+                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)", fontWeight: 700 }}
+                  onClick={() => {
+                    setSimulatedFleetCount(0);
+                    notify(`Restored ${realCameraCount} physical cameras`);
+                  }}
+                >
+                  Exit Simulation (Restore {realCameraCount} Cameras)
+                </button>
+              )}
             </div>
           </div>
         </div>
