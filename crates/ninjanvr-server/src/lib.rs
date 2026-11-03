@@ -5351,16 +5351,33 @@ async fn api_go2rtc_webrtc(
     body: axum::body::Bytes,
 ) -> Response {
     let query = uri.query().unwrap_or("");
-    let url = format!("{}/api/webrtc?{query}", state.go2rtc_http_base);
+    let url = if query.is_empty() {
+        format!("{}/api/webrtc", state.go2rtc_http_base)
+    } else {
+        format!("{}/api/webrtc?{query}", state.go2rtc_http_base)
+    };
     let mut req = state.http_client.post(&url).body(body.to_vec());
     if let Some(ct) = headers.get(header::CONTENT_TYPE) {
         req = req.header(header::CONTENT_TYPE, ct);
+    } else {
+        req = req.header(header::CONTENT_TYPE, "application/sdp");
     }
     match req.send().await {
         Ok(resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/sdp")
+                .to_string();
             let bytes = resp.bytes().await.unwrap_or_default();
-            (status, Body::from(bytes)).into_response()
+            (
+                status,
+                [(header::CONTENT_TYPE, content_type)],
+                Body::from(bytes),
+            )
+                .into_response()
         }
         Err(err) => (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
     }
@@ -8234,5 +8251,131 @@ version: 0.18-0
                 .unwrap();
         assert_eq!(mse_ws_resp.status(), StatusCode::SWITCHING_PROTOCOLS);
         srv_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_go2rtc_webrtc_backchannel_proxy_and_upstream_failure() {
+        let t = setup_test_app().await;
+
+        let captured_requests: Arc<RwLock<Vec<(String, String, String)>>> =
+            Arc::new(RwLock::new(Vec::new()));
+        let captured_clone = captured_requests.clone();
+
+        let mock_go2rtc = Router::new().route(
+            "/api/webrtc",
+            post(
+                move |uri: Uri, headers: HeaderMap, body: axum::body::Bytes| {
+                    let captured = captured_clone.clone();
+                    async move {
+                        let query = uri.query().unwrap_or("").to_string();
+                        let ct = headers
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let sdp_offer = String::from_utf8_lossy(&body).to_string();
+                        captured
+                            .write()
+                            .await
+                            .push((query.clone(), ct, sdp_offer.clone()));
+
+                        let answer_sdp = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=go2rtc-backchannel\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\na=mid:0\r\n".to_string();
+                        let status = if query.contains("status=201") {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::OK
+                        };
+                        (
+                            status,
+                            [(header::CONTENT_TYPE, "application/sdp")],
+                            answer_sdp,
+                        )
+                    }
+                },
+            ),
+        );
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let mock_handle = tokio::spawn(async move {
+            let _ = axum::serve(mock_listener, mock_go2rtc).await;
+        });
+
+        let mut state = t.state.clone();
+        state.go2rtc_http_base = format!("http://{mock_addr}");
+        let app = build_router(state);
+
+        let sdp_offer = "v=0\r\no=- 42 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n";
+
+        // 1. Verify 200 OK SDP offer/answer proxy with explicit Content-Type and src=front_door
+        let resp_ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/go2rtc/webrtc?src=front_door")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(sdp_offer))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ok.status(), StatusCode::OK);
+        assert_eq!(
+            resp_ok
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/sdp")
+        );
+        let answer_bytes = to_bytes(resp_ok.into_body(), 64 * 1024).await.unwrap();
+        let answer_text = String::from_utf8_lossy(&answer_bytes);
+        assert!(answer_text.contains("s=go2rtc-backchannel"));
+        assert!(answer_text.contains("a=recvonly"));
+
+        // 2. Verify 201 Created response passthrough and default Content-Type header injection
+        let resp_created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/go2rtc/webrtc?src=front_door&status=201")
+                    .body(Body::from(sdp_offer))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_created.status(), StatusCode::CREATED);
+        let created_bytes = to_bytes(resp_created.into_body(), 64 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&created_bytes).contains("s=go2rtc-backchannel"));
+
+        // Assert upstream mock received exact query parameters, Content-Type, and SDP offers
+        {
+            let recorded = captured_requests.read().await;
+            assert_eq!(recorded.len(), 2);
+            assert_eq!(recorded[0].0, "src=front_door");
+            assert_eq!(recorded[0].1, "application/sdp");
+            assert_eq!(recorded[0].2, sdp_offer);
+            assert_eq!(recorded[1].0, "src=front_door&status=201");
+            assert_eq!(recorded[1].1, "application/sdp");
+            assert_eq!(recorded[1].2, sdp_offer);
+        }
+
+        // 3. Shut down mock go2rtc server and verify 502 Bad Gateway on upstream error
+        mock_handle.abort();
+        let _ = mock_handle.await;
+
+        let resp_fail = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/go2rtc/webrtc?src=front_door")
+                    .header(header::CONTENT_TYPE, "application/sdp")
+                    .body(Body::from(sdp_offer))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_fail.status(), StatusCode::BAD_GATEWAY);
     }
 }

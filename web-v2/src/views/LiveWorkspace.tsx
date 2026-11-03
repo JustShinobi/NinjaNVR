@@ -10,7 +10,7 @@ import {
   ReviewItem,
 } from "../types/nvr";
 import { HudPosition, MatrixDensity, SpotlightFilter, formatTs } from "../utils/format";
-import { LiveMsePlayer, VodHlsPlayer } from "../components/VideoPlayers";
+import { LiveMsePlayer, PushToTalkButton, VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 
@@ -977,6 +977,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   >
                     Expand
                   </button>
+                  {!isTimeShifted && <PushToTalkButton camera={cam} height={22} />}
                   <a
                     href={`/api/${cam}/latest.jpg`}
                     download={`${cam}-snapshot.jpg`}
@@ -1194,7 +1195,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   cameraActivity[selectedCamera]?.night_mode ||
                     stats?.cameras?.[selectedCamera]?.night_mode
                 ) && <span className="nvr-badge mono">IR NIGHT</span>}
-                {timeShiftTs !== null && (
+                {timeShiftTs === null ? (
+                  <PushToTalkButton camera={selectedCamera} height={22} />
+                ) : (
                   <button
                     className="nvr-btn success"
                     onClick={() => setTimeShiftTs(null)}
