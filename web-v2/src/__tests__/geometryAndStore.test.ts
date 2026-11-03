@@ -81,6 +81,12 @@ describe("useNvrStore state transitions and i18n parity", () => {
     const s = useNvrStore.getState();
     s.setActiveTab("review");
     s.setLiveLayout("focus");
+    s.setActiveCameraGroup("perimeter");
+    s.setMatrixDensity("4x4");
+    s.setMatrixPage(3);
+    s.setMatrixTourEnabled((prev) => !prev);
+    s.setMatrixTourIntervalSec(20);
+    s.setSyncQuadCameras(["cam1", "cam2", "cam3", "cam4", "cam5"]);
     s.setSpotlightFilter("person");
     s.setSpotlightHoldSec(30);
     s.setSecurityProfile("home");
@@ -125,6 +131,12 @@ describe("useNvrStore state transitions and i18n parity", () => {
     const updated = useNvrStore.getState();
     expect(updated.activeTab).toBe("review");
     expect(updated.liveLayout).toBe("focus");
+    expect(updated.activeCameraGroup).toBe("perimeter");
+    expect(updated.matrixDensity).toBe("4x4");
+    expect(updated.matrixPage).toBe(3);
+    expect(updated.matrixTourEnabled).toBe(true);
+    expect(updated.matrixTourIntervalSec).toBe(20);
+    expect(updated.syncQuadCameras).toEqual(["cam1", "cam2", "cam3", "cam4"]);
     expect(updated.spotlightFilter).toBe("person");
     expect(updated.spotlightHoldSec).toBe(30);
     expect(updated.securityProfile).toBe("home");

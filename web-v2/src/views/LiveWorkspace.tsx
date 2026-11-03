@@ -1,11 +1,139 @@
-import React, { useEffect, useRef, useState } from "react";
-import { Camera, Check, Eye, Play } from "lucide-react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Camera, Check, ChevronLeft, ChevronRight, Eye, Play, RefreshCw } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
-import { CameraMapPlacement, RecordingSegment, ReviewItem } from "../types/nvr";
-import { HudPosition, SpotlightFilter, formatTs } from "../utils/format";
+import {
+  CameraConfig,
+  CameraGroupConfig,
+  CameraMapPlacement,
+  RecordingSegment,
+  ReviewItem,
+} from "../types/nvr";
+import { HudPosition, MatrixDensity, SpotlightFilter, formatTs } from "../utils/format";
 import { LiveMsePlayer, VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
+import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
+
+export const MAX_DOCK_LIVE_DECODERS = 6;
+
+export function getMatrixPageSize(density: MatrixDensity): number {
+  if (density === "3x3") return 9;
+  if (density === "4x4") return 16;
+  return 4;
+}
+
+export function resolveOrderedDashboardCameras(
+  cameraNames: string[],
+  camerasConfig?: Record<string, CameraConfig>,
+  activeGroup: string = "all",
+  cameraGroups?: Record<string, CameraGroupConfig>
+): string[] {
+  const indexMap = new Map<string, number>();
+  cameraNames.forEach((cam, idx) => indexMap.set(cam, idx));
+
+  const groupSet =
+    activeGroup &&
+    activeGroup !== "all" &&
+    cameraGroups &&
+    cameraGroups[activeGroup]?.cameras
+      ? new Set(cameraGroups[activeGroup].cameras)
+      : null;
+
+  const filtered = cameraNames.filter((cam) => {
+    const camCfg = camerasConfig?.[cam];
+    if (camCfg?.ui?.dashboard === false) {
+      return false;
+    }
+    if (groupSet && !groupSet.has(cam)) {
+      return false;
+    }
+    return true;
+  });
+
+  return [...filtered].sort((a, b) => {
+    const orderA = camerasConfig?.[a]?.ui?.order ?? 0;
+    const orderB = camerasConfig?.[b]?.ui?.order ?? 0;
+    if (orderA !== orderB) {
+      return orderA - orderB;
+    }
+    return (indexMap.get(a) ?? 0) - (indexMap.get(b) ?? 0);
+  });
+}
+
+export function sliceMatrixPage(
+  cameras: string[],
+  page: number,
+  density: MatrixDensity
+): {
+  visibleMatrixCams: string[];
+  pageSize: number;
+  totalPages: number;
+  safePage: number;
+} {
+  const pageSize = getMatrixPageSize(density);
+  const totalPages = Math.max(1, Math.ceil(cameras.length / pageSize));
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const visibleMatrixCams = cameras.slice(
+    safePage * pageSize,
+    (safePage + 1) * pageSize
+  );
+  return { visibleMatrixCams, pageSize, totalPages, safePage };
+}
+
+export function nextMatrixTourPage(
+  currentPage: number,
+  totalPages: number
+): number {
+  if (totalPages <= 1) return 0;
+  return (Math.max(0, currentPage) + 1) % totalPages;
+}
+
+export function resolveDockTileMode(
+  index: number,
+  cam: string,
+  hoveredCam: string | null,
+  maxLive: number = MAX_DOCK_LIVE_DECODERS,
+  allDockCams?: string[]
+): "mse" | "snapshot" {
+  if (maxLive <= 0) return "snapshot";
+  if (cam === hoveredCam) return "mse";
+  const hoveredInBeyond =
+    hoveredCam !== null &&
+    (!allDockCams || allDockCams.indexOf(hoveredCam) >= maxLive);
+  const effectiveCap = hoveredInBeyond ? Math.max(0, maxLive - 1) : maxLive;
+  return index < effectiveCap ? "mse" : "snapshot";
+}
+
+export function computeDefaultMapPlacement(
+  index: number,
+  totalCameras: number
+): CameraMapPlacement {
+  const n = Math.max(1, totalCameras);
+  const cols = Math.max(1, Math.ceil(Math.sqrt(n)));
+  const rows = Math.max(1, Math.ceil(n / cols));
+  const safeIdx = Math.max(0, Math.min(index, n - 1));
+  const col = safeIdx % cols;
+  const row = Math.floor(safeIdx / cols);
+
+  const rawX = cols <= 1 ? 0.5 : 0.1 + (col / (cols - 1)) * 0.8;
+  const rawY = rows <= 1 ? 0.5 : 0.12 + (row / (rows - 1)) * 0.76;
+
+  const x = Number(Math.max(0.1, Math.min(0.9, rawX)).toFixed(3));
+  const y = Number(Math.max(0.12, Math.min(0.88, rawY)).toFixed(3));
+  const angle_deg = (safeIdx * 90 + 45) % 360;
+  const range =
+    n > 16
+      ? Number(Math.max(0.08, 0.25 / Math.sqrt(n / 4)).toFixed(3))
+      : 0.25;
+
+  return {
+    x,
+    y,
+    angle_deg,
+    fov_deg: 90,
+    range,
+  };
+}
 
 function buildFovConeSvgPath(
   cx: number,
@@ -53,9 +181,19 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 }) => {
   const { t } = useI18n();
   const [hoveredAlertId, setHoveredAlertId] = useState<string | null>(null);
+  const [hoveredDockCam, setHoveredDockCam] = useState<string | null>(null);
 
   const liveLayout = useNvrStore((s) => s.liveLayout);
   const setLiveLayout = useNvrStore((s) => s.setLiveLayout);
+  const activeCameraGroup = useNvrStore((s) => s.activeCameraGroup);
+  const setActiveCameraGroup = useNvrStore((s) => s.setActiveCameraGroup);
+  const matrixDensity = useNvrStore((s) => s.matrixDensity);
+  const setMatrixDensity = useNvrStore((s) => s.setMatrixDensity);
+  const matrixPage = useNvrStore((s) => s.matrixPage);
+  const setMatrixPage = useNvrStore((s) => s.setMatrixPage);
+  const matrixTourEnabled = useNvrStore((s) => s.matrixTourEnabled);
+  const setMatrixTourEnabled = useNvrStore((s) => s.setMatrixTourEnabled);
+  const matrixTourIntervalSec = useNvrStore((s) => s.matrixTourIntervalSec);
   const spotlightFilter = useNvrStore((s) => s.spotlightFilter);
   const setSpotlightFilter = useNvrStore((s) => s.setSpotlightFilter);
   const spotlightHoldSec = useNvrStore((s) => s.spotlightHoldSec);
@@ -101,9 +239,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       const next = { ...prev };
       cameraNames.forEach((cam, idx) => {
         const cfgMap = config?.cameras?.[cam]?.map;
-        const defaultX = 0.25 + (idx % 2) * 0.5;
-        const defaultY = 0.28 + Math.floor(idx / 2) * 0.44;
-        const defaultAngle = (idx * 90 + 45) % 360;
+        const fallbackPlacement = computeDefaultMapPlacement(
+          idx,
+          cameraNames.length
+        );
         const isUnconfiguredDefault =
           cfgMap &&
           Math.abs((cfgMap.x ?? 0.5) - 0.5) < 0.001 &&
@@ -111,20 +250,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           Math.abs(cfgMap.angle_deg ?? 0) < 0.001;
         if (cfgMap && !isUnconfiguredDefault) {
           next[cam] = {
-            x: cfgMap.x ?? defaultX,
-            y: cfgMap.y ?? defaultY,
-            angle_deg: cfgMap.angle_deg ?? defaultAngle,
-            fov_deg: cfgMap.fov_deg ?? 90,
-            range: cfgMap.range ?? 0.25,
+            x: cfgMap.x ?? fallbackPlacement.x,
+            y: cfgMap.y ?? fallbackPlacement.y,
+            angle_deg: cfgMap.angle_deg ?? fallbackPlacement.angle_deg,
+            fov_deg: cfgMap.fov_deg ?? fallbackPlacement.fov_deg,
+            range: cfgMap.range ?? fallbackPlacement.range,
           };
         } else if (!next[cam]) {
-          next[cam] = {
-            x: Number(defaultX.toFixed(3)),
-            y: Number(defaultY.toFixed(3)),
-            angle_deg: defaultAngle,
-            fov_deg: 90,
-            range: 0.25,
-          };
+          next[cam] = fallbackPlacement;
         }
       });
       return next;
@@ -212,7 +345,46 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     return () => window.clearInterval(tmr);
   }, [liveLayout]);
 
-  const spotlightPromotedCams = [...cameraNames]
+  const groupCams = useMemo(() => {
+    const resolved = resolveOrderedDashboardCameras(
+      cameraNames,
+      config?.cameras,
+      activeCameraGroup,
+      config?.camera_groups
+    );
+    return resolved.length > 0 || activeCameraGroup !== "all"
+      ? resolved
+      : cameraNames;
+  }, [cameraNames, config?.cameras, activeCameraGroup, config?.camera_groups]);
+
+  const { visibleMatrixCams, totalPages, safePage } = useMemo(
+    () => sliceMatrixPage(groupCams, matrixPage, matrixDensity),
+    [groupCams, matrixPage, matrixDensity]
+  );
+
+  useEffect(() => {
+    if (liveLayout !== "2x2" || !matrixTourEnabled || totalPages <= 1) return;
+    const tmr = window.setInterval(() => {
+      setMatrixPage((prev) => nextMatrixTourPage(prev, totalPages));
+    }, Math.max(3, matrixTourIntervalSec) * 1000);
+    return () => window.clearInterval(tmr);
+  }, [
+    liveLayout,
+    matrixTourEnabled,
+    totalPages,
+    matrixTourIntervalSec,
+    setMatrixPage,
+  ]);
+
+  const cameraGroupEntries = useMemo(() => {
+    if (!config?.camera_groups) return [];
+    return Object.entries(config.camera_groups).sort(
+      ([aKey, aVal], [bKey, bVal]) =>
+        ((aVal.order ?? 0) - (bVal.order ?? 0)) || aKey.localeCompare(bKey)
+    );
+  }, [config?.camera_groups]);
+
+  const spotlightPromotedCams = [...groupCams]
     .filter((cam) => nowTick - (lastActiveRef.current[cam] || 0) <= spotlightHoldSec)
     .sort(
       (a, b) =>
@@ -225,20 +397,50 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       ? spotlightTrail[spotlightTrail.length - 1].cam
       : selectedCamera);
   const spotlightActiveCams = [spotlightHeroCam];
-  const spotlightIdleCams = cameraNames.filter((c) => c !== spotlightHeroCam);
+  const spotlightIdleCams = groupCams.filter((c) => c !== spotlightHeroCam);
+  const focusDockCams = groupCams.filter((c) => c !== selectedCamera);
 
   return (
     <>
       <div className="nvr-subbar">
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <button
-            className={`nvr-btn ${liveLayout === "2x2" ? "active" : ""}`}
+            className={`nvr-btn ${
+              liveLayout === "2x2" && matrixDensity === "2x2" ? "active" : ""
+            }`}
             onClick={() => {
               setLiveLayout("2x2");
+              setMatrixDensity("2x2");
               setTimeShiftTs(null);
             }}
           >
             {t.live.grid2x2}
+          </button>
+          <button
+            className={`nvr-btn mono ${
+              liveLayout === "2x2" && matrixDensity === "3x3" ? "active" : ""
+            }`}
+            onClick={() => {
+              setLiveLayout("2x2");
+              setMatrixDensity("3x3");
+              setTimeShiftTs(null);
+            }}
+            title="3x3 Paginated Tactical Matrix (9 channels per page)"
+          >
+            3x3 Grid
+          </button>
+          <button
+            className={`nvr-btn mono ${
+              liveLayout === "2x2" && matrixDensity === "4x4" ? "active" : ""
+            }`}
+            onClick={() => {
+              setLiveLayout("2x2");
+              setMatrixDensity("4x4");
+              setTimeShiftTs(null);
+            }}
+            title="4x4 High-Density Tactical Matrix (16 channels per page)"
+          >
+            4x4 Grid
           </button>
           <button
             className={`nvr-btn ${liveLayout === "focus" ? "active" : ""}`}
@@ -272,6 +474,85 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           >
             Tactical Map
           </button>
+
+          {cameraGroupEntries.length > 0 && (
+            <>
+              <span className="nvr-divider" aria-hidden="true" />
+              <button
+                type="button"
+                className={`nvr-btn mono ${
+                  activeCameraGroup === "all" ? "active" : ""
+                }`}
+                style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                onClick={() => setActiveCameraGroup("all")}
+              >
+                ALL ({cameraNames.length})
+              </button>
+              {cameraGroupEntries.map(([gName, gCfg]) => (
+                <button
+                  key={gName}
+                  type="button"
+                  className={`nvr-btn mono ${
+                    activeCameraGroup === gName ? "active" : ""
+                  }`}
+                  style={{
+                    height: 24,
+                    padding: "0 7px",
+                    fontSize: "var(--text-xs)",
+                    textTransform: "uppercase",
+                  }}
+                  onClick={() => setActiveCameraGroup(gName)}
+                >
+                  {gName} ({gCfg.cameras?.length || 0})
+                </button>
+              ))}
+            </>
+          )}
+
+          {liveLayout === "2x2" && totalPages > 1 && (
+            <>
+              <span className="nvr-divider" aria-hidden="true" />
+              <button
+                type="button"
+                className="nvr-btn mono"
+                style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                aria-label="Previous matrix page"
+                onClick={() =>
+                  setMatrixPage((p) => (p - 1 + totalPages) % totalPages)
+                }
+              >
+                <ChevronLeft size={12} />
+              </button>
+              <span
+                className="nvr-badge mono"
+                style={{ height: 24, padding: "0 8px" }}
+              >
+                Page {safePage + 1} / {totalPages}
+              </span>
+              <button
+                type="button"
+                className="nvr-btn mono"
+                style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                aria-label="Next matrix page"
+                onClick={() =>
+                  setMatrixPage((p) => nextMatrixTourPage(p, totalPages))
+                }
+              >
+                <ChevronRight size={12} />
+              </button>
+              <button
+                type="button"
+                className={`nvr-btn mono ${matrixTourEnabled ? "active" : ""}`}
+                style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                onClick={() => setMatrixTourEnabled((v) => !v)}
+                title="Auto-Tour carousel across matrix pages"
+              >
+                <RefreshCw size={11} />
+                Tour {matrixTourIntervalSec}s
+              </button>
+            </>
+          )}
+
           {liveLayout === "spotlight" && (
             <>
               <span className="nvr-divider" aria-hidden="true" />
@@ -343,16 +624,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           {(liveLayout === "focus" || liveLayout === "single") && (
             <>
               <span className="nvr-divider" aria-hidden="true" />
-              {cameraNames.map((cam) => (
-                <button
-                  key={cam}
-                  className={`nvr-btn mono ${selectedCamera === cam ? "active" : ""}`}
-                  onClick={() => setSelectedCamera(cam)}
-                  style={{ textTransform: "uppercase" }}
-                >
-                  {cam}
-                </button>
-              ))}
+              <TacticalCameraPicker
+                cameras={groupCams}
+                selectedCamera={selectedCamera}
+                onSelect={setSelectedCamera}
+                cameraGroups={config?.camera_groups}
+                cameraStats={stats?.cameras}
+                cameraActivity={cameraActivity}
+                ariaLabel="Focus camera selector"
+              />
             </>
           )}
         </div>
@@ -555,8 +835,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       )}
 
       {liveLayout === "2x2" && (
-        <div className="nvr-matrix-2x2">
-          {cameraNames.map((cam) => {
+        <div className={`nvr-matrix-${matrixDensity}`}>
+          {visibleMatrixCams.map((cam) => {
             const camCfg = config?.cameras?.[cam];
             const camStat = stats?.cameras?.[cam];
             const act = cameraActivity[cam];
@@ -792,33 +1072,59 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
           {spotlightIdleCams.length > 0 && (
             <div className="nvr-focus-dock">
-              {spotlightIdleCams.map((cam) => (
-                <div
-                  key={cam}
-                  className="nvr-cam-tile"
-                  style={{ height: "33.33%", minHeight: 140, opacity: 0.78 }}
-                >
-                  <LiveMsePlayer
-                    camera={cam}
-                    useMainStream={false}
-                    cameraConfig={config?.cameras?.[cam]}
-                    showVectors={showVectors}
-                    onClick={() => {
-                      const ts = Math.floor(Date.now() / 1000);
-                      lastActiveRef.current[cam] = ts;
-                      lastSurgeRef.current[cam] = ts;
-                      setSelectedCamera(cam);
-                      setNowTick(ts);
-                    }}
-                  />
-                  <div className={`nvr-cam-hud pos-${hudPosition}`}>
-                    <span className="nvr-badge mono">{cam.toUpperCase()} · STANDBY</span>
-                    {Boolean(
-                      cameraActivity[cam]?.night_mode || stats?.cameras?.[cam]?.night_mode
-                    ) && <span className="nvr-badge mono">IR NIGHT</span>}
+              {spotlightIdleCams.map((cam, idx) => {
+                const tileMode = resolveDockTileMode(
+                  idx,
+                  cam,
+                  hoveredDockCam,
+                  MAX_DOCK_LIVE_DECODERS,
+                  spotlightIdleCams
+                );
+                const promoteCam = () => {
+                  const ts = Math.floor(Date.now() / 1000);
+                  lastActiveRef.current[cam] = ts;
+                  lastSurgeRef.current[cam] = ts;
+                  setSelectedCamera(cam);
+                  setNowTick(ts);
+                };
+                return (
+                  <div
+                    key={cam}
+                    className="nvr-cam-tile"
+                    style={{ height: "33.33%", minHeight: 140, opacity: 0.78, cursor: "pointer" }}
+                    onPointerEnter={() => setHoveredDockCam(cam)}
+                    onPointerLeave={() =>
+                      setHoveredDockCam((c) => (c === cam ? null : c))
+                    }
+                    onClick={promoteCam}
+                  >
+                    {tileMode === "mse" ? (
+                      <LiveMsePlayer
+                        camera={cam}
+                        useMainStream={false}
+                        cameraConfig={config?.cameras?.[cam]}
+                        showVectors={showVectors}
+                        onClick={promoteCam}
+                      />
+                    ) : (
+                      <img
+                        className="nvr-cam-poster"
+                        src={`/api/${encodeURIComponent(cam)}/latest.webp`}
+                        alt={`${cam} standby snapshot`}
+                        loading="lazy"
+                      />
+                    )}
+                    <div className={`nvr-cam-hud pos-${hudPosition}`}>
+                      <span className="nvr-badge mono">
+                        {cam.toUpperCase()} · {tileMode === "mse" ? "STANDBY" : "SNAPSHOT"}
+                      </span>
+                      {Boolean(
+                        cameraActivity[cam]?.night_mode || stats?.cameras?.[cam]?.night_mode
+                      ) && <span className="nvr-badge mono">IR NIGHT</span>}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -903,29 +1209,52 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
           {liveLayout === "focus" && (
             <div className="nvr-focus-dock">
-              {cameraNames
-                .filter((c) => c !== selectedCamera)
-                .map((cam) => (
+              {focusDockCams.map((cam, idx) => {
+                const tileMode = resolveDockTileMode(
+                  idx,
+                  cam,
+                  hoveredDockCam,
+                  MAX_DOCK_LIVE_DECODERS,
+                  focusDockCams
+                );
+                return (
                   <div
                     key={cam}
                     className="nvr-cam-tile"
-                    style={{ height: "33.33%", minHeight: 160 }}
+                    style={{ height: "33.33%", minHeight: 160, cursor: "pointer" }}
+                    onPointerEnter={() => setHoveredDockCam(cam)}
+                    onPointerLeave={() =>
+                      setHoveredDockCam((c) => (c === cam ? null : c))
+                    }
+                    onClick={() => setSelectedCamera(cam)}
                   >
-                    <LiveMsePlayer
-                      camera={cam}
-                      useMainStream={false}
-                      cameraConfig={config?.cameras?.[cam]}
-                      showVectors={showVectors}
-                      onClick={() => setSelectedCamera(cam)}
-                    />
+                    {tileMode === "mse" ? (
+                      <LiveMsePlayer
+                        camera={cam}
+                        useMainStream={false}
+                        cameraConfig={config?.cameras?.[cam]}
+                        showVectors={showVectors}
+                        onClick={() => setSelectedCamera(cam)}
+                      />
+                    ) : (
+                      <img
+                        className="nvr-cam-poster"
+                        src={`/api/${encodeURIComponent(cam)}/latest.webp`}
+                        alt={`${cam} dock snapshot`}
+                        loading="lazy"
+                      />
+                    )}
                     <div className={`nvr-cam-hud pos-${hudPosition}`}>
                       <span className="nvr-badge live">{cam.toUpperCase()}</span>
                       <span className="nvr-badge">
-                        {stats?.cameras?.[cam]?.camera_fps?.toFixed(1) || "5.0"} FPS
+                        {tileMode === "mse"
+                          ? `${stats?.cameras?.[cam]?.camera_fps?.toFixed(1) || "5.0"} FPS`
+                          : "WEBP"}
                       </span>
                     </div>
                   </div>
-                ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -1188,17 +1517,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               </button>
             </div>
             <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-              {cameraNames.map((cam) => (
-                <button
-                  key={cam}
-                  type="button"
-                  className={`nvr-btn mono ${selectedCamera === cam ? "active" : ""}`}
-                  style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
-                  onClick={() => setSelectedCamera(cam)}
-                >
-                  {cam.toUpperCase()}
-                </button>
-              ))}
+              <TacticalCameraPicker
+                cameras={groupCams}
+                selectedCamera={selectedCamera}
+                onSelect={setSelectedCamera}
+                cameraGroups={config?.camera_groups}
+                cameraStats={stats?.cameras}
+                cameraActivity={cameraActivity}
+                ariaLabel="Map sector camera selector"
+              />
             </div>
 
             <div className="nvr-cam-tile" style={{ height: 210, flexShrink: 0 }}>

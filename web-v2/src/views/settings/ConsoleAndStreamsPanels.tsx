@@ -8,6 +8,7 @@ import {
   NinjaConfigResponse,
 } from "../../types/nvr";
 import { FirstWeekday, HudPosition, LiveLayoutMode } from "../../utils/format";
+import { TacticalCameraPicker } from "../../components/TacticalCameraPicker";
 
 export const ToggleSwitch: React.FC<{
   checked: boolean;
@@ -640,17 +641,26 @@ export const ChannelsStreamsSection: React.FC<{
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       {/* Camera Matrix State Table */}
       <div className="nvr-cfg-card">
-        <div className="nvr-cfg-card-header">
+        <div className="nvr-cfg-card-header" style={{ flexWrap: "wrap" }}>
           <span>
             {isPt
               ? `CANAIS DE CÂMERA & FUNÇÕES DE PIPELINE (${camKeys.length})`
               : `CAMERA CHANNELS & PIPELINE ROLES (${camKeys.length})`}
           </span>
-          <span className="mono" style={{ color: "var(--signal-accent-text)" }}>
-            {isPt
-              ? `INSPECIONANDO: ${inspectorCam.toUpperCase()}`
-              : `ACTIVE CHANNEL: ${inspectorCam.toUpperCase()}`}
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <TacticalCameraPicker
+              cameras={camKeys}
+              selectedCamera={inspectorCam}
+              onSelect={setInspectorCam}
+              cameraGroups={draftConfig.camera_groups}
+              ariaLabel="Channel inspector selector"
+            />
+            <span className="mono" style={{ color: "var(--signal-accent-text)" }}>
+              {isPt
+                ? `INSPECIONANDO: ${inspectorCam.toUpperCase()}`
+                : `ACTIVE CHANNEL: ${inspectorCam.toUpperCase()}`}
+            </span>
+          </div>
         </div>
         <div style={{ overflowX: "auto" }}>
           <table className="nvr-table mono">

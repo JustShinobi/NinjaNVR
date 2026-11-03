@@ -277,4 +277,47 @@ go2rtc:
     expect(yamlText).toContain("path: /config/ninjanvr.db");
     expect(yamlText.toLowerCase()).not.toContain("frigate");
   });
+
+  test("serializes camera_groups and camera.ui order and dashboard settings", () => {
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      camera_groups: {
+        perimeter: {
+          cameras: ["north_gate", "south_gate"],
+          icon: "shield",
+          order: 1,
+        },
+      },
+      cameras: {
+        north_gate: {
+          enabled: true,
+          ui: { order: 2, dashboard: true },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {},
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+        south_gate: {
+          enabled: true,
+          ui: { order: 1, dashboard: false },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {},
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+      },
+    };
+
+    const yamlText = buildCleanYamlFromDraft(draft, "");
+    expect(yamlText).toContain("camera_groups:");
+    expect(yamlText).toContain("perimeter:");
+    expect(yamlText).toContain("- north_gate");
+    expect(yamlText).toContain("- south_gate");
+    expect(yamlText).toContain("icon: shield");
+    expect(yamlText).toContain("dashboard: false");
+    expect(yamlText).toContain("order: 2");
+  });
 });
