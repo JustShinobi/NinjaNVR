@@ -2121,22 +2121,74 @@ impl NinjaDatabase {
         continuous_before_ts: f64,
         event_before_ts: f64,
     ) -> Result<Vec<String>> {
+        self.delete_expired_recordings_with_window(
+            camera,
+            continuous_before_ts,
+            continuous_before_ts,
+            event_before_ts,
+            0.0,
+            0.0,
+        )
+    }
+
+    pub fn delete_expired_recordings_with_window(
+        &self,
+        camera: &str,
+        continuous_before_ts: f64,
+        motion_before_ts: f64,
+        event_before_ts: f64,
+        pre_capture_sec: f64,
+        post_capture_sec: f64,
+    ) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, path
-            FROM recordings
-            WHERE camera = ?1
+            SELECT r.id, r.path
+            FROM recordings r
+            WHERE r.camera = ?1
               AND (
-                (COALESCE(motion, 0) = 0 AND COALESCE(objects, 0) = 0 AND end_time < ?2)
-                OR end_time < ?3
+                r.end_time < ?3
+                OR (
+                  COALESCE(r.objects, 0) = 0
+                  AND (
+                    (COALESCE(r.motion, 0) = 0 AND r.end_time < ?2)
+                    OR r.end_time < ?6
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM event e
+                    WHERE e.camera = r.camera
+                      AND r.end_time >= (e.start_time - ?4)
+                      AND r.start_time <= (COALESCE(e.end_time, e.start_time + 15.0) + ?5)
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM reviewsegment rv
+                    WHERE rv.camera = r.camera
+                      AND r.end_time >= (rv.start_time - ?4)
+                      AND r.start_time <= (COALESCE(rv.end_time, rv.start_time + 15.0) + ?5)
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM recordings r2
+                    WHERE r2.camera = r.camera
+                      AND r2.id != r.id
+                      AND COALESCE(r2.objects, 0) > 0
+                      AND r.end_time >= (r2.start_time - ?4)
+                      AND r.start_time <= (r2.end_time + ?5)
+                  )
+                )
               )
-            ORDER BY end_time ASC
+            ORDER BY r.end_time ASC
             LIMIT 500
             "#,
         )?;
         let rows = stmt.query_map(
-            params![camera, continuous_before_ts, event_before_ts],
+            params![
+                camera,
+                continuous_before_ts,
+                event_before_ts,
+                pre_capture_sec,
+                post_capture_sec,
+                motion_before_ts
+            ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )?;
         let mut ids = Vec::new();
@@ -2155,6 +2207,79 @@ impl NinjaDatabase {
             }
         }
         Ok(paths)
+    }
+
+    pub fn list_cold_compaction_candidates(
+        &self,
+        camera: &str,
+        before_ts: f64,
+        idle_only: bool,
+        pre_capture_sec: f64,
+        post_capture_sec: f64,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let sql = if idle_only {
+            r#"
+            SELECT r.id, r.path
+            FROM recordings r
+            WHERE r.camera = ?1
+              AND r.end_time < ?2
+              AND COALESCE(r.stream_tier, 'main') != 'compacted'
+              AND COALESCE(r.motion, 0) = 0
+              AND COALESCE(r.objects, 0) = 0
+              AND NOT EXISTS (
+                SELECT 1 FROM event e
+                WHERE e.camera = r.camera
+                  AND r.end_time >= (e.start_time - ?3)
+                  AND r.start_time <= (COALESCE(e.end_time, e.start_time + 15.0) + ?4)
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM reviewsegment rv
+                WHERE rv.camera = r.camera
+                  AND r.end_time >= (rv.start_time - ?3)
+                  AND r.start_time <= (COALESCE(rv.end_time, rv.start_time + 15.0) + ?4)
+              )
+            ORDER BY r.start_time ASC
+            LIMIT ?5
+            "#
+        } else {
+            r#"
+            SELECT r.id, r.path
+            FROM recordings r
+            WHERE r.camera = ?1
+              AND r.end_time < ?2
+              AND COALESCE(r.stream_tier, 'main') != 'compacted'
+              AND (?3 >= 0.0 AND ?4 >= 0.0)
+            ORDER BY r.start_time ASC
+            LIMIT ?5
+            "#
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(
+            params![
+                camera,
+                before_ts,
+                pre_capture_sec,
+                post_capture_sec,
+                limit as i64
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn update_recording_compacted(&self, id: &str, new_size_mb: f64) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE recordings SET segment_size = ?2, stream_tier = 'compacted' WHERE id = ?1",
+            params![id, new_size_mb],
+        )?;
+        Ok(())
     }
 
     /// Deletes recording rows for `camera` overlapping `[after, before]` in a single transaction

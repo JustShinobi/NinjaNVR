@@ -693,6 +693,130 @@ pub fn build_recorder_ffmpeg_args(
     ]);
     args
 }
+
+/// Builds the FFmpeg CLI arguments for Cold Compaction (`record.cold_compaction`),
+/// supporting software (`libx264`, `libx265`) and hardware-accelerated (`vaapi`, `qsv`, `nvenc`)
+/// encoders, presets, and CRF/QP targets.
+pub fn build_cold_compaction_ffmpeg_args(
+    src_path: &Path,
+    dst_path: &Path,
+    codec: &str,
+    preset: &str,
+    hwaccel: &str,
+    crf: u8,
+) -> Vec<String> {
+    let is_hevc = matches!(codec.to_ascii_lowercase().as_str(), "hevc" | "h265");
+    let safe_preset = match preset {
+        "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" | "medium" | "slow" => preset,
+        _ => "veryfast",
+    };
+    let crf_str = crf.clamp(18, 36).to_string();
+    let mut args = vec![
+        "-y".to_string(),
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+    ];
+
+    match hwaccel.to_ascii_lowercase().as_str() {
+        "vaapi" => {
+            args.extend([
+                "-hwaccel".to_string(),
+                "vaapi".to_string(),
+                "-hwaccel_device".to_string(),
+                "/dev/dri/renderD128".to_string(),
+                "-hwaccel_output_format".to_string(),
+                "vaapi".to_string(),
+                "-i".to_string(),
+                src_path.to_string_lossy().to_string(),
+                "-c:v".to_string(),
+                if is_hevc {
+                    "hevc_vaapi".to_string()
+                } else {
+                    "h264_vaapi".to_string()
+                },
+                "-qp".to_string(),
+                crf_str,
+            ]);
+        }
+        "qsv" => {
+            args.extend([
+                "-hwaccel".to_string(),
+                "qsv".to_string(),
+                "-i".to_string(),
+                src_path.to_string_lossy().to_string(),
+                "-c:v".to_string(),
+                if is_hevc {
+                    "hevc_qsv".to_string()
+                } else {
+                    "h264_qsv".to_string()
+                },
+                "-preset".to_string(),
+                safe_preset.to_string(),
+                "-global_quality".to_string(),
+                crf_str,
+            ]);
+        }
+        "nvenc" => {
+            let nv_preset = match safe_preset {
+                "ultrafast" | "superfast" => "p1",
+                "veryfast" | "faster" => "p2",
+                "fast" => "p3",
+                "medium" => "p4",
+                "slow" => "p5",
+                _ => "p2",
+            };
+            args.extend([
+                "-hwaccel".to_string(),
+                "cuda".to_string(),
+                "-i".to_string(),
+                src_path.to_string_lossy().to_string(),
+                "-c:v".to_string(),
+                if is_hevc {
+                    "hevc_nvenc".to_string()
+                } else {
+                    "h264_nvenc".to_string()
+                },
+                "-preset".to_string(),
+                nv_preset.to_string(),
+                "-cq".to_string(),
+                crf_str,
+            ]);
+        }
+        _ => {
+            args.extend([
+                "-threads".to_string(),
+                "1".to_string(),
+                "-i".to_string(),
+                src_path.to_string_lossy().to_string(),
+                "-c:v".to_string(),
+                if is_hevc {
+                    "libx265".to_string()
+                } else {
+                    "libx264".to_string()
+                },
+                "-preset".to_string(),
+                safe_preset.to_string(),
+                "-crf".to_string(),
+                crf_str,
+                "-threads".to_string(),
+                "1".to_string(),
+            ]);
+        }
+    }
+
+    if is_hevc {
+        args.extend(["-tag:v".to_string(), "hvc1".to_string()]);
+    }
+    args.extend([
+        "-c:a".to_string(),
+        "copy".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        dst_path.to_string_lossy().to_string(),
+    ]);
+    args
+}
 /// Removes empty `<camera>`, `HH`, and `YYYY-MM-DD` parent directories after a segment file is deleted.
 pub fn prune_empty_parent_dirs(file_path: &Path, stop_at: &Path) {
     let mut cur = file_path.parent();
@@ -786,8 +910,14 @@ impl RecordingEngine {
                     } else {
                         cfg.camera_input_for_role(name, "record")?
                     };
+                    let has_pre_post_buffer = c.record.alerts.pre_capture > 0
+                        || c.record.alerts.post_capture > 0
+                        || c.record.detections.pre_capture > 0
+                        || c.record.detections.post_capture > 0;
                     let policy = CameraRecordPolicy {
-                        keep_continuous: c.record.continuous.days > 0.0 || use_sub_default,
+                        keep_continuous: c.record.continuous.days > 0.0
+                            || use_sub_default
+                            || has_pre_post_buffer,
                         keep_motion: c.record.motion.days > 0.0,
                         continuous_substream: use_sub_default,
                         retain_mode: c.record.alerts.retain.mode.clone(),
@@ -1180,13 +1310,24 @@ impl RecordingEngine {
 
     async fn run_retention_cleanup_loop(&self) {
         let recordings_root = self.media_dir.join("recordings");
+        let ffmpeg_bin = resolve_ffmpeg_bin();
         struct CameraRetentionEntry {
             camera: String,
             continuous_days: f64,
+            motion_days: f64,
             alerts_days: f64,
             detections_days: f64,
+            pre_capture_sec: f64,
+            post_capture_sec: f64,
             quota_gb: Option<f64>,
             mode_tiering: bool,
+            compact_enabled: bool,
+            compact_after_hours: u32,
+            compact_crf: u8,
+            compact_idle_only: bool,
+            compact_codec: String,
+            compact_preset: String,
+            compact_hwaccel: String,
         }
         loop {
             let (expire_interval, camera_retentions, global_quota_gb, global_min_free_gb): (
@@ -1211,7 +1352,23 @@ impl RecordingEngine {
                     .cameras
                     .iter()
                     .map(|(name, c)| {
-                        let continuous_days = c.record.continuous.days.max(0.1);
+                        let pre_cap = c
+                            .record
+                            .alerts
+                            .pre_capture
+                            .max(c.record.detections.pre_capture)
+                            .max(cfg.record.alerts.pre_capture)
+                            as f64;
+                        let post_cap = c
+                            .record
+                            .alerts
+                            .post_capture
+                            .max(c.record.detections.post_capture)
+                            .max(cfg.record.alerts.post_capture)
+                            as f64;
+                        let min_buffer_days = ((pre_cap + post_cap + 60.0) / 86400.0).max(0.002);
+                        let continuous_days = c.record.continuous.days.max(min_buffer_days);
+                        let motion_days = c.record.motion.days.max(continuous_days);
                         let alerts_days = c.record.alerts.retain.days.max(0.1);
                         let detections_days = c.record.detections.retain.days.max(0.1);
                         let quota_gb = c
@@ -1223,13 +1380,36 @@ impl RecordingEngine {
                             || cfg.record.mode_tiering
                             || c.record.continuous_substream
                             || cfg.record.continuous_substream;
+                        let compact_src = if c.record.cold_compaction.enabled {
+                            &c.record.cold_compaction
+                        } else {
+                            &cfg.record.cold_compaction
+                        };
+                        let compact_enabled =
+                            c.record.cold_compaction.enabled || cfg.record.cold_compaction.enabled;
+                        let compact_after_hours = compact_src.after_hours.max(1);
+                        let compact_crf = compact_src.crf.clamp(18, 36);
+                        let compact_idle_only = compact_src.idle_only;
+                        let compact_codec = compact_src.codec.clone();
+                        let compact_preset = compact_src.preset.clone();
+                        let compact_hwaccel = compact_src.hwaccel.clone();
                         CameraRetentionEntry {
                             camera: name.clone(),
                             continuous_days,
+                            motion_days,
                             alerts_days,
                             detections_days,
+                            pre_capture_sec: pre_cap,
+                            post_capture_sec: post_cap,
                             quota_gb,
                             mode_tiering,
+                            compact_enabled,
+                            compact_after_hours,
+                            compact_crf,
+                            compact_idle_only,
+                            compact_codec,
+                            compact_preset,
+                            compact_hwaccel,
                         }
                     })
                     .collect();
@@ -1240,10 +1420,20 @@ impl RecordingEngine {
             for CameraRetentionEntry {
                 camera,
                 continuous_days,
+                motion_days,
                 alerts_days,
                 detections_days,
+                pre_capture_sec,
+                post_capture_sec,
                 quota_gb,
                 mode_tiering,
+                compact_enabled,
+                compact_after_hours,
+                compact_crf,
+                compact_idle_only,
+                compact_codec,
+                compact_preset,
+                compact_hwaccel,
             } in camera_retentions
             {
                 if mode_tiering {
@@ -1265,14 +1455,18 @@ impl RecordingEngine {
                     }
                 }
                 let continuous_cutoff = now - continuous_days * 86400.0;
+                let motion_cutoff = now - motion_days * 86400.0;
                 let alerts_cutoff = now - alerts_days * 86400.0;
                 let detections_cutoff = now - detections_days * 86400.0;
                 let event_recording_cutoff = alerts_cutoff.min(detections_cutoff);
                 loop {
-                    let Ok(expired_paths) = self.db.delete_expired_recordings(
+                    let Ok(expired_paths) = self.db.delete_expired_recordings_with_window(
                         &camera,
                         continuous_cutoff,
+                        motion_cutoff,
                         event_recording_cutoff,
+                        pre_capture_sec,
+                        post_capture_sec,
                     ) else {
                         break;
                     };
@@ -1334,6 +1528,84 @@ impl RecordingEngine {
                             PathBuf::from(cp)
                         };
                         let _ = std::fs::remove_file(disk_path);
+                    }
+                }
+
+                if compact_enabled {
+                    let compact_before = now - (compact_after_hours as f64) * 3600.0;
+                    if let Ok(candidates) = self.db.list_cold_compaction_candidates(
+                        &camera,
+                        compact_before,
+                        compact_idle_only,
+                        pre_capture_sec,
+                        post_capture_sec,
+                        12,
+                    ) {
+                        for (seg_id, db_path) in candidates {
+                            let disk_path = if let Some(rel) = strip_media_root(&db_path) {
+                                self.media_dir.join(rel)
+                            } else {
+                                PathBuf::from(&db_path)
+                            };
+                            let Ok(orig_meta) = std::fs::metadata(&disk_path) else {
+                                let _ = self.db.update_recording_compacted(&seg_id, 0.0);
+                                continue;
+                            };
+                            let orig_len = orig_meta.len();
+                            if orig_len < 65_536 {
+                                let mb =
+                                    ((orig_len as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
+                                let _ = self.db.update_recording_compacted(&seg_id, mb);
+                                continue;
+                            }
+                            let tmp_out = disk_path.with_extension("compact.mp4");
+                            let primary_args = build_cold_compaction_ffmpeg_args(
+                                &disk_path,
+                                &tmp_out,
+                                &compact_codec,
+                                &compact_preset,
+                                &compact_hwaccel,
+                                compact_crf,
+                            );
+                            let mut status =
+                                Command::new(&ffmpeg_bin).args(&primary_args).status().await;
+                            if !status.as_ref().map(|s| s.success()).unwrap_or(false)
+                                && compact_hwaccel != "none"
+                            {
+                                let fallback_args = build_cold_compaction_ffmpeg_args(
+                                    &disk_path,
+                                    &tmp_out,
+                                    &compact_codec,
+                                    &compact_preset,
+                                    "none",
+                                    compact_crf,
+                                );
+                                status = Command::new(&ffmpeg_bin)
+                                    .args(&fallback_args)
+                                    .status()
+                                    .await;
+                            }
+                            let mut final_mb =
+                                ((orig_len as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
+                            if status.map(|s| s.success()).unwrap_or(false)
+                                && let Ok(new_meta) = std::fs::metadata(&tmp_out)
+                                && new_meta.len() > 4096
+                                && new_meta.len() < orig_len
+                                && probe_mp4_duration_fast(&tmp_out).is_some()
+                            {
+                                if std::fs::rename(&tmp_out, &disk_path).is_ok() {
+                                    final_mb = ((new_meta.len() as f64) / (1024.0 * 1024.0)
+                                        * 100.0)
+                                        .round()
+                                        / 100.0;
+                                } else {
+                                    let _ = std::fs::remove_file(&tmp_out);
+                                }
+                            } else {
+                                let _ = std::fs::remove_file(&tmp_out);
+                            }
+                            let _ = self.db.update_recording_compacted(&seg_id, final_mb);
+                        }
                     }
                 }
             }

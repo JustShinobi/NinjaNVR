@@ -616,6 +616,58 @@ impl Default for AlertBackupConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColdCompactionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_compact_after_hours")]
+    pub after_hours: u32,
+    #[serde(default = "default_compact_crf")]
+    pub crf: u8,
+    #[serde(default = "default_true")]
+    pub idle_only: bool,
+    #[serde(default = "default_compact_codec")]
+    pub codec: String,
+    #[serde(default = "default_compact_preset")]
+    pub preset: String,
+    #[serde(default = "default_compact_hwaccel")]
+    pub hwaccel: String,
+}
+
+fn default_compact_after_hours() -> u32 {
+    24
+}
+
+fn default_compact_crf() -> u8 {
+    28
+}
+
+fn default_compact_codec() -> String {
+    "h264".to_string()
+}
+
+fn default_compact_preset() -> String {
+    "veryfast".to_string()
+}
+
+fn default_compact_hwaccel() -> String {
+    "none".to_string()
+}
+
+impl Default for ColdCompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            after_hours: default_compact_after_hours(),
+            crf: default_compact_crf(),
+            idle_only: true,
+            codec: default_compact_codec(),
+            preset: default_compact_preset(),
+            hwaccel: default_compact_hwaccel(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -643,6 +695,8 @@ pub struct RecordConfig {
     pub storage_tiers: StorageTiersConfig,
     #[serde(default)]
     pub alert_backup: AlertBackupConfig,
+    #[serde(default)]
+    pub cold_compaction: ColdCompactionConfig,
 }
 
 fn default_expire_interval() -> u64 {
@@ -665,6 +719,7 @@ impl Default for RecordConfig {
             preview: RecordPreviewConfig::default(),
             storage_tiers: StorageTiersConfig::default(),
             alert_backup: AlertBackupConfig::default(),
+            cold_compaction: ColdCompactionConfig::default(),
         }
     }
 }
@@ -1566,6 +1621,7 @@ impl NinjaConfig {
                         "min_free_gb": cam.record.min_free_gb,
                         "storage_tiers": cam.record.storage_tiers,
                         "alert_backup": cam.record.alert_backup,
+                        "cold_compaction": cam.record.cold_compaction,
                         "continuous": { "days": cam.record.continuous.days },
                         "motion": { "days": cam.record.motion.days },
                         "detections": {
@@ -1881,6 +1937,7 @@ impl NinjaConfig {
                 "min_free_gb": self.record.min_free_gb,
                 "storage_tiers": self.record.storage_tiers,
                 "alert_backup": self.record.alert_backup,
+                "cold_compaction": self.record.cold_compaction,
                 "continuous": { "days": self.record.continuous.days },
                 "motion": { "days": self.record.motion.days },
                 "detections": {
