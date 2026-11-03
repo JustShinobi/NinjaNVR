@@ -4922,166 +4922,15 @@ export const AiDetectionObjectsSection: React.FC<{
           )}
         </div>
       </div>
-
-      {/* NinjaNVR Model Factory (Colab G4 / Local RTX Fine-Tuning) Card */}
-      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
-        <div className="nvr-cfg-card-header">
-          <span>
-            {isPt
-              ? "FÁBRICA DE MODELOS NINJANVR (COLAB G4 / FINE-TUNING LOCAL RTX)"
-              : "NinjaNVR Model Factory (Colab G4 / Local RTX Fine-Tuning)"}
-          </span>
-          <span className="nvr-badge live">
-            15-CLASS SECURITY · FREEZE=10 · ONNX / OPENVINO FP16
-          </span>
-        </div>
-        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: 8,
-              flexWrap: "wrap",
-            }}
-          >
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span
-                className="mono"
-                style={{
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 700,
-                  color: "var(--signal-accent-text)",
-                }}
-              >
-                {isPt
-                  ? "PRESET DE 15 CLASSES DE SEGURANÇA & TRANSFER LEARNING (FREEZE=10)"
-                  : "15-CLASS SECURITY TAXONOMY PRESET & FROZEN-BACKBONE TRANSFER LEARNING"}
-              </span>
-              <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                {isPt
-                  ? `Labelmap atual: ${modelCfg.labelmap_path} (${modelCfg.model_type})`
-                  : `Active labelmap: ${modelCfg.labelmap_path} (${modelCfg.model_type})`}
-              </span>
-            </div>
-
-            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-              <button
-                type="button"
-                className={`nvr-btn mono ${
-                  modelCfg.labelmap_path === NINJANVR_SECURITY_15CL_LABELMAP_PATH &&
-                  modelCfg.model_type === "yolo-generic"
-                    ? "active"
-                    : "primary"
-                }`}
-                style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                onClick={() => {
-                  updateDraft((next) => {
-                    next.model = applySecurity15ClassPreset(next.model);
-                  });
-                  notify(
-                    "Applied 15-Class Security Labelmap Preset (/openvino-model/ninjanvr_security_15cl.txt · yolo-generic)"
-                  );
-                }}
-              >
-                <CheckCircle2 size={11} />
-                Apply 15-Class Security Labelmap Preset
-              </button>
-
-              <a
-                href={COLAB_MODEL_FACTORY_URL}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="nvr-btn success mono"
-                style={{
-                  height: 26,
-                  padding: "0 10px",
-                  fontSize: "var(--text-xs)",
-                  textDecoration: "none",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 5,
-                }}
-              >
-                <Sparkles size={11} />
-                Launch Google Colab Notebook (G4 / A100 / T4)
-              </a>
-            </div>
-          </div>
-
-          <div className="nvr-subcard" style={{ padding: "8px 10px" }}>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: 8,
-                flexWrap: "wrap",
-              }}
-            >
-              <span
-                className="mono"
-                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
-              >
-                LOCAL GPU (RTX 4070 Ti Super 16GB · ~60s) / CPU FROZEN-BACKBONE (freeze=10) CLI:
-              </span>
-              <button
-                type="button"
-                className="nvr-btn mono"
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                onClick={() => {
-                  const origin =
-                    typeof window !== "undefined" && window.location?.origin
-                      ? window.location.origin
-                      : "http://localhost:5000";
-                  const cmd = buildLocalFinetuneCliCommand({
-                    nvrUrl: origin,
-                    imgsz: modelCfg.width === 320 ? 320 : 640,
-                  });
-                  navigator.clipboard?.writeText(cmd);
-                  notify("Copied local RTX / CPU fine-tuning CLI command to clipboard");
-                }}
-              >
-                <Copy size={11} />
-                Copy CLI Command
-              </button>
-            </div>
-            <code
-              className="mono"
-              style={{
-                display: "block",
-                padding: "6px 8px",
-                background: "var(--bg-input)",
-                border: "1px solid var(--border-input)",
-                borderRadius: 2,
-                fontSize: "var(--text-xs)",
-                color: "var(--signal-live-text)",
-                wordBreak: "break-all",
-              }}
-            >
-              {buildLocalFinetuneCliCommand({
-                nvrUrl:
-                  typeof window !== "undefined" && window.location?.origin
-                    ? window.location.origin
-                    : "http://localhost:5000",
-                imgsz: modelCfg.width === 320 ? 320 : 640,
-              })}
-            </code>
-          </div>
-        </div>
-      </div>
-
-      {/* Self-Hosted Active Learning Dataset Studio & Model Hot-Reload */}
-      <div style={{ gridColumn: "1 / -1" }}>
-        <DatasetStudioSection notify={notify} />
-      </div>
     </div>
   );
 };
 
 export const DatasetStudioSection: React.FC<{
+  draftConfig?: NinjaConfigResponse | null;
+  updateDraft?: (updater: (next: NinjaConfigResponse) => void) => void;
   notify: (msg: string) => void;
-}> = ({ notify }) => {
+}> = ({ draftConfig, updateDraft, notify }) => {
   const { locale } = useI18n();
   const isPt = locale === "pt";
   const [summary, setSummary] = useState<DatasetSummaryResponse | null>(null);
@@ -5095,6 +4944,16 @@ export const DatasetStudioSection: React.FC<{
   const [uploadBase64, setUploadBase64] = useState("");
   const [uploadWidth, setUploadWidth] = useState(640);
   const [uploadHeight, setUploadHeight] = useState(640);
+
+  const modelCfg = draftConfig?.model || {
+    path: "/openvino-model/ssdlite_mobilenet_v2.xml",
+    labelmap_path: "/openvino-model/coco_91cl_bkgr.txt",
+    width: 300,
+    height: 300,
+    input_tensor: "nhwc",
+    input_pixel_format: "bgr",
+    model_type: "ssd",
+  };
 
   const loadDatasetState = async () => {
     try {
@@ -5286,162 +5145,239 @@ export const DatasetStudioSection: React.FC<{
     });
   };
 
+  const quickClassIndices = [0, 1, 2, 3, 7, 8, 11] as const;
+
   return (
-    <div className="nvr-cfg-card">
-      <div className="nvr-cfg-card-header">
-        <span>
-          {isPt
-            ? "ESTÚDIO DE DATASET & APRENDIZADO ATIVO (DESTILAÇÃO PROFESSOR-ALUNO YOLO)"
-            : "ACTIVE LEARNING DATASET STUDIO & TEACHER-STUDENT YOLO DISTILLATION"}
-        </span>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-          <button
-            type="button"
-            className="nvr-btn mono"
-            style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
-            disabled={busyAction === "batch-auto"}
-            onClick={() => void handleBatchAutoAnnotate()}
-          >
-            <Sparkles size={11} />
-            {busyAction === "batch-auto"
-              ? "Auto-Annotating..."
-              : "Batch Auto-Annotate Unverified"}
-          </button>
-          <a
-            href="/api/dataset/export.zip"
-            download="ninjanvr-yolo-dataset.zip"
-            className="nvr-btn primary mono"
-            style={{
-              height: 22,
-              padding: "0 8px",
-              fontSize: "var(--text-xs)",
-              textDecoration: "none",
-              display: "inline-flex",
-              alignItems: "center",
-            }}
-          >
-            Export YOLO Dataset (.zip)
-          </a>
-        </div>
-      </div>
-
-      <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
-        {/* Readiness Gauges */}
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
-            gap: 8,
-          }}
-        >
-          <div
-            className="nvr-subcard mono"
-            style={{
-              padding: 8,
-              gap: 2,
-              fontSize: "var(--text-xs)",
-            }}
-          >
-            <div style={{ color: "var(--text-secondary)" }}>TOTAL SAMPLES</div>
-            <div style={{ fontSize: "var(--text-md)", fontWeight: 700, marginTop: 2 }}>
-              {readiness.totalSamples} FRAMES · {summary?.total_annotations ?? 0} BOXES
-            </div>
-            <div style={{ color: "var(--text-muted)", marginTop: 2 }}>
-              Verified: {readiness.verifiedCount} ({readiness.verifiedPct}%)
-            </div>
-          </div>
-
-          <div
-            className="nvr-subcard mono"
-            style={{
-              padding: 8,
-              gap: 2,
-              fontSize: "var(--text-xs)",
-            }}
-          >
-            <div style={{ color: "var(--text-secondary)" }}>
-              TP vs HARD NEGATIVES (TARGET 80% / 20%)
-            </div>
-            <div style={{ fontSize: "var(--text-md)", fontWeight: 700, marginTop: 2 }}>
-              {readiness.positivePct}% TP ({readiness.positiveCount}) /{" "}
-              {readiness.hardNegativePct}% BG ({readiness.hardNegativeCount})
-            </div>
-            <div style={{ color: "var(--text-muted)", marginTop: 2 }}>
-              Balance Score: {readiness.balanceScorePct}%{" "}
-              {readiness.isBalanced ? "· OPTIMAL" : "· COLLECT MORE"}
-            </div>
-          </div>
-
-          <div
-            className="nvr-subcard mono"
-            style={{
-              padding: 8,
-              gap: 2,
-              fontSize: "var(--text-xs)",
-            }}
-          >
-            <div style={{ color: "var(--text-secondary)" }}>
-              STRATIFIED SPLIT (80/20 HASH)
-            </div>
-            <div style={{ fontSize: "var(--text-md)", fontWeight: 700, marginTop: 2 }}>
-              TRAIN: {readiness.trainCount} ({readiness.trainPct}%) · VAL:{" "}
-              {readiness.valCount} ({readiness.valPct}%)
-            </div>
-            <div style={{ color: "var(--text-muted)", marginTop: 2 }}>
-              Night IR Frames: {summary?.night_mode_count ?? 0}
-            </div>
-          </div>
-
-          <div
-            className="nvr-subcard mono"
-            style={{
-              padding: 8,
-              gap: 2,
-              fontSize: "var(--text-xs)",
-            }}
-          >
-            <div style={{ color: "var(--text-secondary)" }}>PER-CAMERA DISTRIBUTION</div>
-            <div
+    <div className="nvr-card-grid" style={{ gap: 12 }}>
+      {/* Step 1: Dataset Curation, Readiness Gauges & Interactive YOLO Annotation Stage */}
+      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="nvr-cfg-card-header">
+          <span>
+            {isPt
+              ? "ESTÚDIO DE DATASET & APRENDIZADO ATIVO (DESTILAÇÃO PROFESSOR-ALUNO YOLO)"
+              : "ACTIVE LEARNING DATASET STUDIO & TEACHER-STUDENT YOLO DISTILLATION"}
+          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span className={`nvr-badge ${readiness.isBalanced ? "live" : ""}`}>
+              {readiness.totalSamples} SAMPLES · {readiness.verifiedPct}% VERIFIED
+            </span>
+            <button
+              type="button"
+              className="nvr-btn mono"
+              style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              onClick={() => void loadDatasetState()}
+            >
+              {isPt ? "Atualizar" : "Refresh"}
+            </button>
+            <button
+              type="button"
+              className="nvr-btn mono"
+              style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              disabled={busyAction === "batch-auto"}
+              onClick={() => void handleBatchAutoAnnotate()}
+            >
+              <Sparkles size={11} />
+              {busyAction === "batch-auto"
+                ? "Auto-Annotating..."
+                : "Batch Auto-Annotate Unverified"}
+            </button>
+            <a
+              href="/api/dataset/export.zip"
+              download="ninjanvr-yolo-dataset.zip"
+              className="nvr-btn primary mono"
               style={{
-                display: "flex",
-                gap: 4,
-                flexWrap: "wrap",
-                marginTop: 4,
+                height: 22,
+                padding: "0 8px",
+                fontSize: "var(--text-xs)",
               }}
             >
-              {Object.entries(summary?.by_camera || {}).map(([cam, cnt]) => (
-                <span key={cam} className="nvr-badge mono">
-                  {cam.toUpperCase()}: {cnt}
-                </span>
-              ))}
-              {Object.keys(summary?.by_camera || {}).length === 0 && (
-                <span style={{ color: "var(--text-muted)" }}>No camera samples yet</span>
-              )}
-            </div>
+              Export YOLO Dataset (.zip)
+            </a>
           </div>
         </div>
 
-        {/* Sample Grid + Interactive SVG Bounding-Box Overlay Editor */}
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "290px minmax(0, 1fr)",
-            gap: 10,
-            minHeight: 280,
-          }}
-        >
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
+          {/* 4 Readiness Gauges */}
           <div
-            className="nvr-subcard"
             style={{
-              padding: 8,
-              gap: 6,
+              display: "grid",
+              gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+              gap: 8,
             }}
           >
-            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+            <div
+              className="nvr-subcard mono"
+              style={{
+                padding: "8px 10px",
+                gap: 4,
+                fontSize: "var(--text-xs)",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                <span style={{ color: "var(--text-secondary)", fontWeight: 700 }}>TOTAL SAMPLES</span>
+                <span className={`nvr-badge ${readiness.verifiedPct >= 80 ? "live" : ""}`}>
+                  {readiness.verifiedPct}% VERIFIED
+                </span>
+              </div>
+              <div style={{ fontSize: "var(--text-md)", fontWeight: 700 }}>
+                {readiness.totalSamples} FRAMES · {summary?.total_annotations ?? 0} BOXES
+              </div>
+              <div className="nvr-util-bar" style={{ width: "100%" }}>
+                <div
+                  className="nvr-util-fill"
+                  style={{
+                    width: `${Math.min(100, readiness.verifiedPct)}%`,
+                    background: "var(--signal-live)",
+                  }}
+                />
+              </div>
+              <div style={{ color: "var(--text-muted)" }}>
+                Verified: {readiness.verifiedCount} ({readiness.verifiedPct}%)
+              </div>
+            </div>
+
+            <div
+              className="nvr-subcard mono"
+              style={{
+                padding: "8px 10px",
+                gap: 4,
+                fontSize: "var(--text-xs)",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                <span style={{ color: "var(--text-secondary)", fontWeight: 700 }}>
+                  TP vs HARD NEGATIVES
+                </span>
+                <span className={`nvr-badge ${readiness.isBalanced ? "live" : "motion"}`}>
+                  {readiness.isBalanced ? "OPTIMAL 80/20" : `${readiness.balanceScorePct}% SCORE`}
+                </span>
+              </div>
+              <div style={{ fontSize: "var(--text-md)", fontWeight: 700 }}>
+                {readiness.positivePct}% TP ({readiness.positiveCount}) /{" "}
+                {readiness.hardNegativePct}% BG ({readiness.hardNegativeCount})
+              </div>
+              <div className="nvr-util-bar" style={{ width: "100%" }}>
+                <div
+                  className="nvr-util-fill"
+                  style={{
+                    width: `${Math.min(100, readiness.positivePct)}%`,
+                    background: "var(--signal-accent)",
+                  }}
+                />
+              </div>
+              <div style={{ color: "var(--text-muted)" }}>
+                Balance Score: {readiness.balanceScorePct}%{" "}
+                {readiness.isBalanced ? "· OPTIMAL" : "· TARGET 80% / 20%"}
+              </div>
+            </div>
+
+            <div
+              className="nvr-subcard mono"
+              style={{
+                padding: "8px 10px",
+                gap: 4,
+                fontSize: "var(--text-xs)",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                <span style={{ color: "var(--text-secondary)", fontWeight: 700 }}>
+                  STRATIFIED SPLIT (80/20)
+                </span>
+                <span className="nvr-badge">
+                  NIGHT IR: {summary?.night_mode_count ?? 0}
+                </span>
+              </div>
+              <div style={{ fontSize: "var(--text-md)", fontWeight: 700 }}>
+                TRAIN: {readiness.trainCount} ({readiness.trainPct}%) · VAL:{" "}
+                {readiness.valCount} ({readiness.valPct}%)
+              </div>
+              <div className="nvr-util-bar" style={{ width: "100%" }}>
+                <div
+                  className="nvr-util-fill"
+                  style={{
+                    width: `${Math.min(100, readiness.trainPct)}%`,
+                    background: "var(--signal-live)",
+                  }}
+                />
+              </div>
+              <div style={{ color: "var(--text-muted)" }}>
+                Night IR Frames: {summary?.night_mode_count ?? 0} · Deterministic hash
+              </div>
+            </div>
+
+            <div
+              className="nvr-subcard mono"
+              style={{
+                padding: "8px 10px",
+                gap: 4,
+                fontSize: "var(--text-xs)",
+                justifyContent: "space-between",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                <span style={{ color: "var(--text-secondary)", fontWeight: 700 }}>
+                  PER-CAMERA DISTRIBUTION
+                </span>
+                <span className="nvr-badge">
+                  {Object.keys(summary?.by_camera || {}).length} CHANNELS
+                </span>
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  gap: 4,
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                }}
+              >
+                {Object.entries(summary?.by_camera || {}).map(([cam, cnt]) => (
+                  <span key={cam} className="nvr-badge mono">
+                    {cam.toUpperCase()}: {cnt}
+                  </span>
+                ))}
+                {Object.keys(summary?.by_camera || {}).length === 0 && (
+                  <span style={{ fontSize: "var(--text-md)", fontWeight: 700, color: "var(--text-secondary)" }}>
+                    0 ACTIVE SAMPLES
+                  </span>
+                )}
+              </div>
+              <div style={{ color: "var(--text-muted)" }}>
+                {Object.keys(summary?.by_camera || {}).length === 0
+                  ? "No camera samples yet"
+                  : "Balanced multi-camera dataset coverage"}
+              </div>
+            </div>
+          </div>
+
+          {/* Sample Queue + Interactive SVG Bounding-Box Overlay Editor */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "320px minmax(0, 1fr)",
+              gap: 10,
+              minHeight: 290,
+            }}
+          >
+            <div
+              className="nvr-subcard"
+              style={{
+                padding: "8px 10px",
+                gap: 8,
+              }}
+            >
+              <div className="nvr-subcard-header">
+                <span>
+                  {isPt ? "FILA DE AMOSTRAS" : "SAMPLE QUEUE"} ({samples.length})
+                </span>
+                <span style={{ color: "var(--signal-accent-text)" }}>
+                  {readiness.verifiedCount} VERIFIED
+                </span>
+              </div>
+
               <select
                 className="nvr-select mono"
                 aria-label="Filter dataset samples by kind"
-                style={{ flex: 1, height: 24, fontSize: "var(--text-xs)" }}
+                style={{ width: "100%", height: 26, fontSize: "var(--text-xs)" }}
                 value={filterKind}
                 onChange={(e) => setFilterKind(e.target.value)}
               >
@@ -5450,269 +5386,501 @@ export const DatasetStudioSection: React.FC<{
                 <option value="ai_annotated">AI ANNOTATED</option>
                 <option value="hard_negative">HARD NEGATIVES (BG)</option>
               </select>
-            </div>
 
-            <div
-              className="nvr-scroll-y"
-              style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 240 }}
-            >
-              {samples.map((s) => {
-                const isSel = selectedSample?.id === s.id;
-                return (
+              <div
+                className="nvr-scroll-y"
+                style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1, maxHeight: 280 }}
+              >
+                {samples.map((s) => {
+                  const isSel = selectedSample?.id === s.id;
+                  return (
+                    <div
+                      key={s.id}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => setSelectedSampleId(s.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          setSelectedSampleId(s.id);
+                        }
+                      }}
+                      className="mono"
+                      style={{
+                        padding: 6,
+                        background: isSel
+                          ? "rgba(14, 165, 233, 0.14)"
+                          : "var(--bg-panel)",
+                        border: `1px solid ${
+                          isSel ? "var(--signal-accent)" : "var(--border-hairline)"
+                        }`,
+                        borderRadius: 3,
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: 6,
+                        fontSize: "var(--text-xs)",
+                      }}
+                    >
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 700 }}>
+                          {s.camera.toUpperCase()} · {s.split.toUpperCase()}
+                        </div>
+                        <div style={{ color: "var(--text-muted)" }}>
+                          {s.sample_kind.toUpperCase()} · {(s.annotations || []).length} boxes
+                        </div>
+                      </div>
+                      <span className={`nvr-badge ${s.verified ? "live" : ""}`}>
+                        {s.verified ? "VERIFIED" : "DRAFT"}
+                      </span>
+                    </div>
+                  );
+                })}
+                {samples.length === 0 && (
                   <div
-                    key={s.id}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => setSelectedSampleId(s.id)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        setSelectedSampleId(s.id);
-                      }
-                    }}
                     className="mono"
                     style={{
-                      padding: 6,
-                      background: isSel
-                        ? "rgba(14, 165, 233, 0.14)"
-                        : "var(--bg-panel)",
-                      border: `1px solid ${
-                        isSel ? "var(--signal-accent)" : "var(--border-hairline)"
-                      }`,
+                      flex: 1,
+                      padding: 10,
+                      background: "var(--bg-input)",
+                      border: "1px solid var(--border-divider)",
                       borderRadius: 3,
-                      cursor: "pointer",
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      gap: 6,
                       fontSize: "var(--text-xs)",
+                      color: "var(--text-secondary)",
+                      display: "flex",
+                      flexDirection: "column",
+                      justifyContent: "center",
+                      gap: 6,
                     }}
                   >
-                    <div style={{ minWidth: 0 }}>
-                      <div style={{ fontWeight: 700 }}>
-                        {s.camera.toUpperCase()} · {s.split.toUpperCase()}
-                      </div>
-                      <div style={{ color: "var(--text-muted)" }}>
-                        {s.sample_kind.toUpperCase()} · {(s.annotations || []).length} boxes
-                      </div>
+                    <div style={{ fontWeight: 700, color: "var(--signal-accent-text)" }}>
+                      DATASET QUEUE EMPTY
                     </div>
-                    <span className={`nvr-badge ${s.verified ? "live" : ""}`}>
-                      {s.verified ? "VERIFIED" : "DRAFT"}
+                    <div style={{ color: "var(--text-muted)", lineHeight: 1.45 }}>
+                      Mark events as False Positive or click &quot;Add to Training Dataset&quot; in
+                      Explore to populate frames.
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Interactive SVG Bounding-Box Stage */}
+            <div
+              className="nvr-subcard"
+              style={{
+                padding: "8px 10px",
+                gap: 8,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: 8,
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-accent-text)" }}>
+                    CLASS (0..14):
+                  </span>
+                  <select
+                    className="nvr-select mono"
+                    aria-label="YOLO Security Class Selector"
+                    style={{ height: 24, width: 165, fontSize: "var(--text-xs)" }}
+                    value={activeClassId}
+                    onChange={(e) => setActiveClassId(Number(e.target.value))}
+                  >
+                    {NINJANVR_SECURITY_CLASSES.map((cls, idx) => (
+                      <option key={cls} value={idx}>
+                        {idx}: {cls}
+                      </option>
+                    ))}
+                  </select>
+                  {quickClassIndices.map((idx) => {
+                    const cls = NINJANVR_SECURITY_CLASSES[idx];
+                    const isAct = activeClassId === idx;
+                    return (
+                      <button
+                        key={cls}
+                        type="button"
+                        className={`nvr-btn mono ${isAct ? "active" : ""}`}
+                        style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                        onClick={() => setActiveClassId(idx)}
+                      >
+                        {idx}:{cls}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {selectedSample ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className={`nvr-btn mono ${selectedSample.verified ? "active" : ""}`}
+                      style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      onClick={() =>
+                        void handleUpdateSample(selectedSample, {
+                          verified: !selectedSample.verified,
+                        })
+                      }
+                    >
+                      {selectedSample.verified ? "Verified ✓" : "Verify"}
+                    </button>
+                    <button
+                      type="button"
+                      className="nvr-btn mono"
+                      style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      disabled={busyAction === `auto-${selectedSample.id}`}
+                      onClick={() => void handleAutoAnnotateSample(selectedSample.id)}
+                    >
+                      <Sparkles size={11} />
+                      Auto-Annotate with AI
+                    </button>
+                    <button
+                      type="button"
+                      className="nvr-btn danger mono"
+                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                      aria-label="Delete dataset sample"
+                      onClick={() => void handleDeleteSample(selectedSample.id)}
+                    >
+                      <Trash2 size={11} />
+                    </button>
+                  </div>
+                ) : (
+                  <span className="nvr-badge mono">
+                    CLICK 2 CORNERS TO DRAW NORMALIZED YOLO BOX
+                  </span>
+                )}
+              </div>
+
+              <div
+                style={{
+                  position: "relative",
+                  flex: 1,
+                  minHeight: 240,
+                  background: "var(--video-stage-bg)",
+                  border: "1px solid var(--border-hairline)",
+                  borderRadius: 3,
+                  overflow: "hidden",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                {selectedSample ? (
+                  <>
+                    <img
+                      src={`/api/dataset/samples/${encodeURIComponent(
+                        selectedSample.id
+                      )}/image.webp`}
+                      alt={selectedSample.id}
+                      style={{
+                        width: "100%",
+                        height: "100%",
+                        objectFit: "contain",
+                        display: "block",
+                      }}
+                    />
+                    <svg
+                      viewBox="0 0 1000 1000"
+                      preserveAspectRatio="none"
+                      onClick={handleSvgClick}
+                      style={{
+                        position: "absolute",
+                        inset: 0,
+                        width: "100%",
+                        height: "100%",
+                        cursor: "crosshair",
+                      }}
+                    >
+                      {(selectedSample.annotations || []).map((ann, idx) => {
+                        const [x1, y1, x2, y2] = yoloNormalizedToXyxy(ann);
+                        return (
+                          <g key={`${ann.class_id}-${idx}`}>
+                            <rect
+                              x={x1 * 1000}
+                              y={y1 * 1000}
+                              width={(x2 - x1) * 1000}
+                              height={(y2 - y1) * 1000}
+                              fill="rgba(14, 165, 233, 0.16)"
+                              stroke="var(--signal-accent-text)"
+                              strokeWidth={4}
+                            />
+                            <text
+                              x={x1 * 1000 + 8}
+                              y={Math.max(24, y1 * 1000 + 22)}
+                              fill="var(--text-primary)"
+                              fontSize={22}
+                              fontFamily="monospace"
+                            >
+                              {ann.class_id}:{ann.label} ({ann.cx.toFixed(2)},{ann.cy.toFixed(2)})
+                            </text>
+                          </g>
+                        );
+                      })}
+                    </svg>
+                  </>
+                ) : (
+                  <div
+                    className="mono"
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "center",
+                      gap: 6,
+                      color: "var(--text-muted)",
+                      fontSize: "var(--text-xs)",
+                      textAlign: "center",
+                      padding: 16,
+                    }}
+                  >
+                    <span className="nvr-badge">
+                      YOLO ANNOTATION STAGE // 15-CLASS SECURITY TAXONOMY
+                    </span>
+                    <span>
+                      Select a dataset sample to inspect or draw normalized YOLO bounding boxes.
                     </span>
                   </div>
-                );
-              })}
-              {samples.length === 0 && (
-                <div
-                  className="mono"
-                  style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)", padding: 8 }}
-                >
-                  Mark events as False Positive or click &quot;Add to Training Dataset&quot; in
-                  Explore to populate frames.
-                </div>
-              )}
+                )}
+              </div>
             </div>
           </div>
+        </div>
+      </div>
 
-          {/* Interactive SVG Bounding-Box Stage */}
-          <div
-            className="nvr-subcard"
-            style={{
-              padding: 8,
-            }}
-          >
+      {/* Step 2: NinjaNVR Model Factory (Colab G4 / Local RTX Fine-Tuning) Card */}
+      <div className="nvr-cfg-card">
+        <div className="nvr-cfg-card-header">
+          <span>
+            {isPt
+              ? "FÁBRICA DE MODELOS NINJANVR (COLAB G4 / FINE-TUNING LOCAL RTX)"
+              : "NinjaNVR Model Factory (Colab G4 / Local RTX Fine-Tuning)"}
+          </span>
+          <span className="nvr-badge live">
+            15-CLASS · FREEZE=10 · FP16
+          </span>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
+          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt
+                  ? "Preset de 15 Classes de Segurança (Labelmap & Tensor)"
+                  : "15-Class Security Taxonomy Preset"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? `Labelmap ativo: ${modelCfg.labelmap_path} (${modelCfg.model_type})`
+                  : `Active labelmap: ${modelCfg.labelmap_path} (${modelCfg.model_type})`}
+              </div>
+            </div>
+            <button
+              type="button"
+              className={`nvr-btn mono ${
+                modelCfg.labelmap_path === NINJANVR_SECURITY_15CL_LABELMAP_PATH &&
+                modelCfg.model_type === "yolo-generic"
+                  ? "active"
+                  : "primary"
+              }`}
+              style={{ height: 28, padding: "0 10px", fontSize: "var(--text-xs)" }}
+              onClick={() => {
+                updateDraft?.((next) => {
+                  next.model = applySecurity15ClassPreset(next.model);
+                });
+                notify(
+                  "Applied 15-Class Security Labelmap Preset (/openvino-model/ninjanvr_security_15cl.txt · yolo-generic)"
+                );
+              }}
+            >
+              <CheckCircle2 size={11} />
+              Apply 15-Class Security Labelmap Preset
+            </button>
+          </div>
+
+          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt
+                  ? "Treinamento em Nuvem Google Colab (G4 / A100 / T4)"
+                  : "Cloud GPU Training Factory (Google Colab)"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Treine um modelo YOLOv11 customizado com backbone congelado (freeze=10) e exporte para .onnx / OpenVINO."
+                  : "Fine-tune a frozen-backbone YOLOv11 detector from your exported dataset (.zip) and export to .onnx / FP16."}
+              </div>
+            </div>
+            <a
+              href={COLAB_MODEL_FACTORY_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="nvr-btn success mono"
+              style={{
+                height: 28,
+                padding: "0 10px",
+                fontSize: "var(--text-xs)",
+              }}
+            >
+              <Sparkles size={11} />
+              Launch Google Colab Notebook (G4 / A100 / T4)
+            </a>
+          </div>
+
+          <div className="nvr-subcard" style={{ padding: "8px 10px", marginTop: "auto" }}>
             <div
               style={{
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",
-                gap: 6,
+                gap: 8,
                 flexWrap: "wrap",
               }}
             >
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700 }}>
-                  CLASS (0..14):
-                </span>
-                <select
-                  className="nvr-select mono"
-                  aria-label="YOLO Security Class Selector"
-                  style={{ height: 24, fontSize: "var(--text-xs)" }}
-                  value={activeClassId}
-                  onChange={(e) => setActiveClassId(Number(e.target.value))}
-                >
-                  {NINJANVR_SECURITY_CLASSES.map((cls, idx) => (
-                    <option key={cls} value={idx}>
-                      {idx}: {cls}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              {selectedSample && (
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <button
-                    type="button"
-                    className={`nvr-btn mono ${selectedSample.verified ? "active" : ""}`}
-                    style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                    onClick={() =>
-                      void handleUpdateSample(selectedSample, {
-                        verified: !selectedSample.verified,
-                      })
-                    }
-                  >
-                    {selectedSample.verified ? "Verified ✓" : "Verify"}
-                  </button>
-                  <button
-                    type="button"
-                    className="nvr-btn mono"
-                    style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                    disabled={busyAction === `auto-${selectedSample.id}`}
-                    onClick={() => void handleAutoAnnotateSample(selectedSample.id)}
-                  >
-                    <Sparkles size={11} />
-                    Auto-Annotate with AI
-                  </button>
-                  <button
-                    type="button"
-                    className="nvr-btn danger mono"
-                    style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                    aria-label="Delete dataset sample"
-                    onClick={() => void handleDeleteSample(selectedSample.id)}
-                  >
-                    <Trash2 size={11} />
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {selectedSample ? (
-              <div
-                style={{
-                  position: "relative",
-                  height: 210,
-                  background: "var(--video-stage-bg)",
-                  border: "1px solid var(--border-hairline)",
-                  borderRadius: 3,
-                  overflow: "hidden",
-                }}
-              >
-                <img
-                  src={`/api/dataset/samples/${encodeURIComponent(
-                    selectedSample.id
-                  )}/image.webp`}
-                  alt={selectedSample.id}
-                  style={{
-                    width: "100%",
-                    height: "100%",
-                    objectFit: "contain",
-                    display: "block",
-                  }}
-                />
-                <svg
-                  viewBox="0 0 1000 1000"
-                  preserveAspectRatio="none"
-                  onClick={handleSvgClick}
-                  style={{
-                    position: "absolute",
-                    inset: 0,
-                    width: "100%",
-                    height: "100%",
-                    cursor: "crosshair",
-                  }}
-                >
-                  {(selectedSample.annotations || []).map((ann, idx) => {
-                    const [x1, y1, x2, y2] = yoloNormalizedToXyxy(ann);
-                    return (
-                      <g key={`${ann.class_id}-${idx}`}>
-                        <rect
-                          x={x1 * 1000}
-                          y={y1 * 1000}
-                          width={(x2 - x1) * 1000}
-                          height={(y2 - y1) * 1000}
-                          fill="rgba(14, 165, 233, 0.16)"
-                          stroke="var(--signal-accent-text)"
-                          strokeWidth={4}
-                        />
-                        <text
-                          x={x1 * 1000 + 8}
-                          y={Math.max(24, y1 * 1000 + 22)}
-                          fill="var(--text-primary)"
-                          fontSize={22}
-                          fontFamily="monospace"
-                        >
-                          {ann.class_id}:{ann.label} ({ann.cx.toFixed(2)},{ann.cy.toFixed(2)})
-                        </text>
-                      </g>
-                    );
-                  })}
-                </svg>
-              </div>
-            ) : (
-              <div
+              <span
                 className="mono"
-                style={{
-                  height: 180,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: "var(--text-muted)",
-                  fontSize: "var(--text-xs)",
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", fontWeight: 700 }}
+              >
+                LOCAL GPU (RTX 4070 Ti Super 16GB · ~60s) / CPU FROZEN-BACKBONE (freeze=10) CLI:
+              </span>
+              <button
+                type="button"
+                className="nvr-btn mono"
+                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                onClick={() => {
+                  const origin =
+                    typeof window !== "undefined" && window.location?.origin
+                      ? window.location.origin
+                      : "http://localhost:5000";
+                  const cmd = buildLocalFinetuneCliCommand({
+                    nvrUrl: origin,
+                    imgsz: modelCfg.width === 320 ? 320 : 640,
+                  });
+                  navigator.clipboard?.writeText(cmd);
+                  notify("Copied local RTX / CPU fine-tuning CLI command to clipboard");
                 }}
               >
-                Select a dataset sample to inspect or draw normalized YOLO bounding boxes.
-              </div>
-            )}
+                <Copy size={11} />
+                Copy CLI Command
+              </button>
+            </div>
+            <code
+              className="mono"
+              style={{
+                display: "block",
+                padding: "6px 8px",
+                background: "var(--bg-input)",
+                border: "1px solid var(--border-input)",
+                borderRadius: 2,
+                fontSize: "var(--text-xs)",
+                color: "var(--signal-live-text)",
+                wordBreak: "break-all",
+              }}
+            >
+              {buildLocalFinetuneCliCommand({
+                nvrUrl:
+                  typeof window !== "undefined" && window.location?.origin
+                    ? window.location.origin
+                    : "http://localhost:5000",
+                imgsz: modelCfg.width === 320 ? 320 : 640,
+              })}
+            </code>
           </div>
         </div>
+      </div>
 
-        {/* Zero-Downtime Custom Model Upload & Hot-Reload Bar */}
-        <div
-          className="nvr-subcard"
-          style={{
-            padding: 8,
-            flexDirection: "row",
-            alignItems: "center",
-            justifyContent: "space-between",
-            flexWrap: "wrap",
-            gap: 8,
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700 }}>
-              HOT-RELOAD FINE-TUNED MODEL:
-            </span>
-            <input
-              type="file"
-              accept=".onnx,.xml,.bin"
-              aria-label="Select custom .onnx or .xml model file"
-              className="mono"
-              style={{ fontSize: "var(--text-xs)" }}
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (!file) return;
-                setUploadFilename(file.name);
-                const reader = new FileReader();
-                reader.onload = () => {
-                  if (typeof reader.result === "string") {
-                    setUploadBase64(reader.result);
-                  }
-                };
-                reader.readAsDataURL(file);
-              }}
-            />
+      {/* Step 3: Zero-Downtime Custom Model Upload & Engine Hot-Reload Card */}
+      <div className="nvr-cfg-card">
+        <div className="nvr-cfg-card-header">
+          <span>
+            {isPt
+              ? "HOT-RELOAD DE MODELO TREINADO (.ONNX / .XML)"
+              : "HOT-RELOAD FINE-TUNED MODEL (.ONNX / .XML)"}
+          </span>
+          <span className="nvr-badge live">
+            {uploadBase64 ? "WEIGHTS STAGED" : "ZERO-DOWNTIME HOT-RELOAD"}
+          </span>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
+          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt
+                  ? "Arquivo de Pesos do Modelo (.onnx / .xml)"
+                  : "Select Custom Model Weights (.onnx / .xml)"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Selecione o arquivo .onnx ou .xml exportado pelo Colab ou script local."
+                  : "Choose a trained .onnx or OpenVINO .xml file from disk to stage for upload."}
+              </div>
+            </div>
+            <label
+              className="nvr-btn mono"
+              style={{ height: 28, padding: "0 10px", fontSize: "var(--text-xs)", cursor: "pointer" }}
+            >
+              {uploadBase64 ? `✓ ${uploadFilename}` : isPt ? "Escolher Arquivo .onnx..." : "Choose .onnx / .xml File..."}
+              <input
+                type="file"
+                accept=".onnx,.xml,.bin"
+                aria-label="Select custom .onnx or .xml model file"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  setUploadFilename(file.name);
+                  const reader = new FileReader();
+                  reader.onload = () => {
+                    if (typeof reader.result === "string") {
+                      setUploadBase64(reader.result);
+                    }
+                  };
+                  reader.readAsDataURL(file);
+                }}
+              />
+            </label>
+          </div>
+
+          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt ? "Nome do Arquivo de Destino" : "Target Model Filename"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Gravado em /config/models/ e ativado automaticamente no detector."
+                  : "Persisted under /config/models/ and bound to the active detector pool."}
+              </div>
+            </div>
             <input
               type="text"
               className="nvr-input mono"
               aria-label="Custom model filename"
-              style={{ width: 170, height: 24, fontSize: "var(--text-xs)" }}
+              style={{ width: 280, maxWidth: "100%" }}
               value={uploadFilename}
               onChange={(e) => setUploadFilename(e.target.value)}
             />
+          </div>
+
+          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt ? "Dimensões do Tensor de Entrada" : "Model Input Dimensions"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Resolução quadrada (NCHW · RGB) usada na exportação do modelo."
+                  : "Input tensor resolution matching the exported YOLO / SSD network."}
+              </div>
+            </div>
             <select
               className="nvr-select mono"
               aria-label="Model input dimensions"
-              style={{ height: 24, fontSize: "var(--text-xs)" }}
+              style={{ width: 280, maxWidth: "100%" }}
               value={`${uploadWidth}x${uploadHeight}`}
               onChange={(e) => {
                 const [w, h] = e.target.value.split("x").map(Number);
@@ -5720,16 +5888,22 @@ export const DatasetStudioSection: React.FC<{
                 setUploadHeight(h || 640);
               }}
             >
-              <option value="640x640">640×640 (YOLOv8/v11)</option>
-              <option value="320x320">320×320 (YOLOX Edge)</option>
-              <option value="300x300">300×300 (SSD)</option>
+              <option value="640x640">640×640 (YOLOv8 / YOLOv11 · NCHW)</option>
+              <option value="320x320">320×320 (YOLOX Edge · NCHW)</option>
+              <option value="300x300">300×300 (MobileNetV2 SSD · NHWC)</option>
             </select>
           </div>
 
           <button
             type="button"
             className="nvr-btn success mono"
-            style={{ height: 24, padding: "0 10px", fontSize: "var(--text-xs)" }}
+            style={{
+              width: "100%",
+              height: 28,
+              padding: "0 12px",
+              fontSize: "var(--text-xs)",
+              marginTop: "auto",
+            }}
             disabled={busyAction === "upload-model"}
             onClick={() => void handleUploadModel()}
           >

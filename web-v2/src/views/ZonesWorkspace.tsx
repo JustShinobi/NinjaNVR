@@ -600,7 +600,13 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               />
             )}
 
-            {activeCategory === "dataset" && <DatasetStudioSection notify={notify} />}
+            {activeCategory === "dataset" && (
+              <DatasetStudioSection
+                draftConfig={draftConfig}
+                updateDraft={updateDraft}
+                notify={notify}
+              />
+            )}
 
             {draftConfig && activeCategory === "recording" && (
               <RecordingReviewSection
