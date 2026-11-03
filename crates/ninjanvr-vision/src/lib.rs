@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use anyhow::Result;
 use image::{ImageFormat, Rgb, RgbImage};
-use ninjanvr_config::MotionConfig;
+use ninjanvr_config::{MotionConfig, StateRoiConfig};
 use ninjanvr_media::YuvFrame;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1313,6 +1314,408 @@ pub fn annotate_rgb_image_with_boxes(img: &mut RgbImage, boxes: &[(BoundingBox, 
     }
 }
 
+/// Resolves a normalized (`0.0..=1.0`) or pixel-space `[x1, y1, x2, y2]` ROI crop array
+/// into a valid `BoundingBox` clamped within `(0..frame_w, 0..frame_h)`.
+pub fn resolve_roi_crop_bbox(crop: [f32; 4], frame_w: u32, frame_h: u32) -> BoundingBox {
+    let fw = frame_w.max(1) as f32;
+    let fh = frame_h.max(1) as f32;
+    let is_normalized = crop.iter().all(|&v| v <= 1.0);
+    let raw_x1 = if is_normalized { crop[0] * fw } else { crop[0] };
+    let raw_y1 = if is_normalized { crop[1] * fh } else { crop[1] };
+    let raw_x2 = if is_normalized { crop[2] * fw } else { crop[2] };
+    let raw_y2 = if is_normalized { crop[3] * fh } else { crop[3] };
+
+    let x_min = raw_x1
+        .min(raw_x2)
+        .round()
+        .clamp(0.0, (frame_w.saturating_sub(1)) as f32) as u32;
+    let y_min = raw_y1
+        .min(raw_y2)
+        .round()
+        .clamp(0.0, (frame_h.saturating_sub(1)) as f32) as u32;
+    let x_max = raw_x1
+        .max(raw_x2)
+        .round()
+        .clamp((x_min + 1) as f32, frame_w.max(1) as f32) as u32;
+    let y_max = raw_y1
+        .max(raw_y2)
+        .round()
+        .clamp((y_min + 1) as f32, frame_h.max(1) as f32) as u32;
+    BoundingBox::new(x_min, y_min, x_max, y_max)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RoiCropSignature {
+    pub mean_luma: f32,
+    pub luma_std_dev: f32,
+    pub edge_energy: f32,
+    pub activity_score: f32,
+}
+
+/// Computes luminance mean, standard deviation (contrast), spatial edge energy, and
+/// a normalized `activity_score` (`0.0..=1.0`) for `crop` inside a planar `YUV420p` buffer.
+pub fn compute_roi_crop_signature(
+    yuv_data: &[u8],
+    width: u32,
+    height: u32,
+    crop: [f32; 4],
+) -> RoiCropSignature {
+    let fw = width as usize;
+    let fh = height as usize;
+    let y_len = fw.saturating_mul(fh);
+    if fw == 0 || fh == 0 || yuv_data.len() < y_len {
+        return RoiCropSignature {
+            mean_luma: 0.0,
+            luma_std_dev: 0.0,
+            edge_energy: 0.0,
+            activity_score: 0.0,
+        };
+    }
+
+    let bbox = resolve_roi_crop_bbox(crop, width, height);
+    let x1 = (bbox.x_min as usize).min(fw.saturating_sub(1));
+    let y1 = (bbox.y_min as usize).min(fh.saturating_sub(1));
+    let x2 = (bbox.x_max as usize).clamp(x1 + 1, fw);
+    let y2 = (bbox.y_max as usize).clamp(y1 + 1, fh);
+
+    let y_plane = &yuv_data[..y_len];
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut edge_sum = 0u64;
+    let mut count = 0u64;
+
+    for y in y1..y2 {
+        let row = &y_plane[y * fw..(y + 1) * fw];
+        let next_row = if y + 1 < y2 {
+            Some(&y_plane[(y + 1) * fw..(y + 2) * fw])
+        } else {
+            None
+        };
+        for x in x1..x2 {
+            let v = row[x];
+            let vf = v as f64;
+            sum += vf;
+            sum_sq += vf * vf;
+            if x + 1 < x2 {
+                edge_sum += (v as i32 - row[x + 1] as i32).unsigned_abs() as u64;
+            }
+            if let Some(nr) = next_row {
+                edge_sum += (v as i32 - nr[x] as i32).unsigned_abs() as u64;
+            }
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return RoiCropSignature {
+            mean_luma: 0.0,
+            luma_std_dev: 0.0,
+            edge_energy: 0.0,
+            activity_score: 0.0,
+        };
+    }
+
+    let mean_luma = (sum / (count as f64)) as f32;
+    let variance = ((sum_sq / (count as f64)) - (mean_luma as f64) * (mean_luma as f64)).max(0.0);
+    let luma_std_dev = (variance.sqrt()) as f32;
+    let edge_energy = (edge_sum as f32) / (count as f32);
+
+    let luma_norm = ((mean_luma - 55.0) / 145.0).clamp(0.0, 1.0);
+    let edge_norm = (edge_energy / 20.0).clamp(0.0, 1.0);
+    let contrast_norm = (luma_std_dev / 40.0).clamp(0.0, 1.0);
+    let activity_score =
+        (0.50 * luma_norm + 0.30 * edge_norm + 0.20 * contrast_norm).clamp(0.0, 1.0);
+
+    RoiCropSignature {
+        mean_luma,
+        luma_std_dev,
+        edge_energy,
+        activity_score,
+    }
+}
+
+/// Evaluates a configured ROI crop on a planar `YUV420p` frame and returns `(predicted_class, confidence)`
+/// across `cfg.classes` (defaulting to `["closed", "open"]`).
+pub fn classify_roi_crop(
+    yuv_data: &[u8],
+    width: u32,
+    height: u32,
+    cfg: &StateRoiConfig,
+) -> (String, f32) {
+    let classes: Vec<&str> = if cfg.classes.is_empty() {
+        vec!["closed", "open"]
+    } else {
+        cfg.classes.iter().map(String::as_str).collect()
+    };
+    if classes.len() == 1 {
+        return (classes[0].to_string(), 1.0);
+    }
+
+    let sig = compute_roi_crop_signature(yuv_data, width, height, cfg.crop);
+    let n = classes.len();
+    let raw_idx = (sig.activity_score * (n as f32)).floor() as usize;
+    let idx = raw_idx.min(n - 1);
+    let conf = (0.55 + (sig.activity_score - 0.5).abs() * 0.9).clamp(0.50, 0.99);
+    (classes[idx].to_string(), conf)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoiStateTransition {
+    pub roi_name: String,
+    pub previous_state: Option<String>,
+    pub current_state: String,
+    pub confidence: f32,
+    pub state_changed: bool,
+    pub is_anomalous: bool,
+    pub anomaly_triggered: bool,
+    pub anomaly_elapsed_sec: f64,
+}
+
+/// Tracks a single ROI's state with N-frame hysteresis confirmation and sustained anomaly timeout detection.
+#[derive(Debug, Clone)]
+pub struct RoiStateTracker {
+    roi_name: String,
+    config: StateRoiConfig,
+    confirmed_state: String,
+    pending_state: Option<String>,
+    pending_count: u32,
+    state_since_ts: f64,
+    last_eval_ts: Option<f64>,
+    had_motion_in_roi: bool,
+    anomaly_alert_emitted: bool,
+    initialized: bool,
+}
+
+impl RoiStateTracker {
+    pub fn new(roi_name: impl Into<String>, config: StateRoiConfig) -> Self {
+        let initial_state = config
+            .classes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "closed".to_string());
+        Self {
+            roi_name: roi_name.into(),
+            config,
+            confirmed_state: initial_state,
+            pending_state: None,
+            pending_count: 0,
+            state_since_ts: 0.0,
+            last_eval_ts: None,
+            had_motion_in_roi: false,
+            anomaly_alert_emitted: false,
+            initialized: false,
+        }
+    }
+
+    pub fn roi_name(&self) -> &str {
+        &self.roi_name
+    }
+
+    pub fn config(&self) -> &StateRoiConfig {
+        &self.config
+    }
+
+    pub fn current_state(&self) -> &str {
+        &self.confirmed_state
+    }
+
+    pub fn pending_state(&self) -> Option<&str> {
+        self.pending_state.as_deref()
+    }
+
+    pub fn pending_count(&self) -> u32 {
+        self.pending_count
+    }
+
+    pub fn is_anomalous(&self) -> bool {
+        self.config
+            .anomaly_state
+            .as_ref()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&self.confirmed_state))
+    }
+
+    pub fn anomaly_elapsed_sec(&self, now: f64) -> f64 {
+        if self.is_anomalous() && self.initialized {
+            (now - self.state_since_ts).max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Returns `true` when the ROI crop should be evaluated at `now`:
+    /// either on the first frame, when `interval_sec` has elapsed, while confirming a pending
+    /// hysteresis transition, or immediately after motion inside the ROI settles.
+    pub fn should_evaluate(&mut self, now: f64, motion_in_roi: bool) -> bool {
+        if motion_in_roi {
+            self.had_motion_in_roi = true;
+        }
+        let motion_settled = self.had_motion_in_roi && !motion_in_roi;
+        let interval_due = match self.last_eval_ts {
+            None => true,
+            Some(last) => (now - last) >= (self.config.interval_sec.max(1) as f64),
+        };
+        if motion_settled || interval_due {
+            if motion_settled {
+                self.had_motion_in_roi = false;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Feeds a classified `candidate_state` into the N-frame hysteresis state machine at timestamp `now`.
+    /// Requires `config.hysteresis` consecutive confirmations before transitioning `confirmed_state`,
+    /// and triggers `anomaly_triggered = true` once when `confirmed_state == anomaly_state` for
+    /// `>= config.anomaly_timeout_sec`.
+    pub fn observe_state(
+        &mut self,
+        candidate_state: &str,
+        confidence: f32,
+        now: f64,
+    ) -> RoiStateTransition {
+        self.last_eval_ts = Some(now);
+        let mut previous_state = None;
+        let mut state_changed = false;
+
+        if candidate_state.eq_ignore_ascii_case(&self.confirmed_state) {
+            self.pending_state = None;
+            self.pending_count = 0;
+            if !self.initialized {
+                self.initialized = true;
+                self.state_since_ts = now;
+            }
+        } else {
+            if !self.initialized {
+                self.initialized = true;
+                self.state_since_ts = now;
+            }
+            let same_pending = self
+                .pending_state
+                .as_ref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(candidate_state));
+            if same_pending {
+                self.pending_count = self.pending_count.saturating_add(1);
+            } else {
+                self.pending_state = Some(candidate_state.to_string());
+                self.pending_count = 1;
+            }
+
+            let required = self.config.hysteresis.max(1);
+            if self.pending_count >= required {
+                previous_state = Some(self.confirmed_state.clone());
+                self.confirmed_state = candidate_state.to_string();
+                self.pending_state = None;
+                self.pending_count = 0;
+                self.state_since_ts = now;
+                self.anomaly_alert_emitted = false;
+                state_changed = true;
+            }
+        }
+
+        let is_anomalous = self.is_anomalous();
+        let anomaly_elapsed_sec = if is_anomalous {
+            (now - self.state_since_ts).max(0.0)
+        } else {
+            self.anomaly_alert_emitted = false;
+            0.0
+        };
+
+        let timeout_sec = self.config.anomaly_timeout_sec.max(1) as f64;
+        let anomaly_triggered =
+            if is_anomalous && !self.anomaly_alert_emitted && anomaly_elapsed_sec >= timeout_sec {
+                self.anomaly_alert_emitted = true;
+                true
+            } else {
+                false
+            };
+
+        RoiStateTransition {
+            roi_name: self.roi_name.clone(),
+            previous_state,
+            current_state: self.confirmed_state.clone(),
+            confidence,
+            state_changed,
+            is_anomalous,
+            anomaly_triggered,
+            anomaly_elapsed_sec,
+        }
+    }
+
+    /// Evaluates a YUV420p frame if due (or when `force_eval` is true) and advances the hysteresis state machine.
+    pub fn evaluate_frame(
+        &mut self,
+        yuv_data: &[u8],
+        width: u32,
+        height: u32,
+        now: f64,
+        motion_boxes: &[BoundingBox],
+        force_eval: bool,
+    ) -> Option<RoiStateTransition> {
+        let roi_bbox = resolve_roi_crop_bbox(self.config.crop, width, height);
+        let motion_in_roi = motion_boxes.iter().any(|mb| mb.intersects(&roi_bbox));
+        if !force_eval && !self.should_evaluate(now, motion_in_roi) {
+            return None;
+        }
+        let (candidate, confidence) = classify_roi_crop(yuv_data, width, height, &self.config);
+        Some(self.observe_state(&candidate, confidence, now))
+    }
+}
+
+/// Manages all configured `RoiStateTracker` instances for a single camera.
+#[derive(Debug, Clone, Default)]
+pub struct CameraRoiStateMonitor {
+    trackers: BTreeMap<String, RoiStateTracker>,
+}
+
+impl CameraRoiStateMonitor {
+    pub fn new(rois: &BTreeMap<String, StateRoiConfig>) -> Self {
+        let mut trackers = BTreeMap::new();
+        for (name, cfg) in rois {
+            trackers.insert(
+                name.clone(),
+                RoiStateTracker::new(name.clone(), cfg.clone()),
+            );
+        }
+        Self { trackers }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.trackers.is_empty()
+    }
+
+    pub fn current_states(&self) -> BTreeMap<String, String> {
+        self.trackers
+            .iter()
+            .map(|(k, t)| (k.clone(), t.current_state().to_string()))
+            .collect()
+    }
+
+    pub fn tracker_mut(&mut self, roi_name: &str) -> Option<&mut RoiStateTracker> {
+        self.trackers.get_mut(roi_name)
+    }
+
+    pub fn evaluate_frame(
+        &mut self,
+        yuv_data: &[u8],
+        width: u32,
+        height: u32,
+        now: f64,
+        motion_boxes: &[BoundingBox],
+        force_eval: bool,
+    ) -> Vec<RoiStateTransition> {
+        let mut out = Vec::new();
+        for tracker in self.trackers.values_mut() {
+            if let Some(tr) =
+                tracker.evaluate_frame(yuv_data, width, height, now, motion_boxes, force_eval)
+            {
+                out.push(tr);
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1832,5 +2235,151 @@ mod tests {
         let _ = compute_crop_dhash64(&frame_a, w, h, oob_bbox);
         assert_eq!(compute_crop_dhash64(&[1, 2, 3], w, h, bbox), 0);
         assert_eq!(compute_crop_dhash64(&frame_a, 0, h, bbox), 0);
+    }
+
+    #[test]
+    fn roi_state_tracker_enforces_n_frame_hysteresis_and_anomaly_timeout_recovery() {
+        let cfg = StateRoiConfig {
+            crop: [0.2, 0.2, 0.8, 0.8],
+            classes: vec!["closed".to_string(), "open".to_string()],
+            interval_sec: 5,
+            hysteresis: 3,
+            anomaly_state: Some("open".to_string()),
+            anomaly_timeout_sec: 60,
+        };
+        let mut tracker = RoiStateTracker::new("gate", cfg);
+        assert_eq!(tracker.current_state(), "closed");
+
+        // 1. Initial baseline "closed" observation
+        let t0 = tracker.observe_state("closed", 0.92, 100.0);
+        assert_eq!(t0.current_state, "closed");
+        assert!(!t0.state_changed);
+        assert!(!t0.is_anomalous);
+        assert!(!t0.anomaly_triggered);
+
+        // 2. Single-frame and 2-frame flicker to "open" must NOT transition state (hysteresis = 3)
+        let f1 = tracker.observe_state("open", 0.88, 105.0);
+        assert_eq!(f1.current_state, "closed");
+        assert!(!f1.state_changed);
+        assert_eq!(tracker.pending_state(), Some("open"));
+        assert_eq!(tracker.pending_count(), 1);
+
+        let f2 = tracker.observe_state("open", 0.90, 110.0);
+        assert_eq!(f2.current_state, "closed");
+        assert!(!f2.state_changed);
+        assert_eq!(tracker.pending_count(), 2);
+
+        // Intervening "closed" resets pending counter to 0
+        let f_reset = tracker.observe_state("closed", 0.95, 115.0);
+        assert_eq!(f_reset.current_state, "closed");
+        assert!(!f_reset.state_changed);
+        assert_eq!(tracker.pending_count(), 0);
+        assert!(tracker.pending_state().is_none());
+
+        // 3. Three consecutive "open" frames transition CLOSED -> OPEN on the 3rd frame
+        assert!(!tracker.observe_state("open", 0.89, 120.0).state_changed);
+        assert!(!tracker.observe_state("open", 0.91, 125.0).state_changed);
+        let tr_open = tracker.observe_state("open", 0.93, 130.0);
+        assert!(tr_open.state_changed);
+        assert_eq!(tr_open.previous_state.as_deref(), Some("closed"));
+        assert_eq!(tr_open.current_state, "open");
+        assert!(tr_open.is_anomalous);
+        assert!(!tr_open.anomaly_triggered);
+
+        // 4. Anomaly timer recovery before timeout (returns to "closed" after 40s < 60s timeout)
+        let mid_open = tracker.observe_state("open", 0.93, 170.0);
+        assert_eq!(mid_open.anomaly_elapsed_sec, 40.0);
+        assert!(!mid_open.anomaly_triggered);
+
+        assert!(!tracker.observe_state("closed", 0.94, 175.0).state_changed);
+        assert!(!tracker.observe_state("closed", 0.94, 180.0).state_changed);
+        let tr_closed = tracker.observe_state("closed", 0.95, 185.0);
+        assert!(tr_closed.state_changed);
+        assert_eq!(tr_closed.current_state, "closed");
+        assert!(!tr_closed.is_anomalous);
+        assert_eq!(tr_closed.anomaly_elapsed_sec, 0.0);
+
+        // 5. Re-open at t=220 and sustain >= 60s -> triggers anomaly alert exactly once at t=280
+        let _ = tracker.observe_state("open", 0.90, 210.0);
+        let _ = tracker.observe_state("open", 0.90, 215.0);
+        let reopened = tracker.observe_state("open", 0.92, 220.0);
+        assert!(reopened.state_changed);
+        assert_eq!(reopened.current_state, "open");
+        assert!(!reopened.anomaly_triggered);
+
+        let before_timeout = tracker.observe_state("open", 0.92, 279.0);
+        assert!(!before_timeout.anomaly_triggered);
+
+        let at_timeout = tracker.observe_state("open", 0.92, 280.0);
+        assert!(at_timeout.anomaly_triggered);
+        assert_eq!(at_timeout.anomaly_elapsed_sec, 60.0);
+
+        // Subsequent observations while still open do not re-emit duplicate alert
+        let after_timeout = tracker.observe_state("open", 0.92, 300.0);
+        assert!(!after_timeout.anomaly_triggered);
+        assert!(after_timeout.is_anomalous);
+    }
+
+    #[test]
+    fn classify_roi_crop_and_monitor_evaluate_interval_and_motion_settle() {
+        let w = 160u32;
+        let h = 120u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+
+        let mut rois = BTreeMap::new();
+        rois.insert(
+            "gate".to_string(),
+            StateRoiConfig {
+                crop: [0.25, 0.25, 0.75, 0.75],
+                classes: vec!["closed".to_string(), "open".to_string()],
+                interval_sec: 10,
+                hysteresis: 2,
+                anomaly_state: Some("open".to_string()),
+                anomaly_timeout_sec: 120,
+            },
+        );
+        let mut monitor = CameraRoiStateMonitor::new(&rois);
+        assert!(!monitor.is_empty());
+        assert_eq!(
+            monitor.current_states().get("gate").map(String::as_str),
+            Some("closed")
+        );
+
+        // Dark uniform closed frame
+        let closed_yuv = vec![35u8; y_len + uv_len * 2];
+        // Bright high-contrast open frame inside ROI
+        let mut open_yuv = vec![35u8; y_len + uv_len * 2];
+        for y in 30..90 {
+            for x in 40..120 {
+                open_yuv[y * (w as usize) + x] = if (x + y) % 2 == 0 { 235 } else { 180 };
+            }
+        }
+
+        // First evaluation at t=100.0 runs immediately
+        let tr1 = monitor.evaluate_frame(&closed_yuv, w, h, 100.0, &[], false);
+        assert_eq!(tr1.len(), 1);
+        assert_eq!(tr1[0].current_state, "closed");
+
+        // At t=103.0 (< 10s interval) with no motion settle, evaluation is skipped
+        let tr_skip = monitor.evaluate_frame(&open_yuv, w, h, 103.0, &[], false);
+        assert!(tr_skip.is_empty());
+
+        // Motion inside ROI at t=104.0 followed by motion settling at t=105.0 triggers immediate evaluation
+        let roi_motion = vec![BoundingBox::new(50, 40, 100, 80)];
+        let _ = monitor.evaluate_frame(&open_yuv, w, h, 104.0, &roi_motion, false);
+        let tr_settle = monitor.evaluate_frame(&open_yuv, w, h, 105.0, &[], false);
+        assert_eq!(tr_settle.len(), 1);
+        assert_eq!(tr_settle[0].current_state, "closed"); // 1st of 2 hysteresis frames
+
+        // Next interval at t=115.0 completes 2-frame hysteresis -> transitions to "open"
+        let tr_confirm = monitor.evaluate_frame(&open_yuv, w, h, 115.0, &[], false);
+        assert_eq!(tr_confirm.len(), 1);
+        assert!(tr_confirm[0].state_changed);
+        assert_eq!(tr_confirm[0].current_state, "open");
+        assert_eq!(
+            monitor.current_states().get("gate").map(String::as_str),
+            Some("open")
+        );
     }
 }

@@ -342,6 +342,30 @@ export function buildCleanYamlFromDraft(
         })
       ),
       lines: cam.lines || {},
+      ...(cam.state_rois && Object.keys(cam.state_rois).length > 0
+        ? {
+            state_rois: Object.fromEntries(
+              Object.entries(cam.state_rois).map(([roiName, roiCfg]) => [
+                roiName,
+                {
+                  crop: (roiCfg.crop || [0.25, 0.25, 0.75, 0.75]).map((v) =>
+                    Number(Number(v).toFixed(4))
+                  ),
+                  classes:
+                    roiCfg.classes && roiCfg.classes.length > 0
+                      ? roiCfg.classes
+                      : ["closed", "open"],
+                  interval_sec: roiCfg.interval_sec ?? 5,
+                  hysteresis: roiCfg.hysteresis ?? 3,
+                  ...(roiCfg.anomaly_state
+                    ? { anomaly_state: roiCfg.anomaly_state }
+                    : {}),
+                  anomaly_timeout_sec: roiCfg.anomaly_timeout_sec ?? 300,
+                },
+              ])
+            ),
+          }
+        : {}),
       privacy_mask: cam.privacy_mask || [],
       ...(cam.onvif &&
       ((cam.onvif.host && cam.onvif.host.trim().length > 0) ||

@@ -3358,6 +3358,19 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
             (1.8, 4.5)
         };
 
+        let mut roi_states = BTreeMap::new();
+        for (roi_name, roi_cfg) in &cam_cfg.state_rois {
+            let default_state = roi_cfg
+                .classes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "closed".to_string());
+            roi_states.insert(roi_name.clone(), default_state);
+        }
+        for (roi_name, live_state) in state.comms.get_camera_roi_states(cam_name) {
+            roi_states.insert(roi_name, live_state);
+        }
+
         total_cam_fps += fps;
         total_det_fps += det_fps;
         cameras_stats.insert(
@@ -3370,6 +3383,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
                 "detection_enabled": cam_cfg.detect.enabled,
                 "last_frame_ts": last_frame_ts,
                 "night_mode": night_mode,
+                "states": roi_states,
                 "pid": pid,
                 "capture_pid": pid,
                 "ffmpeg_pid": cam_pid,
