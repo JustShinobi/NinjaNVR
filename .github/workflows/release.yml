@@ -108,7 +108,6 @@ jobs:
             ghcr.io/justshinobi/ninjanvr
           tags: |
             type=raw,value=${{ steps.resolve.outputs.tag }}
-            type=sha,prefix=sha-
             type=raw,value=${{ steps.resolve.outputs.channel }}
 
       - name: Build and push container image
@@ -125,6 +124,101 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
+
+      - name: Prune old GHCR RC and untagged versions (keep latest 10 RC tags)
+        env:
+          GH_TOKEN: ${{ secrets.PLATFORM_GITOPS_TOKEN || secrets.GITHUB_TOKEN }}
+          PACKAGE_OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          MAX_RC_TO_KEEP = 10
+          STABLE_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+          RC_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-rc\.(\d+)$")
+          owner = os.environ.get("PACKAGE_OWNER", "JustShinobi")
+
+          res = subprocess.run(
+              [
+                  "gh",
+                  "api",
+                  "--paginate",
+                  "--slurp",
+                  f"/users/{owner}/packages/container/ninjanvr/versions?per_page=100",
+              ],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          if res.returncode != 0 or not res.stdout.strip():
+              print(f"Skipping GHCR version prune (API returned {res.returncode}): {res.stderr.strip()}")
+              raise SystemExit(0)
+
+          try:
+              raw_pages = json.loads(res.stdout)
+              versions = (
+                  [item for page in raw_pages for item in page]
+                  if raw_pages and isinstance(raw_pages[0], list)
+                  else raw_pages
+              )
+          except Exception as exc:
+              print(f"Skipping GHCR version prune (JSON parse error): {exc}")
+              raise SystemExit(0)
+
+          rc_entries = []
+          orphan_ids = []
+
+          for v in versions:
+              vid = v.get("id")
+              tags = (
+                  v.get("metadata", {})
+                  .get("container", {})
+                  .get("tags", [])
+              )
+              if any(t in ("latest", "dev") or STABLE_RE.match(t) for t in tags):
+                  continue
+
+              rc_matches = [m for t in tags if (m := RC_RE.match(t))]
+              if rc_matches:
+                  best_rc = max(
+                      (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+                      for m in rc_matches
+                  )
+                  rc_entries.append((best_rc, v.get("created_at", ""), vid, tags))
+              else:
+                  # Untagged or legacy sha-* only image version
+                  orphan_ids.append((vid, tags))
+
+          rc_entries.sort(reverse=True)
+          to_delete = [
+              (vid, tags) for _, _, vid, tags in rc_entries[MAX_RC_TO_KEEP:]
+          ] + orphan_ids
+
+          print(
+              f"GHCR retention check: {len(rc_entries)} RC version(s) found (keeping up to {MAX_RC_TO_KEEP}), "
+              f"{len(to_delete)} old/orphan version(s) queued for deletion."
+          )
+          for vid, tags in to_delete:
+              del_res = subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      "--method",
+                      "DELETE",
+                      f"/users/{owner}/packages/container/ninjanvr/versions/{vid}",
+                  ],
+                  capture_output=True,
+                  text=True,
+                  check=False,
+              )
+              if del_res.returncode == 0:
+                  print(f"Deleted GHCR package version {vid} (tags={tags})")
+              else:
+                  print(f"Could not delete GHCR package version {vid} (tags={tags}): {del_res.stderr.strip()}")
+          PY
 
   gitops-bump:
     name: Promote Release Tag to GitOps

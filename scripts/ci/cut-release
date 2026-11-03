@@ -18,6 +18,8 @@ import sys
 from pathlib import Path
 
 STABLE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+RC_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-rc\.(\d+)$")
+MAX_RC_TAGS_TO_KEEP = 10
 
 
 def run(cmd: list[str], check: bool = True) -> str:
@@ -186,8 +188,8 @@ def main() -> int:
         next_tag = f"v{next_version}"
         print(f"[dev pre-release] Cutting {next_tag} (commits since {last_any_tag}: {len(incremental_commits)})")
 
-        # Since superseded -rc.* pre-releases are pruned below, the active pre-release
-        # must include all cumulative commits since the last stable release (`last_stable_tag..HEAD`).
+        # Include all cumulative commits since the last stable release (`last_stable_tag..HEAD`)
+        # so each -rc.* pre-release shows the complete set of changes for the upcoming stable version.
         _, release_notes = format_release_notes(commits_since_stable)
         run(["git", "config", "user.name", "github-actions[bot]"])
         run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
@@ -235,11 +237,23 @@ def main() -> int:
         gh_cmd.append("--latest")
     run(gh_cmd)
 
-    # Prune superseded -rc.* pre-releases and tags so GitHub Releases/Tags never clutter
-    # or sort older single-digit RCs (e.g. rc.9) above double-digit RCs (e.g. rc.12).
-    superseded_rcs = [t for t in all_tags if "-rc." in t and t != next_tag]
+    # Keep the latest MAX_RC_TAGS_TO_KEEP (10) -rc.* pre-releases and tags; prune older ones.
+    seen_rc_tags = set(all_tags)
+    if "-rc." in next_tag:
+        seen_rc_tags.add(next_tag)
+    rc_candidates: list[tuple[int, int, int, int, str]] = []
+    for t in seen_rc_tags:
+        m = RC_TAG_RE.match(t)
+        if m:
+            rc_candidates.append(
+                (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), t)
+            )
+    rc_candidates.sort()
+    superseded_rcs = [item[4] for item in rc_candidates[:-MAX_RC_TAGS_TO_KEEP]]
     for old_rc in superseded_rcs:
-        print(f"Pruning superseded pre-release and tag: {old_rc}")
+        print(
+            f"Pruning old pre-release and tag (keeping latest {MAX_RC_TAGS_TO_KEEP} RCs): {old_rc}"
+        )
         subprocess.run(
             ["gh", "release", "delete", old_rc, "--cleanup-tag", "--yes"],
             check=False,
