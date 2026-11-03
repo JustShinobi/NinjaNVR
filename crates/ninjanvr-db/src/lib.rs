@@ -15,6 +15,92 @@ use tracing::info;
 
 const PASSWORD_HASH_ALGORITHM: &str = "pbkdf2_sha256";
 
+pub const NINJANVR_SECURITY_CLASSES: [&str; 15] = [
+    "person",
+    "face",
+    "car",
+    "motorcycle",
+    "bicycle",
+    "truck",
+    "bus",
+    "license_plate",
+    "dog",
+    "cat",
+    "bird",
+    "package",
+    "waste_bin",
+    "backpack",
+    "umbrella",
+];
+
+pub fn security_class_id(label: &str) -> Option<usize> {
+    let normalized = label.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    NINJANVR_SECURITY_CLASSES
+        .iter()
+        .position(|&c| c == normalized)
+}
+
+pub fn security_class_label(class_id: usize) -> Option<&'static str> {
+    NINJANVR_SECURITY_CLASSES.get(class_id).copied()
+}
+
+pub fn deterministic_dataset_split(id: &str) -> &'static str {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in id.as_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    if hash.is_multiple_of(5) {
+        "val"
+    } else {
+        "train"
+    }
+}
+
+fn default_annotation_score() -> f64 {
+    1.0
+}
+
+fn default_annotation_source() -> String {
+    "event".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DatasetAnnotationBox {
+    pub class_id: usize,
+    pub label: String,
+    pub cx: f64,
+    pub cy: f64,
+    pub w: f64,
+    pub h: f64,
+    #[serde(default = "default_annotation_score")]
+    pub score: f64,
+    #[serde(default = "default_annotation_source")]
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetSampleDto {
+    pub id: String,
+    pub event_id: Option<String>,
+    pub camera: String,
+    #[serde(default)]
+    pub split: String,
+    pub sample_kind: String,
+    pub image_path: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub annotations: Vec<DatasetAnnotationBox>,
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub night_mode: bool,
+    pub created_at: f64,
+}
+
 #[derive(Clone)]
 pub struct NinjaDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -504,6 +590,21 @@ impl NinjaDatabase {
                 last_seen_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_fp_sig_cam_label ON false_positive_signature(camera, label);
+            CREATE TABLE IF NOT EXISTS dataset_sample (
+                id TEXT PRIMARY KEY,
+                event_id TEXT,
+                camera TEXT NOT NULL,
+                split TEXT NOT NULL DEFAULT 'train',
+                sample_kind TEXT NOT NULL,
+                image_path TEXT NOT NULL,
+                width INTEGER NOT NULL DEFAULT 0,
+                height INTEGER NOT NULL DEFAULT 0,
+                annotations TEXT NOT NULL DEFAULT '[]',
+                verified INTEGER NOT NULL DEFAULT 0,
+                night_mode INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dataset_sample_cam ON dataset_sample(camera, sample_kind);
             "#,
         )?;
         let _ = conn.execute(
@@ -3598,6 +3699,266 @@ impl NinjaDatabase {
 
         Ok(files_to_remove)
     }
+
+    pub fn upsert_dataset_sample(&self, sample: &DatasetSampleDto) -> Result<DatasetSampleDto> {
+        let split = if sample.split == "train" || sample.split == "val" {
+            sample.split.clone()
+        } else {
+            deterministic_dataset_split(&sample.id).to_string()
+        };
+        let annotations_json = serde_json::to_string(&sample.annotations)?;
+        let verified_int = if sample.verified { 1 } else { 0 };
+        let night_int = if sample.night_mode { 1 } else { 0 };
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO dataset_sample (
+                id, event_id, camera, split, sample_kind, image_path,
+                width, height, annotations, verified, night_mode, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(id) DO UPDATE SET
+                event_id = COALESCE(excluded.event_id, dataset_sample.event_id),
+                camera = excluded.camera,
+                split = excluded.split,
+                sample_kind = excluded.sample_kind,
+                image_path = excluded.image_path,
+                width = CASE WHEN excluded.width > 0 THEN excluded.width ELSE dataset_sample.width END,
+                height = CASE WHEN excluded.height > 0 THEN excluded.height ELSE dataset_sample.height END,
+                annotations = excluded.annotations,
+                verified = excluded.verified,
+                night_mode = excluded.night_mode
+            "#,
+            params![
+                sample.id,
+                sample.event_id,
+                sample.camera,
+                split,
+                sample.sample_kind,
+                sample.image_path,
+                sample.width as i64,
+                sample.height as i64,
+                annotations_json,
+                verified_int,
+                night_int,
+                sample.created_at
+            ],
+        )?;
+        let mut out = sample.clone();
+        out.split = split;
+        Ok(out)
+    }
+
+    fn map_dataset_sample_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetSampleDto> {
+        let raw_ann: String = r.get(8)?;
+        let annotations: Vec<DatasetAnnotationBox> =
+            serde_json::from_str(&raw_ann).unwrap_or_default();
+        Ok(DatasetSampleDto {
+            id: r.get(0)?,
+            event_id: r.get(1)?,
+            camera: r.get(2)?,
+            split: r.get(3)?,
+            sample_kind: r.get(4)?,
+            image_path: r.get(5)?,
+            width: r.get::<_, i64>(6)?.max(0) as u32,
+            height: r.get::<_, i64>(7)?.max(0) as u32,
+            annotations,
+            verified: r.get::<_, i64>(9)? != 0,
+            night_mode: r.get::<_, i64>(10)? != 0,
+            created_at: r.get(11)?,
+        })
+    }
+
+    pub fn list_dataset_samples(
+        &self,
+        camera: Option<&str>,
+        sample_kind: Option<&str>,
+        verified: Option<bool>,
+    ) -> Result<Vec<DatasetSampleDto>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                id, event_id, camera, split, sample_kind, image_path,
+                width, height, annotations, verified, night_mode, created_at
+            FROM dataset_sample
+            ORDER BY created_at DESC, id DESC
+            "#,
+        )?;
+        let filter_cam = camera.filter(|c| !c.is_empty() && *c != "all");
+        let filter_kind = sample_kind.filter(|k| !k.is_empty() && *k != "all");
+        let rows = stmt.query_map([], Self::map_dataset_sample_row)?;
+        let mut out = Vec::new();
+        for row_res in rows {
+            let item = row_res?;
+            if let Some(cam) = filter_cam
+                && item.camera != cam
+            {
+                continue;
+            }
+            if let Some(kind) = filter_kind
+                && item.sample_kind != kind
+            {
+                continue;
+            }
+            if let Some(ver) = verified
+                && item.verified != ver
+            {
+                continue;
+            }
+            out.push(item);
+        }
+        Ok(out)
+    }
+
+    pub fn get_dataset_sample(&self, id: &str) -> Result<Option<DatasetSampleDto>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let sample = conn
+            .query_row(
+                r#"
+                SELECT
+                    id, event_id, camera, split, sample_kind, image_path,
+                    width, height, annotations, verified, night_mode, created_at
+                FROM dataset_sample
+                WHERE id = ?1
+                "#,
+                params![id],
+                Self::map_dataset_sample_row,
+            )
+            .optional()?;
+        Ok(sample)
+    }
+
+    pub fn update_dataset_sample_annotations(
+        &self,
+        id: &str,
+        annotations: Option<&[DatasetAnnotationBox]>,
+        sample_kind: Option<&str>,
+        verified: Option<bool>,
+        split: Option<&str>,
+    ) -> Result<Option<DatasetSampleDto>> {
+        let Some(mut current) = self.get_dataset_sample(id)? else {
+            return Ok(None);
+        };
+        if let Some(anns) = annotations {
+            current.annotations = anns.to_vec();
+        }
+        if let Some(kind) = sample_kind
+            && !kind.trim().is_empty()
+        {
+            current.sample_kind = kind.trim().to_string();
+        }
+        if let Some(ver) = verified {
+            current.verified = ver;
+        }
+        if let Some(sp) = split
+            && (sp == "train" || sp == "val")
+        {
+            current.split = sp.to_string();
+        }
+        let annotations_json = serde_json::to_string(&current.annotations)?;
+        let verified_int = if current.verified { 1 } else { 0 };
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            UPDATE dataset_sample
+            SET annotations = ?2, sample_kind = ?3, verified = ?4, split = ?5
+            WHERE id = ?1
+            "#,
+            params![
+                id,
+                annotations_json,
+                current.sample_kind,
+                verified_int,
+                current.split
+            ],
+        )?;
+        Ok(Some(current))
+    }
+
+    pub fn delete_dataset_sample(&self, id: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(conn.execute("DELETE FROM dataset_sample WHERE id = ?1", params![id])?)
+    }
+
+    pub fn get_dataset_summary(&self) -> Result<Value> {
+        let samples = self.list_dataset_samples(None, None, None)?;
+        let total_samples = samples.len();
+        let mut true_positive_count = 0usize;
+        let mut hard_negative_count = 0usize;
+        let mut ai_annotated_count = 0usize;
+        let mut train_count = 0usize;
+        let mut val_count = 0usize;
+        let mut verified_count = 0usize;
+        let mut night_mode_count = 0usize;
+        let mut total_annotations = 0usize;
+        let mut by_camera: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_class: BTreeMap<String, usize> = BTreeMap::new();
+        for &cls in &NINJANVR_SECURITY_CLASSES {
+            by_class.insert(cls.to_string(), 0);
+        }
+
+        for s in &samples {
+            match s.sample_kind.as_str() {
+                "hard_negative" => hard_negative_count += 1,
+                "ai_annotated" => ai_annotated_count += 1,
+                _ => true_positive_count += 1,
+            }
+            if s.split == "val" {
+                val_count += 1;
+            } else {
+                train_count += 1;
+            }
+            if s.verified {
+                verified_count += 1;
+            }
+            if s.night_mode {
+                night_mode_count += 1;
+            }
+            *by_camera.entry(s.camera.clone()).or_insert(0) += 1;
+            total_annotations += s.annotations.len();
+            for ann in &s.annotations {
+                let cls_name = security_class_label(ann.class_id)
+                    .map(String::from)
+                    .unwrap_or_else(|| ann.label.clone());
+                *by_class.entry(cls_name).or_insert(0) += 1;
+            }
+        }
+
+        let positive_samples = true_positive_count + ai_annotated_count;
+        let positive_ratio = if total_samples > 0 {
+            positive_samples as f64 / total_samples as f64
+        } else {
+            0.0
+        };
+        let hard_negative_ratio = if total_samples > 0 {
+            hard_negative_count as f64 / total_samples as f64
+        } else {
+            0.0
+        };
+        let unverified_count = total_samples.saturating_sub(verified_count);
+
+        Ok(json!({
+            "total_samples": total_samples,
+            "true_positive_count": true_positive_count,
+            "hard_negative_count": hard_negative_count,
+            "ai_annotated_count": ai_annotated_count,
+            "positive_samples": positive_samples,
+            "train_count": train_count,
+            "val_count": val_count,
+            "verified_count": verified_count,
+            "unverified_count": unverified_count,
+            "night_mode_count": night_mode_count,
+            "total_annotations": total_annotations,
+            "positive_ratio": positive_ratio,
+            "hard_negative_ratio": hard_negative_ratio,
+            "target_positive_ratio": 0.8,
+            "target_hard_negative_ratio": 0.2,
+            "by_camera": by_camera,
+            "by_class": by_class,
+            "classes": NINJANVR_SECURITY_CLASSES,
+            "ready_for_export": total_samples > 0
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -5031,6 +5392,194 @@ mod tests {
         db.set_event_sub_label("ev_face_1", None).unwrap();
         let ev_cleared = db.get_event("ev_face_1").unwrap().unwrap();
         assert!(ev_cleared["sub_label"].is_null());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn dataset_sample_crud_split_assignment_and_summary_counts() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_dataset_sample_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        assert_eq!(NINJANVR_SECURITY_CLASSES.len(), 15);
+        assert_eq!(security_class_id("person"), Some(0));
+        assert_eq!(security_class_id("face"), Some(1));
+        assert_eq!(security_class_id("license_plate"), Some(7));
+        assert_eq!(security_class_id("umbrella"), Some(14));
+        assert_eq!(security_class_label(11), Some("package"));
+        assert_eq!(security_class_label(99), None);
+
+        // Verify deterministic 80/20 split across 50 sample IDs produces both train and val
+        let mut seen_train = 0;
+        let mut seen_val = 0;
+        for i in 0..50 {
+            let sid = format!("sample_det_{i}");
+            let s1 = deterministic_dataset_split(&sid);
+            let s2 = deterministic_dataset_split(&sid);
+            assert_eq!(s1, s2);
+            if s1 == "val" {
+                seen_val += 1;
+            } else {
+                assert_eq!(s1, "train");
+                seen_train += 1;
+            }
+        }
+        assert!(seen_train > 0 && seen_val > 0);
+
+        // 1. Insert true_positive, hard_negative, and ai_annotated samples
+        let tp_sample = db
+            .upsert_dataset_sample(&DatasetSampleDto {
+                id: "ds_ev_tp_1".to_string(),
+                event_id: Some("ev_tp_1".to_string()),
+                camera: "front_door".to_string(),
+                split: String::new(),
+                sample_kind: "true_positive".to_string(),
+                image_path: "/media/ninjanvr/dataset/ds_ev_tp_1.webp".to_string(),
+                width: 1280,
+                height: 720,
+                annotations: vec![
+                    DatasetAnnotationBox {
+                        class_id: 0,
+                        label: "person".to_string(),
+                        cx: 0.45,
+                        cy: 0.55,
+                        w: 0.20,
+                        h: 0.60,
+                        score: 0.92,
+                        source: "event".to_string(),
+                    },
+                    DatasetAnnotationBox {
+                        class_id: 11,
+                        label: "package".to_string(),
+                        cx: 0.48,
+                        cy: 0.78,
+                        w: 0.08,
+                        h: 0.10,
+                        score: 0.88,
+                        source: "event".to_string(),
+                    },
+                ],
+                verified: true,
+                night_mode: false,
+                created_at: 1000.0,
+            })
+            .unwrap();
+        assert!(tp_sample.split == "train" || tp_sample.split == "val");
+
+        db.upsert_dataset_sample(&DatasetSampleDto {
+            id: "ds_ev_hn_1".to_string(),
+            event_id: Some("ev_hn_1".to_string()),
+            camera: "patio".to_string(),
+            split: "val".to_string(),
+            sample_kind: "hard_negative".to_string(),
+            image_path: "/media/ninjanvr/dataset/ds_ev_hn_1.webp".to_string(),
+            width: 1280,
+            height: 720,
+            annotations: vec![],
+            verified: true,
+            night_mode: true,
+            created_at: 1005.0,
+        })
+        .unwrap();
+
+        db.upsert_dataset_sample(&DatasetSampleDto {
+            id: "ds_ev_ai_1".to_string(),
+            event_id: Some("ev_ai_1".to_string()),
+            camera: "front_door".to_string(),
+            split: "train".to_string(),
+            sample_kind: "ai_annotated".to_string(),
+            image_path: "/media/ninjanvr/dataset/ds_ev_ai_1.webp".to_string(),
+            width: 1920,
+            height: 1080,
+            annotations: vec![DatasetAnnotationBox {
+                class_id: 2,
+                label: "car".to_string(),
+                cx: 0.50,
+                cy: 0.50,
+                w: 0.40,
+                h: 0.30,
+                score: 0.96,
+                source: "ai_teacher".to_string(),
+            }],
+            verified: false,
+            night_mode: false,
+            created_at: 1010.0,
+        })
+        .unwrap();
+
+        // 2. List & filter samples
+        let all = db.list_dataset_samples(None, None, None).unwrap();
+        assert_eq!(all.len(), 3);
+        let front_only = db
+            .list_dataset_samples(Some("front_door"), None, None)
+            .unwrap();
+        assert_eq!(front_only.len(), 2);
+        let unverified = db.list_dataset_samples(None, None, Some(false)).unwrap();
+        assert_eq!(unverified.len(), 1);
+        assert_eq!(unverified[0].id, "ds_ev_ai_1");
+
+        // 3. Update annotations, verified flag, and split
+        let updated = db
+            .update_dataset_sample_annotations(
+                "ds_ev_ai_1",
+                Some(&[
+                    DatasetAnnotationBox {
+                        class_id: 2,
+                        label: "car".to_string(),
+                        cx: 0.52,
+                        cy: 0.48,
+                        w: 0.38,
+                        h: 0.28,
+                        score: 0.99,
+                        source: "manual".to_string(),
+                    },
+                    DatasetAnnotationBox {
+                        class_id: 7,
+                        label: "license_plate".to_string(),
+                        cx: 0.52,
+                        cy: 0.56,
+                        w: 0.08,
+                        h: 0.04,
+                        score: 0.95,
+                        source: "manual".to_string(),
+                    },
+                ]),
+                None,
+                Some(true),
+                Some("train"),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(updated.verified);
+        assert_eq!(updated.annotations.len(), 2);
+
+        // 4. Verify get_dataset_summary aggregation
+        let summary = db.get_dataset_summary().unwrap();
+        assert_eq!(summary["total_samples"], 3);
+        assert_eq!(summary["true_positive_count"], 1);
+        assert_eq!(summary["hard_negative_count"], 1);
+        assert_eq!(summary["ai_annotated_count"], 1);
+        assert_eq!(summary["verified_count"], 3);
+        assert_eq!(summary["unverified_count"], 0);
+        assert_eq!(summary["night_mode_count"], 1);
+        assert_eq!(summary["total_annotations"], 4);
+        assert_eq!(summary["by_camera"]["front_door"], 2);
+        assert_eq!(summary["by_camera"]["patio"], 1);
+        assert_eq!(summary["by_class"]["person"], 1);
+        assert_eq!(summary["by_class"]["package"], 1);
+        assert_eq!(summary["by_class"]["car"], 1);
+        assert_eq!(summary["by_class"]["license_plate"], 1);
+        assert_eq!(summary["ready_for_export"], true);
+
+        // 5. Delete sample and verify count decreases
+        assert_eq!(db.delete_dataset_sample("ds_ev_hn_1").unwrap(), 1);
+        assert!(db.get_dataset_sample("ds_ev_hn_1").unwrap().is_none());
+        let summary_after = db.get_dataset_summary().unwrap();
+        assert_eq!(summary_after["total_samples"], 2);
+        assert_eq!(summary_after["hard_negative_count"], 0);
 
         let _ = std::fs::remove_file(&tmp);
     }

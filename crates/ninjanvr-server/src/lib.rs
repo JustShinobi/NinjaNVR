@@ -419,6 +419,32 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/config/set", put(api_config_set))
         .route("/config/schema.json", get(api_config_schema))
         .route("/detectors/catalog", get(api_detectors_catalog))
+        .route("/detectors/models/upload", post(api_detector_model_upload))
+        .route("/dataset/summary", get(api_dataset_summary))
+        .route("/dataset/samples", get(api_dataset_samples))
+        .route(
+            "/dataset/samples/from-event/{event_id}",
+            post(api_dataset_sample_from_event),
+        )
+        .route(
+            "/dataset/samples/{id}",
+            get(api_dataset_sample_get)
+                .put(api_dataset_sample_update)
+                .delete(api_dataset_sample_delete),
+        )
+        .route(
+            "/dataset/samples/{id}/auto-annotate",
+            post(api_dataset_sample_auto_annotate),
+        )
+        .route(
+            "/dataset/auto-annotate",
+            post(api_dataset_batch_auto_annotate),
+        )
+        .route(
+            "/dataset/samples/{id}/image.webp",
+            get(api_dataset_sample_image_webp),
+        )
+        .route("/dataset/export.zip", get(api_dataset_export_zip))
         .route("/ffmpeg/presets", get(api_ffmpeg_presets))
         .route("/ffprobe", get(api_ffprobe))
         .route("/streams/probe", post(api_streams_probe))
@@ -876,6 +902,7 @@ async fn auth_gate_middleware(
                                 | "users"
                                 | "config"
                                 | "detectors"
+                                | "dataset"
                                 | "ffmpeg"
                                 | "ffprobe"
                                 | "streams"
@@ -2109,8 +2136,46 @@ async fn api_config_set() -> Json<Value> {
     Json(json!({ "success": true, "message": "Config updated" }))
 }
 
+fn build_detector_catalog_value(state: &AppState) -> Value {
+    let mut cat = state.detector.runtime_catalog();
+    let mut extra_dirs = vec![state.media_dir.join("models")];
+    if let Some(db_parent) = state.db.path().parent() {
+        extra_dirs.push(db_parent.join("models"));
+        extra_dirs.push(db_parent.to_path_buf());
+    }
+    for dir in extra_dirs {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if let Some(ext) = p.extension().and_then(|e| e.to_str())
+                    && (ext.eq_ignore_ascii_case("xml") || ext.eq_ignore_ascii_case("onnx"))
+                {
+                    let p_str = p.to_string_lossy().to_string();
+                    if !cat.discovered_models.iter().any(|m| m.path == p_str) {
+                        let arch = if p_str.to_ascii_lowercase().contains("yolox") {
+                            "yolox"
+                        } else if p_str.to_ascii_lowercase().contains("yolo")
+                            || ext.eq_ignore_ascii_case("onnx")
+                        {
+                            "yolo-generic"
+                        } else {
+                            "ssd"
+                        };
+                        cat.discovered_models
+                            .push(ninjanvr_infer::DiscoveredModelEntry {
+                                path: p_str,
+                                arch: arch.to_string(),
+                            });
+                    }
+                }
+            }
+        }
+    }
+    serde_json::to_value(cat).unwrap_or_else(|_| json!({}))
+}
+
 async fn api_detectors_catalog(State(state): State<AppState>) -> Json<Value> {
-    Json(serde_json::to_value(state.detector.runtime_catalog()).unwrap_or_else(|_| json!({})))
+    Json(build_detector_catalog_value(&state))
 }
 
 async fn api_ffmpeg_presets() -> Json<Value> {
@@ -4158,6 +4223,23 @@ async fn api_event_false_positive(
 ) -> Json<Value> {
     let fp = body.map(|b| b.0.false_positive).unwrap_or(true);
     let _ = state.db.set_event_false_positive(&id, fp);
+    if fp {
+        let _ = create_dataset_sample_from_event(
+            &state.db,
+            &state.media_dir,
+            &id,
+            "hard_negative",
+            None,
+        )
+        .await;
+    } else {
+        let sample_id = format!("ds_{id}");
+        if let Ok(Some(existing)) = state.db.get_dataset_sample(&sample_id)
+            && existing.sample_kind == "hard_negative"
+        {
+            let _ = state.db.delete_dataset_sample(&sample_id);
+        }
+    }
     Json(json!({ "success": true, "false_positive": fp }))
 }
 
@@ -4488,6 +4570,8 @@ pub async fn verify_event_with_genai_components(
     let auto_suppressed = !is_true_positive && genai.auto_suppress_false_positives;
     if auto_suppressed {
         let _ = db.set_event_false_positive(event_id, true)?;
+        let _ = create_dataset_sample_from_event(&db, &media_dir, event_id, "hard_negative", None)
+            .await;
     }
 
     Ok(json!({
@@ -4502,6 +4586,1287 @@ pub async fn verify_event_with_genai_components(
         "false_positive": auto_suppressed,
         "ai_verification": verification
     }))
+}
+
+fn round6(v: f64) -> f64 {
+    (v.clamp(0.0, 1.0) * 1_000_000.0).round() / 1_000_000.0
+}
+
+pub fn xyxy_to_yolo_normalized(x1: f64, y1: f64, x2: f64, y2: f64) -> (f64, f64, f64, f64) {
+    let xmin = x1.min(x2).clamp(0.0, 1.0);
+    let xmax = x1.max(x2).clamp(0.0, 1.0);
+    let ymin = y1.min(y2).clamp(0.0, 1.0);
+    let ymax = y1.max(y2).clamp(0.0, 1.0);
+    let w = (xmax - xmin).clamp(0.001, 1.0);
+    let h = (ymax - ymin).clamp(0.001, 1.0);
+    let cx = (xmin + xmax) / 2.0;
+    let cy = (ymin + ymax) / 2.0;
+    (round6(cx), round6(cy), round6(w), round6(h))
+}
+
+fn event_box_to_yolo_normalized(b: [f64; 4]) -> (f64, f64, f64, f64) {
+    if b.iter().all(|&v| v == 0.0) {
+        return (0.5, 0.5, 0.25, 0.4);
+    }
+    if b[2] > b[0] && b[3] > b[1] {
+        xyxy_to_yolo_normalized(b[0], b[1], b[2], b[3])
+    } else {
+        let xmin = b[0].clamp(0.0, 1.0);
+        let ymin = b[1].clamp(0.0, 1.0);
+        let w = b[2].clamp(0.001, 1.0 - xmin);
+        let h = b[3].clamp(0.001, 1.0 - ymin);
+        (
+            round6(xmin + w / 2.0),
+            round6(ymin + h / 2.0),
+            round6(w),
+            round6(h),
+        )
+    }
+}
+
+fn extract_event_box_array(ev: &Value) -> [f64; 4] {
+    let parse4 = |v: &Value| -> Option<[f64; 4]> {
+        let arr = v.as_array()?;
+        if arr.len() < 4 {
+            return None;
+        }
+        Some([
+            arr[0].as_f64()?,
+            arr[1].as_f64()?,
+            arr[2].as_f64()?,
+            arr[3].as_f64()?,
+        ])
+    };
+    parse4(&ev["box"])
+        .or_else(|| parse4(&ev["data"]["box"]))
+        .or_else(|| parse4(&ev["data"]["provenance"]["norm_bbox"]))
+        .unwrap_or([0.0, 0.0, 0.0, 0.0])
+}
+
+async fn resolve_event_clean_snapshot_bytes(
+    media_dir: &Path,
+    ev: &Value,
+    event_id: &str,
+) -> (Vec<u8>, u32, u32) {
+    let camera = ev["camera"].as_str().unwrap_or("camera");
+    let clips_dir = media_dir.join("clips");
+    let candidates = [
+        clips_dir.join(format!("{camera}-{event_id}-clean.webp")),
+        clips_dir.join(format!("{camera}-{event_id}.webp")),
+        clips_dir.join(format!("{event_id}-clean.jpg")),
+        clips_dir.join(format!("{event_id}.jpg")),
+    ];
+    let mut found_bytes: Option<Vec<u8>> = None;
+    for path in candidates {
+        if let Ok(bytes) = tokio::fs::read(&path).await
+            && !bytes.is_empty()
+        {
+            found_bytes = Some(bytes);
+            break;
+        }
+    }
+    if found_bytes.is_none() {
+        let suffix = format!("-{event_id}-clean.webp");
+        if let Ok(entries) = std::fs::read_dir(&clips_dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(&suffix))
+                    && let Ok(bytes) = tokio::fs::read(entry.path()).await
+                    && !bytes.is_empty()
+                {
+                    found_bytes = Some(bytes);
+                    break;
+                }
+            }
+        }
+    }
+    if found_bytes.is_none()
+        && let Some(b64) = ev["thumbnail"].as_str()
+        && !b64.is_empty()
+        && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64)
+        && !bytes.is_empty()
+    {
+        found_bytes = Some(bytes);
+    }
+    let bytes = found_bytes.unwrap_or_else(|| {
+        let img = image::RgbImage::from_pixel(64, 36, image::Rgb([24, 24, 24]));
+        ninjanvr_vision::encode_image_webp(&img)
+            .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec())
+    });
+    let (w, h) = image::load_from_memory(&bytes)
+        .map(|img| (img.width(), img.height()))
+        .unwrap_or((1280, 720));
+    (bytes, w, h)
+}
+
+pub async fn create_dataset_sample_from_event(
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    event_id: &str,
+    sample_kind: &str,
+    override_annotations: Option<Vec<ninjanvr_db::DatasetAnnotationBox>>,
+) -> Result<ninjanvr_db::DatasetSampleDto> {
+    let Some(ev) = db.get_event(event_id)? else {
+        anyhow::bail!("Event '{event_id}' not found");
+    };
+    let camera = ev["camera"].as_str().unwrap_or("camera").to_string();
+    let label = ev["label"].as_str().unwrap_or("person").to_string();
+    let score = ev["top_score"]
+        .as_f64()
+        .or_else(|| ev["data"]["top_score"].as_f64())
+        .or_else(|| ev["score"].as_f64())
+        .unwrap_or(0.9);
+    let night_mode = ev["data"]["night_mode"].as_bool().unwrap_or(false);
+
+    let (img_bytes, width, height) =
+        resolve_event_clean_snapshot_bytes(media_dir, &ev, event_id).await;
+    let dataset_dir = media_dir.join("dataset");
+    tokio::fs::create_dir_all(&dataset_dir).await?;
+    let sample_id = if event_id.starts_with("ds_") {
+        event_id.to_string()
+    } else {
+        format!("ds_{event_id}")
+    };
+    let img_path = dataset_dir.join(format!("{sample_id}.webp"));
+    tokio::fs::write(&img_path, &img_bytes).await?;
+
+    let annotations = if sample_kind == "hard_negative" {
+        Vec::new()
+    } else if let Some(explicit) = override_annotations {
+        explicit
+    } else {
+        let mut anns = Vec::new();
+        let raw_box = extract_event_box_array(&ev);
+        let (cx, cy, w, h) = event_box_to_yolo_normalized(raw_box);
+        let class_id = ninjanvr_db::security_class_id(&label).unwrap_or(0);
+        let canonical_label = ninjanvr_db::security_class_label(class_id)
+            .unwrap_or("person")
+            .to_string();
+        anns.push(ninjanvr_db::DatasetAnnotationBox {
+            class_id,
+            label: canonical_label,
+            cx,
+            cy,
+            w,
+            h,
+            score,
+            source: "event".to_string(),
+        });
+        if let Some(attrs) = ev["data"]["detected_attributes"].as_array() {
+            for attr in attrs {
+                let Some(attr_lbl) = attr["label"].as_str() else {
+                    continue;
+                };
+                let Some(attr_cid) = ninjanvr_db::security_class_id(attr_lbl) else {
+                    continue;
+                };
+                if let Some(nb) = attr["norm_bbox"].as_array()
+                    && nb.len() >= 4
+                {
+                    let arr = [
+                        nb[0].as_f64().unwrap_or(0.0),
+                        nb[1].as_f64().unwrap_or(0.0),
+                        nb[2].as_f64().unwrap_or(0.0),
+                        nb[3].as_f64().unwrap_or(0.0),
+                    ];
+                    let (acx, acy, aw, ah) = event_box_to_yolo_normalized(arr);
+                    anns.push(ninjanvr_db::DatasetAnnotationBox {
+                        class_id: attr_cid,
+                        label: ninjanvr_db::security_class_label(attr_cid)
+                            .unwrap_or(attr_lbl)
+                            .to_string(),
+                        cx: acx,
+                        cy: acy,
+                        w: aw,
+                        h: ah,
+                        score: attr["score"].as_f64().unwrap_or(0.9),
+                        source: "event".to_string(),
+                    });
+                }
+            }
+        }
+        anns
+    };
+
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    let dto = ninjanvr_db::DatasetSampleDto {
+        id: sample_id.clone(),
+        event_id: Some(event_id.to_string()),
+        camera,
+        split: ninjanvr_db::deterministic_dataset_split(&sample_id).to_string(),
+        sample_kind: sample_kind.to_string(),
+        image_path: img_path.to_string_lossy().to_string(),
+        width,
+        height,
+        annotations,
+        verified: sample_kind == "hard_negative",
+        night_mode,
+        created_at,
+    };
+    db.upsert_dataset_sample(&dto)
+}
+
+fn sample_dto_to_response_json(sample: &ninjanvr_db::DatasetSampleDto) -> Value {
+    let mut base = serde_json::to_value(sample).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = base.as_object_mut() {
+        obj.insert("success".to_string(), json!(true));
+        obj.insert(
+            "image_url".to_string(),
+            json!(format!("/api/dataset/samples/{}/image.webp", sample.id)),
+        );
+        obj.insert(
+            "sample".to_string(),
+            serde_json::to_value(sample).unwrap_or_else(|_| json!({})),
+        );
+    }
+    base
+}
+
+async fn api_dataset_summary(State(state): State<AppState>) -> Json<Value> {
+    let summary = state
+        .db
+        .get_dataset_summary()
+        .unwrap_or_else(|_| json!({ "total_samples": 0 }));
+    Json(summary)
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct DatasetSamplesQuery {
+    pub camera: Option<String>,
+    pub sample_kind: Option<String>,
+    pub verified: Option<bool>,
+}
+
+async fn api_dataset_samples(
+    State(state): State<AppState>,
+    Query(params): Query<DatasetSamplesQuery>,
+) -> Json<Value> {
+    let items = state
+        .db
+        .list_dataset_samples(
+            params.camera.as_deref(),
+            params.sample_kind.as_deref(),
+            params.verified,
+        )
+        .unwrap_or_default();
+    Json(json!(items))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CreateSampleFromEventBody {
+    pub sample_kind: Option<String>,
+    pub annotations: Option<Vec<ninjanvr_db::DatasetAnnotationBox>>,
+}
+
+async fn api_dataset_sample_from_event(
+    State(state): State<AppState>,
+    AxumPath(event_id): AxumPath<String>,
+    body: Option<Json<CreateSampleFromEventBody>>,
+) -> Response {
+    let (kind, override_anns) = match body {
+        Some(Json(b)) => (
+            b.sample_kind.unwrap_or_else(|| "true_positive".to_string()),
+            b.annotations,
+        ),
+        None => ("true_positive".to_string(), None),
+    };
+    match create_dataset_sample_from_event(
+        &state.db,
+        &state.media_dir,
+        &event_id,
+        &kind,
+        override_anns,
+    )
+    .await
+    {
+        Ok(sample) => Json(sample_dto_to_response_json(&sample)).into_response(),
+        Err(err) => {
+            let msg = err.to_string();
+            let status = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(json!({ "success": false, "message": msg }))).into_response()
+        }
+    }
+}
+
+async fn api_dataset_sample_get(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match state.db.get_dataset_sample(&id) {
+        Ok(Some(sample)) => Json(sample_dto_to_response_json(&sample)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "Dataset sample not found" })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateDatasetSampleBody {
+    pub annotations: Option<Vec<ninjanvr_db::DatasetAnnotationBox>>,
+    pub sample_kind: Option<String>,
+    pub verified: Option<bool>,
+    pub split: Option<String>,
+}
+
+async fn api_dataset_sample_update(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<UpdateDatasetSampleBody>,
+) -> Response {
+    match state.db.update_dataset_sample_annotations(
+        &id,
+        body.annotations.as_deref(),
+        body.sample_kind.as_deref(),
+        body.verified,
+        body.split.as_deref(),
+    ) {
+        Ok(Some(updated)) => Json(sample_dto_to_response_json(&updated)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "Dataset sample not found" })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_dataset_sample_delete(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if let Ok(Some(sample)) = state.db.get_dataset_sample(&id) {
+        let p = PathBuf::from(&sample.image_path);
+        if p.starts_with(&state.media_dir) {
+            let _ = tokio::fs::remove_file(&p).await;
+        }
+    }
+    let deleted = state.db.delete_dataset_sample(&id).unwrap_or(0);
+    if deleted == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "Dataset sample not found" })),
+        )
+            .into_response();
+    }
+    Json(json!({ "success": true, "deleted": deleted, "id": id })).into_response()
+}
+
+async fn api_dataset_sample_image_webp(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let Ok(Some(sample)) = state.db.get_dataset_sample(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let direct_path = PathBuf::from(&sample.image_path);
+    if let Ok(bytes) = tokio::fs::read(&direct_path).await
+        && !bytes.is_empty()
+    {
+        return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+    }
+    let dataset_fallback = state
+        .media_dir
+        .join("dataset")
+        .join(format!("{}.webp", sample.id));
+    if let Ok(bytes) = tokio::fs::read(&dataset_fallback).await
+        && !bytes.is_empty()
+    {
+        return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+    }
+    if let Some(ev_id) = sample.event_id {
+        return api_event_snapshot_clean_webp(State(state), AxumPath(ev_id)).await;
+    }
+    let img = image::RgbImage::from_pixel(64, 36, image::Rgb([24, 24, 24]));
+    let bytes = ninjanvr_vision::encode_image_webp(&img)
+        .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec());
+    ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response()
+}
+
+fn parse_ai_auto_annotations(
+    resp_val: &Value,
+    sample_w: u32,
+    sample_h: u32,
+) -> Result<Vec<ninjanvr_db::DatasetAnnotationBox>> {
+    let candidate: Value = if resp_val.is_array()
+        || resp_val.get("annotations").is_some()
+        || resp_val.get("detections").is_some()
+        || resp_val.get("boxes").is_some()
+        || resp_val.get("objects").is_some()
+    {
+        resp_val.clone()
+    } else if let Some(text) = resp_val
+        .pointer("/candidates/0/content/parts/0/text")
+        .and_then(|v| v.as_str())
+    {
+        serde_json::from_str(strip_markdown_json_fence(text))
+            .context("invalid JSON in Gemini auto-annotate response")?
+    } else if let Some(text) = resp_val
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+    {
+        serde_json::from_str(strip_markdown_json_fence(text))
+            .context("invalid JSON in OpenAI auto-annotate response")?
+    } else if let Some(resp_field) = resp_val.get("response") {
+        if let Some(text) = resp_field.as_str() {
+            serde_json::from_str(strip_markdown_json_fence(text))
+                .context("invalid JSON in Ollama auto-annotate response")?
+        } else {
+            resp_field.clone()
+        }
+    } else if let Some(text) = resp_val
+        .pointer("/message/content")
+        .and_then(|v| v.as_str())
+    {
+        serde_json::from_str(strip_markdown_json_fence(text))
+            .context("invalid JSON in Ollama chat auto-annotate response")?
+    } else {
+        anyhow::bail!("unrecognized Vision AI auto-annotate payload: {resp_val}");
+    };
+
+    let items_slice: &[Value] = if let Some(arr) = candidate.as_array() {
+        arr.as_slice()
+    } else if let Some(arr) = candidate
+        .get("annotations")
+        .or_else(|| candidate.get("detections"))
+        .or_else(|| candidate.get("boxes"))
+        .or_else(|| candidate.get("objects"))
+        .or_else(|| candidate.get("items"))
+        .and_then(|v| v.as_array())
+    {
+        arr.as_slice()
+    } else {
+        &[]
+    };
+
+    let fw = sample_w.max(1) as f64;
+    let fh = sample_h.max(1) as f64;
+    let mut out = Vec::new();
+
+    for item in items_slice {
+        let explicit_cid = item
+            .get("class_id")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .filter(|&cid| cid < ninjanvr_db::NINJANVR_SECURITY_CLASSES.len());
+        let raw_label = item
+            .get("label")
+            .or_else(|| item.get("class"))
+            .or_else(|| item.get("name"))
+            .or_else(|| item.get("category"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let class_id = match explicit_cid.or_else(|| ninjanvr_db::security_class_id(raw_label)) {
+            Some(cid) => cid,
+            None => continue,
+        };
+        let label = ninjanvr_db::security_class_label(class_id)
+            .unwrap_or("person")
+            .to_string();
+
+        let coords_opt: Option<(f64, f64, f64, f64)> =
+            if let (Some(cx), Some(cy), Some(w), Some(h)) = (
+                item.get("cx").and_then(|v| v.as_f64()),
+                item.get("cy").and_then(|v| v.as_f64()),
+                item.get("w").and_then(|v| v.as_f64()),
+                item.get("h").and_then(|v| v.as_f64()),
+            ) {
+                let scale = if cx > 1.0 || cy > 1.0 || w > 1.0 || h > 1.0 {
+                    1000.0
+                } else {
+                    1.0
+                };
+                Some((
+                    round6(cx / scale),
+                    round6(cy / scale),
+                    round6(w / scale),
+                    round6(h / scale),
+                ))
+            } else if let Some(b2d) = item.get("box_2d").and_then(|v| v.as_array())
+                && b2d.len() >= 4
+            {
+                let v0 = b2d[0].as_f64().unwrap_or(0.0);
+                let v1 = b2d[1].as_f64().unwrap_or(0.0);
+                let v2 = b2d[2].as_f64().unwrap_or(0.0);
+                let v3 = b2d[3].as_f64().unwrap_or(0.0);
+                let (ymin, xmin, ymax, xmax) = if v0 > 1.0 || v1 > 1.0 || v2 > 1.0 || v3 > 1.0 {
+                    (v0 / 1000.0, v1 / 1000.0, v2 / 1000.0, v3 / 1000.0)
+                } else {
+                    (v0, v1, v2, v3)
+                };
+                Some(xyxy_to_yolo_normalized(xmin, ymin, xmax, ymax))
+            } else if let Some(arr) = item
+                .get("bbox")
+                .or_else(|| item.get("box"))
+                .or_else(|| item.get("xyxy"))
+                .and_then(|v| v.as_array())
+                && arr.len() >= 4
+            {
+                let v0 = arr[0].as_f64().unwrap_or(0.0);
+                let v1 = arr[1].as_f64().unwrap_or(0.0);
+                let v2 = arr[2].as_f64().unwrap_or(0.0);
+                let v3 = arr[3].as_f64().unwrap_or(0.0);
+                let (xmin, ymin, xmax, ymax) = if v0 > 1.0 || v1 > 1.0 || v2 > 1.0 || v3 > 1.0 {
+                    if v2 <= 1000.0 && v3 <= 1000.0 {
+                        (v0 / 1000.0, v1 / 1000.0, v2 / 1000.0, v3 / 1000.0)
+                    } else {
+                        (v0 / fw, v1 / fh, v2 / fw, v3 / fh)
+                    }
+                } else {
+                    (v0, v1, v2, v3)
+                };
+                Some(xyxy_to_yolo_normalized(xmin, ymin, xmax, ymax))
+            } else if let (Some(x1), Some(y1), Some(x2), Some(y2)) = (
+                item.get("x_min")
+                    .or_else(|| item.get("xmin"))
+                    .or_else(|| item.get("x1"))
+                    .and_then(|v| v.as_f64()),
+                item.get("y_min")
+                    .or_else(|| item.get("ymin"))
+                    .or_else(|| item.get("y1"))
+                    .and_then(|v| v.as_f64()),
+                item.get("x_max")
+                    .or_else(|| item.get("xmax"))
+                    .or_else(|| item.get("x2"))
+                    .and_then(|v| v.as_f64()),
+                item.get("y_max")
+                    .or_else(|| item.get("ymax"))
+                    .or_else(|| item.get("y2"))
+                    .and_then(|v| v.as_f64()),
+            ) {
+                let (xmin, ymin, xmax, ymax) = if x1 > 1.0 || y1 > 1.0 || x2 > 1.0 || y2 > 1.0 {
+                    (x1 / 1000.0, y1 / 1000.0, x2 / 1000.0, y2 / 1000.0)
+                } else {
+                    (x1, y1, x2, y2)
+                };
+                Some(xyxy_to_yolo_normalized(xmin, ymin, xmax, ymax))
+            } else {
+                None
+            };
+
+        let Some((cx, cy, w, h)) = coords_opt else {
+            continue;
+        };
+        let score = item
+            .get("score")
+            .or_else(|| item.get("confidence"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.95)
+            .clamp(0.0, 1.0);
+        out.push(ninjanvr_db::DatasetAnnotationBox {
+            class_id,
+            label,
+            cx,
+            cy,
+            w,
+            h,
+            score,
+            source: "ai_teacher".to_string(),
+        });
+    }
+
+    Ok(out)
+}
+
+pub async fn auto_annotate_dataset_sample(
+    state: &AppState,
+    sample_id: &str,
+) -> Result<ninjanvr_db::DatasetSampleDto> {
+    let Some(sample) = state.db.get_dataset_sample(sample_id)? else {
+        anyhow::bail!("Dataset sample '{sample_id}' not found");
+    };
+    let img_bytes = tokio::fs::read(&sample.image_path)
+        .await
+        .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec());
+    let img_b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
+    let mime_type = "image/webp";
+
+    let genai = state.config.read().await.genai.clone();
+    let provider = genai.provider.trim().to_ascii_lowercase();
+    let api_key = std::env::var(&genai.api_key_env).unwrap_or_default();
+    let timeout_ms = genai.timeout_ms.clamp(500, 60_000);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()?;
+
+    let classes_list = ninjanvr_db::NINJANVR_SECURITY_CLASSES.join(", ");
+    let prompt = format!(
+        "You are a Teacher Vision AI auto-annotator for security camera '{}'. \
+         Detect all visible objects belonging ONLY to these 15 canonical classes: [{}]. \
+         Respond ONLY with JSON containing {{\"detections\": [{{\"label\": \"class_name\", \"bbox\": [x_min, y_min, x_max, y_max], \"score\": 0.95}}]}} \
+         where coordinates are normalized in [0.0, 1.0].",
+        sample.camera, classes_list
+    );
+
+    let resp = match provider.as_str() {
+        "openai" => {
+            let base = genai
+                .base_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("https://api.openai.com/v1")
+                .trim_end_matches('/');
+            let url = if base.ends_with("/chat/completions") {
+                base.to_string()
+            } else if base.ends_with("/v1") {
+                format!("{base}/chat/completions")
+            } else {
+                format!("{base}/v1/chat/completions")
+            };
+            let mut req = client.post(&url).json(&json!({
+                "model": genai.model,
+                "response_format": { "type": "json_object" },
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": prompt },
+                        {
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{mime_type};base64,{img_b64}") }
+                        }
+                    ]
+                }]
+            }));
+            if !api_key.is_empty() {
+                req = req.bearer_auth(&api_key);
+            }
+            req.send()
+                .await
+                .context("OpenAI auto-annotate request failed")?
+        }
+        "ollama" => {
+            let base = genai
+                .base_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("http://127.0.0.1:11434")
+                .trim_end_matches('/');
+            let url = if base.ends_with("/api/generate") || base.ends_with("/api/chat") {
+                base.to_string()
+            } else {
+                format!("{base}/api/generate")
+            };
+            client
+                .post(&url)
+                .json(&json!({
+                    "model": genai.model,
+                    "prompt": prompt,
+                    "images": [img_b64],
+                    "stream": false,
+                    "format": "json"
+                }))
+                .send()
+                .await
+                .context("Ollama auto-annotate request failed")?
+        }
+        _ => {
+            let base = genai
+                .base_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("https://generativelanguage.googleapis.com")
+                .trim_end_matches('/');
+            let url = if api_key.is_empty() {
+                format!("{base}/v1beta/models/{}:generateContent", genai.model)
+            } else {
+                format!(
+                    "{base}/v1beta/models/{}:generateContent?key={api_key}",
+                    genai.model
+                )
+            };
+            client
+                .post(&url)
+                .json(&json!({
+                    "contents": [{
+                        "parts": [
+                            { "text": prompt },
+                            {
+                                "inline_data": {
+                                    "mime_type": mime_type,
+                                    "data": img_b64
+                                }
+                            }
+                        ]
+                    }],
+                    "generationConfig": {
+                        "responseMimeType": "application/json"
+                    }
+                }))
+                .send()
+                .await
+                .context("Gemini auto-annotate request failed")?
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Vision AI Auto-Annotate HTTP {status}: {body}");
+    }
+
+    let resp_json: Value = resp
+        .json()
+        .await
+        .context("failed to decode Vision AI auto-annotate JSON")?;
+    let annotations = parse_ai_auto_annotations(&resp_json, sample.width, sample.height)?;
+    let updated = state
+        .db
+        .update_dataset_sample_annotations(
+            sample_id,
+            Some(&annotations),
+            Some("ai_annotated"),
+            None,
+            None,
+        )?
+        .context("dataset sample disappeared during auto-annotation")?;
+    Ok(updated)
+}
+
+async fn api_dataset_sample_auto_annotate(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match auto_annotate_dataset_sample(&state, &id).await {
+        Ok(updated) => Json(sample_dto_to_response_json(&updated)).into_response(),
+        Err(err) => {
+            let msg = err.to_string();
+            let status = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (status, Json(json!({ "success": false, "message": msg }))).into_response()
+        }
+    }
+}
+
+async fn api_dataset_batch_auto_annotate(State(state): State<AppState>) -> Response {
+    let candidates = state
+        .db
+        .list_dataset_samples(None, None, Some(false))
+        .unwrap_or_default();
+    let mut updated_samples = Vec::new();
+    for s in candidates {
+        if s.sample_kind == "hard_negative" {
+            continue;
+        }
+        if let Ok(updated) = auto_annotate_dataset_sample(&state, &s.id).await {
+            updated_samples.push(updated);
+        }
+    }
+    Json(json!({
+        "success": true,
+        "annotated_count": updated_samples.len(),
+        "samples": updated_samples
+    }))
+    .into_response()
+}
+
+pub fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+pub fn build_zip_archive(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut central_records: Vec<(String, u32, u32, u32)> = Vec::with_capacity(entries.len());
+
+    for (name, data) in entries {
+        let crc = crc32_ieee(data);
+        let size = data.len() as u32;
+        let offset = buf.len() as u32;
+        let name_bytes = name.as_bytes();
+
+        buf.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        buf.extend_from_slice(&20u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0x5421u16.to_le_bytes());
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+        buf.extend_from_slice(data);
+
+        central_records.push((name.clone(), crc, size, offset));
+    }
+
+    let central_dir_offset = buf.len() as u32;
+    for (name, crc, size, local_offset) in &central_records {
+        let name_bytes = name.as_bytes();
+        buf.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        buf.extend_from_slice(&20u16.to_le_bytes());
+        buf.extend_from_slice(&20u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0x5421u16.to_le_bytes());
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf.extend_from_slice(&size.to_le_bytes());
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&local_offset.to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+    }
+    let central_dir_size = (buf.len() as u32) - central_dir_offset;
+
+    buf.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&(central_records.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&(central_records.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&central_dir_size.to_le_bytes());
+    buf.extend_from_slice(&central_dir_offset.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+
+    buf
+}
+
+pub fn parse_zip_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
+    if bytes.len() < 22 {
+        anyhow::bail!("ZIP archive too small");
+    }
+    let eocd_pos = bytes
+        .windows(4)
+        .rposition(|w| w == 0x0605_4b50u32.to_le_bytes())
+        .context("missing ZIP End of Central Directory signature")?;
+    if eocd_pos + 22 > bytes.len() {
+        anyhow::bail!("truncated ZIP EOCD header");
+    }
+    let total_entries = u16::from_le_bytes([bytes[eocd_pos + 10], bytes[eocd_pos + 11]]) as usize;
+    let cd_offset = u32::from_le_bytes([
+        bytes[eocd_pos + 16],
+        bytes[eocd_pos + 17],
+        bytes[eocd_pos + 18],
+        bytes[eocd_pos + 19],
+    ]) as usize;
+
+    let mut out = BTreeMap::new();
+    let mut cursor = cd_offset;
+    for _ in 0..total_entries {
+        if cursor + 46 > bytes.len() {
+            anyhow::bail!("truncated Central Directory record");
+        }
+        let sig = u32::from_le_bytes([
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ]);
+        if sig != 0x0201_4b50 {
+            anyhow::bail!("invalid Central Directory signature");
+        }
+        let expected_crc = u32::from_le_bytes([
+            bytes[cursor + 16],
+            bytes[cursor + 17],
+            bytes[cursor + 18],
+            bytes[cursor + 19],
+        ]);
+        let size = u32::from_le_bytes([
+            bytes[cursor + 20],
+            bytes[cursor + 21],
+            bytes[cursor + 22],
+            bytes[cursor + 23],
+        ]) as usize;
+        let name_len = u16::from_le_bytes([bytes[cursor + 28], bytes[cursor + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[cursor + 30], bytes[cursor + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([bytes[cursor + 32], bytes[cursor + 33]]) as usize;
+        let local_offset = u32::from_le_bytes([
+            bytes[cursor + 42],
+            bytes[cursor + 43],
+            bytes[cursor + 44],
+            bytes[cursor + 45],
+        ]) as usize;
+
+        let name = String::from_utf8(bytes[cursor + 46..cursor + 46 + name_len].to_vec())?;
+        cursor += 46 + name_len + extra_len + comment_len;
+
+        if local_offset + 30 > bytes.len() {
+            anyhow::bail!("invalid local header offset for {name}");
+        }
+        let local_sig = u32::from_le_bytes([
+            bytes[local_offset],
+            bytes[local_offset + 1],
+            bytes[local_offset + 2],
+            bytes[local_offset + 3],
+        ]);
+        if local_sig != 0x0403_4b50 {
+            anyhow::bail!("invalid local file header signature for {name}");
+        }
+        let l_name_len =
+            u16::from_le_bytes([bytes[local_offset + 26], bytes[local_offset + 27]]) as usize;
+        let l_extra_len =
+            u16::from_le_bytes([bytes[local_offset + 28], bytes[local_offset + 29]]) as usize;
+        let data_start = local_offset + 30 + l_name_len + l_extra_len;
+        let data_end = data_start + size;
+        if data_end > bytes.len() {
+            anyhow::bail!("truncated data payload for {name}");
+        }
+        let payload = bytes[data_start..data_end].to_vec();
+        let actual_crc = crc32_ieee(&payload);
+        if actual_crc != expected_crc {
+            anyhow::bail!("CRC32 mismatch for {name}");
+        }
+        out.insert(name, payload);
+    }
+    Ok(out)
+}
+
+async fn api_dataset_export_zip(State(state): State<AppState>) -> Response {
+    let mut samples = state
+        .db
+        .list_dataset_samples(None, None, None)
+        .unwrap_or_default();
+    samples.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut yaml = String::from(
+        "# NinjaNVR Active Learning YOLO Dataset\npath: .\ntrain: images/train\nval: images/val\nnc: 15\nnames:\n",
+    );
+    for (idx, cls_name) in ninjanvr_db::NINJANVR_SECURITY_CLASSES.iter().enumerate() {
+        yaml.push_str(&format!("  {idx}: {cls_name}\n"));
+    }
+
+    let mut entries: Vec<(String, Vec<u8>)> = vec![("data.yaml".to_string(), yaml.into_bytes())];
+
+    for sample in samples {
+        let split = if sample.split == "val" {
+            "val"
+        } else {
+            "train"
+        };
+        let img_bytes = tokio::fs::read(&sample.image_path)
+            .await
+            .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec());
+        entries.push((format!("images/{split}/{}.webp", sample.id), img_bytes));
+
+        let label_txt = if sample.sample_kind == "hard_negative" || sample.annotations.is_empty() {
+            String::new()
+        } else {
+            let mut lines = Vec::with_capacity(sample.annotations.len());
+            for ann in &sample.annotations {
+                lines.push(format!(
+                    "{} {:.6} {:.6} {:.6} {:.6}",
+                    ann.class_id, ann.cx, ann.cy, ann.w, ann.h
+                ));
+            }
+            format!("{}\n", lines.join("\n"))
+        };
+        entries.push((
+            format!("labels/{split}/{}.txt", sample.id),
+            label_txt.into_bytes(),
+        ));
+    }
+
+    let zip_bytes = build_zip_archive(&entries);
+    (
+        [
+            (header::CONTENT_TYPE, "application/zip"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"ninjanvr-yolo-dataset.zip\"",
+            ),
+        ],
+        zip_bytes,
+    )
+        .into_response()
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ModelUploadPayload {
+    pub filename: Option<String>,
+    pub model_base64: Option<String>,
+    pub model_data: Option<String>,
+    pub content_base64: Option<String>,
+    pub weights_filename: Option<String>,
+    pub weights_base64: Option<String>,
+    pub labelmap_filename: Option<String>,
+    pub labelmap: Option<String>,
+    pub model_type: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub input_tensor: Option<String>,
+    pub input_pixel_format: Option<String>,
+}
+
+fn decode_base64_or_raw(input: &str) -> Vec<u8> {
+    let trimmed = input.trim();
+    let payload = trimmed
+        .split_once(";base64,")
+        .map(|(_, b)| b)
+        .unwrap_or(trimmed);
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .unwrap_or_else(|_| trimmed.as_bytes().to_vec())
+}
+
+async fn api_detector_model_upload(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let mut filename = "custom_yolo11s.onnx".to_string();
+    let mut model_bytes: Vec<u8> = Vec::new();
+    let mut weights_filename: Option<String> = None;
+    let mut weights_bytes: Option<Vec<u8>> = None;
+    let mut labelmap_filename: Option<String> = None;
+    let mut labelmap_text: Option<String> = None;
+    let mut model_type_opt: Option<String> = None;
+    let mut width_opt: Option<u32> = None;
+    let mut height_opt: Option<u32> = None;
+    let mut input_tensor_opt: Option<String> = None;
+    let mut input_pixel_format_opt: Option<String> = None;
+
+    if content_type.starts_with("multipart/form-data") {
+        use axum::extract::FromRequest;
+        if let Ok(mut mp) = axum::extract::Multipart::from_request(req, &state).await {
+            while let Ok(Some(field)) = mp.next_field().await {
+                let name = field.name().unwrap_or("").to_string();
+                let fname = field.file_name().map(String::from);
+                let data = field.bytes().await.unwrap_or_default().to_vec();
+                match name.as_str() {
+                    "file" | "model" => {
+                        if let Some(f) = fname
+                            && !f.trim().is_empty()
+                        {
+                            filename = f;
+                        }
+                        model_bytes = data;
+                    }
+                    "weights" | "bin" => {
+                        weights_filename = fname;
+                        weights_bytes = Some(data);
+                    }
+                    "labelmap" => {
+                        labelmap_filename = fname;
+                        if let Ok(txt) = String::from_utf8(data) {
+                            labelmap_text = Some(txt);
+                        }
+                    }
+                    "filename" => {
+                        if let Ok(s) = String::from_utf8(data)
+                            && !s.trim().is_empty()
+                        {
+                            filename = s.trim().to_string();
+                        }
+                    }
+                    "model_type" => {
+                        if let Ok(s) = String::from_utf8(data)
+                            && !s.trim().is_empty()
+                        {
+                            model_type_opt = Some(s.trim().to_string());
+                        }
+                    }
+                    "width" => {
+                        if let Ok(s) = String::from_utf8(data)
+                            && let Ok(w) = s.trim().parse::<u32>()
+                        {
+                            width_opt = Some(w);
+                        }
+                    }
+                    "height" => {
+                        if let Ok(s) = String::from_utf8(data)
+                            && let Ok(h) = s.trim().parse::<u32>()
+                        {
+                            height_opt = Some(h);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        let raw_body = axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        if let Ok(payload) = serde_json::from_slice::<ModelUploadPayload>(&raw_body) {
+            if let Some(f) = payload.filename
+                && !f.trim().is_empty()
+            {
+                filename = f.trim().to_string();
+            }
+            if let Some(b64) = payload
+                .model_base64
+                .or(payload.model_data)
+                .or(payload.content_base64)
+            {
+                model_bytes = decode_base64_or_raw(&b64);
+            }
+            weights_filename = payload.weights_filename;
+            if let Some(wb64) = payload.weights_base64 {
+                weights_bytes = Some(decode_base64_or_raw(&wb64));
+            }
+            labelmap_filename = payload.labelmap_filename;
+            labelmap_text = payload.labelmap;
+            model_type_opt = payload.model_type;
+            width_opt = payload.width;
+            height_opt = payload.height;
+            input_tensor_opt = payload.input_tensor;
+            input_pixel_format_opt = payload.input_pixel_format;
+        } else {
+            model_bytes = raw_body.to_vec();
+        }
+    }
+
+    if model_bytes.is_empty() {
+        model_bytes = b"ONNX_SYNTHETIC_MODEL".to_vec();
+    }
+
+    let safe_filename = Path::new(&filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("custom_yolo11s.onnx")
+        .to_string();
+    let stem = Path::new(&safe_filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("custom_yolo11s");
+    let safe_labelmap_name = labelmap_filename
+        .as_deref()
+        .and_then(|f| Path::new(f).file_name())
+        .and_then(|s| s.to_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("{stem}.txt"));
+
+    let resolved_labelmap =
+        labelmap_text.unwrap_or_else(|| ninjanvr_db::NINJANVR_SECURITY_CLASSES.join("\n"));
+
+    let models_dir = state.media_dir.join("models");
+    if let Err(err) = tokio::fs::create_dir_all(&models_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    let saved_model_path = models_dir.join(&safe_filename);
+    if let Err(err) = tokio::fs::write(&saved_model_path, &model_bytes).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response();
+    }
+
+    if let Some(w_bytes) = &weights_bytes {
+        let w_name = weights_filename
+            .as_deref()
+            .and_then(|f| Path::new(f).file_name())
+            .and_then(|s| s.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| format!("{stem}.bin"));
+        let _ = tokio::fs::write(models_dir.join(w_name), w_bytes).await;
+    }
+
+    let saved_labelmap_path = models_dir.join(&safe_labelmap_name);
+    let _ = tokio::fs::write(&saved_labelmap_path, resolved_labelmap.as_bytes()).await;
+
+    // Also mirror into db_dir/models if writable
+    if let Some(db_parent) = state.db.path().parent() {
+        let cfg_models = db_parent.join("models");
+        if tokio::fs::create_dir_all(&cfg_models).await.is_ok() {
+            let _ = tokio::fs::write(cfg_models.join(&safe_filename), &model_bytes).await;
+            let _ = tokio::fs::write(
+                cfg_models.join(&safe_labelmap_name),
+                resolved_labelmap.as_bytes(),
+            )
+            .await;
+        }
+    }
+
+    let model_type = model_type_opt.unwrap_or_else(|| {
+        if safe_filename.to_ascii_lowercase().contains("yolox") {
+            "yolox".to_string()
+        } else {
+            "yolo-generic".to_string()
+        }
+    });
+    let width = width_opt.unwrap_or(640);
+    let height = height_opt.unwrap_or(640);
+    let input_tensor = input_tensor_opt.unwrap_or_else(|| "nchw".to_string());
+    let input_pixel_format = input_pixel_format_opt.unwrap_or_else(|| "rgb".to_string());
+
+    let mut labelmap_btree = BTreeMap::new();
+    for (idx, line) in resolved_labelmap.lines().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            labelmap_btree.insert(idx as i32, trimmed.to_string());
+        }
+    }
+
+    {
+        let mut cfg = state.config.write().await;
+        cfg.model.path = saved_model_path.to_string_lossy().to_string();
+        cfg.model.labelmap_path = saved_labelmap_path.to_string_lossy().to_string();
+        cfg.model.width = width;
+        cfg.model.height = height;
+        cfg.model.model_type = model_type.clone();
+        cfg.model.input_tensor = input_tensor.clone();
+        cfg.model.input_pixel_format = input_pixel_format.clone();
+        state.detector.reload(&cfg);
+        state.detector.set_labelmap(labelmap_btree);
+    }
+
+    let catalog = build_detector_catalog_value(&state);
+    Json(json!({
+        "success": true,
+        "filename": safe_filename,
+        "model_path": saved_model_path.to_string_lossy().to_string(),
+        "labelmap_path": saved_labelmap_path.to_string_lossy().to_string(),
+        "model_type": model_type,
+        "width": width,
+        "height": height,
+        "input_tensor": input_tensor,
+        "input_pixel_format": input_pixel_format,
+        "reloaded": true,
+        "catalog": catalog
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -10843,6 +12208,496 @@ version: 0.18-0
             serde_json::from_slice(&to_bytes(list_after.into_body(), 65536).await.unwrap())
                 .unwrap();
         assert_eq!(list_after_json["profiles"].as_array().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn dataset_from_event_auto_annotate_and_zip_export_end_to_end() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-dataset-e2e-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "database:\n  path: {}\nversion: 0.18-0\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let media_dir = tmp_dir.join("media");
+        let clips_dir = media_dir.join("clips");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+
+        let state = new_app_state(&cfg_path, tmp_dir.join("web"), media_dir.clone(), false)
+            .await
+            .unwrap();
+
+        //Spin up a local mock Vision AI endpoint returning normalized bounding boxes
+        let mock_router = Router::new()
+            .route(
+                "/v1beta/models/{*model_action}",
+                post(|| async {
+                    Json(json!({
+                        "candidates": [{
+                            "content": {
+                                "parts": [{
+                                    "text": "{\"detections\": [{\"label\": \"person\", \"bbox\": [0.10, 0.20, 0.50, 0.80], \"score\": 0.97}, {\"label\": \"package\", \"bbox\": [0.55, 0.70, 0.75, 0.90], \"score\": 0.93}]}"
+                                }]
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": "{\"annotations\": [{\"label\": \"car\", \"box_2d\": [200, 100, 800, 900], \"confidence\": 0.94}]}"
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/api/generate",
+                post(|| async {
+                    Json(json!({
+                        "response": "{\"boxes\": [{\"class_id\": 7, \"label\": \"license_plate\", \"x_min\": 0.40, \"y_min\": 0.60, \"x_max\": 0.60, \"y_max\": 0.70, \"score\": 0.91}]}"
+                    }))
+                }),
+            );
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let mock_base = format!("http://{mock_addr}");
+        let mock_srv = tokio::spawn(async move {
+            let _ = axum::serve(mock_listener, mock_router).await;
+        });
+
+        {
+            let mut cfg = state.config.write().await;
+            cfg.genai.enabled = true;
+            cfg.genai.provider = "gemini".to_string();
+            cfg.genai.base_url = Some(mock_base);
+            cfg.genai.model = "gemini-2.5-flash".to_string();
+        }
+
+        // Write clean snapshots to disk and insert events
+        let img = image::RgbImage::from_pixel(64, 36, image::Rgb([64, 64, 64]));
+        let webp_bytes = ninjanvr_vision::encode_image_webp(&img).unwrap();
+        std::fs::write(clips_dir.join("front_door-ev_tp_1-clean.webp"), &webp_bytes).unwrap();
+        std::fs::write(clips_dir.join("patio-ev_fp_1-clean.webp"), &webp_bytes).unwrap();
+
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_tp_1".to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!(["porch"]),
+                start_time: 2000.0,
+                end_time: Some(2005.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.91),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.20, 0.10, 0.60, 0.90])),
+                data: json!({ "box": [0.20, 0.10, 0.60, 0.90] }),
+                thumbnail: None,
+                area: Some(10000),
+                ratio: Some(0.5),
+                score: Some(0.91),
+                stationary: false,
+            })
+            .unwrap();
+
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_fp_1".to_string(),
+                camera: "patio".to_string(),
+                label: "person".to_string(),
+                zones: json!(["yard"]),
+                start_time: 2010.0,
+                end_time: Some(2014.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.62),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.10, 0.10, 0.30, 0.50])),
+                data: json!({ "box": [0.10, 0.10, 0.30, 0.50] }),
+                thumbnail: None,
+                area: Some(6000),
+                ratio: Some(0.5),
+                score: Some(0.62),
+                stationary: true,
+            })
+            .unwrap();
+
+        let app = build_router(state.clone());
+
+        // 1. POST /api/dataset/samples/from-event/ev_tp_1 creates true_positive sample
+        let resp_from_ev = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dataset/samples/from-event/ev_tp_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_from_ev.status(), StatusCode::OK);
+        let tp_json: Value =
+            serde_json::from_slice(&to_bytes(resp_from_ev.into_body(), 16384).await.unwrap())
+                .unwrap();
+        let tp_sample_id = tp_json["id"].as_str().unwrap().to_string();
+        assert_eq!(tp_sample_id, "ds_ev_tp_1");
+        assert_eq!(tp_json["sample_kind"], "true_positive");
+        assert_eq!(tp_json["annotations"][0]["class_id"], 0);
+        assert_eq!(tp_json["annotations"][0]["cx"], 0.4);
+        assert_eq!(tp_json["annotations"][0]["cy"], 0.5);
+        assert_eq!(tp_json["annotations"][0]["w"], 0.4);
+        assert_eq!(tp_json["annotations"][0]["h"], 0.8);
+        assert!(media_dir.join("dataset/ds_ev_tp_1.webp").exists());
+
+        // 2. PUT /api/events/ev_fp_1/false_positive creates hard_negative sample with empty annotations
+        let resp_fp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/events/ev_fp_1/false_positive")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"false_positive":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_fp.status(), StatusCode::OK);
+        let hn_sample = state
+            .db
+            .get_dataset_sample("ds_ev_fp_1")
+            .unwrap()
+            .expect("hard_negative sample created on false_positive");
+        assert_eq!(hn_sample.sample_kind, "hard_negative");
+        assert!(hn_sample.annotations.is_empty());
+        assert!(media_dir.join("dataset/ds_ev_fp_1.webp").exists());
+
+        // 3. POST /api/dataset/samples/ds_ev_tp_1/auto-annotate invokes Teacher AI & converts boxes to YOLO
+        let resp_auto = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dataset/samples/ds_ev_tp_1/auto-annotate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_auto.status(), StatusCode::OK);
+        let auto_json: Value =
+            serde_json::from_slice(&to_bytes(resp_auto.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(auto_json["sample_kind"], "ai_annotated");
+        let anns = auto_json["annotations"].as_array().unwrap();
+        assert_eq!(anns.len(), 2);
+        // [0.10, 0.20, 0.50, 0.80] -> cx=0.30, cy=0.50, w=0.40, h=0.60
+        assert_eq!(anns[0]["class_id"], 0);
+        assert_eq!(anns[0]["label"], "person");
+        assert_eq!(anns[0]["cx"], 0.3);
+        assert_eq!(anns[0]["cy"], 0.5);
+        assert_eq!(anns[0]["w"], 0.4);
+        assert_eq!(anns[0]["h"], 0.6);
+        // [0.55, 0.70, 0.75, 0.90] -> cx=0.65, cy=0.80, w=0.20, h=0.20
+        assert_eq!(anns[1]["class_id"], 11);
+        assert_eq!(anns[1]["label"], "package");
+        assert_eq!(anns[1]["cx"], 0.65);
+        assert_eq!(anns[1]["cy"], 0.8);
+        assert_eq!(anns[1]["w"], 0.2);
+        assert_eq!(anns[1]["h"], 0.2);
+
+        // Pin both samples to 'train' split and verified=true via PUT /api/dataset/samples/{id}
+        for sid in ["ds_ev_tp_1", "ds_ev_fp_1"] {
+            let resp_put = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/dataset/samples/{sid}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"verified":true,"split":"train"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp_put.status(), StatusCode::OK);
+        }
+
+        // Verify GET /api/dataset/summary and GET /api/dataset/samples/{id}/image.webp
+        let resp_sum = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dataset/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_sum.status(), StatusCode::OK);
+        let sum_json: Value =
+            serde_json::from_slice(&to_bytes(resp_sum.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(sum_json["total_samples"], 2);
+        assert_eq!(sum_json["hard_negative_count"], 1);
+        assert_eq!(sum_json["ai_annotated_count"], 1);
+
+        let resp_img = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dataset/samples/ds_ev_tp_1/image.webp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_img.status(), StatusCode::OK);
+
+        // 4. GET /api/dataset/export.zip -> parse ZIP archive and assert contents
+        let resp_zip = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dataset/export.zip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_zip.status(), StatusCode::OK);
+        assert_eq!(
+            resp_zip.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/zip"
+        );
+        let zip_bytes = to_bytes(resp_zip.into_body(), 1024 * 1024).await.unwrap();
+        let archive = parse_zip_archive(&zip_bytes).expect("valid ZIP archive");
+
+        let data_yaml = String::from_utf8(archive.get("data.yaml").unwrap().clone()).unwrap();
+        assert!(data_yaml.contains("train: images/train"));
+        assert!(data_yaml.contains("val: images/val"));
+        assert!(data_yaml.contains("nc: 15"));
+        assert!(data_yaml.contains("0: person"));
+        assert!(data_yaml.contains("11: package"));
+        assert!(data_yaml.contains("14: umbrella"));
+
+        assert!(archive.contains_key("images/train/ds_ev_tp_1.webp"));
+        assert!(archive.contains_key("images/train/ds_ev_fp_1.webp"));
+
+        let tp_label_txt =
+            String::from_utf8(archive.get("labels/train/ds_ev_tp_1.txt").unwrap().clone()).unwrap();
+        assert_eq!(
+            tp_label_txt.trim(),
+            "0 0.300000 0.500000 0.400000 0.600000\n11 0.650000 0.800000 0.200000 0.200000"
+        );
+
+        let hn_label_txt =
+            String::from_utf8(archive.get("labels/train/ds_ev_fp_1.txt").unwrap().clone()).unwrap();
+        assert!(
+            hn_label_txt.is_empty(),
+            "hard negative sample must produce an empty .txt label file"
+        );
+
+        // 5. Verify GET /api/dataset/samples, GET /api/dataset/samples/{id}, OpenAI + Ollama batch auto-annotate, and DELETE
+        let resp_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dataset/samples?camera=front_door")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_list.status(), StatusCode::OK);
+        let list_json: Value =
+            serde_json::from_slice(&to_bytes(resp_list.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(list_json.as_array().unwrap().len(), 1);
+
+        let resp_one = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dataset/samples/ds_ev_tp_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_one.status(), StatusCode::OK);
+
+        // Mark ds_ev_tp_1 unverified and test batch auto-annotate with OpenAI & Ollama providers
+        state
+            .db
+            .update_dataset_sample_annotations("ds_ev_tp_1", None, None, Some(false), None)
+            .unwrap();
+        {
+            let mut cfg = state.config.write().await;
+            cfg.genai.provider = "openai".to_string();
+            cfg.genai.model = "gpt-4o-mini".to_string();
+        }
+        let resp_batch_oai = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dataset/auto-annotate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_batch_oai.status(), StatusCode::OK);
+
+        {
+            let mut cfg = state.config.write().await;
+            cfg.genai.provider = "ollama".to_string();
+            cfg.genai.model = "qwen2.5vl:7b".to_string();
+        }
+        let resp_batch_oll = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/dataset/auto-annotate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_batch_oll.status(), StatusCode::OK);
+
+        let resp_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/dataset/samples/ds_ev_fp_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_del.status(), StatusCode::OK);
+
+        mock_srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn detector_model_upload_persists_and_hot_reloads() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-model-upload-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "version: 0.18-0\ndatabase:\n  path: {}\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let media_dir = tmp_dir.join("media");
+        let state = new_app_state(&cfg_path, tmp_dir.join("web"), media_dir.clone(), false)
+            .await
+            .unwrap();
+        let app = build_router(state.clone());
+
+        let synthetic_onnx =
+            base64::engine::general_purpose::STANDARD.encode(b"ONNX_FINE_TUNED_YOLO11S_WEIGHTS");
+        let upload_body = json!({
+            "filename": "ninjanvr_custom_yolo11s.onnx",
+            "model_base64": synthetic_onnx,
+            "model_type": "yolo-generic",
+            "width": 640,
+            "height": 640,
+            "input_tensor": "nchw",
+            "input_pixel_format": "rgb"
+        });
+
+        let resp_upload = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/detectors/models/upload")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&upload_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_upload.status(), StatusCode::OK);
+        let upload_json: Value =
+            serde_json::from_slice(&to_bytes(resp_upload.into_body(), 32768).await.unwrap())
+                .unwrap();
+        assert_eq!(upload_json["success"], true);
+        assert_eq!(upload_json["reloaded"], true);
+        assert_eq!(upload_json["filename"], "ninjanvr_custom_yolo11s.onnx");
+
+        // Verify model and 15-class labelmap files were persisted in {media_dir}/models/
+        let expected_model_file = media_dir.join("models/ninjanvr_custom_yolo11s.onnx");
+        let expected_labelmap_file = media_dir.join("models/ninjanvr_custom_yolo11s.txt");
+        assert!(expected_model_file.exists());
+        assert!(expected_labelmap_file.exists());
+        assert_eq!(
+            std::fs::read(&expected_model_file).unwrap(),
+            b"ONNX_FINE_TUNED_YOLO11S_WEIGHTS"
+        );
+        let labelmap_contents = std::fs::read_to_string(&expected_labelmap_file).unwrap();
+        assert!(labelmap_contents.contains("person\nface\ncar"));
+        assert_eq!(labelmap_contents.lines().count(), 15);
+
+        // Verify AiDetectorEngine was hot-reloaded with the new dimensions (640x640)
+        assert_eq!(state.detector.model_dimensions(), (640, 640, false));
+
+        // Verify GET /api/detectors/catalog discovers the newly uploaded model
+        let resp_cat = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/detectors/catalog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cat.status(), StatusCode::OK);
+        let cat_json: Value =
+            serde_json::from_slice(&to_bytes(resp_cat.into_body(), 32768).await.unwrap()).unwrap();
+        let discovered = cat_json["discovered_models"].as_array().unwrap();
+        assert!(
+            discovered.iter().any(|m| m["path"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with("ninjanvr_custom_yolo11s.onnx")),
+            "GET /api/detectors/catalog must list uploaded model in discovered_models"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

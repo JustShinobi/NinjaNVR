@@ -27,10 +27,14 @@ import {
   resolveCameraRoiStateBadges,
 } from "../views/LiveWorkspace";
 import {
+  buildModelUploadPayload,
+  computeDatasetReadinessMetrics,
   DEFAULT_ATTRIBUTE_LABELS,
   buildStateRoiConfig,
   formatDhash64Hex,
   formatSignatureBbox,
+  formatYoloAnnotationLine,
+  NINJANVR_SECURITY_CLASSES,
   normalizeFaceProfileName,
   parseFacesApiResponse,
   parseRoiClassesInput,
@@ -40,6 +44,8 @@ import {
   toggleAttributeLabelList,
   toggleSubLabelRuleList,
   upsertKnownPlateEntry,
+  xyxyToYoloNormalized,
+  yoloNormalizedToXyxy,
 } from "../views/settings/VisionAndAiPanels";
 
 describe("buildCleanYamlFromDraft", () => {
@@ -1014,5 +1020,56 @@ cameras:
     expect(resolvedBadges[0].color).toBe("var(--signal-alert-text)");
     expect(resolvedBadges[1].label).toBe("PARKING_SPOT: EMPTY");
     expect(resolvedBadges[1].isAnomaly).toBe(false);
+  });
+
+  test("converts YOLO bounding boxes ([x1,y1,x2,y2] <-> [cx,cy,w,h]) and computes dataset readiness gauge percentages", () => {
+    expect(NINJANVR_SECURITY_CLASSES.length).toBe(15);
+    expect(NINJANVR_SECURITY_CLASSES[0]).toBe("person");
+    expect(NINJANVR_SECURITY_CLASSES[1]).toBe("face");
+    expect(NINJANVR_SECURITY_CLASSES[7]).toBe("license_plate");
+    expect(NINJANVR_SECURITY_CLASSES[14]).toBe("umbrella");
+
+    const yolo = xyxyToYoloNormalized([0.1, 0.2, 0.5, 0.8]);
+    expect(yolo).toEqual({ cx: 0.3, cy: 0.5, w: 0.4, h: 0.6 });
+    const roundtrip = yoloNormalizedToXyxy(yolo);
+    expect(roundtrip).toEqual([0.1, 0.2, 0.5, 0.8]);
+
+    expect(
+      formatYoloAnnotationLine({
+        class_id: 11,
+        label: "package",
+        cx: 0.65,
+        cy: 0.8,
+        w: 0.2,
+        h: 0.2,
+      })
+    ).toBe("11 0.650000 0.800000 0.200000 0.200000");
+
+    const readinessOptimal = computeDatasetReadinessMetrics({
+      total_samples: 100,
+      true_positive_count: 50,
+      ai_annotated_count: 30,
+      hard_negative_count: 20,
+      train_count: 80,
+      val_count: 20,
+      verified_count: 90,
+    });
+    expect(readinessOptimal.positivePct).toBe(80);
+    expect(readinessOptimal.hardNegativePct).toBe(20);
+    expect(readinessOptimal.balanceScorePct).toBe(100);
+    expect(readinessOptimal.isBalanced).toBe(true);
+    expect(readinessOptimal.trainPct).toBe(80);
+    expect(readinessOptimal.valPct).toBe(20);
+    expect(readinessOptimal.verifiedPct).toBe(90);
+
+    const payload = buildModelUploadPayload({
+      filename: "custom_yolo11s.onnx",
+      modelBase64: "T05OWF9W5USEVUSUM=",
+    });
+    expect(payload.filename).toBe("custom_yolo11s.onnx");
+    expect(payload.model_type).toBe("yolo-generic");
+    expect(payload.width).toBe(640);
+    expect(payload.height).toBe(640);
+    expect(payload.labelmap?.split("\n").length).toBe(15);
   });
 });
