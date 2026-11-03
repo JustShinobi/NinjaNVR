@@ -10,11 +10,22 @@ pub fn probe_mp4_resolution(mp4_path: &Path) -> Option<(u32, u32)> {
     for b in &moov_boxes {
         if &b.box_type == b"trak" {
             let trak_boxes = iter_boxes(b.payload);
-            let tkhd = find_box(&trak_boxes, b"tkhd")?;
-            let mdia = find_box(&trak_boxes, b"mdia")?;
+            let Some(tkhd) = find_box(&trak_boxes, b"tkhd") else {
+                continue;
+            };
+            let Some(mdia) = find_box(&trak_boxes, b"mdia") else {
+                continue;
+            };
             let mdia_boxes = iter_boxes(mdia);
-            let hdlr = find_box(&mdia_boxes, b"hdlr")?;
-            if hdlr.len() >= 12 && &hdlr[8..12] == b"vide" && tkhd.len() >= 84 {
+            let Some(hdlr) = find_box(&mdia_boxes, b"hdlr") else {
+                continue;
+            };
+            let min_tkhd_len = if tkhd.first().copied() == Some(1) {
+                96
+            } else {
+                84
+            };
+            if hdlr.len() >= 12 && &hdlr[8..12] == b"vide" && tkhd.len() >= min_tkhd_len {
                 let n = tkhd.len();
                 let w =
                     u32::from_be_bytes([tkhd[n - 8], tkhd[n - 7], tkhd[n - 6], tkhd[n - 5]]) >> 16;
@@ -40,9 +51,43 @@ pub fn build_master_playlist() -> String {
     .join("\n")
 }
 
+/// Generates an HLS master playlist (`master.m3u8`).
+pub fn build_master_m3u8() -> String {
+    build_master_playlist()
+}
+
 /// Generates a VOD media playlist (`index-v1-a1.m3u8`) from a slice of recording segments.
 pub fn build_media_playlist(segments: &[RecordingRow]) -> Result<String> {
     build_media_playlist_with_resolutions(segments, None)
+}
+
+/// Generates a VOD media playlist (`index-v1-a1.m3u8`) from a slice of recording segments.
+pub fn build_media_m3u8(segments: &[RecordingRow]) -> Result<String> {
+    build_media_playlist(segments)
+}
+
+fn format_program_date_time_utc(epoch_sec: f64) -> String {
+    let total_ms = (epoch_sec.max(0.0) * 1000.0).round() as i64;
+    let secs = total_ms.div_euclid(1000);
+    let ms = total_ms.rem_euclid(1000);
+    let days = secs.div_euclid(86400);
+    let day_secs = secs.rem_euclid(86400);
+    let hh = day_secs / 3600;
+    let mm = (day_secs % 3600) / 60;
+    let ss = day_secs % 60;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{ms:03}Z")
 }
 
 /// Generates a VOD media playlist (`index-v1-a1.m3u8`) supporting hybrid sub-stream / main-stream
@@ -63,7 +108,7 @@ pub fn build_media_playlist_with_resolutions(
         format!("#EXT-X-TARGETDURATION:{max_dur}"),
         "#EXT-X-ALLOW-CACHE:YES".to_string(),
         "#EXT-X-PLAYLIST-TYPE:VOD".to_string(),
-        "#EXT-X-VERSION:6".to_string(),
+        "#EXT-X-VERSION:7".to_string(),
         "#EXT-X-MEDIA-SEQUENCE:1".to_string(),
         "#EXT-X-MAP:URI=\"init-v1-a1.mp4\"".to_string(),
     ];
@@ -96,6 +141,10 @@ pub fn build_media_playlist_with_resolutions(
                 lines.push(format!("#EXT-X-MAP:URI=\"init-v1-a1.mp4?seg={}\"", idx + 1));
             }
         }
+        lines.push(format!(
+            "#EXT-X-PROGRAM-DATE-TIME:{}",
+            format_program_date_time_utc(seg.start_time)
+        ));
         lines.push(format!("#EXTINF:{dur:.3},"));
         lines.push(format!("seg-{}-v1-a1.m4s", idx + 1));
         prev_end = Some(seg.end_time);
@@ -927,5 +976,350 @@ mod tests {
         let m3u8 = build_media_playlist_with_resolutions(&segs, Some(&resolutions)).unwrap();
         assert!(m3u8.contains("#EXT-X-DISCONTINUITY"));
         assert!(m3u8.contains("#EXT-X-MAP:URI=\"init-v1-a1.mp4?seg=2\""));
+    }
+
+    #[test]
+    fn probe_mp4_resolution_parses_v0_and_v1_tkhd_fixed_point_dimensions() {
+        let build_resolution_mp4 = |version: u8, width: u32, height: u32| -> Vec<u8> {
+            let body_len = if version == 1 { 92 } else { 80 };
+            let mut tkhd_body = vec![0u8; body_len];
+            let track_id_pos = if version == 1 { 16 } else { 8 };
+            tkhd_body[track_id_pos..track_id_pos + 4].copy_from_slice(&1u32.to_be_bytes());
+            let w_fixed = width << 16;
+            let h_fixed = height << 16;
+            tkhd_body[body_len - 8..body_len - 4].copy_from_slice(&w_fixed.to_be_bytes());
+            tkhd_body[body_len - 4..body_len].copy_from_slice(&h_fixed.to_be_bytes());
+            let tkhd = make_full_box(b"tkhd", version, 3, &tkhd_body);
+
+            let mut hdlr_body = vec![0u8; 20];
+            hdlr_body[4..8].copy_from_slice(b"vide");
+            let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+            let mdia = make_box(b"mdia", &hdlr);
+
+            let mut trak_children = Vec::new();
+            trak_children.extend_from_slice(&tkhd);
+            trak_children.extend_from_slice(&mdia);
+            let trak = make_box(b"trak", &trak_children);
+            let moov = make_box(b"moov", &trak);
+
+            let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+            let mut out = Vec::new();
+            out.extend_from_slice(&ftyp);
+            out.extend_from_slice(&moov);
+            out
+        };
+
+        let tmp_v0 = std::env::temp_dir().join("ninjanvr-vod-res-v0-1920x1080.mp4");
+        let tmp_v1 = std::env::temp_dir().join("ninjanvr-vod-res-v1-640x360.mp4");
+        std::fs::write(&tmp_v0, build_resolution_mp4(0, 1920, 1080)).unwrap();
+        std::fs::write(&tmp_v1, build_resolution_mp4(1, 640, 360)).unwrap();
+
+        assert_eq!(probe_mp4_resolution(&tmp_v0), Some((1920, 1080)));
+        assert_eq!(probe_mp4_resolution(&tmp_v1), Some((640, 360)));
+
+        let _ = std::fs::remove_file(&tmp_v0);
+        let _ = std::fs::remove_file(&tmp_v1);
+    }
+
+    #[test]
+    fn build_master_m3u8_and_build_media_m3u8_format_hls_v7_tags_and_program_date_time() {
+        let master = build_master_m3u8();
+        assert!(master.starts_with("#EXTM3U\n"));
+        assert!(master.contains("#EXT-X-STREAM-INF:"));
+        assert!(master.contains("index-v1-a1.m3u8"));
+
+        let segs = vec![RecordingRow {
+            id: "seg_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-02/14/front_door/05.10.mp4".to_string(),
+            start_time: 1_793_628_310.0, // 2026-11-02T14:05:10.000Z
+            end_time: 1_793_628_320.0,
+            duration: 10.0,
+            motion: 12,
+            objects: 1,
+            dbfs: -20,
+            segment_size: 2.5,
+            regions: 1,
+            motion_heatmap: None,
+        }];
+
+        let media = build_media_m3u8(&segs).unwrap();
+        assert!(media.starts_with("#EXTM3U\n"));
+        assert!(media.contains("#EXT-X-VERSION:7"));
+        assert!(media.contains("#EXT-X-MAP:URI=\"init-v1-a1.mp4\""));
+        assert!(media.contains("#EXT-X-PROGRAM-DATE-TIME:2026-11-02T14:05:10.000Z"));
+        assert!(media.contains("#EXTINF:10.000,"));
+        assert!(media.contains("seg-1-v1-a1.m4s"));
+        assert!(media.contains("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn build_init_and_m4s_support_co64_multi_entry_stsc_ctts_and_dual_av_interleaving() {
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+
+        // Video samples: 3 samples across 2 chunks (chunk 1 has 2 samples, chunk 2 has 1 sample)
+        let v_sample_1 = vec![0x11u8; 32];
+        let v_sample_2 = vec![0x22u8; 24];
+        let v_sample_3 = vec![0x33u8; 40];
+        // Audio samples: 2 samples in 1 chunk
+        let a_sample_1 = vec![0xAAu8; 16];
+        let a_sample_2 = vec![0xBBu8; 16];
+
+        let mdat_header_end = (ftyp.len() + 8) as u64;
+        let v_chunk1_offset = mdat_header_end;
+        let a_chunk1_offset = v_chunk1_offset + (v_sample_1.len() + v_sample_2.len()) as u64;
+        let v_chunk2_offset = a_chunk1_offset + (a_sample_1.len() + a_sample_2.len()) as u64;
+
+        let mut mdat_payload = Vec::new();
+        mdat_payload.extend_from_slice(&v_sample_1);
+        mdat_payload.extend_from_slice(&v_sample_2);
+        mdat_payload.extend_from_slice(&a_sample_1);
+        mdat_payload.extend_from_slice(&a_sample_2);
+        mdat_payload.extend_from_slice(&v_sample_3);
+        let mdat = make_box(b"mdat", &mdat_payload);
+
+        // Build video trak (track_id = 1, handler = vide/avc1, co64, 2-entry stsc, non-zero ctts)
+        let mut v_tkhd_body = vec![0u8; 80];
+        v_tkhd_body[8..12].copy_from_slice(&1u32.to_be_bytes());
+        v_tkhd_body[72..76].copy_from_slice(&(1920u32 << 16).to_be_bytes());
+        v_tkhd_body[76..80].copy_from_slice(&(1080u32 << 16).to_be_bytes());
+        let v_tkhd = make_full_box(b"tkhd", 0, 3, &v_tkhd_body);
+
+        let mut v_mdhd_body = vec![0u8; 20];
+        v_mdhd_body[8..12].copy_from_slice(&90_000u32.to_be_bytes());
+        v_mdhd_body[12..16].copy_from_slice(&9_000u32.to_be_bytes());
+        let v_mdhd = make_full_box(b"mdhd", 0, 0, &v_mdhd_body);
+
+        let mut v_hdlr_body = vec![0u8; 20];
+        v_hdlr_body[4..8].copy_from_slice(b"vide");
+        let v_hdlr = make_full_box(b"hdlr", 0, 0, &v_hdlr_body);
+
+        let mut v_stsd_body = Vec::new();
+        v_stsd_body.extend_from_slice(&1u32.to_be_bytes());
+        v_stsd_body.extend_from_slice(&make_box(b"avc1", &[0u8; 24]));
+        let v_stsd = make_full_box(b"stsd", 0, 0, &v_stsd_body);
+
+        // Variable stsz (fixed_size = 0, sample_count = 3)
+        let mut v_stsz_body = Vec::new();
+        v_stsz_body.extend_from_slice(&0u32.to_be_bytes());
+        v_stsz_body.extend_from_slice(&3u32.to_be_bytes());
+        v_stsz_body.extend_from_slice(&(v_sample_1.len() as u32).to_be_bytes());
+        v_stsz_body.extend_from_slice(&(v_sample_2.len() as u32).to_be_bytes());
+        v_stsz_body.extend_from_slice(&(v_sample_3.len() as u32).to_be_bytes());
+        let v_stsz = make_full_box(b"stsz", 0, 0, &v_stsz_body);
+
+        let mut v_stts_body = Vec::new();
+        v_stts_body.extend_from_slice(&1u32.to_be_bytes());
+        v_stts_body.extend_from_slice(&3u32.to_be_bytes());
+        v_stts_body.extend_from_slice(&3000u32.to_be_bytes());
+        let v_stts = make_full_box(b"stts", 0, 0, &v_stts_body);
+
+        // Non-zero ctts composition offsets: sample 1 = +3000, samples 2..3 = +1500
+        let mut v_ctts_body = Vec::new();
+        v_ctts_body.extend_from_slice(&2u32.to_be_bytes()); // 2 entries
+        v_ctts_body.extend_from_slice(&1u32.to_be_bytes());
+        v_ctts_body.extend_from_slice(&3000i32.to_be_bytes());
+        v_ctts_body.extend_from_slice(&2u32.to_be_bytes());
+        v_ctts_body.extend_from_slice(&1500i32.to_be_bytes());
+        let v_ctts = make_full_box(b"ctts", 0, 0, &v_ctts_body);
+
+        // stss: only sample 1 is sync
+        let mut v_stss_body = Vec::new();
+        v_stss_body.extend_from_slice(&1u32.to_be_bytes());
+        v_stss_body.extend_from_slice(&1u32.to_be_bytes());
+        let v_stss = make_full_box(b"stss", 0, 0, &v_stss_body);
+
+        // Multi-entry stsc: chunk 1 has 2 samples, chunk 2 has 1 sample
+        let mut v_stsc_body = Vec::new();
+        v_stsc_body.extend_from_slice(&2u32.to_be_bytes()); // 2 entries
+        v_stsc_body.extend_from_slice(&1u32.to_be_bytes()); // first_chunk = 1
+        v_stsc_body.extend_from_slice(&2u32.to_be_bytes()); // samples_per_chunk = 2
+        v_stsc_body.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index = 1
+        v_stsc_body.extend_from_slice(&2u32.to_be_bytes()); // first_chunk = 2
+        v_stsc_body.extend_from_slice(&1u32.to_be_bytes()); // samples_per_chunk = 1
+        v_stsc_body.extend_from_slice(&1u32.to_be_bytes()); // sample_description_index = 1
+        let v_stsc = make_full_box(b"stsc", 0, 0, &v_stsc_body);
+
+        // co64 (64-bit chunk offsets for the 2 video chunks)
+        let mut v_co64_body = Vec::new();
+        v_co64_body.extend_from_slice(&2u32.to_be_bytes());
+        v_co64_body.extend_from_slice(&v_chunk1_offset.to_be_bytes());
+        v_co64_body.extend_from_slice(&v_chunk2_offset.to_be_bytes());
+        let v_co64 = make_full_box(b"co64", 0, 0, &v_co64_body);
+
+        let mut v_stbl_children = Vec::new();
+        v_stbl_children.extend_from_slice(&v_stsd);
+        v_stbl_children.extend_from_slice(&v_stsz);
+        v_stbl_children.extend_from_slice(&v_stts);
+        v_stbl_children.extend_from_slice(&v_ctts);
+        v_stbl_children.extend_from_slice(&v_stss);
+        v_stbl_children.extend_from_slice(&v_stsc);
+        v_stbl_children.extend_from_slice(&v_co64);
+        let v_stbl = make_box(b"stbl", &v_stbl_children);
+        let v_minf = make_box(b"minf", &v_stbl);
+        let mut v_mdia_children = Vec::new();
+        v_mdia_children.extend_from_slice(&v_mdhd);
+        v_mdia_children.extend_from_slice(&v_hdlr);
+        v_mdia_children.extend_from_slice(&v_minf);
+        let v_mdia = make_box(b"mdia", &v_mdia_children);
+        let mut v_trak_children = Vec::new();
+        v_trak_children.extend_from_slice(&v_tkhd);
+        v_trak_children.extend_from_slice(&v_mdia);
+        let v_trak = make_box(b"trak", &v_trak_children);
+
+        // Build audio trak (track_id = 2, handler = soun/mp4a, co64)
+        let mut a_tkhd_body = vec![0u8; 80];
+        a_tkhd_body[8..12].copy_from_slice(&2u32.to_be_bytes());
+        let a_tkhd = make_full_box(b"tkhd", 0, 3, &a_tkhd_body);
+
+        let mut a_mdhd_body = vec![0u8; 20];
+        a_mdhd_body[8..12].copy_from_slice(&48_000u32.to_be_bytes());
+        a_mdhd_body[12..16].copy_from_slice(&2048u32.to_be_bytes());
+        let a_mdhd = make_full_box(b"mdhd", 0, 0, &a_mdhd_body);
+
+        let mut a_hdlr_body = vec![0u8; 20];
+        a_hdlr_body[4..8].copy_from_slice(b"soun");
+        let a_hdlr = make_full_box(b"hdlr", 0, 0, &a_hdlr_body);
+
+        let mut a_stsd_body = Vec::new();
+        a_stsd_body.extend_from_slice(&1u32.to_be_bytes());
+        a_stsd_body.extend_from_slice(&make_box(b"mp4a", &[0u8; 20]));
+        let a_stsd = make_full_box(b"stsd", 0, 0, &a_stsd_body);
+
+        let mut a_stsz_body = Vec::new();
+        a_stsz_body.extend_from_slice(&(a_sample_1.len() as u32).to_be_bytes());
+        a_stsz_body.extend_from_slice(&2u32.to_be_bytes());
+        let a_stsz = make_full_box(b"stsz", 0, 0, &a_stsz_body);
+
+        let mut a_stts_body = Vec::new();
+        a_stts_body.extend_from_slice(&1u32.to_be_bytes());
+        a_stts_body.extend_from_slice(&2u32.to_be_bytes());
+        a_stts_body.extend_from_slice(&1024u32.to_be_bytes());
+        let a_stts = make_full_box(b"stts", 0, 0, &a_stts_body);
+
+        let mut a_stsc_body = Vec::new();
+        a_stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        a_stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        a_stsc_body.extend_from_slice(&2u32.to_be_bytes());
+        a_stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        let a_stsc = make_full_box(b"stsc", 0, 0, &a_stsc_body);
+
+        let mut a_co64_body = Vec::new();
+        a_co64_body.extend_from_slice(&1u32.to_be_bytes());
+        a_co64_body.extend_from_slice(&a_chunk1_offset.to_be_bytes());
+        let a_co64 = make_full_box(b"co64", 0, 0, &a_co64_body);
+
+        let mut a_stbl_children = Vec::new();
+        a_stbl_children.extend_from_slice(&a_stsd);
+        a_stbl_children.extend_from_slice(&a_stsz);
+        a_stbl_children.extend_from_slice(&a_stts);
+        a_stbl_children.extend_from_slice(&a_stsc);
+        a_stbl_children.extend_from_slice(&a_co64);
+        let a_stbl = make_box(b"stbl", &a_stbl_children);
+        let a_minf = make_box(b"minf", &a_stbl);
+        let mut a_mdia_children = Vec::new();
+        a_mdia_children.extend_from_slice(&a_mdhd);
+        a_mdia_children.extend_from_slice(&a_hdlr);
+        a_mdia_children.extend_from_slice(&a_minf);
+        let a_mdia = make_box(b"mdia", &a_mdia_children);
+        let mut a_trak_children = Vec::new();
+        a_trak_children.extend_from_slice(&a_tkhd);
+        a_trak_children.extend_from_slice(&a_mdia);
+        let a_trak = make_box(b"trak", &a_trak_children);
+
+        let mvhd = make_full_box(b"mvhd", 0, 0, &[0u8; 96]);
+        let mut moov_children = Vec::new();
+        moov_children.extend_from_slice(&mvhd);
+        moov_children.extend_from_slice(&v_trak);
+        moov_children.extend_from_slice(&a_trak);
+        let moov = make_box(b"moov", &moov_children);
+
+        let mut mp4_bytes = Vec::new();
+        mp4_bytes.extend_from_slice(&ftyp);
+        mp4_bytes.extend_from_slice(&mdat);
+        mp4_bytes.extend_from_slice(&moov);
+
+        let tmp_path = std::env::temp_dir().join("ninjanvr-vod-co64-ctts-av.mp4");
+        std::fs::write(&tmp_path, &mp4_bytes).unwrap();
+
+        // 1. Verify build_init_mp4 contains mvex with 2 trex boxes (track 1 and track 2)
+        let init_bytes = build_init_mp4(&tmp_path).expect("build_init_mp4");
+        let init_boxes = iter_boxes(&init_bytes);
+        let init_moov = find_box(&init_boxes, b"moov").expect("moov in init");
+        let init_moov_boxes = iter_boxes(init_moov);
+        let mvex = find_box(&init_moov_boxes, b"mvex").expect("mvex in init moov");
+        let mvex_boxes = iter_boxes(mvex);
+        let trex_boxes: Vec<_> = mvex_boxes
+            .iter()
+            .filter(|b| &b.box_type == b"trex")
+            .collect();
+        assert_eq!(trex_boxes.len(), 2, "expected 2 trex boxes in mvex");
+        assert_eq!(
+            u32::from_be_bytes(trex_boxes[0].payload[4..8].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_be_bytes(trex_boxes[1].payload[4..8].try_into().unwrap()),
+            2
+        );
+
+        // 2. Verify build_media_segment_m4s trun flags (0x000F01 for vide with ctts, 0x000701 for soun)
+        // and verify sample payload integrity in mdat
+        let m4s_bytes =
+            build_media_segment_m4s(&tmp_path, 3, 20.0).expect("build_media_segment_m4s");
+        let m4s_boxes = iter_boxes(&m4s_bytes);
+        let moof = find_box(&m4s_boxes, b"moof").expect("moof in m4s");
+        let m4s_mdat = find_box(&m4s_boxes, b"mdat").expect("mdat in m4s");
+
+        let moof_boxes = iter_boxes(moof);
+        let trafs: Vec<_> = moof_boxes
+            .iter()
+            .filter(|b| &b.box_type == b"traf")
+            .collect();
+        assert_eq!(trafs.len(), 2, "expected 2 traf boxes (vide + soun)");
+
+        // Video traf (track 1): trun version 1, flags 0x000F01, sample_count = 3
+        let v_traf_boxes = iter_boxes(trafs[0].payload);
+        let v_trun = find_box(&v_traf_boxes, b"trun").expect("video trun");
+        let v_trun_vf = u32::from_be_bytes(v_trun[0..4].try_into().unwrap());
+        assert_eq!(
+            v_trun_vf >> 24,
+            1,
+            "video trun version must be 1 when ctts present"
+        );
+        assert_eq!(
+            v_trun_vf & 0x00FF_FFFF,
+            0x000F01,
+            "video trun flags must be 0x000F01 when ctts present"
+        );
+        let v_sample_count = u32::from_be_bytes(v_trun[4..8].try_into().unwrap());
+        assert_eq!(v_sample_count, 3);
+        let v_flags_1 = u32::from_be_bytes(v_trun[20..24].try_into().unwrap());
+        let v_cts_1 = i32::from_be_bytes(v_trun[24..28].try_into().unwrap());
+        let v_flags_2 = u32::from_be_bytes(v_trun[36..40].try_into().unwrap());
+        let v_cts_2 = i32::from_be_bytes(v_trun[40..44].try_into().unwrap());
+        assert_eq!(v_flags_1, 0x0200_0000);
+        assert_eq!(v_cts_1, 3000);
+        assert_eq!(v_flags_2, 0x0101_0000);
+        assert_eq!(v_cts_2, 1500);
+
+        // Audio traf (track 2): trun version 0, flags 0x000701, sample_count = 2
+        let a_traf_boxes = iter_boxes(trafs[1].payload);
+        let a_trun = find_box(&a_traf_boxes, b"trun").expect("audio trun");
+        let a_trun_vf = u32::from_be_bytes(a_trun[0..4].try_into().unwrap());
+        assert_eq!(a_trun_vf & 0x00FF_FFFF, 0x000701);
+        let a_sample_count = u32::from_be_bytes(a_trun[4..8].try_into().unwrap());
+        assert_eq!(a_sample_count, 2);
+
+        // Verify reassembled mdat payload integrity (v_sample_1 + v_sample_2 + v_sample_3 + a_sample_1 + a_sample_2)
+        let mut expected_mdat = Vec::new();
+        expected_mdat.extend_from_slice(&v_sample_1);
+        expected_mdat.extend_from_slice(&v_sample_2);
+        expected_mdat.extend_from_slice(&v_sample_3);
+        expected_mdat.extend_from_slice(&a_sample_1);
+        expected_mdat.extend_from_slice(&a_sample_2);
+        assert_eq!(m4s_mdat, expected_mdat.as_slice());
+
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }

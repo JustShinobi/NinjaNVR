@@ -185,22 +185,32 @@ fn parse_duration_box(body: &[u8]) -> Option<f64> {
         return None;
     }
     let ver = body[0];
-    if ver == 1 && body.len() >= 32 {
+    let secs = if ver == 1 && body.len() >= 32 {
         let ts = u32::from_be_bytes([body[20], body[21], body[22], body[23]]);
         let dur = u64::from_be_bytes([
             body[24], body[25], body[26], body[27], body[28], body[29], body[30], body[31],
         ]);
         if ts > 0 {
-            return Some(dur as f64 / ts as f64);
+            Some(dur as f64 / ts as f64)
+        } else {
+            None
         }
     } else if ver == 0 && body.len() >= 20 {
         let ts = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
         let dur = u32::from_be_bytes([body[16], body[17], body[18], body[19]]);
         if ts > 0 {
-            return Some(dur as f64 / ts as f64);
+            Some(dur as f64 / ts as f64)
+        } else {
+            None
         }
+    } else {
+        None
+    }?;
+    if secs > 0.0 && secs <= 300.0 {
+        Some(secs)
+    } else {
+        None
     }
-    None
 }
 
 /// Reads the exact video track duration in seconds from an MP4 file's `vide` `mdhd` box
@@ -232,6 +242,7 @@ pub fn probe_mp4_duration_fast(path: &Path) -> Option<f64> {
             let mut moov = vec![0u8; (box_size - hdr_len).min(131_072) as usize];
             file.read_exact(&mut moov).ok()?;
             let mut fallback_mvhd = None;
+            let mut saw_vide_trak = false;
             let mut mpos = 0usize;
             while mpos + 8 <= moov.len() {
                 let msize = u32::from_be_bytes([
@@ -247,18 +258,60 @@ pub fn probe_mp4_duration_fast(path: &Path) -> Option<f64> {
                 let mbody = &moov[mpos + 8..mpos + msize];
                 if mtype == b"mvhd" {
                     fallback_mvhd = parse_duration_box(mbody);
-                } else if mtype == b"trak"
-                    && let Some(vide_dur) = extract_vide_mdhd_duration(mbody)
-                {
-                    return Some(vide_dur);
+                } else if mtype == b"trak" {
+                    if let Some(vide_dur) = extract_vide_mdhd_duration(mbody) {
+                        return Some(vide_dur);
+                    }
+                    if trak_has_vide_handler(mbody) {
+                        saw_vide_trak = true;
+                    }
                 }
                 mpos += msize;
             }
-            return fallback_mvhd;
+            return if saw_vide_trak { None } else { fallback_mvhd };
         }
         pos += box_size;
     }
     None
+}
+
+fn trak_has_vide_handler(trak_body: &[u8]) -> bool {
+    let mut tpos = 0usize;
+    while tpos + 8 <= trak_body.len() {
+        let tsize = u32::from_be_bytes([
+            trak_body[tpos],
+            trak_body[tpos + 1],
+            trak_body[tpos + 2],
+            trak_body[tpos + 3],
+        ]) as usize;
+        let ttype = &trak_body[tpos + 4..tpos + 8];
+        if tsize < 8 || tpos + tsize > trak_body.len() {
+            break;
+        }
+        if ttype == b"mdia" {
+            let mdia = &trak_body[tpos + 8..tpos + tsize];
+            let mut dpos = 0usize;
+            while dpos + 8 <= mdia.len() {
+                let dsize = u32::from_be_bytes([
+                    mdia[dpos],
+                    mdia[dpos + 1],
+                    mdia[dpos + 2],
+                    mdia[dpos + 3],
+                ]) as usize;
+                let dtype = &mdia[dpos + 4..dpos + 8];
+                if dsize < 8 || dpos + dsize > mdia.len() {
+                    break;
+                }
+                let dbody = &mdia[dpos + 8..dpos + dsize];
+                if dtype == b"hdlr" && dbody.len() >= 12 && &dbody[8..12] == b"vide" {
+                    return true;
+                }
+                dpos += dsize;
+            }
+        }
+        tpos += tsize;
+    }
+    false
 }
 
 fn extract_vide_mdhd_duration(trak_body: &[u8]) -> Option<f64> {
@@ -625,6 +678,133 @@ fn parse_staged_start_time(camera: &str, staged_path: &Path) -> Option<f64> {
     let date_part = stem.strip_prefix(&format!("{camera}_"))?;
     let ndt = NaiveDateTime::parse_from_str(date_part, "%Y%m%d%H%M%S").ok()?;
     Some(ndt.and_utc().timestamp() as f64)
+}
+
+/// Parses a recording segment path (`.../YYYY-MM-DD/HH/<camera>/MM.SS.mp4`) into `(camera, start_time_utc)`.
+pub fn parse_recording_segment_path(path: &Path) -> Option<(String, f64)> {
+    if path.extension().and_then(|e| e.to_str()) != Some("mp4") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let mm_ss = stem.split('-').next()?;
+    let (mm_str, ss_str) = mm_ss.split_once('.')?;
+    let minute: u32 = mm_str.parse().ok()?;
+    let second: u32 = ss_str.parse().ok()?;
+    if minute >= 60 || second >= 60 {
+        return None;
+    }
+
+    let cam_dir = path.parent()?;
+    let camera = cam_dir.file_name()?.to_str()?;
+    if camera.is_empty() || camera.starts_with('.') {
+        return None;
+    }
+
+    let hour_dir = cam_dir.parent()?;
+    let hour_str = hour_dir.file_name()?.to_str()?;
+    let hour: u32 = hour_str.parse().ok()?;
+    if hour >= 24 {
+        return None;
+    }
+
+    let date_dir = hour_dir.parent()?;
+    let date_str = date_dir.file_name()?.to_str()?;
+    let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").ok()?;
+    let ndt = date.and_hms_opt(hour, minute, second)?;
+    Some((camera.to_string(), ndt.and_utc().timestamp() as f64))
+}
+
+/// Scans `media_dir/recordings/YYYY-MM-DD/HH/<camera>/MM.SS.mp4`, removes 0-byte orphan files,
+/// and indexes valid MP4 recording segments into SQLite.
+pub fn sync_recordings_from_disk(db: &NinjaDatabase, media_dir: &Path) -> Result<usize> {
+    let rec_root = media_dir.join("recordings");
+    if !rec_root.exists() {
+        return Ok(0);
+    }
+    let mut synced = 0usize;
+    let Ok(date_entries) = std::fs::read_dir(&rec_root) else {
+        return Ok(0);
+    };
+    for date_entry in date_entries.flatten() {
+        let date_path = date_entry.path();
+        let Some(date_name) = date_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if date_name.starts_with('.') || !date_path.is_dir() {
+            continue;
+        }
+        let Ok(hour_entries) = std::fs::read_dir(&date_path) else {
+            continue;
+        };
+        for hour_entry in hour_entries.flatten() {
+            let hour_path = hour_entry.path();
+            let Some(hour_name) = hour_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if hour_name.starts_with('.') || !hour_path.is_dir() {
+                continue;
+            }
+            let Ok(cam_entries) = std::fs::read_dir(&hour_path) else {
+                continue;
+            };
+            for cam_entry in cam_entries.flatten() {
+                let cam_path = cam_entry.path();
+                if !cam_path.is_dir() {
+                    continue;
+                }
+                let Ok(file_entries) = std::fs::read_dir(&cam_path) else {
+                    continue;
+                };
+                for file_entry in file_entries.flatten() {
+                    let file_path = file_entry.path();
+                    if file_path.extension().and_then(|e| e.to_str()) != Some("mp4") {
+                        continue;
+                    }
+                    let Ok(meta) = std::fs::metadata(&file_path) else {
+                        continue;
+                    };
+                    if meta.len() == 0 {
+                        let _ = std::fs::remove_file(&file_path);
+                        continue;
+                    }
+                    let Some((camera, start_time)) = parse_recording_segment_path(&file_path)
+                    else {
+                        continue;
+                    };
+                    let Some(duration) = probe_mp4_duration_fast(&file_path) else {
+                        continue;
+                    };
+                    let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    let end_time = start_time + duration;
+                    let dbfs = probe_mp4_audio_dbfs_fast(&file_path);
+                    let seg_size_mb =
+                        ((meta.len() as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
+                    let db_canonical_path = format!(
+                        "/media/ninjanvr/recordings/{date_name}/{hour_name}/{camera}/{file_name}"
+                    );
+                    let id = format!("{:.1}-{}", start_time, random_suffix());
+                    db.insert_recording(&RecordingRow {
+                        id,
+                        camera,
+                        path: db_canonical_path,
+                        start_time,
+                        end_time,
+                        duration,
+                        motion: 0,
+                        objects: 0,
+                        dbfs,
+                        segment_size: seg_size_mb,
+                        regions: 0,
+                        motion_heatmap: None,
+                    })?;
+                    synced += 1;
+                }
+            }
+        }
+    }
+    Ok(synced)
 }
 
 /// Builds the FFmpeg CLI arguments for segment recording, injecting `-itsoffset <sec>` and
@@ -2085,7 +2265,12 @@ pub fn build_mp4_export_ffmpeg_args_with_privacy(
             "copy".to_string(),
         ]);
     } else {
-        args.extend(["-c".to_string(), "copy".to_string()]);
+        args.extend([
+            "-c:v".to_string(),
+            "copy".to_string(),
+            "-c:a".to_string(),
+            "copy".to_string(),
+        ]);
     }
     if !include_audio {
         args.push("-an".to_string());
@@ -2747,6 +2932,352 @@ mod tests {
 
         assert!(backed_up_mp4.exists());
         assert!(backed_up_mp4.with_extension("webp").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mp4_duration_fast_and_extract_vide_mdhd_parse_v0_v1_mvhd_and_reject_invalid() {
+        fn make_box(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let sz = (8 + body.len()) as u32;
+            let mut out = Vec::with_capacity(sz as usize);
+            out.extend_from_slice(&sz.to_be_bytes());
+            out.extend_from_slice(btype);
+            out.extend_from_slice(body);
+            out
+        }
+
+        fn make_mdhd_v0(timescale: u32, duration: u32) -> Vec<u8> {
+            let mut body = vec![0u8; 24];
+            body[0] = 0; // version 0
+            body[12..16].copy_from_slice(&timescale.to_be_bytes());
+            body[16..20].copy_from_slice(&duration.to_be_bytes());
+            make_box(b"mdhd", &body)
+        }
+
+        fn make_mdhd_v1(timescale: u32, duration: u64) -> Vec<u8> {
+            let mut body = vec![0u8; 36];
+            body[0] = 1; // version 1 (64-bit)
+            body[20..24].copy_from_slice(&timescale.to_be_bytes());
+            body[24..32].copy_from_slice(&duration.to_be_bytes());
+            make_box(b"mdhd", &body)
+        }
+
+        fn make_mvhd_v0(timescale: u32, duration: u32) -> Vec<u8> {
+            let mut body = vec![0u8; 100];
+            body[0] = 0;
+            body[12..16].copy_from_slice(&timescale.to_be_bytes());
+            body[16..20].copy_from_slice(&duration.to_be_bytes());
+            make_box(b"mvhd", &body)
+        }
+
+        fn make_hdlr(handler: &[u8; 4]) -> Vec<u8> {
+            let mut body = vec![0u8; 24];
+            body[8..12].copy_from_slice(handler);
+            make_box(b"hdlr", &body)
+        }
+
+        fn make_trak(mdhd: &[u8], handler: &[u8; 4]) -> Vec<u8> {
+            let hdlr = make_hdlr(handler);
+            let mut mdia_body = Vec::with_capacity(mdhd.len() + hdlr.len());
+            mdia_body.extend_from_slice(mdhd);
+            mdia_body.extend_from_slice(&hdlr);
+            let mdia = make_box(b"mdia", &mdia_body);
+            make_box(b"trak", &mdia)
+        }
+
+        fn wrap_mp4(moov_children: &[u8]) -> Vec<u8> {
+            let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+            let moov = make_box(b"moov", moov_children);
+            let mut out = Vec::with_capacity(ftyp.len() + moov.len());
+            out.extend_from_slice(&ftyp);
+            out.extend_from_slice(&moov);
+            out
+        }
+
+        // 1. Direct extract_vide_mdhd_duration checks for v0 (10.0s) and v1 (15.0s)
+        let trak_v0 = make_trak(&make_mdhd_v0(90_000, 900_000), b"vide");
+        assert_eq!(extract_vide_mdhd_duration(&trak_v0[8..]), Some(10.0));
+
+        let trak_v1 = make_trak(&make_mdhd_v1(48_000, 720_000), b"vide");
+        assert_eq!(extract_vide_mdhd_duration(&trak_v1[8..]), Some(15.0));
+
+        let trak_soun = make_trak(&make_mdhd_v0(48_000, 480_000), b"soun");
+        assert_eq!(extract_vide_mdhd_duration(&trak_soun[8..]), None);
+
+        // 2. File-level probe_mp4_duration_fast checks
+        let tmp_dir = std::env::temp_dir().join(format!("ninjanvr-dur-probe-{}", random_suffix()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        // v0 mdhd (timescale=90000, duration=900000 -> 10.0s)
+        let v0_path = tmp_dir.join("v0.mp4");
+        let mut v0_moov = make_mvhd_v0(1000, 8000);
+        v0_moov.extend_from_slice(&trak_v0);
+        std::fs::write(&v0_path, wrap_mp4(&v0_moov)).unwrap();
+        assert_eq!(probe_mp4_duration_fast(&v0_path), Some(10.0));
+
+        // v1 mdhd (timescale=48000, duration=720000 -> 15.0s)
+        let v1_path = tmp_dir.join("v1.mp4");
+        let mut v1_moov = make_mvhd_v0(1000, 8000);
+        v1_moov.extend_from_slice(&trak_v1);
+        std::fs::write(&v1_path, wrap_mp4(&v1_moov)).unwrap();
+        assert_eq!(probe_mp4_duration_fast(&v1_path), Some(15.0));
+
+        // Fallback mvhd-only buffer when vide mdhd is absent
+        let mvhd_only_path = tmp_dir.join("mvhd_only.mp4");
+        let mut mvhd_moov = make_mvhd_v0(1000, 12_500);
+        mvhd_moov.extend_from_slice(&trak_soun);
+        std::fs::write(&mvhd_only_path, wrap_mp4(&mvhd_moov)).unwrap();
+        assert_eq!(probe_mp4_duration_fast(&mvhd_only_path), Some(12.5));
+
+        // Zero duration -> None
+        let zero_path = tmp_dir.join("zero.mp4");
+        let trak_zero = make_trak(&make_mdhd_v0(90_000, 0), b"vide");
+        std::fs::write(&zero_path, wrap_mp4(&trak_zero)).unwrap();
+        assert_eq!(probe_mp4_duration_fast(&zero_path), None);
+
+        // Excessive (>300s) duration -> None
+        let excessive_path = tmp_dir.join("excessive.mp4");
+        let trak_excessive = make_trak(&make_mdhd_v0(1000, 350_000), b"vide");
+        std::fs::write(&excessive_path, wrap_mp4(&trak_excessive)).unwrap();
+        assert_eq!(probe_mp4_duration_fast(&excessive_path), None);
+
+        // Truncated / non-MP4 -> None
+        let corrupt_path = tmp_dir.join("corrupt.mp4");
+        std::fs::write(&corrupt_path, b"not_an_mp4").unwrap();
+        assert_eq!(probe_mp4_duration_fast(&corrupt_path), None);
+
+        let truncated_path = tmp_dir.join("truncated.mp4");
+        std::fs::write(
+            &truncated_path,
+            [0x00, 0x00, 0x01, 0x00, b'm', b'o', b'o', b'v'],
+        )
+        .unwrap();
+        assert_eq!(probe_mp4_duration_fast(&truncated_path), None);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn privacy_drawbox_filter_and_export_ffmpeg_args_handle_normalized_and_empty_masks() {
+        let mask_norm = json!(["0.10,0.20,0.50,0.20,0.50,0.80,0.10,0.80"]);
+        let vf = build_privacy_drawbox_filter(&mask_norm).expect("expected drawbox filter");
+        assert_eq!(
+            vf,
+            "drawbox=x=iw*0.100:y=ih*0.200:w=iw*0.400:h=ih*0.600:color=#0c0e12@1.0:t=fill"
+        );
+
+        let mask_px = json!("100,200,500,200,500,800,100,800");
+        let vf_px = build_privacy_drawbox_filter(&mask_px).expect("expected pixel drawbox filter");
+        assert_eq!(
+            vf_px,
+            "drawbox=x=100:y=200:w=400:h=600:color=#0c0e12@1.0:t=fill"
+        );
+
+        assert_eq!(build_privacy_drawbox_filter(&json!(null)), None);
+        assert_eq!(build_privacy_drawbox_filter(&json!([])), None);
+        assert_eq!(build_privacy_drawbox_filter(&json!("")), None);
+        assert_eq!(build_privacy_drawbox_filter(&json!(["0.1,0.2"])), None);
+
+        let list_path = Path::new("/tmp/list.txt");
+        let out_path = Path::new("/tmp/out.mp4");
+
+        let args_masked = build_mp4_export_ffmpeg_args_with_privacy(
+            list_path,
+            1.25,
+            10.0,
+            true,
+            Some(&mask_norm),
+            out_path,
+        );
+        assert!(args_masked.iter().any(|a| a == "-vf"));
+        assert!(args_masked.iter().any(|a| a.starts_with("drawbox=")));
+        assert!(!args_masked.iter().any(|a| a == "-c:v"));
+
+        let args_empty = build_mp4_export_ffmpeg_args_with_privacy(
+            list_path,
+            0.0,
+            10.0,
+            true,
+            Some(&json!([])),
+            out_path,
+        );
+        assert!(!args_empty.iter().any(|a| a == "-vf"));
+        assert!(args_empty.windows(2).any(|w| w == ["-c:v", "copy"]));
+
+        let args_none =
+            build_mp4_export_ffmpeg_args_with_privacy(list_path, 0.0, 10.0, false, None, out_path);
+        assert!(!args_none.iter().any(|a| a == "-vf"));
+        assert!(args_none.windows(2).any(|w| w == ["-c:v", "copy"]));
+        assert!(args_none.iter().any(|a| a == "-an"));
+    }
+
+    #[test]
+    fn sync_recordings_from_disk_and_probe_storage_writable_index_valid_and_prune_orphans() {
+        fn make_box(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let sz = (8 + body.len()) as u32;
+            let mut out = Vec::with_capacity(sz as usize);
+            out.extend_from_slice(&sz.to_be_bytes());
+            out.extend_from_slice(btype);
+            out.extend_from_slice(body);
+            out
+        }
+
+        let root = std::env::temp_dir().join(format!("ninjanvr-sync-test-{}", random_suffix()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 1. probe_storage_writable on writable directory
+        assert!(probe_storage_writable(&root).is_ok());
+        assert!(root.join("recordings").is_dir());
+        assert!(root.join("clips").is_dir());
+        assert!(root.join("exports").is_dir());
+
+        // 2. probe_storage_writable on non-writable path (regular file blocking directory creation)
+        let blocked_root = root.join("blocked_mount");
+        std::fs::write(&blocked_root, b"not_a_dir").unwrap();
+        assert!(probe_storage_writable(&blocked_root).is_err());
+
+        // 3. parse_recording_segment_path & sync_recordings_from_disk
+        let cam_dir = root.join("recordings/2026-11-02/14/front_door");
+        std::fs::create_dir_all(&cam_dir).unwrap();
+
+        let valid_seg_path = cam_dir.join("05.10.mp4");
+        let orphan_zero_path = cam_dir.join("05.20.mp4");
+
+        let (parsed_cam, parsed_ts) =
+            parse_recording_segment_path(&valid_seg_path).expect("valid segment path");
+        assert_eq!(parsed_cam, "front_door");
+        let expected_ts = chrono::NaiveDate::from_ymd_opt(2026, 11, 2)
+            .unwrap()
+            .and_hms_opt(14, 5, 10)
+            .unwrap()
+            .and_utc()
+            .timestamp() as f64;
+        assert_eq!(parsed_ts, expected_ts);
+        assert_eq!(
+            parse_recording_segment_path(Path::new("/tmp/recordings/2026-11-02/99/cam/05.10.mp4")),
+            None
+        );
+
+        // Write valid synthetic 10.0s MP4 to 05.10.mp4 and 0-byte orphan to 05.20.mp4
+        let mut mdhd_body = vec![0u8; 24];
+        mdhd_body[12..16].copy_from_slice(&90_000u32.to_be_bytes());
+        mdhd_body[16..20].copy_from_slice(&900_000u32.to_be_bytes());
+        let mdhd = make_box(b"mdhd", &mdhd_body);
+        let mut hdlr_body = vec![0u8; 24];
+        hdlr_body[8..12].copy_from_slice(b"vide");
+        let hdlr = make_box(b"hdlr", &hdlr_body);
+        let mut mdia_body = Vec::new();
+        mdia_body.extend_from_slice(&mdhd);
+        mdia_body.extend_from_slice(&hdlr);
+        let mdia = make_box(b"mdia", &mdia_body);
+        let trak = make_box(b"trak", &mdia);
+        let moov = make_box(b"moov", &trak);
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+        let mut valid_mp4 = Vec::new();
+        valid_mp4.extend_from_slice(&ftyp);
+        valid_mp4.extend_from_slice(&moov);
+
+        std::fs::write(&valid_seg_path, &valid_mp4).unwrap();
+        std::fs::write(&orphan_zero_path, b"").unwrap();
+
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+        let synced = sync_recordings_from_disk(&db, &root).unwrap();
+        assert_eq!(synced, 1);
+        assert!(
+            !orphan_zero_path.exists(),
+            "0-byte orphan MP4 must be removed during sync"
+        );
+
+        let rows = db
+            .query_recordings("front_door", expected_ts - 5.0, expected_ts + 25.0)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].camera, "front_door");
+        assert_eq!(rows[0].start_time, expected_ts);
+        assert_eq!(rows[0].duration, 10.0);
+        assert_eq!(
+            rows[0].path,
+            "/media/ninjanvr/recordings/2026-11-02/14/front_door/05.10.mp4"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn recording_engine_sweep_and_finalize_closed_segment_index_and_prune_staged_files() {
+        fn make_box(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let sz = (8 + body.len()) as u32;
+            let mut out = Vec::with_capacity(sz as usize);
+            out.extend_from_slice(&sz.to_be_bytes());
+            out.extend_from_slice(btype);
+            out.extend_from_slice(body);
+            out
+        }
+
+        let root = std::env::temp_dir().join(format!("ninjanvr-finalize-test-{}", random_suffix()));
+        let staging_dir = root.join("recordings/.staging/front_door");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+        let cfg = Arc::new(RwLock::new(
+            NinjaConfig::from_yaml_str("cameras: {}\n", root.join("config.yml")).unwrap(),
+        ));
+        let ledger = new_activity_ledger();
+        let engine = RecordingEngine::new(cfg, db.clone(), root.clone(), ledger);
+
+        // Build >1KB valid synthetic MP4 with v0 mdhd (10.0s)
+        let mut mdhd_body = vec![0u8; 24];
+        mdhd_body[12..16].copy_from_slice(&90_000u32.to_be_bytes());
+        mdhd_body[16..20].copy_from_slice(&900_000u32.to_be_bytes());
+        let mdhd = make_box(b"mdhd", &mdhd_body);
+        let mut hdlr_body = vec![0u8; 24];
+        hdlr_body[8..12].copy_from_slice(b"vide");
+        let hdlr = make_box(b"hdlr", &hdlr_body);
+        let mut mdia_body = Vec::new();
+        mdia_body.extend_from_slice(&mdhd);
+        mdia_body.extend_from_slice(&hdlr);
+        let mdia = make_box(b"mdia", &mdia_body);
+        let trak = make_box(b"trak", &mdia);
+        let moov = make_box(b"moov", &trak);
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+        let mdat = make_box(b"mdat", &vec![0u8; 1500]);
+        let mut valid_mp4 = Vec::new();
+        valid_mp4.extend_from_slice(&ftyp);
+        valid_mp4.extend_from_slice(&mdat);
+        valid_mp4.extend_from_slice(&moov);
+
+        let staged_valid = staging_dir.join("front_door_20261102140510.mp4");
+        let staged_corrupt = staging_dir.join("front_door_20261102140520.mp4");
+        std::fs::write(&staged_valid, &valid_mp4).unwrap();
+        std::fs::write(&staged_corrupt, b"").unwrap();
+
+        let policy = CameraRecordPolicy {
+            keep_continuous: true,
+            keep_motion: true,
+            continuous_substream: false,
+            retain_mode: "all".to_string(),
+            audio_offset_ms: 0,
+        };
+
+        engine
+            .sweep_staging_dir("front_door", &staging_dir, &policy)
+            .await;
+
+        assert!(!staged_valid.exists());
+        assert!(!staged_corrupt.exists());
+
+        let expected_ts = chrono::NaiveDate::from_ymd_opt(2026, 11, 2)
+            .unwrap()
+            .and_hms_opt(14, 5, 10)
+            .unwrap()
+            .and_utc()
+            .timestamp() as f64;
+        let recs = db
+            .query_recordings("front_door", expected_ts - 5.0, expected_ts + 25.0)
+            .unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].duration, 10.0);
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }
