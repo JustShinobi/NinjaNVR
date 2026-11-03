@@ -225,20 +225,67 @@ jobs:
     needs: [publish-ghcr]
     if: always() && needs.publish-ghcr.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       GITOPS_TOKEN: ${{ secrets.PLATFORM_GITOPS_TOKEN }}
-      GITOPS_REPO: ${{ vars.GITOPS_REPO || 'JustShinobi/k3s-gitops-prod' }}
+      GITOPS_APP_ID: ${{ secrets.GITOPS_APP_ID }}
+      GITOPS_APP_PRIVATE_KEY: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+      GITOPS_REPO: ${{ vars.GITOPS_REPO || 'Shhinobi/k3s-gitops-prod' }}
       GITOPS_MANIFEST_PATH: ${{ vars.GITOPS_MANIFEST_PATH || 'clusters/prod/workloads/ninjanvr/ninjanvr.yaml' }}
+      GITOPS_KUSTOMIZATION_PATH: 'clusters/prod/workloads/ninjanvr/kustomization.yaml'
       IMAGE_TAG: ${{ needs.publish-ghcr.outputs.image_tag }}
+      IMAGE_DIGEST: ${{ needs.publish-ghcr.outputs.image_digest }}
     steps:
-      - name: Check GitOps token availability
+      - name: Resolve GitOps authentication token (GitHub App or PAT fallback)
         id: check_token
         run: |
-          if [ -z "${GITOPS_TOKEN}" ]; then
-            echo "PLATFORM_GITOPS_TOKEN not configured; skipping GitOps promotion."
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          else
+          if [ -n "${GITOPS_APP_ID}" ] && [ -n "${GITOPS_APP_PRIVATE_KEY}" ]; then
+            TOKEN="$(python3 - <<'PY'
+          import base64, json, os, subprocess, time, urllib.request
+          def b64url(b: bytes) -> str:
+              return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+          app_id = os.environ["GITOPS_APP_ID"].strip()
+          priv_key = os.environ["GITOPS_APP_PRIVATE_KEY"].strip()
+          owner = os.environ.get("GITOPS_REPO", "Shhinobi/k3s-gitops-prod").split("/", 1)[0]
+          now = int(time.time())
+          h = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+          p = b64url(json.dumps({"iat": now - 60, "exp": now + 300, "iss": app_id}).encode())
+          proc = subprocess.run(
+              ["bash", "-c", 'openssl dgst -sha256 -sign <(printf "%s" "$PRIV_KEY")'],
+              input=f"{h}.{p}".encode(),
+              env={"PRIV_KEY": priv_key, "PATH": "/usr/bin:/bin"},
+              capture_output=True,
+              check=True,
+          )
+          jwt_tok = f"{h}.{p}.{b64url(proc.stdout)}"
+          req = urllib.request.Request(
+              "https://api.github.com/app/installations",
+              headers={"Authorization": f"Bearer {jwt_tok}", "Accept": "application/vnd.github+json"},
+          )
+          with urllib.request.urlopen(req) as resp:
+              installs = json.loads(resp.read().decode())
+          inst_id = next(
+              (str(i["id"]) for i in installs if i.get("account", {}).get("login", "").lower() == owner.lower()),
+              str(installs[0]["id"]) if installs else "",
+          )
+          req2 = urllib.request.Request(
+              f"https://api.github.com/app/installations/{inst_id}/access_tokens",
+              method="POST",
+              headers={"Authorization": f"Bearer {jwt_tok}", "Accept": "application/vnd.github+json"},
+          )
+          with urllib.request.urlopen(req2) as resp2:
+              print(json.loads(resp2.read().decode())["token"])
+          PY
+            )"
+            echo "::add-mask::${TOKEN}"
+            echo "token=${TOKEN}" >> "$GITHUB_OUTPUT"
             echo "enabled=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "${GITOPS_TOKEN}" ]; then
+            echo "token=${GITOPS_TOKEN}" >> "$GITHUB_OUTPUT"
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Neither GITOPS_APP_ID/PRIVATE_KEY nor PLATFORM_GITOPS_TOKEN configured; skipping GitOps promotion."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout GitOps repository
@@ -246,20 +293,28 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: ${{ env.GITOPS_REPO }}
-          token: ${{ env.GITOPS_TOKEN }}
+          token: ${{ steps.check_token.outputs.token }}
           path: gitops
 
-      - name: Bump NinjaNVR image tag in GitOps manifest
+      - name: Bump NinjaNVR image tag and digest in GitOps manifests
         if: steps.check_token.outputs.enabled == 'true'
         working-directory: gitops
         run: |
           sed -i -E "s|(image:[[:space:]]*ghcr\.io/justshinobi/ninjanvr:)[^[:space:]]+|\1${IMAGE_TAG}|g" "${GITOPS_MANIFEST_PATH}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- "${GITOPS_MANIFEST_PATH}"; then
-            echo "GitOps manifest already at ${IMAGE_TAG}; nothing to commit."
+          if [ -f "${GITOPS_KUSTOMIZATION_PATH}" ]; then
+            sed -i -E "s|(newTag:[[:space:]]*)[^[:space:]]+|\1${IMAGE_TAG}|g" "${GITOPS_KUSTOMIZATION_PATH}"
+            if [[ "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              sed -i -E "s|(digest:[[:space:]]*)sha256:[0-9a-f]{64}|\1${IMAGE_DIGEST}|g" "${GITOPS_KUSTOMIZATION_PATH}"
+            fi
+          fi
+          git config user.name "homelab-gitops-promoter[bot]"
+          git config user.email "4292757+homelab-gitops-promoter[bot]@users.noreply.github.com"
+          if git diff --quiet -- "${GITOPS_MANIFEST_PATH}" "${GITOPS_KUSTOMIZATION_PATH}"; then
+            echo "GitOps manifest already at ${IMAGE_TAG} (${IMAGE_DIGEST}); nothing to commit."
           else
             git add "${GITOPS_MANIFEST_PATH}"
+            [ -f "${GITOPS_KUSTOMIZATION_PATH}" ] && git add "${GITOPS_KUSTOMIZATION_PATH}"
             git commit -m "chore(gitops): bump ninjanvr to ${IMAGE_TAG}"
+            git pull --rebase origin main
             git push origin HEAD:main
           fi
