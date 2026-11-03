@@ -949,7 +949,7 @@ async fn auth_gate_middleware(
                                 | "faces"
                         ) {
                             None
-                        } else if first == "export" || first == "vod" {
+                        } else if first == "vod" {
                             let after_first = rest
                                 .strip_prefix(first)
                                 .unwrap_or("")
@@ -957,6 +957,18 @@ async fn auth_gate_middleware(
                             let after_clip =
                                 after_first.strip_prefix("clip/").unwrap_or(after_first);
                             after_clip.split('/').next()
+                        } else if first == "export" {
+                            let after_first = rest
+                                .strip_prefix(first)
+                                .unwrap_or("")
+                                .trim_start_matches('/');
+                            let after_clip =
+                                after_first.strip_prefix("clip/").unwrap_or(after_first);
+                            if after_clip.contains("/start/") {
+                                after_clip.split('/').next()
+                            } else {
+                                None
+                            }
                         } else {
                             Some(first)
                         }
@@ -5017,15 +5029,19 @@ fn extract_gemini_candidate_text(resp_val: &Value) -> Option<&str> {
             .iter()
             .rev()
             .filter(|p| p.get("thought").and_then(|t| t.as_bool()) != Some(true))
-            .find_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .find_map(|p| {
+                p.get("text")
+                    .and_then(|t| t.as_str())
+                    .filter(|s| !s.trim().is_empty())
+            })
         {
             return Some(text);
         }
-        if let Some(text) = parts
-            .iter()
-            .rev()
-            .find_map(|p| p.get("text").and_then(|t| t.as_str()))
-        {
+        if let Some(text) = parts.iter().rev().find_map(|p| {
+            p.get("text")
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.trim().is_empty())
+        }) {
             return Some(text);
         }
     }
@@ -14207,5 +14223,298 @@ cameras:
         assert_eq!(events_arr[0]["data"]["recognized_license_plate"], "BRA2E19");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn genai_parsers_scrub_secrets_skip_gemini_thoughts_filter_models_and_parse_annotations() {
+        // 1. scrub_genai_secret_in_error masks active key without corrupting masked/empty keys
+        assert_eq!(
+            scrub_genai_secret_in_error(
+                "HTTP 401 from https://api.example.invalid?key=sk-secret-999".to_string(),
+                "sk-secret-999"
+            ),
+            "HTTP 401 from https://api.example.invalid?key=***"
+        );
+        assert_eq!(
+            scrub_genai_secret_in_error("normal error".to_string(), "***"),
+            "normal error"
+        );
+
+        // 2. build_effective_genai_config honors overrides, ignores "***", and clears key on clear_api_key
+        let saved = ninjanvr_config::GenAiConfig {
+            provider: "gemini".to_string(),
+            base_url: Some("https://saved.example.invalid".to_string()),
+            api_key: Some("sk-saved".to_string()),
+            api_key_env: "SAVED_ENV".to_string(),
+            ..Default::default()
+        };
+        let masked_req = GenAiValidateRequest {
+            provider: Some(" openai ".to_string()),
+            base_url: Some("   ".to_string()),
+            api_key: Some("***".to_string()),
+            api_key_env: Some("OPENAI_API_KEY".to_string()),
+            clear_api_key: Some(false),
+            validate: None,
+        };
+        let eff_masked = build_effective_genai_config(&saved, &masked_req);
+        assert_eq!(eff_masked.provider, "openai");
+        assert_eq!(eff_masked.base_url, None);
+        assert_eq!(eff_masked.api_key.as_deref(), Some("sk-saved"));
+        assert_eq!(eff_masked.api_key_env, "OPENAI_API_KEY");
+
+        let clear_req = GenAiValidateRequest {
+            provider: None,
+            base_url: None,
+            api_key: Some("sk-ignored".to_string()),
+            api_key_env: None,
+            clear_api_key: Some(true),
+            validate: None,
+        };
+        let eff_cleared = build_effective_genai_config(&saved, &clear_req);
+        assert_eq!(eff_cleared.api_key, None);
+
+        // 3. extract_models_from_provider_payload filters non-vision/embedding models for Gemini & OpenAI
+        let gemini_payload = json!({
+            "models": [
+                {
+                    "name": "models/gemini-2.5-flash",
+                    "supportedGenerationMethods": ["generateContent", "countTokens"]
+                },
+                {
+                    "name": "models/text-embedding-004",
+                    "supportedGenerationMethods": ["embedContent"]
+                },
+                {
+                    "name": "models/imagen-3.0-generate-002",
+                    "supportedGenerationMethods": ["generateContent"]
+                },
+                {
+                    "name": "models/veo-2.0-generate-001",
+                    "supportedGenerationMethods": ["generateContent"]
+                }
+            ]
+        });
+        assert_eq!(
+            extract_models_from_provider_payload("gemini", &gemini_payload),
+            vec!["gemini-2.5-flash".to_string()]
+        );
+
+        let openai_payload = json!({
+            "data": [
+                { "id": "gpt-4o-mini" },
+                { "id": "whisper-1" },
+                { "id": "tts-1-hd" },
+                { "id": "dall-e-3" },
+                { "id": "text-embedding-3-small" }
+            ]
+        });
+        assert_eq!(
+            extract_models_from_provider_payload("openai", &openai_payload),
+            vec!["gpt-4o-mini".to_string()]
+        );
+
+        // 4. extract_gemini_candidate_text & parse_ai_judge_json_verdict skip "thought": true parts
+        let gemini_thinking_resp = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {
+                            "thought": true,
+                            "text": "Let me analyze the shadow near the porch..."
+                        },
+                        {
+                            "text": "```json\n{\"is_true_positive\": false, \"confidence\": 0.94, \"reason\": \"Moving tree branch shadow\"}\n```"
+                        },
+                        {
+                            "text": "   ",
+                            "thoughtSignature": "trailing_empty_signature_part"
+                        }
+                    ]
+                }
+            }]
+        });
+        let (is_tp, conf, reason) = parse_ai_judge_json_verdict(&gemini_thinking_resp).unwrap();
+        assert!(!is_tp);
+        assert!((conf - 0.94).abs() < 1e-6);
+        assert_eq!(reason, "Moving tree branch shadow");
+
+        // 5. parse_ai_auto_annotations converts Gemini box_2d [ymin, xmin, ymax, xmax] (0..1000)
+        // and pixel-space bbox into normalized YOLO [cx, cy, w, h] while skipping unknown labels
+        let annotate_resp = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "thought": true, "text": "Detecting objects in frame..." },
+                        {
+                            "text": "```JSON\n[{\"label\": \"person\", \"box_2d\": [100, 200, 500, 400], \"score\": 0.96}, {\"label\": \"License-Plate\", \"bbox\": [640, 360, 768, 432], \"confidence\": 0.89}, {\"label\": \"alien_spaceship\", \"box_2d\": [0, 0, 100, 100]}]\n```"
+                        }
+                    ]
+                }
+            }]
+        });
+        let boxes = parse_ai_auto_annotations(&annotate_resp, 1280, 720).unwrap();
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0].class_id, 0);
+        assert_eq!(boxes[0].label, "person");
+        // box_2d [ymin=100, xmin=200, ymax=500, xmax=400] -> xmin=0.2, ymin=0.1, xmax=0.4, ymax=0.5 -> cx=0.3, cy=0.3, w=0.2, h=0.4
+        assert!((boxes[0].cx - 0.3).abs() < 1e-5);
+        assert!((boxes[0].cy - 0.3).abs() < 1e-5);
+        assert!((boxes[0].w - 0.2).abs() < 1e-5);
+        assert!((boxes[0].h - 0.4).abs() < 1e-5);
+        assert_eq!(boxes[1].class_id, 7);
+        assert_eq!(boxes[1].label, "license_plate");
+    }
+
+    #[tokio::test]
+    async fn security_helpers_pkce_protected_paths_share_tokens_range_mp4_and_onvif_status_work() {
+        // 1. is_protected_path matrix
+        for public_path in [
+            "/",
+            "/login",
+            "/logout",
+            "/api/login",
+            "/api/logout",
+            "/api/auth/first_time_login",
+            "/api/auth/providers",
+            "/api/auth/oidc/login",
+            "/api/auth/oidc/callback",
+            "/api/ui/switch",
+            "/api/ui/version",
+            "/share/some_token",
+        ] {
+            assert!(
+                !is_protected_path(public_path),
+                "path '{public_path}' must be public"
+            );
+        }
+        for protected_path in [
+            "/api",
+            "/api/config",
+            "/api/events",
+            "/vod/front_door/start/1/end/2/master.m3u8",
+            "/vod/clip/front_door/start/1/end/2/master.m3u8",
+            "/live/mse/api/ws",
+            "/ws",
+            "/clips/front_door-123.webp",
+            "/recordings/2026-11-02/14/front_door/05.10.mp4",
+            "/exports/exp_1.mp4",
+        ] {
+            assert!(
+                is_protected_path(protected_path),
+                "path '{protected_path}' must be protected"
+            );
+        }
+
+        // 2. generate_pkce_pair S256 challenge verification + urlencoding_simple + resolve_external_base_url
+        let (state_hex, verifier, challenge) = generate_pkce_pair();
+        assert_eq!(state_hex.len(), 32);
+        let expected_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
+        assert_eq!(challenge, expected_challenge);
+        assert_eq!(
+            urlencoding_simple("https://nvr.example.invalid/cb?a=1&b=two words"),
+            "https%3A%2F%2Fnvr.example.invalid%2Fcb%3Fa%3D1%26b%3Dtwo%20words"
+        );
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        hdrs.insert(
+            "x-forwarded-host",
+            "nvr.example.invalid:8443, internal".parse().unwrap(),
+        );
+        let uri: Uri = "/api/auth/oidc/login".parse().unwrap();
+        assert_eq!(
+            resolve_external_base_url(&hdrs, &uri),
+            "https://nvr.example.invalid:8443"
+        );
+
+        // 3. sign_share_token & verify_share_token (valid, expired, tampered, malformed)
+        let payload = ShareTokenPayload {
+            k: "export".to_string(),
+            id: "exp_01".to_string(),
+            exp: 2_000,
+        };
+        let token = sign_share_token("top_secret_hmac_key", &payload);
+        let verified = verify_share_token("top_secret_hmac_key", &token, 1_500).unwrap();
+        assert_eq!(verified.id, "exp_01");
+        assert_eq!(
+            verify_share_token("top_secret_hmac_key", &token, 2_000).unwrap_err(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            verify_share_token("wrong_key", &token, 1_500).unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            verify_share_token("top_secret_hmac_key", "no_dot_separator", 1_500).unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 4. serve_mp4_bytes_with_range (open-ended range, clamped end, invalid range fallback)
+        let sample_mp4 = b"0123456789ABCDEF".to_vec();
+        let mut range_hdrs = HeaderMap::new();
+        range_hdrs.insert(header::RANGE, "bytes=10-".parse().unwrap());
+        let resp_open = serve_mp4_bytes_with_range(sample_mp4.clone(), &range_hdrs);
+        assert_eq!(resp_open.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp_open.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 10-15/16"
+        );
+        let body_open = to_bytes(resp_open.into_body(), 64).await.unwrap();
+        assert_eq!(&body_open[..], b"ABCDEF");
+
+        range_hdrs.insert(header::RANGE, "bytes=12-9999".parse().unwrap());
+        let resp_clamped = serve_mp4_bytes_with_range(sample_mp4.clone(), &range_hdrs);
+        assert_eq!(resp_clamped.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp_clamped.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 12-15/16"
+        );
+
+        range_hdrs.insert(header::RANGE, "bytes=10-4".parse().unwrap());
+        let resp_invalid = serve_mp4_bytes_with_range(sample_mp4.clone(), &range_hdrs);
+        assert_eq!(resp_invalid.status(), StatusCode::OK);
+
+        // 5. parse_onvif_status_xml, continuous/relative move SOAP builders, and resolve_recording_disk_path
+        let status_xml = r#"
+        <s:Envelope>
+            <s:Body>
+                <tptz:GetStatusResponse>
+                    <tptz:PTZStatus>
+                        <tt:Position>
+                            <tt:PanTilt x="-0.45" y="0.80"/>
+                            <tt:Zoom x="0.25"/>
+                        </tt:Position>
+                        <tt:MoveStatus><tt:PanTilt>moving</tt:PanTilt></tt:MoveStatus>
+                        <tt:Error>NoError</tt:Error>
+                    </tptz:PTZStatus>
+                </tptz:GetStatusResponse>
+            </s:Body>
+        </s:Envelope>
+        "#;
+        let parsed_status = parse_onvif_status_xml(status_xml);
+        assert!((parsed_status.pan - (-0.45)).abs() < 1e-4);
+        assert!((parsed_status.tilt - 0.80).abs() < 1e-4);
+        assert!((parsed_status.zoom - 0.25).abs() < 1e-4);
+        assert_eq!(parsed_status.move_status, "MOVING");
+        assert_eq!(parsed_status.error, None);
+
+        let cont_soap =
+            build_onvif_continuous_move_soap("Profile_1", -2.0, 0.5, 0.0, 120, None, None);
+        assert!(cont_soap.contains("<tt:PanTilt x=\"-1.0000\" y=\"0.5000\"/>"));
+        assert!(cont_soap.contains("<tptz:Timeout>PT60S</tptz:Timeout>"));
+
+        let rel_soap =
+            build_onvif_relative_move_soap("Profile_1", 0.2, -0.2, 0.1, Some(0.01), None, None);
+        assert!(rel_soap.contains("<tptz:RelativeMove>"));
+        assert!(rel_soap.contains("<tt:PanTilt x=\"0.0500\" y=\"0.0500\"/>"));
+
+        assert_eq!(
+            resolve_recording_disk_path(
+                Path::new("/custom/media"),
+                "/media/ninjanvr/recordings/2026-11-02/14/front_door/05.10.mp4"
+            ),
+            PathBuf::from("/custom/media/recordings/2026-11-02/14/front_door/05.10.mp4")
+        );
     }
 }
