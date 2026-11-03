@@ -271,13 +271,11 @@ pub struct DetectorPool {
 impl DetectorPool {
     pub fn new(config: &NinjaConfig) -> Self {
         let default_detector = Arc::new(AiDetectorEngine::new(config));
-        let mut detectors = BTreeMap::new();
-        for (name, entry) in &config.detectors {
-            detectors.insert(
-                name.clone(),
-                Arc::new(AiDetectorEngine::new_for_entry(config, entry)),
-            );
-        }
+        let detectors = default_detector
+            .pool
+            .lock()
+            .expect("detector pool mutex poisoned")
+            .clone();
         Self {
             default_detector,
             detectors,
@@ -2071,9 +2069,13 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     ((dot / denom) as f32).clamp(-1.0, 1.0)
 }
 
-/// Computes a deterministic 512-dimensional L2-normalized face embedding descriptor from raw
-/// face crop or image bytes (`[f32; 512]`). Identical inputs produce cosine similarity `1.0`,
-/// while distinct inputs produce signed zero-mean projections with near-zero similarity.
+/// Computes a deterministic 512-dimensional L2-normalized face embedding descriptor from either
+/// an encoded image (`JPEG`, `WebP`, `PNG`), a raw `N x N x 3` RGB face crop (`112x112x3`), or
+/// arbitrary fallback bytes (`[f32; 512]`).
+///
+/// When `data` is a decodable image or a raw square RGB crop, it computes a 16x16 spatial
+/// zero-mean luma/chroma + directional gradient descriptor so that an enrolled `.jpg`/`.webp`
+/// face photo matches a live camera `112x112x3` RGB crop despite re-encoding or minor sensor noise.
 pub fn compute_fallback_face_embedding(data: &[u8]) -> Vec<f32> {
     let mut out = vec![0.0f32; FACE_EMBEDDING_DIM];
     if data.is_empty() {
@@ -2081,7 +2083,46 @@ pub fn compute_fallback_face_embedding(data: &[u8]) -> Vec<f32> {
         return out;
     }
 
-    // Compute a content digest over the entire byte slice using 64-bit SplitMix/FNV mixing
+    if let Some(grid) = ninjanvr_vision::decode_or_extract_rgb_grid_16x16(data) {
+        let mut luma = [0.0f32; 256];
+        let mut mean_y = 0.0f32;
+        let mut mean_rg = 0.0f32;
+        let mut mean_yb = 0.0f32;
+        for (i, &[r, g, b]) in grid.iter().enumerate() {
+            let y = 0.299 * r + 0.587 * g + 0.114 * b;
+            luma[i] = y;
+            mean_y += y;
+            mean_rg += r - g;
+            mean_yb += 0.5 * (r + g) - b;
+        }
+        mean_y /= 256.0;
+        mean_rg /= 256.0;
+        mean_yb /= 256.0;
+
+        for gy in 0..16usize {
+            for gx in 0..16usize {
+                let idx = gy * 16 + gx;
+                let [r, g, b] = grid[idx];
+                let y_centered = luma[idx] - mean_y;
+                let rg_centered = (r - g) - mean_rg;
+                let yb_centered = (0.5 * (r + g) - b) - mean_yb;
+
+                let x_left = gx.saturating_sub(1);
+                let x_right = (gx + 1).min(15);
+                let y_up = gy.saturating_sub(1);
+                let y_down = (gy + 1).min(15);
+                let grad_x = luma[gy * 16 + x_right] - luma[gy * 16 + x_left];
+                let grad_y = luma[y_down * 16 + gx] - luma[y_up * 16 + gx];
+
+                out[idx * 2] = y_centered + 0.65 * rg_centered + 0.45 * grad_x;
+                out[idx * 2 + 1] = grad_y + 0.65 * yb_centered - 0.35 * y_centered;
+            }
+        }
+        l2_normalize_embedding(&mut out);
+        return out;
+    }
+
+    // Fallback content digest for non-image byte buffers using 64-bit SplitMix/FNV mixing
     let mut base_hash: u64 = 0xcbf2_9ce4_8422_2325;
     for (idx, &b) in data.iter().enumerate() {
         base_hash ^= (b as u64).wrapping_add((idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
@@ -2098,7 +2139,6 @@ pub fn compute_fallback_face_embedding(data: &[u8]) -> Vec<f32> {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^= z >> 31;
-        // Map to signed [-1.0, 1.0] so independent face crops are quasi-orthogonal in R^512
         let unit = ((z >> 11) as f64) / ((1u64 << 53) as f64);
         *slot = (unit * 2.0 - 1.0) as f32;
     }
@@ -4095,5 +4135,191 @@ version: 0.18-0
             let expected_score = 0.96 - (cls_idx as f32) * 0.01;
             assert!((dets[cls_idx].score - expected_score).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn sanitize_face_profile_name_blocks_traversal_reserved_names_and_strips_symbols() {
+        for forbidden in [
+            "",
+            "   ",
+            "..",
+            "../etc/passwd",
+            "alice/bob",
+            "alice\\bob",
+            "unknown",
+            "UNKNOWN",
+            "  Unknown  ",
+            "!!!@@@###",
+        ] {
+            assert_eq!(
+                sanitize_face_profile_name(forbidden),
+                None,
+                "input '{forbidden}' must be rejected"
+            );
+        }
+
+        assert_eq!(
+            sanitize_face_profile_name("  João_Silva-01!@# "),
+            Some("João_Silva-01".to_string())
+        );
+        assert_eq!(
+            sanitize_face_profile_name("Maria Clara"),
+            Some("Maria Clara".to_string())
+        );
+    }
+
+    #[test]
+    fn license_plate_normalization_lookup_ctc_softmax_and_voter_window_eviction() {
+        // 1. normalize_license_plate & lookup_known_plate
+        assert_eq!(normalize_license_plate(" bra-2e19! "), "BRA2E19");
+        assert_eq!(normalize_license_plate("---"), "");
+
+        let mut known = BTreeMap::new();
+        known.insert("bra-2e19".to_string(), "Courier Van".to_string());
+        known.insert("XYZ9876".to_string(), "Visitor Sedan".to_string());
+        assert_eq!(
+            lookup_known_plate("BRA2E19", &known),
+            Some("Courier Van".to_string())
+        );
+        assert_eq!(
+            lookup_known_plate("xyz-9876", &known),
+            Some("Visitor Sedan".to_string())
+        );
+        assert_eq!(lookup_known_plate("???", &known), None);
+        assert_eq!(lookup_known_plate("AAA0000", &known), None);
+
+        // 2. decode_lpr_ctc_logits guard clauses, all-blank sequence, and raw logit softmax branch
+        assert!(decode_lpr_ctc_logits(&[], 0, 37, 0).is_none());
+        assert!(decode_lpr_ctc_logits(&[1.0, 2.0], 2, 1, 0).is_none());
+        assert!(decode_lpr_ctc_logits(&[1.0, 2.0], 2, 4, 0).is_none());
+
+        // All-blank timesteps (blank_idx = 0) -> None
+        let all_blank = vec![5.0, -2.0, -1.0, 6.0, -3.0, -2.0];
+        assert!(decode_lpr_ctc_logits(&all_blank, 2, 3, 0).is_none());
+
+        // Raw unnormalized logits outside [0.0, 1.0]:
+        // blank_idx = 0, class 1 = '0', class 11 = 'A'
+        let num_classes = 37;
+        let mut raw_logits = vec![-5.0f32; 3 * num_classes];
+        raw_logits[11] = 8.0; // t=0 -> 'A'
+        raw_logits[num_classes + 11] = 8.0; // t=1 -> repeated 'A' (collapsed)
+        raw_logits[2 * num_classes + 1] = 8.0; // t=2 -> '0'
+        let decoded = decode_lpr_ctc_logits(&raw_logits, 3, num_classes, 0).unwrap();
+        assert_eq!(decoded.text, "A0");
+        assert_eq!(decoded.char_confidences.len(), 2);
+        assert!(decoded.confidence > 0.99 && decoded.confidence <= 1.0);
+
+        // 3. LprTrackVoter rolling window eviction (max_window = 3) and remove_track
+        let lpr_cfg = LprConfig {
+            min_confidence: 0.70,
+            ..Default::default()
+        };
+        let mut voter = LprTrackVoter::new(3);
+        let _ = voter.record_read("trk-1", OcrPlateRead::new("AAA1111", 0.95), &lpr_cfg);
+        let _ = voter.record_read("trk-1", OcrPlateRead::new("AAA1111", 0.95), &lpr_cfg);
+        // Push 3 newer reads of "BBB2222" so both "AAA1111" reads are evicted from the 3-slot window
+        let _ = voter.record_read("trk-1", OcrPlateRead::new("BBB2222", 0.90), &lpr_cfg);
+        let _ = voter.record_read("trk-1", OcrPlateRead::new("BBB2222", 0.90), &lpr_cfg);
+        let consensus = voter
+            .record_read("trk-1", OcrPlateRead::new("BBB2222", 0.90), &lpr_cfg)
+            .unwrap();
+        assert_eq!(consensus.plate, "BBB2222");
+        assert_eq!(consensus.votes, 3);
+        assert_eq!(
+            voter.consensus_for_track("trk-1", &lpr_cfg).unwrap().plate,
+            "BBB2222"
+        );
+        assert_eq!(voter.remove_track("trk-1").unwrap().len(), 3);
+        assert!(voter.consensus_for_track("trk-1", &lpr_cfg).is_none());
+    }
+
+    #[test]
+    fn face_embedding_matches_encoded_image_against_raw_rgb_crop_and_shares_detector_pool() {
+        // 1. Build two visually distinct 112x112 RGB face crops
+        let mut face_alice_rgb = vec![0u8; 112 * 112 * 3];
+        let mut face_bob_rgb = vec![0u8; 112 * 112 * 3];
+        for y in 0..112usize {
+            for x in 0..112usize {
+                let idx = (y * 112 + x) * 3;
+                // Alice: warm skin-tone center oval with dark top hair band
+                let in_hair = y < 28;
+                let in_eyes =
+                    (40..52).contains(&y) && ((28..46).contains(&x) || (66..84).contains(&x));
+                if in_hair || in_eyes {
+                    face_alice_rgb[idx] = 30;
+                    face_alice_rgb[idx + 1] = 25;
+                    face_alice_rgb[idx + 2] = 20;
+                } else {
+                    face_alice_rgb[idx] = 220;
+                    face_alice_rgb[idx + 1] = 175;
+                    face_alice_rgb[idx + 2] = 145;
+                }
+
+                // Bob: cool background with bright bottom beard/collar gradient
+                let dx = (x as f32) - 56.0;
+                let dy = (y as f32) - 56.0;
+                if dx * dx + dy * dy < 900.0 {
+                    face_bob_rgb[idx] = 45;
+                    face_bob_rgb[idx + 1] = 90;
+                    face_bob_rgb[idx + 2] = 210;
+                } else {
+                    face_bob_rgb[idx] = (y as u8).saturating_mul(2);
+                    face_bob_rgb[idx + 1] = 230u8.saturating_sub(x as u8);
+                    face_bob_rgb[idx + 2] = 60;
+                }
+            }
+        }
+
+        // Encode Alice's crop as WebP (simulating /api/faces enrollment file on disk)
+        let alice_img =
+            ninjanvr_vision::RgbImage::from_raw(112, 112, face_alice_rgb.clone()).unwrap();
+        let alice_webp = ninjanvr_vision::encode_image_webp(&alice_img).unwrap();
+
+        // Add +/- 4 sensor noise to Alice's raw 112x112x3 RGB buffer (simulating live pipeline.rs crop)
+        let noisy_alice_raw: Vec<u8> = face_alice_rgb
+            .iter()
+            .enumerate()
+            .map(|(i, &px)| {
+                if i % 2 == 0 {
+                    px.saturating_add(4)
+                } else {
+                    px.saturating_sub(4)
+                }
+            })
+            .collect();
+
+        let emb_enrolled_webp = extract_face_embedding(&alice_webp);
+        let emb_live_raw = extract_face_embedding(&noisy_alice_raw);
+        let emb_bob_raw = extract_face_embedding(&face_bob_rgb);
+
+        let sim_same = cosine_similarity(&emb_enrolled_webp, &emb_live_raw);
+        let sim_diff = cosine_similarity(&emb_enrolled_webp, &emb_bob_raw);
+        assert!(
+            sim_same >= 0.90,
+            "enrolled WebP face must match noisy live 112x112x3 RGB crop (got {sim_same})"
+        );
+        assert!(
+            sim_diff < 0.40,
+            "distinct face pattern must have low cosine similarity (got {sim_diff})"
+        );
+
+        // 2. Verify DetectorPool::new reuses the Arc instances created by AiDetectorEngine::new
+        let yaml = r#"
+detectors:
+  cpu_a:
+    type: openvino
+    device: CPU
+  cpu_b:
+    type: onnxruntime
+    device: CPU
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/pool_dedup.yml")).unwrap();
+        let pool = DetectorPool::new(&cfg);
+        let from_pool = pool.get(Some("cpu_a"));
+        let from_default = pool.default_detector.named_detector(Some("cpu_a")).unwrap();
+        assert!(
+            Arc::ptr_eq(&from_pool, &from_default),
+            "DetectorPool must share Arc<AiDetectorEngine> instances rather than loading models twice"
+        );
     }
 }

@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use anyhow::Result;
-use image::{ImageFormat, Rgb, RgbImage};
+pub use image::RgbImage;
+use image::{ImageFormat, Rgb};
 use ninjanvr_config::{MotionConfig, StateRoiConfig};
 use ninjanvr_media::YuvFrame;
 use serde::{Deserialize, Serialize};
@@ -35,7 +36,7 @@ impl BoundingBox {
     }
 
     pub fn area(&self) -> u32 {
-        self.width() * self.height()
+        self.width().saturating_mul(self.height())
     }
 
     pub fn center(&self) -> (f32, f32) {
@@ -448,6 +449,12 @@ impl SimdMotionDetector {
         let mut active_pixels = 0usize;
 
         for i in 0..self.work_blurred.len() {
+            if self.masked_bitmap[i] {
+                self.avg_frame[i] = 255.0;
+                self.avg_delta[i] = 0.0;
+                self.work_thresh[i] = 0;
+                continue;
+            }
             let px = self.work_blurred[i];
             let avg_u8 = self.avg_frame[i].round().clamp(0.0, 255.0) as u8;
             let frame_delta = px.abs_diff(avg_u8);
@@ -672,6 +679,8 @@ impl SimdMotionDetector {
                                 if self.osd_tick_counts[idx] >= 2 && !self.masked_bitmap[idx] {
                                     self.masked_bitmap[idx] = true;
                                     self.masked_indices.push(idx);
+                                    self.avg_frame[idx] = 255.0;
+                                    self.avg_delta[idx] = 0.0;
                                     self.auto_masked_count += 1;
                                 }
                             }
@@ -1716,6 +1725,62 @@ impl CameraRoiStateMonitor {
     }
 }
 
+/// Decodes an encoded image (`JPEG`, `WebP`, `PNG`) or a raw square `N x N x 3` RGB pixel buffer
+/// (such as `112x112x3`) into a `16 x 16` area-averaged `[R, G, B]` grid (`256` cells in `0.0..=1.0`).
+/// Returns `None` if `data` is neither a decodable image nor a valid square RGB pixel buffer.
+pub fn decode_or_extract_rgb_grid_16x16(data: &[u8]) -> Option<[[f32; 3]; 256]> {
+    let (raw_rgb, w, h): (std::borrow::Cow<'_, [u8]>, usize, usize) =
+        if let Ok(dyn_img) = image::load_from_memory(data) {
+            let rgb = dyn_img.to_rgb8();
+            let (iw, ih) = (rgb.width() as usize, rgb.height() as usize);
+            if iw < 8 || ih < 8 {
+                return None;
+            }
+            (std::borrow::Cow::Owned(rgb.into_raw()), iw, ih)
+        } else if data.len() >= 16 * 16 * 3 && data.len().is_multiple_of(3) {
+            let px_count = data.len() / 3;
+            let side = (px_count as f64).sqrt().round() as usize;
+            if side >= 16 && side * side == px_count {
+                (std::borrow::Cow::Borrowed(data), side, side)
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+
+    let mut grid = [[0.0f32; 3]; 256];
+    for gy in 0..16usize {
+        let y0 = (gy * h) / 16;
+        let y1 = (((gy + 1) * h) / 16).max(y0 + 1).min(h);
+        for gx in 0..16usize {
+            let x0 = (gx * w) / 16;
+            let x1 = (((gx + 1) * w) / 16).max(x0 + 1).min(w);
+            let mut sum_r = 0u64;
+            let mut sum_g = 0u64;
+            let mut sum_b = 0u64;
+            let mut count = 0u64;
+            for py in y0..y1 {
+                let row_off = py * w * 3;
+                for px in x0..x1 {
+                    let idx = row_off + px * 3;
+                    sum_r += raw_rgb[idx] as u64;
+                    sum_g += raw_rgb[idx + 1] as u64;
+                    sum_b += raw_rgb[idx + 2] as u64;
+                    count += 1;
+                }
+            }
+            let denom = (count.max(1) as f32) * 255.0;
+            grid[gy * 16 + gx] = [
+                (sum_r as f32) / denom,
+                (sum_g as f32) / denom,
+                (sum_b as f32) / denom,
+            ];
+        }
+    }
+    Some(grid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2381,5 +2446,84 @@ mod tests {
             monitor.current_states().get("gate").map(String::as_str),
             Some("open")
         );
+    }
+
+    #[test]
+    fn bounding_box_geometry_methods_normalize_and_compute_overlap_metrics() {
+        // Reversed coordinates are automatically sorted on construction
+        let b = BoundingBox::new(300, 400, 100, 200);
+        assert_eq!(b.x_min, 100);
+        assert_eq!(b.y_min, 200);
+        assert_eq!(b.x_max, 300);
+        assert_eq!(b.y_max, 400);
+        assert_eq!(b.width(), 200);
+        assert_eq!(b.height(), 200);
+        assert_eq!(b.area(), 40_000);
+        assert_eq!(b.center(), (200.0, 300.0));
+        assert_eq!(b.bottom_center(), (200.0, 400.0));
+
+        // Identical boxes -> IoU = 1.0, intersection_over_min = 1.0
+        assert!((b.iou(&b) - 1.0).abs() < 1e-6);
+        assert!((b.intersection_over_min(&b) - 1.0).abs() < 1e-6);
+
+        // Nested box -> inside = true, intersection_over_min = 1.0, IoU = 0.25
+        let inner = BoundingBox::new(150, 250, 250, 350);
+        assert!(inner.inside(&b));
+        assert!(!b.inside(&inner));
+        assert!(b.intersects(&inner));
+        assert!((inner.intersection_over_min(&b) - 1.0).abs() < 1e-6);
+        assert!((inner.iou(&b) - 0.25).abs() < 1e-6);
+        assert_eq!(inner.union(&b), b);
+
+        // Edge-touching / disjoint boxes -> intersects = false, IoU = 0.0
+        let touching = BoundingBox::new(300, 200, 400, 400);
+        assert!(!b.intersects(&touching));
+        assert_eq!(b.iou(&touching), 0.0);
+        assert_eq!(b.intersection_over_min(&touching), 0.0);
+
+        // Zero-area degenerate box -> IoU = 0.0, intersection_over_min = 0.0
+        let zero = BoundingBox::new(150, 250, 150, 250);
+        assert_eq!(zero.area(), 0);
+        assert_eq!(zero.iou(&b), 0.0);
+        assert_eq!(zero.intersection_over_min(&b), 0.0);
+
+        // Normalized [x, y, w, h] and zero-dimension frame safety
+        let norm = b.to_normalized(1000, 1000);
+        assert!((norm[0] - 0.1).abs() < 1e-6);
+        assert!((norm[1] - 0.2).abs() < 1e-6);
+        assert!((norm[2] - 0.2).abs() < 1e-6);
+        assert!((norm[3] - 0.2).abs() < 1e-6);
+        let norm_zero = b.to_normalized(0, 0);
+        assert_eq!(norm_zero, [100.0, 200.0, 200.0, 200.0]);
+    }
+
+    #[test]
+    fn compute_inference_regions_merges_proximate_boxes_and_clamps_square_crops() {
+        assert!(compute_inference_regions(1920, 1080, 320, &[], &[]).is_empty());
+
+        // Motion box completely inside a tracked box is deduplicated into a single crop
+        let tracked = [BoundingBox::new(100, 100, 260, 260)];
+        let inside_motion = [BoundingBox::new(120, 120, 200, 200)];
+        let regs_dedup = compute_inference_regions(1920, 1080, 320, &inside_motion, &tracked);
+        assert_eq!(regs_dedup.len(), 1);
+        assert_eq!(regs_dedup[0].width(), 320);
+        assert_eq!(regs_dedup[0].height(), 320);
+
+        // Two proximate motion boxes within pad (320 / 8 = 40px) merge into 1 region,
+        // while a distant box near the bottom-right corner produces a second clamped region
+        let motion = [
+            BoundingBox::new(100, 100, 180, 180),
+            BoundingBox::new(205, 110, 270, 190),
+            BoundingBox::new(1820, 980, 1915, 1075),
+        ];
+        let regs = compute_inference_regions(1920, 1080, 320, &motion, &[]);
+        assert_eq!(regs.len(), 2);
+        for r in &regs {
+            assert!(r.width() >= 320);
+            assert_eq!(r.width(), r.height());
+            assert_eq!(r.width() % 4, 0);
+            assert!(r.x_max <= 1920);
+            assert!(r.y_max <= 1080);
+        }
     }
 }
