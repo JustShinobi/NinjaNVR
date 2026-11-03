@@ -26,3 +26,5 @@ CLAUDE.md
 .playwright-mcp/
 local/
 .local/
+/temp/
+temp/
