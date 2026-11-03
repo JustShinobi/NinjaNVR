@@ -617,6 +617,17 @@ impl NinjaDatabase {
                 created_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_dataset_sample_cam ON dataset_sample(camera, sample_kind);
+            CREATE TABLE IF NOT EXISTS "share_link" (
+                "id" TEXT NOT NULL PRIMARY KEY,
+                "kind" TEXT NOT NULL,
+                "target_id" TEXT NOT NULL,
+                "camera" TEXT NULL,
+                "created_by" TEXT NOT NULL,
+                "created_at" REAL NOT NULL,
+                "expires_at" REAL NOT NULL,
+                "revoked" INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS "idx_share_link_target" ON "share_link" ("kind", "target_id");
             "#,
         )?;
         let _ = conn.execute(
@@ -3558,6 +3569,111 @@ impl NinjaDatabase {
         Ok(row)
     }
 
+    pub fn get_export_by_id(&self, id: &str) -> Result<Option<Value>> {
+        self.get_export(id)
+    }
+
+    fn map_share_link_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+        Ok(json!({
+            "id": r.get::<_, String>(0)?,
+            "kind": r.get::<_, String>(1)?,
+            "target_id": r.get::<_, String>(2)?,
+            "camera": r.get::<_, Option<String>>(3).ok().flatten(),
+            "created_by": r.get::<_, String>(4)?,
+            "created_at": r.get::<_, f64>(5).unwrap_or(0.0),
+            "expires_at": r.get::<_, f64>(6).unwrap_or(0.0),
+            "revoked": r.get::<_, i64>(7).unwrap_or(0) != 0,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_share_link(
+        &self,
+        id: &str,
+        kind: &str,
+        target_id: &str,
+        camera: Option<&str>,
+        created_by: &str,
+        created_at: f64,
+        expires_at: f64,
+    ) -> Result<Value> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO share_link (
+                id, kind, target_id, camera, created_by, created_at, expires_at, revoked
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+            "#,
+            params![
+                id, kind, target_id, camera, created_by, created_at, expires_at
+            ],
+        )?;
+        Ok(json!({
+            "id": id,
+            "kind": kind,
+            "target_id": target_id,
+            "camera": camera,
+            "created_by": created_by,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "revoked": false
+        }))
+    }
+
+    pub fn get_share_link(&self, id: &str) -> Result<Option<Value>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let row = conn
+            .query_row(
+                r#"
+                SELECT id, kind, target_id, camera, created_by, created_at, expires_at, revoked
+                FROM share_link
+                WHERE id = ?1
+                "#,
+                params![id],
+                Self::map_share_link_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn list_share_links(&self) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, kind, target_id, camera, created_by, created_at, expires_at, revoked
+            FROM share_link
+            ORDER BY created_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([], Self::map_share_link_row)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn revoke_share_link(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            "UPDATE share_link SET revoked = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(updated > 0)
+    }
+
+    pub fn is_share_link_revoked(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let revoked: Option<i64> = conn
+            .query_row(
+                "SELECT revoked FROM share_link WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(revoked.unwrap_or(0) != 0)
+    }
+
     pub fn insert_export(&self, exp: &ExportRow) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
@@ -6156,6 +6272,118 @@ mod tests {
 
         let distinct = db.list_distinct_sub_labels().unwrap();
         assert_eq!(distinct, vec!["Alice"]);
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn share_link_and_get_export_by_id_crud_and_revocation_transitions_work() {
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_share_links_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. get_export_by_id for existing and non-existent IDs
+        assert!(db.get_export_by_id("exp_missing").unwrap().is_none());
+        db.insert_export(&ExportRow {
+            id: "exp_share_1".to_string(),
+            camera: "front_door".to_string(),
+            name: "Incident Clip".to_string(),
+            date: 1700000500.0,
+            video_path: "/media/ninjanvr/exports/exp_share_1.mp4".to_string(),
+            thumb_path: "/media/ninjanvr/clips/exp_share_1.webp".to_string(),
+            in_progress: false,
+        })
+        .unwrap();
+
+        let exp = db.get_export_by_id("exp_share_1").unwrap().unwrap();
+        assert_eq!(exp["id"], "exp_share_1");
+        assert_eq!(exp["camera"], "front_door");
+        assert_eq!(exp["name"], "Incident Clip");
+        assert_eq!(exp["date"], 1700000500.0);
+        assert_eq!(exp["video_path"], "/media/ninjanvr/exports/exp_share_1.mp4");
+        assert_eq!(exp["thumb_path"], "/media/ninjanvr/clips/exp_share_1.webp");
+        assert_eq!(exp["in_progress"], false);
+        assert!(exp["export_case_id"].is_null());
+
+        // 2. Non-existent share link queries
+        assert!(db.get_share_link("sl_missing").unwrap().is_none());
+        assert!(!db.is_share_link_revoked("sl_missing").unwrap());
+        assert!(!db.revoke_share_link("sl_missing").unwrap());
+        assert!(db.list_share_links().unwrap().is_empty());
+
+        // 3. Insert share links with camera Some(...) and None
+        let s1 = db
+            .insert_share_link(
+                "sl_1",
+                "export",
+                "exp_share_1",
+                Some("front_door"),
+                "admin",
+                1000.0,
+                2000.0,
+            )
+            .unwrap();
+        assert_eq!(s1["id"], "sl_1");
+        assert_eq!(s1["kind"], "export");
+        assert_eq!(s1["target_id"], "exp_share_1");
+        assert_eq!(s1["camera"], "front_door");
+        assert_eq!(s1["created_by"], "admin");
+        assert_eq!(s1["created_at"], 1000.0);
+        assert_eq!(s1["expires_at"], 2000.0);
+        assert_eq!(s1["revoked"], false);
+
+        let s2 = db
+            .insert_share_link(
+                "sl_2",
+                "event",
+                "ev_share_2",
+                None,
+                "operator1",
+                1500.0,
+                3000.0,
+            )
+            .unwrap();
+        assert_eq!(s2["id"], "sl_2");
+        assert!(s2["camera"].is_null());
+        assert_eq!(s2["revoked"], false);
+
+        // 4. get_share_link and list_share_links (ordered by created_at DESC)
+        let fetched_s1 = db.get_share_link("sl_1").unwrap().unwrap();
+        assert_eq!(fetched_s1["camera"], "front_door");
+        assert_eq!(fetched_s1["revoked"], false);
+
+        let fetched_s2 = db.get_share_link("sl_2").unwrap().unwrap();
+        assert!(fetched_s2["camera"].is_null());
+
+        let listed = db.list_share_links().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["id"], "sl_2");
+        assert_eq!(listed[1]["id"], "sl_1");
+
+        // 5. Revocation state transitions and re-insertion reset
+        assert!(!db.is_share_link_revoked("sl_1").unwrap());
+        assert!(db.revoke_share_link("sl_1").unwrap());
+        assert!(db.is_share_link_revoked("sl_1").unwrap());
+        assert_eq!(db.get_share_link("sl_1").unwrap().unwrap()["revoked"], true);
+        assert!(!db.is_share_link_revoked("sl_2").unwrap());
+
+        // Replacing an existing share link resets revoked to 0
+        db.insert_share_link(
+            "sl_1",
+            "export",
+            "exp_share_1",
+            Some("front_door"),
+            "admin",
+            1800.0,
+            3600.0,
+        )
+        .unwrap();
+        assert!(!db.is_share_link_revoked("sl_1").unwrap());
+        assert_eq!(
+            db.get_share_link("sl_1").unwrap().unwrap()["revoked"],
+            false
+        );
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);

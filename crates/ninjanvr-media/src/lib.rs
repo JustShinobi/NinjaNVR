@@ -2255,9 +2255,7 @@ pub fn build_mp4_export_ffmpeg_args_with_privacy(
         "-avoid_negative_ts".to_string(),
         "make_zero".to_string(),
     ]);
-    if let Some(mask) = privacy_mask
-        && let Some(vf) = build_privacy_drawbox_filter(mask)
-    {
+    if let Some(vf) = build_privacy_drawbox_filter(privacy_mask) {
         args.extend([
             "-vf".to_string(),
             vf,
@@ -2283,24 +2281,74 @@ pub fn build_mp4_export_ffmpeg_args_with_privacy(
     args
 }
 
-/// Converts a `privacy_mask` config value (normalized or pixel polygon strings) into an FFmpeg
-/// `drawbox` video filter expression (`drawbox=x=iw*0.2:y=ih*0.2:w=iw*0.6:h=ih*0.6:color=black@1.0:t=fill`)
+/// Returns `true` when `mask` contains a non-empty privacy mask configuration.
+pub fn privacy_mask_is_configured(mask: Option<&serde_json::Value>) -> bool {
+    match mask {
+        Some(serde_json::Value::Array(arr)) => !arr.is_empty(),
+        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+        Some(serde_json::Value::Object(map)) => !map.is_empty(),
+        _ => false,
+    }
+}
+
+/// Converts a `privacy_mask` config value (normalized or pixel polygon strings, coordinate-pair
+/// arrays, or objects) into an FFmpeg `drawbox` video filter expression
+/// (`drawbox=x=iw*0.2:y=ih*0.2:w=iw*0.6:h=ih*0.6:color=#0c0e12@1.0:t=fill`)
 /// for redacting privacy regions during MP4 export transcoding.
-pub fn build_privacy_drawbox_filter(privacy_mask: &serde_json::Value) -> Option<String> {
-    fn collect_polygon_strings(val: &serde_json::Value, out: &mut Vec<String>) {
+pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<String> {
+    let privacy_mask = mask?;
+
+    fn collect_polygons(val: &serde_json::Value, out: &mut Vec<Vec<f32>>) {
         match val {
-            serde_json::Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
-            serde_json::Value::Array(arr) => {
-                for item in arr {
-                    collect_polygon_strings(item, out);
+            serde_json::Value::String(s) if !s.trim().is_empty() => {
+                let nums: Vec<f32> = s
+                    .split(',')
+                    .filter_map(|p| p.trim().parse::<f32>().ok())
+                    .collect();
+                if !nums.is_empty() {
+                    out.push(nums);
+                }
+            }
+            serde_json::Value::Array(arr) if !arr.is_empty() => {
+                if arr.iter().all(|v| v.is_number()) {
+                    let nums: Vec<f32> = arr
+                        .iter()
+                        .filter_map(|v| v.as_f64().map(|n| n as f32))
+                        .collect();
+                    if !nums.is_empty() {
+                        out.push(nums);
+                    }
+                } else if arr.iter().all(|v| {
+                    v.as_array()
+                        .is_some_and(|p| p.len() == 2 && p[0].is_number() && p[1].is_number())
+                }) {
+                    let mut nums = Vec::with_capacity(arr.len() * 2);
+                    for pair in arr.iter().filter_map(|v| v.as_array()) {
+                        if let (Some(x), Some(y)) = (pair[0].as_f64(), pair[1].as_f64()) {
+                            nums.push(x as f32);
+                            nums.push(y as f32);
+                        }
+                    }
+                    if !nums.is_empty() {
+                        out.push(nums);
+                    }
+                } else {
+                    for item in arr {
+                        collect_polygons(item, out);
+                    }
                 }
             }
             serde_json::Value::Object(map) => {
-                if let Some(coords) = map.get("coordinates").or_else(|| map.get("points")) {
-                    collect_polygon_strings(coords, out);
-                } else {
-                    for (_, nested) in map {
-                        collect_polygon_strings(nested, out);
+                let mut matched_known = false;
+                for key in ["coordinates", "points", "zones"] {
+                    if let Some(coords) = map.get(key) {
+                        collect_polygons(coords, out);
+                        matched_known = true;
+                    }
+                }
+                if !matched_known {
+                    for nested in map.values() {
+                        collect_polygons(nested, out);
                     }
                 }
             }
@@ -2308,15 +2356,11 @@ pub fn build_privacy_drawbox_filter(privacy_mask: &serde_json::Value) -> Option<
         }
     }
 
-    let mut polys: Vec<String> = Vec::new();
-    collect_polygon_strings(privacy_mask, &mut polys);
+    let mut polys: Vec<Vec<f32>> = Vec::new();
+    collect_polygons(privacy_mask, &mut polys);
     let mut filters = Vec::new();
-    for poly in polys {
-        let nums: Vec<f32> = poly
-            .split(',')
-            .filter_map(|p| p.trim().parse::<f32>().ok())
-            .collect();
-        if nums.len() < 6 || !nums.len().is_multiple_of(2) {
+    for nums in polys {
+        if nums.len() < 4 || !nums.len().is_multiple_of(2) {
             continue;
         }
         let mut x_min = f32::MAX;
@@ -2490,6 +2534,15 @@ async fn build_mp4_export_inner(
         .unwrap_or(0.0);
     let target_dur = (end_time - start_time).max(3.0);
 
+    if privacy_mask_is_configured(privacy_mask)
+        && build_privacy_drawbox_filter(privacy_mask).is_none()
+    {
+        let _ = std::fs::remove_file(&list_file);
+        anyhow::bail!(
+            "privacy mask is configured for {camera} but could not be compiled into a redaction filter"
+        );
+    }
+
     let ffmpeg_bin = resolve_ffmpeg_bin();
     let ffmpeg_args = build_mp4_export_ffmpeg_args_with_privacy(
         &list_file,
@@ -2501,25 +2554,7 @@ async fn build_mp4_export_inner(
     );
     let mut cmd = Command::new(&ffmpeg_bin);
     cmd.kill_on_drop(true);
-    let mut status = cmd.args(&ffmpeg_args).status().await;
-    if (status.as_ref().map(|s| !s.success()).unwrap_or(true)
-        || std::fs::metadata(&tmp_out_file)
-            .map(|m| m.len() < 1024)
-            .unwrap_or(true))
-        && privacy_mask.is_some()
-    {
-        let fallback_args = build_mp4_export_ffmpeg_args(
-            &list_file,
-            trim_offset,
-            target_dur,
-            include_audio,
-            &tmp_out_file,
-        );
-        status = Command::new(&ffmpeg_bin)
-            .args(&fallback_args)
-            .status()
-            .await;
-    }
+    let status = cmd.args(&ffmpeg_args).status().await;
 
     let _ = std::fs::remove_file(&list_file);
 
@@ -2528,6 +2563,12 @@ async fn build_mp4_export_inner(
             .map(|m| m.len() < 1024)
             .unwrap_or(true)
     {
+        if privacy_mask_is_configured(privacy_mask) {
+            let _ = std::fs::remove_file(&tmp_out_file);
+            anyhow::bail!(
+                "failed to redact export {export_id} with privacy mask for camera {camera}"
+            );
+        }
         std::fs::copy(&existing_paths[0], &tmp_out_file)?;
     }
 
@@ -2535,9 +2576,7 @@ async fn build_mp4_export_inner(
     std::fs::rename(&tmp_out_file, &out_file)?;
 
     // Extract a real video frame thumbnail as WebP (with RgbImage fallback and privacy mask filter)
-    let thumb_vf = if let Some(mask) = privacy_mask
-        && let Some(db_f) = build_privacy_drawbox_filter(mask)
-    {
+    let thumb_vf = if let Some(db_f) = build_privacy_drawbox_filter(privacy_mask) {
         format!("{db_f},scale=320:-1")
     } else {
         "scale=320:-1".to_string()
@@ -3069,23 +3108,67 @@ mod tests {
     #[test]
     fn privacy_drawbox_filter_and_export_ffmpeg_args_handle_normalized_and_empty_masks() {
         let mask_norm = json!(["0.10,0.20,0.50,0.20,0.50,0.80,0.10,0.80"]);
-        let vf = build_privacy_drawbox_filter(&mask_norm).expect("expected drawbox filter");
+        let vf = build_privacy_drawbox_filter(Some(&mask_norm)).expect("expected drawbox filter");
         assert_eq!(
             vf,
             "drawbox=x=iw*0.100:y=ih*0.200:w=iw*0.400:h=ih*0.600:color=#0c0e12@1.0:t=fill"
         );
 
         let mask_px = json!("100,200,500,200,500,800,100,800");
-        let vf_px = build_privacy_drawbox_filter(&mask_px).expect("expected pixel drawbox filter");
+        let vf_px =
+            build_privacy_drawbox_filter(Some(&mask_px)).expect("expected pixel drawbox filter");
         assert_eq!(
             vf_px,
             "drawbox=x=100:y=200:w=400:h=600:color=#0c0e12@1.0:t=fill"
         );
 
-        assert_eq!(build_privacy_drawbox_filter(&json!(null)), None);
-        assert_eq!(build_privacy_drawbox_filter(&json!([])), None);
-        assert_eq!(build_privacy_drawbox_filter(&json!("")), None);
-        assert_eq!(build_privacy_drawbox_filter(&json!(["0.1,0.2"])), None);
+        let mask_coord_pairs = json!([[[0.1, 0.1], [0.5, 0.5]]]);
+        let vf_pairs =
+            build_privacy_drawbox_filter(Some(&mask_coord_pairs)).expect("coordinate-pair filter");
+        assert_eq!(
+            vf_pairs,
+            "drawbox=x=iw*0.100:y=ih*0.100:w=iw*0.400:h=ih*0.400:color=#0c0e12@1.0:t=fill"
+        );
+
+        let mask_single_poly_pairs = json!([[0.2, 0.2], [0.6, 0.2], [0.6, 0.7], [0.2, 0.7]]);
+        let vf_single_pairs = build_privacy_drawbox_filter(Some(&mask_single_poly_pairs))
+            .expect("single polygon coordinate-pair filter");
+        assert_eq!(
+            vf_single_pairs,
+            "drawbox=x=iw*0.200:y=ih*0.200:w=iw*0.400:h=ih*0.500:color=#0c0e12@1.0:t=fill"
+        );
+
+        let mask_flat_nums = json!([0.1, 0.1, 0.4, 0.4]);
+        let vf_flat =
+            build_privacy_drawbox_filter(Some(&mask_flat_nums)).expect("flat number array filter");
+        assert!(vf_flat.contains("drawbox=x=iw*0.100:y=ih*0.100:w=iw*0.300:h=ih*0.300"));
+
+        let mask_zones_obj = json!({
+            "zones": [
+                { "points": [[0.1, 0.2], [0.5, 0.6]] }
+            ]
+        });
+        let vf_zones =
+            build_privacy_drawbox_filter(Some(&mask_zones_obj)).expect("zones/points filter");
+        assert!(vf_zones.contains("drawbox=x=iw*0.100:y=ih*0.200:w=iw*0.400:h=ih*0.400"));
+
+        assert!(!privacy_mask_is_configured(None));
+        assert!(!privacy_mask_is_configured(Some(&json!(null))));
+        assert!(!privacy_mask_is_configured(Some(&json!([]))));
+        assert!(!privacy_mask_is_configured(Some(&json!("  "))));
+        assert!(!privacy_mask_is_configured(Some(&json!({}))));
+        assert!(privacy_mask_is_configured(Some(&mask_norm)));
+        assert!(privacy_mask_is_configured(Some(&mask_px)));
+        assert!(privacy_mask_is_configured(Some(&mask_zones_obj)));
+
+        assert_eq!(build_privacy_drawbox_filter(None), None);
+        assert_eq!(build_privacy_drawbox_filter(Some(&json!(null))), None);
+        assert_eq!(build_privacy_drawbox_filter(Some(&json!([]))), None);
+        assert_eq!(build_privacy_drawbox_filter(Some(&json!(""))), None);
+        assert_eq!(
+            build_privacy_drawbox_filter(Some(&json!(["0.1,0.2"]))),
+            None
+        );
 
         let list_path = Path::new("/tmp/list.txt");
         let out_path = Path::new("/tmp/out.mp4");
@@ -3118,6 +3201,84 @@ mod tests {
         assert!(!args_none.iter().any(|a| a == "-vf"));
         assert!(args_none.windows(2).any(|w| w == ["-c:v", "copy"]));
         assert!(args_none.iter().any(|a| a == "-an"));
+    }
+
+    #[tokio::test]
+    async fn build_mp4_export_with_privacy_fails_closed_when_mask_active_and_redaction_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "ninjanvr-privacy-export-fail-closed-{}",
+            random_suffix()
+        ));
+        let rec_dir = root.join("recordings/2026-11-03/12/front_door");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+        let seg_path = rec_dir.join("00.00.mp4");
+        std::fs::write(&seg_path, b"UNREDACTED_RAW_SEGMENT_BYTES").unwrap();
+
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+        db.insert_recording(&ninjanvr_db::RecordingRow {
+            id: "rec_fd_priv_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-03/12/front_door/00.00.mp4".to_string(),
+            start_time: 1000.0,
+            end_time: 1010.0,
+            duration: 10.0,
+            motion: 5,
+            objects: 1,
+            dbfs: -20,
+            segment_size: 0.1,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        // 1. Invalid non-empty privacy mask -> fails closed with compilation error
+        let invalid_mask = json!(["0.1,0.2"]);
+        let err_invalid = build_mp4_export_with_privacy(
+            &db,
+            &root,
+            "exp_invalid_mask",
+            "front_door",
+            "Invalid Mask Export",
+            1000.0,
+            1010.0,
+            false,
+            Some(&invalid_mask),
+        )
+        .await
+        .expect_err("invalid non-empty privacy mask must fail closed");
+        assert!(
+            err_invalid
+                .to_string()
+                .contains("could not be compiled into a redaction filter"),
+            "unexpected error: {err_invalid}"
+        );
+        assert!(!root.join("exports/exp_invalid_mask.mp4").exists());
+
+        // 2. Valid privacy mask where ffmpeg cannot transcode raw segment -> fails closed without copying raw segment
+        let valid_mask = json!([[[0.1, 0.1], [0.5, 0.5]]]);
+        let err_redact = build_mp4_export_with_privacy(
+            &db,
+            &root,
+            "exp_valid_mask",
+            "front_door",
+            "Redacted Export",
+            1000.0,
+            1010.0,
+            false,
+            Some(&valid_mask),
+        )
+        .await
+        .expect_err("failed ffmpeg redaction must fail closed");
+        assert!(
+            err_redact
+                .to_string()
+                .contains("failed to redact export exp_valid_mask with privacy mask"),
+            "unexpected error: {err_redact}"
+        );
+        assert!(!root.join("exports/exp_valid_mask.mp4").exists());
+        assert!(db.get_export_by_id("exp_valid_mask").unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3396,14 +3557,14 @@ mod tests {
             "mode": "pixelate",
             "coordinates": "0.1,0.2,0.5,0.2,0.5,0.6,0.1,0.6"
         });
-        let f_obj = build_privacy_drawbox_filter(&obj_mask).expect("object mask filter");
+        let f_obj = build_privacy_drawbox_filter(Some(&obj_mask)).expect("object mask filter");
         assert!(f_obj.contains("drawbox=x=iw*0.100:y=ih*0.200:w=iw*0.400:h=ih*0.400"));
 
         let nested_mask = serde_json::json!({
             "neighbor_window": { "coordinates": "0.2,0.1,0.4,0.1,0.4,0.3,0.2,0.3" }
         });
         let f_nested =
-            build_privacy_drawbox_filter(&nested_mask).expect("nested object mask filter");
+            build_privacy_drawbox_filter(Some(&nested_mask)).expect("nested object mask filter");
         assert!(f_nested.contains("drawbox=x=iw*0.200:y=ih*0.100:w=iw*0.200:h=ih*0.200"));
 
         // parse_staged_start_time extracts exact UTC epoch from {camera}_%Y%m%d%H%M%S.mp4
