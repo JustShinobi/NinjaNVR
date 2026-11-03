@@ -6144,6 +6144,25 @@ version: 0.18-0
 
         let mut cfg_patch = val.clone();
         cfg_patch["cameras"]["front_door"]["detect"]["fps"] = json!(8);
+        cfg_patch["ui"] = json!({
+            "floorplan": {
+                "background_data_url": "data:image/svg+xml;base64,PHN2Zy8+",
+                "opacity": 0.65,
+                "rooms": [
+                    {
+                        "id": "escritorio",
+                        "label": "ESCRITÓRIO",
+                        "x": 0.08,
+                        "y": 0.10,
+                        "w": 0.38,
+                        "h": 0.36
+                    }
+                ],
+                "walls": [
+                    { "points": [0.08, 0.46, 0.46, 0.46] }
+                ]
+            }
+        });
         let resp_struct = app
             .clone()
             .oneshot(
@@ -6165,8 +6184,29 @@ version: 0.18-0
             struct_body["config"]["cameras"]["front_door"]["detect"]["fps"],
             8
         );
+        assert_eq!(
+            struct_body["config"]["ui"]["floorplan"]["rooms"][0]["id"],
+            "escritorio"
+        );
+        assert!(
+            (struct_body["config"]["ui"]["floorplan"]["walls"][0]["points"][0]
+                .as_f64()
+                .unwrap()
+                - 0.08)
+                .abs()
+                < 1e-4
+        );
+        assert!(
+            (struct_body["config"]["ui"]["floorplan"]["walls"][0]["points"][1]
+                .as_f64()
+                .unwrap()
+                - 0.46)
+                .abs()
+                < 1e-4
+        );
         let on_disk_yaml = std::fs::read_to_string(&ctx.cfg_path).unwrap();
         assert!(on_disk_yaml.contains("admin:supersecret@192.0.2.10:554/stream1"));
+        assert!(on_disk_yaml.contains("escritorio"));
 
         let resp_probe_err = app
             .clone()

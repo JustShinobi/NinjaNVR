@@ -279,6 +279,17 @@ export function buildCleanYamlFromDraft(
             },
           }
         : {}),
+      ...(cam.map
+        ? {
+            map: {
+              x: Number((cam.map.x ?? 0.5).toFixed(3)),
+              y: Number((cam.map.y ?? 0.5).toFixed(3)),
+              angle_deg: Number((cam.map.angle_deg ?? 0).toFixed(1)),
+              fov_deg: Number((cam.map.fov_deg ?? 90).toFixed(1)),
+              range: Number((cam.map.range ?? 0.25).toFixed(3)),
+            },
+          }
+        : {}),
     };
   }
 
@@ -378,6 +389,44 @@ export function buildCleanYamlFromDraft(
     },
     ...(draft.camera_groups && Object.keys(draft.camera_groups).length > 0
       ? { camera_groups: draft.camera_groups }
+      : {}),
+    ...(draft.ui &&
+    (draft.ui.floorplan ||
+      draft.ui.time_format !== undefined ||
+      draft.ui.unit_system !== undefined)
+      ? {
+          ui: {
+            ...(draft.ui.time_format ? { time_format: draft.ui.time_format } : {}),
+            ...(draft.ui.unit_system ? { unit_system: draft.ui.unit_system } : {}),
+            ...(draft.ui.floorplan
+              ? {
+                  floorplan: {
+                    ...(draft.ui.floorplan.background_data_url
+                      ? {
+                          background_data_url:
+                            draft.ui.floorplan.background_data_url,
+                        }
+                      : {}),
+                    opacity: Number(
+                      (draft.ui.floorplan.opacity ?? 0.45).toFixed(2)
+                    ),
+                    rooms: (draft.ui.floorplan.rooms || []).map((r) => ({
+                      id: r.id,
+                      label: r.label,
+                      x: Number(r.x.toFixed(3)),
+                      y: Number(r.y.toFixed(3)),
+                      w: Number(r.w.toFixed(3)),
+                      h: Number(r.h.toFixed(3)),
+                      ...(r.color ? { color: r.color } : {}),
+                    })),
+                    walls: (draft.ui.floorplan.walls || []).map((w) => ({
+                      points: w.points.map((p) => Number(p.toFixed(3))),
+                    })),
+                  },
+                }
+              : {}),
+          },
+        }
       : {}),
     cameras: camerasOut,
     version: draft.version || "0.18-0",

@@ -11,12 +11,16 @@ import {
 } from "../components/TacticalCameraPicker";
 import {
   MAX_DOCK_LIVE_DECODERS,
+  computeCameraAimFromTip,
   computeDefaultMapPlacement,
+  computeFovConeTipSvgPoint,
   getMatrixPageSize,
   nextMatrixTourPage,
+  normalizeFloorplanRoomRect,
   resolveDockTileMode,
   resolveOrderedDashboardCameras,
   sliceMatrixPage,
+  snapFloorplanCoord,
 } from "../views/LiveWorkspace";
 import {
   MAX_SYNC_QUAD_SLOTS,
@@ -165,6 +169,79 @@ describe("Adaptive Tactical Map ceil(sqrt(N)) coordinate placement", () => {
       // Every camera gets a unique grid cell
       expect(coords.size).toBe(total);
     }
+  });
+
+  test("computeCameraAimFromTip computes normalized angle_deg in [0, 360) and clamped range in [0.05, 0.50]", () => {
+    // East (0 deg)
+    const east = computeCameraAimFromTip(0.5, 0.5, 0.75, 0.5);
+    expect(east.angle_deg).toBe(0);
+    expect(east.range).toBe(0.25);
+
+    // South (90 deg)
+    const south = computeCameraAimFromTip(0.5, 0.5, 0.5, 0.8);
+    expect(south.angle_deg).toBe(90);
+    expect(south.range).toBe(0.3);
+
+    // West (180 deg)
+    const west = computeCameraAimFromTip(0.5, 0.5, 0.2, 0.5);
+    expect(west.angle_deg).toBe(180);
+    expect(west.range).toBe(0.3);
+
+    // North (-90 deg -> normalized to 270 deg)
+    const north = computeCameraAimFromTip(0.5, 0.5, 0.5, 0.2);
+    expect(north.angle_deg).toBe(270);
+    expect(north.range).toBe(0.3);
+
+    // North-East (-45 deg -> normalized to 315 deg)
+    const ne = computeCameraAimFromTip(0.5, 0.5, 0.7, 0.3);
+    expect(ne.angle_deg).toBe(315);
+    expect(ne.range).toBeGreaterThanOrEqual(0.05);
+    expect(ne.range).toBeLessThanOrEqual(0.5);
+
+    // Clamping range minimum (0.05) and maximum (0.50)
+    const tooClose = computeCameraAimFromTip(0.5, 0.5, 0.51, 0.5);
+    expect(tooClose.range).toBe(0.05);
+    expect(tooClose.angle_deg).toBeGreaterThanOrEqual(0);
+    expect(tooClose.angle_deg).toBeLessThan(360);
+
+    const tooFar = computeCameraAimFromTip(0.1, 0.1, 0.95, 0.95);
+    expect(tooFar.range).toBe(0.5);
+    expect(tooFar.angle_deg).toBe(45);
+
+    const svgTip = computeFovConeTipSvgPoint(500, 300, 90, 200);
+    expect(svgTip).toEqual({ x: 500, y: 500 });
+  });
+
+  test("normalizeFloorplanRoomRect normalizes drags from any corner into positive (x, y, w, h) within [0, 1]", () => {
+    // Top-left to bottom-right
+    const tlToBr = normalizeFloorplanRoomRect(0.08, 0.1, 0.46, 0.46);
+    expect(tlToBr).toEqual({ x: 0.08, y: 0.1, w: 0.38, h: 0.36 });
+
+    // Bottom-right to top-left (reversed drag)
+    const brToTl = normalizeFloorplanRoomRect(0.46, 0.46, 0.08, 0.1);
+    expect(brToTl).toEqual({ x: 0.08, y: 0.1, w: 0.38, h: 0.36 });
+
+    // Bottom-left to top-right
+    const blToTr = normalizeFloorplanRoomRect(0.1, 0.8, 0.6, 0.2);
+    expect(blToTr).toEqual({ x: 0.1, y: 0.2, w: 0.5, h: 0.6 });
+
+    // Out-of-bounds coordinates clamped strictly to [0, 1]
+    const clamped = normalizeFloorplanRoomRect(-0.25, 1.3, 0.4, 0.2);
+    expect(clamped.x).toBe(0);
+    expect(clamped.y).toBe(0.2);
+    expect(clamped.w).toBe(0.4);
+    expect(clamped.h).toBe(0.8);
+    expect(clamped.x + clamped.w).toBeLessThanOrEqual(1);
+    expect(clamped.y + clamped.h).toBeLessThanOrEqual(1);
+
+    // Zero-area click enforces minimum room dimensions
+    const zeroClick = normalizeFloorplanRoomRect(0.5, 0.5, 0.5, 0.5, 0.05);
+    expect(zeroClick.w).toBe(0.05);
+    expect(zeroClick.h).toBe(0.05);
+
+    expect(snapFloorplanCoord(0.113, 0.02)).toBe(0.12);
+    expect(snapFloorplanCoord(-0.5, 0.02)).toBe(0);
+    expect(snapFloorplanCoord(1.4, 0.02)).toBe(1);
   });
 });
 
