@@ -133,7 +133,15 @@ pub struct EventFilter {
     pub limit: Option<usize>,
 }
 
-/// Hashes a password using Frigate's exact `pbkdf2_sha256$<iterations>$<salt>$<b64>` format.
+/// Strips any `/media/<root>/` prefix (such as `/media/ninjanvr/`) and returns the relative path
+/// under the media mount (`recordings/...`, `clips/...`, `exports/...`).
+pub fn strip_media_root(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/media/")?;
+    let (_, rel) = rest.split_once('/')?;
+    if rel.is_empty() { None } else { Some(rel) }
+}
+
+/// Hashes a password using the `pbkdf2_sha256$<iterations>$<salt>$<b64>` format.
 pub fn hash_password(password: &str, salt: Option<&str>, iterations: u32) -> String {
     let owned_salt: String;
     let salt_str = match salt {
@@ -157,7 +165,7 @@ pub fn hash_password(password: &str, salt: Option<&str>, iterations: u32) -> Str
     format!("{PASSWORD_HASH_ALGORITHM}${iterations}${salt_str}${b64}")
 }
 
-/// Verifies a plaintext password against Frigate's `pbkdf2_sha256$<iterations>$<salt>$<b64>` hash.
+/// Verifies a plaintext password against a `pbkdf2_sha256$<iterations>$<salt>$<b64>` hash.
 pub fn verify_password(password: &str, password_hash: &str) -> bool {
     let parts: Vec<&str> = password_hash.splitn(4, '$').collect();
     if parts.len() != 4 {
@@ -2560,10 +2568,9 @@ impl NinjaDatabase {
         )?;
         let rows = stmt.query_map(params![camera, after, before], |r| {
             let raw_path: String = r.get(1)?;
-            let src = raw_path
-                .strip_prefix("/media/frigate")
-                .unwrap_or(&raw_path)
-                .to_string();
+            let src = strip_media_root(&raw_path)
+                .map(|rel| format!("/{rel}"))
+                .unwrap_or_else(|| raw_path.clone());
             Ok(json!({
                 "camera": r.get::<_, String>(0)?,
                 "src": src,
@@ -2689,8 +2696,8 @@ impl NinjaDatabase {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             drop(stmt);
             for id in ids {
-                files_to_remove.push(format!("/media/frigate/clips/{id}.jpg"));
-                files_to_remove.push(format!("/media/frigate/clips/{camera}-{id}.webp"));
+                files_to_remove.push(format!("/media/ninjanvr/clips/{id}.jpg"));
+                files_to_remove.push(format!("/media/ninjanvr/clips/{camera}-{id}.webp"));
                 let _ = conn.execute("DELETE FROM event WHERE id = ?1", params![id]);
             }
         }
@@ -2728,7 +2735,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pbkdf2_password_roundtrip_matches_frigate_format() {
+    fn pbkdf2_password_roundtrip_verifies_password_hash() {
         let hash = hash_password("my-secret-pass", Some("e1c16db9bfff2200"), 10_000);
         assert!(hash.starts_with("pbkdf2_sha256$10000$e1c16db9bfff2200$"));
         assert!(verify_password("my-secret-pass", &hash));
@@ -2751,7 +2758,7 @@ mod tests {
         db.insert_recording(&RecordingRow {
             id: "1700000000.0-abc".to_string(),
             camera: "front_door".to_string(),
-            path: "/media/frigate/recordings/2026-11-01/00/front_door/00.00.mp4".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-01/00/front_door/00.00.mp4".to_string(),
             start_time: 1700000000.0,
             end_time: 1700000010.0,
             duration: 10.0,
@@ -2774,7 +2781,7 @@ mod tests {
         db.insert_recording(&RecordingRow {
             id: "1700000020.0-orphan".to_string(),
             camera: "front_door".to_string(),
-            path: "/media/frigate/recordings/2026-11-01/00/front_door/00.20.mp4".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-01/00/front_door/00.20.mp4".to_string(),
             start_time: 1700000020.0,
             end_time: 1700000030.0,
             duration: 10.0,
@@ -2867,7 +2874,7 @@ mod tests {
             db.insert_recording(&RecordingRow {
                 id: format!("quota_seg_{i}"),
                 camera: "front_door".to_string(),
-                path: format!("/media/frigate/recordings/2026-11-01/01/front_door/00.{i}0.mp4"),
+                path: format!("/media/ninjanvr/recordings/2026-11-01/01/front_door/00.{i}0.mp4"),
                 start_time: 1700001000.0 + (i as f64) * 10.0,
                 end_time: 1700001010.0 + (i as f64) * 10.0,
                 duration: 10.0,

@@ -95,7 +95,7 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
                   }}
                 >
                   <img
-                    src={rev.thumb_path.replace("/media/frigate", "")}
+                    src={rev.thumb_path.replace(/^\/media\/[^/]+/, "")}
                     alt={rev.camera}
                     width={68}
                     height={40}

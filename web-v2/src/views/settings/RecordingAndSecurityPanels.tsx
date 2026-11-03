@@ -582,8 +582,8 @@ export const RecordingReviewSection: React.FC<{
                   mutateRec((r) => {
                     r.storage_tiers = {
                       enabled: v,
-                      hot_dir: r.storage_tiers?.hot_dir || "/media/frigate/recordings",
-                      cold_dir: r.storage_tiers?.cold_dir || "/media/frigate/archive",
+                      hot_dir: r.storage_tiers?.hot_dir || "/media/ninjanvr/recordings",
+                      cold_dir: r.storage_tiers?.cold_dir || "/media/ninjanvr/archive",
                       migrate_after_hours: r.storage_tiers?.migrate_after_hours ?? 24,
                     };
                   })
@@ -598,7 +598,7 @@ export const RecordingReviewSection: React.FC<{
                 <input
                   className="nvr-input mono"
                   style={{ width: "100%", marginTop: 2 }}
-                  placeholder="/media/frigate/archive"
+                  placeholder="/media/ninjanvr/archive"
                   value={activeRec.storage_tiers?.cold_dir || ""}
                   onChange={(e) =>
                     mutateRec((r) => {
@@ -658,7 +658,7 @@ export const RecordingReviewSection: React.FC<{
                   mutateRec((r) => {
                     r.alert_backup = {
                       enabled: v,
-                      target_dir: r.alert_backup?.target_dir || "/media/frigate/exports/backup",
+                      target_dir: r.alert_backup?.target_dir || "/media/ninjanvr/exports/backup",
                       severities: r.alert_backup?.severities || ["alert"],
                       include_snapshot: r.alert_backup?.include_snapshot ?? true,
                     };
@@ -673,7 +673,7 @@ export const RecordingReviewSection: React.FC<{
               <input
                 className="nvr-input mono"
                 style={{ width: "100%", marginTop: 2 }}
-                placeholder="/media/frigate/exports/backup"
+                placeholder="/media/ninjanvr/exports/backup"
                 value={activeRec.alert_backup?.target_dir || ""}
                 onChange={(e) =>
                   mutateRec((r) => {
@@ -1201,15 +1201,15 @@ export const CommsAuthUsersSection: React.FC<{
     enabled: false,
     host: "127.0.0.1",
     port: 1883,
-    topic_prefix: "frigate",
-    client_id: "frigate",
+    topic_prefix: "ninjanvr",
+    client_id: "ninjanvr",
     stats_interval: 60,
   };
 
   const authCfg: AuthConfig = draftConfig.auth || {
     enabled: true,
     reset_admin_password: false,
-    cookie_name: "frigate_token",
+    cookie_name: "ninjanvr_token",
     cookie_secure: false,
     session_length: 86400,
     refresh_time: 1800,
@@ -1564,7 +1564,7 @@ export const CommsAuthUsersSection: React.FC<{
               <input
                 className="nvr-input mono"
                 style={{ width: "100%", marginTop: 3 }}
-                value={draftConfig.database?.path || "/config/frigate.db"}
+                value={draftConfig.database?.path || "/config/ninjanvr.db"}
                 onChange={(e) =>
                   updateDraft((next) => {
                     next.database = { path: e.target.value };

@@ -194,7 +194,7 @@ impl VisionPipeline {
 
             let Ok(mut child) = cmd.spawn() else {
                 if self.comms.set_camera_availability(&camera, false) {
-                    self.log_hub.push_frigate(
+                    self.log_hub.push_ninjanvr(
                         "WARNING",
                         &format!("ninjanvr.camera.{camera}"),
                         "Camera stream went OFFLINE (decoder spawn failed)",
@@ -246,7 +246,7 @@ impl VisionPipeline {
                     let now = unix_now_f64();
                     frame_count += 1;
                     if frame_count == 1 && self.comms.set_camera_availability(&camera, true) {
-                        self.log_hub.push_frigate(
+                        self.log_hub.push_ninjanvr(
                             "INFO",
                             &format!("ninjanvr.camera.{camera}"),
                             "Camera stream reconnected (ONLINE)",
@@ -281,7 +281,7 @@ impl VisionPipeline {
                         if consecutive_tamper_frames == tamper_threshold_frames
                             && self.comms.set_camera_tamper(&camera, true)
                         {
-                            self.log_hub.push_frigate(
+                            self.log_hub.push_ninjanvr(
                                 "WARNING",
                                 &format!("ninjanvr.vision.{camera}"),
                                 &format!(
@@ -529,7 +529,7 @@ impl VisionPipeline {
                 }
             }
             if self.comms.set_camera_availability(&camera, false) {
-                self.log_hub.push_frigate(
+                self.log_hub.push_ninjanvr(
                     "WARNING",
                     &format!("ninjanvr.camera.{camera}"),
                     "Camera stream disconnected (OFFLINE)",
@@ -767,7 +767,7 @@ impl VisionPipeline {
                 );
                 if is_new {
                     debug!("New tracked object on {camera}: {} ({})", trk.label, trk.id);
-                    self.log_hub.push_frigate(
+                    self.log_hub.push_ninjanvr(
                         "INFO",
                         &format!("ninjanvr.detect.{camera}"),
                         &format!(
@@ -796,7 +796,8 @@ impl VisionPipeline {
 
             let rev = active_review.get_or_insert_with(|| {
                 let rev_id = format!("{now:.6}-{}", random_suffix());
-                let thumb_rel = format!("/media/frigate/clips/review/thumb-{camera}-{rev_id}.webp");
+                let thumb_rel =
+                    format!("/media/ninjanvr/clips/review/thumb-{camera}-{rev_id}.webp");
                 ActiveReviewState {
                     id: rev_id,
                     start_time: now,
@@ -933,7 +934,7 @@ impl VisionPipeline {
             );
         }
 
-        // Flush or close active review segment with Frigate-compatible {type, before, after} schema
+        // Flush or close active review segment with {type, before, after} schema
         if let Some(rev) = active_review {
             let cutoff_secs = if rev.severity == "alert" {
                 cam_cfg.review.alerts.cutoff_time.max(15) as f64

@@ -252,7 +252,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                     Share Link
                   </button>
                   <a
-                    href={ex.video_path.replace("/media/frigate", "")}
+                    href={ex.video_path.replace(/^\/media\/[^/]+/, "")}
                     download={`${ex.id}.mp4`}
                     className="nvr-btn"
                     style={{ textDecoration: "none" }}
@@ -298,7 +298,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           <div className="nvr-cam-tile" style={{ flex: 1 }}>
             {activeExportPreview ? (
               <video
-                src={activeExportPreview.video_path.replace("/media/frigate", "")}
+                src={activeExportPreview.video_path.replace(/^\/media\/[^/]+/, "")}
                 controls
                 autoPlay
                 muted

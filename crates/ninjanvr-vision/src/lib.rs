@@ -336,7 +336,7 @@ impl SimdMotionDetector {
             }
         }
 
-        // 2. 3x3 Gaussian blur (`[1, 2, 1; 2, 4, 2; 1, 2, 1] / 16`, matching Frigate's gaussian_filter sigma=1, radius=1)
+        // 2. 3x3 Gaussian blur (`[1, 2, 1; 2, 4, 2; 1, 2, 1] / 16`, sigma=1, radius=1)
         self.gaussian_blur_3x3();
 
         // 3. Apply motion mask first so masked pixels do not skew contrast stretching
@@ -456,7 +456,7 @@ impl SimdMotionDetector {
         // 8. Connected Components Labeling & BoundingBox extraction
         let motion_boxes = self.extract_connected_boxes();
 
-        // 9. Update background model (`delta_alpha` = 0.2 default in Frigate config, so static changes settle in ~1.5s)
+        // 9. Update background model (`delta_alpha` = 0.2 default, so static changes settle in ~1.5s)
         let bg_alpha = self.config.delta_alpha.clamp(0.05, 0.5);
         for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
             *avg = (1.0 - bg_alpha) * (*avg) + bg_alpha * (px as f32);

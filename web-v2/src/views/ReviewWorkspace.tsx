@@ -429,7 +429,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 item.end_time
               );
               const thumbUrl = item.thumb_path
-                ? item.thumb_path.replace("/media/frigate", "")
+                ? item.thumb_path.replace(/^\/media\/[^/]+/, "")
                 : `/api/${item.camera}/latest.webp`;
               return (
                 <div

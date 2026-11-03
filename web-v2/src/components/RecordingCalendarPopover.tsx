@@ -319,7 +319,7 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
             ))}
           </div>
 
-          {/* Days Grid with Frigate-style Recording Indicators */}
+          {/* Days Grid with Recording Activity Indicators */}
           <div
             style={{
               display: "grid",

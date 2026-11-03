@@ -1173,7 +1173,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   .sort((a, b) => a.start_time - b.start_time)
                   .map((rev) => {
                     const thumbSrc = rev.thumb_path
-                      ? rev.thumb_path.replace("/media/frigate", "")
+                      ? rev.thumb_path.replace(/^\/media\/[^/]+/, "")
                       : `/api/${rev.camera}/latest.webp`;
                     const isHov = hoveredStoryboardId === rev.id;
                     return (
@@ -1934,7 +1934,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               >
                 {hoveredReviewOnTrack && (
                   <img
-                    src={hoveredReviewOnTrack.thumb_path.replace("/media/frigate", "")}
+                    src={hoveredReviewOnTrack.thumb_path.replace(/^\/media\/[^/]+/, "")}
                     alt="preview"
                     width={128}
                     height={72}

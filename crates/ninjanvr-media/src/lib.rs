@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use ninjanvr_config::{AudioConfig, NinjaConfig};
-use ninjanvr_db::{EventDto, NinjaDatabase, RecordingRow, ReviewItemDto};
+use ninjanvr_db::{EventDto, NinjaDatabase, RecordingRow, ReviewItemDto, strip_media_root};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -835,9 +835,8 @@ impl RecordingEngine {
                 break;
             }
             for (id, db_path) in batch {
-                let rel = db_path
-                    .strip_prefix("/media/frigate/")
-                    .unwrap_or(db_path.trim_start_matches('/'));
+                let rel =
+                    strip_media_root(&db_path).unwrap_or_else(|| db_path.trim_start_matches('/'));
                 let disk_path = self.media_dir.join(rel);
                 let media_path = disk_path.clone();
                 let real_dbfs = tokio::task::spawn_blocking(move || {
@@ -1084,7 +1083,7 @@ impl RecordingEngine {
         })?;
 
         let db_canonical_path =
-            format!("/media/frigate/recordings/{date_dir}/{hour_dir}/{camera}/{file_name}");
+            format!("/media/ninjanvr/recordings/{date_dir}/{hour_dir}/{camera}/{file_name}");
         let seg_size_mb = ((size_bytes as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
         let id = format!("{:.1}-{}", start_time, random_suffix());
 
@@ -1254,12 +1253,11 @@ impl RecordingEngine {
                         .delete_expired_idle_main_recordings(&camera, idle_main_cutoff)
                     {
                         for db_path in &idle_paths {
-                            let disk_path =
-                                if let Some(rel) = db_path.strip_prefix("/media/frigate/") {
-                                    self.media_dir.join(rel)
-                                } else {
-                                    PathBuf::from(db_path)
-                                };
+                            let disk_path = if let Some(rel) = strip_media_root(db_path) {
+                                self.media_dir.join(rel)
+                            } else {
+                                PathBuf::from(db_path)
+                            };
                             if std::fs::remove_file(&disk_path).is_ok() {
                                 prune_empty_parent_dirs(&disk_path, &recordings_root);
                             }
@@ -1284,7 +1282,7 @@ impl RecordingEngine {
                     let batch_len = expired_paths.len();
                     let mut removed_files = 0usize;
                     for db_path in &expired_paths {
-                        let disk_path = if let Some(rel) = db_path.strip_prefix("/media/frigate/") {
+                        let disk_path = if let Some(rel) = strip_media_root(db_path) {
                             self.media_dir.join(rel)
                         } else {
                             PathBuf::from(db_path)
@@ -1313,7 +1311,7 @@ impl RecordingEngine {
                         .delete_recordings_over_quota_mb(&camera, max_gb * 1024.0)
                 {
                     for db_path in &quota_paths {
-                        let disk_path = if let Some(rel) = db_path.strip_prefix("/media/frigate/") {
+                        let disk_path = if let Some(rel) = strip_media_root(db_path) {
                             self.media_dir.join(rel)
                         } else {
                             PathBuf::from(db_path)
@@ -1330,7 +1328,7 @@ impl RecordingEngine {
                     detections_cutoff,
                 ) {
                     for cp in clip_paths {
-                        let disk_path = if let Some(rel) = cp.strip_prefix("/media/frigate/") {
+                        let disk_path = if let Some(rel) = strip_media_root(&cp) {
                             self.media_dir.join(rel)
                         } else {
                             PathBuf::from(cp)
@@ -1370,7 +1368,7 @@ impl RecordingEngine {
                 && let Ok(evicted_paths) = self.db.delete_global_recordings_over_quota_mb(max_mb)
             {
                 for db_path in &evicted_paths {
-                    let disk_path = if let Some(rel) = db_path.strip_prefix("/media/frigate/") {
+                    let disk_path = if let Some(rel) = strip_media_root(db_path) {
                         self.media_dir.join(rel)
                     } else {
                         PathBuf::from(db_path)
@@ -1471,8 +1469,7 @@ impl RecordingEngine {
 
                     let mut list_content = String::new();
                     for seg in &segs {
-                        let local_path = if let Some(rel) = seg.path.strip_prefix("/media/frigate/")
-                        {
+                        let local_path = if let Some(rel) = strip_media_root(&seg.path) {
                             self.media_dir.join(rel)
                         } else {
                             PathBuf::from(&seg.path)
@@ -1522,7 +1519,8 @@ impl RecordingEngine {
 
                     if status.map(|s| s.success()).unwrap_or(false) && out_file.exists() {
                         let id = format!("{camera}_{hour_start_i64}");
-                        let db_path = format!("/media/frigate/clips/previews/{camera}/{file_name}");
+                        let db_path =
+                            format!("/media/ninjanvr/clips/previews/{camera}/{file_name}");
                         let _ = self
                             .db
                             .insert_preview(&id, &camera, &db_path, start_ts, end_ts, duration);
@@ -1554,13 +1552,15 @@ pub fn migrate_hot_segments_to_cold(
 
     for _ in 0..5 {
         let candidates =
-            db.list_recordings_for_tier_migration(before_ts, "/media/frigate/recordings/%", 200)?;
+            db.list_recordings_for_tier_migration(before_ts, "/media/%/recordings/%", 200)?;
         if candidates.is_empty() {
             break;
         }
         let batch_len = candidates.len();
         for (id, db_path) in candidates {
-            let Some(rel_under_rec) = db_path.strip_prefix("/media/frigate/recordings/") else {
+            let Some(rel_under_rec) =
+                strip_media_root(&db_path).and_then(|r| r.strip_prefix("recordings/"))
+            else {
                 continue;
             };
             let src_path = hot_rec_root.join(rel_under_rec);
@@ -1653,7 +1653,7 @@ pub async fn backup_alert_clip(
     let existing_paths: Vec<PathBuf> = segments
         .iter()
         .map(|s| {
-            if let Some(rel) = s.path.strip_prefix("/media/frigate/") {
+            if let Some(rel) = strip_media_root(&s.path) {
                 media_dir.join(rel)
             } else {
                 PathBuf::from(&s.path)
@@ -1696,7 +1696,7 @@ pub async fn backup_alert_clip(
     }
 
     if include_snapshot && let Some(t_rel) = thumb_rel {
-        let thumb_disk = if let Some(rel) = t_rel.strip_prefix("/media/frigate/") {
+        let thumb_disk = if let Some(rel) = strip_media_root(t_rel) {
             media_dir.join(rel)
         } else {
             PathBuf::from(t_rel)
@@ -1967,7 +1967,7 @@ async fn build_mp4_export_inner(
     let mut existing_paths = Vec::new();
     let mut first_seg_start = None;
     for seg in &segments {
-        let local_path = if let Some(rel) = seg.path.strip_prefix("/media/frigate/") {
+        let local_path = if let Some(rel) = strip_media_root(&seg.path) {
             media_dir.join(rel)
         } else {
             PathBuf::from(&seg.path)
@@ -2062,8 +2062,8 @@ async fn build_mp4_export_inner(
         let _ = img.save_with_format(&thumb_file, image::ImageFormat::WebP);
     }
 
-    let video_rel = format!("/media/frigate/exports/{export_id}.mp4");
-    let thumb_rel = format!("/media/frigate/clips/{export_id}.webp");
+    let video_rel = format!("/media/ninjanvr/exports/{export_id}.mp4");
+    let thumb_rel = format!("/media/ninjanvr/clips/{export_id}.webp");
     db.insert_export(&ninjanvr_db::ExportRow {
         id: export_id.to_string(),
         camera: camera.to_string(),
@@ -2241,7 +2241,7 @@ mod tests {
         let rec_dir = root.join("recordings/2026-11-01/12/front_door");
         std::fs::create_dir_all(&rec_dir).unwrap();
 
-        let db_path = root.join("frigate.db");
+        let db_path = root.join("ninjanvr.db");
         let db = NinjaDatabase::open(&db_path).unwrap();
 
         let seg1_disk = rec_dir.join("00.00.mp4");
@@ -2255,7 +2255,7 @@ mod tests {
         db.insert_recording(&RecordingRow {
             id: "seg1".to_string(),
             camera: "front_door".to_string(),
-            path: "/media/frigate/recordings/2026-11-01/12/front_door/00.00.mp4".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-01/12/front_door/00.00.mp4".to_string(),
             start_time: 1000.0,
             end_time: 1010.0,
             duration: 10.0,
@@ -2270,7 +2270,7 @@ mod tests {
         db.insert_recording(&RecordingRow {
             id: "seg2".to_string(),
             camera: "front_door".to_string(),
-            path: "/media/frigate/recordings/2026-11-01/12/front_door/00.10.mp4".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-01/12/front_door/00.10.mp4".to_string(),
             start_time: 1010.0,
             end_time: 1020.0,
             duration: 10.0,
@@ -2360,14 +2360,14 @@ mod tests {
         let hot_seg_dir = hot_media.join("recordings/2026-11-01/08/front_door");
         std::fs::create_dir_all(&hot_seg_dir).unwrap();
 
-        let db = NinjaDatabase::open(root.join("frigate.db")).unwrap();
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
         let seg_file = hot_seg_dir.join("00.00.mp4");
         std::fs::write(&seg_file, b"mp4_segment_payload_bytes").unwrap();
 
         db.insert_recording(&RecordingRow {
             id: "seg_tier_1".to_string(),
             camera: "front_door".to_string(),
-            path: "/media/frigate/recordings/2026-11-01/08/front_door/00.00.mp4".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-01/08/front_door/00.00.mp4".to_string(),
             start_time: 1000.0,
             end_time: 1010.0,
             duration: 10.0,
@@ -2407,7 +2407,7 @@ mod tests {
         std::fs::create_dir_all(&rec_dir).unwrap();
         std::fs::create_dir_all(&rev_dir).unwrap();
 
-        let db = NinjaDatabase::open(root.join("frigate.db")).unwrap();
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
         let seg_disk = rec_dir.join("00.00.mp4");
         std::fs::write(&seg_disk, b"alert_mp4_bytes").unwrap();
         let snap_disk = rev_dir.join("thumb-front_door-rev1.webp");
@@ -2416,7 +2416,7 @@ mod tests {
         db.insert_recording(&RecordingRow {
             id: "seg_bak_1".to_string(),
             camera: "front_door".to_string(),
-            path: "/media/frigate/recordings/2026-11-01/12/front_door/00.00.mp4".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-01/12/front_door/00.00.mp4".to_string(),
             start_time: 1730500000.0,
             end_time: 1730500010.0,
             duration: 10.0,
@@ -2437,7 +2437,7 @@ mod tests {
             "person",
             1730500000.0,
             1730500010.0,
-            Some("/media/frigate/clips/review/thumb-front_door-rev1.webp"),
+            Some("/media/ninjanvr/clips/review/thumb-front_door-rev1.webp"),
             true,
         )
         .await

@@ -2,7 +2,7 @@
 
 pub mod pipeline;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -62,7 +62,7 @@ impl LogBufferHub {
     pub fn new() -> Self {
         let (stream_tx, _) = broadcast::channel(256);
         let mut map = HashMap::new();
-        map.insert("frigate".to_string(), VecDeque::new());
+        map.insert("ninjanvr".to_string(), VecDeque::new());
         map.insert("go2rtc".to_string(), VecDeque::new());
         map.insert("nginx".to_string(), VecDeque::new());
         Self {
@@ -71,14 +71,14 @@ impl LogBufferHub {
         }
     }
 
-    pub fn push_frigate(&self, severity: &str, section: &str, message: &str) {
+    pub fn push_ninjanvr(&self, severity: &str, section: &str, message: &str) {
         let now = Local::now();
         let outer_ts = now.format("%Y-%m-%d %H:%M:%S%.9f");
         let inner_ts = now.format("%Y-%m-%d %H:%M:%S");
         let sev_pad = format!("{:<7}", severity.to_ascii_uppercase());
         let sec_pad = format!("{:<30}", section);
         let line = format!("{outer_ts}  [{inner_ts}] {sec_pad} {sev_pad} : {message}");
-        self.push_raw("frigate", line);
+        self.push_raw("ninjanvr", line);
     }
 
     pub fn push_go2rtc(&self, level: &str, section: &str, message: &str) {
@@ -350,7 +350,7 @@ fn unix_now() -> u64 {
 }
 
 pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
-    if let Ok(env_secret) = std::env::var("FRIGATE_JWT_SECRET")
+    if let Ok(env_secret) = std::env::var("NINJANVR_JWT_SECRET")
         && !env_secret.is_empty()
     {
         return env_secret;
@@ -1998,7 +1998,7 @@ async fn api_config(
 ) -> Json<Value> {
     let mut api_cfg = {
         let cfg = state.config.read().await;
-        cfg.to_frigate_api_config()
+        cfg.to_api_config()
     };
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
         && let Some(cams_obj) = api_cfg.get_mut("cameras").and_then(|v| v.as_object_mut())
@@ -2027,6 +2027,11 @@ async fn api_config_save(State(state): State<AppState>, body: String) -> Respons
             }
             let _ = new_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH);
             state.detector.reload(&new_cfg);
+            let rec_dir = state.media_dir.join("recordings");
+            let rec_mount = stat_mount_mb(&rec_dir, "ext4");
+            let heuristics =
+                evaluate_system_heuristics(&new_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
+            emit_heuristics_to_logs(&state.log_hub, &heuristics);
             *state.config.write().await = new_cfg;
             Json(json!({ "success": true, "message": "Config saved successfully" })).into_response()
         }
@@ -2057,7 +2062,12 @@ async fn api_config_structured(State(state): State<AppState>, Json(body): Json<V
     }
     let _ = next_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH);
     state.detector.reload(&next_cfg);
-    let api_cfg = next_cfg.to_frigate_api_config();
+    let rec_dir = state.media_dir.join("recordings");
+    let rec_mount = stat_mount_mb(&rec_dir, "ext4");
+    let heuristics =
+        evaluate_system_heuristics(&next_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
+    emit_heuristics_to_logs(&state.log_hub, &heuristics);
+    let api_cfg = next_cfg.to_api_config();
     let raw_yaml = next_cfg.raw_yaml.clone();
     *state.config.write().await = next_cfg;
     Json(json!({
@@ -2255,14 +2265,14 @@ async fn api_prometheus_metrics(State(state): State<AppState>) -> Response {
 
     let sys_cpu = stats_val
         .get("cpu_usages")
-        .and_then(|c| c.get("frigate.full_system"))
+        .and_then(|c| c.get("ninjanvr.full_system"))
         .and_then(|f| f.get("cpu"))
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
     let sys_mem_pct = stats_val
         .get("cpu_usages")
-        .and_then(|c| c.get("frigate.full_system"))
+        .and_then(|c| c.get("ninjanvr.full_system"))
         .and_then(|f| f.get("mem"))
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<f64>().ok())
@@ -3371,7 +3381,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
 
     let mut cpu_usages = serde_json::Map::new();
     cpu_usages.insert(
-        "frigate.full_system".to_string(),
+        "ninjanvr.full_system".to_string(),
         json!({
             "cpu": format!("{:.1}", ninjanvr_cpu + go2rtc_cpu),
             "mem": format!("{:.1}", ninjanvr_mem + go2rtc_mem)
@@ -3480,8 +3490,11 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         }
     }
 
+    let heuristics =
+        evaluate_system_heuristics(&cfg, &cameras_stats, &rec_mount, estimated_retention_days);
+
     let mut storage_map = serde_json::Map::new();
-    storage_map.insert("/media/frigate/recordings".to_string(), rec_mount);
+    storage_map.insert("/media/ninjanvr/recordings".to_string(), rec_mount);
     if cfg.record.storage_tiers.enabled
         && let Some(ref cold_dir) = cfg.record.storage_tiers.cold_dir
     {
@@ -3491,7 +3504,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
         );
     }
     storage_map.insert(
-        "/media/frigate/clips".to_string(),
+        "/media/ninjanvr/clips".to_string(),
         stat_mount_mb(&clips_dir, "ext4"),
     );
     storage_map.insert(
@@ -3518,6 +3531,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
             "estimated_retention_days": estimated_retention_days,
             "camera_storage": cam_storage,
             "storage": Value::Object(storage_map),
+            "heuristics": heuristics,
             "last_updated": unix_now()
         },
         "processes": {
@@ -3538,6 +3552,309 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
             }
         }
     }))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeuristicAlertDto {
+    pub id: String,
+    pub severity: String,
+    pub category: String,
+    pub target: String,
+    pub title: String,
+    pub detail: String,
+    pub recommendation: String,
+}
+
+fn is_motion_mask_empty(mask: &Value) -> bool {
+    match mask {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(arr) => arr.is_empty(),
+        Value::Object(map) => map.is_empty(),
+        _ => false,
+    }
+}
+
+pub fn evaluate_system_heuristics(
+    cfg: &NinjaConfig,
+    cameras_stats: &serde_json::Map<String, Value>,
+    rec_mount: &Value,
+    estimated_retention_days: f64,
+) -> Vec<HeuristicAlertDto> {
+    let mut alerts = Vec::new();
+
+    // 1. Duplicate external RTSP producers in go2rtc.streams
+    let mut url_to_streams: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (s_name, s_val) in &cfg.go2rtc.streams {
+        let first_url = match s_val {
+            Value::String(s) => Some(s.as_str()),
+            Value::Array(arr) => arr.first().and_then(|v| v.as_str()),
+            _ => None,
+        };
+        if let Some(raw_url) = first_url {
+            let clean = raw_url.split('#').next().unwrap_or(raw_url).trim();
+            if (clean.starts_with("rtsp://") || clean.starts_with("rtsps://"))
+                && !clean.contains("127.0.0.1")
+                && !clean.contains("localhost")
+            {
+                let scrubbed = ninjanvr_config::scrub_rtsp_credentials(clean);
+                url_to_streams
+                    .entry(scrubbed)
+                    .or_default()
+                    .push(s_name.clone());
+            }
+        }
+    }
+    for (_url, stream_names) in url_to_streams {
+        if stream_names.len() >= 2 {
+            let primary = &stream_names[0];
+            let secondary = &stream_names[1];
+            alerts.push(HeuristicAlertDto {
+                id: format!("duplicate_rtsp_producer_{primary}"),
+                severity: "warning".to_string(),
+                category: "streams".to_string(),
+                target: stream_names.join(", "),
+                title: "Duplicate upstream RTSP connections to physical camera".to_string(),
+                detail: format!(
+                    "Streams [{}] pull the identical external RTSP endpoint directly from the camera, opening {} concurrent RTSP sessions and duplicating network traffic.",
+                    stream_names.join(", "),
+                    stream_names.len()
+                ),
+                recommendation: format!(
+                    "Point '{secondary}' in go2rtc.streams to 'rtsp://127.0.0.1:8554/{primary}' so go2rtc pulls from the camera once and multiplexes locally in RAM."
+                ),
+            });
+        }
+    }
+
+    // 2. Detect resolution / aspect ratio mismatch & FFmpeg software downscale overhead
+    let mut ff_cpus: Vec<(String, f64)> = Vec::new();
+    for (cam_name, cam_cfg) in &cfg.cameras {
+        if !cam_cfg.enabled {
+            continue;
+        }
+        let w = cam_cfg.detect.width.max(1);
+        let h = cam_cfg.detect.height.max(1);
+        let ratio = (w as f64) / (h as f64);
+        if (ratio - (16.0 / 9.0)).abs() > 0.15 {
+            alerts.push(HeuristicAlertDto {
+                id: format!("detect_aspect_mismatch_{cam_name}"),
+                severity: "warning".to_string(),
+                category: "vision".to_string(),
+                target: cam_name.clone(),
+                title: format!("Non-16:9 detect resolution ({w}x{h})"),
+                detail: format!(
+                    "Camera '{cam_name}' runs detect/preview at {w}x{h} (aspect {:.2}:1) while main recording is 16:9, causing lower preview sharpness and bounding-box projection distortion.",
+                    ratio
+                ),
+                recommendation: "Set detect.width: 1280 and detect.height: 720 (16:9) and ensure the go2rtc substream uses a 16:9 VBR profile.".to_string(),
+            });
+        }
+        if let Some(c_stat) = cameras_stats.get(cam_name)
+            && let Some(ff_str) = c_stat.get("ffmpeg_cpu").and_then(|v| v.as_str())
+            && let Ok(ff_val) = ff_str.parse::<f64>()
+        {
+            ff_cpus.push((cam_name.clone(), ff_val));
+        }
+    }
+    if ff_cpus.len() >= 2 {
+        let min_ff = ff_cpus
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f64::INFINITY, f64::min)
+            .max(0.3);
+        for (cam_name, ff_val) in &ff_cpus {
+            if *ff_val >= 1.4 && *ff_val >= min_ff * 1.8 {
+                alerts.push(HeuristicAlertDto {
+                    id: format!("detect_ffmpeg_cpu_{cam_name}"),
+                    severity: "optimization".to_string(),
+                    category: "vision".to_string(),
+                    target: cam_name.clone(),
+                    title: "Elevated FFmpeg decode/scale CPU on detect pipeline".to_string(),
+                    detail: format!(
+                        "Camera '{cam_name}' detect decoder uses {ff_val:.1}% CPU (vs {min_ff:.1}% peer baseline), caused by software downscaling a 1080p/20fps stream or CBR substream packet flood."
+                    ),
+                    recommendation: "Share a single go2rtc loopback producer (rtsp://127.0.0.1:8554/<cam>) or lower the camera's encoder FPS to 15 FPS.".to_string(),
+                });
+            }
+        }
+    }
+
+    // 3. Storage capacity & unbounded retention risk
+    let total_mb = rec_mount["total"].as_f64().unwrap_or(0.0);
+    let used_mb = rec_mount["used"].as_f64().unwrap_or(0.0);
+    let free_mb = rec_mount["free"].as_f64().unwrap_or(0.0);
+    if total_mb > 0.0 {
+        let used_pct = (used_mb / total_mb) * 100.0;
+        let free_gb = free_mb / 1024.0;
+        if used_pct >= 85.0 && cfg.record.min_free_gb.is_none() && cfg.record.max_size_gb.is_none()
+        {
+            let sev = if used_pct >= 95.0 {
+                "critical"
+            } else {
+                "warning"
+            };
+            alerts.push(HeuristicAlertDto {
+                id: "storage_capacity_unbounded".to_string(),
+                severity: sev.to_string(),
+                category: "storage".to_string(),
+                target: "/media/ninjanvr/recordings".to_string(),
+                title: format!(
+                    "Recording volume at {used_pct:.1}% capacity without min_free_gb guard"
+                ),
+                detail: format!(
+                    "/media/ninjanvr/recordings has only {free_gb:.1} GB free ({used_pct:.1}% used, ~{estimated_retention_days:.1}d runway), and neither record.min_free_gb nor record.max_size_gb is configured."
+                ),
+                recommendation: "Configure record.min_free_gb (e.g. 100) or record.max_size_gb in config.yml so retention cleanup prunes segments before disk exhaustion.".to_string(),
+            });
+        }
+    }
+
+    // 4. Retention policy asymmetry & runway mismatch
+    let enabled_days: Vec<(String, f64)> = cfg
+        .cameras
+        .iter()
+        .filter(|(_, c)| c.enabled && c.record.enabled)
+        .map(|(n, c)| (n.clone(), c.record.continuous.days))
+        .collect();
+    if enabled_days.len() >= 2 {
+        let min_d = enabled_days
+            .iter()
+            .map(|(_, d)| *d)
+            .fold(f64::INFINITY, f64::min);
+        let max_d = enabled_days.iter().map(|(_, d)| *d).fold(0.0_f64, f64::max);
+        if (max_d - min_d) >= 3.0 || max_d > estimated_retention_days + 1.0 {
+            alerts.push(HeuristicAlertDto {
+                id: "retention_runway_asymmetry".to_string(),
+                severity: "warning".to_string(),
+                category: "storage".to_string(),
+                target: "record.continuous.days".to_string(),
+                title: "Retention policy exceeds disk runway & camera asymmetry".to_string(),
+                detail: format!(
+                    "Configured continuous retention varies from {min_d:.0}d to {max_d:.0}d across cameras, while free storage only supports ~{estimated_retention_days:.1}d at current write rate."
+                ),
+                recommendation: "Standardize cameras.*.record.continuous.days (e.g. 3d across all cameras) or enable continuous_substream / mode_tiering.".to_string(),
+            });
+        }
+    }
+
+    // 5. Unmasked camera OSD timestamps / low motion contour threshold
+    let unmasked_cams: Vec<String> = cfg
+        .cameras
+        .iter()
+        .filter(|(_, c)| {
+            c.enabled
+                && c.motion.enabled
+                && is_motion_mask_empty(&c.motion.mask)
+                && c.motion.contour_area <= 15
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    if !unmasked_cams.is_empty() {
+        alerts.push(HeuristicAlertDto {
+            id: "unmasked_osd_motion".to_string(),
+            severity: "optimization".to_string(),
+            category: "vision".to_string(),
+            target: unmasked_cams.join(", "),
+            title: "Unmasked camera OSD timestamps & low motion contour threshold".to_string(),
+            detail: format!(
+                "Cameras [{}] have empty motion.mask ({{}}) with contour_area <= 15; 1-second OSD clock digit ticks or IR dust specks can trigger micro-motion boxes and unnecessary OpenVINO CPU inference.",
+                unmasked_cams.join(", ")
+            ),
+            recommendation: "Add a polygon motion mask over each camera's OSD timestamp corner in Zones & Masks, or increase motion.contour_area to 20–30.".to_string(),
+        });
+    }
+
+    // 6. Audio role active while acoustic detection disabled
+    let unused_audio_cams: Vec<String> = cfg
+        .cameras
+        .iter()
+        .filter(|(_, c)| {
+            c.enabled
+                && !c.audio.enabled
+                && !cfg.audio.enabled
+                && c.ffmpeg
+                    .inputs
+                    .iter()
+                    .any(|inp| inp.roles.iter().any(|r| r == "audio"))
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    if !unused_audio_cams.is_empty() {
+        alerts.push(HeuristicAlertDto {
+            id: "audio_role_disabled_mismatch".to_string(),
+            severity: "optimization".to_string(),
+            category: "audio".to_string(),
+            target: unused_audio_cams.join(", "),
+            title: "Continuous AAC audio transcoding while acoustic detection is disabled"
+                .to_string(),
+            detail: format!(
+                "Cameras [{}] include the 'audio' FFmpeg input role and transcode audio to AAC (-c:a aac) on every segment while audio.enabled is false (and PCMA substreams lack #audio=aac in go2rtc for MSE live audio).",
+                unused_audio_cams.join(", ")
+            ),
+            recommendation: "Enable audio.enabled if acoustic event detection is desired, or remove the 'audio' role on mute channels to save FFmpeg CPU cycles.".to_string(),
+        });
+    }
+
+    // 7. Corrupted or orphan streams in /config/go2rtc_homekit.yml
+    let hk_path = Path::new(ninjanvr_config::DEFAULT_GO2RTC_HOMEKIT_PATH);
+    if let Ok(hk_content) = std::fs::read_to_string(hk_path)
+        && (hk_content.contains("wizard_stream_")
+            || hk_content.contains("test_")
+            || hk_content.matches("streams:").count() > 1)
+    {
+        alerts.push(HeuristicAlertDto {
+            id: "stale_go2rtc_homekit_overlay".to_string(),
+            severity: "warning".to_string(),
+            category: "config".to_string(),
+            target: "/config/go2rtc_homekit.yml".to_string(),
+            title: "Orphan / duplicate stream definitions in go2rtc_homekit.yml".to_string(),
+            detail: "The auxiliary /config/go2rtc_homekit.yml file contains duplicate 'streams:' keys or orphan wizard_stream_* / test_* entries loaded alongside go2rtc.yaml.".to_string(),
+            recommendation: "Reset /config/go2rtc_homekit.yml to '{}' so go2rtc only loads canonical stream definitions from config.yml.".to_string(),
+        });
+    }
+
+    // 8. Snapshot / preview quality drift across cameras
+    let snap_qualities: BTreeSet<u8> = cfg
+        .cameras
+        .values()
+        .filter(|c| c.enabled)
+        .map(|c| c.snapshots.quality)
+        .collect();
+    let prev_qualities: BTreeSet<String> = cfg
+        .cameras
+        .values()
+        .filter(|c| c.enabled)
+        .map(|c| format!("{:?}", c.record.preview.quality))
+        .collect();
+    if snap_qualities.len() > 1 || prev_qualities.len() > 1 {
+        alerts.push(HeuristicAlertDto {
+            id: "camera_quality_drift".to_string(),
+            severity: "optimization".to_string(),
+            category: "config".to_string(),
+            target: "snapshots / preview".to_string(),
+            title: "Inconsistent snapshot or preview quality across cameras".to_string(),
+            detail: "Enabled cameras have mixed snapshots.quality (e.g. 95 vs 100) or record.preview.quality (very_high vs medium) settings.".to_string(),
+            recommendation: "Standardize snapshots.quality: 100 and record.preview.quality: medium across all cameras.".to_string(),
+        });
+    }
+
+    alerts
+}
+
+fn emit_heuristics_to_logs(log_hub: &LogBufferHub, alerts: &[HeuristicAlertDto]) {
+    for alert in alerts {
+        let level = match alert.severity.as_str() {
+            "critical" => "ERROR",
+            "warning" => "WARNING",
+            _ => "INFO",
+        };
+        let msg = format!(
+            "[{}] {}: {} — {}",
+            alert.target, alert.title, alert.detail, alert.recommendation
+        );
+        log_hub.push_ninjanvr(level, &format!("ninjanvr.heuristics.{}", alert.id), &msg);
+    }
 }
 
 fn split_csv_opt(raw: &Option<String>) -> Option<Vec<String>> {
@@ -4702,8 +5019,8 @@ async fn api_export_create(
     let name = parsed_body
         .name
         .unwrap_or_else(|| format!("{camera} export"));
-    let video_rel = format!("/media/frigate/exports/{id}.mp4");
-    let thumb_rel = format!("/media/frigate/clips/{id}.webp");
+    let video_rel = format!("/media/ninjanvr/exports/{id}.mp4");
+    let thumb_rel = format!("/media/ninjanvr/clips/{id}.webp");
     let now = unix_now() as f64;
     let _ = state.db.insert_export(&ExportRow {
         id: id.clone(),
@@ -5169,7 +5486,7 @@ async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) 
 }
 
 fn resolve_recording_disk_path(media_dir: &Path, db_path: &str) -> PathBuf {
-    if let Some(rel) = db_path.strip_prefix("/media/frigate/") {
+    if let Some(rel) = ninjanvr_db::strip_media_root(db_path) {
         media_dir.join(rel)
     } else {
         PathBuf::from(db_path)
@@ -5304,7 +5621,6 @@ pub fn generate_self_signed_tls_config_with_sans(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut subject_alt_names = vec![
         "localhost".to_string(),
-        "frigate".to_string(),
         "ninjanvr".to_string(),
         "127.0.0.1".to_string(),
         "::1".to_string(),
@@ -5394,17 +5710,17 @@ pub async fn new_app_state(
         comms.set_active_profile(saved_prof.trim());
     }
     let log_hub = LogBufferHub::new();
-    log_hub.push_frigate(
+    log_hub.push_ninjanvr(
         "INFO",
         "ninjanvr.app",
         &format!("Starting NinjaNVR ({NINJANVR_VERSION})"),
     );
-    log_hub.push_frigate(
+    log_hub.push_ninjanvr(
         "INFO",
         "ninjanvr.db",
         &format!("Connected to SQLite WAL database at {}", cfg.database.path),
     );
-    log_hub.push_frigate(
+    log_hub.push_ninjanvr(
         "INFO",
         "ninjanvr.infer",
         &format!(
@@ -5414,7 +5730,7 @@ pub async fn new_app_state(
     );
     for (cam_name, cam_cfg) in &cfg.cameras {
         if cam_cfg.enabled {
-            log_hub.push_frigate(
+            log_hub.push_ninjanvr(
                 "INFO",
                 &format!("ninjanvr.camera.{cam_name}"),
                 &format!(
@@ -5434,6 +5750,13 @@ pub async fn new_app_state(
     log_hub.push_go2rtc("INF", "webrtc", "listen tcp/udp addr=:8555");
     log_hub.push_nginx("GET", "/api/version", 200);
     log_hub.push_nginx("GET", "/api/stats", 200);
+    {
+        let rec_dir = media_dir.join("recordings");
+        let rec_mount = stat_mount_mb(&rec_dir, "ext4");
+        let startup_heuristics =
+            evaluate_system_heuristics(&cfg, &serde_json::Map::new(), &rec_mount, 14.0);
+        emit_heuristics_to_logs(&log_hub, &startup_heuristics);
+    }
 
     let shared_cfg = Arc::new(RwLock::new(cfg));
     let activity_ledger = new_activity_ledger();
@@ -5557,7 +5880,7 @@ mod tests {
         let tmp_dir =
             std::env::temp_dir().join(format!("ninjanvr-srv-test-{}", rand::random::<u32>()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
-        let db_path = tmp_dir.join("frigate.db");
+        let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
         let web_dir = tmp_dir.join("web-v2");
         std::fs::create_dir_all(&web_dir).unwrap();
@@ -5904,7 +6227,7 @@ version: 0.18-0
             .insert_recording(&ninjanvr_db::RecordingRow {
                 id: "seg_on_disk".to_string(),
                 camera: "front_door".to_string(),
-                path: "/media/frigate/recordings/2026-11-01/00/front_door/00.00.mp4".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-01/00/front_door/00.00.mp4".to_string(),
                 start_time: 2000.0,
                 end_time: 2010.0,
                 duration: 10.0,
@@ -5921,7 +6244,7 @@ version: 0.18-0
             .insert_recording(&ninjanvr_db::RecordingRow {
                 id: "seg_ghost".to_string(),
                 camera: "front_door".to_string(),
-                path: "/media/frigate/recordings/2026-11-01/00/front_door/00.10.mp4".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-01/00/front_door/00.10.mp4".to_string(),
                 start_time: 2010.0,
                 end_time: 2020.0,
                 duration: 10.0,

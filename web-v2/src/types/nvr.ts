@@ -341,6 +341,16 @@ export interface ProcessStatItem {
   mem: string;
 }
 
+export interface HeuristicAlertItem {
+  id: string;
+  severity: "critical" | "warning" | "optimization" | string;
+  category: "streams" | "vision" | "storage" | "audio" | "config" | string;
+  target: string;
+  title: string;
+  detail: string;
+  recommendation: string;
+}
+
 export interface NinjaStatsResponse {
   cameras: Record<string, CameraRuntimeStats>;
   detectors: Record<string, DetectorStats>;
@@ -365,6 +375,7 @@ export interface NinjaStatsResponse {
       }
     >;
     storage: Record<string, StorageStatItem>;
+    heuristics?: HeuristicAlertItem[];
     last_updated: number;
   };
   processes: Record<string, ProcessStatItem>;

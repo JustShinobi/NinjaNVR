@@ -29,7 +29,7 @@ pub fn probe_mp4_resolution(mp4_path: &Path) -> Option<(u32, u32)> {
     None
 }
 
-/// Generates a Frigate-compatible HLS master playlist (`master.m3u8`).
+/// Generates an HLS master playlist (`master.m3u8`).
 pub fn build_master_playlist() -> String {
     [
         "#EXTM3U",

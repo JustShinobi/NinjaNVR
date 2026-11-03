@@ -256,7 +256,7 @@ interface LiveMsePlayerProps {
 }
 
 /**
- * Safely extracts an array of polygon coordinate strings from Frigate's `motion.mask`
+ * Safely extracts an array of polygon coordinate strings from `motion.mask`
  * (which may be a string, string[], or Record<string, { coordinates: string } | string>).
  */
 export function extractMaskPolygons(mask: unknown): string[] {
@@ -290,7 +290,7 @@ export function extractMaskPolygons(mask: unknown): string[] {
 }
 
 /**
- * Parses a Frigate normalized or pixel polygon string ("x1,y1,x2,y2,...") into SVG points ("0..1000" coordinate space).
+ * Parses a normalized or pixel polygon string ("x1,y1,x2,y2,...") into SVG points ("0..1000" coordinate space).
  */
 export function parsePolygonPoints(
   coordStr: string,

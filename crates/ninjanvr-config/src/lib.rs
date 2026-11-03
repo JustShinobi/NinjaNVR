@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/config/config.yml";
-pub const DEFAULT_DB_PATH: &str = "/config/frigate.db";
+pub const DEFAULT_DB_PATH: &str = "/config/ninjanvr.db";
 pub const DEFAULT_GO2RTC_SHM_PATH: &str = "/dev/shm/go2rtc.yaml";
 pub const DEFAULT_GO2RTC_HOMEKIT_PATH: &str = "/config/go2rtc_homekit.yml";
 pub const NINJANVR_VERSION: &str = match option_env!("NINJANVR_RELEASE_VERSION") {
@@ -155,10 +155,10 @@ fn default_mqtt_port() -> u16 {
     1883
 }
 fn default_mqtt_prefix() -> String {
-    "frigate".to_string()
+    "ninjanvr".to_string()
 }
 fn default_mqtt_client_id() -> String {
-    "frigate".to_string()
+    "ninjanvr".to_string()
 }
 fn default_stats_interval() -> u64 {
     60
@@ -347,7 +347,7 @@ pub struct AuthConfig {
 }
 
 fn default_cookie_name() -> String {
-    "frigate_token".to_string()
+    "ninjanvr_token".to_string()
 }
 fn default_session_length() -> u64 {
     86400
@@ -1363,8 +1363,8 @@ impl NinjaConfig {
         map
     }
 
-    /// Generates the complete Frigate 0.18 compatible `/api/config` JSON object expected by the React SPA.
-    pub fn to_frigate_api_config(&self) -> Value {
+    /// Generates the complete `/api/config` JSON object expected by the React SPA.
+    pub fn to_api_config(&self) -> Value {
         let labelmap = self.load_labelmap();
         let attributes_map = json!({
             "person": ["amazon", "face"],
@@ -2411,7 +2411,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_frigate_config_and_generates_api_payload() {
+    fn parses_ninjanvr_config_and_generates_api_payload() {
         let yaml = r#"
 mqtt:
   enabled: true
@@ -2451,7 +2451,7 @@ version: 0.18-0
             Some("rtsp://127.0.0.1:8554/sala")
         );
 
-        let api_val = cfg.to_frigate_api_config();
+        let api_val = cfg.to_api_config();
         assert_eq!(api_val["version"], "0.18-0");
         assert_eq!(api_val["cameras"]["sala"]["detect"]["width"], 640);
         assert_eq!(
@@ -2488,7 +2488,7 @@ go2rtc:
       - rtsp://camuser:campass@192.0.2.50:554/main
 "#;
         let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
-        let mut api_payload = cfg.to_frigate_api_config();
+        let mut api_payload = cfg.to_api_config();
 
         // Simulate UI v2 modifying camera detect FPS, adding a zone, and changing MQTT port
         // while sending back the scrubbed URLs from GET /api/config
@@ -2548,7 +2548,7 @@ go2rtc:
         assert!((cam_map.angle_deg - 135.0).abs() < 1e-4);
         assert!((cam_map.fov_deg - 110.0).abs() < 1e-4);
         assert!((cam_map.range - 0.35).abs() < 1e-4);
-        let api_json = cfg.to_frigate_api_config();
+        let api_json = cfg.to_api_config();
         assert_eq!(api_json["cameras"]["front_door"]["map"]["fov_deg"], 110.0);
     }
 }

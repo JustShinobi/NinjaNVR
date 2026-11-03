@@ -277,15 +277,15 @@ export function buildCleanYamlFromDraft(
       enabled: draft.mqtt?.enabled ?? true,
       host: draft.mqtt?.host || "127.0.0.1",
       port: draft.mqtt?.port ?? 1883,
-      topic_prefix: draft.mqtt?.topic_prefix || "frigate",
-      client_id: draft.mqtt?.client_id || "frigate",
+      topic_prefix: draft.mqtt?.topic_prefix || "ninjanvr",
+      client_id: draft.mqtt?.client_id || "ninjanvr",
       stats_interval: draft.mqtt?.stats_interval ?? 60,
       ...(draft.mqtt?.user ? { user: draft.mqtt.user } : {}),
       ...(draft.mqtt?.password ? { password: draft.mqtt.password } : {}),
     },
     auth: {
       enabled: draft.auth?.enabled ?? true,
-      cookie_name: draft.auth?.cookie_name || "frigate_token",
+      cookie_name: draft.auth?.cookie_name || "ninjanvr_token",
       cookie_secure: draft.auth?.cookie_secure ?? false,
       session_length: draft.auth?.session_length ?? 86400,
       refresh_time: draft.auth?.refresh_time ?? 1800,
@@ -295,7 +295,7 @@ export function buildCleanYamlFromDraft(
       enabled: draft.tls?.enabled ?? true,
     },
     database: {
-      path: draft.database?.path || "/config/frigate.db",
+      path: draft.database?.path || "/config/ninjanvr.db",
     },
     detectors: detectorsOut,
     model: {

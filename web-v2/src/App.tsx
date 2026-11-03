@@ -125,7 +125,7 @@ export const App: React.FC = () => {
   const [ffprobeInfo, setFfprobeInfo] = useState<FfprobeItem[] | null>(null);
 
   // System & Logs state
-  const [logService, setLogService] = useState<"frigate" | "go2rtc" | "nginx">("frigate");
+  const [logService, setLogService] = useState<"ninjanvr" | "go2rtc" | "nginx">("ninjanvr");
   const [logLines, setLogLines] = useState<string[]>([]);
   const [logSearch, setLogSearch] = useState("");
   const [logPaused, setLogPaused] = useState(false);
@@ -740,8 +740,8 @@ export const App: React.FC = () => {
   ]);
 
   // Telemetry summary values
-  const sysCpu = stats?.cpu_usages?.["frigate.full_system"]?.cpu || "6.5";
-  const sysMem = stats?.cpu_usages?.["frigate.full_system"]?.mem || "26.0";
+  const sysCpu = stats?.cpu_usages?.["ninjanvr.full_system"]?.cpu || "6.5";
+  const sysMem = stats?.cpu_usages?.["ninjanvr.full_system"]?.mem || "26.0";
   const inferMs = stats?.detectors?.detector01?.inference_speed?.toFixed(1) || "7.0";
   const totalFps = stats?.camera_fps?.toFixed(1) || "20.0";
   const rawServerVer = stats?.service?.version?.trim() || "";

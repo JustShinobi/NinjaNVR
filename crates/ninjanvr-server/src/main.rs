@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| "/opt/ninjanvr/web-v2".to_string()),
     );
     let mut media_dir = PathBuf::from(
-        std::env::var("NINJANVR_MEDIA_DIR").unwrap_or_else(|_| "/media/frigate".to_string()),
+        std::env::var("NINJANVR_MEDIA_DIR").unwrap_or_else(|_| "/media/ninjanvr".to_string()),
     );
     let mut http_port: u16 = std::env::var("NINJANVR_HTTP_PORT")
         .ok()

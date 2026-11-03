@@ -63,7 +63,7 @@ docker run -d \
   -p 8555:8555/tcp \
   -p 8555:8555/udp \
   -v /path/to/config:/config \
-  -v /path/to/storage:/media/frigate \
+  -v /path/to/storage:/media/ninjanvr \
   ghcr.io/justshinobi/ninjanvr:latest
 ```
 
@@ -87,9 +87,9 @@ make build
 ./target/release/ninjanvr --config ./config/config.example.yml
 ```
 
-## Migration and Compatibility
+## Migration and Architecture
 
-NinjaNVR reads existing Frigate-style `config.yml` camera/detector definitions, mounts the same SQLite database schema (`recordings`, `event`, `reviewsegment`, `export`, `previews`, `user`), and publishes compatible Home Assistant MQTT topics.
+NinjaNVR was initially inspired by Frigate's YAML camera configuration style, but has evolved into an independent Rust + React 19 architecture with its own recording engine, database schema extensions, and AI pipeline. While basic camera and detector blocks remain familiar for manual setup, NinjaNVR is not a drop-in replacement; dedicated migration tooling for importing legacy configurations may be introduced in future releases.
 
 ## Contributing
 

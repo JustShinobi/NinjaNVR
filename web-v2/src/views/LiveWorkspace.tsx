@@ -444,7 +444,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           {unreviewedAlerts.slice(0, 14).map((item) => {
             const isHovered = hoveredAlertId === item.id;
             const thumbSrc = item.thumb_path
-              ? item.thumb_path.replace("/media/frigate", "")
+              ? item.thumb_path.replace(/^\/media\/[^/]+/, "")
               : `/api/${item.camera}/latest.webp`;
             const objs = item.data?.objects || ["person"];
 

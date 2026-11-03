@@ -8,7 +8,7 @@ use tower::ServiceExt;
 async fn jwt_login_and_authenticated_cookie_roundtrip() {
     let tmp_dir = std::env::temp_dir().join(format!("ninjanvr-jwt-test-{}", rand::random::<u32>()));
     std::fs::create_dir_all(&tmp_dir).unwrap();
-    let db_path = tmp_dir.join("frigate.db");
+    let db_path = tmp_dir.join("ninjanvr.db");
     let cfg_path = tmp_dir.join("config.yml");
     let web_dir = tmp_dir.join("web-v2");
     std::fs::create_dir_all(&web_dir).unwrap();
@@ -89,7 +89,7 @@ version: 0.18-0
         .next()
         .expect("cookie key=value must be present")
         .to_string();
-    assert!(cookie_pair.starts_with("frigate_token="));
+    assert!(cookie_pair.starts_with("ninjanvr_token="));
 
     // 3. Authenticated request decodes & verifies the HS256 JWT via jsonwebtoken::decode
     let auth_resp = app
