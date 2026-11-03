@@ -1431,6 +1431,11 @@ impl NinjaConfig {
     }
 
     /// Generates the complete `/api/config` JSON object expected by the React SPA.
+    pub fn to_api_value(&self) -> Value {
+        self.to_api_config()
+    }
+
+    /// Generates the complete `/api/config` JSON object expected by the React SPA.
     pub fn to_api_config(&self) -> Value {
         let labelmap = self.load_labelmap();
         let attributes_map = json!({
@@ -2058,7 +2063,7 @@ impl NinjaConfig {
                 "replace_rules": []
             },
             "camera_groups": {},
-            "profiles": {},
+            "profiles": self.profiles,
             "peers": self.peers,
             "plus": { "enabled": false }
         })
@@ -2165,6 +2170,16 @@ impl NinjaConfig {
         if let Some(auth_val) = obj.get("auth") {
             self.auth = serde_json::from_value(auth_val.clone()).context("invalid auth config")?;
         }
+        if let Some(oidc_val) = obj.get("oidc") {
+            self.auth.oidc =
+                serde_json::from_value(oidc_val.clone()).context("invalid oidc config")?;
+        }
+        if let Some(proxy_val) = obj.get("proxy")
+            && proxy_val.get("header_map").is_none()
+        {
+            self.auth.proxy =
+                serde_json::from_value(proxy_val.clone()).context("invalid proxy config")?;
+        }
         if let Some(tls_val) = obj.get("tls") {
             self.tls = serde_json::from_value(tls_val.clone()).context("invalid tls config")?;
         }
@@ -2210,6 +2225,10 @@ impl NinjaConfig {
         if let Some(audio_val) = obj.get("audio") {
             self.audio =
                 serde_json::from_value(audio_val.clone()).context("invalid audio config")?;
+        }
+        if let Some(profiles_val) = obj.get("profiles") {
+            self.profiles =
+                serde_json::from_value(profiles_val.clone()).context("invalid profiles config")?;
         }
         if let Some(peers_val) = obj.get("peers") {
             self.peers =
@@ -2288,6 +2307,18 @@ fn extract_host_from_go2rtc_val(val: &Value) -> Option<String> {
     }
 }
 
+fn extract_authority_host(host_port_and_more: &str) -> &str {
+    if host_port_and_more.starts_with('[')
+        && let Some(bracket_end) = host_port_and_more.find(']')
+    {
+        return &host_port_and_more[..=bracket_end];
+    }
+    let end = host_port_and_more
+        .find(['/', '?', '#', ':'])
+        .unwrap_or(host_port_and_more.len());
+    &host_port_and_more[..end]
+}
+
 /// Restores credentials into a scrubbed RTSP/HTTP URL (`rtsp://*:*@host/path`) if a matching original exists.
 pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
     if !input.contains("://*:*@") && !input.contains("://*@") {
@@ -2304,8 +2335,7 @@ pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
         let after_scheme = &input[scheme_idx + 3..];
         if let Some(at_idx) = after_scheme.find('@') {
             let rest = &after_scheme[at_idx + 1..];
-            let host_end = rest.find(['/', '?', '#', ':']).unwrap_or(rest.len());
-            let target_host = &rest[..host_end];
+            let target_host = extract_authority_host(rest);
             for orig in originals {
                 if let Some(orig_scheme_idx) = orig.find("://") {
                     let orig_after = &orig[orig_scheme_idx + 3..];
@@ -2315,9 +2345,7 @@ pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
                     if let Some(orig_at) = orig_auth.rfind('@') {
                         let orig_creds = &orig_auth[..orig_at];
                         let orig_host_part = &orig_auth[orig_at + 1..];
-                        let orig_host_end =
-                            orig_host_part.find(':').unwrap_or(orig_host_part.len());
-                        if &orig_host_part[..orig_host_end] == target_host {
+                        if extract_authority_host(orig_host_part) == target_host {
                             return format!("{}{}@{}", &input[..scheme_idx + 3], orig_creds, rest);
                         }
                     }
@@ -2374,6 +2402,56 @@ pub fn scrub_rtsp_credentials(input: &str) -> String {
             &after_scheme[at_idx + 1..]
         )
     }
+}
+
+/// Scrubs credentials from all RTSP/HTTP URLs embedded in a raw YAML configuration string.
+pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
+    let mut out = String::with_capacity(raw_yaml.len());
+    let mut cursor = 0usize;
+    let bytes = raw_yaml.as_bytes();
+    while let Some(rel_idx) = raw_yaml[cursor..].find("://") {
+        let scheme_sep = cursor + rel_idx;
+        let mut scheme_start = scheme_sep;
+        while scheme_start > cursor {
+            let b = bytes[scheme_start - 1];
+            if b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.' {
+                scheme_start -= 1;
+            } else {
+                break;
+            }
+        }
+        if scheme_start == scheme_sep {
+            out.push_str(&raw_yaml[cursor..scheme_sep + 3]);
+            cursor = scheme_sep + 3;
+            continue;
+        }
+        out.push_str(&raw_yaml[cursor..scheme_start]);
+        let after_sep = scheme_sep + 3;
+        let mut url_end = after_sep;
+        let slash_pos = raw_yaml[after_sep..].find('/').unwrap_or(usize::MAX);
+        let mut in_ipv6_brackets = false;
+        for (offset, ch) in raw_yaml[after_sep..].char_indices() {
+            if ch == '[' && offset < slash_pos {
+                in_ipv6_brackets = true;
+                url_end = after_sep + offset + ch.len_utf8();
+                continue;
+            }
+            if in_ipv6_brackets && ch == ']' {
+                in_ipv6_brackets = false;
+                url_end = after_sep + offset + ch.len_utf8();
+                continue;
+            }
+            if ch.is_whitespace() || matches!(ch, '"' | '\'' | '#' | ',' | ']') {
+                break;
+            }
+            url_end = after_sep + offset + ch.len_utf8();
+        }
+        let url_token = &raw_yaml[scheme_start..url_end];
+        out.push_str(&scrub_rtsp_credentials(url_token));
+        cursor = url_end;
+    }
+    out.push_str(&raw_yaml[cursor..]);
+    out
 }
 
 /// Recursively scrubs credentials from any URL strings inside a JSON `Value`.
@@ -2682,5 +2760,613 @@ version: 0.18-0
             cfg.detectors["ort_cuda"].normalized_backend_type(),
             "onnxruntime"
         );
+    }
+
+    #[test]
+    fn credential_scrubbing_and_restoration_handles_ipv4_ipv6_tokens_and_edited_paths() {
+        // 1. user:password@ (*:*@) vs single token@ (*@) and IPv6 authority
+        assert_eq!(
+            scrub_rtsp_credentials("rtsp://admin:pass123@192.0.2.50:554/h264Preview_01_main"),
+            "rtsp://*:*@192.0.2.50:554/h264Preview_01_main"
+        );
+        assert_eq!(
+            scrub_rtsp_credentials("rtsp://single_token@192.0.2.60:554/live/ch0"),
+            "rtsp://*@192.0.2.60:554/live/ch0"
+        );
+        assert_eq!(
+            scrub_rtsp_credentials("rtsp://user:pass@[2001:db8::1]:8554/stream"),
+            "rtsp://*:*@[2001:db8::1]:8554/stream"
+        );
+        assert_eq!(
+            scrub_rtsp_credentials("rtsps://token_only@[2001:db8::2]:8555/secure"),
+            "rtsps://*@[2001:db8::2]:8555/secure"
+        );
+        assert_eq!(
+            scrub_rtsp_credentials("rtsp://127.0.0.1:8554/no_creds"),
+            "rtsp://127.0.0.1:8554/no_creds"
+        );
+        assert_eq!(
+            scrub_rtsp_credentials("preset-rtsp-restream"),
+            "preset-rtsp-restream"
+        );
+
+        // 2. scrub_yaml_credentials across user:pass@, token@, and IPv6 URLs in raw YAML
+        let raw_yaml = r#"
+go2rtc:
+  streams:
+    cam_v4:
+      - rtsp://admin:pass123@192.0.2.50:554/h264Preview_01_main
+    cam_tok:
+      - "rtsp://single_token@192.0.2.60:554/live/ch0"
+    cam_v6:
+      - rtsp://user:pass@[2001:db8::1]:8554/stream#video=copy
+"#;
+        let scrubbed_yaml = scrub_yaml_credentials(raw_yaml);
+        assert!(scrubbed_yaml.contains("rtsp://*:*@192.0.2.50:554/h264Preview_01_main"));
+        assert!(scrubbed_yaml.contains("\"rtsp://*@192.0.2.60:554/live/ch0\""));
+        assert!(scrubbed_yaml.contains("rtsp://*:*@[2001:db8::1]:8554/stream#video=copy"));
+        assert!(!scrubbed_yaml.contains("admin:pass123"));
+        assert!(!scrubbed_yaml.contains("single_token"));
+        assert!(!scrubbed_yaml.contains("user:pass"));
+
+        // 3. restore_scrubbed_url: exact match, path modification on scrubbed URL, and unmatched host
+        let originals = vec![
+            "rtsp://user:pass@192.0.2.50:554/h264Preview_01_main".to_string(),
+            "rtsp://single_token@192.0.2.60:554/live/ch0".to_string(),
+            "rtsp://v6user:v6pass@[2001:db8::1]:8554/stream".to_string(),
+        ];
+
+        // Exact matches
+        assert_eq!(
+            restore_scrubbed_url("rtsp://*:*@192.0.2.50:554/h264Preview_01_main", &originals),
+            "rtsp://user:pass@192.0.2.50:554/h264Preview_01_main"
+        );
+        assert_eq!(
+            restore_scrubbed_url("rtsp://*@192.0.2.60:554/live/ch0", &originals),
+            "rtsp://single_token@192.0.2.60:554/live/ch0"
+        );
+        assert_eq!(
+            restore_scrubbed_url("rtsp://*:*@[2001:db8::1]:8554/stream", &originals),
+            "rtsp://v6user:v6pass@[2001:db8::1]:8554/stream"
+        );
+
+        // Path modification on a scrubbed URL restores credentials by matching host
+        assert_eq!(
+            restore_scrubbed_url("rtsp://*:*@192.0.2.50:554/h265Preview_01_main", &originals),
+            "rtsp://user:pass@192.0.2.50:554/h265Preview_01_main"
+        );
+        assert_eq!(
+            restore_scrubbed_url("rtsp://*@192.0.2.60:554/live/ch1_sub", &originals),
+            "rtsp://single_token@192.0.2.60:554/live/ch1_sub"
+        );
+        assert_eq!(
+            restore_scrubbed_url("rtsp://*:*@[2001:db8::1]:8554/sub_stream", &originals),
+            "rtsp://v6user:v6pass@[2001:db8::1]:8554/sub_stream"
+        );
+
+        // Unmatched host leaves URL untouched without panicking
+        assert_eq!(
+            restore_scrubbed_url("rtsp://*:*@198.51.100.99:554/stream", &originals),
+            "rtsp://*:*@198.51.100.99:554/stream"
+        );
+        assert_eq!(
+            restore_scrubbed_url("rtsp://*:*@[2001:db8::99]:8554/stream", &originals),
+            "rtsp://*:*@[2001:db8::99]:8554/stream"
+        );
+        assert_eq!(
+            restore_scrubbed_url("not_a_url_at_all", &originals),
+            "not_a_url_at_all"
+        );
+    }
+
+    #[test]
+    fn to_api_value_and_apply_structured_json_roundtrip_all_sections() {
+        let initial_yaml = r#"
+version: 0.18-0
+mqtt:
+  enabled: true
+  host: 127.0.0.1
+  port: 1883
+  user: mqtt_op
+  password: initial_mqtt_password
+cameras:
+  driveway:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://cam_admin:cam_secret@192.0.2.50:554/h264Preview_01_main
+          roles: [record]
+        - path: rtsp://cam_admin:cam_secret@192.0.2.50:554/h264Preview_01_sub
+          roles: [detect]
+go2rtc:
+  streams:
+    driveway:
+      - rtsp://cam_admin:cam_secret@192.0.2.50:554/h264Preview_01_main
+"#;
+        let mut cfg =
+            NinjaConfig::from_yaml_str(initial_yaml, PathBuf::from("/tmp/roundtrip.yml")).unwrap();
+        let mut api = cfg.to_api_value();
+        assert_eq!(api["mqtt"]["has_password"], true);
+
+        // Mutate all config sections in the structured payload
+        api["mqtt"]["host"] = json!("10.20.30.40");
+        api["mqtt"]["port"] = json!(8883);
+        api["mqtt"]["tls_enabled"] = json!(true);
+        api["mqtt"]["password"] = json!("***"); // Masked password must preserve original password
+
+        api["auth"]["session_length"] = json!(43200);
+        api["auth"]["trusted_proxies"] = json!(["10.0.0.0/8", "127.0.0.1/32"]);
+        api["auth"]["oidc"] = json!({
+            "enabled": true,
+            "provider_name": "Zitadel",
+            "issuer_url": "https://sso.example.org",
+            "client_id": "ninjanvr-web",
+            "client_secret_env": "NINJANVR_OIDC_SECRET",
+            "scopes": ["openid", "profile", "email", "groups"],
+            "auto_redirect": true,
+            "username_claim": "preferred_username",
+            "groups_claim": "groups",
+            "role_mapping": {
+                "admin": ["nvr-admins"],
+                "operator": ["nvr-ops"],
+                "viewer": ["nvr-viewers"]
+            },
+            "default_role": "viewer"
+        });
+        api["auth"]["proxy"] = json!({
+            "enabled": true,
+            "trusted_proxies": ["127.0.0.1/32"],
+            "user_header": "X-Forwarded-User",
+            "groups_header": "X-Forwarded-Groups",
+            "logout_url": "https://sso.example.org/logout"
+        });
+
+        api["detectors"] = json!({
+            "ov_gpu": {
+                "type": "openvino",
+                "device": "GPU"
+            }
+        });
+        api["model"] = json!({
+            "width": 416,
+            "height": 416,
+            "input_tensor": "nhwc",
+            "input_pixel_format": "rgb",
+            "path": "/openvino-model/yolox.xml",
+            "labelmap_path": "/openvino-model/coco.txt",
+            "model_type": "yolox"
+        });
+        api["motion"] = json!({
+            "enabled": true,
+            "threshold": 35,
+            "lightning_threshold": 0.75,
+            "improve_contrast": true,
+            "contour_area": 15,
+            "delta_alpha": 0.2,
+            "frame_alpha": 0.01,
+            "frame_height": 120,
+            "mask": "0.0,0.0,1.0,0.0,1.0,0.1,0.0,0.1"
+        });
+        api["objects"] = json!({
+            "track": ["person", "car", "dog"],
+            "filters": {
+                "person": {
+                    "min_area": 0.02,
+                    "max_area": 500000.0,
+                    "min_ratio": 0.2,
+                    "max_ratio": 4.0,
+                    "threshold": 0.72,
+                    "min_score": 0.55,
+                    "mask": {}
+                }
+            },
+            "mask": {}
+        });
+        api["record"] = json!({
+            "enabled": true,
+            "expire_interval": 120,
+            "continuous_substream": true,
+            "mode_tiering": true,
+            "max_size_gb": 500.0,
+            "min_free_gb": 25.0,
+            "continuous": { "days": 7.0 },
+            "motion": { "days": 14.0 },
+            "alerts": {
+                "pre_capture": 8,
+                "post_capture": 12,
+                "retain": { "days": 30.0, "mode": "active_objects" }
+            },
+            "detections": {
+                "pre_capture": 5,
+                "post_capture": 10,
+                "retain": { "days": 14.0, "mode": "motion" }
+            },
+            "preview": { "quality": "high" },
+            "storage_tiers": {
+                "enabled": true,
+                "hot_dir": "/media/hot",
+                "cold_dir": "/media/cold",
+                "migrate_after_hours": 48
+            },
+            "alert_backup": {
+                "enabled": true,
+                "target_dir": "/media/backup",
+                "severities": ["alert"],
+                "include_snapshot": true
+            },
+            "cold_compaction": {
+                "enabled": true,
+                "after_hours": 72,
+                "crf": 30,
+                "idle_only": true,
+                "codec": "hevc",
+                "preset": "fast",
+                "hwaccel": "vaapi"
+            }
+        });
+        api["snapshots"] = json!({
+            "enabled": true,
+            "timestamp": true,
+            "bounding_box": true,
+            "crop": true,
+            "quality": 85,
+            "high_res": true,
+            "from_main_stream": true,
+            "selection": "best_overall"
+        });
+        api["review"] = json!({
+            "alerts": {
+                "enabled": true,
+                "labels": ["person", "car"],
+                "required_zones": ["entry_zone"],
+                "cutoff_time": 45
+            },
+            "detections": {
+                "enabled": true,
+                "required_zones": ["sidewalk"],
+                "cutoff_time": 25
+            }
+        });
+        api["audio"] = json!({
+            "enabled": true,
+            "min_volume_dbfs": -48,
+            "labels": ["bark", "speech", "glass"]
+        });
+        api["profiles"] = json!({
+            "home": {
+                "disabled_alerts_cameras": ["driveway"],
+                "disabled_record_cameras": []
+            }
+        });
+        api["peers"] = json!({
+            "warehouse_nvr": {
+                "enabled": true,
+                "url": "https://nvr2.example.org",
+                "token_env": "NINJANVR_PEER_WAREHOUSE_TOKEN"
+            }
+        });
+        api["go2rtc"]["streams"] = json!({
+            "driveway": ["rtsp://*:*@192.0.2.50:554/h265Preview_01_main"],
+            "driveway_sub": ["rtsp://*:*@192.0.2.50:554/h264Preview_01_sub"]
+        });
+        api["cameras"]["driveway"]["ffmpeg"]["inputs"] = json!([
+            {
+                "path": "rtsp://*:*@192.0.2.50:554/h265Preview_01_main",
+                "roles": ["record"]
+            },
+            {
+                "path": "rtsp://*:*@192.0.2.50:554/h264Preview_01_sub",
+                "roles": ["detect"]
+            }
+        ]);
+        api["cameras"]["driveway"]["live"] = json!({
+            "streams": {
+                "Sub": "driveway_sub",
+                "Main": "driveway"
+            },
+            "height": 1080,
+            "quality": 9,
+            "rotate": 90
+        });
+        api["cameras"]["driveway"]["zones"] = json!({
+            "entry_zone": {
+                "coordinates": "0.1,0.2,0.8,0.2,0.8,0.9,0.1,0.9",
+                "objects": ["person", "car"],
+                "inertia": 4,
+                "loitering_time": 6,
+                "min_area": 0.03,
+                "max_area": 200000.0,
+                "min_score": 0.6
+            }
+        });
+        api["cameras"]["driveway"]["lines"] = json!({
+            "gate_line": {
+                "points": [0.1, 0.5, 0.9, 0.5],
+                "direction": "a_to_b",
+                "objects": ["person", "car"]
+            }
+        });
+        api["cameras"]["driveway"]["motion"]["threshold"] = json!(28);
+        api["cameras"]["driveway"]["objects"]["track"] = json!(["person", "car"]);
+        api["cameras"]["driveway"]["review"] = json!({
+            "alerts": {
+                "enabled": true,
+                "labels": ["person"],
+                "required_zones": ["entry_zone"],
+                "cutoff_time": 50
+            },
+            "detections": {
+                "enabled": true,
+                "required_zones": [],
+                "cutoff_time": 20
+            }
+        });
+        api["cameras"]["driveway"]["record"]["continuous"]["days"] = json!(10.0);
+        api["cameras"]["driveway"]["snapshots"]["quality"] = json!(90);
+        api["cameras"]["driveway"]["audio"]["enabled"] = json!(true);
+        api["cameras"]["driveway"]["audio"]["min_volume_dbfs"] = json!(-52);
+
+        cfg.apply_structured_json(&api).unwrap();
+
+        // Masked password must have been preserved
+        assert_eq!(cfg.mqtt.password.as_deref(), Some("initial_mqtt_password"));
+
+        // Serialize to YAML and re-parse with NinjaConfig::from_yaml_str
+        let exported_yaml = cfg.to_clean_yaml().unwrap();
+        let reparsed =
+            NinjaConfig::from_yaml_str(&exported_yaml, PathBuf::from("/tmp/roundtrip.yml"))
+                .unwrap();
+
+        assert_eq!(reparsed.mqtt.host, "10.20.30.40");
+        assert_eq!(reparsed.mqtt.port, 8883);
+        assert!(reparsed.mqtt.should_use_tls());
+        assert_eq!(
+            reparsed.mqtt.password.as_deref(),
+            Some("initial_mqtt_password")
+        );
+        assert!(reparsed.auth.oidc.enabled);
+        assert_eq!(reparsed.auth.oidc.provider_name, "Zitadel");
+        assert_eq!(reparsed.auth.oidc.issuer_url, "https://sso.example.org");
+        assert!(reparsed.auth.proxy.enabled);
+        assert_eq!(reparsed.auth.proxy.user_header, "X-Forwarded-User");
+        assert_eq!(reparsed.detectors["ov_gpu"].device, "GPU");
+        assert_eq!(reparsed.model.width, 416);
+        assert_eq!(reparsed.model.model_type, "yolox");
+        assert_eq!(reparsed.motion.threshold, 35);
+        assert_eq!(reparsed.objects.track, vec!["person", "car", "dog"]);
+        assert_eq!(reparsed.record.continuous.days, 7.0);
+        assert_eq!(reparsed.record.cold_compaction.codec, "hevc");
+        assert_eq!(
+            reparsed.snapshots.selection,
+            SnapshotSelectionPolicy::BestOverall
+        );
+        assert_eq!(reparsed.review.alerts.cutoff_time, 45);
+        assert!(reparsed.audio.enabled);
+        assert_eq!(reparsed.audio.min_volume_dbfs, -48);
+        assert_eq!(
+            reparsed.profiles["home"].disabled_alerts_cameras,
+            vec!["driveway"]
+        );
+        assert_eq!(
+            reparsed.peers["warehouse_nvr"].url,
+            "https://nvr2.example.org"
+        );
+
+        let drv = &reparsed.cameras["driveway"];
+        assert_eq!(
+            reparsed
+                .camera_input_for_role("driveway", "record")
+                .as_deref(),
+            Some("rtsp://cam_admin:cam_secret@192.0.2.50:554/h265Preview_01_main")
+        );
+        assert_eq!(
+            reparsed
+                .camera_input_for_role("driveway", "detect")
+                .as_deref(),
+            Some("rtsp://cam_admin:cam_secret@192.0.2.50:554/h264Preview_01_sub")
+        );
+        assert_eq!(drv.live.rotate, 90);
+        assert_eq!(drv.zones["entry_zone"].loitering_time, 6);
+        assert_eq!(drv.lines["gate_line"].direction, LineDirection::AToB);
+        assert_eq!(drv.motion.threshold, 28);
+        assert_eq!(drv.review.alerts.cutoff_time, 50);
+        assert_eq!(drv.record.continuous.days, 10.0);
+        assert_eq!(drv.snapshots.quality, 90);
+        assert!(drv.audio.enabled);
+        assert_eq!(drv.audio.min_volume_dbfs, -52);
+
+        // Now verify mqtt.clear_password clears the password
+        let clear_patch = json!({
+            "mqtt": {
+                "enabled": true,
+                "host": "10.20.30.40",
+                "port": 1883,
+                "clear_password": true
+            }
+        });
+        cfg.apply_structured_json(&clear_patch).unwrap();
+        assert!(cfg.mqtt.password.is_none());
+        assert_eq!(cfg.to_api_value()["mqtt"]["has_password"], false);
+    }
+
+    #[test]
+    fn write_go2rtc_config_generates_streams_webrtc_api_and_extra_keys() {
+        let yaml = r#"
+go2rtc:
+  streams:
+    front_door:
+      - rtsp://admin:secret@192.0.2.10:554/main
+    front_door_sub:
+      - rtsp://admin:secret@192.0.2.10:554/sub
+  rtsp:
+    listen: ":8554"
+  ffmpeg:
+    bin: /usr/local/bin/ffmpeg
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_go2rtc_test_{}", std::process::id()));
+        let go2rtc_path = tmp_dir.join("go2rtc.yaml");
+        cfg.write_go2rtc_config(&go2rtc_path).unwrap();
+
+        let written = std::fs::read_to_string(&go2rtc_path).unwrap();
+        let parsed: Value = serde_yaml::from_str(&written).unwrap();
+
+        assert_eq!(
+            parsed["streams"]["front_door"][0],
+            "rtsp://admin:secret@192.0.2.10:554/main"
+        );
+        assert_eq!(
+            parsed["streams"]["front_door_sub"][0],
+            "rtsp://admin:secret@192.0.2.10:554/sub"
+        );
+        assert_eq!(parsed["api"]["origin"], "*");
+        assert_eq!(parsed["webrtc"]["candidates"][0], "stun:8555");
+        assert_eq!(parsed["log"]["format"], "text");
+        assert_eq!(parsed["rtsp"]["listen"], ":8554");
+        assert_eq!(parsed["ffmpeg"]["bin"], "/usr/local/bin/ffmpeg");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn camera_input_for_role_load_labelmap_and_resolve_area_bounds_px_work() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_labelmap_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let custom_labelmap = tmp_dir.join("custom_labels.txt");
+        std::fs::write(&custom_labelmap, "__background__\nperson\nforklift\ncar\n").unwrap();
+
+        let yaml = format!(
+            r#"
+model:
+  labelmap_path: {}
+cameras:
+  yard:
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/yard_sub
+          roles: [detect]
+        - path: rtsp://127.0.0.1:8554/yard_main
+          roles: [record, audio]
+"#,
+            custom_labelmap.display()
+        );
+        let mut cfg = NinjaConfig::from_yaml_str(&yaml, tmp_dir.join("config.yml")).unwrap();
+
+        // 1. camera_input_for_role (detect vs record vs missing)
+        assert_eq!(
+            cfg.camera_input_for_role("yard", "detect").as_deref(),
+            Some("rtsp://127.0.0.1:8554/yard_sub")
+        );
+        assert_eq!(
+            cfg.camera_input_for_role("yard", "record").as_deref(),
+            Some("rtsp://127.0.0.1:8554/yard_main")
+        );
+        assert!(
+            cfg.camera_input_for_role("yard", "nonexistent_role")
+                .is_none()
+        );
+        assert!(
+            cfg.camera_input_for_role("missing_camera", "detect")
+                .is_none()
+        );
+
+        // 2. load_labelmap: custom file path vs fallback COCO-91 map
+        let loaded_custom = cfg.load_labelmap();
+        assert_eq!(
+            loaded_custom.get("0").map(String::as_str),
+            Some("__background__")
+        );
+        assert_eq!(loaded_custom.get("1").map(String::as_str), Some("person"));
+        assert_eq!(loaded_custom.get("2").map(String::as_str), Some("forklift"));
+        assert_eq!(loaded_custom.get("3").map(String::as_str), Some("car"));
+
+        cfg.model.labelmap_path = "/nonexistent/path/to/labels.txt".to_string();
+        let fallback_map = cfg.load_labelmap();
+        assert_eq!(
+            fallback_map.get("0").map(String::as_str),
+            Some("__background__")
+        );
+        assert_eq!(fallback_map.get("1").map(String::as_str), Some("person"));
+        assert_eq!(fallback_map.get("2").map(String::as_str), Some("bicycle"));
+        assert_eq!(fallback_map.get("3").map(String::as_str), Some("car"));
+        assert_eq!(fallback_map.get("17").map(String::as_str), Some("cat"));
+        assert_eq!(fallback_map.get("18").map(String::as_str), Some("dog"));
+
+        // 3. ObjectFilterConfig::resolve_area_bounds_px(1920, 1080)
+        // Fractional: 0.05 * (1920 * 1080) = 103,680 px^2
+        let frac_filter = ObjectFilterConfig {
+            min_area: 0.05,
+            max_area: 0.50,
+            ..Default::default()
+        };
+        assert_eq!(
+            frac_filter.resolve_area_bounds_px(1920, 1080),
+            (103_680, 1_036_800)
+        );
+
+        // Absolute pixel values: 5000.0 -> 5,000 px^2
+        let abs_filter = ObjectFilterConfig {
+            min_area: 5000.0,
+            max_area: 250_000.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            abs_filter.resolve_area_bounds_px(1920, 1080),
+            (5_000, 250_000)
+        );
+
+        // 4. NinjaConfig::load from disk, resolve_camera_webui_base_url, and Go2RtcSupervisor::new/pid
+        let disk_cfg_path = tmp_dir.join("disk_config.yml");
+        std::fs::write(
+            &disk_cfg_path,
+            r#"
+cameras:
+  custom_ui_cam:
+    webui_url: "https://192.0.2.80:8443/"
+  rtsp_host_cam:
+    ffmpeg:
+      inputs:
+        - path: rtsp://admin:pass@192.0.2.81:554/main
+          roles: [record]
+  loopback_cam:
+    webui_url: "http://127.0.0.1:8080"
+    ffmpeg:
+      inputs:
+        - path: rtsp://localhost:8554/loop
+          roles: [detect]
+go2rtc:
+  streams:
+    loopback_cam:
+      - rtsp://admin:pass@[2001:db8::88]:554/live
+"#,
+        )
+        .unwrap();
+        let disk_cfg = NinjaConfig::load(&disk_cfg_path).unwrap();
+        assert_eq!(
+            disk_cfg
+                .resolve_camera_webui_base_url("custom_ui_cam")
+                .as_deref(),
+            Some("https://192.0.2.80:8443")
+        );
+        assert_eq!(
+            disk_cfg
+                .resolve_camera_webui_base_url("rtsp_host_cam")
+                .as_deref(),
+            Some("http://192.0.2.81")
+        );
+        assert_eq!(
+            disk_cfg
+                .resolve_camera_webui_base_url("loopback_cam")
+                .as_deref(),
+            Some("http://[2001:db8::88]")
+        );
+        assert!(disk_cfg.resolve_camera_webui_base_url("missing").is_none());
+
+        let sup = Go2RtcSupervisor::new(Arc::new(RwLock::new(disk_cfg)));
+        assert_eq!(sup.pid(), 0);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
