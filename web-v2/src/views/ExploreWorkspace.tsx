@@ -1,7 +1,8 @@
 import React from "react";
-import { Camera, Play, Trash2 } from "lucide-react";
+import { Camera, Play, Sparkles, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
 import {
+  AiVerificationResult,
   DetectedAttribute,
   EventItem,
   ExportItem,
@@ -9,6 +10,12 @@ import {
 } from "../types/nvr";
 import { WorkspaceTab, findMatchingExport, formatDateTime } from "../utils/format";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
+
+export function formatAiVerificationBadge(verdict: AiVerificationResult): string {
+  const pct = Math.round((verdict.confidence ?? 0) * 100);
+  const status = verdict.is_true_positive ? "TRUE POSITIVE" : "FALSE POSITIVE";
+  return `AI JUDGE: ${status} (${pct}%)`;
+}
 
 export function formatEventLabelWithSubLabel(
   label: string,
@@ -86,6 +93,77 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const { t } = useI18n();
   const [showForensic, setShowForensic] = React.useState(false);
   const [eventNoteDraft, setEventNoteDraft] = React.useState("");
+  const [aiVerifyBusy, setAiVerifyBusy] = React.useState(false);
+
+  const handleToggleFalsePositive = async () => {
+    if (!selectedEvent) return;
+    const nextFp = !selectedEvent.false_positive;
+    const res = await fetch(
+      `/api/events/${encodeURIComponent(selectedEvent.id)}/false_positive`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ false_positive: nextFp }),
+      }
+    );
+    if (res.ok) {
+      setSelectedEvent({
+        ...selectedEvent,
+        false_positive: nextFp,
+      });
+      notify(
+        nextFp
+          ? "Marked as False Positive — spatial & dhash64 suppression signature saved"
+          : "Cleared False Positive flag & removed suppression signature"
+      );
+    }
+  };
+
+  const handleVerifyWithAi = async () => {
+    if (!selectedEvent || aiVerifyBusy) return;
+    setAiVerifyBusy(true);
+    try {
+      const res = await fetch(
+        `/api/events/${encodeURIComponent(selectedEvent.id)}/verify-ai`,
+        {
+          method: "POST",
+          credentials: "include",
+        }
+      );
+      const data = await res.json().catch(() => null);
+      if (res.ok && data) {
+        const aiVerdict: AiVerificationResult = data.ai_verification || {
+          is_true_positive: Boolean(data.is_true_positive),
+          confidence: Number(data.confidence ?? 0.9),
+          reason: String(data.reason || "Verified by Vision AI Judge"),
+          provider: data.provider,
+          model: data.model,
+          verified_at: data.verified_at,
+        };
+        setSelectedEvent({
+          ...selectedEvent,
+          false_positive:
+            data.false_positive !== undefined
+              ? Boolean(data.false_positive)
+              : selectedEvent.false_positive,
+          data: {
+            ...(selectedEvent.data || {}),
+            ai_verification: aiVerdict,
+          },
+        });
+        notify(
+          `${formatAiVerificationBadge(aiVerdict)} — ${aiVerdict.reason}`
+        );
+      } else {
+        notify(data?.message || "Vision AI Judge verification failed");
+      }
+    } catch {
+      notify("Vision AI Judge request failed");
+    } finally {
+      setAiVerifyBusy(false);
+    }
+  };
 
   React.useEffect(() => {
     setEventNoteDraft(selectedEvent?.data?.notes || "");
@@ -601,21 +679,22 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     {t.explore.retainToggle}
                   </button>
                   <button
-                    className="nvr-btn"
-                    onClick={async () => {
-                      await fetch(
-                        `/api/events/${encodeURIComponent(selectedEvent.id)}/false_positive`,
-                        {
-                          method: "PUT",
-                          headers: { "Content-Type": "application/json" },
-                          credentials: "include",
-                          body: JSON.stringify({ false_positive: true }),
-                        }
-                      );
-                      notify("Event flagged as false positive");
-                    }}
+                    className={`nvr-btn ${selectedEvent.false_positive ? "active danger" : ""}`}
+                    onClick={handleToggleFalsePositive}
+                    title="Toggle false-positive memory suppression signature (spatial IoU + dhash64)"
                   >
-                    {t.explore.falsePositive}
+                    {selectedEvent.false_positive
+                      ? "False Positive ✓"
+                      : "Mark False Positive"}
+                  </button>
+                  <button
+                    className="nvr-btn mono"
+                    disabled={aiVerifyBusy}
+                    onClick={handleVerifyWithAi}
+                    title="Verify this detection snapshot using the configured Vision AI Judge (Gemini / OpenAI / Ollama)"
+                  >
+                    <Sparkles size={12} />
+                    {aiVerifyBusy ? "Verifying..." : "Verify with AI"}
                   </button>
                   <button
                     className="nvr-btn"
@@ -656,6 +735,60 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   </button>
                 </div>
               </div>
+
+              {(selectedEvent.data?.ai_verification || selectedEvent.false_positive) && (
+                <div
+                  className="mono"
+                  style={{
+                    background: "var(--bg-canvas)",
+                    borderBottom: "1px solid var(--border-strong)",
+                    padding: "7px 12px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    flexWrap: "wrap",
+                    gap: 10,
+                    fontSize: "var(--text-xs)",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                    {selectedEvent.data?.ai_verification && (
+                      <>
+                        <span
+                          className={`nvr-badge mono ${
+                            selectedEvent.data.ai_verification.is_true_positive
+                              ? "live"
+                              : "alert"
+                          }`}
+                        >
+                          {formatAiVerificationBadge(selectedEvent.data.ai_verification)}
+                        </span>
+                        <span style={{ color: "var(--text-primary)" }}>
+                          Reason:{" "}
+                          <strong>{selectedEvent.data.ai_verification.reason}</strong>
+                        </span>
+                        {selectedEvent.data.ai_verification.model && (
+                          <span style={{ color: "var(--text-secondary)" }}>
+                            Model:{" "}
+                            <strong>
+                              {(
+                                selectedEvent.data.ai_verification.provider || "genai"
+                              ).toUpperCase()}{" "}
+                              / {selectedEvent.data.ai_verification.model}
+                            </strong>
+                          </span>
+                        )}
+                      </>
+                    )}
+                    {selectedEvent.false_positive && (
+                      <span className="nvr-badge alert mono">
+                        SUPPRESSED IN FALSE-POSITIVE MEMORY
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
 
               {showForensic && (
                 <div

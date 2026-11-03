@@ -302,6 +302,46 @@ export interface PeerNodeConfig {
   token_env?: string;
 }
 
+export interface GenAiConfig {
+  enabled: boolean;
+  provider: "gemini" | "openai" | "ollama" | string;
+  base_url?: string | null;
+  api_key_env: string;
+  model: string;
+  verify_ambiguous_alerts: boolean;
+  ambiguous_score_min: number;
+  ambiguous_score_max: number;
+  auto_suppress_false_positives: boolean;
+  timeout_ms?: number;
+}
+
+export interface FalsePositiveSignatureItem {
+  id: number;
+  camera: string;
+  label: string;
+  norm_bbox: [number, number, number, number];
+  norm_x1?: number;
+  norm_y1?: number;
+  norm_x2?: number;
+  norm_y2?: number;
+  dhash64?: number | null;
+  dominant_color?: string | null;
+  hit_count: number;
+  source_event_id?: string | null;
+  reason?: string | null;
+  created_at: number;
+  last_seen_at: number;
+}
+
+export interface AiVerificationResult {
+  is_true_positive: boolean;
+  confidence: number;
+  reason: string;
+  provider?: string;
+  model?: string;
+  verified_at?: number;
+}
+
 export interface NinjaConfigResponse {
   version: string;
   safe_mode: boolean;
@@ -315,6 +355,7 @@ export interface NinjaConfigResponse {
   };
   detectors?: Record<string, DetectorEntryConfig>;
   model?: ModelConfig;
+  genai?: GenAiConfig;
   detect?: CameraDetectConfig;
   motion?: CameraMotionConfig;
   objects?: ObjectsConfig;
@@ -509,6 +550,8 @@ export interface EventItem {
     face_box?: [number, number, number, number] | null;
     license_plate_box?: [number, number, number, number] | null;
     box?: [number, number, number, number];
+    dhash64?: number | null;
+    ai_verification?: AiVerificationResult | null;
     provenance?: TriggerProvenance | null;
   };
 }

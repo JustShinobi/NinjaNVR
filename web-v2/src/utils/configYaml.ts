@@ -329,6 +329,30 @@ export function buildCleanYamlFromDraft(
         draft.model?.labelmap_path || "/openvino-model/coco_91cl_bkgr.txt",
       model_type: draft.model?.model_type || "ssd",
     },
+    ...(draft.genai
+      ? {
+          genai: {
+            enabled: draft.genai.enabled ?? false,
+            provider: draft.genai.provider || "gemini",
+            ...(draft.genai.base_url ? { base_url: draft.genai.base_url } : {}),
+            api_key_env: draft.genai.api_key_env || "GEMINI_API_KEY",
+            model: draft.genai.model || "gemini-2.5-flash",
+            verify_ambiguous_alerts:
+              draft.genai.verify_ambiguous_alerts ?? false,
+            ambiguous_score_min: Number(
+              (draft.genai.ambiguous_score_min ?? 0.45).toFixed(2)
+            ),
+            ambiguous_score_max: Number(
+              (draft.genai.ambiguous_score_max ?? 0.72).toFixed(2)
+            ),
+            auto_suppress_false_positives:
+              draft.genai.auto_suppress_false_positives ?? true,
+            ...(draft.genai.timeout_ms
+              ? { timeout_ms: draft.genai.timeout_ms }
+              : {}),
+          },
+        }
+      : {}),
     detect: {
       enabled: draft.detect?.enabled ?? true,
       width: draft.detect?.width ?? 1280,
