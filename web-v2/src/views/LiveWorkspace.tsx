@@ -968,7 +968,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const [showMeasurements, setShowMeasurements] = useState<boolean>(true);
   const [snapStep, setSnapStep] = useState<number>(0.005);
   const [orthoSnap, setOrthoSnap] = useState<boolean>(true);
-  const [wallKindDraft, setWallKindDraft] = useState<"wall" | "door">("wall");
+  const [wallKindDraft, setWallKindDraft] = useState<"wall" | "door" | "window">("wall");
   const [quickWallLenM, setQuickWallLenM] = useState<number>(3.0);
   const [cursorNorm, setCursorNorm] = useState<{ x: number; y: number } | null>(
     null
@@ -2672,6 +2672,21 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     >
                       Draw Door
                     </button>
+                    <button
+                      type="button"
+                      className={`nvr-btn mono ${
+                        mapTool === "draw_wall" && wallKindDraft === "window" ? "active" : ""
+                      }`}
+                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      onClick={() => {
+                        setMapTool("draw_wall");
+                        setWallKindDraft("window");
+                        setWallStartPoint(null);
+                        setWallPreviewPoint(null);
+                      }}
+                    >
+                      Draw Window
+                    </button>
 
                     <span className="nvr-divider" aria-hidden="true" />
 
@@ -2988,6 +3003,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         >
                           <option value="wall">Wall (Parede)</option>
                           <option value="door">Door (Porta)</option>
+                          <option value="window">Window (Janela)</option>
                         </select>
                         <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
                           <span>Medida (m):</span>
@@ -3828,9 +3844,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         fontWeight="600"
                         style={{ pointerEvents: "none" }}
                       >
-                        {`${rmMetrics.widthM.toFixed(2)}m × ${rmMetrics.heightM.toFixed(
-                          2
-                        )}m (${rmMetrics.areaSqM.toFixed(1)}m²)`}
+                        {rw < 155
+                          ? `${rmMetrics.widthM.toFixed(2)}×${rmMetrics.heightM.toFixed(2)}m`
+                          : `${rmMetrics.widthM.toFixed(2)}m × ${rmMetrics.heightM.toFixed(
+                              2
+                            )}m (${rmMetrics.areaSqM.toFixed(1)}m²)`}
                       </text>
                     )}
                     {mapEditMode && isRoomSelected && (
@@ -4004,7 +4022,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 })()
               )}
 
-              {/* Vector Structural Walls & Doors Layer */}
+              {/* Vector Structural Walls, Doors & Windows Layer */}
               {floorplanWalls.map((wall, wIdx) => {
                 const [x1, y1, x2, y2] = wall.points;
                 const sx1 = x1 * 1000;
@@ -4013,6 +4031,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 const sy2 = y2 * 600;
                 const isWallSelected = selectedWallIdx === wIdx;
                 const isDoor = wall.kind === "door";
+                const isWindow = wall.kind === "window";
+                const kindLabel = isDoor ? "Door" : isWindow ? "Window" : "Wall";
                 const wMetrics = computeWallMetrics(
                   wall.points,
                   floorplanWidthM,
@@ -4075,16 +4095,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     >
                       <title>
                         {mapEditMode
-                          ? `Click to select & edit ${
-                              isDoor ? "Door" : "Wall"
-                            } #${wIdx + 1} (${wMetrics.lengthM.toFixed(2)}m)`
-                          : `${isDoor ? "Door" : "Wall"} #${wIdx + 1} (${wMetrics.lengthM.toFixed(
+                          ? `Click to select & edit ${kindLabel} #${wIdx + 1} (${wMetrics.lengthM.toFixed(2)}m)`
+                          : `${wall.label || `${kindLabel} #${wIdx + 1}`} (${wMetrics.lengthM.toFixed(
                               2
                             )}m)`}
                       </title>
                     </line>
 
-                    {/* Visible wall / door line */}
+                    {/* Visible wall / door / window line */}
                     <line
                       x1={sx1}
                       y1={sy1}
@@ -4095,13 +4113,30 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           ? "#38bdf8"
                           : isDoor
                           ? "#f59e0b"
+                          : isWindow
+                          ? "#38bdf8"
                           : mapTheme.floorplanWallStroke
                       }
-                      strokeWidth={isWallSelected ? 6 : isDoor ? 4 : 4.5}
+                      strokeWidth={
+                        isWallSelected ? 6 : isDoor ? 4 : isWindow ? 5.5 : 4.5
+                      }
                       strokeDasharray={isDoor ? "8 4" : undefined}
                       strokeLinecap="round"
                       style={{ pointerEvents: "none" }}
                     />
+                    {isWindow && (
+                      <line
+                        x1={sx1}
+                        y1={sy1}
+                        x2={sx2}
+                        y2={sy2}
+                        stroke="#e0f2fe"
+                        strokeWidth={1.6}
+                        strokeDasharray="10 3"
+                        strokeLinecap="round"
+                        style={{ pointerEvents: "none" }}
+                      />
+                    )}
 
                     {/* Endpoint nodes (draggable when selected in edit mode) */}
                     <circle
@@ -4198,7 +4233,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     />
 
                     {/* Wall Measurement Pill on Canvas */}
-                    {(showMeasurements || isWallSelected || mapEditMode) && (
+                    {(isWallSelected || (mapEditMode && showMeasurements)) && (
                       <g style={{ pointerEvents: "none" }}>
                         <rect
                           x={midSvgX - (isWallSelected ? 46 : 30)}
@@ -4212,6 +4247,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                               ? "#38bdf8"
                               : isDoor
                               ? "#f59e0b"
+                              : isWindow
+                              ? "#38bdf8"
                               : "rgba(148, 163, 184, 0.45)"
                           }
                           strokeWidth={1}
@@ -4886,10 +4923,16 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         color:
                           wall.kind === "door"
                             ? "var(--signal-motion-text)"
+                            : wall.kind === "window"
+                            ? "var(--signal-accent-text)"
                             : "var(--text-primary)",
                       }}
                     >
-                      {wall.kind === "door" ? `D#${wIdx + 1}` : `W#${wIdx + 1}`}
+                      {wall.kind === "door"
+                        ? `D#${wIdx + 1}`
+                        : wall.kind === "window"
+                        ? `J#${wIdx + 1}`
+                        : `W#${wIdx + 1}`}
                     </span>
                     <input
                       type="number"

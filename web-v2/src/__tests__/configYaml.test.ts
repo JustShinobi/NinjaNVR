@@ -487,7 +487,10 @@ go2rtc:
               color: "#0ea5e9",
             },
           ],
-          walls: [{ points: [0.08, 0.46, 0.46, 0.46] }],
+          walls: [
+            { points: [0.08, 0.46, 0.46, 0.46], label: "Parede Sul", kind: "wall" },
+            { points: [0.46, 0.16, 0.46, 0.32], label: "Janela Leste", kind: "window" },
+          ],
         },
       },
       cameras: {
@@ -524,6 +527,8 @@ go2rtc:
     expect(yamlText).toContain("walls:");
     expect(yamlText).toContain("points:");
     expect(yamlText).toContain("0.46");
+    expect(yamlText).toContain("label: Janela Leste");
+    expect(yamlText).toContain("kind: window");
     expect(yamlText).toContain("map:");
     expect(yamlText).toContain("angle_deg: 135");
     expect(yamlText).toContain("fov_deg: 95");
