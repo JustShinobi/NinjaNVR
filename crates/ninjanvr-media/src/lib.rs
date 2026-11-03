@@ -1410,12 +1410,12 @@ impl RecordingEngine {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
         loop {
-            let cameras: Vec<String> = {
+            let cameras: Vec<(String, String)> = {
                 let cfg = self.config.read().await;
                 cfg.cameras
                     .iter()
                     .filter(|(_, c)| c.enabled && c.record.enabled)
-                    .map(|(n, _)| n.clone())
+                    .map(|(n, c)| (n.clone(), c.record.preview.quality.clone()))
                     .collect()
             };
 
@@ -1423,7 +1423,13 @@ impl RecordingEngine {
             let current_hour_start = ((now as i64) / 3600) * 3600;
             let prev_hour_start = current_hour_start - 3600;
 
-            for camera in cameras {
+            for (camera, preview_quality) in cameras {
+                let (vf_filter, crf_val) = match preview_quality.as_str() {
+                    "very_high" => ("fps=2,scale=-2:480", "23"),
+                    "high" => ("fps=1,scale=-2:360", "26"),
+                    "medium" => ("fps=1,scale=-2:240", "28"),
+                    _ => ("fps=1,scale=-2:180", "32"),
+                };
                 for hour_start_i64 in [prev_hour_start, current_hour_start] {
                     let hour_start = hour_start_i64 as f64;
                     let hour_end = (hour_start_i64 + 3600) as f64;
@@ -1501,13 +1507,13 @@ impl RecordingEngine {
                         .arg(&list_file)
                         .args([
                             "-vf",
-                            "fps=1,scale=-2:180",
+                            vf_filter,
                             "-c:v",
                             "libx264",
                             "-preset",
                             "ultrafast",
                             "-crf",
-                            "32",
+                            crf_val,
                             "-an",
                             "-movflags",
                             "+faststart",

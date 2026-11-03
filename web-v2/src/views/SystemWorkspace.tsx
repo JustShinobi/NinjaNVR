@@ -103,7 +103,9 @@ function buildClientFallbackHeuristics(
   }
 
   // 3. Storage capacity & retention runway
-  const recSt = stats?.service?.storage?.["/media/ninjanvr/recordings"];
+  const recSt =
+    stats?.service?.storage?.["/media/ninjanvr/recordings"] ||
+    stats?.service?.storage?.["/media/frigate/recordings"];
   const estDays = stats?.service?.estimated_retention_days ?? 14;
   if (recSt && recSt.total > 0) {
     const usedPct = (recSt.used / recSt.total) * 100;
@@ -154,34 +156,7 @@ function buildClientFallbackHeuristics(
     }
   }
 
-  // 4. Unmasked OSD timestamps
-  const unmasked = enabledEntries
-    .filter(([, c]) => {
-      const m = c.motion?.mask;
-      const empty =
-        !m ||
-        (typeof m === "string" && !m.trim()) ||
-        (Array.isArray(m) && m.length === 0) ||
-        (typeof m === "object" && Object.keys(m as object).length === 0);
-      return c.motion?.enabled !== false && empty && (c.motion?.contour_area ?? 10) <= 15;
-    })
-    .map(([n]) => n);
-  if (unmasked.length > 0) {
-    out.push({
-      id: "unmasked_osd_motion",
-      severity: "optimization",
-      category: "vision",
-      target: unmasked.join(", "),
-      title: "Unmasked camera OSD timestamps & low motion contour threshold",
-      detail: `Cameras [${unmasked.join(
-        ", "
-      )}] have empty motion.mask ({}) with contour_area <= 15; 1-second OSD clock digit ticks or IR dust specks can trigger micro-motion boxes and unnecessary OpenVINO CPU inference.`,
-      recommendation:
-        "Add a polygon motion mask over each camera's OSD timestamp corner in Zones & Masks, or increase motion.contour_area to 20–30.",
-    });
-  }
-
-  // 5. Audio role active while audio detection disabled
+  // 4. Audio role active while audio detection disabled
   const unusedAudio = enabledEntries
     .filter(
       ([, c]) =>
@@ -202,6 +177,27 @@ function buildClientFallbackHeuristics(
       )}] include the 'audio' FFmpeg input role and transcode audio to AAC (-c:a aac) on every segment while audio.enabled is false.`,
       recommendation:
         "Enable audio.enabled if acoustic event detection is desired, or remove the 'audio' role on mute channels to save FFmpeg CPU cycles.",
+    });
+  }
+
+  // 5. Snapshot / preview quality drift across cameras
+  const snapQuals = new Set(
+    enabledEntries.map(([, c]) => c.snapshots?.quality ?? 100)
+  );
+  const prevQuals = new Set(
+    enabledEntries.map(([, c]) => c.record?.preview?.quality || "medium")
+  );
+  if (snapQuals.size > 1 || prevQuals.size > 1) {
+    out.push({
+      id: "camera_quality_drift",
+      severity: "optimization",
+      category: "config",
+      target: "snapshots / preview",
+      title: "Inconsistent snapshot or preview quality across cameras",
+      detail:
+        "Enabled cameras have mixed snapshots.quality (e.g. 95 vs 100) or record.preview.quality (very_high vs medium) settings.",
+      recommendation:
+        "Standardize snapshots.quality: 100 and record.preview.quality: very_high across all cameras.",
     });
   }
 

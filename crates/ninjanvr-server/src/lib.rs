@@ -3565,16 +3565,6 @@ pub struct HeuristicAlertDto {
     pub recommendation: String,
 }
 
-fn is_motion_mask_empty(mask: &Value) -> bool {
-    match mask {
-        Value::Null => true,
-        Value::String(s) => s.trim().is_empty(),
-        Value::Array(arr) => arr.is_empty(),
-        Value::Object(map) => map.is_empty(),
-        _ => false,
-    }
-}
-
 pub fn evaluate_system_heuristics(
     cfg: &NinjaConfig,
     cameras_stats: &serde_json::Map<String, Value>,
@@ -3738,34 +3728,7 @@ pub fn evaluate_system_heuristics(
         }
     }
 
-    // 5. Unmasked camera OSD timestamps / low motion contour threshold
-    let unmasked_cams: Vec<String> = cfg
-        .cameras
-        .iter()
-        .filter(|(_, c)| {
-            c.enabled
-                && c.motion.enabled
-                && is_motion_mask_empty(&c.motion.mask)
-                && c.motion.contour_area <= 15
-        })
-        .map(|(n, _)| n.clone())
-        .collect();
-    if !unmasked_cams.is_empty() {
-        alerts.push(HeuristicAlertDto {
-            id: "unmasked_osd_motion".to_string(),
-            severity: "optimization".to_string(),
-            category: "vision".to_string(),
-            target: unmasked_cams.join(", "),
-            title: "Unmasked camera OSD timestamps & low motion contour threshold".to_string(),
-            detail: format!(
-                "Cameras [{}] have empty motion.mask ({{}}) with contour_area <= 15; 1-second OSD clock digit ticks or IR dust specks can trigger micro-motion boxes and unnecessary OpenVINO CPU inference.",
-                unmasked_cams.join(", ")
-            ),
-            recommendation: "Add a polygon motion mask over each camera's OSD timestamp corner in Zones & Masks, or increase motion.contour_area to 20–30.".to_string(),
-        });
-    }
-
-    // 6. Audio role active while acoustic detection disabled
+    // 5. Audio role active while acoustic detection disabled
     let unused_audio_cams: Vec<String> = cfg
         .cameras
         .iter()

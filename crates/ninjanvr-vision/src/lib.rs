@@ -244,6 +244,9 @@ pub struct SimdMotionDetector {
     scale_y: f32,
     config: MotionConfig,
     masked_indices: Vec<usize>,
+    masked_bitmap: Vec<bool>,
+    osd_tick_counts: Vec<u16>,
+    auto_masked_count: usize,
     avg_frame: Vec<f32>,
     avg_delta: Vec<f32>,
     work_gray: Vec<u8>,
@@ -268,13 +271,16 @@ impl SimdMotionDetector {
 
         let poly_mask = PolygonMask::from_config_value(&config.mask, frame_w, frame_h);
         let mut masked_indices = Vec::new();
+        let mut masked_bitmap = vec![false; len];
         if !poly_mask.is_empty() {
             for y in 0..motion_h {
                 for x in 0..motion_w {
                     let fx = (x as f32 + 0.5) * scale_x;
                     let fy = (y as f32 + 0.5) * scale_y;
                     if poly_mask.contains_point(fx, fy) {
-                        masked_indices.push((y * motion_w + x) as usize);
+                        let idx = (y * motion_w + x) as usize;
+                        masked_indices.push(idx);
+                        masked_bitmap[idx] = true;
                     }
                 }
             }
@@ -289,6 +295,9 @@ impl SimdMotionDetector {
             scale_y,
             config,
             masked_indices,
+            masked_bitmap,
+            osd_tick_counts: vec![0; len],
+            auto_masked_count: 0,
             avg_frame: vec![0.0; len],
             avg_delta: vec![0.0; len],
             work_gray: vec![0; len],
@@ -301,6 +310,11 @@ impl SimdMotionDetector {
             smooth_min_v: 16.0,
             smooth_max_v: 235.0,
         }
+    }
+
+    /// Returns the number of motion-grid cells automatically masked due to repetitive OSD clock ticks.
+    pub fn auto_masked_cell_count(&self) -> usize {
+        self.auto_masked_count
     }
 
     pub fn detect(&mut self, frame: &YuvFrame) -> Vec<BoundingBox> {
@@ -630,12 +644,26 @@ impl SimdMotionDetector {
                 if fx2 > fx1 && fy2 > fy1 {
                     let b = BoundingBox::new(fx1, fy1, fx2, fy2);
                     // Suppress isolated 1-second camera OSD clock digit ticks in top/bottom margins
+                    // and automatically promote repetitive OSD cells into the active motion mask.
                     let in_osd_band =
-                        fy2 <= (self.frame_h * 10) / 100 || fy1 >= (self.frame_h * 88) / 100;
+                        fy2 <= (self.frame_h * 12) / 100 || fy1 >= (self.frame_h * 86) / 100;
                     let is_osd_clock_tick = in_osd_band
-                        && b.height() <= (self.frame_h * 10) / 100
-                        && b.area().saturating_mul(200) <= frame_area;
-                    if !is_osd_clock_tick {
+                        && b.height() <= (self.frame_h * 12) / 100
+                        && b.area().saturating_mul(160) <= frame_area;
+                    if is_osd_clock_tick {
+                        for cy in st.y_min..st.y_max.min(self.motion_h) {
+                            for cx in st.x_min..st.x_max.min(self.motion_w) {
+                                let idx = (cy as usize) * w + (cx as usize);
+                                self.osd_tick_counts[idx] =
+                                    self.osd_tick_counts[idx].saturating_add(1);
+                                if self.osd_tick_counts[idx] >= 2 && !self.masked_bitmap[idx] {
+                                    self.masked_bitmap[idx] = true;
+                                    self.masked_indices.push(idx);
+                                    self.auto_masked_count += 1;
+                                }
+                            }
+                        }
+                    } else {
                         boxes.push(b);
                     }
                 }
@@ -1226,6 +1254,8 @@ mod tests {
         };
         let _ = detector.detect(&osd_frame);
         assert!(detector.detect(&osd_frame).is_empty());
+        let _ = detector.detect(&osd_frame);
+        assert!(detector.auto_masked_cell_count() > 0);
     }
 
     #[test]
