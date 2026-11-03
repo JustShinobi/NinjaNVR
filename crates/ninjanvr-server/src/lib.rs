@@ -4429,6 +4429,7 @@ fn extract_models_from_provider_payload(provider: &str, val: &Value) -> Vec<Stri
 }
 
 pub async fn discover_genai_models(genai: &ninjanvr_config::GenAiConfig) -> Result<Vec<String>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = genai.provider.trim().to_ascii_lowercase();
     let api_key = genai.resolve_api_key();
     let custom_base = genai
@@ -4436,7 +4437,7 @@ pub async fn discover_genai_models(genai: &ninjanvr_config::GenAiConfig) -> Resu
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let timeout_ms = genai.timeout_ms.clamp(1000, 30_000);
+    let timeout_ms = genai.timeout_ms.clamp(2000, 30_000);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
         .build()?;
@@ -4507,14 +4508,14 @@ pub async fn discover_genai_models(genai: &ninjanvr_config::GenAiConfig) -> Resu
                 if api_key.is_empty() || !base.contains("/v1beta") {
                     base.to_string()
                 } else {
-                    format!("{base}?key={api_key}")
+                    format!("{base}?pageSize=100&key={api_key}")
                 }
             } else if base.ends_with("/v1") {
                 format!("{base}/models")
             } else if api_key.is_empty() {
-                format!("{base}/v1beta/models")
+                format!("{base}/v1beta/models?pageSize=100")
             } else {
-                format!("{base}/v1beta/models?key={api_key}")
+                format!("{base}/v1beta/models?pageSize=100&key={api_key}")
             };
             let mut req = client.get(&url);
             if !api_key.is_empty() {
@@ -4603,13 +4604,18 @@ async fn api_genai_models_post(State(state): State<AppState>, body: axum::body::
     let saved = state.config.read().await.genai.clone();
     let effective = build_effective_genai_config(&saved, &req);
     match discover_genai_models(&effective).await {
-        Ok(models) => Json(json!({
-            "valid": true,
-            "provider": effective.provider,
-            "models": models,
-            "message": format!("Validated {} API ({} models loaded)", effective.provider.to_uppercase(), models.len())
-        }))
-        .into_response(),
+        Ok(models) => {
+            if effective.api_key.is_some() {
+                state.config.write().await.genai.api_key = effective.api_key.clone();
+            }
+            Json(json!({
+                "valid": true,
+                "provider": effective.provider,
+                "models": models,
+                "message": format!("Validated {} API ({} models loaded)", effective.provider.to_uppercase(), models.len())
+            }))
+            .into_response()
+        }
         Err(err) => {
             let msg = err.to_string();
             let status = if msg.contains("Missing ") {

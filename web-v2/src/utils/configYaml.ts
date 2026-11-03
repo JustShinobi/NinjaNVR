@@ -106,16 +106,39 @@ export function buildGenAiProviderChangePatch(
   };
 }
 
-export function normalizeDiscoveredGenAiModels(payload: unknown): string[] {
+export function normalizeDiscoveredGenAiModels(
+  payload: unknown,
+  provider?: string
+): string[] {
+  const prov = (provider || "").trim().toLowerCase();
+  const obj =
+    payload && typeof payload === "object"
+      ? (payload as { models?: unknown[]; data?: unknown[] })
+      : null;
   const rawList: unknown[] = Array.isArray(payload)
     ? payload
-    : payload &&
-      typeof payload === "object" &&
-      Array.isArray((payload as { models?: unknown[] }).models)
-    ? (payload as { models: unknown[] }).models
+    : obj && Array.isArray(obj.models)
+    ? obj.models
+    : obj && Array.isArray(obj.data)
+    ? obj.data
     : [];
   const out: string[] = [];
   for (const item of rawList) {
+    if (
+      prov === "gemini" &&
+      item &&
+      typeof item === "object" &&
+      Array.isArray(
+        (item as { supportedGenerationMethods?: unknown[] })
+          .supportedGenerationMethods
+      )
+    ) {
+      const methods = (item as { supportedGenerationMethods: unknown[] })
+        .supportedGenerationMethods;
+      if (methods.length > 0 && !methods.includes("generateContent")) {
+        continue;
+      }
+    }
     const str =
       typeof item === "string"
         ? item
@@ -128,7 +151,24 @@ export function normalizeDiscoveredGenAiModels(payload: unknown): string[] {
           )
         : "";
     const cleaned = str.trim().replace(/^models\//, "");
-    if (cleaned && !out.includes(cleaned)) {
+    if (!cleaned) continue;
+    const lower = cleaned.toLowerCase();
+    if (
+      lower.startsWith("embedding-") ||
+      lower.startsWith("text-embedding-") ||
+      lower === "aqa" ||
+      lower.startsWith("imagen-") ||
+      lower.startsWith("veo-") ||
+      lower.startsWith("whisper-") ||
+      lower.startsWith("tts-") ||
+      lower.startsWith("dall-e-") ||
+      lower.startsWith("omni-moderation-") ||
+      lower.startsWith("babbage-") ||
+      lower.startsWith("davinci-")
+    ) {
+      continue;
+    }
+    if (!out.includes(cleaned)) {
       out.push(cleaned);
     }
   }

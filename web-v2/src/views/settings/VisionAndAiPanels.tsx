@@ -1972,46 +1972,108 @@ export const AiDetectionObjectsSection: React.FC<{
   const handleValidateGenAiApi = async () => {
     setGenaiValidating(true);
     setGenaiValidationState({ status: "idle" });
+    const prov = (genaiCfg.provider || "gemini").trim().toLowerCase();
+    const directKey =
+      genaiCfg.api_key && genaiCfg.api_key !== "***" && genaiCfg.api_key !== "*"
+        ? genaiCfg.api_key.trim()
+        : "";
+    const customBase = (genaiCfg.base_url || "").trim().replace(/\/+$/, "");
+
+    const applyValidModels = (models: string[], customMsg?: string) => {
+      setGenaiModels(models);
+      const msg =
+        customMsg ||
+        (isPt
+          ? `API validada (${models.length} modelos disponíveis)`
+          : `API validated (${models.length} models available)`);
+      setGenaiValidationState({ status: "valid", message: msg });
+      if (genaiCfg.model && !models.includes(genaiCfg.model)) {
+        updateGenAi({ model: "" });
+      }
+      notify(msg);
+    };
+
     try {
       const res = await fetch("/api/genai/models", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
         body: JSON.stringify({
-          provider: genaiCfg.provider || "gemini",
-          api_key:
-            genaiCfg.api_key && genaiCfg.api_key !== "***"
-              ? genaiCfg.api_key
-              : undefined,
+          provider: prov,
+          api_key: directKey || undefined,
           api_key_env: genaiCfg.api_key_env || "GEMINI_API_KEY",
-          base_url: genaiCfg.base_url || null,
+          base_url: customBase || null,
           clear_api_key: genaiCfg.clear_api_key || false,
         }),
       });
       const data = await res.json().catch(() => ({}));
-      const loadedModels = normalizeDiscoveredGenAiModels(data);
+      const loadedModels = normalizeDiscoveredGenAiModels(data, prov);
       if (res.ok && loadedModels.length > 0) {
-        setGenaiModels(loadedModels);
-        const msg =
-          data?.message ||
-          (isPt
-            ? `API validada (${loadedModels.length} modelos disponíveis)`
-            : `API validated (${loadedModels.length} models available)`);
-        setGenaiValidationState({ status: "valid", message: msg });
-        if (genaiCfg.model && !loadedModels.includes(genaiCfg.model)) {
-          updateGenAi({ model: "" });
-        }
-        notify(msg);
-      } else {
-        setGenaiModels([]);
-        const errMsg =
-          data?.message ||
-          (isPt
-            ? "Falha ao validar API ou nenhum modelo disponível"
-            : "API validation failed or no models returned");
-        setGenaiValidationState({ status: "invalid", message: errMsg });
-        notify(errMsg);
+        applyValidModels(loadedModels, data?.message);
+        return;
       }
+
+      // Direct browser fallback when user provided an API key or custom endpoint
+      if (directKey || prov === "ollama" || customBase) {
+        let directUrl = "";
+        const headers: Record<string, string> = {};
+        if (prov === "openai") {
+          const base = customBase || "https://api.openai.com/v1";
+          directUrl = base.endsWith("/models")
+            ? base
+            : base.endsWith("/v1")
+            ? `${base}/models`
+            : `${base}/v1/models`;
+          if (directKey) headers.Authorization = `Bearer ${directKey}`;
+        } else if (prov === "ollama") {
+          const base = customBase || "http://127.0.0.1:11434";
+          directUrl =
+            base.endsWith("/api/tags") || base.endsWith("/models")
+              ? base
+              : `${base}/api/tags`;
+          if (directKey) headers.Authorization = `Bearer ${directKey}`;
+        } else {
+          const base = customBase || "https://generativelanguage.googleapis.com";
+          if (base.endsWith("/v1") || base.endsWith("/v1/models")) {
+            directUrl = base.endsWith("/models") ? base : `${base}/models`;
+            if (directKey) headers.Authorization = `Bearer ${directKey}`;
+          } else {
+            const endpoint = base.endsWith("/models")
+              ? base
+              : `${base}/v1beta/models`;
+            directUrl = directKey
+              ? `${endpoint}?pageSize=100&key=${encodeURIComponent(directKey)}`
+              : `${endpoint}?pageSize=100`;
+          }
+        }
+
+        const directRes = await fetch(directUrl, { method: "GET", headers });
+        const directJson = await directRes.json().catch(() => ({}));
+        const directModels = normalizeDiscoveredGenAiModels(directJson, prov);
+        if (directRes.ok && directModels.length > 0) {
+          applyValidModels(directModels);
+          return;
+        }
+        const apiErr =
+          directJson?.error?.message ||
+          data?.message ||
+          (isPt
+            ? `Falha ao validar API (HTTP ${directRes.status})`
+            : `API validation failed (HTTP ${directRes.status})`);
+        setGenaiModels([]);
+        setGenaiValidationState({ status: "invalid", message: apiErr });
+        notify(apiErr);
+        return;
+      }
+
+      setGenaiModels([]);
+      const errMsg =
+        data?.message ||
+        (isPt
+          ? "Informe uma chave de API válida para carregar os modelos"
+          : "Provide a valid API key to validate and load available models");
+      setGenaiValidationState({ status: "invalid", message: errMsg });
+      notify(errMsg);
     } catch {
       setGenaiModels([]);
       const errMsg = isPt
@@ -2024,9 +2086,12 @@ export const AiDetectionObjectsSection: React.FC<{
     }
   };
 
-  const genaiModelOptions = Array.from(
-    new Set([...(genaiCfg.model ? [genaiCfg.model] : []), ...genaiModels])
-  );
+  const genaiModelOptions =
+    genaiValidationState.status === "valid"
+      ? genaiModels
+      : genaiCfg.enabled && genaiCfg.model
+      ? [genaiCfg.model]
+      : [];
 
   const [enrolledProfiles, setEnrolledProfiles] = useState<EnrolledFaceProfileItem[]>([]);
   const [enrollNameInput, setEnrollNameInput] = useState("");
@@ -3703,7 +3768,9 @@ export const AiDetectionObjectsSection: React.FC<{
                   updateGenAi({
                     api_key: val || (genaiCfg.has_api_key ? "***" : null),
                     clear_api_key: false,
+                    model: "",
                   });
+                  setGenaiModels([]);
                   setGenaiValidationState({ status: "idle" });
                 }}
               />
@@ -3828,7 +3895,11 @@ export const AiDetectionObjectsSection: React.FC<{
                 aria-label="Vision AI Judge Model"
                 style={{ width: "100%", marginTop: 2 }}
                 disabled={genaiModelOptions.length === 0}
-                value={genaiCfg.model || ""}
+                value={
+                  genaiModelOptions.includes(genaiCfg.model)
+                    ? genaiCfg.model
+                    : ""
+                }
                 onChange={(e) => updateGenAi({ model: e.target.value })}
               >
                 <option value="">
