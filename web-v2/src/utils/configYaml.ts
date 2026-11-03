@@ -216,6 +216,11 @@ export function buildCleanYamlFromDraft(
       },
       objects: {
         track: cam.objects?.track || draft.objects?.track || ["person"],
+        ...(cam.objects?.attribute_labels && cam.objects.attribute_labels.length > 0
+          ? { attribute_labels: cam.objects.attribute_labels }
+          : draft.objects?.attribute_labels && draft.objects.attribute_labels.length > 0
+          ? { attribute_labels: draft.objects.attribute_labels }
+          : {}),
         filters: cam.objects?.filters || {},
         mask: cam.objects?.mask || {},
       },
@@ -244,7 +249,10 @@ export function buildCleanYamlFromDraft(
         bounding_box: cam.snapshots?.bounding_box ?? true,
         crop: cam.snapshots?.crop ?? false,
         quality: cam.snapshots?.quality ?? 70,
-        selection: cam.snapshots?.selection || "highest_confidence",
+        selection:
+          cam.snapshots?.selection ||
+          draft.snapshots?.selection ||
+          "highest_confidence",
       },
       review: cam.review || {
         alerts: {
@@ -322,6 +330,9 @@ export function buildCleanYamlFromDraft(
     },
     objects: {
       track: draft.objects?.track || ["person"],
+      ...(draft.objects?.attribute_labels && draft.objects.attribute_labels.length > 0
+        ? { attribute_labels: draft.objects.attribute_labels }
+        : {}),
       filters: draft.objects?.filters || {},
     },
     record: {
@@ -349,6 +360,9 @@ export function buildCleanYamlFromDraft(
       bounding_box: draft.snapshots?.bounding_box ?? true,
       crop: draft.snapshots?.crop ?? false,
       quality: draft.snapshots?.quality ?? 70,
+      ...(draft.snapshots?.selection
+        ? { selection: draft.snapshots.selection }
+        : {}),
     },
     go2rtc: {
       streams: streamsOut,

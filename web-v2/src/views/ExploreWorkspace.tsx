@@ -1,9 +1,34 @@
 import React from "react";
 import { Camera, Play, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
-import { EventItem, ExportItem, RecordingDaySummary } from "../types/nvr";
+import {
+  DetectedAttribute,
+  EventItem,
+  ExportItem,
+  RecordingDaySummary,
+} from "../types/nvr";
 import { WorkspaceTab, findMatchingExport, formatDateTime } from "../utils/format";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
+
+export function formatEventLabelWithSubLabel(
+  label: string,
+  subLabel?: string | null,
+  detectedAttributes?: DetectedAttribute[]
+): string {
+  const primary = (label || "object").toUpperCase();
+  const effectiveSub =
+    subLabel && subLabel.trim().length > 0
+      ? subLabel.trim().toUpperCase()
+      : detectedAttributes && detectedAttributes.length > 0
+      ? detectedAttributes[0].label.toUpperCase()
+      : null;
+  return effectiveSub ? `${primary} · ${effectiveSub}` : primary;
+}
+
+export function formatDetectedAttributePill(attr: DetectedAttribute): string {
+  const pct = Math.round(attr.score * 100);
+  return `${attr.label.toUpperCase()} ${pct}% · ${attr.area_px}px²`;
+}
 
 interface ExploreWorkspaceProps {
   cameraNames: string[];
@@ -429,7 +454,12 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                         className="mono"
                         style={{ fontWeight: 700, textTransform: "uppercase" }}
                       >
-                        {ev.label} · {topScore}%
+                        {formatEventLabelWithSubLabel(
+                          ev.label,
+                          ev.sub_label,
+                          ev.data?.detected_attributes
+                        )}{" "}
+                        · {topScore}%
                       </span>
                       <span
                         className="mono"
@@ -512,7 +542,11 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   }}
                 >
                   <span className="nvr-badge alert">
-                    {selectedEvent.label.toUpperCase()}{" "}
+                    {formatEventLabelWithSubLabel(
+                      selectedEvent.label,
+                      selectedEvent.sub_label,
+                      selectedEvent.data?.detected_attributes
+                    )}{" "}
                     {Math.round(
                       ((selectedEvent.top_score ??
                         selectedEvent.data?.top_score ??
@@ -520,6 +554,19 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     )}
                     %
                   </span>
+                  {(selectedEvent.data?.detected_attributes || []).map((attr, idx) => (
+                    <span
+                      key={`${attr.label}-${idx}`}
+                      className="nvr-badge mono"
+                      style={{
+                        fontFamily: "var(--font-mono)",
+                        fontSize: "var(--text-xs)",
+                        color: "var(--signal-accent-text)",
+                      }}
+                    >
+                      {formatDetectedAttributePill(attr)}
+                    </span>
+                  ))}
                   <span
                     className="mono"
                     title={selectedEvent.id}
@@ -676,6 +723,42 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                             Matched Zones:{" "}
                             <strong>{zones.length > 0 ? zones.join(", ") : "NONE"}</strong>
                           </span>
+                          {selectedEvent.sub_label && (
+                            <span>
+                              Sub-Label:{" "}
+                              <strong>{selectedEvent.sub_label.toUpperCase()}</strong>
+                            </span>
+                          )}
+                          {selectedEvent.data?.detected_attributes &&
+                            selectedEvent.data.detected_attributes.length > 0 && (
+                              <span
+                                style={{
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: 6,
+                                  flexWrap: "wrap",
+                                  fontFamily: "var(--font-mono)",
+                                }}
+                              >
+                                Child Attributes:{" "}
+                                {selectedEvent.data.detected_attributes.map((attr, idx) => (
+                                  <span
+                                    key={`${attr.label}-${idx}`}
+                                    className="nvr-badge mono"
+                                    style={{
+                                      fontFamily: "var(--font-mono)",
+                                      fontSize: "var(--text-xs)",
+                                    }}
+                                  >
+                                    {formatDetectedAttributePill(attr)} [
+                                    {(attr.norm_bbox || [0, 0, 0, 0])
+                                      .map((v) => Number(v).toFixed(2))
+                                      .join(", ")}
+                                    ]
+                                  </span>
+                                ))}
+                              </span>
+                            )}
                         </div>
                         <button
                           type="button"

@@ -836,6 +836,7 @@ pub enum SnapshotSelectionPolicy {
     #[default]
     BestInZone,
     FirstTrigger,
+    BestAttribute,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -934,10 +935,31 @@ impl Default for MotionConfig {
     }
 }
 
+pub const DEFAULT_ATTRIBUTE_LABELS: [&str; 9] = [
+    "face",
+    "license_plate",
+    "amazon",
+    "fedex",
+    "ups",
+    "dhl",
+    "correios",
+    "mercado_livre",
+    "usps",
+];
+
+pub fn default_attribute_labels() -> Vec<String> {
+    DEFAULT_ATTRIBUTE_LABELS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectsConfig {
     #[serde(default = "default_tracked_objects")]
     pub track: Vec<String>,
+    #[serde(default = "default_attribute_labels")]
+    pub attribute_labels: Vec<String>,
     #[serde(default)]
     pub filters: BTreeMap<String, ObjectFilterConfig>,
     #[serde(default)]
@@ -954,6 +976,7 @@ impl Default for ObjectsConfig {
         filters.insert("person".to_string(), ObjectFilterConfig::default());
         Self {
             track: default_tracked_objects(),
+            attribute_labels: default_attribute_labels(),
             filters,
             mask: json!({}),
         }
@@ -1347,6 +1370,12 @@ impl NinjaConfig {
             if cam.objects.track.is_empty() {
                 cam.objects.track = cfg.objects.track.clone();
             }
+            if cam.objects.attribute_labels.is_empty()
+                || (cam.objects.attribute_labels == default_attribute_labels()
+                    && cfg.objects.attribute_labels != default_attribute_labels())
+            {
+                cam.objects.attribute_labels = cfg.objects.attribute_labels.clone();
+            }
             if !cam.record.alert_backup.enabled && cfg.record.alert_backup.enabled {
                 cam.record.alert_backup = cfg.record.alert_backup.clone();
             }
@@ -1430,13 +1459,18 @@ impl NinjaConfig {
         map
     }
 
+    /// Alias for `to_api_config()` returning the full `/api/config` JSON payload.
+    pub fn to_api_value(&self) -> Value {
+        self.to_api_config()
+    }
+
     /// Generates the complete `/api/config` JSON object expected by the React SPA.
     pub fn to_api_config(&self) -> Value {
         let labelmap = self.load_labelmap();
         let attributes_map = json!({
             "person": ["amazon", "face"],
-            "car": ["amazon", "an_post", "canada_post", "dhl", "dpd", "fedex", "gls", "license_plate", "nzpost", "postnl", "postnord", "purolator", "royal_mail", "ups", "usps"],
-            "truck": ["license_plate"],
+            "car": ["amazon", "an_post", "canada_post", "correios", "dhl", "dpd", "fedex", "gls", "license_plate", "mercado_livre", "nzpost", "postnl", "postnord", "purolator", "royal_mail", "ups", "usps"],
+            "truck": ["amazon", "correios", "dhl", "fedex", "license_plate", "mercado_livre", "ups", "usps"],
             "garbage_truck": ["license_plate"],
             "motorcycle": ["license_plate"],
             "bus": ["license_plate"],
@@ -1610,6 +1644,7 @@ impl NinjaConfig {
                     },
                     "objects": {
                         "track": cam.objects.track,
+                        "attribute_labels": cam.objects.attribute_labels,
                         "filters": filters_json,
                         "mask": cam.objects.mask,
                         "genai": {
@@ -1928,6 +1963,7 @@ impl NinjaConfig {
             },
             "objects": {
                 "track": self.objects.track,
+                "attribute_labels": self.objects.attribute_labels,
                 "filters": serde_json::to_value(&self.objects.filters).unwrap_or_else(|_| json!({})),
                 "mask": self.objects.mask,
                 "genai": {
@@ -2235,6 +2271,9 @@ impl NinjaConfig {
                 }
                 if cam.objects.track.is_empty() {
                     cam.objects.track = self.objects.track.clone();
+                }
+                if cam.objects.attribute_labels.is_empty() {
+                    cam.objects.attribute_labels = self.objects.attribute_labels.clone();
                 }
             }
             self.cameras = next_cams;
@@ -2681,6 +2720,73 @@ version: 0.18-0
         assert_eq!(
             cfg.detectors["ort_cuda"].normalized_backend_type(),
             "onnxruntime"
+        );
+    }
+
+    #[test]
+    fn attribute_labels_and_best_attribute_snapshot_policy_roundtrip() {
+        let yaml = r#"
+objects:
+  track: [person, car]
+  attribute_labels: [face, license_plate, correios, mercado_livre]
+snapshots:
+  enabled: true
+  selection: best_attribute
+cameras:
+  portao:
+    enabled: true
+    snapshots:
+      enabled: true
+      selection: best_attribute
+version: 0.18-0
+"#;
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(
+            cfg.objects.attribute_labels,
+            vec!["face", "license_plate", "correios", "mercado_livre"]
+        );
+        assert_eq!(
+            cfg.cameras["portao"].objects.attribute_labels,
+            vec!["face", "license_plate", "correios", "mercado_livre"]
+        );
+        assert_eq!(
+            cfg.snapshots.selection,
+            SnapshotSelectionPolicy::BestAttribute
+        );
+        assert_eq!(
+            cfg.cameras["portao"].snapshots.selection,
+            SnapshotSelectionPolicy::BestAttribute
+        );
+
+        let api_val = cfg.to_api_value();
+        assert_eq!(
+            api_val["objects"]["attribute_labels"],
+            json!(["face", "license_plate", "correios", "mercado_livre"])
+        );
+        assert_eq!(api_val["snapshots"]["selection"], "best_attribute");
+        assert_eq!(
+            api_val["cameras"]["portao"]["snapshots"]["selection"],
+            "best_attribute"
+        );
+
+        let patch = json!({
+            "objects": {
+                "track": ["person", "car", "truck"],
+                "attribute_labels": ["face", "license_plate", "dhl"]
+            },
+            "snapshots": {
+                "enabled": true,
+                "selection": "best_attribute"
+            }
+        });
+        cfg.apply_structured_json(&patch).unwrap();
+        assert_eq!(
+            cfg.objects.attribute_labels,
+            vec!["face", "license_plate", "dhl"]
+        );
+        assert_eq!(
+            cfg.snapshots.selection,
+            SnapshotSelectionPolicy::BestAttribute
         );
     }
 }

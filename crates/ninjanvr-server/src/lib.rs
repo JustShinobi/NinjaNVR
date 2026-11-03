@@ -486,7 +486,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/events/{id}/snapshot.jpg", get(api_event_snapshot_jpg))
         .route(
             "/events/{id}/snapshot-clean.webp",
-            get(api_event_thumbnail_webp),
+            get(api_event_snapshot_clean_webp),
         )
         .route("/events/{id}/clip.mp4", get(api_event_clip_mp4))
         .route("/timeline", get(api_timeline))
@@ -4191,6 +4191,39 @@ async fn api_event_thumbnail_webp(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    serve_event_thumb(&state, &id, "image/webp").await
+}
+
+async fn api_event_snapshot_clean_webp(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let clips_dir = state.media_dir.join("clips");
+    if let Ok(Some(ev)) = state.db.get_event(&id)
+        && let Some(cam) = ev["camera"].as_str()
+    {
+        let clean_candidate = clips_dir.join(format!("{cam}-{id}-clean.webp"));
+        if let Ok(bytes) = tokio::fs::read(&clean_candidate).await {
+            return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+        }
+        let webp_candidate = clips_dir.join(format!("{cam}-{id}.webp"));
+        if let Ok(bytes) = tokio::fs::read(&webp_candidate).await {
+            return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+        }
+    }
+    let suffix = format!("-{id}-clean.webp");
+    if let Ok(entries) = std::fs::read_dir(&clips_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(&suffix))
+                && let Ok(bytes) = tokio::fs::read(entry.path()).await
+            {
+                return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+            }
+        }
+    }
     serve_event_thumb(&state, &id, "image/webp").await
 }
 

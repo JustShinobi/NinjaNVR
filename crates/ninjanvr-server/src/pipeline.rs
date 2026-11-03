@@ -10,7 +10,10 @@ use ninjanvr_config::{CameraConfig, NinjaConfig};
 use ninjanvr_db::{EventDto, NinjaDatabase, ReviewItemDto};
 use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{SharedActivityLedger, YuvFrame, backup_alert_clip, resolve_ffmpeg_bin};
-use ninjanvr_track::{ByteTracker, TrackedObject, TriggerProvenance, should_replace_snapshot};
+use ninjanvr_track::{
+    ByteTracker, TrackedAttribute, TrackedObject, TriggerProvenance, compute_attribute_quality,
+    should_replace_snapshot,
+};
 pub use ninjanvr_vision::classify_dominant_color_tag;
 use ninjanvr_vision::{
     BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, apply_privacy_masks_from_value,
@@ -59,9 +62,12 @@ pub struct FrameLifecycleCtx<'a> {
     pub now: f64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TrackPersistSnapshot {
     pub best_score: f32,
+    pub best_attribute_score: f32,
+    pub sub_label: Option<String>,
+    pub detected_attributes: Vec<TrackedAttribute>,
     pub zones: Vec<String>,
     pub stationary: bool,
 }
@@ -78,6 +84,8 @@ pub struct ActiveReviewState {
     pub best_score: f32,
     pub detections: Vec<String>,
     pub objects: Vec<String>,
+    pub sub_labels: Vec<String>,
+    pub detected_attributes: Vec<TrackedAttribute>,
     pub zones: Vec<String>,
     pub provenance: Option<TriggerProvenance>,
     pub is_new: bool,
@@ -98,7 +106,8 @@ impl ActiveReviewState {
                 "detections": self.detections,
                 "objects": self.objects,
                 "verified_objects": [],
-                "sub_labels": [],
+                "sub_labels": self.sub_labels,
+                "detected_attributes": self.detected_attributes,
                 "zones": self.zones,
                 "audio": [],
                 "thumb_time": self.thumb_time,
@@ -404,7 +413,7 @@ impl VisionPipeline {
                                     "area": t.bbox.area(),
                                     "ratio": ratio,
                                     "score": t.score,
-                                    "sub_label": null
+                                    "sub_label": t.inferred_sub_label
                                 })
                             })
                             .collect();
@@ -624,20 +633,65 @@ impl VisionPipeline {
                 .filter(|z| !prev_zones.contains(z))
                 .cloned()
                 .collect();
+            let prev_best_score = prev.map(|p| p.best_score).unwrap_or(0.0);
+            let prev_best_attr_quality = prev.map(|p| p.best_attribute_score).unwrap_or(0.0);
+            let attr_q_from_boxes = trk
+                .attributes
+                .iter()
+                .filter(|a| {
+                    a.label.eq_ignore_ascii_case("face")
+                        || a.label.eq_ignore_ascii_case("license_plate")
+                })
+                .map(|a| compute_attribute_quality(a.score, a.area_px, frame.width, frame.height))
+                .fold(0.0f32, f32::max);
+            let new_attr_quality = if attr_q_from_boxes > 0.0 {
+                attr_q_from_boxes.max(trk.best_attribute_score)
+            } else if trk.best_attribute_score > prev_best_attr_quality {
+                trk.best_attribute_score
+            } else {
+                0.0
+            };
             let is_better_score = prev
                 .map(|p| trk.score > p.best_score + 0.05)
                 .unwrap_or(true);
+            let is_better_attr = (prev_best_attr_quality <= 0.0 && new_attr_quality > 0.0)
+                || new_attr_quality > prev_best_attr_quality + 0.02;
             let state_changed = prev
                 .map(|p| p.zones != trk.entered_zones || p.stationary != trk.stationary)
                 .unwrap_or(false);
 
-            if is_new || is_better_score || state_changed {
-                let prev_best_score = prev.map(|p| p.best_score).unwrap_or(0.0);
+            let effective_sub_label = trk
+                .inferred_sub_label
+                .clone()
+                .or_else(|| prev.and_then(|p| p.sub_label.clone()));
+            let mut merged_attrs: Vec<TrackedAttribute> = prev
+                .map(|p| p.detected_attributes.clone())
+                .unwrap_or_default();
+            for attr in &trk.attributes {
+                if let Some(existing) = merged_attrs.iter_mut().find(|a| a.label == attr.label) {
+                    if attr.score >= existing.score || attr.area_px >= existing.area_px {
+                        *existing = attr.clone();
+                    }
+                } else {
+                    merged_attrs.push(attr.clone());
+                }
+            }
+            let attrs_changed = prev
+                .map(|p| {
+                    p.sub_label != effective_sub_label || p.detected_attributes != merged_attrs
+                })
+                .unwrap_or(!merged_attrs.is_empty() || effective_sub_label.is_some());
+
+            if is_new || is_better_score || is_better_attr || state_changed || attrs_changed {
                 let best_score = prev_best_score.max(trk.score);
+                let best_attr_score = prev_best_attr_quality.max(new_attr_quality);
                 track_snapshots.insert(
                     trk.id.clone(),
                     TrackPersistSnapshot {
                         best_score,
+                        best_attribute_score: best_attr_score,
+                        sub_label: effective_sub_label.clone(),
+                        detected_attributes: merged_attrs.clone(),
                         zones: trk.entered_zones.clone(),
                         stationary: trk.stationary,
                     },
@@ -649,6 +703,8 @@ impl VisionPipeline {
                     is_new,
                     prev_best_score,
                     trk.score,
+                    prev_best_attr_quality,
+                    new_attr_quality,
                     &trk.zones,
                     &trk.entered_zones,
                 );
@@ -663,9 +719,21 @@ impl VisionPipeline {
                     if snapshots_active {
                         let jpg_path = clips_dir.join(format!("{}.jpg", trk.id));
                         let webp_path = clips_dir.join(format!("{camera}-{}.webp", trk.id));
-                        let mut full_img =
-                            yuv420p_to_rgb_image(frame, None, &[(trk.bbox, [31, 119, 180])]);
-                        apply_privacy_masks_from_value(&mut full_img, &cam_cfg.privacy_mask);
+                        let clean_jpg_path = clips_dir.join(format!("{}-clean.jpg", trk.id));
+                        let clean_webp_path =
+                            clips_dir.join(format!("{camera}-{}-clean.webp", trk.id));
+
+                        let mut clean_img = yuv420p_to_rgb_image(frame, None, &[]);
+                        apply_privacy_masks_from_value(&mut clean_img, &cam_cfg.privacy_mask);
+                        if let Ok(clean_webp) = encode_image_webp(&clean_img) {
+                            let _ = std::fs::write(&clean_webp_path, clean_webp);
+                        }
+                        if let Ok(clean_jpg) = encode_image_jpeg(&clean_img) {
+                            let _ = std::fs::write(&clean_jpg_path, clean_jpg);
+                        }
+
+                        let mut full_img = clean_img;
+                        annotate_rgb_image_with_boxes(&mut full_img, &[(trk.bbox, [31, 119, 180])]);
                         if let Ok(jpg) = encode_image_jpeg(&full_img) {
                             let _ = std::fs::write(&jpg_path, jpg);
                         }
@@ -704,6 +772,13 @@ impl VisionPipeline {
                                 {
                                     let mut hr_rgb = dyn_img.to_rgb8();
                                     if hr_rgb.width() >= det_w && hr_rgb.height() >= det_h {
+                                        apply_privacy_masks_from_value(&mut hr_rgb, &priv_mask);
+                                        if let Ok(hr_clean_webp) = encode_image_webp(&hr_rgb) {
+                                            let _ = std::fs::write(&clean_webp_path, hr_clean_webp);
+                                        }
+                                        if let Ok(hr_clean_jpg) = encode_image_jpeg(&hr_rgb) {
+                                            let _ = std::fs::write(&clean_jpg_path, hr_clean_jpg);
+                                        }
                                         if draw_bbox {
                                             let projected = det_bbox.project_to_resolution(
                                                 det_w,
@@ -716,7 +791,6 @@ impl VisionPipeline {
                                                 &[(projected, [31, 119, 180])],
                                             );
                                         }
-                                        apply_privacy_masks_from_value(&mut hr_rgb, &priv_mask);
                                         if let Ok(hr_jpg) = encode_image_jpeg(&hr_rgb) {
                                             let _ = std::fs::write(&jpg_path, hr_jpg);
                                         }
@@ -747,6 +821,21 @@ impl VisionPipeline {
 
                 let color_attr =
                     classify_dominant_color_tag(&frame.data, frame.width, frame.height, trk.bbox);
+                let mut attr_tags = vec![color_attr.to_string()];
+                for a in &merged_attrs {
+                    if !attr_tags.contains(&a.label) {
+                        attr_tags.push(a.label.clone());
+                    }
+                }
+                let face_box = merged_attrs
+                    .iter()
+                    .find(|a| a.label.eq_ignore_ascii_case("face"))
+                    .map(|a| a.norm_bbox);
+                let license_plate_box = merged_attrs
+                    .iter()
+                    .find(|a| a.label.eq_ignore_ascii_case("license_plate"))
+                    .map(|a| a.norm_bbox);
+
                 let ev_dto = EventDto {
                     id: trk.id.clone(),
                     camera: camera.to_string(),
@@ -758,7 +847,7 @@ impl VisionPipeline {
                     has_snapshot: snapshots_active,
                     plus_id: None,
                     retain_indefinitely: false,
-                    sub_label: None,
+                    sub_label: effective_sub_label.clone(),
                     top_score: Some(best_score as f64),
                     false_positive: Some(false),
                     box_coords: Some(json!(norm_box)),
@@ -767,7 +856,10 @@ impl VisionPipeline {
                         "region": norm_reg,
                         "score": trk.score,
                         "top_score": best_score,
-                        "attributes": [color_attr],
+                        "attributes": attr_tags,
+                        "detected_attributes": merged_attrs,
+                        "face_box": face_box,
+                        "license_plate_box": license_plate_box,
                         "type": "object",
                         "max_severity": severity,
                         "provenance": trk.provenance
@@ -779,6 +871,9 @@ impl VisionPipeline {
                     stationary: trk.stationary,
                 };
                 let _ = self.db.upsert_event(&ev_dto);
+                if let Some(ref sl) = effective_sub_label {
+                    let _ = self.db.set_event_sub_label(&trk.id, Some(sl));
+                }
                 if is_new {
                     let _ = self.db.insert_timeline_entry(
                         now,
@@ -871,6 +966,8 @@ impl VisionPipeline {
                     best_score: 0.0,
                     detections: Vec::new(),
                     objects: Vec::new(),
+                    sub_labels: Vec::new(),
+                    detected_attributes: Vec::new(),
                     zones: Vec::new(),
                     provenance: Some(trk.provenance.clone()),
                     is_new: true,
@@ -892,6 +989,22 @@ impl VisionPipeline {
             if !rev.objects.contains(&trk.label) {
                 rev.objects.push(trk.label.clone());
                 rev.dirty = true;
+            }
+            if let Some(ref sl) = effective_sub_label
+                && !rev.sub_labels.contains(sl)
+            {
+                rev.sub_labels.push(sl.clone());
+                rev.dirty = true;
+            }
+            for attr in &merged_attrs {
+                if !rev
+                    .detected_attributes
+                    .iter()
+                    .any(|a| a.label == attr.label)
+                {
+                    rev.detected_attributes.push(attr.clone());
+                    rev.dirty = true;
+                }
             }
             for z in &trk.entered_zones {
                 if !rev.zones.contains(z) {
@@ -920,10 +1033,27 @@ impl VisionPipeline {
 
         // Finalize ended tracks
         for trk in ended_tracks {
-            let best_score = track_snapshots
-                .remove(&trk.id)
+            let removed_snap = track_snapshots.remove(&trk.id);
+            let best_score = removed_snap
+                .as_ref()
                 .map(|s| s.best_score.max(trk.top_score))
                 .unwrap_or(trk.top_score);
+            let effective_sub_label = trk
+                .inferred_sub_label
+                .clone()
+                .or_else(|| removed_snap.as_ref().and_then(|s| s.sub_label.clone()));
+            let mut merged_attrs = removed_snap
+                .map(|s| s.detected_attributes)
+                .unwrap_or_default();
+            for attr in &trk.attributes {
+                if let Some(existing) = merged_attrs.iter_mut().find(|a| a.label == attr.label) {
+                    if attr.score >= existing.score || attr.area_px >= existing.area_px {
+                        *existing = attr.clone();
+                    }
+                } else {
+                    merged_attrs.push(attr.clone());
+                }
+            }
             let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
             let norm_reg = trk.region.to_normalized(frame.width, frame.height);
             let severity = if !cam_rt_flags.alerts {
@@ -940,6 +1070,21 @@ impl VisionPipeline {
             let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
             let color_attr =
                 classify_dominant_color_tag(&frame.data, frame.width, frame.height, trk.bbox);
+            let mut attr_tags = vec![color_attr.to_string()];
+            for a in &merged_attrs {
+                if !attr_tags.contains(&a.label) {
+                    attr_tags.push(a.label.clone());
+                }
+            }
+            let face_box = merged_attrs
+                .iter()
+                .find(|a| a.label.eq_ignore_ascii_case("face"))
+                .map(|a| a.norm_bbox);
+            let license_plate_box = merged_attrs
+                .iter()
+                .find(|a| a.label.eq_ignore_ascii_case("license_plate"))
+                .map(|a| a.norm_bbox);
+
             let ev_dto = EventDto {
                 id: trk.id.clone(),
                 camera: camera.to_string(),
@@ -951,7 +1096,7 @@ impl VisionPipeline {
                 has_snapshot: snapshots_active,
                 plus_id: None,
                 retain_indefinitely: false,
-                sub_label: None,
+                sub_label: effective_sub_label.clone(),
                 top_score: Some(best_score as f64),
                 false_positive: Some(false),
                 box_coords: Some(json!(norm_box)),
@@ -960,7 +1105,10 @@ impl VisionPipeline {
                     "region": norm_reg,
                     "score": trk.score,
                     "top_score": best_score,
-                    "attributes": [color_attr],
+                    "attributes": attr_tags,
+                    "detected_attributes": merged_attrs,
+                    "face_box": face_box,
+                    "license_plate_box": license_plate_box,
                     "type": "object",
                     "max_severity": severity,
                     "provenance": trk.provenance
@@ -972,6 +1120,9 @@ impl VisionPipeline {
                 stationary: trk.stationary,
             };
             let _ = self.db.upsert_event(&ev_dto);
+            if let Some(ref sl) = effective_sub_label {
+                let _ = self.db.set_event_sub_label(&trk.id, Some(sl));
+            }
             let _ = self.db.insert_timeline_entry(
                 now,
                 camera,
@@ -1189,6 +1340,9 @@ mod tests {
                 frames_tracked: 5,
                 stationary: false,
             },
+            attributes: Vec::new(),
+            best_attribute_score: 0.0,
+            inferred_sub_label: None,
         }
     }
 
@@ -1752,6 +1906,204 @@ mod tests {
                     .map(|p| p["type"] == "end" && p["after"]["id"] == rev_id)
                     .unwrap_or(false)
         }));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_persists_clean_snapshot_inferred_sub_label_and_detected_attributes() {
+        use axum::body::{Body, to_bytes};
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let (pipeline, tmp_dir) = build_isolated_pipeline("clean-snap-attrs");
+        let camera = "front_door";
+
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.snapshots.enabled = true;
+        cam_cfg.snapshots.high_res = false;
+        cam_cfg.snapshots.from_main_stream = false;
+        cam_cfg.snapshots.selection = SnapshotSelectionPolicy::BestAttribute;
+        cam_cfg.record.enabled = true;
+
+        let w = 320u32;
+        let h = 180u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        let mut frame_bytes = vec![200u8; y_len + uv_len * 2];
+        frame_bytes[y_len..].fill(128);
+        let yuv_frame = YuvFrame {
+            camera: Arc::from(camera),
+            timestamp: 2000.0,
+            width: w,
+            height: h,
+            data: Arc::new(frame_bytes),
+        };
+
+        let mut active_review: Option<ActiveReviewState> = None;
+        let mut track_snapshots: HashMap<String, TrackPersistSnapshot> = HashMap::new();
+
+        let mut trk = sample_track();
+        trk.id = "1730500999.000000-attr01".to_string();
+        trk.label = "car".to_string();
+        trk.score = 0.86;
+        trk.top_score = 0.86;
+        trk.bbox = BoundingBox::new(40, 40, 280, 160);
+        trk.inferred_sub_label = Some("correios".to_string());
+        trk.best_attribute_score = compute_attribute_quality(0.93, 60 * 24, w, h);
+        trk.attributes = vec![
+            TrackedAttribute {
+                label: "license_plate".to_string(),
+                score: 0.93,
+                bbox: BoundingBox::new(120, 110, 180, 134),
+                norm_bbox: BoundingBox::new(120, 110, 180, 134).to_normalized(w, h),
+                area_px: 60 * 24,
+            },
+            TrackedAttribute {
+                label: "correios".to_string(),
+                score: 0.89,
+                bbox: BoundingBox::new(80, 60, 160, 100),
+                norm_bbox: BoundingBox::new(80, 60, 160, 100).to_normalized(w, h),
+                area_px: 80 * 40,
+            },
+        ];
+
+        let ctx = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 2000.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx,
+                std::slice::from_ref(&trk),
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+
+        // 1. Assert SQLite event.sub_label and event.data.detected_attributes
+        let ev = pipeline
+            .db
+            .get_event(&trk.id)
+            .unwrap()
+            .expect("event row must be persisted");
+        assert_eq!(ev["sub_label"], json!("correios"));
+        let det_attrs = ev["data"]["detected_attributes"]
+            .as_array()
+            .expect("detected_attributes array must exist");
+        assert_eq!(det_attrs.len(), 2);
+        assert!(
+            det_attrs
+                .iter()
+                .any(|a| a["label"] == "license_plate" && a["area_px"] == 1440)
+        );
+        assert!(
+            det_attrs
+                .iter()
+                .any(|a| a["label"] == "correios" && a["area_px"] == 3200)
+        );
+        assert!(ev["data"]["license_plate_box"].is_array());
+
+        // 2. Assert {clips_dir}/{camera}-{id}-clean.webp exists on disk and is unannotated
+        let clean_webp_path = pipeline
+            .media_dir
+            .join("clips")
+            .join(format!("{camera}-{}-clean.webp", trk.id));
+        assert!(
+            clean_webp_path.exists(),
+            "clean unannotated WebP snapshot must be persisted on disk"
+        );
+        let clean_bytes = std::fs::read(&clean_webp_path).unwrap();
+        assert!(clean_bytes.starts_with(b"RIFF") && &clean_bytes[8..12] == b"WEBP");
+
+        // 2b. Verify attribute-guided snapshot replacement when parent score is flat (0.86 -> 0.85)
+        //     but license_plate area increases (60x24 -> 140x50)
+        std::fs::write(&clean_webp_path, b"sentinel_old_clean").unwrap();
+        trk.score = 0.85;
+        trk.last_seen_time = 2001.0;
+        trk.best_attribute_score = compute_attribute_quality(0.95, 140 * 50, w, h);
+        trk.attributes[0].score = 0.95;
+        trk.attributes[0].area_px = 140 * 50;
+        let ctx2 = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 2001.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx2,
+                std::slice::from_ref(&trk),
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+        let upgraded_clean = std::fs::read(&clean_webp_path).unwrap();
+        assert!(
+            upgraded_clean.starts_with(b"RIFF") && &upgraded_clean[8..12] == b"WEBP",
+            "improved attribute quality must overwrite clean snapshot even when parent score decreased"
+        );
+
+        // 2c. Finalize track in ended_tracks and verify sub_label + detected_attributes remain persisted
+        trk.last_seen_time = 2003.0;
+        let ctx_end = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 2003.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx_end,
+                &[],
+                std::slice::from_ref(&trk),
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+        let ev_final = pipeline.db.get_event(&trk.id).unwrap().unwrap();
+        assert_eq!(ev_final["sub_label"], json!("correios"));
+        assert_eq!(ev_final["end_time"], json!(2003.0));
+        assert_eq!(
+            ev_final["data"]["detected_attributes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // 3. Assert GET /api/events/{id}/snapshot-clean.webp returns 200 OK with valid WebP magic bytes
+        let cfg_path = tmp_dir.join("config.yml");
+        std::fs::write(&cfg_path, "version: 0.18-0\n").unwrap();
+        let mut state = crate::new_app_state(
+            &cfg_path,
+            tmp_dir.join("web"),
+            pipeline.media_dir.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        state.db = pipeline.db.clone();
+        let app = crate::build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/events/{}/snapshot-clean.webp", trk.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            body_bytes.starts_with(b"RIFF") && &body_bytes[8..12] == b"WEBP",
+            "GET /api/events/{{id}}/snapshot-clean.webp must return valid WebP magic bytes"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

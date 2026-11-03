@@ -40,6 +40,7 @@ export interface ObjectFilterConfig {
 
 export interface ObjectsConfig {
   track: string[];
+  attribute_labels?: string[];
   filters?: Record<string, ObjectFilterConfig>;
   mask?: unknown;
 }
@@ -110,7 +111,7 @@ export interface SnapshotsConfig {
   quality?: number;
   high_res?: boolean;
   from_main_stream?: boolean;
-  selection?: "best_overall" | "best_in_zone" | "first_trigger";
+  selection?: "best_overall" | "best_in_zone" | "first_trigger" | "best_attribute";
 }
 
 export interface ReviewSeverityConfig {
@@ -430,6 +431,16 @@ export interface TriggerProvenance {
   stationary: boolean;
 }
 
+export interface DetectedAttribute {
+  label: string;
+  score: number;
+  bbox?:
+    | { x_min: number; y_min: number; x_max: number; y_max: number }
+    | [number, number, number, number];
+  norm_bbox: [number, number, number, number];
+  area_px: number;
+}
+
 export interface ReviewItem {
   id: string;
   camera: string;
@@ -447,6 +458,7 @@ export interface ReviewItem {
     dbfs?: number;
     notes?: string;
     provenance?: TriggerProvenance | null;
+    detected_attributes?: DetectedAttribute[];
     metadata?: {
       potential_threat_level?: number;
     };
@@ -477,6 +489,9 @@ export interface EventItem {
     description?: string;
     notes?: string;
     attributes?: string[];
+    detected_attributes?: DetectedAttribute[];
+    face_box?: [number, number, number, number] | null;
+    license_plate_box?: [number, number, number, number] | null;
     box?: [number, number, number, number];
     provenance?: TriggerProvenance | null;
   };
