@@ -51,6 +51,7 @@ ADD --checksum=sha256:bd4e708db591e2c104a8ac3db734809578788f9e76bacfb7ddd227ab02
 
 RUN tar --no-same-owner -C /openvino-model -xzf /tmp/model.tar.gz \
     && rm -f /tmp/model.tar.gz
+COPY models/ninjanvr_security_15cl.txt /openvino-model/ninjanvr_security_15cl.txt
 
 FROM debian:trixie-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \

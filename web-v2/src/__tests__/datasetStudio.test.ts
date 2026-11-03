@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+  applySecurity15ClassPreset,
+  buildLocalFinetuneCliCommand,
   buildModelUploadPayload,
+  COLAB_MODEL_FACTORY_URL,
   computeDatasetReadinessMetrics,
   formatYoloAnnotationLine,
+  NINJANVR_SECURITY_15CL_LABELMAP_PATH,
   NINJANVR_SECURITY_CLASSES,
   xyxyToYoloNormalized,
   yoloNormalizedToXyxy,
@@ -101,5 +105,52 @@ describe("Dataset Studio YOLO Normalization & Readiness Gauges", () => {
     expect(upload.activate).toBe(true);
     expect(upload.input_tensor).toBe("nchw");
     expect(upload.input_pixel_format).toBe("rgb");
+  });
+
+  test("applies 15-class Security Labelmap preset and generates local RTX freeze=10 CLI command", () => {
+    const updatedModel = applySecurity15ClassPreset({
+      path: "/openvino-model/ssdlite_mobilenet_v2.xml",
+      labelmap_path: "/openvino-model/coco_91cl_bkgr.txt",
+      width: 300,
+      height: 300,
+      input_tensor: "nhwc",
+      input_pixel_format: "bgr",
+      model_type: "ssd",
+    });
+    expect(updatedModel.labelmap_path).toBe(NINJANVR_SECURITY_15CL_LABELMAP_PATH);
+    expect(updatedModel.labelmap_path).toBe("/openvino-model/ninjanvr_security_15cl.txt");
+    expect(updatedModel.model_type).toBe("yolo-generic");
+    expect(updatedModel.width).toBe(640);
+    expect(updatedModel.height).toBe(640);
+    expect(updatedModel.input_tensor).toBe("nchw");
+    expect(updatedModel.input_pixel_format).toBe("rgb");
+
+    const preserved320 = applySecurity15ClassPreset({
+      path: "/config/models/custom_yolo11t_320.onnx",
+      labelmap_path: "/openvino-model/coco_91cl_bkgr.txt",
+      width: 320,
+      height: 320,
+      input_tensor: "nchw",
+      input_pixel_format: "rgb",
+      model_type: "yolox",
+    });
+    expect(preserved320.path).toBe("/config/models/custom_yolo11t_320.onnx");
+    expect(preserved320.labelmap_path).toBe("/openvino-model/ninjanvr_security_15cl.txt");
+    expect(preserved320.model_type).toBe("yolo-generic");
+    expect(preserved320.width).toBe(320);
+
+    const cliCmd = buildLocalFinetuneCliCommand({
+      nvrUrl: "https://nvr.example.com:8971/",
+      datasetPath: "ninjanvr-dataset.zip",
+      modelArch: "yolo11s.pt",
+      imgsz: 640,
+      epochs: 30,
+      freeze: 10,
+      nvrToken: "$NINJANVR_API_TOKEN",
+    });
+    expect(cliCmd).toBe(
+      "python3 scripts/ai/train_ninjanvr_model.py --mode finetune --dataset ninjanvr-dataset.zip --model yolo11s.pt --imgsz 640 --epochs 30 --freeze 10 --nvr-url https://nvr.example.com:8971 --nvr-token $NINJANVR_API_TOKEN"
+    );
+    expect(COLAB_MODEL_FACTORY_URL).toContain("notebooks/NinjaNVR_Model_Factory.ipynb");
   });
 });
