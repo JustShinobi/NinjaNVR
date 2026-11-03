@@ -44,6 +44,7 @@ pub struct CameraRuntimeMetrics {
 }
 
 pub type SharedCameraMetrics = Arc<RwLock<HashMap<String, CameraRuntimeMetrics>>>;
+pub type SharedLatestYuvFrames = Arc<RwLock<HashMap<String, YuvFrame>>>;
 
 fn unix_now_f64() -> f64 {
     SystemTime::now()
@@ -134,6 +135,7 @@ pub struct VisionPipeline {
     pub detector: Arc<AiDetectorEngine>,
     pub activity_ledger: SharedActivityLedger,
     pub latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    pub latest_yuv_frames: SharedLatestYuvFrames,
     pub camera_metrics: SharedCameraMetrics,
     pub media_dir: PathBuf,
     pub log_hub: crate::LogBufferHub,
@@ -465,8 +467,20 @@ impl VisionPipeline {
                         );
                     }
 
-                    // 6. Update latest frame JPEG cache every 25 frames (~5s) at 360p to keep idle CPU near zero
-                    if frame_count == 1 || frame_count.is_multiple_of(25) {
+                    // 6. Store zero-copy YuvFrame in memory on every frame for lazy high-res snapshots,
+                    // and throttle disk fallback persistence (`latest_{camera}.jpg`) to every 150 frames (~30s).
+                    self.latest_yuv_frames
+                        .write()
+                        .await
+                        .insert(camera.clone(), yuv_frame.clone());
+                    self.camera_metrics
+                        .write()
+                        .await
+                        .entry(camera.clone())
+                        .or_default()
+                        .last_frame_ts = now;
+
+                    if frame_count == 1 || frame_count.is_multiple_of(150) {
                         let annotated: Vec<(BoundingBox, [u8; 3])> = active_tracks
                             .iter()
                             .map(|t| (t.bbox, [31, 119, 180]))
@@ -485,12 +499,6 @@ impl VisionPipeline {
                                 .await
                                 .insert(camera.clone(), jpeg_bytes);
                         }
-                        self.camera_metrics
-                            .write()
-                            .await
-                            .entry(camera.clone())
-                            .or_default()
-                            .last_frame_ts = now;
                     }
 
                     // 7. Persist Events, Timeline entries, and ReviewSegments
@@ -1737,6 +1745,7 @@ mod tests {
             detector,
             activity_ledger: new_activity_ledger(),
             latest_frames: Arc::new(RwLock::new(HashMap::new())),
+            latest_yuv_frames: Arc::new(RwLock::new(HashMap::new())),
             camera_metrics: Arc::new(RwLock::new(HashMap::new())),
             media_dir,
             log_hub: crate::LogBufferHub::new(),

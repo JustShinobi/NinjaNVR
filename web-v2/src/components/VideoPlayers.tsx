@@ -879,6 +879,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     const objUrl = URL.createObjectURL(mediaSource);
     videoEl.src = objUrl;
 
+    let initialBurstSeekDone = false;
+
     const flushQueue = () => {
       if (closed || !sourceBuffer || sourceBuffer.updating || queue.length === 0) {
         return;
@@ -890,8 +892,11 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         if (videoEl.buffered.length > 0) {
           const end = videoEl.buffered.end(videoEl.buffered.length - 1);
           const start = videoEl.buffered.start(0);
-          if (end - videoEl.currentTime > 2.5) {
-            videoEl.currentTime = end - 0.35;
+          if (!initialBurstSeekDone && end > 0.25) {
+            videoEl.currentTime = Math.max(start, end - 0.08);
+            initialBurstSeekDone = true;
+          } else if (end - videoEl.currentTime > 1.8) {
+            videoEl.currentTime = Math.max(start, end - 0.15);
           }
           if (end - start > 18 && !sourceBuffer.updating) {
             try {
@@ -974,6 +979,14 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
 
     const onLoadedData = () => {
       if (!closed) {
+        if (videoEl.buffered.length > 0) {
+          const end = videoEl.buffered.end(videoEl.buffered.length - 1);
+          const start = videoEl.buffered.start(0);
+          if (end > 0.25) {
+            videoEl.currentTime = Math.max(start, end - 0.08);
+            initialBurstSeekDone = true;
+          }
+        }
         setMseReady(true);
         updateOverlayGeometry();
         videoEl.play().catch(() => {});
@@ -1127,7 +1140,11 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         <img
           ref={imgRef}
           className="nvr-cam-poster"
-          src={`/api/${encodeURIComponent(realCamera)}/latest.jpg?height=360&cache=${posterTick}`}
+          src={
+            useMainStream
+              ? `/api/${encodeURIComponent(realCamera)}/latest.jpg?cache=${posterTick}`
+              : `/api/${encodeURIComponent(realCamera)}/latest.jpg?height=360&cache=${posterTick}`
+          }
           alt={camera}
           onLoad={updateOverlayGeometry}
           style={{

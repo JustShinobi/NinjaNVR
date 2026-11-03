@@ -800,6 +800,136 @@ pub fn build_media_segment_m4s(
     Ok(out)
 }
 
+/// Returns `true` if `buf` is an ISO-BMFF fMP4 initialization segment (`ftyp` and/or `moov` box, with no `moof` box).
+pub fn is_fmp4_init_segment(buf: &[u8]) -> bool {
+    let boxes = iter_boxes(buf);
+    if boxes.is_empty() {
+        return false;
+    }
+    let has_init_box = boxes
+        .iter()
+        .any(|b| &b.box_type == b"ftyp" || &b.box_type == b"moov");
+    let has_moof = boxes.iter().any(|b| &b.box_type == b"moof");
+    has_init_box && !has_moof
+}
+
+#[inline]
+fn sample_flags_is_sync(flags: u32) -> bool {
+    let sample_depends_on = (flags >> 24) & 0x03;
+    let sample_is_non_sync_sample = (flags >> 16) & 0x01;
+    sample_depends_on == 2 || (sample_is_non_sync_sample == 0 && sample_depends_on != 1)
+}
+
+/// Parses an ISO-BMFF `trun` box payload (starting with `version + tr_flags`) and returns whether
+/// its first sample is a sync sample (IDR Keyframe).
+pub fn parse_trun_first_sample_is_sync(
+    trun: &[u8],
+    default_sample_flags: Option<u32>,
+) -> Option<bool> {
+    if trun.len() < 8 {
+        return None;
+    }
+    let vf = u32::from_be_bytes([trun[0], trun[1], trun[2], trun[3]]);
+    let tr_flags = vf & 0x00FF_FFFF;
+    let sample_count = u32::from_be_bytes([trun[4], trun[5], trun[6], trun[7]]);
+    if sample_count == 0 {
+        return None;
+    }
+    let mut pos = 8usize;
+    if (tr_flags & 0x000001) != 0 {
+        pos += 4;
+    }
+    if (tr_flags & 0x000004) != 0 {
+        if pos + 4 > trun.len() {
+            return None;
+        }
+        let first_sample_flags =
+            u32::from_be_bytes([trun[pos], trun[pos + 1], trun[pos + 2], trun[pos + 3]]);
+        return Some(sample_flags_is_sync(first_sample_flags));
+    }
+    if (tr_flags & 0x000400) != 0 {
+        if (tr_flags & 0x000100) != 0 {
+            pos += 4;
+        }
+        if (tr_flags & 0x000200) != 0 {
+            pos += 4;
+        }
+        if pos + 4 > trun.len() {
+            return None;
+        }
+        let first_sample_flags =
+            u32::from_be_bytes([trun[pos], trun[pos + 1], trun[pos + 2], trun[pos + 3]]);
+        return Some(sample_flags_is_sync(first_sample_flags));
+    }
+    default_sample_flags.map(sample_flags_is_sync)
+}
+
+fn parse_tfhd_track_and_default_flags(tfhd: &[u8]) -> (Option<u32>, Option<u32>) {
+    if tfhd.len() < 8 {
+        return (None, None);
+    }
+    let vf = u32::from_be_bytes([tfhd[0], tfhd[1], tfhd[2], tfhd[3]]);
+    let tf_flags = vf & 0x00FF_FFFF;
+    let track_id = u32::from_be_bytes([tfhd[4], tfhd[5], tfhd[6], tfhd[7]]);
+    let mut pos = 8usize;
+    if (tf_flags & 0x000001) != 0 {
+        pos += 8;
+    }
+    if (tf_flags & 0x000002) != 0 {
+        pos += 4;
+    }
+    if (tf_flags & 0x000008) != 0 {
+        pos += 4;
+    }
+    if (tf_flags & 0x000010) != 0 {
+        pos += 4;
+    }
+    let default_flags = if (tf_flags & 0x000020) != 0 && pos + 4 <= tfhd.len() {
+        Some(u32::from_be_bytes([
+            tfhd[pos],
+            tfhd[pos + 1],
+            tfhd[pos + 2],
+            tfhd[pos + 3],
+        ]))
+    } else {
+        None
+    };
+    (Some(track_id), default_flags)
+}
+
+/// Returns `true` if `buf` is an ISO-BMFF fMP4 media fragment (`moof` + `mdat`) whose video track
+/// (`track_id == 1` or first `traf` with `trun`) begins with an IDR Sync Sample (Keyframe).
+pub fn is_fmp4_sync_fragment(buf: &[u8]) -> bool {
+    let top_boxes = iter_boxes(buf);
+    let Some(moof) = find_box(&top_boxes, b"moof") else {
+        return false;
+    };
+    let moof_boxes = iter_boxes(moof);
+    let mut first_traf_sync: Option<bool> = None;
+    for b in &moof_boxes {
+        if &b.box_type != b"traf" {
+            continue;
+        }
+        let traf_boxes = iter_boxes(b.payload);
+        let (track_id, default_flags) = find_box(&traf_boxes, b"tfhd")
+            .map(parse_tfhd_track_and_default_flags)
+            .unwrap_or((None, None));
+        let Some(trun) = find_box(&traf_boxes, b"trun") else {
+            continue;
+        };
+        let Some(is_sync) = parse_trun_first_sample_is_sync(trun, default_flags) else {
+            continue;
+        };
+        if track_id == Some(1) {
+            return is_sync;
+        }
+        if first_traf_sync.is_none() {
+            first_traf_sync = Some(is_sync);
+        }
+    }
+    first_traf_sync.unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1461,5 +1591,75 @@ mod tests {
         let vbr_m3u8 = build_media_playlist_with_resolutions(&vbr_segs, Some(&res)).unwrap();
         assert_eq!(vbr_m3u8.matches("#EXT-X-DISCONTINUITY").count(), 0);
         assert_eq!(vbr_m3u8.matches("#EXT-X-MAP:").count(), 1);
+    }
+
+    #[test]
+    fn fmp4_classifier_distinguishes_init_segment_sync_keyframe_and_non_sync_fragments() {
+        // 1. Synthesize init-v1-a1.mp4 (ftyp + moov)
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso6dashmp41");
+        let mvhd = make_full_box(b"mvhd", 0, 0, &[0u8; 96]);
+        let moov = make_box(b"moov", &mvhd);
+        let mut init_seg = Vec::new();
+        init_seg.extend_from_slice(&ftyp);
+        init_seg.extend_from_slice(&moov);
+
+        assert!(is_fmp4_init_segment(&init_seg));
+        assert!(!is_fmp4_sync_fragment(&init_seg));
+
+        // Helper to build moof+mdat fragment with sample-flags-present (0x000701)
+        let build_fragment = |track_id: u32, sample_flags: u32| -> Vec<u8> {
+            let mfhd = make_full_box(b"mfhd", 0, 0, &1u32.to_be_bytes());
+            let tfhd = make_full_box(b"tfhd", 0, 0x020000, &track_id.to_be_bytes());
+            let mut trun_body = Vec::new();
+            trun_body.extend_from_slice(&1u32.to_be_bytes()); // sample_count = 1
+            trun_body.extend_from_slice(&64i32.to_be_bytes()); // data_offset
+            trun_body.extend_from_slice(&3000u32.to_be_bytes()); // sample_duration
+            trun_body.extend_from_slice(&128u32.to_be_bytes()); // sample_size
+            trun_body.extend_from_slice(&sample_flags.to_be_bytes()); // sample_flags
+            let trun = make_full_box(b"trun", 0, 0x000701, &trun_body);
+            let mut traf_children = Vec::new();
+            traf_children.extend_from_slice(&tfhd);
+            traf_children.extend_from_slice(&trun);
+            let traf = make_box(b"traf", &traf_children);
+            let mut moof_children = Vec::new();
+            moof_children.extend_from_slice(&mfhd);
+            moof_children.extend_from_slice(&traf);
+            let moof_box = make_box(b"moof", &moof_children);
+            let mdat_box = make_box(b"mdat", &[0x65u8; 32]);
+            let mut frag = Vec::new();
+            frag.extend_from_slice(&moof_box);
+            frag.extend_from_slice(&mdat_box);
+            frag
+        };
+
+        // 2. Keyframe moof+mdat (flags = 0x0200_0000 -> sample_depends_on == 2)
+        let keyframe_frag = build_fragment(1, 0x0200_0000);
+        assert!(!is_fmp4_init_segment(&keyframe_frag));
+        assert!(is_fmp4_sync_fragment(&keyframe_frag));
+
+        // 3. Non-sync delta moof+mdat (flags = 0x0101_0000 -> sample_depends_on == 1, is_non_sync == 1)
+        let delta_frag = build_fragment(1, 0x0101_0000);
+        assert!(!is_fmp4_init_segment(&delta_frag));
+        assert!(!is_fmp4_sync_fragment(&delta_frag));
+
+        // 4. Test first-sample-flags-present (0x000004) & tfhd default-sample-flags-present (0x000020)
+        let mut trun_first_flag_body = Vec::new();
+        trun_first_flag_body.extend_from_slice(&1u32.to_be_bytes()); // sample_count
+        trun_first_flag_body.extend_from_slice(&0x0200_0000u32.to_be_bytes()); // first_sample_flags (sync)
+        let trun_first_sync = make_full_box(b"trun", 0, 0x000004, &trun_first_flag_body);
+        assert_eq!(
+            parse_trun_first_sample_is_sync(&trun_first_sync[8..], None),
+            Some(true)
+        );
+
+        let trun_default_only = make_full_box(b"trun", 0, 0x000000, &1u32.to_be_bytes());
+        assert_eq!(
+            parse_trun_first_sample_is_sync(&trun_default_only[8..], Some(0x0101_0000)),
+            Some(false)
+        );
+        assert_eq!(
+            parse_trun_first_sample_is_sync(&trun_default_only[8..], Some(0x0000_0000)),
+            Some(true)
+        );
     }
 }

@@ -1,0 +1,373 @@
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::Bytes;
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::{Notify, RwLock};
+use tokio_tungstenite::tungstenite::Message as TungMsg;
+
+pub const MAX_GOP_FRAGMENTS: usize = 90;
+pub const MAX_GOP_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_GOP_CACHE_AGE: Duration = Duration::from_secs(10);
+pub const PREWARM_KEEPALIVE_TTL: Duration = Duration::from_secs(25);
+
+#[derive(Debug, Clone)]
+pub struct MseGopBurst {
+    pub codec_msg: String,
+    pub init_segment: Bytes,
+    pub gop_fragments: Vec<Bytes>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MseGopCache {
+    pub codec_msg: Option<String>,
+    pub init_segment: Option<Bytes>,
+    pub gop_fragments: VecDeque<Bytes>,
+    pub gop_bytes: usize,
+    pub updated_at: Instant,
+}
+
+impl Default for MseGopCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MseGopCache {
+    pub fn new() -> Self {
+        Self {
+            codec_msg: None,
+            init_segment: None,
+            gop_fragments: VecDeque::new(),
+            gop_bytes: 0,
+            updated_at: Instant::now(),
+        }
+    }
+
+    pub fn ingest_text(&mut self, text: &str) -> bool {
+        if text.contains("\"type\"") && text.contains("\"mse\"") {
+            self.codec_msg = Some(text.to_string());
+            self.updated_at = Instant::now();
+            return true;
+        }
+        false
+    }
+
+    pub fn ingest_binary(&mut self, bytes: Bytes) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        if ninjanvr_vod::is_fmp4_init_segment(&bytes) {
+            self.init_segment = Some(bytes);
+            self.gop_fragments.clear();
+            self.gop_bytes = 0;
+            self.updated_at = Instant::now();
+            return false;
+        }
+        if ninjanvr_vod::is_fmp4_sync_fragment(&bytes) {
+            self.gop_fragments.clear();
+            self.gop_bytes = 0;
+            if bytes.len() <= MAX_GOP_BYTES {
+                self.gop_bytes = bytes.len();
+                self.gop_fragments.push_back(bytes);
+            }
+            self.updated_at = Instant::now();
+            return true;
+        }
+        // Delta (P/B) fragment: only append if we already have an IDR keyframe anchor in gop_fragments
+        // and adding this fragment stays within MAX_GOP_FRAGMENTS and MAX_GOP_BYTES.
+        if !self.gop_fragments.is_empty()
+            && self.gop_fragments.len() < MAX_GOP_FRAGMENTS
+            && self.gop_bytes.saturating_add(bytes.len()) <= MAX_GOP_BYTES
+        {
+            self.gop_bytes += bytes.len();
+            self.gop_fragments.push_back(bytes);
+            self.updated_at = Instant::now();
+        }
+        false
+    }
+
+    pub fn snapshot_fresh_burst(&self, max_age: Duration) -> Option<MseGopBurst> {
+        if self.updated_at.elapsed() > max_age {
+            return None;
+        }
+        let codec_msg = self.codec_msg.clone()?;
+        let init_segment = self.init_segment.clone()?;
+        if self.gop_fragments.is_empty() {
+            return None;
+        }
+        Some(MseGopBurst {
+            codec_msg,
+            init_segment,
+            gop_fragments: self.gop_fragments.iter().cloned().collect(),
+        })
+    }
+}
+
+struct PrewarmSession {
+    expires_at: Instant,
+    ready_notify: Arc<Notify>,
+}
+
+#[derive(Clone, Default)]
+pub struct MseStreamHub {
+    caches: Arc<RwLock<HashMap<String, MseGopCache>>>,
+    prewarm_sessions: Arc<RwLock<HashMap<String, PrewarmSession>>>,
+}
+
+impl MseStreamHub {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn ingest_upstream_text(&self, stream: &str, text: &str) {
+        if stream.is_empty() {
+            return;
+        }
+        let mut guard = self.caches.write().await;
+        guard
+            .entry(stream.to_string())
+            .or_default()
+            .ingest_text(text);
+    }
+
+    pub async fn ingest_upstream_binary(&self, stream: &str, bytes: Bytes) -> bool {
+        if stream.is_empty() {
+            return false;
+        }
+        let is_sync = {
+            let mut guard = self.caches.write().await;
+            guard
+                .entry(stream.to_string())
+                .or_default()
+                .ingest_binary(bytes)
+        };
+        if is_sync && let Some(session) = self.prewarm_sessions.read().await.get(stream) {
+            session.ready_notify.notify_waiters();
+        }
+        is_sync
+    }
+
+    pub async fn get_fresh_burst(&self, stream: &str) -> Option<MseGopBurst> {
+        if stream.is_empty() {
+            return None;
+        }
+        let guard = self.caches.read().await;
+        guard
+            .get(stream)
+            .and_then(|c| c.snapshot_fresh_burst(MAX_GOP_CACHE_AGE))
+    }
+
+    /// Spawns or refreshes a background upstream `go2rtc` MSE consumer for `stream`
+    /// that keeps its `MseGopCache` warm for `PREWARM_KEEPALIVE_TTL` (25s).
+    /// Returns `true` if a warm GOP burst is ready in cache.
+    pub async fn prewarm_stream(&self, go2rtc_ws_base: &str, stream: &str) -> bool {
+        let stream_key = stream.trim();
+        if stream_key.is_empty() {
+            return false;
+        }
+
+        // If already warm, refresh deadline if a session exists or spawn/refresh
+        let now = Instant::now();
+        let new_expires = now + PREWARM_KEEPALIVE_TTL;
+
+        let existing_notify = {
+            let mut sessions = self.prewarm_sessions.write().await;
+            if let Some(sess) = sessions.get_mut(stream_key) {
+                sess.expires_at = new_expires;
+                Some(sess.ready_notify.clone())
+            } else {
+                let notify = Arc::new(Notify::new());
+                sessions.insert(
+                    stream_key.to_string(),
+                    PrewarmSession {
+                        expires_at: new_expires,
+                        ready_notify: notify.clone(),
+                    },
+                );
+                None
+            }
+        };
+
+        if self.get_fresh_burst(stream_key).await.is_some() && existing_notify.is_some() {
+            return true;
+        }
+
+        let notify = if let Some(n) = existing_notify {
+            n
+        } else {
+            let n = self
+                .prewarm_sessions
+                .read()
+                .await
+                .get(stream_key)
+                .map(|s| s.ready_notify.clone())
+                .unwrap_or_else(|| Arc::new(Notify::new()));
+            let hub = self.clone();
+            let ws_url = format!("{}/api/ws?src={}", go2rtc_ws_base, stream_key);
+            let stream_owned = stream_key.to_string();
+            let notify_bg = n.clone();
+            tokio::spawn(async move {
+                run_prewarm_worker(hub, ws_url, stream_owned, notify_bg).await;
+            });
+            n
+        };
+
+        if self.get_fresh_burst(stream_key).await.is_some() {
+            return true;
+        }
+
+        let _ = tokio::time::timeout(Duration::from_millis(250), notify.notified()).await;
+        self.get_fresh_burst(stream_key).await.is_some()
+    }
+}
+
+async fn run_prewarm_worker(
+    hub: MseStreamHub,
+    ws_url: String,
+    stream: String,
+    notify: Arc<Notify>,
+) {
+    if let Ok((ws_stream, _)) = tokio_tungstenite::connect_async(&ws_url).await {
+        let (mut sink, mut stream_rx) = ws_stream.split();
+        let handshake = r#"{"type":"mse","value":"avc1.640029,avc1.64002A,avc1.4D401F,avc1.42E01E,hev1.1.6.L153.B0,mp4a.40.2"}"#;
+        if sink.send(TungMsg::Text(handshake.into())).await.is_ok() {
+            loop {
+                let expired = {
+                    let sessions = hub.prewarm_sessions.read().await;
+                    sessions
+                        .get(&stream)
+                        .map(|s| Instant::now() >= s.expires_at)
+                        .unwrap_or(true)
+                };
+                if expired {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_secs(2), stream_rx.next()).await {
+                    Ok(Some(Ok(TungMsg::Text(t)))) => {
+                        hub.ingest_upstream_text(&stream, t.as_str()).await;
+                    }
+                    Ok(Some(Ok(TungMsg::Binary(b)))) => {
+                        hub.ingest_upstream_binary(&stream, b).await;
+                    }
+                    Ok(Some(Ok(TungMsg::Ping(p)))) => {
+                        let _ = sink.send(TungMsg::Pong(p)).await;
+                    }
+                    Ok(Some(Ok(TungMsg::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    hub.prewarm_sessions.write().await.remove(&stream);
+    notify.notify_waiters();
+}
+
+pub fn extract_stream_src_from_query(query: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "src"
+            && !v.is_empty()
+        {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let total = (8 + payload.len()) as u32;
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(box_type);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn make_full_box(box_type: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let total = (12 + body.len()) as u32;
+        let mut out = Vec::with_capacity(12 + body.len());
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(box_type);
+        let vf = ((version as u32) << 24) | (flags & 0x00FF_FFFF);
+        out.extend_from_slice(&vf.to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    pub fn build_test_init_segment() -> Bytes {
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso6dashmp41");
+        let moov = make_box(b"moov", &[0u8; 32]);
+        let mut out = Vec::new();
+        out.extend_from_slice(&ftyp);
+        out.extend_from_slice(&moov);
+        Bytes::from(out)
+    }
+
+    pub fn build_test_fragment(is_sync: bool, mdat_payload: &[u8]) -> Bytes {
+        let sample_flags: u32 = if is_sync { 0x0200_0000 } else { 0x0101_0000 };
+        let mfhd = make_full_box(b"mfhd", 0, 0, &1u32.to_be_bytes());
+        let tfhd = make_full_box(b"tfhd", 0, 0x020000, &1u32.to_be_bytes());
+        let mut trun_body = Vec::new();
+        trun_body.extend_from_slice(&1u32.to_be_bytes());
+        trun_body.extend_from_slice(&64i32.to_be_bytes());
+        trun_body.extend_from_slice(&3000u32.to_be_bytes());
+        trun_body.extend_from_slice(&(mdat_payload.len() as u32).to_be_bytes());
+        trun_body.extend_from_slice(&sample_flags.to_be_bytes());
+        let trun = make_full_box(b"trun", 0, 0x000701, &trun_body);
+        let mut traf_children = Vec::new();
+        traf_children.extend_from_slice(&tfhd);
+        traf_children.extend_from_slice(&trun);
+        let traf = make_box(b"traf", &traf_children);
+        let mut moof_children = Vec::new();
+        moof_children.extend_from_slice(&mfhd);
+        moof_children.extend_from_slice(&traf);
+        let moof = make_box(b"moof", &moof_children);
+        let mdat = make_box(b"mdat", mdat_payload);
+        let mut out = Vec::new();
+        out.extend_from_slice(&moof);
+        out.extend_from_slice(&mdat);
+        Bytes::from(out)
+    }
+
+    #[test]
+    fn mse_gop_cache_evicts_previous_gop_on_new_keyframe_and_enforces_byte_cap() {
+        let mut cache = MseGopCache::new();
+        assert!(cache.ingest_text(r#"{"type":"mse","value":"video/mp4; codecs=\"avc1.640029\""}"#));
+
+        let init = build_test_init_segment();
+        cache.ingest_binary(init.clone());
+        assert_eq!(cache.init_segment, Some(init.clone()));
+        assert!(cache.gop_fragments.is_empty());
+
+        // GOP #1: I + P1 + P2
+        let gop1_i = build_test_fragment(true, &[0x11; 64]);
+        let gop1_p1 = build_test_fragment(false, &[0x12; 32]);
+        let gop1_p2 = build_test_fragment(false, &[0x13; 32]);
+        assert!(cache.ingest_binary(gop1_i));
+        assert!(!cache.ingest_binary(gop1_p1));
+        assert!(!cache.ingest_binary(gop1_p2));
+        assert_eq!(cache.gop_fragments.len(), 3);
+
+        // GOP #2: I + P1 -> must evict GOP #1 and retain init_segment + GOP #2 only
+        let gop2_i = build_test_fragment(true, &[0x21; 80]);
+        let gop2_p1 = build_test_fragment(false, &[0x22; 40]);
+        assert!(cache.ingest_binary(gop2_i.clone()));
+        assert!(!cache.ingest_binary(gop2_p1.clone()));
+        assert_eq!(cache.init_segment, Some(init));
+        assert_eq!(cache.gop_fragments.len(), 2);
+        assert_eq!(cache.gop_fragments[0], gop2_i);
+        assert_eq!(cache.gop_fragments[1], gop2_p1);
+
+        // Enforce MAX_GOP_BYTES cap on oversized delta fragment
+        let huge_delta = build_test_fragment(false, &vec![0x99u8; MAX_GOP_BYTES]);
+        cache.ingest_binary(huge_delta);
+        assert_eq!(cache.gop_fragments.len(), 2);
+        assert!(cache.gop_bytes <= MAX_GOP_BYTES);
+    }
+}

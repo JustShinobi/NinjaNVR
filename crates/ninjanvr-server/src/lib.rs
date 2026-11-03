@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+pub mod mse_hub;
 pub mod pipeline;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -21,6 +22,7 @@ use chrono::Local;
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+pub use mse_hub::{MseGopCache, MseStreamHub};
 use ninjanvr_comms::{CommsHub, SharedCommsHub};
 use ninjanvr_config::{
     DEFAULT_GO2RTC_SHM_PATH, Go2RtcSupervisor, NINJANVR_VERSION, NinjaConfig, scrub_json_value,
@@ -32,7 +34,7 @@ use ninjanvr_media::{
     RecordingEngine, SharedActivityLedger, build_mp4_export_with_privacy, new_activity_ledger,
     probe_storage_writable,
 };
-use pipeline::{SharedCameraMetrics, VisionPipeline};
+use pipeline::{SharedCameraMetrics, SharedLatestYuvFrames, VisionPipeline};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -241,6 +243,9 @@ impl ProcCpuTracker {
     }
 }
 
+pub type LazySnapshotCacheKey = (String, u32, bool);
+pub type LazySnapshotCacheValue = (Instant, Bytes, u64);
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<NinjaConfig>>,
@@ -255,6 +260,9 @@ pub struct AppState {
     pub web_dir: PathBuf,
     pub media_dir: PathBuf,
     pub latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    pub latest_yuv_frames: SharedLatestYuvFrames,
+    pub lazy_snapshot_cache: Arc<RwLock<HashMap<LazySnapshotCacheKey, LazySnapshotCacheValue>>>,
+    pub mse_hub: MseStreamHub,
     pub activity_ledger: SharedActivityLedger,
     pub detector: Arc<AiDetectorEngine>,
     pub camera_metrics: SharedCameraMetrics,
@@ -567,6 +575,10 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         )
         .route("/go2rtc/streams", get(api_go2rtc_streams))
         .route("/go2rtc/streams/{stream}", get(api_go2rtc_stream_one))
+        .route(
+            "/go2rtc/streams/{stream}/prewarm",
+            post(api_go2rtc_stream_prewarm),
+        )
         .route("/go2rtc/webrtc", post(api_go2rtc_webrtc))
         .route(
             "/{camera}/recordings",
@@ -8060,13 +8072,23 @@ async fn api_previews(
 async fn api_preview_thumbnail(
     State(state): State<AppState>,
     AxumPath(preview_name): AxumPath<String>,
+    uri: Uri,
 ) -> Response {
     let camera = preview_name
         .strip_prefix("preview_")
         .and_then(|s| s.split('-').next())
         .unwrap_or("sala")
         .to_string();
-    api_camera_latest_frame(State(state), AxumPath(camera)).await
+    api_camera_latest_frame(
+        State(state),
+        AxumPath(camera),
+        Query(LatestFrameQuery {
+            height: Some(360),
+            bbox: None,
+        }),
+        uri,
+    )
+    .await
 }
 
 async fn api_labels(State(state): State<AppState>) -> Json<Value> {
@@ -9065,10 +9087,27 @@ async fn api_camera_state_set(
     Json(serde_json::to_value(flags).unwrap_or_else(|_| json!({})))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct LatestFrameQuery {
+    pub height: Option<u32>,
+    pub bbox: Option<bool>,
+}
+
 async fn api_camera_latest_frame(
     State(state): State<AppState>,
     AxumPath(camera): AxumPath<String>,
+    Query(query): Query<LatestFrameQuery>,
+    uri: Uri,
 ) -> Response {
+    let _ = query.bbox;
+    let is_webp = uri.path().ends_with(".webp");
+    let target_height = query.height.filter(|&h| h > 0);
+    let content_type = if is_webp {
+        "image/webp".to_string()
+    } else {
+        "image/jpeg".to_string()
+    };
+
     let metric_ts = state
         .camera_metrics
         .read()
@@ -9078,6 +9117,69 @@ async fn api_camera_latest_frame(
         .unwrap_or(0.0);
 
     let ts_hdr = header::HeaderName::from_static("x-last-frame-timestamp");
+
+    // 1. Check short-lived 400ms in-memory encoded snapshot cache
+    let cache_key = (camera.clone(), target_height.unwrap_or(0), is_webp);
+    if let Some((cached_at, cached_bytes, cached_ts)) = state
+        .lazy_snapshot_cache
+        .read()
+        .await
+        .get(&cache_key)
+        .cloned()
+        && cached_at.elapsed() <= Duration::from_millis(400)
+    {
+        return (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (ts_hdr, cached_ts.to_string()),
+            ],
+            cached_bytes,
+        )
+            .into_response();
+    }
+
+    // 2. Encode on demand from latest_yuv_frames (zero-copy raw YuvFrame)
+    if let Some(yuv_frame) = state.latest_yuv_frames.read().await.get(&camera).cloned() {
+        let priv_mask = {
+            let cfg = state.config.read().await;
+            cfg.cameras.get(&camera).map(|c| c.privacy_mask.clone())
+        };
+        let mut rgb =
+            ninjanvr_vision::yuv420p_to_rgb_image_scaled(&yuv_frame, None, &[], target_height);
+        if let Some(ref mask) = priv_mask
+            && !mask.is_null()
+        {
+            ninjanvr_vision::apply_privacy_masks_from_value(&mut rgb, mask);
+        }
+        let encoded_res = if is_webp {
+            ninjanvr_vision::encode_image_webp(&rgb)
+        } else {
+            ninjanvr_vision::encode_image_jpeg(&rgb)
+        };
+        if let Ok(encoded_vec) = encoded_res {
+            let out_bytes = Bytes::from(encoded_vec);
+            let ts = if yuv_frame.timestamp > 0.0 {
+                yuv_frame.timestamp as u64
+            } else if metric_ts > 0.0 {
+                metric_ts as u64
+            } else {
+                unix_now()
+            };
+            state
+                .lazy_snapshot_cache
+                .write()
+                .await
+                .insert(cache_key, (Instant::now(), out_bytes.clone(), ts));
+            return (
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (ts_hdr, ts.to_string()),
+                ],
+                out_bytes,
+            )
+                .into_response();
+        }
+    }
 
     if let Some(frame_bytes) = state.latest_frames.read().await.get(&camera).cloned() {
         let ts = if metric_ts > 0.0 {
@@ -9162,6 +9264,22 @@ async fn api_camera_latest_frame(
     }
 
     placeholder_jpeg_response()
+}
+
+async fn api_go2rtc_stream_prewarm(
+    State(state): State<AppState>,
+    AxumPath(stream): AxumPath<String>,
+) -> Response {
+    let warm = state
+        .mse_hub
+        .prewarm_stream(&state.go2rtc_ws_base, &stream)
+        .await;
+    Json(json!({
+        "success": true,
+        "stream": stream,
+        "warm": warm,
+    }))
+    .into_response()
 }
 
 fn placeholder_jpeg_response() -> Response {
@@ -9311,19 +9429,74 @@ async fn ws_go2rtc_proxy(
 }
 
 async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) {
+    let stream_src = mse_hub::extract_stream_src_from_query(&query);
     let target_url = if query.is_empty() {
         format!("{}/api/ws", state.go2rtc_ws_base)
     } else {
         format!("{}/api/ws?{query}", state.go2rtc_ws_base)
     };
 
+    let (mut client_sink, mut client_stream) = client_ws.split();
+
+    // Wait briefly for client MSE handshake (or proceed immediately if none arrives within 40ms)
+    let first_client_msg =
+        match tokio::time::timeout(Duration::from_millis(40), client_stream.next()).await {
+            Ok(Some(Ok(msg))) => Some(msg),
+            Ok(Some(Err(_))) | Ok(None) => return,
+            Err(_) => None,
+        };
+
+    // Instant GOP Burst: if MseStreamHub holds a fresh GOP cache for this stream,
+    // immediately push codec_msg, init_segment, and the cached GOP fragments to the client.
+    let mut burst_sent = false;
+    if let Some(ref src) = stream_src
+        && let Some(burst) = state.mse_hub.get_fresh_burst(src).await
+    {
+        if client_sink
+            .send(AxumWsMsg::Text(burst.codec_msg.into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if client_sink
+            .send(AxumWsMsg::Binary(burst.init_segment))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        for frag in burst.gop_fragments {
+            if client_sink.send(AxumWsMsg::Binary(frag)).await.is_err() {
+                return;
+            }
+        }
+        burst_sent = true;
+    }
+
     let Ok((upstream_ws, _)) = tokio_tungstenite::connect_async(&target_url).await else {
-        warn!("Failed to connect upstream go2rtc WS at {target_url}");
+        if !burst_sent {
+            warn!("Failed to connect upstream go2rtc WS at {target_url}");
+        }
         return;
     };
 
-    let (mut client_sink, mut client_stream) = client_ws.split();
     let (mut up_sink, mut up_stream) = upstream_ws.split();
+
+    if let Some(msg) = first_client_msg {
+        let out = match msg {
+            AxumWsMsg::Text(t) => Some(TungMsg::Text(t.to_string().into())),
+            AxumWsMsg::Binary(b) => Some(TungMsg::Binary(b)),
+            AxumWsMsg::Ping(p) => Some(TungMsg::Ping(p)),
+            AxumWsMsg::Pong(p) => Some(TungMsg::Pong(p)),
+            AxumWsMsg::Close(_) => return,
+        };
+        if let Some(m) = out
+            && up_sink.send(m).await.is_err()
+        {
+            return;
+        }
+    }
 
     let c2u = async {
         while let Some(Ok(msg)) = client_stream.next().await {
@@ -9341,10 +9514,32 @@ async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) 
     };
 
     let u2c = async {
+        let mut skip_until_next_sync = burst_sent;
         while let Some(Ok(msg)) = up_stream.next().await {
             let out = match msg {
-                TungMsg::Text(t) => AxumWsMsg::Text(t.to_string().into()),
-                TungMsg::Binary(b) => AxumWsMsg::Binary(b),
+                TungMsg::Text(t) => {
+                    if let Some(ref src) = stream_src {
+                        state.mse_hub.ingest_upstream_text(src, t.as_str()).await;
+                    }
+                    if burst_sent && t.contains("\"type\"") && t.contains("\"mse\"") {
+                        continue;
+                    }
+                    AxumWsMsg::Text(t.to_string().into())
+                }
+                TungMsg::Binary(b) => {
+                    if let Some(ref src) = stream_src {
+                        state.mse_hub.ingest_upstream_binary(src, b.clone()).await;
+                    }
+                    if skip_until_next_sync {
+                        if ninjanvr_vod::is_fmp4_init_segment(&b) {
+                            continue;
+                        }
+                        if ninjanvr_vod::is_fmp4_sync_fragment(&b) {
+                            skip_until_next_sync = false;
+                        }
+                    }
+                    AxumWsMsg::Binary(b)
+                }
                 TungMsg::Ping(p) => AxumWsMsg::Ping(p),
                 TungMsg::Pong(p) => AxumWsMsg::Pong(p),
                 TungMsg::Close(_) => break,
@@ -9638,6 +9833,9 @@ pub async fn new_app_state(
     let shared_cfg = Arc::new(RwLock::new(cfg));
     let activity_ledger = new_activity_ledger();
     let latest_frames = Arc::new(RwLock::new(HashMap::new()));
+    let latest_yuv_frames: SharedLatestYuvFrames = Arc::new(RwLock::new(HashMap::new()));
+    let lazy_snapshot_cache = Arc::new(RwLock::new(HashMap::new()));
+    let mse_hub = MseStreamHub::new();
     let camera_metrics: SharedCameraMetrics = Arc::new(RwLock::new(HashMap::new()));
     let stats_history: Arc<RwLock<VecDeque<Value>>> = Arc::new(RwLock::new(VecDeque::new()));
     let go2rtc_supervisor = Arc::new(Go2RtcSupervisor::new(shared_cfg.clone()));
@@ -9676,6 +9874,7 @@ pub async fn new_app_state(
             detector: detector.clone(),
             activity_ledger: activity_ledger.clone(),
             latest_frames: latest_frames.clone(),
+            latest_yuv_frames: latest_yuv_frames.clone(),
             camera_metrics: camera_metrics.clone(),
             media_dir: media_dir.clone(),
             log_hub: log_hub.clone(),
@@ -9714,6 +9913,9 @@ pub async fn new_app_state(
         web_dir,
         media_dir,
         latest_frames,
+        latest_yuv_frames,
+        lazy_snapshot_cache,
+        mse_hub,
         activity_ledger,
         detector,
         camera_metrics,
@@ -14516,5 +14718,268 @@ cameras:
             ),
             PathBuf::from("/custom/media/recordings/2026-11-02/14/front_door/05.10.mp4")
         );
+    }
+
+    #[tokio::test]
+    async fn ws_go2rtc_proxy_delivers_instant_gop_burst_and_prewarm_populates_cache() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-mse-prewarm-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "version: 0.18-0\ndatabase:\n  path: {}\ncameras:\n  front_door:\n    enabled: true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        // Build synthetic fMP4 init segment + IDR keyframe fragment + P-frame fragment
+        let make_box = |box_type: &[u8; 4], payload: &[u8]| -> Vec<u8> {
+            let total = (8 + payload.len()) as u32;
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&total.to_be_bytes());
+            out.extend_from_slice(box_type);
+            out.extend_from_slice(payload);
+            out
+        };
+        let make_full_box = |box_type: &[u8; 4], version: u8, flags: u32, body: &[u8]| -> Vec<u8> {
+            let total = (12 + body.len()) as u32;
+            let mut out = Vec::with_capacity(12 + body.len());
+            out.extend_from_slice(&total.to_be_bytes());
+            out.extend_from_slice(box_type);
+            let vf = ((version as u32) << 24) | (flags & 0x00FF_FFFF);
+            out.extend_from_slice(&vf.to_be_bytes());
+            out.extend_from_slice(body);
+            out
+        };
+        let mut init_vec = make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso6dashmp41");
+        init_vec.extend_from_slice(&make_box(b"moov", &[0u8; 24]));
+        let init_bytes = Bytes::from(init_vec);
+
+        let build_frag = |is_sync: bool, tag: u8| -> Bytes {
+            let flags: u32 = if is_sync { 0x0200_0000 } else { 0x0101_0000 };
+            let mfhd = make_full_box(b"mfhd", 0, 0, &1u32.to_be_bytes());
+            let tfhd = make_full_box(b"tfhd", 0, 0x020000, &1u32.to_be_bytes());
+            let mut trun_body = Vec::new();
+            trun_body.extend_from_slice(&1u32.to_be_bytes());
+            trun_body.extend_from_slice(&64i32.to_be_bytes());
+            trun_body.extend_from_slice(&3000u32.to_be_bytes());
+            trun_body.extend_from_slice(&16u32.to_be_bytes());
+            trun_body.extend_from_slice(&flags.to_be_bytes());
+            let trun = make_full_box(b"trun", 0, 0x000701, &trun_body);
+            let mut traf_c = Vec::new();
+            traf_c.extend_from_slice(&tfhd);
+            traf_c.extend_from_slice(&trun);
+            let traf = make_box(b"traf", &traf_c);
+            let mut moof_c = Vec::new();
+            moof_c.extend_from_slice(&mfhd);
+            moof_c.extend_from_slice(&traf);
+            let mut out = make_box(b"moof", &moof_c);
+            out.extend_from_slice(&make_box(b"mdat", &[tag; 16]));
+            Bytes::from(out)
+        };
+        let keyframe_bytes = build_frag(true, 0xAA);
+        let delta_bytes = build_frag(false, 0xBB);
+        let codec_str = r#"{"type":"mse","value":"video/mp4; codecs=\"avc1.640029\""}"#;
+
+        // Spin up mock go2rtc WS server
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let init_srv = init_bytes.clone();
+        let key_srv = keyframe_bytes.clone();
+        let delta_srv = delta_bytes.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = mock_listener.accept().await {
+                let init_c = init_srv.clone();
+                let key_c = key_srv.clone();
+                let delta_c = delta_srv.clone();
+                tokio::spawn(async move {
+                    if let Ok(ws) = tokio_tungstenite::accept_async(tcp).await {
+                        let (mut sink, mut rx) = ws.split();
+                        // Wait for client mse handshake
+                        let _ = rx.next().await;
+                        let _ = sink.send(TungMsg::Text(codec_str.into())).await;
+                        let _ = sink.send(TungMsg::Binary(init_c)).await;
+                        let _ = sink.send(TungMsg::Binary(key_c)).await;
+                        let _ = sink.send(TungMsg::Binary(delta_c)).await;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                });
+            }
+        });
+
+        let mut state = new_app_state(&cfg_path, tmp_dir.join("web"), tmp_dir.join("media"), false)
+            .await
+            .unwrap();
+        state.go2rtc_ws_base = format!("ws://{mock_addr}");
+        let app = build_router(state.clone());
+
+        // 1. Trigger POST /api/go2rtc/streams/front_door/prewarm
+        let prewarm_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/go2rtc/streams/front_door/prewarm")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prewarm_resp.status(), StatusCode::OK);
+        let prewarm_json: Value =
+            serde_json::from_slice(&to_bytes(prewarm_resp.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(prewarm_json["success"], true);
+        assert_eq!(prewarm_json["stream"], "front_door");
+        assert_eq!(prewarm_json["warm"], true);
+
+        // Wait briefly for the trailing delta frame to also land in MseGopCache
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // 2. Start NinjanVR HTTP server and connect a client WS to /live/mse/api/ws?src=front_door
+        let srv_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = srv_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(srv_listener, app).await;
+        });
+
+        let client_url = format!("ws://{srv_addr}/live/mse/api/ws?src=front_door");
+        let (mut client_ws, _) = tokio_tungstenite::connect_async(&client_url).await.unwrap();
+        client_ws
+            .send(TungMsg::Text(
+                r#"{"type":"mse","value":"avc1.640029"}"#.into(),
+            ))
+            .await
+            .unwrap();
+
+        // Client must immediately receive codec_msg, init_segment, and IDR keyframe fragment from cache
+        let msg1 = tokio::time::timeout(Duration::from_millis(500), client_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg1, TungMsg::Text(codec_str.into()));
+
+        let msg2 = tokio::time::timeout(Duration::from_millis(500), client_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg2, TungMsg::Binary(init_bytes));
+
+        let msg3 = tokio::time::timeout(Duration::from_millis(500), client_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg3, TungMsg::Binary(keyframe_bytes));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn latest_frame_endpoint_encodes_lazy_yuv_at_native_and_custom_heights() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-lazy-yuv-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "version: 0.18-0\ndatabase:\n  path: {}\ncameras:\n  front_door:\n    enabled: true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let state = new_app_state(&cfg_path, tmp_dir.join("web"), tmp_dir.join("media"), false)
+            .await
+            .unwrap();
+
+        let width = 1280u32;
+        let height = 720u32;
+        let yuv_len = ((width * height * 3) / 2) as usize;
+        let yuv_frame = ninjanvr_media::YuvFrame {
+            camera: Arc::from("front_door"),
+            timestamp: 1_793_700_000.0,
+            width,
+            height,
+            data: Arc::new(vec![128u8; yuv_len]),
+        };
+        state
+            .latest_yuv_frames
+            .write()
+            .await
+            .insert("front_door".to_string(), yuv_frame);
+
+        let app = build_router(state);
+
+        // 1. Native resolution (no ?height param) -> 1280x720 JPEG
+        let resp_native = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/latest.jpg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_native.status(), StatusCode::OK);
+        assert_eq!(
+            resp_native.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+        let native_bytes = to_bytes(resp_native.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let native_img = image::load_from_memory(&native_bytes).unwrap();
+        assert_eq!(native_img.width(), 1280);
+        assert_eq!(native_img.height(), 720);
+
+        // 2. Scaled resolution (?height=360) -> 640x360 JPEG
+        let resp_360 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/latest.jpg?height=360")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_360.status(), StatusCode::OK);
+        let bytes_360 = to_bytes(resp_360.into_body(), 1024 * 1024).await.unwrap();
+        let img_360 = image::load_from_memory(&bytes_360).unwrap();
+        assert_eq!(img_360.width(), 640);
+        assert_eq!(img_360.height(), 360);
+
+        // 3. WebP format (/latest.webp?height=360) -> 640x360 WebP
+        let resp_webp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/latest.webp?height=360")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_webp.status(), StatusCode::OK);
+        assert_eq!(
+            resp_webp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/webp"
+        );
+        let bytes_webp = to_bytes(resp_webp.into_body(), 1024 * 1024).await.unwrap();
+        let img_webp = image::load_from_memory(&bytes_webp).unwrap();
+        assert_eq!(img_webp.width(), 640);
+        assert_eq!(img_webp.height(), 360);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
