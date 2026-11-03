@@ -14,7 +14,9 @@ import {
   WorkspaceTab,
   applyThemeToDocument,
   cycleThemeMode,
+  formatDisplayVersion,
   formatTs,
+  resolveHeaderTelemetryMeta,
 } from "./utils/format";
 import { expandSimulatedFleet, useNvrStore } from "./store/useNvrStore";
 import { LiveWorkspace } from "./views/LiveWorkspace";
@@ -333,87 +335,103 @@ export const App: React.FC = () => {
     return () => window.clearInterval(timer);
   }, [fetchCoreData, authNeeded]);
 
-  // Connect to /ws for real-time camera_activity and stats
+  // Connect to /ws for real-time camera_activity and stats (with auto-reconnect on disconnect)
   useEffect(() => {
     if (!authChecked || authNeeded) return;
     let closed = false;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: number | null = null;
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
 
-    ws.onopen = () => {
-      if (!closed) setWsOnline(true);
-    };
-    ws.onclose = () => {
-      if (!closed) setWsOnline(false);
-    };
-    ws.onmessage = (ev) => {
-      if (closed || typeof ev.data !== "string") return;
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.topic === "camera_activity" && msg.payload) {
-          const parsed =
-            typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
-          setCameraActivity(parsed);
-        } else if (msg.topic === "profile/state" && typeof msg.payload === "string") {
-          const p = msg.payload.trim().toLowerCase();
-          if (p === "armed" || p === "home" || p === "disarmed") {
-            setSecurityProfile(p);
-          }
-        } else if (msg.topic === "events" && msg.payload) {
-          const parsed =
-            typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
-          if ((parsed?.type === "new" || parsed?.type === "update") && parsed?.after?.id) {
-            const evItem: EventItem = parsed.after;
-            setEvents((prev) => {
-              const idx = prev.findIndex((x) => x.id === evItem.id);
-              if (idx >= 0) {
-                const copy = [...prev];
-                copy[idx] = evItem;
-                return copy;
-              }
-              return [evItem, ...prev];
-            });
-          }
-        } else if (msg.topic === "reviews" && msg.payload) {
-          const parsed =
-            typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
-          if (parsed?.type === "new" && parsed?.after?.severity === "alert") {
-            const alertItem: ReviewItem = parsed.after;
-            setReviews((prev) =>
-              prev.some((r) => r.id === alertItem.id) ? prev : [alertItem, ...prev]
-            );
-            if (useNvrStore.getState().audibleAlertChime) {
-              playTacticalAlertChime();
-            }
-            if (
-              useNvrStore.getState().browserNotifications &&
-              "Notification" in window &&
-              Notification.permission === "granted"
-            ) {
-              const objs = (alertItem.data?.objects || ["person"]).join(", ").toUpperCase();
-              const n = new Notification(
-                `NinjaNVR Alert // ${alertItem.camera.toUpperCase()}`,
-                {
-                  body: `Detected ${objs}`,
-                  icon: `/api/${encodeURIComponent(alertItem.camera)}/latest.jpg`,
-                }
-              );
-              n.onclick = () => {
-                window.focus();
-                setActiveReview(alertItem);
-                switchTab("review");
-              };
-            }
-          }
+    const connect = () => {
+      if (closed) return;
+      ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+
+      ws.onopen = () => {
+        if (!closed) setWsOnline(true);
+      };
+      ws.onclose = () => {
+        if (!closed) {
+          setWsOnline(false);
+          reconnectTimer = window.setTimeout(connect, 2000);
         }
-      } catch {
-        // ignore
-      }
+      };
+      ws.onmessage = (ev) => {
+        if (closed || typeof ev.data !== "string") return;
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.topic === "camera_activity" && msg.payload) {
+            const parsed =
+              typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
+            setCameraActivity(parsed);
+          } else if (msg.topic === "profile/state" && typeof msg.payload === "string") {
+            const p = msg.payload.trim().toLowerCase();
+            if (p === "armed" || p === "home" || p === "disarmed") {
+              setSecurityProfile(p);
+            }
+          } else if (msg.topic === "events" && msg.payload) {
+            const parsed =
+              typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
+            if ((parsed?.type === "new" || parsed?.type === "update") && parsed?.after?.id) {
+              const evItem: EventItem = parsed.after;
+              setEvents((prev) => {
+                const idx = prev.findIndex((x) => x.id === evItem.id);
+                if (idx >= 0) {
+                  const copy = [...prev];
+                  copy[idx] = evItem;
+                  return copy;
+                }
+                return [evItem, ...prev];
+              });
+            }
+          } else if (msg.topic === "reviews" && msg.payload) {
+            const parsed =
+              typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
+            if (parsed?.type === "new" && parsed?.after?.severity === "alert") {
+              const alertItem: ReviewItem = parsed.after;
+              setReviews((prev) =>
+                prev.some((r) => r.id === alertItem.id) ? prev : [alertItem, ...prev]
+              );
+              if (useNvrStore.getState().audibleAlertChime) {
+                playTacticalAlertChime();
+              }
+              if (
+                useNvrStore.getState().browserNotifications &&
+                "Notification" in window &&
+                Notification.permission === "granted"
+              ) {
+                const objs = (alertItem.data?.objects || ["person"]).join(", ").toUpperCase();
+                const n = new Notification(
+                  `NinjaNVR Alert // ${alertItem.camera.toUpperCase()}`,
+                  {
+                    body: `Detected ${objs}`,
+                    icon: `/api/${encodeURIComponent(alertItem.camera)}/latest.jpg`,
+                  }
+                );
+                n.onclick = () => {
+                  window.focus();
+                  setActiveReview(alertItem);
+                  switchTab("review");
+                };
+              }
+            }
+          }
+        } catch {
+          // ignore
+        }
+      };
     };
+
+    connect();
 
     return () => {
       closed = true;
-      ws.close();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+      if (ws) {
+        ws.close();
+      }
     };
   }, [
     authChecked,
@@ -825,12 +843,8 @@ export const App: React.FC = () => {
   const sysMem = stats?.cpu_usages?.["ninjanvr.full_system"]?.mem || "26.0";
   const inferMs = stats?.detectors?.detector01?.inference_speed?.toFixed(1) || "7.0";
   const totalFps = stats?.camera_fps?.toFixed(1) || "20.0";
-  const rawServerVer = stats?.service?.version?.trim() || "";
-  const displayVersion = rawServerVer
-    ? rawServerVer.startsWith("v")
-      ? rawServerVer
-      : `v${rawServerVer}`
-    : "";
+  const displayVersion = formatDisplayVersion(stats?.service?.version, t.brand.release);
+  const headerTelemetry = resolveHeaderTelemetryMeta(wsOnline, cameraNames.length);
 
   if (!authChecked) {
     return <div className="nvr-shell" />;
@@ -858,15 +872,17 @@ export const App: React.FC = () => {
         >
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <img
+              className="nvr-brand-logo"
               src="/favicon.svg?v=ninjanvr"
               alt=""
-              width={26}
-              height={26}
-              style={{ flexShrink: 0 }}
+              width={28}
+              height={28}
+              style={{ width: 28, height: 28 }}
             />
-            <div>
-              <div className="nvr-brand-title">
-                {t.brand.name} // {displayVersion || t.brand.release}
+            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                <span className="nvr-brand-title">{t.brand.name}</span>
+                <span className="nvr-brand-version mono">{displayVersion}</span>
               </div>
               <div className="nvr-brand-sub">{t.auth.title}</div>
             </div>
@@ -963,33 +979,14 @@ export const App: React.FC = () => {
       <header className="nvr-header">
         <div className="nvr-brand">
           <img
+            className="nvr-brand-logo"
             src="/favicon.svg?v=ninjanvr"
             alt=""
             width={24}
             height={24}
-            style={{ flexShrink: 0 }}
           />
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-              <span className="nvr-brand-title">{t.brand.name}</span>
-              <span
-                className="mono"
-                style={{
-                  fontSize: "var(--text-xs)",
-                  padding: "1px 5px",
-                  background: "rgba(14, 165, 233, 0.16)",
-                  border: "1px solid rgba(14, 165, 233, 0.45)",
-                  color: "var(--signal-accent-text)",
-                  borderRadius: 2,
-                }}
-              >
-                {displayVersion || t.brand.release}
-              </span>
-            </div>
-            <div className="nvr-brand-sub">
-              {wsOnline ? "WS NOMINAL" : "POLLING"} · {cameraNames.length} CH
-            </div>
-          </div>
+          <span className="nvr-brand-title">{t.brand.name}</span>
+          <span className="nvr-brand-version mono">{displayVersion}</span>
         </div>
 
         <nav className="nvr-nav" aria-label="Primary Workspace Navigation">
@@ -1157,9 +1154,11 @@ export const App: React.FC = () => {
           <button
             className="nvr-telemetry-pill"
             onClick={() => switchTab("system")}
-            title="Inspect System Telemetry & OpenVINO Detector"
+            title={headerTelemetry.tooltip}
           >
-            <span className="nvr-dot live" />
+            <span className={`nvr-dot ${headerTelemetry.wsDotClass}`} />
+            <span>{headerTelemetry.channelBadge}</span>
+            <span className="nvr-divider" aria-hidden="true" />
             <span>CPU {sysCpu}%</span>
             <span className="nvr-divider nvr-telemetry-ext" aria-hidden="true" />
             <span className="nvr-telemetry-ext">MEM {sysMem}%</span>

@@ -209,11 +209,20 @@ body,
 }
 
 .nvr-brand {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 8px;
+  height: 30px;
+  padding: 0 2px;
   flex-shrink: 0;
   white-space: nowrap;
+}
+
+.nvr-brand-logo {
+  display: block;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
 }
 
 .nvr-brand-mark {
@@ -224,11 +233,28 @@ body,
 }
 
 .nvr-brand-title {
+  display: inline-flex;
+  align-items: center;
   font-family: var(--font-mono);
   font-weight: 700;
   font-size: 13.5px;
+  line-height: 1;
   letter-spacing: 0.02em;
   color: var(--text-primary);
+}
+
+.nvr-brand-version {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 6px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1;
+  background: rgba(14, 165, 233, 0.16);
+  border: 1px solid rgba(14, 165, 233, 0.45);
+  color: var(--signal-accent-text);
+  border-radius: 2px;
 }
 
 .nvr-brand-sub {

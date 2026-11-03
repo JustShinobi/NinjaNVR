@@ -4,10 +4,12 @@ import {
   findMatchingExport,
   formatClockTime,
   formatDateTime,
+  formatDisplayVersion,
   formatDuration,
   formatRelTime,
   formatTs,
   formatUptime,
+  resolveHeaderTelemetryMeta,
   resolveInitialBool,
   resolveInitialFirstWeekday,
   resolveInitialHudPosition,
@@ -135,5 +137,24 @@ describe("format utilities", () => {
     expect(resolveInitialFirstWeekday()).toBe("sunday");
     win.localStorage.setItem("ninjanvr_first_weekday", "monday");
     expect(resolveInitialFirstWeekday()).toBe("monday");
+  });
+
+  test("formatDisplayVersion and resolveHeaderTelemetryMeta format brand version and header telemetry status", () => {
+    expect(formatDisplayVersion("1.9.9-rc.1", "CONSOLE")).toBe("v1.9.9-rc.1");
+    expect(formatDisplayVersion("v1.9.9-rc.1", "CONSOLE")).toBe("v1.9.9-rc.1");
+    expect(formatDisplayVersion("   ", "CONSOLE")).toBe("CONSOLE");
+    expect(formatDisplayVersion(undefined, "CONSOLE")).toBe("CONSOLE");
+
+    const online = resolveHeaderTelemetryMeta(true, 4);
+    expect(online.wsDotClass).toBe("live");
+    expect(online.channelBadge).toBe("4 CH");
+    expect(online.tooltip).toContain("4 CH");
+    expect(online.tooltip).toContain("Real-time WebSocket stream online");
+
+    const reconnecting = resolveHeaderTelemetryMeta(false, 16);
+    expect(reconnecting.wsDotClass).toBe("motion");
+    expect(reconnecting.channelBadge).toBe("16 CH");
+    expect(reconnecting.tooltip).toContain("16 CH");
+    expect(reconnecting.tooltip).toContain("WebSocket reconnecting");
   });
 });

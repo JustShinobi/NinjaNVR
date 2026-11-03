@@ -210,6 +210,40 @@ export function formatUptime(sec: number): string {
   return `${h}h ${m}m ${s}s`;
 }
 
+export interface HeaderTelemetryMeta {
+  wsDotClass: "live" | "motion";
+  wsStatusLabel: string;
+  channelBadge: string;
+  tooltip: string;
+}
+
+export function formatDisplayVersion(
+  rawServerVer?: string | null,
+  fallbackRelease: string = "CONSOLE"
+): string {
+  const clean = (rawServerVer || "").trim();
+  if (!clean) return fallbackRelease;
+  return clean.startsWith("v") ? clean : `v${clean}`;
+}
+
+export function resolveHeaderTelemetryMeta(
+  wsOnline: boolean,
+  channelCount: number
+): HeaderTelemetryMeta {
+  const safeCount = Math.max(0, Math.floor(channelCount || 0));
+  const channelBadge = `${safeCount} CH`;
+  const wsDotClass = wsOnline ? "live" : "motion";
+  const wsStatusLabel = wsOnline
+    ? "Real-time WebSocket stream online"
+    : "WebSocket reconnecting (HTTP fallback active)";
+  return {
+    wsDotClass,
+    wsStatusLabel,
+    channelBadge,
+    tooltip: `Inspect System Telemetry & OpenVINO Detector · ${channelBadge} · ${wsStatusLabel}`,
+  };
+}
+
 export function findMatchingExport(
   exportsList: ExportItem[],
   camera: string,
