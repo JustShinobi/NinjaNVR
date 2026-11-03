@@ -125,6 +125,8 @@ pub struct EventFilter {
     pub exclude_labels: Option<Vec<String>>,
     pub zones: Option<Vec<String>>,
     pub sub_labels: Option<Vec<String>>,
+    pub plate: Option<String>,
+    pub recognized_license_plates: Option<Vec<String>>,
     pub favorites: Option<bool>,
     pub min_score: Option<f64>,
     pub stationary: Option<bool>,
@@ -1495,6 +1497,47 @@ impl NinjaDatabase {
                     continue;
                 }
             }
+            let mut req_plates: Vec<String> = Vec::new();
+            if let Some(ref p) = filter.plate {
+                for tok in p.split(',') {
+                    let norm: String = tok
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .map(|c| c.to_ascii_uppercase())
+                        .collect();
+                    if !norm.is_empty() && !norm.eq_ignore_ascii_case("all") {
+                        req_plates.push(norm);
+                    }
+                }
+            }
+            if let Some(ref list) = filter.recognized_license_plates {
+                for tok in list {
+                    let norm: String = tok
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .map(|c| c.to_ascii_uppercase())
+                        .collect();
+                    if !norm.is_empty() && !norm.eq_ignore_ascii_case("all") {
+                        req_plates.push(norm);
+                    }
+                }
+            }
+            if !req_plates.is_empty() {
+                let ev_plate_norm: String = item["data"]["recognized_license_plate"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect();
+                if ev_plate_norm.is_empty()
+                    || !req_plates
+                        .iter()
+                        .any(|rp| ev_plate_norm == *rp || ev_plate_norm.contains(rp))
+                {
+                    continue;
+                }
+            }
             out.push(item);
             if out.len() >= requested_limit {
                 break;
@@ -2193,6 +2236,76 @@ impl NinjaDatabase {
             "UPDATE event SET data = json_set(COALESCE(data, '{}'), '$.notes', ?1) WHERE id = ?2",
             params![notes, id],
         )?)
+    }
+
+    /// Manually sets or clears `data.recognized_license_plate` on an event (normalizing alphanumeric uppercase).
+    pub fn set_event_license_plate(&self, id: &str, plate: Option<&str>) -> Result<usize> {
+        let Some(mut ev) = self.get_event(id)? else {
+            return Ok(0);
+        };
+        let normalized: Option<String> = plate
+            .map(|p| {
+                p.chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect::<String>()
+            })
+            .filter(|s| !s.is_empty());
+
+        if !ev["data"].is_object() {
+            ev["data"] = json!({});
+        }
+        if let Some(data_obj) = ev["data"].as_object_mut() {
+            match normalized {
+                Some(ref norm_plate) => {
+                    data_obj.insert("recognized_license_plate".to_string(), json!(norm_plate));
+                    if let Some(attrs) = data_obj
+                        .get_mut("attributes")
+                        .and_then(|v| v.as_array_mut())
+                        && !attrs
+                            .iter()
+                            .any(|a| a.as_str() == Some(norm_plate.as_str()))
+                    {
+                        attrs.push(json!(norm_plate));
+                    }
+                }
+                None => {
+                    data_obj.insert("recognized_license_plate".to_string(), Value::Null);
+                }
+            }
+        }
+        let data_str = serde_json::to_string(&ev["data"])?;
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(conn.execute(
+            "UPDATE event SET data = ?1 WHERE id = ?2",
+            params![data_str, id],
+        )?)
+    }
+
+    /// Returns a sorted list of distinct non-empty `recognized_license_plate` values stored in `event.data`.
+    pub fn query_recognized_license_plates(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT data FROM event WHERE data LIKE '%recognized_license_plate%' ORDER BY start_time DESC LIMIT 5000",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
+        let mut set = std::collections::BTreeSet::new();
+        for r in rows {
+            if let Some(raw) = r?
+                && let Ok(val) = serde_json::from_str::<Value>(&raw)
+                && let Some(p) = val["recognized_license_plate"].as_str()
+            {
+                let norm: String = p
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect();
+                if !norm.is_empty() {
+                    set.insert(norm);
+                }
+            }
+        }
+        Ok(set.into_iter().collect())
     }
 
     pub fn set_review_notes(&self, id: &str, notes: &str) -> Result<usize> {
@@ -4567,6 +4680,32 @@ mod tests {
         assert_eq!(mutated["sub_label"], "Courier");
         assert_eq!(mutated["data"]["description"], "Package left at door");
         assert_eq!(mutated["data"]["notes"], "Confirmed by operator");
+
+        assert_eq!(
+            db.set_event_license_plate("ev_m1", Some("abc-1d23"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.set_event_license_plate("missing", Some("ABC1D23"))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_recognized_license_plates().unwrap(),
+            vec!["ABC1D23".to_string()]
+        );
+        let by_plate = db
+            .query_events(&EventFilter {
+                plate: Some("ABC1D23".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_plate.len(), 1);
+        assert_eq!(by_plate[0]["id"], "ev_m1");
+        assert_eq!(by_plate[0]["data"]["recognized_license_plate"], "ABC1D23");
+        assert_eq!(db.set_event_license_plate("ev_m1", None).unwrap(), 1);
+        assert!(db.query_recognized_license_plates().unwrap().is_empty());
 
         assert_eq!(db.set_event_retain("ev_m1", false).unwrap(), 1);
         assert_eq!(db.set_event_false_positive("ev_m1", false).unwrap(), 1);

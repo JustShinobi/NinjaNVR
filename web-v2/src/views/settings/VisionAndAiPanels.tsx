@@ -24,9 +24,15 @@ import {
   FaceRecognitionConfig,
   FalsePositiveSignatureItem,
   GenAiConfig,
+  LprConfig,
   NinjaConfigResponse,
   ObjectFilterConfig,
 } from "../../types/nvr";
+import {
+  DEFAULT_LPR_FORMAT_REGEX,
+  normalizeLicensePlate,
+  validateLicensePlateFormat,
+} from "../../utils/configYaml";
 import { formatDateTime } from "../../utils/format";
 import { ToggleSwitch } from "./ConsoleAndStreamsPanels";
 
@@ -57,6 +63,7 @@ export const STANDARD_LABELS = [
   "bird",
   "package",
   "waste_bin",
+  "license_plate",
 ];
 
 export const DEFAULT_ATTRIBUTE_LABELS = [
@@ -81,6 +88,33 @@ export function toggleAttributeLabelList(
   return base.includes(clean)
     ? base.filter((x) => x !== clean)
     : [...base, clean];
+}
+
+export function upsertKnownPlateEntry(
+  current: Record<string, string> | undefined,
+  plate: string,
+  label: string
+): Record<string, string> {
+  const norm = normalizeLicensePlate(plate);
+  const cleanLabel = label.trim();
+  const next = { ...(current || {}) };
+  if (!norm || !cleanLabel) return next;
+  next[norm] = cleanLabel;
+  return next;
+}
+
+export function removeKnownPlateEntry(
+  current: Record<string, string> | undefined,
+  plate: string
+): Record<string, string> {
+  const norm = normalizeLicensePlate(plate);
+  const next: Record<string, string> = {};
+  for (const [k, v] of Object.entries(current || {})) {
+    if (normalizeLicensePlate(k) !== norm) {
+      next[k] = v;
+    }
+  }
+  return next;
 }
 
 export function normalizeFaceProfileName(raw: string): string {
@@ -1347,6 +1381,26 @@ export const AiDetectionObjectsSection: React.FC<{
   const [enrollImageB64, setEnrollImageB64] = useState<string>("");
   const [enrollBusy, setEnrollBusy] = useState(false);
   const [excludeSubLabelInput, setExcludeSubLabelInput] = useState("");
+  const [newKnownPlate, setNewKnownPlate] = useState("");
+  const [newKnownPlateLabel, setNewKnownPlateLabel] = useState("");
+
+  const lprCfg: LprConfig = draftConfig.lpr || {
+    enabled: false,
+    min_confidence: 0.75,
+    format_regex: DEFAULT_LPR_FORMAT_REGEX,
+    known_plates: {},
+  };
+  const updateLpr = (patch: Partial<LprConfig>) => {
+    updateDraft((next) => {
+      next.lpr = {
+        enabled: next.lpr?.enabled ?? false,
+        min_confidence: next.lpr?.min_confidence ?? 0.75,
+        format_regex: next.lpr?.format_regex ?? DEFAULT_LPR_FORMAT_REGEX,
+        known_plates: { ...(next.lpr?.known_plates || {}) },
+        ...patch,
+      };
+    });
+  };
 
   const faceCfg: FaceRecognitionConfig = draftConfig.face_recognition || {
     enabled: false,
@@ -3579,6 +3633,285 @@ export const AiDetectionObjectsSection: React.FC<{
               {enrolledProfiles.length === 0 && (
                 <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
                   No faces enrolled in /media/ninjanvr/faces yet.
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* License Plate Recognition (LPR) & Known Plates Card */}
+      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="nvr-cfg-card-header">
+          <span>
+            {isPt
+              ? "RECONHECIMENTO DE PLACAS (LPR / ANPR) & PLACAS CONHECIDAS"
+              : "LICENSE PLATE RECOGNITION (LPR) & KNOWN PLATES"}
+          </span>
+          <span className="mono">
+            {Object.keys(lprCfg.known_plates || {}).length}{" "}
+            {isPt ? "PLACAS REGISTRADAS" : "KNOWN PLATES"}
+          </span>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: 12,
+              alignItems: "center",
+            }}
+          >
+            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? "Ativar OCR de Placas Multi-Frame (LPR / ANPR)"
+                    : "Enable Multi-Frame License Plate Recognition (LPR)"}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Consolida leituras OCR por votação majoritária ponderada entre frames consecutivos (Mercosul ABC1D23 e legado ABC1234)."
+                    : "Aggregates CTC/OCR character reads via confidence-weighted majority voting across track frames (Mercosul ABC1D23 & standard)."}
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={Boolean(lprCfg.enabled)}
+                onChange={(val) => updateLpr({ enabled: val })}
+              />
+            </div>
+
+            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? `Confiança Mínima de Consenso OCR (${Math.round((lprCfg.min_confidence ?? 0.75) * 100)}%)`
+                    : `Minimum OCR Consensus Confidence (${Math.round((lprCfg.min_confidence ?? 0.75) * 100)}%)`}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Pontuação mínima após votação multi-frame para gravar recognized_license_plate."
+                    : "Minimum consolidated character score required to record recognized_license_plate."}
+                </div>
+              </div>
+              <input
+                type="range"
+                min={50}
+                max={98}
+                aria-label="Minimum LPR Confidence"
+                value={Math.round((lprCfg.min_confidence ?? 0.75) * 100)}
+                onChange={(e) =>
+                  updateLpr({
+                    min_confidence: Number((Number(e.target.value) / 100).toFixed(2)),
+                  })
+                }
+              />
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "2fr 1fr 1fr",
+              gap: 10,
+              alignItems: "end",
+            }}
+          >
+            <div>
+              <div
+                className="mono"
+                style={{
+                  fontSize: "var(--text-xs)",
+                  color: "var(--text-secondary)",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 6,
+                }}
+              >
+                <span>
+                  {isPt
+                    ? "Expressão Regular de Validação (format_regex)"
+                    : "Plate Format Validation Regex (format_regex)"}
+                </span>
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  style={{ height: 18, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                  onClick={() =>
+                    updateLpr({ format_regex: "^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$" })
+                  }
+                >
+                  Mercosul + Legacy
+                </button>
+              </div>
+              <input
+                className="nvr-input mono"
+                aria-label="LPR Format Regex"
+                style={{ width: "100%", marginTop: 3, fontFamily: "var(--font-mono)" }}
+                placeholder={DEFAULT_LPR_FORMAT_REGEX}
+                value={lprCfg.format_regex ?? ""}
+                onChange={(e) => updateLpr({ format_regex: e.target.value })}
+              />
+            </div>
+
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt ? "Modelo Detector de Placa (Opcional)" : "Plate Detector Model (Optional)"}
+              </div>
+              <input
+                className="nvr-input mono"
+                style={{ width: "100%", marginTop: 3, fontFamily: "var(--font-mono)" }}
+                placeholder="/config/models/lpr_det.onnx"
+                value={lprCfg.detector_model_path ?? ""}
+                onChange={(e) =>
+                  updateLpr({
+                    detector_model_path: e.target.value.trim() || undefined,
+                  })
+                }
+              />
+            </div>
+
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt ? "Modelo OCR CTC (Opcional)" : "Plate OCR CTC Model (Optional)"}
+              </div>
+              <input
+                className="nvr-input mono"
+                style={{ width: "100%", marginTop: 3, fontFamily: "var(--font-mono)" }}
+                placeholder="/config/models/lpr_ocr.onnx"
+                value={lprCfg.ocr_model_path ?? ""}
+                onChange={(e) =>
+                  updateLpr({
+                    ocr_model_path: e.target.value.trim() || undefined,
+                  })
+                }
+              />
+            </div>
+          </div>
+
+          <div
+            style={{
+              padding: "8px 10px",
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: 8,
+              }}
+            >
+              <span
+                className="mono"
+                style={{
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 700,
+                  color: "var(--signal-accent-text)",
+                }}
+              >
+                {isPt
+                  ? "DIRETÓRIO DE PLACAS CONHECIDAS (KNOWN_PLATES → SUB_LABEL)"
+                  : "KNOWN PLATES REGISTRY (KNOWN_PLATES → SUB_LABEL MAPPING)"}
+              </span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <input
+                  className="nvr-input mono"
+                  aria-label="Known plate number"
+                  style={{
+                    width: 120,
+                    height: 24,
+                    fontSize: "var(--text-xs)",
+                    fontFamily: "var(--font-mono)",
+                  }}
+                  placeholder="ABC1D23"
+                  value={newKnownPlate}
+                  onChange={(e) => setNewKnownPlate(e.target.value.toUpperCase())}
+                />
+                <input
+                  className="nvr-input"
+                  aria-label="Known plate vehicle label"
+                  style={{ width: 170, height: 24, fontSize: "var(--text-xs)" }}
+                  placeholder={isPt ? "Ex: SUV da Família" : "e.g. Family SUV"}
+                  value={newKnownPlateLabel}
+                  onChange={(e) => setNewKnownPlateLabel(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn primary mono"
+                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  onClick={() => {
+                    const norm = normalizeLicensePlate(newKnownPlate);
+                    if (!norm || !newKnownPlateLabel.trim()) return;
+                    if (!validateLicensePlateFormat(norm, lprCfg.format_regex)) {
+                      notify(`Plate ${norm} does not match configured format_regex`);
+                    }
+                    updateLpr({
+                      known_plates: upsertKnownPlateEntry(
+                        lprCfg.known_plates,
+                        norm,
+                        newKnownPlateLabel
+                      ),
+                    });
+                    setNewKnownPlate("");
+                    setNewKnownPlateLabel("");
+                  }}
+                >
+                  <Plus size={11} />
+                  {isPt ? "Registrar Placa" : "Add Known Plate"}
+                </button>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              {Object.entries(lprCfg.known_plates || {}).map(([plateKey, vehicleLabel]) => (
+                <span
+                  key={plateKey}
+                  className="nvr-badge mono"
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                    fontFamily: "var(--font-mono)",
+                    fontSize: "var(--text-xs)",
+                    padding: "2px 7px",
+                  }}
+                >
+                  <strong>{plateKey}</strong>
+                  <span style={{ color: "var(--text-secondary)" }}>→ {vehicleLabel}</span>
+                  <button
+                    type="button"
+                    className="nvr-btn danger mono"
+                    style={{ height: 18, padding: "0 4px", fontSize: "var(--text-xs)" }}
+                    aria-label={`Remove known plate ${plateKey}`}
+                    onClick={() =>
+                      updateLpr({
+                        known_plates: removeKnownPlateEntry(lprCfg.known_plates, plateKey),
+                      })
+                    }
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              {Object.keys(lprCfg.known_plates || {}).length === 0 && (
+                <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                  {isPt
+                    ? "Nenhuma placa conhecida cadastrada. Adicione placas acima para preencher sub_label automaticamente."
+                    : "No known plates registered yet. Add plates above to automatically tag vehicle events with sub_label."}
                 </span>
               )}
             </div>

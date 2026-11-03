@@ -311,6 +311,9 @@ pub struct EventQueryParams {
     pub exclude_labels: Option<String>,
     pub zones: Option<String>,
     pub sub_labels: Option<String>,
+    pub plate: Option<String>,
+    pub recognized_license_plate: Option<String>,
+    pub recognized_license_plates: Option<String>,
     pub favorites: Option<i32>,
     pub min_score: Option<f64>,
     pub stationary: Option<i32>,
@@ -486,6 +489,10 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
             delete(api_delete_false_positive_signature),
         )
         .route("/events/{id}/sub_label", post(api_event_sub_label))
+        .route(
+            "/events/{id}/license_plate",
+            put(api_event_license_plate).post(api_event_license_plate),
+        )
         .route("/events/{id}/description", post(api_event_description))
         .route(
             "/events/{id}/notes",
@@ -555,7 +562,10 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/labels", get(api_labels))
         .route("/sub_labels", get(api_sub_labels))
         .route("/audio_labels", get(api_empty_array))
-        .route("/recognized_license_plates", get(api_empty_array))
+        .route(
+            "/recognized_license_plates",
+            get(api_recognized_license_plates),
+        )
         .route("/classification/attributes", get(api_empty_array))
         .route("/classification/custom", get(api_empty_object))
         .route("/genai/models", get(api_empty_array))
@@ -2543,6 +2553,11 @@ async fn api_mcp_handler(
                             .and_then(|v| v.as_str())
                             .map(|s| vec![s.to_string()]),
                         sub_labels: None,
+                        plate: args
+                            .get("plate")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        recognized_license_plates: None,
                         favorites: None,
                         min_score: args.get("min_score").and_then(|v| v.as_f64()),
                         stationary: None,
@@ -4013,12 +4028,20 @@ async fn api_events(
         allowed,
     );
     let labels = split_csv_opt(&q.labels).or_else(|| split_csv_opt(&q.label));
+    let recognized_license_plates = split_csv_opt(&q.recognized_license_plates)
+        .or_else(|| split_csv_opt(&q.recognized_license_plate))
+        .or_else(|| split_csv_opt(&q.plate));
     let filter = EventFilter {
         cameras,
         labels,
         exclude_labels: split_csv_opt(&q.exclude_labels),
         zones: split_csv_opt(&q.zones),
         sub_labels: split_csv_opt(&q.sub_labels),
+        plate: q
+            .plate
+            .clone()
+            .or_else(|| q.recognized_license_plate.clone()),
+        recognized_license_plates,
         favorites: q.favorites.map(|v| v != 0),
         min_score: q.min_score,
         stationary: q.stationary.map(|v| v != 0),
@@ -4703,6 +4726,93 @@ async fn api_sub_labels(State(state): State<AppState>) -> Json<Value> {
         set.insert(p.name);
     }
     Json(json!(set.into_iter().collect::<Vec<_>>()))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct LicensePlateBody {
+    #[serde(
+        default,
+        alias = "license_plate",
+        alias = "plate",
+        alias = "recognizedLicensePlate"
+    )]
+    pub recognized_license_plate: Option<String>,
+    #[serde(default, alias = "subLabel")]
+    pub sub_label: Option<String>,
+}
+
+async fn api_event_license_plate(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<LicensePlateBody>,
+) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && let Ok(Some(ev)) = state.db.get_event(&id)
+        && let Some(cam) = ev["camera"].as_str()
+        && !allowed.iter().any(|c| c == cam)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+
+    let normalized_plate = body
+        .recognized_license_plate
+        .as_deref()
+        .map(ninjanvr_infer::normalize_license_plate)
+        .filter(|s| !s.is_empty());
+
+    let updated = state
+        .db
+        .set_event_license_plate(&id, normalized_plate.as_deref())
+        .unwrap_or(0);
+
+    let resolved_sub_label =
+        if let Some(explicit_sub) = body.sub_label.as_ref().filter(|s| !s.trim().is_empty()) {
+            Some(explicit_sub.trim().to_string())
+        } else if let Some(ref norm_plate) = normalized_plate {
+            let cfg = state.config.read().await;
+            ninjanvr_infer::lookup_known_plate(norm_plate, &cfg.lpr.known_plates)
+        } else {
+            None
+        };
+
+    if updated > 0
+        && let Some(ref sl) = resolved_sub_label
+    {
+        let _ = state.db.set_event_sub_label(&id, Some(sl));
+    }
+
+    Json(json!({
+        "success": updated > 0,
+        "recognized_license_plate": normalized_plate,
+        "sub_label": resolved_sub_label
+    }))
+    .into_response()
+}
+
+async fn api_recognized_license_plates(State(state): State<AppState>) -> Json<Value> {
+    let mut plates = state
+        .db
+        .query_recognized_license_plates()
+        .unwrap_or_default();
+    {
+        let cfg = state.config.read().await;
+        for known in cfg.lpr.known_plates.keys() {
+            let norm = ninjanvr_infer::normalize_license_plate(known);
+            if !norm.is_empty() && !plates.contains(&norm) {
+                plates.push(norm);
+            }
+        }
+    }
+    plates.sort();
+    Json(Value::Array(
+        plates.into_iter().map(Value::String).collect(),
+    ))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -9301,6 +9411,73 @@ version: 0.18-0
             ev_updated["data"]["notes"],
             "Courier left parcel behind planter — verified by guard"
         );
+
+        // Configure known_plates and test PUT /api/events/{id}/license_plate,
+        // GET /api/recognized_license_plates, and GET /api/events?plate=ABC1D23
+        {
+            let mut cfg = state.config.write().await;
+            cfg.lpr.enabled = true;
+            cfg.lpr
+                .known_plates
+                .insert("ABC1D23".to_string(), "Family SUV".to_string());
+        }
+        let resp_lpr_put = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/events/ev_test_1/license_plate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"recognized_license_plate":"abc-1d23"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_lpr_put.status(), StatusCode::OK);
+        let lpr_put_json: Value =
+            serde_json::from_slice(&to_bytes(resp_lpr_put.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(lpr_put_json["success"], true);
+        assert_eq!(lpr_put_json["recognized_license_plate"], "ABC1D23");
+        assert_eq!(lpr_put_json["sub_label"], "Family SUV");
+
+        let resp_plates_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recognized_license_plates")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_plates_list.status(), StatusCode::OK);
+        let plates_list_json: Value =
+            serde_json::from_slice(&to_bytes(resp_plates_list.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(plates_list_json, json!(["ABC1D23"]));
+
+        let resp_ev_plate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events?plate=ABC1D23")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ev_plate.status(), StatusCode::OK);
+        let ev_plate_arr: Value =
+            serde_json::from_slice(&to_bytes(resp_ev_plate.into_body(), 16384).await.unwrap())
+                .unwrap();
+        assert_eq!(ev_plate_arr.as_array().unwrap().len(), 1);
+        assert_eq!(ev_plate_arr[0]["id"], "ev_test_1");
+        assert_eq!(
+            ev_plate_arr[0]["data"]["recognized_license_plate"],
+            "ABC1D23"
+        );
+        assert_eq!(ev_plate_arr[0]["sub_label"], "Family SUV");
 
         let resp_thumb = app
             .clone()

@@ -11,6 +11,13 @@ import {
   ReviewItem,
 } from "../types/nvr";
 import { WorkspaceTab, findMatchingExport, formatDateTime } from "../utils/format";
+import {
+  DEFAULT_LPR_FORMAT_REGEX,
+  formatLicensePlateBadge,
+  normalizeLicensePlate,
+  resolveKnownPlateLabel,
+  validateLicensePlateFormat,
+} from "../utils/configYaml";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import {
   normalizeFaceProfileName,
@@ -21,6 +28,28 @@ export function formatAiVerificationBadge(verdict: AiVerificationResult): string
   const pct = Math.round((verdict.confidence ?? 0) * 100);
   const status = verdict.is_true_positive ? "TRUE POSITIVE" : "FALSE POSITIVE";
   return `AI JUDGE: ${status} (${pct}%)`;
+}
+
+export {
+  DEFAULT_LPR_FORMAT_REGEX,
+  formatLicensePlateBadge,
+  normalizeLicensePlate,
+  resolveKnownPlateLabel,
+  validateLicensePlateFormat,
+};
+
+export function matchesLicensePlateFilter(
+  ev: Pick<EventItem, "sub_label" | "data">,
+  plateQuery: string
+): boolean {
+  const normQuery = normalizeLicensePlate(plateQuery);
+  if (!normQuery) return true;
+  const evPlate = normalizeLicensePlate(ev.data?.recognized_license_plate || "");
+  const evSub = normalizeLicensePlate(ev.sub_label || "");
+  return (
+    (evPlate.length > 0 && evPlate.includes(normQuery)) ||
+    (evSub.length > 0 && evSub.includes(normQuery))
+  );
 }
 
 export function formatEventLabelWithSubLabel(
@@ -232,6 +261,8 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   };
   const [faceNameDraft, setFaceNameDraft] = React.useState("");
   const [enrolledFaces, setEnrolledFaces] = React.useState<EnrolledFaceProfileItem[]>([]);
+  const [eventPlateDraft, setEventPlateDraft] = React.useState("");
+  const [plateFilter, setPlateFilter] = React.useState("");
 
   React.useEffect(() => {
     setEventNoteDraft(selectedEvent?.data?.notes || "");
@@ -240,7 +271,13 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         ? selectedEvent.sub_label
         : ""
     );
-  }, [selectedEvent?.id, selectedEvent?.data?.notes, selectedEvent?.sub_label]);
+    setEventPlateDraft(selectedEvent?.data?.recognized_license_plate || "");
+  }, [
+    selectedEvent?.id,
+    selectedEvent?.data?.notes,
+    selectedEvent?.sub_label,
+    selectedEvent?.data?.recognized_license_plate,
+  ]);
 
   React.useEffect(() => {
     fetch("/api/faces", { credentials: "include" })
@@ -307,6 +344,47 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         setEnrolledFaces(parseFacesApiResponse(d));
       }
       notify(`Enrolled '${cleanName}' face crop into gallery and assigned sub-label`);
+    }
+  };
+
+  const handleSaveEventLicensePlate = async () => {
+    if (!selectedEvent) return;
+    const normalized = normalizeLicensePlate(eventPlateDraft);
+    const res = await fetch(
+      `/api/events/${encodeURIComponent(selectedEvent.id)}/license_plate`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          recognized_license_plate: normalized || null,
+        }),
+      }
+    );
+    if (res.ok) {
+      const payload = await res.json().catch(() => ({}));
+      const nextPlate =
+        payload.recognized_license_plate !== undefined
+          ? payload.recognized_license_plate
+          : normalized || null;
+      const nextSubLabel =
+        payload.sub_label !== undefined
+          ? payload.sub_label
+          : selectedEvent.sub_label;
+      setSelectedEvent({
+        ...selectedEvent,
+        sub_label: nextSubLabel,
+        data: {
+          ...(selectedEvent.data || {}),
+          recognized_license_plate: nextPlate,
+        },
+      });
+      setEventPlateDraft(nextPlate || "");
+      notify(
+        nextPlate
+          ? `License plate set to ${nextPlate}`
+          : "Cleared recognized license plate"
+      );
     }
   };
 
@@ -423,9 +501,17 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       const isStat = Boolean(ev.stationary ?? ev.data?.provenance?.stationary);
       if (stationaryFilter === "moving" && isStat) return false;
       if (stationaryFilter === "stationary" && !isStat) return false;
+      if (!matchesLicensePlateFilter(ev, plateFilter)) return false;
       return true;
     });
-  }, [filteredEvents, excludeLabel, zoneFilter, minScoreFilter, stationaryFilter]);
+  }, [
+    filteredEvents,
+    excludeLabel,
+    zoneFilter,
+    minScoreFilter,
+    stationaryFilter,
+    plateFilter,
+  ]);
 
   const handleSaveExplorePreset = () => {
     const name =
@@ -460,6 +546,14 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
             placeholder={t.explore.searchPlaceholder}
             value={exploreQuery}
             onChange={(e) => setExploreQuery(e.target.value)}
+          />
+          <input
+            className="nvr-input mono"
+            style={{ width: 135, fontFamily: "var(--font-mono)" }}
+            aria-label="Filter events by license plate"
+            placeholder="Plate (ABC1D23)..."
+            value={plateFilter}
+            onChange={(e) => setPlateFilter(e.target.value.toUpperCase())}
           />
           <select
             className="nvr-select"
@@ -727,6 +821,21 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                           ? `${Math.max(1, Math.round(ev.end_time - ev.start_time))}s`
                           : t.explore.inProgress}
                       </span>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                        {ev.data?.recognized_license_plate && (
+                          <span
+                            className="nvr-badge mono"
+                            style={{
+                              height: 19,
+                              padding: "0 5px",
+                              fontFamily: "var(--font-mono)",
+                              fontSize: "var(--text-xs)",
+                              color: "var(--signal-accent-text)",
+                            }}
+                          >
+                            {ev.data.recognized_license_plate}
+                          </span>
+                        )}
                       {matchedExport && (
                         <button
                           className="nvr-badge live mono"
@@ -749,6 +858,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                           EXPORTED
                         </button>
                       )}
+                      </span>
                     </div>
                   </div>
                 </div>
@@ -824,6 +934,24 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                       {formatDetectedAttributePill(attr)}
                     </span>
                   ))}
+                  {selectedEvent.data?.recognized_license_plate && (
+                    <span
+                      className="nvr-badge mono"
+                      style={{
+                        fontFamily: "var(--font-mono)",
+                        fontSize: "var(--text-xs)",
+                        color: "var(--signal-accent-text)",
+                        fontWeight: 700,
+                      }}
+                    >
+                      PLATE:{" "}
+                      {formatLicensePlateBadge(
+                        selectedEvent.data.recognized_license_plate,
+                        null,
+                        selectedEvent.sub_label
+                      )}
+                    </span>
+                  )}
                   <span
                     className="mono"
                     title={selectedEvent.id}
@@ -1280,6 +1408,31 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   onClick={() => void handleEnrollFaceFromEvent()}
                 >
                   Enroll Face
+                </button>
+                <span className="nvr-divider" aria-hidden="true" />
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  LICENSE PLATE:
+                </span>
+                <input
+                  className="nvr-input mono"
+                  aria-label="Manual license plate override"
+                  style={{
+                    width: 120,
+                    height: 26,
+                    fontSize: "var(--text-xs)",
+                    fontFamily: "var(--font-mono)",
+                  }}
+                  placeholder="ABC1D23"
+                  value={eventPlateDraft}
+                  onChange={(e) => setEventPlateDraft(e.target.value.toUpperCase())}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  onClick={handleSaveEventLicensePlate}
+                >
+                  Save Plate
                 </button>
                 <span className="nvr-divider" aria-hidden="true" />
                 <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>

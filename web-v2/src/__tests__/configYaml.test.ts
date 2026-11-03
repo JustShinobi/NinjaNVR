@@ -2,7 +2,13 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, test } from "bun:test";
 import { NinjaConfigResponse } from "../types/nvr";
-import { buildCleanYamlFromDraft } from "../utils/configYaml";
+import {
+  buildCleanYamlFromDraft,
+  formatLicensePlateBadge,
+  normalizeLicensePlate,
+  resolveKnownPlateLabel,
+  validateLicensePlateFormat,
+} from "../utils/configYaml";
 import {
   applyEventSubLabelUpdate,
   applyReviewSubLabelUpdate,
@@ -10,6 +16,7 @@ import {
   formatDetectedAttributePill,
   formatEventLabelWithSubLabel,
   formatSubLabelBadge,
+  matchesLicensePlateFilter,
 } from "../views/ExploreWorkspace";
 import {
   TacticalPtzHudOverlay,
@@ -21,11 +28,13 @@ import {
   DEFAULT_ATTRIBUTE_LABELS,
   formatDhash64Hex,
   formatSignatureBbox,
+  removeKnownPlateEntry,
   STANDARD_LABELS,
   normalizeFaceProfileName,
   parseFacesApiResponse,
   toggleAttributeLabelList,
   toggleSubLabelRuleList,
+  upsertKnownPlateEntry,
 } from "../views/settings/VisionAndAiPanels";
 
 describe("buildCleanYamlFromDraft", () => {
@@ -842,5 +851,69 @@ cameras:
       "Bruno"
     );
     expect(updatedReviews[0].data.sub_labels).toEqual(["Bruno"]);
+  });
+
+  test("serializes lpr configuration with known_plates and validates Mercosul/legacy plates", () => {
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      lpr: {
+        enabled: true,
+        detector_model_path: "/config/models/lpr_det.onnx",
+        ocr_model_path: "/config/models/lpr_ocr.onnx",
+        min_confidence: 0.82,
+        format_regex: "^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$",
+        known_plates: {
+          ABC1D23: "Family SUV",
+          XYZ9876: "Delivery Van",
+        },
+      },
+      cameras: {},
+    };
+
+    const yamlText = buildCleanYamlFromDraft(draft, "");
+    expect(yamlText).toContain("lpr:");
+    expect(yamlText).toContain("detector_model_path: /config/models/lpr_det.onnx");
+    expect(yamlText).toContain("ocr_model_path: /config/models/lpr_ocr.onnx");
+    expect(yamlText).toContain("min_confidence: 0.82");
+    expect(yamlText).toContain("known_plates:");
+    expect(yamlText).toContain("ABC1D23: Family SUV");
+    expect(yamlText).toContain("XYZ9876: Delivery Van");
+
+    expect(normalizeLicensePlate("abc-1d23 ")).toBe("ABC1D23");
+    expect(validateLicensePlateFormat("ABC1D23")).toBe(true);
+    expect(validateLicensePlateFormat("ABC-1234")).toBe(true);
+    expect(validateLicensePlateFormat("12")).toBe(false);
+    expect(
+      validateLicensePlateFormat("ABC1234", "^[A-Z]{3}[0-9][A-Z][0-9]{2}$")
+    ).toBe(false);
+
+    let known = upsertKnownPlateEntry({}, "abc-1d23", "Family SUV");
+    expect(known).toEqual({ ABC1D23: "Family SUV" });
+    expect(resolveKnownPlateLabel("abc1d23", known)).toBe("Family SUV");
+    expect(formatLicensePlateBadge("abc-1d23", known)).toBe(
+      "ABC1D23 · FAMILY SUV"
+    );
+    known = removeKnownPlateEntry(known, "ABC1D23");
+    expect(known).toEqual({});
+
+    expect(
+      matchesLicensePlateFilter(
+        {
+          sub_label: "Family SUV",
+          data: { recognized_license_plate: "ABC1D23" },
+        },
+        "abc-1d"
+      )
+    ).toBe(true);
+    expect(
+      matchesLicensePlateFilter(
+        {
+          sub_label: null,
+          data: { recognized_license_plate: "ABC1D23" },
+        },
+        "XYZ9999"
+      )
+    ).toBe(false);
   });
 });

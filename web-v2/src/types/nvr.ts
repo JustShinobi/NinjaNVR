@@ -427,6 +427,15 @@ export interface AiVerificationResult {
   verified_at?: number;
 }
 
+export interface LprConfig {
+  enabled: boolean;
+  detector_model_path?: string | null;
+  ocr_model_path?: string | null;
+  min_confidence?: number;
+  format_regex?: string | null;
+  known_plates?: Record<string, string>;
+}
+
 export interface NinjaConfigResponse {
   version: string;
   safe_mode: boolean;
@@ -445,6 +454,7 @@ export interface NinjaConfigResponse {
   detect?: CameraDetectConfig;
   motion?: CameraMotionConfig;
   objects?: ObjectsConfig;
+  lpr?: LprConfig;
   record?: RecordConfig;
   snapshots?: SnapshotsConfig;
   review?: ReviewConfig;
@@ -604,6 +614,7 @@ export interface ReviewItem {
     notes?: string;
     provenance?: TriggerProvenance | null;
     detected_attributes?: DetectedAttribute[];
+    recognized_license_plates?: string[];
     metadata?: {
       potential_threat_level?: number;
     };
@@ -640,6 +651,8 @@ export interface EventItem {
     detected_attributes?: DetectedAttribute[];
     face_box?: [number, number, number, number] | null;
     license_plate_box?: [number, number, number, number] | null;
+    recognized_license_plate?: string | null;
+    recognized_license_plate_confidence?: number | null;
     box?: [number, number, number, number];
     dhash64?: number | null;
     ai_verification?: AiVerificationResult | null;

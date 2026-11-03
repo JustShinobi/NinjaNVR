@@ -11,7 +11,9 @@ import {
   applyReviewSubLabelUpdate,
   formatDetectedAttributePill,
   formatEventLabelWithSubLabel,
+  formatLicensePlateBadge,
   formatSubLabelBadge,
+  normalizeLicensePlate,
 } from "./ExploreWorkspace";
 import { normalizeFaceProfileName } from "./settings/VisionAndAiPanels";
 
@@ -79,15 +81,23 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [showForensic, setShowForensic] = React.useState(false);
   const [excludeObjectFilter, setExcludeObjectFilter] = React.useState("none");
   const [zoneFilter, setZoneFilter] = React.useState("all");
+  const [plateFilter, setPlateFilter] = React.useState("");
   const [presetName, setPresetName] = React.useState("");
   const [reviewNoteDraft, setReviewNoteDraft] = React.useState("");
   const [reviewFaceDraft, setReviewFaceDraft] = React.useState("");
+  const [reviewPlateDraft, setReviewPlateDraft] = React.useState("");
 
   React.useEffect(() => {
     setReviewNoteDraft(activeReview?.data?.notes || "");
     const firstSub = activeReview?.data?.sub_labels?.[0] || "";
     setReviewFaceDraft(firstSub && firstSub !== "unknown" ? firstSub : "");
-  }, [activeReview?.id, activeReview?.data?.notes, activeReview?.data?.sub_labels]);
+    setReviewPlateDraft(activeReview?.data?.recognized_license_plates?.[0] || "");
+  }, [
+    activeReview?.id,
+    activeReview?.data?.notes,
+    activeReview?.data?.sub_labels,
+    activeReview?.data?.recognized_license_plates,
+  ]);
 
   const handleAssignReviewFace = async () => {
     if (!activeReview) return;
@@ -128,6 +138,26 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
       );
       setActiveReview(updated);
     }
+  };
+
+  const handleSaveReviewLicensePlate = async () => {
+    if (!activeReview) return;
+    const norm = normalizeLicensePlate(reviewPlateDraft);
+    const primaryEventId = activeReview.data?.detections?.[0] || activeReview.id;
+    await fetch(`/api/events/${encodeURIComponent(primaryEventId)}/license_plate`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ recognized_license_plate: norm || null }),
+    }).catch(() => {});
+    setActiveReview({
+      ...activeReview,
+      data: {
+        ...activeReview.data,
+        recognized_license_plates: norm ? [norm] : [],
+      },
+    });
+    setReviewPlateDraft(norm);
   };
 
   const handleSaveReviewNote = async () => {
@@ -192,9 +222,18 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
       if (zoneFilter !== "all" && !(r.data?.zones || []).includes(zoneFilter)) {
         return false;
       }
+      const normPlateQuery = normalizeLicensePlate(plateFilter);
+      if (normPlateQuery) {
+        const plates = (r.data?.recognized_license_plates || []).map(normalizeLicensePlate);
+        const subs = (r.data?.sub_labels || []).map(normalizeLicensePlate);
+        const matched =
+          plates.some((p) => p.includes(normPlateQuery)) ||
+          subs.some((s) => s.includes(normPlateQuery));
+        if (!matched) return false;
+      }
       return true;
     });
-  }, [filteredReviews, excludeObjectFilter, zoneFilter]);
+  }, [filteredReviews, excludeObjectFilter, zoneFilter, plateFilter]);
 
   const handleSavePreset = () => {
     const label =
@@ -348,6 +387,14 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
               if (dateStr) setReviewStatusFilter("all");
             }}
             onClear={() => setReviewDateFilter("")}
+          />
+          <input
+            className="nvr-input mono"
+            style={{ width: 125, height: 26, fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)" }}
+            placeholder="Plate (ABC1D23)..."
+            aria-label="Filter review queue by license plate"
+            value={plateFilter}
+            onChange={(e) => setPlateFilter(e.target.value.toUpperCase())}
           />
           <input
             className="nvr-input mono"
@@ -585,6 +632,21 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                             </span>
                           );
                         })()}
+                        {(item.data?.recognized_license_plates || []).map((plate) => (
+                          <span
+                            key={plate}
+                            className="nvr-badge mono"
+                            style={{
+                              height: 20,
+                              padding: "0 5px",
+                              fontFamily: "var(--font-mono)",
+                              fontSize: "var(--text-xs)",
+                              color: "var(--signal-accent-text)",
+                            }}
+                          >
+                            {plate}
+                          </span>
+                        ))}
                         {((item.data?.audio && item.data.audio.length > 0) ||
                           (item.data?.objects || []).includes("audio")) && (
                           <span
@@ -718,6 +780,25 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                       }}
                     >
                       {formatDetectedAttributePill(attr)}
+                    </span>
+                  ))}
+                  {(activeReview.data?.recognized_license_plates || []).map((plate) => (
+                    <span
+                      key={plate}
+                      className="nvr-badge mono"
+                      style={{
+                        fontFamily: "var(--font-mono)",
+                        fontSize: "var(--text-xs)",
+                        color: "var(--signal-accent-text)",
+                        fontWeight: 700,
+                      }}
+                    >
+                      PLATE:{" "}
+                      {formatLicensePlateBadge(
+                        plate,
+                        null,
+                        activeReview.data?.sub_labels?.[0] ?? null
+                      )}
                     </span>
                   ))}
                   <span
@@ -1035,6 +1116,31 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   onClick={() => void handleEnrollReviewFace()}
                 >
                   Enroll Face
+                </button>
+                <span className="nvr-divider" aria-hidden="true" />
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  LICENSE PLATE:
+                </span>
+                <input
+                  className="nvr-input mono"
+                  aria-label="Manual review license plate override"
+                  style={{
+                    width: 120,
+                    height: 26,
+                    fontSize: "var(--text-xs)",
+                    fontFamily: "var(--font-mono)",
+                  }}
+                  placeholder="ABC1D23"
+                  value={reviewPlateDraft}
+                  onChange={(e) => setReviewPlateDraft(e.target.value.toUpperCase())}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  onClick={handleSaveReviewLicensePlate}
+                >
+                  Save Plate
                 </button>
                 <span className="nvr-divider" aria-hidden="true" />
                 <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
