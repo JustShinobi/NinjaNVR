@@ -1437,4 +1437,116 @@ cameras:
                 .any(|s| s.contains("driveway/state/gate") && s.contains("open"))
         );
     }
+
+    #[test]
+    fn log_buffer_hub_query_lines_handles_positive_slices_bounds_and_min_capacity() {
+        // Capacity 0 clamps to 1
+        let min_hub = LogBufferHub::with_capacity(0);
+        min_hub.push_raw("ninjanvr", "line-1".to_string());
+        min_hub.push_raw("ninjanvr", "line-2".to_string());
+        let (tot_min, lines_min) = min_hub.query_lines("ninjanvr", None, None);
+        assert_eq!(tot_min, 1);
+        assert_eq!(lines_min, vec!["line-2".to_string()]);
+
+        let hub = LogBufferHub::with_capacity(10);
+        for i in 0..5 {
+            hub.push_raw("ninjanvr", format!("entry-{i}"));
+        }
+
+        // Bounded positive slice [1, 4) -> entries 1, 2, 3
+        let (total, slice) = hub.query_lines("ninjanvr", Some(1), Some(4));
+        assert_eq!(total, 5);
+        assert_eq!(slice, vec!["entry-1", "entry-2", "entry-3"]);
+
+        // start >= end returns (total, empty)
+        let (total2, empty_slice) = hub.query_lines("ninjanvr", Some(4), Some(2));
+        assert_eq!(total2, 5);
+        assert!(empty_slice.is_empty());
+
+        // start > total returns (total, empty)
+        let (total3, over_slice) = hub.query_lines("ninjanvr", Some(99), None);
+        assert_eq!(total3, 5);
+        assert!(over_slice.is_empty());
+
+        // Known empty service and unknown service return (0, empty)
+        assert_eq!(hub.query_lines("go2rtc", None, None), (0, vec![]));
+        assert_eq!(
+            hub.query_lines("nonexistent", Some(0), Some(5)),
+            (0, vec![])
+        );
+    }
+
+    #[test]
+    fn activity_ledger_handles_missing_camera_disjoint_windows_and_negative_dbfs_peaks() {
+        let min_ledger = ActivityLedger::with_capacity(0);
+        min_ledger.record_sample_with_audio("cam1", 100.0, 10, 1, 1, -30);
+        min_ledger.record_sample_with_audio("cam1", 101.0, 20, 2, 1, -20);
+        assert_eq!(min_ledger.sample_count("cam1"), 1);
+
+        let ledger = ActivityLedger::new();
+        assert_eq!(ledger.sample_count("unknown_cam"), 0);
+        assert!(ledger.samples("unknown_cam").is_empty());
+        assert_eq!(
+            ledger.aggregate_range_with_audio("unknown_cam", 0.0, 100.0),
+            (0, 0, 0, 0)
+        );
+
+        ledger.record_sample_with_audio("porch", 1_000.0, 120, 1, 1, -48);
+        ledger.record_sample_with_audio("porch", 1_005.0, 200, 2, 2, -14);
+        ledger.record_sample_with_audio("porch", 1_008.0, 0, 1, 1, -32);
+
+        // Disjoint time window returns all zeros
+        assert_eq!(
+            ledger.aggregate_range_with_audio("porch", 500.0, 600.0),
+            (0, 0, 0, 0)
+        );
+
+        // Overlapping window selects the loudest (least negative: -14 dBFS) peak
+        let (motion, objects, regions, peak_dbfs) =
+            ledger.aggregate_range_with_audio("porch", 1_000.0, 1_010.0);
+        assert_eq!(motion, 320);
+        assert_eq!(objects, 4);
+        assert_eq!(regions, 4);
+        assert_eq!(peak_dbfs, -14);
+    }
+
+    #[test]
+    fn apply_set_command_ignores_malformed_topics_and_maps_feature_aliases() {
+        let yaml = r#"
+cameras:
+  porch:
+    enabled: true
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let hub = CommsHub::new();
+        hub.init_from_config(&cfg);
+
+        let before = hub.get_camera_flags("porch");
+        assert!(before.enabled);
+        assert!(before.detect);
+        assert!(before.record);
+        assert!(before.alerts);
+        assert!(before.snapshots);
+
+        // Non-/set topics and wrong path depth are ignored
+        hub.apply_set_command("porch/detect/state", "OFF");
+        hub.apply_set_command("a/b/c/set", "OFF");
+        assert!(hub.get_camera_flags("porch").detect);
+
+        // Feature aliases: recordings -> record, review_alerts -> alerts, snapshots, enabled, profile/set
+        hub.apply_set_command("porch/recordings/set", "OFF");
+        hub.apply_set_command("porch/review_alerts/set", "false");
+        hub.apply_set_command("porch/snapshots/set", "OFF");
+        hub.apply_set_command("porch/enabled/set", "OFF");
+        hub.apply_set_command("profile/set", "night_perimeter");
+
+        let after = hub.get_camera_flags("porch");
+        assert!(!after.enabled);
+        assert!(!after.record);
+        assert!(!after.alerts);
+        assert!(!after.snapshots);
+        assert_eq!(hub.get_active_profile(), "night_perimeter");
+
+        assert!(hub.get_camera_roi_states("unknown_camera").is_empty());
+    }
 }

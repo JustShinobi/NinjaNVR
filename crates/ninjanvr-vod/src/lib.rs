@@ -128,8 +128,9 @@ pub fn build_media_playlist_with_resolutions(
             (Some(pr), Some(cr)) => pr != cr,
             _ => false,
         };
-        let tier_switched = match prev_rate {
-            Some(pr) if pr > 0.001 && cur_rate > 0.001 => {
+        let tier_switched = match (prev_res, cur_res, prev_rate) {
+            (Some(pr_res), Some(cr_res), _) if pr_res == cr_res => false,
+            (_, _, Some(pr)) if pr > 0.001 && cur_rate > 0.001 => {
                 (cur_rate / pr) > 3.2 || (pr / cur_rate) > 3.2
             }
             _ => false,
@@ -1321,5 +1322,144 @@ mod tests {
         assert_eq!(m4s_mdat, expected_mdat.as_slice());
 
         let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn format_program_date_time_utc_handles_epoch_leap_year_and_ms_rollover() {
+        assert_eq!(
+            format_program_date_time_utc(0.0),
+            "1970-01-01T00:00:00.000Z"
+        );
+        // Negative timestamp clamps to 0.0
+        assert_eq!(
+            format_program_date_time_utc(-50.0),
+            "1970-01-01T00:00:00.000Z"
+        );
+        // 2024 leap year Feb 29 23:59:59.500 UTC (1709251199.5)
+        assert_eq!(
+            format_program_date_time_utc(1_709_251_199.5),
+            "2024-02-29T23:59:59.500Z"
+        );
+        // Sub-millisecond rounding rollover (.9999 -> next second .000)
+        assert_eq!(
+            format_program_date_time_utc(1709251199.9999),
+            "2024-03-01T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn iter_boxes_parses_size64_eof_boxes_and_stops_on_truncated_headers() {
+        // 1. 64-bit extended box (size32 == 1, 16-byte header, total size 20 -> 4-byte payload)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(b"mdat");
+        buf.extend_from_slice(&20u64.to_be_bytes());
+        buf.extend_from_slice(b"ABCD");
+
+        // 2. Box extending to EOF (size32 == 0, 8-byte header -> remaining 3 bytes)
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(b"free");
+        buf.extend_from_slice(b"XYZ");
+
+        let boxes = iter_boxes(&buf);
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(&boxes[0].box_type, b"mdat");
+        assert_eq!(boxes[0].payload, b"ABCD");
+        assert_eq!(&boxes[1].box_type, b"free");
+        assert_eq!(boxes[1].payload, b"XYZ");
+
+        // 3. Invalid header with size32 < 8 (e.g. 4) or truncated size64 stops cleanly without panic
+        let mut malformed = Vec::new();
+        malformed.extend_from_slice(&4u32.to_be_bytes());
+        malformed.extend_from_slice(b"bad!");
+        assert!(iter_boxes(&malformed).is_empty());
+
+        let mut truncated_64 = Vec::new();
+        truncated_64.extend_from_slice(&1u32.to_be_bytes());
+        truncated_64.extend_from_slice(b"mdat");
+        truncated_64.extend_from_slice(&[0u8; 4]); // fewer than 16 bytes
+        assert!(iter_boxes(&truncated_64).is_empty());
+    }
+
+    #[test]
+    fn build_media_playlist_handles_empty_segments_and_time_gap_without_map_duplication() {
+        let empty_m3u8 = build_media_playlist_with_resolutions(&[], None).unwrap();
+        assert!(empty_m3u8.contains("#EXT-X-TARGETDURATION:10"));
+        assert!(empty_m3u8.contains("#EXT-X-MAP:URI=\"init-v1-a1.mp4\""));
+        assert!(empty_m3u8.contains("#EXT-X-ENDLIST"));
+        assert!(!empty_m3u8.contains("#EXT-X-DISCONTINUITY"));
+
+        // Two segments with identical resolution and bitrate but a 10s time gap
+        let segs = vec![
+            RecordingRow {
+                id: "s1".to_string(),
+                camera: "cam".to_string(),
+                path: "/1.mp4".to_string(),
+                start_time: 100.0,
+                end_time: 110.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 2.0,
+                regions: 0,
+                motion_heatmap: None,
+            },
+            RecordingRow {
+                id: "s2".to_string(),
+                camera: "cam".to_string(),
+                path: "/2.mp4".to_string(),
+                start_time: 120.0,
+                end_time: 130.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 2.0,
+                regions: 0,
+                motion_heatmap: None,
+            },
+        ];
+        let res = [(1920, 1080), (1920, 1080)];
+        let m3u8 = build_media_playlist_with_resolutions(&segs, Some(&res)).unwrap();
+        assert_eq!(m3u8.matches("#EXT-X-DISCONTINUITY").count(), 1);
+        // Only the initial #EXT-X-MAP should be present since neither resolution nor tier changed
+        assert_eq!(m3u8.matches("#EXT-X-MAP:").count(), 1);
+
+        // Contiguous segments with identical known resolution (1920x1080) but a >3.2x VBR bitrate spike
+        // must NOT emit a false tier_switched discontinuity
+        let vbr_segs = vec![
+            RecordingRow {
+                id: "v1".to_string(),
+                camera: "cam".to_string(),
+                path: "/v1.mp4".to_string(),
+                start_time: 200.0,
+                end_time: 210.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 1.0,
+                regions: 0,
+                motion_heatmap: None,
+            },
+            RecordingRow {
+                id: "v2".to_string(),
+                camera: "cam".to_string(),
+                path: "/v2.mp4".to_string(),
+                start_time: 210.0,
+                end_time: 220.0,
+                duration: 10.0,
+                motion: 500,
+                objects: 1,
+                dbfs: 0,
+                segment_size: 5.0,
+                regions: 1,
+                motion_heatmap: None,
+            },
+        ];
+        let vbr_m3u8 = build_media_playlist_with_resolutions(&vbr_segs, Some(&res)).unwrap();
+        assert_eq!(vbr_m3u8.matches("#EXT-X-DISCONTINUITY").count(), 0);
+        assert_eq!(vbr_m3u8.matches("#EXT-X-MAP:").count(), 1);
     }
 }

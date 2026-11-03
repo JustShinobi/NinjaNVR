@@ -400,7 +400,7 @@ pub fn check_acoustic_event_trigger(dbfs: i64, cfg: &AudioConfig) -> Option<Stri
 }
 
 fn decode_audio_dbfs_via_ffmpeg(path: &Path) -> i64 {
-    let output = std::process::Command::new("ffmpeg")
+    let output = std::process::Command::new(resolve_ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
         .arg(path)
         .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"])
@@ -2287,20 +2287,29 @@ pub fn build_mp4_export_ffmpeg_args_with_privacy(
 /// `drawbox` video filter expression (`drawbox=x=iw*0.2:y=ih*0.2:w=iw*0.6:h=ih*0.6:color=black@1.0:t=fill`)
 /// for redacting privacy regions during MP4 export transcoding.
 pub fn build_privacy_drawbox_filter(privacy_mask: &serde_json::Value) -> Option<String> {
-    let mut polys: Vec<String> = Vec::new();
-    match privacy_mask {
-        serde_json::Value::String(s) if !s.is_empty() => polys.push(s.clone()),
-        serde_json::Value::Array(arr) => {
-            for v in arr {
-                if let Some(s) = v.as_str()
-                    && !s.is_empty()
-                {
-                    polys.push(s.to_string());
+    fn collect_polygon_strings(val: &serde_json::Value, out: &mut Vec<String>) {
+        match val {
+            serde_json::Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    collect_polygon_strings(item, out);
                 }
             }
+            serde_json::Value::Object(map) => {
+                if let Some(coords) = map.get("coordinates").or_else(|| map.get("points")) {
+                    collect_polygon_strings(coords, out);
+                } else {
+                    for (_, nested) in map {
+                        collect_polygon_strings(nested, out);
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
+
+    let mut polys: Vec<String> = Vec::new();
+    collect_polygon_strings(privacy_mask, &mut polys);
     let mut filters = Vec::new();
     for poly in polys {
         let nums: Vec<f32> = poly
@@ -2321,7 +2330,7 @@ pub fn build_privacy_drawbox_filter(privacy_mask: &serde_json::Value) -> Option<
             y_max = y_max.max(py);
         }
         if x_max > x_min && y_max > y_min {
-            if x_max <= 1.0 && y_max <= 1.0 {
+            if x_min >= 0.0 && y_min >= 0.0 && x_max <= 1.0 && y_max <= 1.0 {
                 filters.push(format!(
                     "drawbox=x=iw*{x_min:.3}:y=ih*{y_min:.3}:w=iw*{:.3}:h=ih*{:.3}:color=#0c0e12@1.0:t=fill",
                     x_max - x_min,
@@ -3279,5 +3288,122 @@ mod tests {
         assert_eq!(recs[0].duration, 10.0);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_cold_compaction_ffmpeg_args_supports_software_vaapi_qsv_nvenc_and_clamps_crf() {
+        let src = Path::new("/media/hot/seg.mp4");
+        let dst = Path::new("/media/cold/seg.mp4");
+
+        // 1. Software fallback ("none") with H.264, unknown preset fallback -> "veryfast", CRF < 18 clamped to "18"
+        let sw_h264 =
+            build_cold_compaction_ffmpeg_args(src, dst, "h264", "bogus_preset", "none", 5);
+        assert!(sw_h264.windows(2).any(|w| w == ["-c:v", "libx264"]));
+        assert!(sw_h264.windows(2).any(|w| w == ["-preset", "veryfast"]));
+        assert!(sw_h264.windows(2).any(|w| w == ["-crf", "18"]));
+        assert!(!sw_h264.iter().any(|a| a == "hvc1"));
+
+        // 2. VAAPI with HEVC and CRF > 36 clamped to "36"
+        let vaapi_hevc = build_cold_compaction_ffmpeg_args(src, dst, "hevc", "fast", "vaapi", 99);
+        assert!(vaapi_hevc.windows(2).any(|w| w == ["-hwaccel", "vaapi"]));
+        assert!(vaapi_hevc.windows(2).any(|w| w == ["-c:v", "hevc_vaapi"]));
+        assert!(vaapi_hevc.windows(2).any(|w| w == ["-qp", "36"]));
+        assert!(vaapi_hevc.windows(2).any(|w| w == ["-tag:v", "hvc1"]));
+
+        // 3. QSV with H.265
+        let qsv_hevc = build_cold_compaction_ffmpeg_args(src, dst, "h265", "medium", "QSV", 28);
+        assert!(qsv_hevc.windows(2).any(|w| w == ["-hwaccel", "qsv"]));
+        assert!(qsv_hevc.windows(2).any(|w| w == ["-c:v", "hevc_qsv"]));
+        assert!(qsv_hevc.windows(2).any(|w| w == ["-preset", "medium"]));
+        assert!(qsv_hevc.windows(2).any(|w| w == ["-global_quality", "28"]));
+        assert!(qsv_hevc.windows(2).any(|w| w == ["-tag:v", "hvc1"]));
+
+        // 4. NVENC preset mapping (ultrafast->p1, veryfast->p2, fast->p3, medium->p4, slow->p5)
+        for (preset_in, expected_nv) in [
+            ("ultrafast", "p1"),
+            ("veryfast", "p2"),
+            ("fast", "p3"),
+            ("medium", "p4"),
+            ("slow", "p5"),
+        ] {
+            let nv_args =
+                build_cold_compaction_ffmpeg_args(src, dst, "h264", preset_in, "nvenc", 26);
+            assert!(nv_args.windows(2).any(|w| w == ["-hwaccel", "cuda"]));
+            assert!(nv_args.windows(2).any(|w| w == ["-c:v", "h264_nvenc"]));
+            assert!(nv_args.windows(2).any(|w| w == ["-preset", expected_nv]));
+            assert!(nv_args.windows(2).any(|w| w == ["-cq", "26"]));
+        }
+    }
+
+    #[test]
+    fn yuv_frame_y_plane_and_parse_recording_segment_path_handle_edge_cases() {
+        // YuvFrame::y_plane normal and truncated buffer clamping
+        let full_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            width: 4,
+            height: 4,
+            data: Arc::new(vec![42u8; 24]),
+            timestamp: 1.0,
+        };
+        assert_eq!(full_frame.y_plane().len(), 16);
+
+        let truncated_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            width: 100,
+            height: 100,
+            data: Arc::new(vec![7u8; 10]),
+            timestamp: 1.0,
+        };
+        assert_eq!(truncated_frame.y_plane().len(), 10);
+
+        // CameraActivityRing record_enabled toggle and 3-tuple aggregate_range wrapper
+        let mut ring = CameraActivityRing::default();
+        assert!(ring.is_record_enabled());
+        ring.set_record_enabled(false);
+        assert!(!ring.is_record_enabled());
+        ring.set_record_enabled(true);
+        ring.record_sample(500.0, 120, 2, 1);
+        assert_eq!(ring.aggregate_range(495.0, 505.0), (120, 2, 1));
+
+        // parse_recording_segment_path collision suffix and invalid path rejection
+        let collided = Path::new("/media/recordings/2026-11-02/14/front_door/05.10-a1b2.mp4");
+        let (cam, ts) =
+            parse_recording_segment_path(collided).expect("collision suffix should parse");
+        assert_eq!(cam, "front_door");
+        assert!(ts > 0.0);
+
+        assert!(
+            parse_recording_segment_path(Path::new(
+                "/media/recordings/2026-11-02/14/.staging/05.10.mp4"
+            ))
+            .is_none()
+        );
+        assert!(
+            parse_recording_segment_path(Path::new(
+                "/media/recordings/2026-11-02/14/front_door/60.10.mp4"
+            ))
+            .is_none()
+        );
+        assert!(
+            parse_recording_segment_path(Path::new(
+                "/media/recordings/2026-11-02/14/front_door/05.60.mp4"
+            ))
+            .is_none()
+        );
+
+        // build_privacy_drawbox_filter supports object and nested-object privacy_mask configs
+        let obj_mask = serde_json::json!({
+            "mode": "pixelate",
+            "coordinates": "0.1,0.2,0.5,0.2,0.5,0.6,0.1,0.6"
+        });
+        let f_obj = build_privacy_drawbox_filter(&obj_mask).expect("object mask filter");
+        assert!(f_obj.contains("drawbox=x=iw*0.100:y=ih*0.200:w=iw*0.400:h=ih*0.400"));
+
+        let nested_mask = serde_json::json!({
+            "neighbor_window": { "coordinates": "0.2,0.1,0.4,0.1,0.4,0.3,0.2,0.3" }
+        });
+        let f_nested =
+            build_privacy_drawbox_filter(&nested_mask).expect("nested object mask filter");
+        assert!(f_nested.contains("drawbox=x=iw*0.200:y=ih*0.100:w=iw*0.200:h=ih*0.200"));
     }
 }
