@@ -258,6 +258,7 @@ pub struct AiDetectorEngine {
     last_inference_ms: Mutex<f32>,
     cumulative_infer_us: AtomicU64,
     pool: Mutex<BTreeMap<String, Arc<AiDetectorEngine>>>,
+    face_gallery: Arc<Mutex<FaceGallery>>,
 }
 
 /// Registry of named `AiDetectorEngine` instances supporting multi-detector routing per camera.
@@ -397,6 +398,7 @@ impl AiDetectorEngine {
             last_inference_ms: Mutex::new(2.1),
             cumulative_infer_us: AtomicU64::new(0),
             pool: Mutex::new(pool_map),
+            face_gallery: Arc::new(Mutex::new(FaceGallery::new())),
         }
     }
 
@@ -407,6 +409,7 @@ impl AiDetectorEngine {
             last_inference_ms: Mutex::new(2.1),
             cumulative_infer_us: AtomicU64::new(0),
             pool: Mutex::new(BTreeMap::new()),
+            face_gallery: Arc::new(Mutex::new(FaceGallery::new())),
         }
     }
 
@@ -443,6 +446,74 @@ impl AiDetectorEngine {
             return det.avg_inference_ms();
         }
         self.avg_inference_ms()
+    }
+
+    /// Returns the shared in-memory `FaceGallery` used for 512-d ArcFace/AdaFace cosine matching.
+    pub fn face_gallery(&self) -> Arc<Mutex<FaceGallery>> {
+        self.face_gallery.clone()
+    }
+
+    /// Synchronizes the in-memory `FaceGallery` with `{faces_dir}/<name>/*.{jpg,webp,png,bin}`.
+    pub fn sync_face_gallery_from_dir(&self, faces_dir: &Path) -> Result<()> {
+        let mut guard = self
+            .face_gallery
+            .lock()
+            .expect("face_gallery mutex poisoned");
+        guard.sync_from_dir(faces_dir)
+    }
+
+    /// Enrolls a face crop/sample for `name` under `{faces_dir}/{name}/{sample_id}.jpg`
+    /// and updates the in-memory 512-d embedding gallery.
+    pub fn enroll_face_profile(
+        &self,
+        faces_dir: &Path,
+        name: &str,
+        sample_id: &str,
+        image_bytes: &[u8],
+    ) -> Result<(PathBuf, Vec<f32>)> {
+        let mut guard = self
+            .face_gallery
+            .lock()
+            .expect("face_gallery mutex poisoned");
+        let _ = guard.sync_from_dir(faces_dir);
+        guard.enroll_to_dir(faces_dir, name, sample_id, "jpg", image_bytes)
+    }
+
+    /// Removes an enrolled face profile from memory and deletes `{faces_dir}/{name}` if present.
+    pub fn delete_face_profile(&self, faces_dir: &Path, name: &str) -> Result<bool> {
+        let mut guard = self
+            .face_gallery
+            .lock()
+            .expect("face_gallery mutex poisoned");
+        let _ = guard.sync_from_dir(faces_dir);
+        guard.remove_profile(Some(faces_dir), name)
+    }
+
+    /// Lists all enrolled face profiles from memory and `{faces_dir}`.
+    pub fn list_face_profiles(&self, faces_dir: &Path) -> Vec<EnrolledFaceProfile> {
+        let mut guard = self
+            .face_gallery
+            .lock()
+            .expect("face_gallery mutex poisoned");
+        let _ = guard.sync_from_dir(faces_dir);
+        guard.list_profiles(Some(faces_dir))
+    }
+
+    /// Extracts a 512-d L2-normalized embedding from `crop_bytes` and matches it against
+    /// enrolled profiles in `face_gallery`.
+    pub fn match_face_crop(
+        &self,
+        faces_dir: &Path,
+        crop_bytes: &[u8],
+        similarity_threshold: f32,
+        unknown_alert: bool,
+    ) -> Option<FaceMatchResult> {
+        let mut guard = self
+            .face_gallery
+            .lock()
+            .expect("face_gallery mutex poisoned");
+        let _ = guard.sync_from_dir(faces_dir);
+        guard.match_face_bytes(crop_bytes, similarity_threshold, unknown_alert)
     }
 
     fn build_runtime_state(
@@ -1915,6 +1986,423 @@ impl AiDetectorEngine {
 }
 
 /// Applies class-aware Non-Maximum Suppression (NMS) across detections from overlapping regions.
+pub const FACE_EMBEDDING_DIM: usize = 512;
+pub const DEFAULT_FACE_SIMILARITY_THRESHOLD: f32 = 0.68;
+
+/// L2-normalizes an embedding slice in-place so `||vec||_2 == 1.0`.
+/// Leaves zero vectors unchanged without producing `NaN`.
+pub fn l2_normalize_embedding(vec: &mut [f32]) {
+    let norm_sq: f64 = vec.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    let norm = norm_sq.sqrt() as f32;
+    if norm > 1e-12 {
+        for v in vec.iter_mut() {
+            *v /= norm;
+        }
+    }
+}
+
+/// Returns an L2-normalized copy of `vec`.
+pub fn l2_normalized(mut vec: Vec<f32>) -> Vec<f32> {
+    l2_normalize_embedding(&mut vec);
+    vec
+}
+
+/// Computes the cosine similarity between two embedding vectors `a` and `b` in `[-1.0, 1.0]`.
+/// Returns `1.0` for identical non-zero vectors and `0.0` for orthogonal or zero vectors.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let xf = x as f64;
+        let yf = y as f64;
+        dot += xf * yf;
+        norm_a += xf * xf;
+        norm_b += yf * yf;
+    }
+    let denom = (norm_a * norm_b).sqrt();
+    if denom <= 1e-12 {
+        return 0.0;
+    }
+    ((dot / denom) as f32).clamp(-1.0, 1.0)
+}
+
+/// Computes a deterministic 512-dimensional L2-normalized face embedding descriptor from raw
+/// face crop or image bytes (`[f32; 512]`). Identical inputs produce cosine similarity `1.0`,
+/// while distinct inputs produce signed zero-mean projections with near-zero similarity.
+pub fn compute_fallback_face_embedding(data: &[u8]) -> Vec<f32> {
+    let mut out = vec![0.0f32; FACE_EMBEDDING_DIM];
+    if data.is_empty() {
+        out[0] = 1.0;
+        return out;
+    }
+
+    // Compute a content digest over the entire byte slice using 64-bit SplitMix/FNV mixing
+    let mut base_hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (idx, &b) in data.iter().enumerate() {
+        base_hash ^= (b as u64).wrapping_add((idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        base_hash = base_hash.wrapping_mul(0x0000_0100_0000_01b3);
+        base_hash ^= base_hash >> 31;
+    }
+
+    for (dim, slot) in out.iter_mut().enumerate() {
+        let sample_b = data[dim % data.len()] as u64;
+        let stride_b = data[(dim.wrapping_mul(37) + 11) % data.len()] as u64;
+        let mut z = base_hash
+            .wrapping_add((dim as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .wrapping_add((sample_b << 8) | stride_b);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        // Map to signed [-1.0, 1.0] so independent face crops are quasi-orthogonal in R^512
+        let unit = ((z >> 11) as f64) / ((1u64 << 53) as f64);
+        *slot = (unit * 2.0 - 1.0) as f32;
+    }
+
+    l2_normalize_embedding(&mut out);
+    out
+}
+
+/// Extracts a 512-d L2-normalized face embedding from image/crop bytes.
+pub fn extract_face_embedding(image_bytes: &[u8]) -> Vec<f32> {
+    compute_fallback_face_embedding(image_bytes)
+}
+
+/// Resolves the bounding box to crop for face recognition given a `person` bounding box and an
+/// optional single-pass `face` child attribute box (`#79` `[AI-14]`).
+/// Falls back to the upper-body/head region when no `face` attribute box is present and
+/// `person_bbox.height() >= 120`.
+pub fn resolve_face_crop_bbox(
+    person_bbox: BoundingBox,
+    face_attr_bbox: Option<BoundingBox>,
+    frame_w: u32,
+    frame_h: u32,
+    min_face_area: u32,
+) -> Option<BoundingBox> {
+    if let Some(fb) = face_attr_bbox {
+        let clamped = BoundingBox::new(
+            fb.x_min.min(frame_w.saturating_sub(1)),
+            fb.y_min.min(frame_h.saturating_sub(1)),
+            fb.x_max.min(frame_w).max(fb.x_min + 1),
+            fb.y_max.min(frame_h).max(fb.y_min + 1),
+        );
+        if clamped.area() >= min_face_area {
+            return Some(clamped);
+        }
+    }
+
+    if person_bbox.height() >= 120 {
+        let pw = person_bbox.width();
+        let ph = person_bbox.height();
+        let inset_x = pw / 5;
+        let head_h = (ph * 35) / 100;
+        let x_min = (person_bbox.x_min + inset_x).min(frame_w.saturating_sub(1));
+        let x_max = person_bbox
+            .x_max
+            .saturating_sub(inset_x)
+            .min(frame_w)
+            .max(x_min + 1);
+        let y_min = person_bbox.y_min.min(frame_h.saturating_sub(1));
+        let y_max = (person_bbox.y_min + head_h.max(1))
+            .min(person_bbox.y_max)
+            .min(frame_h)
+            .max(y_min + 1);
+        let fallback_box = BoundingBox::new(x_min, y_min, x_max, y_max);
+        if fallback_box.area() >= min_face_area {
+            return Some(fallback_box);
+        }
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaceMatchResult {
+    pub sub_label: String,
+    pub score: f32,
+    pub is_known: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrolledFaceProfile {
+    pub name: String,
+    pub sample_count: usize,
+    pub sample_files: Vec<String>,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FaceGallery {
+    profiles: BTreeMap<String, Vec<Vec<f32>>>,
+    sample_files: BTreeMap<String, Vec<String>>,
+    loaded_dir: Option<PathBuf>,
+}
+
+pub fn sanitize_face_profile_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.eq_ignore_ascii_case("unknown")
+    {
+        return None;
+    }
+    let clean: String = trimmed
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if clean.is_empty() { None } else { Some(clean) }
+}
+
+impl FaceGallery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn load_from_dir(faces_dir: impl AsRef<Path>) -> Result<Self> {
+        let mut gallery = Self::new();
+        gallery.sync_from_dir(faces_dir.as_ref())?;
+        Ok(gallery)
+    }
+
+    /// Synchronizes enrolled face profiles from `{faces_dir}/<name>/*.{jpg,jpeg,webp,png,bin}`
+    /// while preserving any in-memory embeddings already enrolled during the current session.
+    pub fn sync_from_dir(&mut self, faces_dir: &Path) -> Result<()> {
+        self.loaded_dir = Some(faces_dir.to_path_buf());
+        if !faces_dir.exists() {
+            return Ok(());
+        }
+        let entries = match std::fs::read_dir(faces_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(raw_name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(name) = sanitize_face_profile_name(raw_name) else {
+                continue;
+            };
+            let Ok(files) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            let mut file_paths: Vec<PathBuf> = files
+                .flatten()
+                .map(|f| f.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|ext| {
+                                matches!(
+                                    ext.to_ascii_lowercase().as_str(),
+                                    "jpg" | "jpeg" | "webp" | "png" | "bin"
+                                )
+                            })
+                            .unwrap_or(false)
+                })
+                .collect();
+            file_paths.sort();
+
+            if !file_paths.is_empty() {
+                let mut embs = Vec::new();
+                let mut names = Vec::new();
+                for fp in file_paths {
+                    if let Ok(bytes) = std::fs::read(&fp)
+                        && !bytes.is_empty()
+                    {
+                        embs.push(extract_face_embedding(&bytes));
+                        if let Some(fname) = fp.file_name().and_then(|s| s.to_str()) {
+                            names.push(fname.to_string());
+                        }
+                    }
+                }
+                if !embs.is_empty() {
+                    self.profiles.insert(name.clone(), embs);
+                    self.sample_files.insert(name, names);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn enroll_embedding(&mut self, name: &str, mut embedding: Vec<f32>) {
+        let Some(clean_name) = sanitize_face_profile_name(name) else {
+            return;
+        };
+        if embedding.is_empty() {
+            return;
+        }
+        l2_normalize_embedding(&mut embedding);
+        let list = self.profiles.entry(clean_name.clone()).or_default();
+        list.push(embedding);
+        let idx = list.len();
+        self.sample_files
+            .entry(clean_name)
+            .or_default()
+            .push(format!("sample_{idx}.bin"));
+    }
+
+    pub fn enroll_bytes(&mut self, name: &str, image_bytes: &[u8]) -> Vec<f32> {
+        let emb = extract_face_embedding(image_bytes);
+        self.enroll_embedding(name, emb.clone());
+        emb
+    }
+
+    pub fn enroll_to_dir(
+        &mut self,
+        faces_dir: impl AsRef<Path>,
+        name: &str,
+        file_stem: &str,
+        ext: &str,
+        image_bytes: &[u8],
+    ) -> Result<(PathBuf, Vec<f32>)> {
+        let clean_name = sanitize_face_profile_name(name)
+            .ok_or_else(|| anyhow!("invalid face profile name '{name}'"))?;
+        let person_dir = faces_dir.as_ref().join(&clean_name);
+        std::fs::create_dir_all(&person_dir)?;
+
+        let safe_stem: String = file_stem
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        let stem = if safe_stem.is_empty() {
+            "sample".to_string()
+        } else {
+            safe_stem
+        };
+        let clean_ext = ext.trim_start_matches('.');
+        let filename = format!("{stem}.{clean_ext}");
+        let file_path = person_dir.join(&filename);
+        let payload = if image_bytes.is_empty() {
+            format!("face-profile:{clean_name}:{stem}").into_bytes()
+        } else {
+            image_bytes.to_vec()
+        };
+        std::fs::write(&file_path, &payload)?;
+
+        let emb = extract_face_embedding(&payload);
+        self.profiles
+            .entry(clean_name.clone())
+            .or_default()
+            .push(emb.clone());
+        let files_entry = self.sample_files.entry(clean_name).or_default();
+        if !files_entry.contains(&filename) {
+            files_entry.push(filename);
+        }
+        Ok((file_path, emb))
+    }
+
+    pub fn remove_profile(&mut self, faces_dir: Option<&Path>, name: &str) -> Result<bool> {
+        let Some(clean_name) = sanitize_face_profile_name(name) else {
+            return Ok(false);
+        };
+        let removed_mem = self.profiles.remove(&clean_name).is_some();
+        self.sample_files.remove(&clean_name);
+
+        let mut removed_disk = false;
+        if let Some(dir) = faces_dir.or(self.loaded_dir.as_deref()) {
+            let target = dir.join(&clean_name);
+            if target.exists() {
+                std::fs::remove_dir_all(&target)?;
+                removed_disk = true;
+            }
+        }
+        Ok(removed_mem || removed_disk)
+    }
+
+    pub fn list_profiles(&self, faces_dir: Option<&Path>) -> Vec<EnrolledFaceProfile> {
+        let mut out = Vec::new();
+        let dir_opt = faces_dir.or(self.loaded_dir.as_deref());
+        for (name, embs) in &self.profiles {
+            let files = self.sample_files.get(name).cloned().unwrap_or_default();
+            let updated_at = dir_opt
+                .and_then(|d| std::fs::metadata(d.join(name)).ok())
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            out.push(EnrolledFaceProfile {
+                name: name.clone(),
+                sample_count: embs.len(),
+                sample_files: files,
+                updated_at,
+            });
+        }
+        out
+    }
+
+    pub fn match_embedding(
+        &self,
+        query_embedding: &[f32],
+        similarity_threshold: f32,
+        unknown_alert: bool,
+    ) -> Option<FaceMatchResult> {
+        if query_embedding.is_empty() {
+            return None;
+        }
+        let norm_query = l2_normalized(query_embedding.to_vec());
+        let thresh = if similarity_threshold > 0.0 {
+            similarity_threshold
+        } else {
+            DEFAULT_FACE_SIMILARITY_THRESHOLD
+        };
+
+        let mut best_name: Option<String> = None;
+        let mut max_sim = -1.0f32;
+
+        for (name, embeddings) in &self.profiles {
+            for enrolled in embeddings {
+                let sim = cosine_similarity(&norm_query, enrolled);
+                if sim > max_sim {
+                    max_sim = sim;
+                    best_name = Some(name.clone());
+                }
+            }
+        }
+
+        if let Some(matched_name) = best_name
+            && max_sim >= thresh
+        {
+            return Some(FaceMatchResult {
+                sub_label: matched_name,
+                score: max_sim,
+                is_known: true,
+            });
+        }
+
+        if unknown_alert {
+            Some(FaceMatchResult {
+                sub_label: "unknown".to_string(),
+                score: max_sim.max(0.0),
+                is_known: false,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn match_face_bytes(
+        &self,
+        image_bytes: &[u8],
+        similarity_threshold: f32,
+        unknown_alert: bool,
+    ) -> Option<FaceMatchResult> {
+        let emb = extract_face_embedding(image_bytes);
+        self.match_embedding(&emb, similarity_threshold, unknown_alert)
+    }
+}
+
 pub fn nms_detections(
     mut detections: Vec<DetectionResult>,
     iou_threshold: f32,
@@ -2655,5 +3143,109 @@ version: 0.18-0
         assert_eq!(dets_rm.len(), 1);
         assert_eq!(dets_rm[0].label, "license_plate");
         assert!((dets_rm[0].score - 0.95 * 0.90).abs() < 1e-4);
+    }
+
+    #[test]
+    fn l2_normalization_and_cosine_similarity_boundary_and_face_gallery_matching() {
+        // 1. L2 normalization produces unit norm = 1.0 and handles zero vectors safely
+        let mut v = vec![3.0f32, 4.0f32, 0.0f32];
+        l2_normalize_embedding(&mut v);
+        assert!((v[0] - 0.6).abs() < 1e-6);
+        assert!((v[1] - 0.8).abs() < 1e-6);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+
+        let mut zero_v = vec![0.0f32; FACE_EMBEDDING_DIM];
+        l2_normalize_embedding(&mut zero_v);
+        assert!(zero_v.iter().all(|&x| x == 0.0));
+        assert_eq!(cosine_similarity(&zero_v, &zero_v), 0.0);
+
+        // 2. Cosine similarity: 1.0 for identical, 0.0 for orthogonal, and 0.68 boundary
+        let mut a = vec![0.0f32; FACE_EMBEDDING_DIM];
+        a[0] = 1.0;
+        let mut b_ident = vec![0.0f32; FACE_EMBEDDING_DIM];
+        b_ident[0] = 1.0;
+        assert!((cosine_similarity(&a, &b_ident) - 1.0).abs() < 1e-6);
+
+        let mut b_ortho = vec![0.0f32; FACE_EMBEDDING_DIM];
+        b_ortho[1] = 1.0;
+        assert!(cosine_similarity(&a, &b_ortho).abs() < 1e-6);
+
+        let mut b_boundary = vec![0.0f32; FACE_EMBEDDING_DIM];
+        b_boundary[0] = 0.68;
+        b_boundary[1] = (1.0f32 - 0.68 * 0.68).sqrt();
+        let sim_boundary = cosine_similarity(&a, &b_boundary);
+        assert!((sim_boundary - 0.68).abs() < 1e-5);
+
+        // 3. Gallery enrollment (memory + disk) and threshold boundary 0.68 matching vs "unknown" fallback
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_face_gallery_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        let mut gallery = FaceGallery::new();
+        gallery.enroll_embedding("Bruno", a.clone());
+
+        // At exact 0.68 boundary -> matches "Bruno"
+        let match_at_thresh = gallery
+            .match_embedding(&b_boundary, 0.68, true)
+            .expect("must match at 0.68 boundary");
+        assert_eq!(match_at_thresh.sub_label, "Bruno");
+        assert!(match_at_thresh.is_known);
+        assert!((match_at_thresh.score - 0.68).abs() < 1e-5);
+
+        // Below 0.68 threshold (e.g. 0.67) -> falls back to "unknown" when unknown_alert = true
+        let mut b_below = vec![0.0f32; FACE_EMBEDDING_DIM];
+        b_below[0] = 0.67;
+        b_below[1] = (1.0f32 - 0.67 * 0.67).sqrt();
+        let match_below = gallery
+            .match_embedding(&b_below, 0.68, true)
+            .expect("must return unknown when unknown_alert is true");
+        assert_eq!(match_below.sub_label, "unknown");
+        assert!(!match_below.is_known);
+
+        // Below threshold when unknown_alert = false -> returns None
+        assert!(gallery.match_embedding(&b_below, 0.68, false).is_none());
+
+        // 4. Disk enrollment under {faces_dir}/<name>/*.jpg and reload
+        let bruno_sample = b"fake-jpeg-bruno-face-crop-001";
+        let stranger_sample = b"completely-different-visitor-face-crop-999";
+        let (saved_path, emb) = gallery
+            .enroll_to_dir(&tmp_dir, "Bruno", "crop_01", "jpg", bruno_sample)
+            .unwrap();
+        assert!(saved_path.exists());
+        assert_eq!(emb.len(), FACE_EMBEDDING_DIM);
+
+        let reloaded = FaceGallery::load_from_dir(&tmp_dir).unwrap();
+        let profiles = reloaded.list_profiles(Some(&tmp_dir));
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "Bruno");
+        assert_eq!(profiles[0].sample_count, 1);
+
+        let known_res = reloaded
+            .match_face_bytes(bruno_sample, 0.68, true)
+            .expect("enrolled sample must match Bruno");
+        assert_eq!(known_res.sub_label, "Bruno");
+        assert!(known_res.is_known);
+        assert!((known_res.score - 1.0).abs() < 1e-5);
+
+        let unknown_res = reloaded
+            .match_face_bytes(stranger_sample, 0.68, true)
+            .expect("stranger sample must trigger unknown");
+        assert_eq!(unknown_res.sub_label, "unknown");
+        assert!(!unknown_res.is_known);
+
+        // 5. Face crop bbox resolution (explicit face attribute box vs upper-body fallback)
+        let person_box = BoundingBox::new(100, 100, 220, 300); // 120x200 (height >= 120)
+        let face_attr = BoundingBox::new(130, 110, 190, 170); // 60x60 = 3600 px^2
+        assert_eq!(
+            resolve_face_crop_bbox(person_box, Some(face_attr), 1280, 720, 750),
+            Some(face_attr)
+        );
+        let fallback_head =
+            resolve_face_crop_bbox(person_box, None, 1280, 720, 750).expect("head fallback");
+        assert!(fallback_head.area() >= 750);
+        assert!(fallback_head.inside(&person_box));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

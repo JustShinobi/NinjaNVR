@@ -4,9 +4,12 @@ import { describe, expect, test } from "bun:test";
 import { NinjaConfigResponse } from "../types/nvr";
 import { buildCleanYamlFromDraft } from "../utils/configYaml";
 import {
+  applyEventSubLabelUpdate,
+  applyReviewSubLabelUpdate,
   formatAiVerificationBadge,
   formatDetectedAttributePill,
   formatEventLabelWithSubLabel,
+  formatSubLabelBadge,
 } from "../views/ExploreWorkspace";
 import {
   TacticalPtzHudOverlay,
@@ -19,7 +22,10 @@ import {
   formatDhash64Hex,
   formatSignatureBbox,
   STANDARD_LABELS,
+  normalizeFaceProfileName,
+  parseFacesApiResponse,
   toggleAttributeLabelList,
+  toggleSubLabelRuleList,
 } from "../views/settings/VisionAndAiPanels";
 
 describe("buildCleanYamlFromDraft", () => {
@@ -693,5 +699,148 @@ cameras:
     expect(hudMarkup).toContain('aria-label="PTZ Stop ptz_gate"');
     expect(hudMarkup).toContain('aria-label="PTZ Preset Selector ptz_gate"');
     expect(hudMarkup).toContain(">driveway</option>");
+  });
+
+  test("serializes face_recognition and review.alerts.exclude_sub_labels in configYaml and validates face gallery helpers", () => {
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      face_recognition: {
+        enabled: true,
+        model_path: "/config/models/arcface_r50.onnx",
+        similarity_threshold: 0.68,
+        min_face_area: 750,
+        unknown_alert: true,
+      },
+      review: {
+        alerts: {
+          enabled: true,
+          labels: ["person", "car"],
+          sub_labels: ["unknown"],
+          exclude_sub_labels: ["Bruno", "Alice"],
+          required_zones: [],
+          cutoff_time: 40,
+        },
+        detections: {
+          enabled: true,
+          required_zones: [],
+          cutoff_time: 30,
+        },
+      },
+      cameras: {
+        front_door: {
+          name: "front_door",
+          enabled: true,
+          ffmpeg: {
+            inputs: [{ path: "rtsp://192.0.2.50:554/sub", roles: ["detect"] }],
+          },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          objects: { track: ["person"] },
+          zones: {},
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+      },
+    };
+
+    const yamlText = buildCleanYamlFromDraft(draft, "");
+    expect(yamlText).toContain("face_recognition:");
+    expect(yamlText).toContain("model_path: /config/models/arcface_r50.onnx");
+    expect(yamlText).toContain("similarity_threshold: 0.68");
+    expect(yamlText).toContain("min_face_area: 750");
+    expect(yamlText).toContain("unknown_alert: true");
+    expect(yamlText).toContain("exclude_sub_labels:");
+    expect(yamlText).toContain("- Bruno");
+    expect(yamlText).toContain("- Alice");
+    expect(yamlText).toContain("sub_labels:");
+    expect(yamlText).toContain("- unknown");
+
+    // Validate sub_label badge formatting for known vs unknown
+    expect(formatSubLabelBadge(null)).toBeNull();
+    expect(formatSubLabelBadge("Bruno", 0.88)).toEqual({
+      text: "ID: BRUNO 88%",
+      isUnknown: false,
+      isKnown: true,
+    });
+    expect(formatSubLabelBadge("unknown", 0.42)).toEqual({
+      text: "UNKNOWN VISITOR 42%",
+      isUnknown: true,
+      isKnown: false,
+    });
+
+    // Validate face profile normalization, exclude_sub_labels toggle, and /api/faces parser
+    expect(normalizeFaceProfileName("  Bruno  ")).toBe("Bruno");
+    expect(normalizeFaceProfileName("../etc/passwd")).toBe("");
+    expect(normalizeFaceProfileName("unknown")).toBe("");
+
+    const toggledIn = toggleSubLabelRuleList(["Alice"], "Bruno");
+    expect(toggledIn).toEqual(["Alice", "Bruno"]);
+    const toggledOut = toggleSubLabelRuleList(toggledIn, "bruno");
+    expect(toggledOut).toEqual(["Alice"]);
+
+    const parsedProfiles = parseFacesApiResponse({
+      profiles: [
+        {
+          name: "Bruno",
+          sample_count: 2,
+          sample_files: ["a.jpg", "b.jpg"],
+          updated_at: 1700000000,
+        },
+      ],
+    });
+    expect(parsedProfiles).toEqual([
+      {
+        name: "Bruno",
+        sample_count: 2,
+        sample_files: ["a.jpg", "b.jpg"],
+        updated_at: 1700000000,
+      },
+    ]);
+
+    // Validate event & review sub_label state update helpers
+    const updatedEvents = applyEventSubLabelUpdate(
+      [
+        {
+          id: "ev_1",
+          camera: "front_door",
+          label: "person",
+          sub_label: null,
+          zones: [],
+          start_time: 1000,
+          end_time: 1005,
+          top_score: 0.9,
+          score: 0.9,
+          has_clip: true,
+          has_snapshot: true,
+          retain_indefinitely: false,
+          false_positive: false,
+          box: null,
+        },
+      ],
+      "ev_1",
+      "Bruno",
+      0.91
+    );
+    expect(updatedEvents[0].sub_label).toBe("Bruno");
+    expect(updatedEvents[0].sub_label_score).toBe(0.91);
+
+    const updatedReviews = applyReviewSubLabelUpdate(
+      [
+        {
+          id: "rev_1",
+          camera: "front_door",
+          start_time: 1000,
+          end_time: 1010,
+          severity: "alert",
+          thumb_path: "/thumb.webp",
+          has_been_reviewed: false,
+          data: { objects: ["person"], sub_labels: [] },
+        },
+      ],
+      "rev_1",
+      "Bruno"
+    );
+    expect(updatedReviews[0].data.sub_labels).toEqual(["Bruno"]);
   });
 });

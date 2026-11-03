@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message as AxumWsMsg, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
@@ -553,14 +553,16 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/{camera}/latest.webp", get(api_camera_latest_frame))
         .route("/{camera}/latest.jpg", get(api_camera_latest_frame))
         .route("/labels", get(api_labels))
-        .route("/sub_labels", get(api_empty_array))
+        .route("/sub_labels", get(api_sub_labels))
         .route("/audio_labels", get(api_empty_array))
         .route("/recognized_license_plates", get(api_empty_array))
         .route("/classification/attributes", get(api_empty_array))
         .route("/classification/custom", get(api_empty_object))
         .route("/genai/models", get(api_empty_array))
         .route("/plus/models", get(api_empty_array))
-        .route("/faces", get(api_empty_object))
+        .route("/faces", get(api_faces_list))
+        .route("/faces/{name}", delete(api_face_delete))
+        .route("/faces/{name}/enroll", post(api_face_enroll))
         .fallback(|| async {
             (
                 StatusCode::NOT_FOUND,
@@ -4469,15 +4471,238 @@ pub async fn verify_event_with_genai_components(
 pub struct SubLabelBody {
     #[serde(alias = "subLabel")]
     pub sub_label: Option<String>,
+    #[serde(default, alias = "subLabelScore", alias = "score")]
+    pub sub_label_score: Option<f64>,
+    #[serde(default, alias = "enrollFace")]
+    pub enroll_face: Option<bool>,
+}
+
+fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> Vec<u8> {
+    let clips_dir = state.media_dir.join("clips");
+    if let Ok(Some(ev)) = state.db.get_event(event_id) {
+        if let Some(cam) = ev["camera"].as_str() {
+            for candidate in [
+                clips_dir.join(format!("{cam}-{event_id}-clean.webp")),
+                clips_dir.join(format!("{event_id}-clean.jpg")),
+                clips_dir.join(format!("{cam}-{event_id}.webp")),
+                clips_dir.join(format!("{event_id}.jpg")),
+            ] {
+                if let Ok(bytes) = std::fs::read(&candidate)
+                    && !bytes.is_empty()
+                {
+                    return bytes;
+                }
+            }
+        }
+        if let Some(thumb_b64) = ev["thumbnail"].as_str()
+            && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(thumb_b64.trim())
+            && !decoded.is_empty()
+        {
+            return decoded;
+        }
+    }
+    format!("event-face-sample:{event_id}").into_bytes()
 }
 
 async fn api_event_sub_label(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<SubLabelBody>,
-) -> Json<Value> {
-    let _ = state.db.set_event_sub_label(&id, body.sub_label.as_deref());
-    Json(json!({ "success": true }))
+) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && let Ok(Some(ev)) = state.db.get_event(&id)
+        && let Some(cam) = ev["camera"].as_str()
+        && !allowed.iter().any(|c| c == cam)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+
+    let clean_sub = body
+        .sub_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let updated = state
+        .db
+        .set_event_sub_label_with_score(&id, clean_sub, body.sub_label_score)
+        .unwrap_or(0);
+
+    if body.enroll_face.unwrap_or(false)
+        && let Some(name) = clean_sub
+        && !name.eq_ignore_ascii_case("unknown")
+    {
+        let faces_dir = state.media_dir.join("faces");
+        let sample_bytes = load_event_face_sample_bytes(&state, &id);
+        let _ = state
+            .detector
+            .enroll_face_profile(&faces_dir, name, &id, &sample_bytes);
+    }
+
+    Json(json!({
+        "success": true,
+        "updated": updated,
+        "sub_label": clean_sub,
+        "sub_label_score": body.sub_label_score
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct FaceEnrollBody {
+    #[serde(default, alias = "eventId")]
+    pub event_id: Option<String>,
+    #[serde(default, alias = "imageBase64", alias = "image")]
+    pub image_base64: Option<String>,
+    #[serde(default, alias = "assignSubLabel")]
+    pub assign_sub_label: Option<bool>,
+}
+
+async fn api_faces_list(State(state): State<AppState>) -> Json<Value> {
+    let faces_dir = state.media_dir.join("faces");
+    let profiles = state.detector.list_face_profiles(&faces_dir);
+    let mut faces_map = serde_json::Map::new();
+    let mut root = serde_json::Map::new();
+    for p in &profiles {
+        faces_map.insert(p.name.clone(), json!(p.sample_files));
+        if p.name != "profiles" && p.name != "faces" {
+            root.insert(p.name.clone(), json!(p.sample_files));
+        }
+    }
+    root.insert("profiles".to_string(), json!(profiles));
+    root.insert("faces".to_string(), Value::Object(faces_map));
+    Json(Value::Object(root))
+}
+
+async fn api_face_enroll(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    body_bytes: Bytes,
+) -> Response {
+    let Some(clean_name) = ninjanvr_infer::sanitize_face_profile_name(&name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid face profile name" })),
+        )
+            .into_response();
+    };
+
+    let mut sample_id = format!("enroll_{}", unix_now());
+    let mut event_to_assign: Option<String> = None;
+    let payload_bytes: Vec<u8> = if body_bytes.is_empty() {
+        format!("face-profile:{clean_name}").into_bytes()
+    } else if body_bytes.first().copied() == Some(b'{')
+        && let Ok(parsed) = serde_json::from_slice::<FaceEnrollBody>(&body_bytes)
+    {
+        if let Some(ref ev_id) = parsed.event_id
+            && !ev_id.trim().is_empty()
+        {
+            sample_id = ev_id.trim().to_string();
+            if parsed.assign_sub_label.unwrap_or(true) {
+                event_to_assign = Some(sample_id.clone());
+            }
+        }
+        if let Some(ref b64) = parsed.image_base64
+            && !b64.trim().is_empty()
+        {
+            let stripped = b64
+                .trim()
+                .split_once(";base64,")
+                .map(|(_, data)| data)
+                .unwrap_or_else(|| b64.trim());
+            base64::engine::general_purpose::STANDARD
+                .decode(stripped)
+                .unwrap_or_else(|_| stripped.as_bytes().to_vec())
+        } else if let Some(ref ev_id) = parsed.event_id
+            && !ev_id.trim().is_empty()
+        {
+            load_event_face_sample_bytes(&state, ev_id.trim())
+        } else {
+            format!("face-profile:{clean_name}").into_bytes()
+        }
+    } else {
+        body_bytes.to_vec()
+    };
+
+    let faces_dir = state.media_dir.join("faces");
+    match state
+        .detector
+        .enroll_face_profile(&faces_dir, &clean_name, &sample_id, &payload_bytes)
+    {
+        Ok((saved_path, emb)) => {
+            if let Some(ev_id) = event_to_assign {
+                let _ =
+                    state
+                        .db
+                        .set_event_sub_label_with_score(&ev_id, Some(&clean_name), Some(1.0));
+            }
+            let profiles = state.detector.list_face_profiles(&faces_dir);
+            let sample_count = profiles
+                .iter()
+                .find(|p| p.name == clean_name)
+                .map(|p| p.sample_count)
+                .unwrap_or(1);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "name": clean_name,
+                    "sample_count": sample_count,
+                    "embedding_dim": emb.len(),
+                    "path": saved_path.to_string_lossy()
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_face_delete(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    let Some(clean_name) = ninjanvr_infer::sanitize_face_profile_name(&name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid face profile name" })),
+        )
+            .into_response();
+    };
+    let faces_dir = state.media_dir.join("faces");
+    let deleted = state
+        .detector
+        .delete_face_profile(&faces_dir, &clean_name)
+        .unwrap_or(false);
+    Json(json!({
+        "success": true,
+        "name": clean_name,
+        "deleted": deleted
+    }))
+    .into_response()
+}
+
+async fn api_sub_labels(State(state): State<AppState>) -> Json<Value> {
+    let mut set = BTreeSet::new();
+    if let Ok(db_subs) = state.db.list_distinct_sub_labels() {
+        for s in db_subs {
+            set.insert(s);
+        }
+    }
+    let faces_dir = state.media_dir.join("faces");
+    for p in state.detector.list_face_profiles(&faces_dir) {
+        set.insert(p.name);
+    }
+    Json(json!(set.into_iter().collect::<Vec<_>>()))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -9741,7 +9966,15 @@ version: 0.18-0
             std::env::temp_dir().join(format!("ninjanvr-ai-judge-{}", rand::random::<u32>()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let cfg_path = tmp_dir.join("config.yml");
-        std::fs::write(&cfg_path, "version: 0.18-0\n").unwrap();
+        let db_path = tmp_dir.join("ninjanvr.db");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "database:\n  path: {}\nversion: 0.18-0\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
 
         let state = new_app_state(&cfg_path, tmp_dir.join("web"), tmp_dir.join("media"), false)
             .await
@@ -10272,5 +10505,154 @@ version: 0.18-0
         assert!(actions.contains(&"GotoPreset".to_string()));
 
         mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn face_recognition_gallery_and_sub_label_http_endpoints_work_end_to_end() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_faces_http_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "database:\n  path: {}\nversion: 0.18-0\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let state = new_app_state(&cfg_path, tmp_dir.join("web"), tmp_dir.join("media"), false)
+            .await
+            .unwrap();
+
+        // Seed a person event and reviewsegment
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_person_bruno".to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!(["porch"]),
+                start_time: 1000.0,
+                end_time: Some(1004.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.93),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.1, 0.1, 0.4, 0.8])),
+                data: json!({ "box": [0.1, 0.1, 0.4, 0.8] }),
+                thumbnail: None,
+                area: Some(15000),
+                ratio: Some(0.5),
+                score: Some(0.93),
+                stationary: false,
+            })
+            .unwrap();
+
+        let app = build_router(state.clone());
+
+        // 1. POST /api/faces/Bruno/enroll
+        let enroll_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/faces/Bruno/enroll")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"image_base64":"ZmFrZS1mYWNlLWNyb3AtYnJ1bm8="}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enroll_resp.status(), StatusCode::OK);
+        let enroll_json: Value =
+            serde_json::from_slice(&to_bytes(enroll_resp.into_body(), 65536).await.unwrap())
+                .unwrap();
+        assert_eq!(enroll_json["success"], true);
+        assert_eq!(enroll_json["name"], "Bruno");
+        assert_eq!(enroll_json["sample_count"], 1);
+        assert_eq!(enroll_json["embedding_dim"], 512);
+
+        // 2. GET /api/faces
+        let list_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/faces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_json: Value =
+            serde_json::from_slice(&to_bytes(list_resp.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(list_json["profiles"][0]["name"], "Bruno");
+        assert_eq!(list_json["profiles"][0]["sample_count"], 1);
+        assert!(list_json["faces"]["Bruno"].is_array());
+
+        // 3. POST /api/events/{id}/sub_label
+        let sub_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/events/ev_person_bruno/sub_label")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"sub_label":"Bruno","sub_label_score":0.89}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sub_resp.status(), StatusCode::OK);
+        let ev_after = state.db.get_event("ev_person_bruno").unwrap().unwrap();
+        assert_eq!(ev_after["sub_label"], "Bruno");
+        assert!((ev_after["sub_label_score"].as_f64().unwrap() - 0.89).abs() < 1e-5);
+
+        // 4. DELETE /api/faces/Bruno
+        let del_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/faces/Bruno")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_resp.status(), StatusCode::OK);
+        let del_json: Value =
+            serde_json::from_slice(&to_bytes(del_resp.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(del_json["success"], true);
+        assert_eq!(del_json["deleted"], true);
+
+        let list_after = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/faces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list_after_json: Value =
+            serde_json::from_slice(&to_bytes(list_after.into_body(), 65536).await.unwrap())
+                .unwrap();
+        assert_eq!(list_after_json["profiles"].as_array().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

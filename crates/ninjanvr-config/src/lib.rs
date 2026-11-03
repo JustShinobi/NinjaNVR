@@ -224,6 +224,44 @@ impl Default for GenAiConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaceRecognitionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_face_model_path")]
+    pub model_path: PathBuf,
+    #[serde(default = "default_face_similarity_threshold")]
+    pub similarity_threshold: f32,
+    #[serde(default = "default_min_face_area")]
+    pub min_face_area: u32,
+    #[serde(default)]
+    pub unknown_alert: bool,
+}
+
+fn default_face_model_path() -> PathBuf {
+    PathBuf::from("/config/models/arcface_r50.onnx")
+}
+
+fn default_face_similarity_threshold() -> f32 {
+    0.68
+}
+
+fn default_min_face_area() -> u32 {
+    750
+}
+
+impl Default for FaceRecognitionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: default_face_model_path(),
+            similarity_threshold: default_face_similarity_threshold(),
+            min_face_area: default_min_face_area(),
+            unknown_alert: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NinjaConfig {
     #[serde(default = "default_version")]
@@ -242,6 +280,8 @@ pub struct NinjaConfig {
     pub model: ModelConfig,
     #[serde(default)]
     pub genai: GenAiConfig,
+    #[serde(default)]
+    pub face_recognition: FaceRecognitionConfig,
     #[serde(default)]
     pub record: RecordConfig,
     #[serde(default)]
@@ -1255,6 +1295,10 @@ pub struct ReviewSeverityConfig {
     pub enabled: bool,
     #[serde(default = "default_alert_labels")]
     pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sub_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_sub_labels: Vec<String>,
     #[serde(default)]
     pub required_zones: Vec<String>,
     #[serde(default = "default_alert_cutoff")]
@@ -1273,6 +1317,8 @@ impl Default for ReviewSeverityConfig {
         Self {
             enabled: true,
             labels: default_alert_labels(),
+            sub_labels: Vec::new(),
+            exclude_sub_labels: Vec::new(),
             required_zones: Vec::new(),
             cutoff_time: default_alert_cutoff(),
         }
@@ -1651,6 +1697,14 @@ impl NinjaConfig {
             if !cam.record.alert_backup.enabled && cfg.record.alert_backup.enabled {
                 cam.record.alert_backup = cfg.record.alert_backup.clone();
             }
+            if cam.review.alerts.sub_labels.is_empty() && !cfg.review.alerts.sub_labels.is_empty() {
+                cam.review.alerts.sub_labels = cfg.review.alerts.sub_labels.clone();
+            }
+            if cam.review.alerts.exclude_sub_labels.is_empty()
+                && !cfg.review.alerts.exclude_sub_labels.is_empty()
+            {
+                cam.review.alerts.exclude_sub_labels = cfg.review.alerts.exclude_sub_labels.clone();
+            }
         }
 
         Ok(cfg)
@@ -1872,8 +1926,8 @@ impl NinjaConfig {
                         "annotation_offset": 0
                     },
                     "face_recognition": {
-                        "enabled": false,
-                        "min_area": 750
+                        "enabled": self.face_recognition.enabled,
+                        "min_area": self.face_recognition.min_face_area
                     },
                     "ffmpeg": {
                         "path": "default",
@@ -1974,6 +2028,8 @@ impl NinjaConfig {
                             "enabled": cam.review.alerts.enabled,
                             "enabled_in_config": cam.review.alerts.enabled,
                             "labels": cam.review.alerts.labels,
+                            "sub_labels": cam.review.alerts.sub_labels,
+                            "exclude_sub_labels": cam.review.alerts.exclude_sub_labels,
                             "required_zones": cam.review.alerts.required_zones,
                             "cutoff_time": cam.review.alerts.cutoff_time
                         },
@@ -2301,6 +2357,8 @@ impl NinjaConfig {
                 "alerts": {
                     "enabled": self.review.alerts.enabled,
                     "labels": self.review.alerts.labels,
+                    "sub_labels": self.review.alerts.sub_labels,
+                    "exclude_sub_labels": self.review.alerts.exclude_sub_labels,
                     "required_zones": self.review.alerts.required_zones,
                     "cutoff_time": self.review.alerts.cutoff_time
                 },
@@ -2355,12 +2413,16 @@ impl NinjaConfig {
                 "model_size": "small"
             },
             "face_recognition": {
-                "enabled": false,
+                "enabled": self.face_recognition.enabled,
+                "model_path": self.face_recognition.model_path,
+                "similarity_threshold": self.face_recognition.similarity_threshold,
+                "min_face_area": self.face_recognition.min_face_area,
+                "unknown_alert": self.face_recognition.unknown_alert,
                 "model_size": "small",
                 "unknown_score": 0.8,
                 "detection_threshold": 0.7,
-                "recognition_threshold": 0.9,
-                "min_area": 750,
+                "recognition_threshold": self.face_recognition.similarity_threshold,
+                "min_area": self.face_recognition.min_face_area,
                 "min_faces": 1,
                 "save_attempts": 200,
                 "blur_confidence_filter": true
@@ -2520,6 +2582,10 @@ impl NinjaConfig {
             self.genai =
                 serde_json::from_value(genai_val.clone()).context("invalid genai config")?;
         }
+        if let Some(face_val) = obj.get("face_recognition") {
+            self.face_recognition = serde_json::from_value(face_val.clone())
+                .context("invalid face_recognition config")?;
+        }
         if let Some(detect_val) = obj.get("detect") {
             self.detect =
                 serde_json::from_value(detect_val.clone()).context("invalid detect config")?;
@@ -2668,6 +2734,17 @@ impl NinjaConfig {
                 }
                 if cam.objects.attribute_labels.is_empty() {
                     cam.objects.attribute_labels = self.objects.attribute_labels.clone();
+                }
+                if cam.review.alerts.sub_labels.is_empty()
+                    && !self.review.alerts.sub_labels.is_empty()
+                {
+                    cam.review.alerts.sub_labels = self.review.alerts.sub_labels.clone();
+                }
+                if cam.review.alerts.exclude_sub_labels.is_empty()
+                    && !self.review.alerts.exclude_sub_labels.is_empty()
+                {
+                    cam.review.alerts.exclude_sub_labels =
+                        self.review.alerts.exclude_sub_labels.clone();
                 }
             }
             self.cameras = next_cams;
@@ -4237,5 +4314,89 @@ version: 0.18-0
             cfg.to_api_value()["cameras"]["ptz_gate"]["onvif"]["has_password"],
             false
         );
+    }
+
+    #[test]
+    fn parses_face_recognition_and_review_sub_label_rules_and_roundtrips_json() {
+        let yaml = r#"
+face_recognition:
+  enabled: true
+  model_path: /config/models/arcface_r50.onnx
+  similarity_threshold: 0.72
+  min_face_area: 900
+  unknown_alert: true
+review:
+  alerts:
+    enabled: true
+    labels: [person, car]
+    sub_labels: [unknown]
+    exclude_sub_labels: [Bruno, Alice]
+cameras:
+  portao:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/portao_sub
+          roles: [detect]
+version: 0.18-0
+"#;
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert!(cfg.face_recognition.enabled);
+        assert_eq!(
+            cfg.face_recognition.model_path,
+            PathBuf::from("/config/models/arcface_r50.onnx")
+        );
+        assert!((cfg.face_recognition.similarity_threshold - 0.72).abs() < 1e-5);
+        assert_eq!(cfg.face_recognition.min_face_area, 900);
+        assert!(cfg.face_recognition.unknown_alert);
+        assert_eq!(cfg.review.alerts.sub_labels, vec!["unknown"]);
+        assert_eq!(cfg.review.alerts.exclude_sub_labels, vec!["Bruno", "Alice"]);
+        assert_eq!(
+            cfg.cameras["portao"].review.alerts.exclude_sub_labels,
+            vec!["Bruno", "Alice"]
+        );
+
+        let api_val = cfg.to_api_value();
+        assert_eq!(api_val["face_recognition"]["enabled"], true);
+        assert_eq!(api_val["face_recognition"]["min_face_area"], 900);
+        assert_eq!(api_val["face_recognition"]["unknown_alert"], true);
+        assert_eq!(
+            api_val["review"]["alerts"]["exclude_sub_labels"],
+            json!(["Bruno", "Alice"])
+        );
+
+        let patch = json!({
+            "face_recognition": {
+                "enabled": true,
+                "model_path": "/config/models/adaface.onnx",
+                "similarity_threshold": 0.68,
+                "min_face_area": 800,
+                "unknown_alert": false
+            },
+            "review": {
+                "alerts": {
+                    "enabled": true,
+                    "labels": ["person"],
+                    "sub_labels": [],
+                    "exclude_sub_labels": ["Bruno"],
+                    "required_zones": [],
+                    "cutoff_time": 40
+                },
+                "detections": {
+                    "enabled": true,
+                    "required_zones": [],
+                    "cutoff_time": 30
+                }
+            }
+        });
+        cfg.apply_structured_json(&patch).unwrap();
+        assert_eq!(
+            cfg.face_recognition.model_path,
+            PathBuf::from("/config/models/adaface.onnx")
+        );
+        assert!((cfg.face_recognition.similarity_threshold - 0.68).abs() < 1e-5);
+        assert_eq!(cfg.face_recognition.min_face_area, 800);
+        assert!(!cfg.face_recognition.unknown_alert);
+        assert_eq!(cfg.review.alerts.exclude_sub_labels, vec!["Bruno"]);
     }
 }

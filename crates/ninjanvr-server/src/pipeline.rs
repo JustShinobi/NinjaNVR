@@ -68,6 +68,7 @@ pub struct TrackPersistSnapshot {
     pub best_score: f32,
     pub best_attribute_score: f32,
     pub sub_label: Option<String>,
+    pub sub_label_score: Option<f32>,
     pub detected_attributes: Vec<TrackedAttribute>,
     pub zones: Vec<String>,
     pub stationary: bool,
@@ -89,6 +90,7 @@ pub struct ActiveReviewState {
     pub detections: Vec<String>,
     pub objects: Vec<String>,
     pub sub_labels: Vec<String>,
+    pub sub_label_score: Option<f32>,
     pub detected_attributes: Vec<TrackedAttribute>,
     pub zones: Vec<String>,
     pub provenance: Option<TriggerProvenance>,
@@ -111,6 +113,7 @@ impl ActiveReviewState {
                 "objects": self.objects,
                 "verified_objects": [],
                 "sub_labels": self.sub_labels,
+                "sub_label_score": self.sub_label_score,
                 "detected_attributes": self.detected_attributes,
                 "zones": self.zones,
                 "audio": [],
@@ -607,7 +610,7 @@ impl VisionPipeline {
 
         let active_profile = self.comms.get_active_profile();
         let cam_rt_flags = self.comms.get_camera_flags(camera);
-        let (camera_suppressed_in_profile, camera_record_disabled_in_profile, genai_cfg) = {
+        let (camera_suppressed_in_profile, camera_record_disabled_in_profile, genai_cfg, face_cfg) = {
             let cfg_guard = self.config.read().await;
             let sup_alerts =
                 is_camera_alert_suppressed_in_profile(&cfg_guard, &active_profile, camera);
@@ -622,8 +625,14 @@ impl VisionPipeline {
                         .any(|c| c == camera || c == "*")
                 })
                 .unwrap_or(false);
-            (sup_alerts, sup_rec, cfg_guard.genai.clone())
+            (
+                sup_alerts,
+                sup_rec,
+                cfg_guard.genai.clone(),
+                cfg_guard.face_recognition.clone(),
+            )
         };
+        let faces_dir = self.media_dir.join("faces");
         let snapshots_active = cam_cfg.snapshots.enabled && cam_rt_flags.snapshots;
         let record_active =
             cam_cfg.record.enabled && cam_rt_flags.record && !camera_record_disabled_in_profile;
@@ -668,10 +677,12 @@ impl VisionPipeline {
                 .map(|p| p.zones != trk.entered_zones || p.stationary != trk.stationary)
                 .unwrap_or(false);
 
-            let effective_sub_label = trk
+            let mut effective_sub_label = trk
                 .inferred_sub_label
                 .clone()
                 .or_else(|| prev.as_ref().and_then(|p| p.sub_label.clone()));
+            let mut effective_sub_label_score: Option<f32> =
+                prev.as_ref().and_then(|p| p.sub_label_score);
             let mut merged_attrs: Vec<TrackedAttribute> = prev
                 .as_ref()
                 .map(|p| p.detected_attributes.clone())
@@ -685,10 +696,41 @@ impl VisionPipeline {
                     merged_attrs.push(attr.clone());
                 }
             }
+            if face_cfg.enabled
+                && trk.label == "person"
+                && (effective_sub_label.is_none()
+                    || effective_sub_label.as_deref() == Some("unknown"))
+            {
+                let face_attr_bbox = merged_attrs
+                    .iter()
+                    .find(|a| a.label.eq_ignore_ascii_case("face"))
+                    .map(|a| a.bbox);
+                if let Some(face_crop_box) = ninjanvr_infer::resolve_face_crop_bbox(
+                    trk.bbox,
+                    face_attr_bbox,
+                    frame.width,
+                    frame.height,
+                    face_cfg.min_face_area,
+                ) {
+                    let face_rgb =
+                        yuv420p_to_rgb_image_scaled(frame, Some(face_crop_box), &[], Some(112));
+                    if let Some(m) = self.detector.match_face_crop(
+                        &faces_dir,
+                        face_rgb.as_raw(),
+                        face_cfg.similarity_threshold,
+                        face_cfg.unknown_alert,
+                    ) {
+                        effective_sub_label = Some(m.sub_label);
+                        effective_sub_label_score = Some(m.score);
+                    }
+                }
+            }
             let attrs_changed = prev
                 .as_ref()
                 .map(|p| {
-                    p.sub_label != effective_sub_label || p.detected_attributes != merged_attrs
+                    p.sub_label != effective_sub_label
+                        || p.sub_label_score != effective_sub_label_score
+                        || p.detected_attributes != merged_attrs
                 })
                 .unwrap_or(!merged_attrs.is_empty() || effective_sub_label.is_some());
 
@@ -737,6 +779,7 @@ impl VisionPipeline {
                         best_score,
                         best_attribute_score: best_attr_score,
                         sub_label: effective_sub_label.clone(),
+                        sub_label_score: effective_sub_label_score,
                         detected_attributes: merged_attrs.clone(),
                         zones: trk.entered_zones.clone(),
                         stationary: trk.stationary,
@@ -854,12 +897,16 @@ impl VisionPipeline {
                 }
 
                 let norm_reg = trk.region.to_normalized(frame.width, frame.height);
+                let mut trk_for_sev = trk.clone();
+                if trk_for_sev.inferred_sub_label.is_none() {
+                    trk_for_sev.inferred_sub_label = effective_sub_label.clone();
+                }
                 let severity = if suppressed_fp || !cam_rt_flags.alerts {
                     "detection"
                 } else {
                     compute_track_severity_for_profile(
                         cam_cfg,
-                        trk,
+                        &trk_for_sev,
                         &active_profile,
                         camera_suppressed_in_profile,
                     )
@@ -906,6 +953,8 @@ impl VisionPipeline {
                         "suppressed_by_fp_signature": matched_fp_sig_id,
                         "score": trk.score,
                         "top_score": best_score,
+                        "sub_label": effective_sub_label,
+                        "sub_label_score": effective_sub_label_score,
                         "attributes": attr_tags,
                         "detected_attributes": merged_attrs,
                         "face_box": face_box,
@@ -922,7 +971,11 @@ impl VisionPipeline {
                 };
                 let _ = self.db.upsert_event(&ev_dto);
                 if let Some(ref sl) = effective_sub_label {
-                    let _ = self.db.set_event_sub_label(&trk.id, Some(sl));
+                    let _ = self.db.set_event_sub_label_with_score(
+                        &trk.id,
+                        Some(sl),
+                        effective_sub_label_score.map(|v| v as f64),
+                    );
                 }
                 if should_trigger_ai {
                     let cfg_clone = self.config.clone();
@@ -1000,12 +1053,16 @@ impl VisionPipeline {
             }
 
             // Update or open ReviewSegment if enabled
+            let mut trk_for_rev_sev = trk.clone();
+            if trk_for_rev_sev.inferred_sub_label.is_none() {
+                trk_for_rev_sev.inferred_sub_label = effective_sub_label.clone();
+            }
             let track_sev = if !cam_rt_flags.alerts {
                 "detection"
             } else {
                 compute_track_severity_for_profile(
                     cam_cfg,
-                    trk,
+                    &trk_for_rev_sev,
                     &active_profile,
                     camera_suppressed_in_profile,
                 )
@@ -1036,6 +1093,7 @@ impl VisionPipeline {
                     detections: Vec::new(),
                     objects: Vec::new(),
                     sub_labels: Vec::new(),
+                    sub_label_score: effective_sub_label_score,
                     detected_attributes: Vec::new(),
                     zones: Vec::new(),
                     provenance: Some(trk.provenance.clone()),
@@ -1063,6 +1121,15 @@ impl VisionPipeline {
                 && !rev.sub_labels.contains(sl)
             {
                 rev.sub_labels.push(sl.clone());
+                rev.dirty = true;
+            }
+            if let Some(sc) = effective_sub_label_score
+                && rev
+                    .sub_label_score
+                    .map(|prev_sc| sc > prev_sc)
+                    .unwrap_or(true)
+            {
+                rev.sub_label_score = Some(sc);
                 rev.dirty = true;
             }
             for attr in &merged_attrs {
@@ -1118,6 +1185,7 @@ impl VisionPipeline {
                 .inferred_sub_label
                 .clone()
                 .or_else(|| removed_snap.as_ref().and_then(|s| s.sub_label.clone()));
+            let effective_sub_label_score = removed_snap.as_ref().and_then(|s| s.sub_label_score);
             let mut merged_attrs = removed_snap
                 .map(|s| s.detected_attributes)
                 .unwrap_or_default();
@@ -1132,12 +1200,16 @@ impl VisionPipeline {
             }
             let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
             let norm_reg = trk.region.to_normalized(frame.width, frame.height);
+            let mut trk_for_sev = trk.clone();
+            if trk_for_sev.inferred_sub_label.is_none() {
+                trk_for_sev.inferred_sub_label = effective_sub_label.clone();
+            }
             let severity = if suppressed_fp || !cam_rt_flags.alerts {
                 "detection"
             } else {
                 compute_track_severity_for_profile(
                     cam_cfg,
-                    trk,
+                    &trk_for_sev,
                     &active_profile,
                     camera_suppressed_in_profile,
                 )
@@ -1182,6 +1254,8 @@ impl VisionPipeline {
                     "dhash64": crop_dhash64,
                     "score": trk.score,
                     "top_score": best_score,
+                    "sub_label": effective_sub_label,
+                    "sub_label_score": effective_sub_label_score,
                     "attributes": attr_tags,
                     "detected_attributes": merged_attrs,
                     "face_box": face_box,
@@ -1198,7 +1272,11 @@ impl VisionPipeline {
             };
             let _ = self.db.upsert_event(&ev_dto);
             if let Some(ref sl) = effective_sub_label {
-                let _ = self.db.set_event_sub_label(&trk.id, Some(sl));
+                let _ = self.db.set_event_sub_label_with_score(
+                    &trk.id,
+                    Some(sl),
+                    effective_sub_label_score.map(|v| v as f64),
+                );
             }
             let _ = self.db.insert_timeline_entry(
                 now,
@@ -1347,18 +1425,44 @@ pub fn compute_track_severity_for_profile(
 }
 
 pub fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'static str {
-    if cam_cfg.review.alerts.enabled
-        && cam_cfg.review.alerts.labels.contains(&trk.label)
-        && (cam_cfg.review.alerts.required_zones.is_empty()
-            || trk
+    if !cam_cfg.review.alerts.enabled
+        || !cam_cfg.review.alerts.labels.contains(&trk.label)
+        || (!cam_cfg.review.alerts.required_zones.is_empty()
+            && !trk
                 .entered_zones
                 .iter()
                 .any(|z| cam_cfg.review.alerts.required_zones.contains(z)))
     {
-        "alert"
-    } else {
-        "detection"
+        return "detection";
     }
+
+    if !cam_cfg.review.alerts.exclude_sub_labels.is_empty()
+        && let Some(ref sub) = trk.inferred_sub_label
+        && cam_cfg
+            .review
+            .alerts
+            .exclude_sub_labels
+            .iter()
+            .any(|ex| ex.eq_ignore_ascii_case(sub))
+    {
+        return "detection";
+    }
+
+    if !cam_cfg.review.alerts.sub_labels.is_empty() {
+        let matched_allowed = trk.inferred_sub_label.as_ref().is_some_and(|sub| {
+            cam_cfg
+                .review
+                .alerts
+                .sub_labels
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(sub))
+        });
+        if !matched_allowed {
+            return "detection";
+        }
+    }
+
+    "alert"
 }
 
 #[cfg(test)]
@@ -2291,5 +2395,47 @@ mod tests {
         assert_eq!(sigs_after[0]["hit_count"], 2);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn compute_track_severity_for_profile_evaluates_sub_labels_and_exclude_sub_labels() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.review.alerts.enabled = true;
+        cam_cfg.review.alerts.labels = vec!["person".to_string()];
+        cam_cfg.review.alerts.exclude_sub_labels = vec!["Bruno".to_string()];
+
+        // Known resident "Bruno" in exclude_sub_labels downgrades alert -> detection
+        let mut trk_bruno = sample_track();
+        trk_bruno.inferred_sub_label = Some("Bruno".to_string());
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk_bruno, "armed", false),
+            "detection"
+        );
+
+        // Unknown person triggers alert
+        let mut trk_unknown = sample_track();
+        trk_unknown.inferred_sub_label = Some("unknown".to_string());
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk_unknown, "armed", false),
+            "alert"
+        );
+
+        // Unclassified person (None) triggers alert when sub_labels filter is empty
+        let trk_none = sample_track();
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk_none, "armed", false),
+            "alert"
+        );
+
+        // When sub_labels is explicitly restricted to ["unknown"], only "unknown" triggers alert
+        cam_cfg.review.alerts.sub_labels = vec!["unknown".to_string()];
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk_unknown, "armed", false),
+            "alert"
+        );
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk_none, "armed", false),
+            "detection"
+        );
     }
 }
