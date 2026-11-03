@@ -392,11 +392,14 @@ impl NinjaDatabase {
                 PRIMARY KEY ("camera", "name")
             );
             CREATE INDEX IF NOT EXISTS "recordings_camera_start_time_end_time" ON "recordings" ("camera", "start_time" DESC, "end_time" DESC);
+            CREATE INDEX IF NOT EXISTS "recordings_camera_end_time" ON "recordings" ("camera", "end_time" ASC);
             CREATE UNIQUE INDEX IF NOT EXISTS "recordings_path" ON "recordings" ("path");
             CREATE INDEX IF NOT EXISTS "review_segment_camera" ON "reviewsegment" ("camera");
             CREATE INDEX IF NOT EXISTS "review_segment_start_time_end_time" ON "reviewsegment" ("start_time" DESC, "end_time" DESC);
+            CREATE INDEX IF NOT EXISTS "review_segment_camera_start_time_end_time" ON "reviewsegment" ("camera", "start_time" ASC, "end_time" ASC);
             CREATE INDEX IF NOT EXISTS "event_camera" ON "event" ("camera");
             CREATE INDEX IF NOT EXISTS "event_start_time_end_time" ON "event" ("start_time" DESC, "end_time" DESC);
+            CREATE INDEX IF NOT EXISTS "event_camera_start_time_end_time" ON "event" ("camera", "start_time" ASC, "end_time" ASC);
             CREATE UNIQUE INDEX IF NOT EXISTS "userreviewstatus_user_segment" ON "userreviewstatus" ("user_id", "review_segment_id");
             CREATE TABLE IF NOT EXISTS "api_token" (
                 "id" TEXT NOT NULL PRIMARY KEY,
@@ -2140,71 +2143,89 @@ impl NinjaDatabase {
         pre_capture_sec: f64,
         post_capture_sec: f64,
     ) -> Result<Vec<String>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT r.id, r.path
-            FROM recordings r
-            WHERE r.camera = ?1
-              AND (
-                r.end_time < ?3
-                OR (
-                  COALESCE(r.objects, 0) = 0
-                  AND (
-                    (COALESCE(r.motion, 0) = 0 AND r.end_time < ?2)
-                    OR r.end_time < ?6
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM event e
-                    WHERE e.camera = r.camera
-                      AND r.end_time >= (e.start_time - ?4)
-                      AND r.start_time <= (COALESCE(e.end_time, e.start_time + 15.0) + ?5)
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM reviewsegment rv
-                    WHERE rv.camera = r.camera
-                      AND r.end_time >= (rv.start_time - ?4)
-                      AND r.start_time <= (COALESCE(rv.end_time, rv.start_time + 15.0) + ?5)
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM recordings r2
-                    WHERE r2.camera = r.camera
-                      AND r2.id != r.id
-                      AND COALESCE(r2.objects, 0) > 0
-                      AND r.end_time >= (r2.start_time - ?4)
-                      AND r.start_time <= (r2.end_time + ?5)
-                  )
-                )
-              )
-            ORDER BY r.end_time ASC
-            LIMIT 500
-            "#,
-        )?;
-        let rows = stmt.query_map(
-            params![
-                camera,
-                continuous_before_ts,
-                event_before_ts,
-                pre_capture_sec,
-                post_capture_sec,
-                motion_before_ts
-            ],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        )?;
+        let max_cutoff_ts = continuous_before_ts
+            .max(motion_before_ts)
+            .max(event_before_ts);
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
         let mut ids = Vec::new();
         let mut paths = Vec::new();
-        for r in rows {
-            let (id, path) = r?;
-            ids.push(id);
-            paths.push(path);
+        {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT r.id, r.path
+                FROM recordings r
+                WHERE r.camera = ?1
+                  AND r.end_time < ?7
+                  AND (
+                    r.end_time < ?3
+                    OR (
+                      COALESCE(r.objects, 0) = 0
+                      AND (
+                        (COALESCE(r.motion, 0) = 0 AND r.end_time < ?2)
+                        OR r.end_time < ?6
+                      )
+                      AND (
+                        (?4 <= 0.0 AND ?5 <= 0.0)
+                        OR (
+                          NOT EXISTS (
+                            SELECT 1 FROM event e
+                            WHERE e.camera = r.camera
+                              AND e.start_time >= (r.start_time - ?5 - 86400.0)
+                              AND e.start_time <= (r.end_time + ?4)
+                              AND COALESCE(e.end_time, e.start_time + 15.0) >= (r.start_time - ?5)
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM reviewsegment rv
+                            WHERE rv.camera = r.camera
+                              AND rv.start_time >= (r.start_time - ?5 - 86400.0)
+                              AND rv.start_time <= (r.end_time + ?4)
+                              AND COALESCE(rv.end_time, rv.start_time + 15.0) >= (r.start_time - ?5)
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM recordings r2
+                            WHERE r2.camera = r.camera
+                              AND r2.start_time >= (r.start_time - ?5 - 300.0)
+                              AND r2.start_time <= (r.end_time + ?4)
+                              AND r2.end_time >= (r.start_time - ?5)
+                              AND COALESCE(r2.objects, 0) > 0
+                              AND r2.id != r.id
+                          )
+                        )
+                      )
+                    )
+                  )
+                ORDER BY r.end_time ASC
+                LIMIT 500
+                "#,
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    camera,
+                    continuous_before_ts,
+                    event_before_ts,
+                    pre_capture_sec,
+                    post_capture_sec,
+                    motion_before_ts,
+                    max_cutoff_ts
+                ],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?;
+            for r in rows {
+                let (id, path) = r?;
+                ids.push(id);
+                paths.push(path);
+            }
         }
-        drop(stmt);
 
         if !ids.is_empty() {
-            let mut del_stmt = conn.prepare("DELETE FROM recordings WHERE id = ?1")?;
-            for id in &ids {
-                del_stmt.execute(params![id])?;
+            let tx = conn.transaction()?;
+            {
+                let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1")?;
+                for id in &ids {
+                    del_stmt.execute(params![id])?;
+                }
             }
+            tx.commit()?;
         }
         Ok(paths)
     }
@@ -2231,16 +2252,18 @@ impl NinjaDatabase {
               AND NOT EXISTS (
                 SELECT 1 FROM event e
                 WHERE e.camera = r.camera
-                  AND r.end_time >= (e.start_time - ?3)
-                  AND r.start_time <= (COALESCE(e.end_time, e.start_time + 15.0) + ?4)
+                  AND e.start_time >= (r.start_time - ?4 - 86400.0)
+                  AND e.start_time <= (r.end_time + ?3)
+                  AND COALESCE(e.end_time, e.start_time + 15.0) >= (r.start_time - ?4)
               )
               AND NOT EXISTS (
                 SELECT 1 FROM reviewsegment rv
                 WHERE rv.camera = r.camera
-                  AND r.end_time >= (rv.start_time - ?3)
-                  AND r.start_time <= (COALESCE(rv.end_time, rv.start_time + 15.0) + ?4)
+                  AND rv.start_time >= (r.start_time - ?4 - 86400.0)
+                  AND rv.start_time <= (r.end_time + ?3)
+                  AND COALESCE(rv.end_time, rv.start_time + 15.0) >= (r.start_time - ?4)
               )
-            ORDER BY r.start_time ASC
+            ORDER BY r.end_time ASC
             LIMIT ?5
             "#
         } else {
@@ -2251,7 +2274,7 @@ impl NinjaDatabase {
               AND r.end_time < ?2
               AND COALESCE(r.stream_tier, 'main') != 'compacted'
               AND (?3 >= 0.0 AND ?4 >= 0.0)
-            ORDER BY r.start_time ASC
+            ORDER BY r.end_time ASC
             LIMIT ?5
             "#
         };
@@ -3039,6 +3062,59 @@ mod tests {
         assert!(db.update_user_role("operator1", "admin").unwrap());
         assert!(db.delete_user("operator1").unwrap());
         assert!(db.get_user("operator1").unwrap().is_none());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn retention_window_cleanup_uses_indexed_bounds_and_protects_pre_post_capture() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr-retention-win-{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // Insert 3 segments around an event at [1010, 1020] with pre=15s, post=15s:
+        // seg_far_old [900, 910] -> outside pre_capture window -> should be deleted
+        // seg_pre     [998, 1008] -> within 15s pre_capture of event [1010, 1020] -> protected
+        // seg_event   [1010, 1020] -> has objects=1 -> protected until event_before_ts
+        // seg_post    [1022, 1032] -> within 15s post_capture of event [1010, 1020] -> protected
+        for (id, start, end, objects) in [
+            ("seg_far_old", 900.0, 910.0, 0),
+            ("seg_pre", 998.0, 1008.0, 0),
+            ("seg_event", 1010.0, 1020.0, 1),
+            ("seg_post", 1022.0, 1032.0, 0),
+        ] {
+            db.insert_recording(&RecordingRow {
+                id: id.to_string(),
+                camera: "sala".to_string(),
+                path: format!("/media/ninjanvr/recordings/{id}.mp4"),
+                start_time: start,
+                end_time: end,
+                duration: 10.0,
+                motion: 0,
+                objects,
+                dbfs: 0,
+                segment_size: 1.0,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        }
+
+        let pruned = db
+            .delete_expired_recordings_with_window(
+                "sala", 2000.0, // continuous_before_ts
+                2000.0, // motion_before_ts
+                500.0,  // event_before_ts
+                15.0,   // pre_capture_sec
+                15.0,   // post_capture_sec
+            )
+            .unwrap();
+        assert_eq!(pruned, vec!["/media/ninjanvr/recordings/seg_far_old.mp4"]);
+
+        let remaining = db.query_recordings("sala", 800.0, 1100.0).unwrap();
+        assert_eq!(remaining.len(), 3);
 
         let _ = std::fs::remove_file(&tmp);
     }

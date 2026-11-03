@@ -14,7 +14,7 @@ use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tracing::{error, info};
 
-#[tokio::main(worker_threads = 2)]
+#[tokio::main(worker_threads = 4)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(

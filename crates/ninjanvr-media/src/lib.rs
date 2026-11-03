@@ -1329,6 +1329,7 @@ impl RecordingEngine {
             compact_preset: String,
             compact_hwaccel: String,
         }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         loop {
             let (expire_interval, camera_retentions, global_quota_gb, global_min_free_gb): (
                 u64,
@@ -1368,9 +1369,18 @@ impl RecordingEngine {
                             as f64;
                         let min_buffer_days = ((pre_cap + post_cap + 60.0) / 86400.0).max(0.002);
                         let continuous_days = c.record.continuous.days.max(min_buffer_days);
-                        let motion_days = c.record.motion.days.max(continuous_days);
                         let alerts_days = c.record.alerts.retain.days.max(0.1);
                         let detections_days = c.record.detections.retain.days.max(0.1);
+                        let event_days = alerts_days.min(detections_days);
+                        let motion_days = if c.record.motion.days > 0.0 {
+                            c.record.motion.days.max(continuous_days)
+                        } else if c.record.alerts.retain.mode != "active_objects"
+                            || c.record.detections.retain.mode != "active_objects"
+                        {
+                            event_days.max(continuous_days)
+                        } else {
+                            continuous_days
+                        };
                         let quota_gb = c
                             .record
                             .max_size_gb
@@ -1460,14 +1470,20 @@ impl RecordingEngine {
                 let detections_cutoff = now - detections_days * 86400.0;
                 let event_recording_cutoff = alerts_cutoff.min(detections_cutoff);
                 loop {
-                    let Ok(expired_paths) = self.db.delete_expired_recordings_with_window(
-                        &camera,
-                        continuous_cutoff,
-                        motion_cutoff,
-                        event_recording_cutoff,
-                        pre_capture_sec,
-                        post_capture_sec,
-                    ) else {
+                    let db_ref = self.db.clone();
+                    let cam_ref = camera.clone();
+                    let Ok(Ok(expired_paths)) = tokio::task::spawn_blocking(move || {
+                        db_ref.delete_expired_recordings_with_window(
+                            &cam_ref,
+                            continuous_cutoff,
+                            motion_cutoff,
+                            event_recording_cutoff,
+                            pre_capture_sec,
+                            post_capture_sec,
+                        )
+                    })
+                    .await
+                    else {
                         break;
                     };
                     if expired_paths.is_empty() {
@@ -1493,6 +1509,7 @@ impl RecordingEngine {
                     info!(
                         "Retention cleanup for {camera}: pruned {batch_len} DB rows and {removed_files} segment files"
                     );
+                    tokio::task::yield_now().await;
                     if batch_len < 500 {
                         break;
                     }
@@ -1516,11 +1533,17 @@ impl RecordingEngine {
                     }
                 }
 
-                if let Ok(clip_paths) = self.db.cleanup_expired_events_and_reviews(
-                    &camera,
-                    alerts_cutoff,
-                    detections_cutoff,
-                ) {
+                let db_ev = self.db.clone();
+                let cam_ev = camera.clone();
+                if let Ok(Ok(clip_paths)) = tokio::task::spawn_blocking(move || {
+                    db_ev.cleanup_expired_events_and_reviews(
+                        &cam_ev,
+                        alerts_cutoff,
+                        detections_cutoff,
+                    )
+                })
+                .await
+                {
                     for cp in clip_paths {
                         let disk_path = if let Some(rel) = strip_media_root(&cp) {
                             self.media_dir.join(rel)
@@ -1671,7 +1694,8 @@ impl RecordingEngine {
             }
 
             // Periodic SQLite query-planner optimization & WAL checkpointing
-            let _ = self.db.run_maintenance();
+            let db_maint = self.db.clone();
+            let _ = tokio::task::spawn_blocking(move || db_maint.run_maintenance()).await;
 
             tokio::time::sleep(std::time::Duration::from_secs(expire_interval)).await;
         }
