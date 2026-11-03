@@ -35,7 +35,9 @@ import {
   StateRoiConfig,
 } from "../../types/nvr";
 import {
+  buildGenAiProviderChangePatch,
   DEFAULT_LPR_FORMAT_REGEX,
+  normalizeDiscoveredGenAiModels,
   normalizeLicensePlate,
   validateLicensePlateFormat,
 } from "../../utils/configYaml";
@@ -1939,14 +1941,23 @@ export const AiDetectionObjectsSection: React.FC<{
     enabled: false,
     provider: "gemini",
     base_url: null,
+    api_key: null,
+    has_api_key: false,
     api_key_env: "GEMINI_API_KEY",
-    model: "gemini-2.5-flash",
+    model: "",
     verify_ambiguous_alerts: false,
     ambiguous_score_min: 0.45,
     ambiguous_score_max: 0.72,
     auto_suppress_false_positives: true,
     timeout_ms: 5000,
   };
+
+  const [genaiModels, setGenaiModels] = useState<string[]>([]);
+  const [genaiValidating, setGenaiValidating] = useState(false);
+  const [genaiValidationState, setGenaiValidationState] = useState<{
+    status: "idle" | "valid" | "invalid";
+    message?: string;
+  }>({ status: "idle" });
 
   const updateGenAi = (patch: Partial<GenAiConfig>) => {
     updateDraft((next) => {
@@ -1957,6 +1968,65 @@ export const AiDetectionObjectsSection: React.FC<{
       };
     });
   };
+
+  const handleValidateGenAiApi = async () => {
+    setGenaiValidating(true);
+    setGenaiValidationState({ status: "idle" });
+    try {
+      const res = await fetch("/api/genai/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          provider: genaiCfg.provider || "gemini",
+          api_key:
+            genaiCfg.api_key && genaiCfg.api_key !== "***"
+              ? genaiCfg.api_key
+              : undefined,
+          api_key_env: genaiCfg.api_key_env || "GEMINI_API_KEY",
+          base_url: genaiCfg.base_url || null,
+          clear_api_key: genaiCfg.clear_api_key || false,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      const loadedModels = normalizeDiscoveredGenAiModels(data);
+      if (res.ok && loadedModels.length > 0) {
+        setGenaiModels(loadedModels);
+        const msg =
+          data?.message ||
+          (isPt
+            ? `API validada (${loadedModels.length} modelos disponíveis)`
+            : `API validated (${loadedModels.length} models available)`);
+        setGenaiValidationState({ status: "valid", message: msg });
+        if (genaiCfg.model && !loadedModels.includes(genaiCfg.model)) {
+          updateGenAi({ model: "" });
+        }
+        notify(msg);
+      } else {
+        setGenaiModels([]);
+        const errMsg =
+          data?.message ||
+          (isPt
+            ? "Falha ao validar API ou nenhum modelo disponível"
+            : "API validation failed or no models returned");
+        setGenaiValidationState({ status: "invalid", message: errMsg });
+        notify(errMsg);
+      }
+    } catch {
+      setGenaiModels([]);
+      const errMsg = isPt
+        ? "Erro de conexão ao validar API do provedor"
+        : "Network error while validating provider API";
+      setGenaiValidationState({ status: "invalid", message: errMsg });
+      notify(errMsg);
+    } finally {
+      setGenaiValidating(false);
+    }
+  };
+
+  const genaiModelOptions = Array.from(
+    new Set([...(genaiCfg.model ? [genaiCfg.model] : []), ...genaiModels])
+  );
 
   const [enrolledProfiles, setEnrolledProfiles] = useState<EnrolledFaceProfileItem[]>([]);
   const [enrollNameInput, setEnrollNameInput] = useState("");
@@ -3530,11 +3600,19 @@ export const AiDetectionObjectsSection: React.FC<{
               ? "JUIZ DE IA VISUAL (GENAI) — AUDITORIA DE ALERTAS AMBÍGUOS & FALSOS POSITIVOS"
               : "VISION AI JUDGE (GENAI) — AMBIGUOUS ALERT VERIFICATION & AUTO-SUPPRESSION"}
           </span>
-          <span className={`nvr-badge ${genaiCfg.enabled ? "live" : ""}`}>
+          <span
+            className={`nvr-badge ${
+              genaiCfg.enabled && Boolean(genaiCfg.model) ? "live" : ""
+            }`}
+          >
             <Sparkles size={11} />
             {(genaiCfg.provider || "gemini").toUpperCase()} ·{" "}
-            {genaiCfg.model || "gemini-2.5-flash"} ·{" "}
-            {genaiCfg.enabled ? "ACTIVE" : "STANDBY"}
+            {genaiCfg.model
+              ? genaiCfg.model
+              : isPt
+              ? "MODELO NÃO SELECIONADO"
+              : "NO MODEL SELECTED"}{" "}
+            · {genaiCfg.enabled ? "ACTIVE" : "STANDBY"}
           </span>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
@@ -3547,8 +3625,8 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
               <div className="nvr-field-desc">
                 {isPt
-                  ? "Permite verificar snapshots com IA sob demanda ou auditar automaticamente detecções limítrofes."
-                  : "Allows on-demand AI snapshot verification and optional automatic auditing of borderline alerts."}
+                  ? "Fluxo guiado: 1. Escolha o provedor → 2. Configure a API → 3. Valide a API → 4. Selecione o Vision Model carregado."
+                  : "Guided flow: 1. Choose provider → 2. Configure API → 3. Validate API → 4. Select available Vision Model from dropdown."}
               </div>
             </div>
             <ToggleSwitch
@@ -3561,8 +3639,10 @@ export const AiDetectionObjectsSection: React.FC<{
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.2fr) minmax(0, 1.2fr) minmax(0, 1.6fr)",
+              gridTemplateColumns:
+                "minmax(0, 1fr) minmax(0, 1.15fr) minmax(0, 0.9fr) minmax(0, 1.35fr)",
               gap: 8,
+              alignItems: "end",
             }}
           >
             <div>
@@ -3570,7 +3650,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 className="mono"
                 style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
               >
-                {isPt ? "Provedor (provider)" : "Provider"}
+                {isPt ? "1. Provedor (provider)" : "1. Provider"}
               </div>
               <select
                 className="nvr-select mono"
@@ -3578,26 +3658,11 @@ export const AiDetectionObjectsSection: React.FC<{
                 style={{ width: "100%", marginTop: 2 }}
                 value={genaiCfg.provider || "gemini"}
                 onChange={(e) => {
-                  const p = e.target.value;
-                  if (p === "gemini") {
-                    updateGenAi({
-                      provider: "gemini",
-                      model: "gemini-2.5-flash",
-                      api_key_env: "GEMINI_API_KEY",
-                    });
-                  } else if (p === "openai") {
-                    updateGenAi({
-                      provider: "openai",
-                      model: "gpt-4o-mini",
-                      api_key_env: "OPENAI_API_KEY",
-                    });
-                  } else {
-                    updateGenAi({
-                      provider: "ollama",
-                      model: "qwen2.5vl:7b",
-                      base_url: genaiCfg.base_url || "http://127.0.0.1:11434",
-                    });
-                  }
+                  updateGenAi(
+                    buildGenAiProviderChangePatch(e.target.value, genaiCfg.base_url)
+                  );
+                  setGenaiModels([]);
+                  setGenaiValidationState({ status: "idle" });
                 }}
               >
                 <option value="gemini">Google Gemini (gemini)</option>
@@ -3611,15 +3676,36 @@ export const AiDetectionObjectsSection: React.FC<{
                 className="mono"
                 style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
               >
-                {isPt ? "Modelo Visual (model)" : "Vision Model"}
+                {isPt ? "2. Chave da API (api_key)" : "2. API Key"}
+                {genaiCfg.has_api_key ? " (Saved)" : ""}
               </div>
               <input
+                type="password"
                 className="nvr-input mono"
-                aria-label="Vision AI Judge Model"
+                aria-label="Vision AI Judge API Key"
                 style={{ width: "100%", marginTop: 2 }}
-                placeholder="gemini-2.5-flash"
-                value={genaiCfg.model}
-                onChange={(e) => updateGenAi({ model: e.target.value })}
+                placeholder={
+                  genaiCfg.has_api_key
+                    ? "•••••••• (saved key)"
+                    : genaiCfg.provider === "ollama"
+                    ? isPt
+                      ? "Opcional (Ollama local)"
+                      : "Optional (Local Ollama)"
+                    : isPt
+                    ? `Cole a chave ou use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
+                    : `Paste key or use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
+                }
+                value={
+                  genaiCfg.api_key === "***" ? "" : genaiCfg.api_key || ""
+                }
+                onChange={(e) => {
+                  const val = e.target.value;
+                  updateGenAi({
+                    api_key: val || (genaiCfg.has_api_key ? "***" : null),
+                    clear_api_key: false,
+                  });
+                  setGenaiValidationState({ status: "idle" });
+                }}
               />
             </div>
 
@@ -3628,15 +3714,24 @@ export const AiDetectionObjectsSection: React.FC<{
                 className="mono"
                 style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
               >
-                {isPt ? "Variável da Chave API (api_key_env)" : "API Key Env Var"}
+                {isPt ? "Variável Env (api_key_env)" : "API Key Env Var"}
               </div>
               <input
                 className="nvr-input mono"
                 aria-label="Vision AI Judge API Key Env"
                 style={{ width: "100%", marginTop: 2 }}
-                placeholder="GEMINI_API_KEY"
+                placeholder={
+                  genaiCfg.provider === "openai"
+                    ? "OPENAI_API_KEY"
+                    : genaiCfg.provider === "ollama"
+                    ? "OLLAMA_API_KEY"
+                    : "GEMINI_API_KEY"
+                }
                 value={genaiCfg.api_key_env}
-                onChange={(e) => updateGenAi({ api_key_env: e.target.value })}
+                onChange={(e) => {
+                  updateGenAi({ api_key_env: e.target.value });
+                  setGenaiValidationState({ status: "idle" });
+                }}
               />
             </div>
 
@@ -3646,7 +3741,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
               >
                 {isPt
-                  ? "Endpoint Customizado (base_url)"
+                  ? "Custom Endpoint Base URL (LLM Proxy)"
                   : "Custom Endpoint Base URL"}
               </div>
               <input
@@ -3656,17 +3751,129 @@ export const AiDetectionObjectsSection: React.FC<{
                 placeholder={
                   genaiCfg.provider === "ollama"
                     ? "http://127.0.0.1:11434"
-                    : "Optional endpoint override..."
+                    : isPt
+                    ? "Opcional (Proxy LLM / OpenRouter / LiteLLM)..."
+                    : "Optional endpoint override (LLM proxy)..."
                 }
                 value={genaiCfg.base_url || ""}
-                onChange={(e) =>
+                onChange={(e) => {
                   updateGenAi({
                     base_url: e.target.value.trim() ? e.target.value.trim() : null,
-                  })
-                }
+                  });
+                  setGenaiValidationState({ status: "idle" });
+                }}
               />
             </div>
           </div>
+
+          <div
+            className="nvr-subcard"
+            style={{
+              padding: "8px 10px",
+              display: "grid",
+              gridTemplateColumns: "auto minmax(0, 1fr)",
+              gap: 10,
+              alignItems: "end",
+            }}
+          >
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt ? "3. Validar API & Buscar Modelos" : "3. Validate API & Fetch Models"}
+              </div>
+              <button
+                type="button"
+                className={`nvr-btn mono ${
+                  genaiValidationState.status === "valid" ? "success" : "primary"
+                }`}
+                aria-label="Validate Vision AI Judge API"
+                style={{
+                  marginTop: 2,
+                  height: 28,
+                  padding: "0 12px",
+                  whiteSpace: "nowrap",
+                  fontSize: "var(--text-xs)",
+                }}
+                disabled={genaiValidating}
+                onClick={() => void handleValidateGenAiApi()}
+              >
+                <CheckCircle2 size={12} />
+                {genaiValidating
+                  ? isPt
+                    ? "Validando API..."
+                    : "Validating API..."
+                  : genaiValidationState.status === "valid"
+                  ? isPt
+                    ? `API Validada (${genaiModels.length} modelos)`
+                    : `API Validated (${genaiModels.length} models)`
+                  : isPt
+                  ? "Validar API & Carregar Modelos"
+                  : "Validate API & Load Models"}
+              </button>
+            </div>
+
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt
+                  ? "4. Modelo Visual (selecione após validar)"
+                  : "4. Vision Model (select after API validation)"}
+              </div>
+              <select
+                className="nvr-select mono"
+                aria-label="Vision AI Judge Model"
+                style={{ width: "100%", marginTop: 2 }}
+                disabled={genaiModelOptions.length === 0}
+                value={genaiCfg.model || ""}
+                onChange={(e) => updateGenAi({ model: e.target.value })}
+              >
+                <option value="">
+                  {genaiModelOptions.length === 0
+                    ? isPt
+                      ? "— Valide a API para carregar os modelos disponíveis —"
+                      : "— Validate API to load available models —"
+                    : isPt
+                    ? `— Escolha o Vision Model na lista (${genaiModelOptions.length} disponíveis) —`
+                    : `— Select Vision Model from list (${genaiModelOptions.length} available) —`}
+                </option>
+                {genaiModelOptions.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {genaiValidationState.status !== "idle" &&
+            genaiValidationState.message && (
+              <div
+                className="mono"
+                style={{
+                  padding: "5px 8px",
+                  borderRadius: 3,
+                  fontSize: "var(--text-xs)",
+                  background:
+                    genaiValidationState.status === "valid"
+                      ? "rgba(16, 185, 129, 0.12)"
+                      : "rgba(239, 68, 68, 0.12)",
+                  border:
+                    genaiValidationState.status === "valid"
+                      ? "1px solid rgba(16, 185, 129, 0.4)"
+                      : "1px solid rgba(239, 68, 68, 0.4)",
+                  color:
+                    genaiValidationState.status === "valid"
+                      ? "var(--signal-live-text)"
+                      : "var(--signal-alert-text)",
+                }}
+              >
+                {genaiValidationState.message}
+              </div>
+            )}
 
           <div
             style={{

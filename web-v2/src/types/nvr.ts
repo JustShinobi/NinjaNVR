@@ -470,6 +470,9 @@ export interface GenAiConfig {
   enabled: boolean;
   provider: "gemini" | "openai" | "ollama" | string;
   base_url?: string | null;
+  api_key?: string | null;
+  has_api_key?: boolean;
+  clear_api_key?: boolean;
   api_key_env: string;
   model: string;
   verify_ambiguous_alerts: boolean;
@@ -477,6 +480,13 @@ export interface GenAiConfig {
   ambiguous_score_max: number;
   auto_suppress_false_positives: boolean;
   timeout_ms?: number;
+}
+
+export interface GenAiValidationResponse {
+  valid: boolean;
+  provider: string;
+  models: string[];
+  message?: string;
 }
 
 export interface FalsePositiveSignatureItem {

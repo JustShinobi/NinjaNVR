@@ -1,4 +1,4 @@
-import { NinjaConfigResponse } from "../types/nvr";
+import { GenAiConfig, NinjaConfigResponse } from "../types/nvr";
 
 /**
  * Extracts all raw `rtsp://...` or `rtsps://...` URLs from an existing raw YAML string
@@ -52,6 +52,87 @@ function extractOriginalOnvifPasswords(rawYaml: string): Record<string, string> 
     }
   }
   return result;
+}
+
+function extractOriginalGenAiApiKey(rawYaml: string): string | undefined {
+  const lines = rawYaml.split(/\r?\n/);
+  let inGenAi = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const indent = line.search(/\S/);
+    if (indent === 0) {
+      inGenAi = /^genai\s*:/.test(trimmed);
+      continue;
+    }
+    if (inGenAi && indent >= 2) {
+      const m = trimmed.match(/^api_key\s*:\s*(.+)$/);
+      if (m) {
+        const rawVal = m[1].replace(/\s+#.*$/, "").trim();
+        const unquoted = rawVal.replace(/^["']|["']$/g, "");
+        if (unquoted && unquoted !== "***" && unquoted !== "*" && unquoted !== "null") {
+          return unquoted;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+export function buildGenAiProviderChangePatch(
+  provider: string,
+  currentBaseUrl?: string | null
+): Partial<GenAiConfig> {
+  const p = provider.trim().toLowerCase();
+  if (p === "openai") {
+    return {
+      provider: "openai",
+      api_key_env: "OPENAI_API_KEY",
+      model: "",
+    };
+  }
+  if (p === "ollama") {
+    return {
+      provider: "ollama",
+      api_key_env: "OLLAMA_API_KEY",
+      base_url: currentBaseUrl || "http://127.0.0.1:11434",
+      model: "",
+    };
+  }
+  return {
+    provider: "gemini",
+    api_key_env: "GEMINI_API_KEY",
+    model: "",
+  };
+}
+
+export function normalizeDiscoveredGenAiModels(payload: unknown): string[] {
+  const rawList: unknown[] = Array.isArray(payload)
+    ? payload
+    : payload &&
+      typeof payload === "object" &&
+      Array.isArray((payload as { models?: unknown[] }).models)
+    ? (payload as { models: unknown[] }).models
+    : [];
+  const out: string[] = [];
+  for (const item of rawList) {
+    const str =
+      typeof item === "string"
+        ? item
+        : item && typeof item === "object"
+        ? String(
+            (item as { id?: string; name?: string; model?: string }).id ||
+              (item as { id?: string; name?: string; model?: string }).name ||
+              (item as { id?: string; name?: string; model?: string }).model ||
+              ""
+          )
+        : "";
+    const cleaned = str.trim().replace(/^models\//, "");
+    if (cleaned && !out.includes(cleaned)) {
+      out.push(cleaned);
+    }
+  }
+  return out;
 }
 
 function scrubUrl(input: string): string {
@@ -200,6 +281,7 @@ export function buildCleanYamlFromDraft(
 ): string {
   const originals = extractOriginalUrls(originalRawYaml);
   const originalOnvifPasswords = extractOriginalOnvifPasswords(originalRawYaml);
+  const originalGenAiApiKey = extractOriginalGenAiApiKey(originalRawYaml);
 
   const streamsOut: Record<string, unknown> = {};
   for (const [sName, sVal] of Object.entries(draft.go2rtc?.streams || {})) {
@@ -470,28 +552,39 @@ export function buildCleanYamlFromDraft(
       model_type: draft.model?.model_type || "ssd",
     },
     ...(draft.genai
-      ? {
-          genai: {
-            enabled: draft.genai.enabled ?? false,
-            provider: draft.genai.provider || "gemini",
-            ...(draft.genai.base_url ? { base_url: draft.genai.base_url } : {}),
-            api_key_env: draft.genai.api_key_env || "GEMINI_API_KEY",
-            model: draft.genai.model || "gemini-2.5-flash",
-            verify_ambiguous_alerts:
-              draft.genai.verify_ambiguous_alerts ?? false,
-            ambiguous_score_min: Number(
-              (draft.genai.ambiguous_score_min ?? 0.45).toFixed(2)
-            ),
-            ambiguous_score_max: Number(
-              (draft.genai.ambiguous_score_max ?? 0.72).toFixed(2)
-            ),
-            auto_suppress_false_positives:
-              draft.genai.auto_suppress_false_positives ?? true,
-            ...(draft.genai.timeout_ms
-              ? { timeout_ms: draft.genai.timeout_ms }
-              : {}),
-          },
-        }
+      ? (() => {
+          const rawApiKey = draft.genai.clear_api_key
+            ? undefined
+            : draft.genai.api_key &&
+              draft.genai.api_key.trim() !== "" &&
+              draft.genai.api_key.trim() !== "***" &&
+              draft.genai.api_key.trim() !== "*"
+            ? draft.genai.api_key.trim()
+            : originalGenAiApiKey;
+          return {
+            genai: {
+              enabled: draft.genai.enabled ?? false,
+              provider: draft.genai.provider || "gemini",
+              ...(draft.genai.base_url ? { base_url: draft.genai.base_url } : {}),
+              ...(rawApiKey ? { api_key: rawApiKey } : {}),
+              api_key_env: draft.genai.api_key_env || "GEMINI_API_KEY",
+              model: draft.genai.model ?? "",
+              verify_ambiguous_alerts:
+                draft.genai.verify_ambiguous_alerts ?? false,
+              ambiguous_score_min: Number(
+                (draft.genai.ambiguous_score_min ?? 0.45).toFixed(2)
+              ),
+              ambiguous_score_max: Number(
+                (draft.genai.ambiguous_score_max ?? 0.72).toFixed(2)
+              ),
+              auto_suppress_false_positives:
+                draft.genai.auto_suppress_false_positives ?? true,
+              ...(draft.genai.timeout_ms
+                ? { timeout_ms: draft.genai.timeout_ms }
+                : {}),
+            },
+          };
+        })()
       : {}),
     ...(draft.face_recognition
       ? {

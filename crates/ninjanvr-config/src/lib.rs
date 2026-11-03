@@ -190,6 +190,8 @@ pub struct GenAiConfig {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     #[serde(default = "default_genai_api_key_env")]
     pub api_key_env: String,
     #[serde(default = "default_genai_model")]
@@ -213,7 +215,7 @@ fn default_genai_api_key_env() -> String {
     "GEMINI_API_KEY".to_string()
 }
 fn default_genai_model() -> String {
-    "gemini-2.5-flash".to_string()
+    String::new()
 }
 fn default_ambiguous_score_min() -> f32 {
     0.45
@@ -231,6 +233,7 @@ impl Default for GenAiConfig {
             enabled: false,
             provider: default_genai_provider(),
             base_url: None,
+            api_key: None,
             api_key_env: default_genai_api_key_env(),
             model: default_genai_model(),
             verify_ambiguous_alerts: false,
@@ -239,6 +242,42 @@ impl Default for GenAiConfig {
             auto_suppress_false_positives: true,
             timeout_ms: default_genai_timeout_ms(),
         }
+    }
+}
+
+impl GenAiConfig {
+    pub fn has_api_key(&self) -> bool {
+        self.api_key
+            .as_ref()
+            .is_some_and(|k| !k.trim().is_empty() && k.trim() != "***" && k.trim() != "*")
+    }
+
+    pub fn resolve_api_key(&self) -> String {
+        if let Some(ref key) = self.api_key {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() && trimmed != "***" && trimmed != "*" {
+                if let Some(env_name) = trimmed.strip_prefix('$')
+                    && let Ok(val) = std::env::var(env_name.trim())
+                    && !val.trim().is_empty()
+                {
+                    return val.trim().to_string();
+                }
+                if let Ok(val) = std::env::var(trimmed)
+                    && !val.trim().is_empty()
+                {
+                    return val.trim().to_string();
+                }
+                return trimmed.to_string();
+            }
+        }
+        let env_var = self.api_key_env.trim();
+        if !env_var.is_empty()
+            && let Ok(val) = std::env::var(env_var)
+            && !val.trim().is_empty()
+        {
+            return val.trim().to_string();
+        }
+        String::new()
     }
 }
 
@@ -2366,6 +2405,7 @@ impl NinjaConfig {
                 "provider": self.genai.provider,
                 "base_url": self.genai.base_url,
                 "api_key_env": self.genai.api_key_env,
+                "has_api_key": self.genai.has_api_key(),
                 "model": self.genai.model,
                 "verify_ambiguous_alerts": self.genai.verify_ambiguous_alerts,
                 "ambiguous_score_min": self.genai.ambiguous_score_min,
@@ -2723,8 +2763,31 @@ impl NinjaConfig {
         if let Some(genai_val) = obj.get("genai")
             && genai_val.as_object().is_some_and(|m| !m.is_empty())
         {
-            self.genai =
+            let prev_key = self.genai.api_key.clone();
+            let clear_key = genai_val
+                .get("clear_api_key")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut next_genai: GenAiConfig =
                 serde_json::from_value(genai_val.clone()).context("invalid genai config")?;
+            if clear_key {
+                next_genai.api_key = None;
+            } else if next_genai
+                .api_key
+                .as_deref()
+                .map(|k| k.trim().is_empty() || k.trim() == "***" || k.trim() == "*")
+                .unwrap_or(true)
+            {
+                next_genai.api_key = prev_key;
+            }
+            if next_genai
+                .base_url
+                .as_deref()
+                .is_some_and(|u| u.trim().is_empty())
+            {
+                next_genai.base_url = None;
+            }
+            self.genai = next_genai;
         }
         if let Some(face_val) = obj.get("face_recognition") {
             self.face_recognition = serde_json::from_value(face_val.clone())
@@ -3132,20 +3195,28 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
             (chunk, "")
         };
         let trimmed_start = line_body.trim_start();
-        if let Some(after_key) = trimmed_start.strip_prefix("password:") {
-            let leading_ws = &line_body[..line_body.len() - trimmed_start.len()];
-            let val_part = after_key.trim();
-            let unquoted = val_part.trim_matches('"').trim_matches('\'').trim();
-            if !unquoted.is_empty()
-                && !unquoted.eq_ignore_ascii_case("null")
-                && unquoted != "~"
-                && !unquoted.starts_with('#')
-            {
-                scrubbed_lines.push_str(leading_ws);
-                scrubbed_lines.push_str("password: \"***\"");
-                scrubbed_lines.push_str(newline);
-                continue;
+        for secret_key in ["password:", "api_key:"] {
+            if let Some(after_key) = trimmed_start.strip_prefix(secret_key) {
+                let leading_ws = &line_body[..line_body.len() - trimmed_start.len()];
+                let val_part = after_key.trim();
+                let unquoted = val_part.trim_matches('"').trim_matches('\'').trim();
+                if !unquoted.is_empty()
+                    && !unquoted.eq_ignore_ascii_case("null")
+                    && unquoted != "~"
+                    && !unquoted.starts_with('#')
+                {
+                    scrubbed_lines.push_str(leading_ws);
+                    scrubbed_lines.push_str(secret_key);
+                    scrubbed_lines.push_str(" \"***\"");
+                    scrubbed_lines.push_str(newline);
+                    break;
+                }
             }
+        }
+        if scrubbed_lines.ends_with(&format!(" \"***\"{newline}"))
+            && (trimmed_start.starts_with("password:") || trimmed_start.starts_with("api_key:"))
+        {
+            continue;
         }
         scrubbed_lines.push_str(chunk);
     }
@@ -4332,6 +4403,8 @@ version: 0.18-0
 
     #[test]
     fn genai_config_roundtrips_yaml_and_structured_json() {
+        assert!(GenAiConfig::default().model.is_empty());
+
         let yaml = r#"
 genai:
   enabled: true
@@ -4364,11 +4437,13 @@ version: 0.18-0
         assert_eq!(api_val["genai"]["enabled"], true);
         assert_eq!(api_val["genai"]["provider"], "ollama");
         assert_eq!(api_val["genai"]["model"], "qwen2.5vl:7b");
+        assert_eq!(api_val["genai"]["has_api_key"], false);
 
         let patch = json!({
             "genai": {
                 "enabled": true,
                 "provider": "gemini",
+                "api_key": "test_direct_genai_key",
                 "api_key_env": "GEMINI_API_KEY",
                 "model": "gemini-2.5-flash",
                 "verify_ambiguous_alerts": false,
@@ -4381,8 +4456,23 @@ version: 0.18-0
         cfg.apply_structured_json(&patch).unwrap();
         assert_eq!(cfg.genai.provider, "gemini");
         assert_eq!(cfg.genai.model, "gemini-2.5-flash");
+        assert_eq!(cfg.genai.resolve_api_key(), "test_direct_genai_key");
+        assert_eq!(cfg.to_api_value()["genai"]["has_api_key"], true);
         assert!(!cfg.genai.verify_ambiguous_alerts);
         assert_eq!(cfg.genai.timeout_ms, 4500);
+
+        // Masked key "***" preserves the saved API key
+        let preserve_patch = json!({
+            "genai": {
+                "enabled": true,
+                "provider": "gemini",
+                "api_key": "***",
+                "api_key_env": "GEMINI_API_KEY",
+                "model": "gemini-2.5-flash"
+            }
+        });
+        cfg.apply_structured_json(&preserve_patch).unwrap();
+        assert_eq!(cfg.genai.resolve_api_key(), "test_direct_genai_key");
     }
 
     #[test]

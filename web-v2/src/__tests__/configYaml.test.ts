@@ -4,7 +4,9 @@ import { describe, expect, test } from "bun:test";
 import { NinjaConfigResponse } from "../types/nvr";
 import {
   buildCleanYamlFromDraft,
+  buildGenAiProviderChangePatch,
   formatLicensePlateBadge,
+  normalizeDiscoveredGenAiModels,
   normalizeLicensePlate,
   resolveKnownPlateLabel,
   validateLicensePlateFormat,
@@ -571,6 +573,34 @@ go2rtc:
     expect(formatSignatureBbox([0.15, 0.25, 0.35, 0.75])).toBe(
       "[0.15, 0.25, 0.35, 0.75]"
     );
+
+    expect(buildGenAiProviderChangePatch("gemini")).toEqual({
+      provider: "gemini",
+      api_key_env: "GEMINI_API_KEY",
+      model: "",
+    });
+    expect(buildGenAiProviderChangePatch("openai")).toEqual({
+      provider: "openai",
+      api_key_env: "OPENAI_API_KEY",
+      model: "",
+    });
+    expect(buildGenAiProviderChangePatch("ollama")).toEqual({
+      provider: "ollama",
+      api_key_env: "OLLAMA_API_KEY",
+      base_url: "http://127.0.0.1:11434",
+      model: "",
+    });
+
+    expect(
+      normalizeDiscoveredGenAiModels({
+        valid: true,
+        models: [
+          "models/gemini-2.5-flash",
+          "gemini-2.5-pro",
+          "gemini-2.5-flash",
+        ],
+      })
+    ).toEqual(["gemini-2.5-flash", "gemini-2.5-pro"]);
   });
 
   test("serializes camera onvif PTZ settings, restores scrubbed ONVIF password, and serializes zone.preset", () => {

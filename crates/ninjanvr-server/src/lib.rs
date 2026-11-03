@@ -594,7 +594,11 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         )
         .route("/classification/attributes", get(api_empty_array))
         .route("/classification/custom", get(api_empty_object))
-        .route("/genai/models", get(api_empty_array))
+        .route(
+            "/genai/models",
+            get(api_genai_models_get).post(api_genai_models_post),
+        )
+        .route("/genai/validate", post(api_genai_models_post))
         .route("/plus/models", get(api_empty_array))
         .route("/faces", get(api_faces_list))
         .route("/faces/{name}", delete(api_face_delete))
@@ -4274,6 +4278,359 @@ async fn api_delete_false_positive_signature(
     Json(json!({ "success": true, "deleted": deleted })).into_response()
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct GenAiValidateRequest {
+    pub provider: Option<String>,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
+    pub base_url: Option<String>,
+    pub clear_api_key: Option<bool>,
+    pub validate: Option<bool>,
+}
+
+fn build_effective_genai_config(
+    saved: &ninjanvr_config::GenAiConfig,
+    req: &GenAiValidateRequest,
+) -> ninjanvr_config::GenAiConfig {
+    let mut cfg = saved.clone();
+    if let Some(ref p) = req.provider
+        && !p.trim().is_empty()
+    {
+        cfg.provider = p.trim().to_string();
+    }
+    if let Some(ref b) = req.base_url {
+        let trimmed = b.trim();
+        cfg.base_url = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+    if let Some(ref env_name) = req.api_key_env
+        && !env_name.trim().is_empty()
+    {
+        cfg.api_key_env = env_name.trim().to_string();
+    }
+    if req.clear_api_key == Some(true) {
+        cfg.api_key = None;
+    } else if let Some(ref key) = req.api_key {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() && trimmed != "***" && trimmed != "*" {
+            cfg.api_key = Some(trimmed.to_string());
+        }
+    }
+    cfg
+}
+
+fn extract_models_from_provider_payload(provider: &str, val: &Value) -> Vec<String> {
+    let mut models = Vec::new();
+    fn push_unique(models: &mut Vec<String>, name: &str) {
+        let cleaned = name.trim().strip_prefix("models/").unwrap_or(name.trim());
+        if !cleaned.is_empty() && !models.iter().any(|m| m == cleaned) {
+            models.push(cleaned.to_string());
+        }
+    }
+
+    if provider == "gemini"
+        && let Some(arr) = val.get("models").and_then(|v| v.as_array())
+    {
+        for item in arr {
+            if let Some(methods) = item
+                .get("supportedGenerationMethods")
+                .and_then(|v| v.as_array())
+                && !methods.is_empty()
+                && !methods
+                    .iter()
+                    .any(|m| m.as_str() == Some("generateContent"))
+            {
+                continue;
+            }
+            if let Some(raw_name) = item
+                .get("name")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str())
+                .or_else(|| item.as_str())
+            {
+                let short = raw_name
+                    .trim()
+                    .strip_prefix("models/")
+                    .unwrap_or(raw_name.trim());
+                let lower = short.to_ascii_lowercase();
+                if lower.starts_with("embedding-")
+                    || lower.starts_with("text-embedding-")
+                    || lower == "aqa"
+                    || lower.starts_with("imagen-")
+                    || lower.starts_with("veo-")
+                {
+                    continue;
+                }
+                push_unique(&mut models, short);
+            }
+        }
+    }
+
+    if models.is_empty() {
+        for key in ["models", "data"] {
+            if let Some(arr) = val.get(key).and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        push_unique(&mut models, s);
+                    } else if let Some(s) = item
+                        .get("id")
+                        .or_else(|| item.get("name"))
+                        .or_else(|| item.get("model"))
+                        .and_then(|v| v.as_str())
+                    {
+                        push_unique(&mut models, s);
+                    }
+                }
+            }
+        }
+    }
+
+    if models.is_empty()
+        && let Some(arr) = val.as_array()
+    {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                push_unique(&mut models, s);
+            } else if let Some(s) = item
+                .get("id")
+                .or_else(|| item.get("name"))
+                .or_else(|| item.get("model"))
+                .and_then(|v| v.as_str())
+            {
+                push_unique(&mut models, s);
+            }
+        }
+    }
+
+    if provider == "openai" && models.len() > 1 {
+        let filtered: Vec<String> = models
+            .iter()
+            .filter(|m| {
+                let l = m.to_ascii_lowercase();
+                !l.starts_with("whisper-")
+                    && !l.starts_with("tts-")
+                    && !l.starts_with("dall-e-")
+                    && !l.starts_with("text-embedding-")
+                    && !l.starts_with("omni-moderation-")
+                    && !l.starts_with("babbage-")
+                    && !l.starts_with("davinci-")
+            })
+            .cloned()
+            .collect();
+        if !filtered.is_empty() {
+            return filtered;
+        }
+    }
+
+    models
+}
+
+pub async fn discover_genai_models(genai: &ninjanvr_config::GenAiConfig) -> Result<Vec<String>> {
+    let provider = genai.provider.trim().to_ascii_lowercase();
+    let api_key = genai.resolve_api_key();
+    let custom_base = genai
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let timeout_ms = genai.timeout_ms.clamp(1000, 30_000);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()?;
+
+    let resp = match provider.as_str() {
+        "openai" => {
+            if api_key.is_empty() && custom_base.is_none() {
+                anyhow::bail!(
+                    "Missing OpenAI API key. Enter an API key, set '{}', or provide a custom LLM proxy Base URL.",
+                    genai.api_key_env
+                );
+            }
+            let base = custom_base
+                .unwrap_or("https://api.openai.com/v1")
+                .trim_end_matches('/');
+            let url = if base.ends_with("/models") {
+                base.to_string()
+            } else if let Some(prefix) = base.strip_suffix("/chat/completions") {
+                format!("{}/models", prefix.trim_end_matches('/'))
+            } else if base.ends_with("/v1") {
+                format!("{base}/models")
+            } else {
+                format!("{base}/v1/models")
+            };
+            let mut req = client.get(&url);
+            if !api_key.is_empty() {
+                req = req.bearer_auth(&api_key);
+            }
+            req.send()
+                .await
+                .context("OpenAI /models validation request failed")?
+        }
+        "ollama" => {
+            let base = custom_base
+                .unwrap_or("http://127.0.0.1:11434")
+                .trim_end_matches('/');
+            let url = if base.ends_with("/api/tags") || base.ends_with("/models") {
+                base.to_string()
+            } else if let Some(prefix) = base
+                .strip_suffix("/api/generate")
+                .or_else(|| base.strip_suffix("/api/chat"))
+            {
+                format!("{}/api/tags", prefix.trim_end_matches('/'))
+            } else if base.ends_with("/v1") {
+                format!("{base}/models")
+            } else {
+                format!("{base}/api/tags")
+            };
+            let mut req = client.get(&url);
+            if !api_key.is_empty() {
+                req = req.bearer_auth(&api_key);
+            }
+            req.send()
+                .await
+                .context("Ollama /api/tags validation request failed")?
+        }
+        _ => {
+            if api_key.is_empty() && custom_base.is_none() {
+                anyhow::bail!(
+                    "Missing Gemini API key. Enter an API key or set '{}'.",
+                    genai.api_key_env
+                );
+            }
+            let base = custom_base
+                .unwrap_or("https://generativelanguage.googleapis.com")
+                .trim_end_matches('/');
+            let url = if base.ends_with("/models") {
+                if api_key.is_empty() || !base.contains("/v1beta") {
+                    base.to_string()
+                } else {
+                    format!("{base}?key={api_key}")
+                }
+            } else if base.ends_with("/v1") {
+                format!("{base}/models")
+            } else if api_key.is_empty() {
+                format!("{base}/v1beta/models")
+            } else {
+                format!("{base}/v1beta/models?key={api_key}")
+            };
+            let mut req = client.get(&url);
+            if !api_key.is_empty() {
+                req = req.header("x-goog-api-key", &api_key);
+                if base.ends_with("/v1") || base.ends_with("/v1/models") {
+                    req = req.bearer_auth(&api_key);
+                }
+            }
+            req.send()
+                .await
+                .context("Gemini /v1beta/models validation request failed")?
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("API validation HTTP {status}: {body}");
+    }
+
+    let resp_json: Value = resp
+        .json()
+        .await
+        .context("failed to decode model catalog JSON from AI provider")?;
+    let models = extract_models_from_provider_payload(&provider, &resp_json);
+    if models.is_empty() {
+        anyhow::bail!(
+            "API endpoint responded, but no compatible models were returned for provider '{provider}'"
+        );
+    }
+    Ok(models)
+}
+
+async fn api_genai_models_get(
+    State(state): State<AppState>,
+    Query(query): Query<GenAiValidateRequest>,
+) -> Response {
+    let wants_live = query.validate == Some(true)
+        || query.provider.is_some()
+        || query.base_url.is_some()
+        || query.api_key.is_some();
+    if !wants_live {
+        return Json(json!([])).into_response();
+    }
+    let saved = state.config.read().await.genai.clone();
+    let effective = build_effective_genai_config(&saved, &query);
+    match discover_genai_models(&effective).await {
+        Ok(models) => Json(json!({
+            "valid": true,
+            "provider": effective.provider,
+            "models": models
+        }))
+        .into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "valid": false,
+                "provider": effective.provider,
+                "models": [],
+                "message": err.to_string()
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_genai_models_post(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+    let req: GenAiValidateRequest = if body.is_empty() {
+        GenAiValidateRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "valid": false,
+                        "models": [],
+                        "message": format!("Invalid JSON request: {err}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+    let saved = state.config.read().await.genai.clone();
+    let effective = build_effective_genai_config(&saved, &req);
+    match discover_genai_models(&effective).await {
+        Ok(models) => Json(json!({
+            "valid": true,
+            "provider": effective.provider,
+            "models": models,
+            "message": format!("Validated {} API ({} models loaded)", effective.provider.to_uppercase(), models.len())
+        }))
+        .into_response(),
+        Err(err) => {
+            let msg = err.to_string();
+            let status = if msg.contains("Missing ") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (
+                status,
+                Json(json!({
+                    "valid": false,
+                    "provider": effective.provider,
+                    "models": [],
+                    "message": msg
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn api_event_verify_ai(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -4427,8 +4784,11 @@ pub async fn verify_event_with_genai_components(
     let img_b64 = img_b64.unwrap_or_default();
 
     let genai = config.read().await.genai.clone();
+    if genai.model.trim().is_empty() {
+        anyhow::bail!("No Vision AI model selected. Validate API and choose a model in Settings.");
+    }
     let provider = genai.provider.trim().to_ascii_lowercase();
-    let api_key = std::env::var(&genai.api_key_env).unwrap_or_default();
+    let api_key = genai.resolve_api_key();
     let timeout_ms = genai.timeout_ms.clamp(500, 60_000);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
@@ -5202,8 +5562,11 @@ pub async fn auto_annotate_dataset_sample(
     let mime_type = "image/webp";
 
     let genai = state.config.read().await.genai.clone();
+    if genai.model.trim().is_empty() {
+        anyhow::bail!("No Vision AI model selected. Validate API and choose a model in Settings.");
+    }
     let provider = genai.provider.trim().to_ascii_lowercase();
-    let api_key = std::env::var(&genai.api_key_env).unwrap_or_default();
+    let api_key = genai.resolve_api_key();
     let timeout_ms = genai.timeout_ms.clamp(500, 60_000);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
@@ -11571,6 +11934,50 @@ version: 0.18-0
                         "response": "{\"is_true_positive\": false, \"confidence\": 0.91, \"reason\": \"Spider web IR reflection\"}"
                     }))
                 }),
+            )
+            .route(
+                "/v1beta/models",
+                get(|| async {
+                    Json(json!({
+                        "models": [
+                            {
+                                "name": "models/gemini-2.5-flash",
+                                "supportedGenerationMethods": ["generateContent"]
+                            },
+                            {
+                                "name": "models/gemini-2.5-pro",
+                                "supportedGenerationMethods": ["generateContent"]
+                            },
+                            {
+                                "name": "models/text-embedding-004",
+                                "supportedGenerationMethods": ["embedContent"]
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/models",
+                get(|| async {
+                    Json(json!({
+                        "data": [
+                            { "id": "gpt-4o-mini" },
+                            { "id": "gpt-4o" },
+                            { "id": "whisper-1" }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/tags",
+                get(|| async {
+                    Json(json!({
+                        "models": [
+                            { "name": "qwen2.5vl:7b" },
+                            { "name": "llava:7b" }
+                        ]
+                    }))
+                }),
             );
         let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mock_addr = mock_listener.local_addr().unwrap();
@@ -11626,6 +12033,39 @@ version: 0.18-0
             cfg.genai.auto_suppress_false_positives = true;
         }
         let app = build_router(state.clone());
+
+        // Validate API & discover models across Gemini, OpenAI, and Ollama
+        for (prov, expected_first) in [
+            ("gemini", "gemini-2.5-flash"),
+            ("openai", "gpt-4o-mini"),
+            ("ollama", "qwen2.5vl:7b"),
+        ] {
+            let resp_models = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/genai/models")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "provider": prov,
+                                "api_key": "test-key",
+                                "base_url": mock_base
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp_models.status(), StatusCode::OK);
+            let models_json: Value =
+                serde_json::from_slice(&to_bytes(resp_models.into_body(), 8192).await.unwrap())
+                    .unwrap();
+            assert_eq!(models_json["valid"], true);
+            assert_eq!(models_json["models"][0], expected_first);
+        }
 
         let resp_gem = app
             .clone()
