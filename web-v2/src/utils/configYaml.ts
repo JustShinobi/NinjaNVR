@@ -304,6 +304,14 @@ export function buildCleanYamlFromDraft(
         alerts: {
           enabled: true,
           labels: ["person", "car"],
+          ...(draft.review?.alerts?.sub_labels &&
+          draft.review.alerts.sub_labels.length > 0
+            ? { sub_labels: draft.review.alerts.sub_labels }
+            : {}),
+          ...(draft.review?.alerts?.exclude_sub_labels &&
+          draft.review.alerts.exclude_sub_labels.length > 0
+            ? { exclude_sub_labels: draft.review.alerts.exclude_sub_labels }
+            : {}),
           required_zones: [],
           cutoff_time: 40,
         },
@@ -461,6 +469,22 @@ export function buildCleanYamlFromDraft(
           },
         }
       : {}),
+    ...(draft.face_recognition
+      ? {
+          face_recognition: {
+            enabled: draft.face_recognition.enabled ?? false,
+            model_path:
+              draft.face_recognition.model_path ||
+              "/config/models/arcface_r50.onnx",
+            similarity_threshold: Number(
+              (draft.face_recognition.similarity_threshold ?? 0.68).toFixed(2)
+            ),
+            min_face_area: draft.face_recognition.min_face_area ?? 750,
+            unknown_alert: draft.face_recognition.unknown_alert ?? false,
+          },
+        }
+      : {}),
+    ...(draft.review ? { review: draft.review } : {}),
     detect: {
       enabled: draft.detect?.enabled ?? true,
       width: draft.detect?.width ?? 1280,

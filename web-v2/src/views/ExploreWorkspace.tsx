@@ -4,12 +4,18 @@ import { useI18n } from "../i18n";
 import {
   AiVerificationResult,
   DetectedAttribute,
+  EnrolledFaceProfileItem,
   EventItem,
   ExportItem,
   RecordingDaySummary,
+  ReviewItem,
 } from "../types/nvr";
 import { WorkspaceTab, findMatchingExport, formatDateTime } from "../utils/format";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
+import {
+  normalizeFaceProfileName,
+  parseFacesApiResponse,
+} from "./settings/VisionAndAiPanels";
 
 export function formatAiVerificationBadge(verdict: AiVerificationResult): string {
   const pct = Math.round((verdict.confidence ?? 0) * 100);
@@ -35,6 +41,66 @@ export function formatEventLabelWithSubLabel(
 export function formatDetectedAttributePill(attr: DetectedAttribute): string {
   const pct = Math.round(attr.score * 100);
   return `${attr.label.toUpperCase()} ${pct}% · ${attr.area_px}px²`;
+}
+
+export function formatSubLabelBadge(
+  subLabel?: string | null,
+  subLabelScore?: number | null
+): { text: string; isUnknown: boolean; isKnown: boolean } | null {
+  const clean = subLabel?.trim();
+  if (!clean) return null;
+  const isUnknown = clean.toLowerCase() === "unknown";
+  const scorePct =
+    typeof subLabelScore === "number" && subLabelScore > 0
+      ? ` ${Math.round(subLabelScore * 100)}%`
+      : "";
+  return {
+    text: isUnknown
+      ? `UNKNOWN VISITOR${scorePct}`
+      : `ID: ${clean.toUpperCase()}${scorePct}`,
+    isUnknown,
+    isKnown: !isUnknown,
+  };
+}
+
+export function applyEventSubLabelUpdate(
+  events: EventItem[],
+  eventId: string,
+  subLabel: string | null,
+  score?: number | null
+): EventItem[] {
+  const clean = subLabel && subLabel.trim().length > 0 ? subLabel.trim() : null;
+  return events.map((ev) => {
+    if (ev.id !== eventId) return ev;
+    return {
+      ...ev,
+      sub_label: clean,
+      sub_label_score: score ?? ev.sub_label_score ?? null,
+      data: {
+        ...(ev.data || {}),
+        sub_label: clean,
+        sub_label_score: score ?? ev.data?.sub_label_score ?? null,
+      },
+    };
+  });
+}
+
+export function applyReviewSubLabelUpdate(
+  reviews: ReviewItem[],
+  reviewId: string,
+  subLabel: string | null
+): ReviewItem[] {
+  const clean = subLabel && subLabel.trim().length > 0 ? subLabel.trim() : null;
+  return reviews.map((rev) => {
+    if (rev.id !== reviewId) return rev;
+    return {
+      ...rev,
+      data: {
+        ...(rev.data || {}),
+        sub_labels: clean ? [clean] : [],
+      },
+    };
+  });
 }
 
 interface ExploreWorkspaceProps {
@@ -164,10 +230,85 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       setAiVerifyBusy(false);
     }
   };
+  const [faceNameDraft, setFaceNameDraft] = React.useState("");
+  const [enrolledFaces, setEnrolledFaces] = React.useState<EnrolledFaceProfileItem[]>([]);
 
   React.useEffect(() => {
     setEventNoteDraft(selectedEvent?.data?.notes || "");
-  }, [selectedEvent?.id, selectedEvent?.data?.notes]);
+    setFaceNameDraft(
+      selectedEvent?.sub_label && selectedEvent.sub_label !== "unknown"
+        ? selectedEvent.sub_label
+        : ""
+    );
+  }, [selectedEvent?.id, selectedEvent?.data?.notes, selectedEvent?.sub_label]);
+
+  React.useEffect(() => {
+    fetch("/api/faces", { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d) setEnrolledFaces(parseFacesApiResponse(d));
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleAssignFaceSubLabel = async (overrideName?: string | null) => {
+    if (!selectedEvent) return;
+    const raw = overrideName !== undefined ? overrideName : faceNameDraft;
+    const clean = raw && raw.trim().length > 0 ? raw.trim() : null;
+    const res = await fetch(
+      `/api/events/${encodeURIComponent(selectedEvent.id)}/sub_label`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ sub_label: clean }),
+      }
+    );
+    if (res.ok) {
+      const [updated] = applyEventSubLabelUpdate(
+        [selectedEvent],
+        selectedEvent.id,
+        clean
+      );
+      setSelectedEvent(updated);
+      notify(clean ? `Assigned face name '${clean}' to event` : "Cleared event sub-label");
+    }
+  };
+
+  const handleEnrollFaceFromEvent = async () => {
+    if (!selectedEvent) return;
+    const cleanName = normalizeFaceProfileName(faceNameDraft);
+    if (!cleanName) {
+      notify("Enter a person name (e.g. Bruno) before enrolling face crop");
+      return;
+    }
+    const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({
+        event_id: selectedEvent.id,
+        assign_sub_label: true,
+      }),
+    });
+    if (res.ok) {
+      const [updated] = applyEventSubLabelUpdate(
+        [selectedEvent],
+        selectedEvent.id,
+        cleanName,
+        1.0
+      );
+      setSelectedEvent(updated);
+      const listRes = await fetch("/api/faces", { credentials: "include" }).catch(
+        () => null
+      );
+      if (listRes && listRes.ok) {
+        const d = await listRes.json();
+        setEnrolledFaces(parseFacesApiResponse(d));
+      }
+      notify(`Enrolled '${cleanName}' face crop into gallery and assigned sub-label`);
+    }
+  };
 
   const handleSaveEventNote = async () => {
     if (!selectedEvent) return;
@@ -539,6 +680,27 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                         )}{" "}
                         · {topScore}%
                       </span>
+                      {(() => {
+                        const subBadge = formatSubLabelBadge(
+                          ev.sub_label,
+                          ev.sub_label_score ?? ev.data?.sub_label_score
+                        );
+                        if (!subBadge) return null;
+                        return (
+                          <span
+                            className={`nvr-badge mono ${
+                              subBadge.isUnknown ? "alert" : "live"
+                            }`}
+                            style={{
+                              height: 18,
+                              padding: "0 5px",
+                              fontSize: "var(--text-xs)",
+                            }}
+                          >
+                            {subBadge.text}
+                          </span>
+                        );
+                      })()}
                       <span
                         className="mono"
                         style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
@@ -632,6 +794,23 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     )}
                     %
                   </span>
+                  {(() => {
+                    const subBadge = formatSubLabelBadge(
+                      selectedEvent.sub_label,
+                      selectedEvent.sub_label_score ??
+                        selectedEvent.data?.sub_label_score
+                    );
+                    if (!subBadge) return null;
+                    return (
+                      <span
+                        className={`nvr-badge mono ${
+                          subBadge.isUnknown ? "alert" : "live"
+                        }`}
+                      >
+                        {subBadge.text}
+                      </span>
+                    );
+                  })()}
                   {(selectedEvent.data?.detected_attributes || []).map((attr, idx) => (
                     <span
                       key={`${attr.label}-${idx}`}
@@ -1049,15 +1228,66 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   borderTop: "1px solid var(--border-hairline)",
                   display: "flex",
                   alignItems: "center",
+                  flexWrap: "wrap",
                   gap: 8,
                 }}
               >
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  FACE ID / SUB-LABEL:
+                </span>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: 150, height: 26, fontSize: "var(--text-xs)" }}
+                  aria-label="Assign Face Name"
+                  placeholder="Person name (e.g. Bruno)..."
+                  value={faceNameDraft}
+                  onChange={(e) => setFaceNameDraft(e.target.value)}
+                />
+                {enrolledFaces.length > 0 && (
+                  <select
+                    className="nvr-select mono"
+                    style={{ height: 26, fontSize: "var(--text-xs)" }}
+                    aria-label="Pick enrolled face profile"
+                    value=""
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val) {
+                        setFaceNameDraft(val);
+                        void handleAssignFaceSubLabel(val);
+                      }
+                    }}
+                  >
+                    <option value="">Quick Assign Profile...</option>
+                    {enrolledFaces.map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.name} ({p.sample_count})
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  onClick={() => void handleAssignFaceSubLabel()}
+                >
+                  Assign Face Name
+                </button>
+                <button
+                  type="button"
+                  className="nvr-btn primary mono"
+                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  onClick={() => void handleEnrollFaceFromEvent()}
+                >
+                  Enroll Face
+                </button>
+                <span className="nvr-divider" aria-hidden="true" />
                 <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   FORENSIC NOTE:
                 </span>
                 <input
                   className="nvr-input mono"
-                  style={{ flex: 1, height: 26, fontSize: "var(--text-xs)" }}
+                  style={{ flex: 1, minWidth: 160, height: 26, fontSize: "var(--text-xs)" }}
                   placeholder="Attach operator annotation (searchable in Explore)..."
                   value={eventNoteDraft}
                   onChange={(e) => setEventNoteDraft(e.target.value)}

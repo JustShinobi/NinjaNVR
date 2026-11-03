@@ -8,9 +8,12 @@ import { VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import {
+  applyReviewSubLabelUpdate,
   formatDetectedAttributePill,
   formatEventLabelWithSubLabel,
+  formatSubLabelBadge,
 } from "./ExploreWorkspace";
+import { normalizeFaceProfileName } from "./settings/VisionAndAiPanels";
 
 interface ReviewWorkspaceProps {
   cameraNames: string[];
@@ -78,10 +81,54 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [zoneFilter, setZoneFilter] = React.useState("all");
   const [presetName, setPresetName] = React.useState("");
   const [reviewNoteDraft, setReviewNoteDraft] = React.useState("");
+  const [reviewFaceDraft, setReviewFaceDraft] = React.useState("");
 
   React.useEffect(() => {
     setReviewNoteDraft(activeReview?.data?.notes || "");
-  }, [activeReview?.id, activeReview?.data?.notes]);
+    const firstSub = activeReview?.data?.sub_labels?.[0] || "";
+    setReviewFaceDraft(firstSub && firstSub !== "unknown" ? firstSub : "");
+  }, [activeReview?.id, activeReview?.data?.notes, activeReview?.data?.sub_labels]);
+
+  const handleAssignReviewFace = async () => {
+    if (!activeReview) return;
+    const detId = activeReview.data?.detections?.[0] || activeReview.id;
+    const clean = reviewFaceDraft.trim() || null;
+    const res = await fetch(`/api/events/${encodeURIComponent(detId)}/sub_label`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ sub_label: clean }),
+    });
+    if (res.ok) {
+      const [updated] = applyReviewSubLabelUpdate(
+        [activeReview],
+        activeReview.id,
+        clean
+      );
+      setActiveReview(updated);
+    }
+  };
+
+  const handleEnrollReviewFace = async () => {
+    if (!activeReview) return;
+    const cleanName = normalizeFaceProfileName(reviewFaceDraft);
+    if (!cleanName) return;
+    const detId = activeReview.data?.detections?.[0] || activeReview.id;
+    const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ event_id: detId, assign_sub_label: true }),
+    });
+    if (res.ok) {
+      const [updated] = applyReviewSubLabelUpdate(
+        [activeReview],
+        activeReview.id,
+        cleanName
+      );
+      setActiveReview(updated);
+    }
+  };
 
   const handleSaveReviewNote = async () => {
     if (!activeReview) return;
@@ -517,6 +564,27 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         )}
                       </span>
                       <div className="nvr-row-actions">
+                        {(() => {
+                          const subBadge = formatSubLabelBadge(
+                            item.data?.sub_labels?.[0] ?? null,
+                            item.data?.sub_label_score
+                          );
+                          if (!subBadge) return null;
+                          return (
+                            <span
+                              className={`nvr-badge mono ${
+                                subBadge.isUnknown ? "alert" : "live"
+                              }`}
+                              style={{
+                                height: 20,
+                                padding: "0 5px",
+                                fontSize: "var(--text-xs)",
+                              }}
+                            >
+                              {subBadge.text}
+                            </span>
+                          );
+                        })()}
                         {((item.data?.audio && item.data.audio.length > 0) ||
                           (item.data?.objects || []).includes("audio")) && (
                           <span
@@ -623,6 +691,22 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                       activeReview.data?.detected_attributes
                     )}
                   </span>
+                  {(() => {
+                    const subBadge = formatSubLabelBadge(
+                      activeReview.data?.sub_labels?.[0] ?? null,
+                      activeReview.data?.sub_label_score
+                    );
+                    if (!subBadge) return null;
+                    return (
+                      <span
+                        className={`nvr-badge mono ${
+                          subBadge.isUnknown ? "alert" : "live"
+                        }`}
+                      >
+                        {subBadge.text}
+                      </span>
+                    );
+                  })()}
                   {(activeReview.data?.detected_attributes || []).map((attr, idx) => (
                     <span
                       key={`${attr.label}-${idx}`}
@@ -921,15 +1005,44 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   borderTop: "1px solid var(--border-hairline)",
                   display: "flex",
                   alignItems: "center",
+                  flexWrap: "wrap",
                   gap: 8,
                 }}
               >
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  FACE ID / SUB-LABEL:
+                </span>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: 145, height: 26, fontSize: "var(--text-xs)" }}
+                  aria-label="Assign Face Name"
+                  placeholder="Person name (e.g. Bruno)..."
+                  value={reviewFaceDraft}
+                  onChange={(e) => setReviewFaceDraft(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  onClick={() => void handleAssignReviewFace()}
+                >
+                  Assign Face Name
+                </button>
+                <button
+                  type="button"
+                  className="nvr-btn primary mono"
+                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  onClick={() => void handleEnrollReviewFace()}
+                >
+                  Enroll Face
+                </button>
+                <span className="nvr-divider" aria-hidden="true" />
                 <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   FORENSIC NOTE:
                 </span>
                 <input
                   className="nvr-input mono"
-                  style={{ flex: 1, height: 26, fontSize: "var(--text-xs)" }}
+                  style={{ flex: 1, minWidth: 160, height: 26, fontSize: "var(--text-xs)" }}
                   placeholder="Attach operator annotation to this review segment..."
                   value={reviewNoteDraft}
                   onChange={(e) => setReviewNoteDraft(e.target.value)}

@@ -437,6 +437,7 @@ impl NinjaDatabase {
                 "area" INTEGER,
                 "retain_indefinitely" INTEGER NOT NULL,
                 "sub_label" VARCHAR(100),
+                "sub_label_score" REAL,
                 "ratio" REAL,
                 "plus_id" VARCHAR(30),
                 "score" REAL,
@@ -519,6 +520,7 @@ impl NinjaDatabase {
             "ALTER TABLE exportcase ADD COLUMN export_ids JSON NOT NULL DEFAULT '[]'",
             [],
         );
+        let _ = conn.execute("ALTER TABLE event ADD COLUMN sub_label_score REAL", []);
         Ok(())
     }
 
@@ -1367,7 +1369,7 @@ impl NinjaDatabase {
             SELECT
                 id, camera, label, zones, start_time, end_time,
                 has_clip, has_snapshot, plus_id, retain_indefinitely,
-                sub_label, top_score, false_positive, box, data, thumbnail
+                sub_label, top_score, false_positive, box, data, thumbnail, sub_label_score
             FROM event
             WHERE 1=1
             "#,
@@ -1437,7 +1439,19 @@ impl NinjaDatabase {
             let zones_raw: Option<String> = row.get(3).ok();
             let box_raw: Option<String> = row.get(13).ok();
             let data_raw: Option<String> = row.get(14).ok();
-            let data_json = parse_json_or(data_raw, json!({}));
+            let mut data_json = parse_json_or(data_raw, json!({}));
+            let sub_label_col: Option<String> = row.get::<_, Option<String>>(10).ok().flatten();
+            let sub_label_score_col: Option<f64> = row
+                .get::<_, Option<f64>>(16)
+                .ok()
+                .flatten()
+                .or_else(|| data_json.get("sub_label_score").and_then(|v| v.as_f64()));
+            if let Some(sc) = sub_label_score_col
+                && let Some(obj) = data_json.as_object_mut()
+            {
+                obj.entry("sub_label_score".to_string())
+                    .or_insert_with(|| json!(sc));
+            }
             let is_stationary = data_json["provenance"]["stationary"]
                 .as_bool()
                 .or_else(|| data_json["stationary"].as_bool())
@@ -1454,7 +1468,8 @@ impl NinjaDatabase {
                 "has_snapshot": row.get::<_, i64>(7).unwrap_or(0) != 0,
                 "plus_id": row.get::<_, Option<String>>(8).ok().flatten(),
                 "retain_indefinitely": row.get::<_, i64>(9).unwrap_or(0) != 0,
-                "sub_label": row.get::<_, Option<String>>(10).ok().flatten(),
+                "sub_label": sub_label_col,
+                "sub_label_score": sub_label_score_col,
                 "top_score": row.get::<_, Option<f64>>(11).ok().flatten(),
                 "false_positive": row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v != 0),
                 "box": parse_json_or(box_raw, Value::Null),
@@ -1714,7 +1729,7 @@ impl NinjaDatabase {
                 SELECT
                     id, camera, label, zones, start_time, end_time,
                     has_clip, has_snapshot, plus_id, retain_indefinitely,
-                    sub_label, top_score, false_positive, box, data, thumbnail
+                    sub_label, top_score, false_positive, box, data, thumbnail, sub_label_score
                 FROM event
                 WHERE id = ?1
                 "#,
@@ -1725,6 +1740,19 @@ impl NinjaDatabase {
                     let zones_raw: Option<String> = row.get(3).ok();
                     let box_raw: Option<String> = row.get(13).ok();
                     let data_raw: Option<String> = row.get(14).ok();
+                    let mut data_json = parse_json_or(data_raw, json!({}));
+                    let sub_label_col: Option<String> = row.get::<_, Option<String>>(10).ok().flatten();
+                    let sub_label_score_col: Option<f64> = row
+                        .get::<_, Option<f64>>(16)
+                        .ok()
+                        .flatten()
+                        .or_else(|| data_json.get("sub_label_score").and_then(|v| v.as_f64()));
+                    if let Some(sc) = sub_label_score_col
+                        && let Some(obj) = data_json.as_object_mut()
+                    {
+                        obj.entry("sub_label_score".to_string())
+                            .or_insert_with(|| json!(sc));
+                    }
                     Ok(json!({
                         "id": row.get::<_, String>(0)?,
                         "camera": row.get::<_, String>(1)?,
@@ -1736,11 +1764,12 @@ impl NinjaDatabase {
                         "has_snapshot": row.get::<_, i64>(7).unwrap_or(0) != 0,
                         "plus_id": row.get::<_, Option<String>>(8).ok().flatten(),
                         "retain_indefinitely": row.get::<_, i64>(9).unwrap_or(0) != 0,
-                        "sub_label": row.get::<_, Option<String>>(10).ok().flatten(),
+                        "sub_label": sub_label_col,
+                        "sub_label_score": sub_label_score_col,
                         "top_score": row.get::<_, Option<f64>>(11).ok().flatten(),
                         "false_positive": row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v != 0),
                         "box": parse_json_or(box_raw, Value::Null),
-                        "data": parse_json_or(data_raw, json!({})),
+                        "data": data_json,
                         "thumbnail": row.get::<_, Option<String>>(15).ok().flatten()
                     }))
                 },
@@ -2045,11 +2074,102 @@ impl NinjaDatabase {
     }
 
     pub fn set_event_sub_label(&self, id: &str, sub_label: Option<&str>) -> Result<usize> {
+        self.set_event_sub_label_with_score(id, sub_label, None)
+    }
+
+    pub fn set_event_sub_label_with_score(
+        &self,
+        id: &str,
+        sub_label: Option<&str>,
+        score: Option<f64>,
+    ) -> Result<usize> {
+        let normalized_sub = sub_label.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn.lock().expect("db mutex poisoned");
-        Ok(conn.execute(
-            "UPDATE event SET sub_label = ?1 WHERE id = ?2",
-            params![sub_label, id],
-        )?)
+        let updated = match (normalized_sub, score) {
+            (Some(sl), Some(sc)) => conn.execute(
+                "UPDATE event SET sub_label = ?1, sub_label_score = ?2, data = json_set(COALESCE(data, '{}'), '$.sub_label', ?1, '$.sub_label_score', ?2) WHERE id = ?3",
+                params![sl, sc, id],
+            )?,
+            (Some(sl), None) => conn.execute(
+                "UPDATE event SET sub_label = ?1, data = json_set(COALESCE(data, '{}'), '$.sub_label', ?1) WHERE id = ?2",
+                params![sl, id],
+            )?,
+            (None, _) => conn.execute(
+                "UPDATE event SET sub_label = NULL, sub_label_score = NULL, data = json_remove(COALESCE(data, '{}'), '$.sub_label', '$.sub_label_score') WHERE id = ?1",
+                params![id],
+            )?,
+        };
+
+        // Propagate sub_label & sub_label_score to any reviewsegment referencing this event ID
+        let like_pattern = format!("%\"{}\"%", id.replace('"', ""));
+        let mut stmt = conn.prepare("SELECT id, data FROM reviewsegment WHERE data LIKE ?1")?;
+        let rev_rows: Vec<(String, String)> = stmt
+            .query_map(params![like_pattern], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            })?
+            .flatten()
+            .collect();
+        drop(stmt);
+
+        for (rev_id, raw_data) in rev_rows {
+            let mut data_val = parse_json_or(Some(raw_data), json!({}));
+            let Some(obj) = data_val.as_object_mut() else {
+                continue;
+            };
+            let has_det = obj
+                .get("detections")
+                .and_then(|d| d.as_array())
+                .map(|arr| arr.iter().any(|v| v.as_str() == Some(id)))
+                .unwrap_or(false);
+            if !has_det {
+                continue;
+            }
+            let mut sub_labels: Vec<String> = obj
+                .get("sub_labels")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(sl) = normalized_sub {
+                if !sub_labels.iter().any(|x| x == sl) {
+                    sub_labels.push(sl.to_string());
+                }
+                obj.insert("sub_labels".to_string(), json!(sub_labels));
+                if let Some(sc) = score {
+                    obj.insert("sub_label_score".to_string(), json!(sc));
+                }
+            } else {
+                obj.insert("sub_labels".to_string(), json!(Vec::<String>::new()));
+                obj.remove("sub_label_score");
+            }
+            if let Ok(new_data) = serde_json::to_string(&data_val) {
+                let _ = conn.execute(
+                    "UPDATE reviewsegment SET data = ?1 WHERE id = ?2",
+                    params![new_data, rev_id],
+                );
+            }
+        }
+
+        Ok(updated)
+    }
+
+    pub fn list_distinct_sub_labels(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT sub_label FROM event WHERE sub_label IS NOT NULL AND TRIM(sub_label) != '' ORDER BY sub_label ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     pub fn set_event_description(&self, id: &str, description: &str) -> Result<usize> {
@@ -2120,14 +2240,15 @@ impl NinjaDatabase {
             .map(serde_json::to_string)
             .transpose()?;
         let data_str = serde_json::to_string(&ev.data)?;
+        let sub_label_score = ev.data.get("sub_label_score").and_then(|v| v.as_f64());
 
         conn.execute(
             r#"
             INSERT INTO event (
                 id, label, camera, start_time, end_time, top_score, false_positive,
                 zones, thumbnail, has_clip, has_snapshot, box, retain_indefinitely,
-                sub_label, plus_id, data, area, ratio, score
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                sub_label, sub_label_score, plus_id, data, area, ratio, score
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
             ON CONFLICT(id) DO UPDATE SET
                 end_time = excluded.end_time,
                 top_score = excluded.top_score,
@@ -2140,6 +2261,8 @@ impl NinjaDatabase {
                 has_clip = excluded.has_clip,
                 has_snapshot = excluded.has_snapshot,
                 box = excluded.box,
+                sub_label = COALESCE(excluded.sub_label, event.sub_label),
+                sub_label_score = COALESCE(excluded.sub_label_score, event.sub_label_score),
                 data = excluded.data,
                 area = COALESCE(excluded.area, event.area),
                 ratio = COALESCE(excluded.ratio, event.ratio),
@@ -2160,6 +2283,7 @@ impl NinjaDatabase {
                 box_str,
                 if ev.retain_indefinitely { 1 } else { 0 },
                 ev.sub_label,
+                sub_label_score,
                 ev.plus_id,
                 data_str,
                 ev.area,
@@ -4694,6 +4818,80 @@ mod tests {
         let sig_id = sigs_again[0]["id"].as_i64().unwrap();
         assert_eq!(db.delete_false_positive_signature(sig_id).unwrap(), 1);
         assert!(db.list_false_positive_signatures(None).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn set_event_sub_label_persists_score_and_propagates_to_reviewsegment() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_db_sub_label_test_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        db.upsert_event(&EventDto {
+            id: "ev_face_1".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!(["porch"]),
+            start_time: 1000.0,
+            end_time: Some(1005.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.92),
+            false_positive: Some(false),
+            box_coords: Some(json!([0.1, 0.1, 0.4, 0.8])),
+            data: json!({ "box": [0.1, 0.1, 0.4, 0.8] }),
+            thumbnail: None,
+            area: Some(12000),
+            ratio: Some(0.5),
+            score: Some(0.92),
+            stationary: false,
+        })
+        .unwrap();
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_face_1".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb.webp".to_string(),
+            data: json!({
+                "detections": ["ev_face_1"],
+                "objects": ["person"],
+                "sub_labels": [],
+                "zones": ["porch"]
+            }),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        let updated = db
+            .set_event_sub_label_with_score("ev_face_1", Some("Bruno"), Some(0.84))
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        let ev = db.get_event("ev_face_1").unwrap().unwrap();
+        assert_eq!(ev["sub_label"], "Bruno");
+        assert!((ev["sub_label_score"].as_f64().unwrap() - 0.84).abs() < 1e-6);
+        assert!((ev["data"]["sub_label_score"].as_f64().unwrap() - 0.84).abs() < 1e-6);
+
+        let rev = db.get_review_by_id("rev_face_1").unwrap().unwrap();
+        assert_eq!(rev.data["sub_labels"], json!(["Bruno"]));
+        assert!((rev.data["sub_label_score"].as_f64().unwrap() - 0.84).abs() < 1e-6);
+
+        let distinct = db.list_distinct_sub_labels().unwrap();
+        assert_eq!(distinct, vec!["Bruno"]);
+
+        db.set_event_sub_label("ev_face_1", None).unwrap();
+        let ev_cleared = db.get_event("ev_face_1").unwrap().unwrap();
+        assert!(ev_cleared["sub_label"].is_null());
 
         let _ = std::fs::remove_file(&tmp);
     }

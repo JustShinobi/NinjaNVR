@@ -117,8 +117,25 @@ export interface SnapshotsConfig {
 export interface ReviewSeverityConfig {
   enabled: boolean;
   labels?: string[];
+  sub_labels?: string[];
+  exclude_sub_labels?: string[];
   required_zones: string[];
   cutoff_time: number;
+}
+
+export interface FaceRecognitionConfig {
+  enabled: boolean;
+  model_path?: string;
+  similarity_threshold?: number;
+  min_face_area?: number;
+  unknown_alert?: boolean;
+}
+
+export interface EnrolledFaceProfileItem {
+  name: string;
+  sample_count: number;
+  sample_files?: string[];
+  updated_at?: number;
 }
 
 export interface ReviewConfig {
@@ -424,6 +441,7 @@ export interface NinjaConfigResponse {
   detectors?: Record<string, DetectorEntryConfig>;
   model?: ModelConfig;
   genai?: GenAiConfig;
+  face_recognition?: FaceRecognitionConfig;
   detect?: CameraDetectConfig;
   motion?: CameraMotionConfig;
   objects?: ObjectsConfig;
@@ -578,6 +596,7 @@ export interface ReviewItem {
   data: {
     objects?: string[];
     sub_labels?: string[];
+    sub_label_score?: number | null;
     zones?: string[];
     detections?: string[];
     audio?: string[];
@@ -596,6 +615,7 @@ export interface EventItem {
   camera: string;
   label: string;
   sub_label: string | null;
+  sub_label_score?: number | null;
   zones: string[];
   start_time: number;
   end_time: number | null;
@@ -612,6 +632,8 @@ export interface EventItem {
   data?: {
     score?: number;
     top_score?: number;
+    sub_label?: string | null;
+    sub_label_score?: number | null;
     description?: string;
     notes?: string;
     attributes?: string[];

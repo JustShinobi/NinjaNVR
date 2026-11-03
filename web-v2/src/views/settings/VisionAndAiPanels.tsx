@@ -20,6 +20,8 @@ import { useNvrStore } from "../../store/useNvrStore";
 import {
   CameraDetectConfig,
   CameraMotionConfig,
+  EnrolledFaceProfileItem,
+  FaceRecognitionConfig,
   FalsePositiveSignatureItem,
   GenAiConfig,
   NinjaConfigResponse,
@@ -79,6 +81,76 @@ export function toggleAttributeLabelList(
   return base.includes(clean)
     ? base.filter((x) => x !== clean)
     : [...base, clean];
+}
+
+export function normalizeFaceProfileName(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.includes("..") || /[\\/]/.test(trimmed)) {
+    return "";
+  }
+  const cleaned = trimmed.replace(/[^a-zA-Z0-9_\- ]/g, "").trim();
+  if (!cleaned || cleaned.toLowerCase() === "unknown") {
+    return "";
+  }
+  return cleaned;
+}
+
+export function toggleSubLabelRuleList(
+  current: string[] | undefined,
+  subLabel: string
+): string[] {
+  const base = current ? [...current] : [];
+  const clean = subLabel.trim();
+  if (!clean) return base;
+  const existingIdx = base.findIndex(
+    (item) => item.toLowerCase() === clean.toLowerCase()
+  );
+  if (existingIdx >= 0) {
+    return base.filter((_, idx) => idx !== existingIdx);
+  }
+  return [...base, clean];
+}
+
+export function parseFacesApiResponse(payload: unknown): EnrolledFaceProfileItem[] {
+  if (!payload || typeof payload !== "object") return [];
+  const obj = payload as Record<string, unknown>;
+  if (Array.isArray(obj.profiles)) {
+    return obj.profiles
+      .filter(
+        (item): item is Record<string, unknown> =>
+          item !== null && typeof item === "object" && typeof (item as Record<string, unknown>).name === "string"
+      )
+      .map((item) => ({
+        name: String(item.name),
+        sample_count:
+          typeof item.sample_count === "number"
+            ? item.sample_count
+            : Array.isArray(item.sample_files)
+            ? item.sample_files.length
+            : 1,
+        sample_files: Array.isArray(item.sample_files)
+          ? item.sample_files.map(String)
+          : [],
+        updated_at:
+          typeof item.updated_at === "number" ? item.updated_at : undefined,
+      }));
+  }
+  const facesMap =
+    obj.faces && typeof obj.faces === "object" && !Array.isArray(obj.faces)
+      ? (obj.faces as Record<string, unknown>)
+      : obj;
+  const out: EnrolledFaceProfileItem[] = [];
+  for (const [key, val] of Object.entries(facesMap)) {
+    if (key === "profiles" || key === "faces") continue;
+    if (Array.isArray(val)) {
+      out.push({
+        name: key,
+        sample_count: val.length,
+        sample_files: val.map(String),
+      });
+    }
+  }
+  return out;
 }
 
 export const VisionZonesMotionSection: React.FC<{
@@ -1268,6 +1340,140 @@ export const AiDetectionObjectsSection: React.FC<{
         ...patch,
       };
     });
+  };
+
+  const [enrolledProfiles, setEnrolledProfiles] = useState<EnrolledFaceProfileItem[]>([]);
+  const [enrollNameInput, setEnrollNameInput] = useState("");
+  const [enrollImageB64, setEnrollImageB64] = useState<string>("");
+  const [enrollBusy, setEnrollBusy] = useState(false);
+  const [excludeSubLabelInput, setExcludeSubLabelInput] = useState("");
+
+  const faceCfg: FaceRecognitionConfig = draftConfig.face_recognition || {
+    enabled: false,
+    model_path: "/config/models/arcface_r50.onnx",
+    similarity_threshold: 0.68,
+    min_face_area: 750,
+    unknown_alert: false,
+  };
+
+  const activeExcludeSubLabels: string[] =
+    (scope === "global"
+      ? draftConfig.review?.alerts?.exclude_sub_labels
+      : draftConfig.cameras?.[inspectorCam]?.review?.alerts?.exclude_sub_labels ??
+        draftConfig.review?.alerts?.exclude_sub_labels) || [];
+
+  const updateFaceRecognition = (patch: Partial<FaceRecognitionConfig>) => {
+    updateDraft((next) => {
+      next.face_recognition = {
+        enabled: faceCfg.enabled ?? false,
+        model_path: faceCfg.model_path || "/config/models/arcface_r50.onnx",
+        similarity_threshold: faceCfg.similarity_threshold ?? 0.68,
+        min_face_area: faceCfg.min_face_area ?? 750,
+        unknown_alert: faceCfg.unknown_alert ?? false,
+        ...patch,
+      };
+    });
+  };
+
+  const handleToggleExcludeSubLabel = (name: string) => {
+    const nextList = toggleSubLabelRuleList(activeExcludeSubLabels, name);
+    updateDraft((next) => {
+      if (scope === "global") {
+        if (!next.review) {
+          next.review = {
+            alerts: {
+              enabled: true,
+              labels: ["person", "car"],
+              required_zones: [],
+              cutoff_time: 40,
+            },
+            detections: {
+              enabled: true,
+              required_zones: [],
+              cutoff_time: 30,
+            },
+          };
+        }
+        next.review.alerts.exclude_sub_labels = nextList;
+      } else if (next.cameras[inspectorCam]) {
+        if (!next.cameras[inspectorCam].review) {
+          next.cameras[inspectorCam].review = {
+            alerts: {
+              enabled: true,
+              labels: ["person", "car"],
+              required_zones: [],
+              cutoff_time: 40,
+            },
+            detections: {
+              enabled: true,
+              required_zones: [],
+              cutoff_time: 30,
+            },
+          };
+        }
+        next.cameras[inspectorCam].review!.alerts.exclude_sub_labels = nextList;
+      }
+    });
+  };
+
+  const refreshEnrolledFaces = async () => {
+    try {
+      const res = await fetch("/api/faces", { credentials: "include" });
+      if (res.ok) {
+        const data = await res.json();
+        setEnrolledProfiles(parseFacesApiResponse(data));
+      }
+    } catch {
+      // ignore offline/unit environment
+    }
+  };
+
+  useEffect(() => {
+    void refreshEnrolledFaces();
+  }, []);
+
+  const handleEnrollProfile = async () => {
+    const cleanName = normalizeFaceProfileName(enrollNameInput);
+    if (!cleanName) {
+      notify("Enter a valid profile name (e.g. Bruno) before enrolling");
+      return;
+    }
+    setEnrollBusy(true);
+    try {
+      const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(
+          enrollImageB64 ? { image_base64: enrollImageB64 } : {}
+        ),
+      });
+      if (res.ok) {
+        setEnrollNameInput("");
+        setEnrollImageB64("");
+        await refreshEnrolledFaces();
+        notify(`Enrolled face profile '${cleanName}' into local gallery`);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setEnrollBusy(false);
+    }
+  };
+
+  const handleDeleteProfile = async (name: string) => {
+    try {
+      const res = await fetch(`/api/faces/${encodeURIComponent(name)}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      if (res.ok) {
+        await refreshEnrolledFaces();
+        notify(`Removed face profile '${name}' from gallery`);
+      }
+    } catch {
+      // ignore
+    }
   };
 
   const detKeys = Object.keys(draftConfig.detectors || { detector01: {} });
@@ -3040,6 +3246,343 @@ export const AiDetectionObjectsSection: React.FC<{
               </table>
             </div>
           )}
+        </div>
+      </div>
+
+      {/* Face Recognition & Enrolled Gallery Card */}
+      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="nvr-cfg-card-header">
+          <span>
+            {isPt
+              ? "RECONHECIMENTO FACIAL LOCAL & GALERIA CADASTRADA (ARCFACE / ADAFACE 512-D)"
+              : "FACE RECOGNITION & ENROLLED GALLERY (ARCFACE / ADAFACE 512-D)"}
+          </span>
+          <span className="mono">
+            {enrolledProfiles.length} {isPt ? "PERFIS CADASTRADOS" : "ENROLLED PROFILES"}
+          </span>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+              gap: 10,
+            }}
+          >
+            <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? "Ativar Reconhecimento Facial Local"
+                    : "Enable Local Face Recognition"}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Extrai vetor 512-d L2-normalizado da face e atribui sub_label (ex: Bruno)."
+                    : "Extracts 512-d L2-normalized embedding from face crops and assigns sub_label."}
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={faceCfg.enabled ?? false}
+                label="Enable Local Face Recognition"
+                onChange={(v) => updateFaceRecognition({ enabled: v })}
+              />
+            </div>
+
+            <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? "Alerta para Pessoas Desconhecidas (unknown_alert)"
+                    : "Flag Unrecognized Faces as 'unknown' Alert"}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Define sub_label='unknown' abaixo do limiar de similaridade para acionar alerta."
+                    : "Marks faces below similarity threshold as 'unknown' to trigger priority alerts."}
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={faceCfg.unknown_alert ?? false}
+                label="Flag Unrecognized Faces as unknown"
+                onChange={(v) => updateFaceRecognition({ unknown_alert: v })}
+              />
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1.2fr 0.8fr 1.4fr",
+              gap: 10,
+              alignItems: "center",
+            }}
+          >
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt ? "Limiar de Similaridade Cosseno:" : "Cosine Similarity Threshold:"}{" "}
+                <strong style={{ color: "var(--text-primary)" }}>
+                  {(faceCfg.similarity_threshold ?? 0.68).toFixed(2)} (
+                  {Math.round((faceCfg.similarity_threshold ?? 0.68) * 100)}%)
+                </strong>
+              </div>
+              <input
+                type="range"
+                min={40}
+                max={95}
+                style={{ width: "100%", marginTop: 4 }}
+                aria-label="Face Recognition Similarity Threshold"
+                value={Math.round((faceCfg.similarity_threshold ?? 0.68) * 100)}
+                onChange={(e) =>
+                  updateFaceRecognition({
+                    similarity_threshold: Number(
+                      (Number(e.target.value) / 100).toFixed(2)
+                    ),
+                  })
+                }
+              />
+            </div>
+
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt ? "Área Mínima da Face (px²)" : "Min Face Area (px²)"}
+              </div>
+              <input
+                type="number"
+                min={100}
+                max={50000}
+                step={50}
+                className="nvr-input mono"
+                style={{ width: "100%", marginTop: 2 }}
+                aria-label="Minimum Face Crop Area"
+                value={faceCfg.min_face_area ?? 750}
+                onChange={(e) =>
+                  updateFaceRecognition({ min_face_area: Number(e.target.value) })
+                }
+              />
+            </div>
+
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt
+                  ? "Modelo de Embedding ONNX / OpenVINO"
+                  : "Embedding Model Path (.onnx / .xml)"}
+              </div>
+              <input
+                className="nvr-input mono"
+                style={{ width: "100%", marginTop: 2 }}
+                aria-label="Face Recognition Model Path"
+                value={faceCfg.model_path || "/config/models/arcface_r50.onnx"}
+                onChange={(e) =>
+                  updateFaceRecognition({ model_path: e.target.value })
+                }
+              />
+            </div>
+          </div>
+
+          {/* Alert Suppression for Known Residents (exclude_sub_labels) */}
+          <div
+            style={{
+              padding: "8px 10px",
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              display: "flex",
+              flexDirection: "column",
+              gap: 6,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: 6,
+              }}
+            >
+              <span
+                className="mono"
+                style={{
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 700,
+                  color: "var(--signal-accent-text)",
+                }}
+              >
+                {isPt
+                  ? "REGRA DE ALERTA: MORADORES CONHECIDOS (EXCLUDE_SUB_LABELS → DOWNGRADE P/ DETECÇÃO)"
+                  : "RESIDENT ALERT SUPPRESSION (EXCLUDE_SUB_LABELS → DOWNGRADE ALERT TO DETECTION)"}
+              </span>
+              <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: 150, height: 24, fontSize: "var(--text-xs)" }}
+                  placeholder="Resident name (e.g. Bruno)..."
+                  aria-label="Exclude sub-label resident name"
+                  value={excludeSubLabelInput}
+                  onChange={(e) => setExcludeSubLabelInput(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  onClick={() => {
+                    const clean = normalizeFaceProfileName(excludeSubLabelInput);
+                    if (!clean) return;
+                    handleToggleExcludeSubLabel(clean);
+                    setExcludeSubLabelInput("");
+                  }}
+                >
+                  + Suppress Alert
+                </button>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              {Array.from(
+                new Set([
+                  ...enrolledProfiles.map((p) => p.name),
+                  ...activeExcludeSubLabels,
+                ])
+              ).map((personName) => {
+                const isExcluded = activeExcludeSubLabels.some(
+                  (x) => x.toLowerCase() === personName.toLowerCase()
+                );
+                return (
+                  <button
+                    key={personName}
+                    type="button"
+                    className={`nvr-btn mono ${isExcluded ? "active" : ""}`}
+                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    onClick={() => handleToggleExcludeSubLabel(personName)}
+                    title="Toggle alert downgrade (alert -> detection) when this resident is recognized"
+                  >
+                    {isExcluded
+                      ? `✓ ${personName} (Downgraded to Detection)`
+                      : `${personName} (Triggers Alert)`}
+                  </button>
+                );
+              })}
+              {enrolledProfiles.length === 0 && activeExcludeSubLabels.length === 0 && (
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                  No resident sub_labels excluded yet. Enroll a profile below or add a name above.
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Enrolled Profiles Gallery & Upload */}
+          <div
+            style={{
+              padding: "8px 10px",
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: 8,
+              }}
+            >
+              <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700 }}>
+                {isPt ? "CADASTRAR NOVO PERFIL FACIAL:" : "ENROLL NEW FACE PROFILE:"}
+              </span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <input
+                  className="nvr-input mono"
+                  style={{ width: 160, height: 26, fontSize: "var(--text-xs)" }}
+                  placeholder="Profile name (e.g. Bruno)"
+                  aria-label="Face profile name to enroll"
+                  value={enrollNameInput}
+                  onChange={(e) => setEnrollNameInput(e.target.value)}
+                />
+                <input
+                  type="file"
+                  accept="image/*"
+                  aria-label="Upload face crop image"
+                  style={{ fontSize: "var(--text-xs)", maxWidth: 210 }}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) {
+                      setEnrollImageB64("");
+                      return;
+                    }
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                      if (typeof reader.result === "string") {
+                        setEnrollImageB64(reader.result);
+                      }
+                    };
+                    reader.readAsDataURL(file);
+                  }}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn primary mono"
+                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  disabled={enrollBusy}
+                  onClick={handleEnrollProfile}
+                >
+                  <Plus size={11} />
+                  {enrollBusy ? "Enrolling..." : "Enroll Face"}
+                </button>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {enrolledProfiles.map((prof) => (
+                <div
+                  key={prof.name}
+                  className="mono"
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "4px 8px",
+                    background: "var(--bg-deep)",
+                    border: "1px solid var(--border-hairline)",
+                    borderRadius: 3,
+                    fontSize: "var(--text-xs)",
+                  }}
+                >
+                  <strong>{prof.name}</strong>
+                  <span style={{ color: "var(--text-muted)" }}>
+                    ({prof.sample_count} {prof.sample_count === 1 ? "sample" : "samples"})
+                  </span>
+                  <button
+                    type="button"
+                    className="nvr-btn danger mono"
+                    style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                    aria-label={`Delete face profile ${prof.name}`}
+                    onClick={() => handleDeleteProfile(prof.name)}
+                  >
+                    <Trash2 size={11} />
+                  </button>
+                </div>
+              ))}
+              {enrolledProfiles.length === 0 && (
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                  No faces enrolled in /media/ninjanvr/faces yet.
+                </span>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>
