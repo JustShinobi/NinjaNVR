@@ -295,6 +295,8 @@ pub struct NinjaConfig {
     #[serde(default)]
     pub review: ReviewConfig,
     #[serde(default)]
+    pub lpr: LprConfig,
+    #[serde(default)]
     pub profiles: BTreeMap<String, ProfileOverrideConfig>,
     #[serde(default)]
     pub peers: BTreeMap<String, PeerNodeConfig>,
@@ -1165,6 +1167,39 @@ impl Default for MotionConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LprConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_model_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr_model_path: Option<PathBuf>,
+    #[serde(default = "default_lpr_min_confidence")]
+    pub min_confidence: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_regex: Option<String>,
+    #[serde(default)]
+    pub known_plates: BTreeMap<String, String>,
+}
+
+fn default_lpr_min_confidence() -> f32 {
+    0.75
+}
+
+impl Default for LprConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            detector_model_path: None,
+            ocr_model_path: None,
+            min_confidence: default_lpr_min_confidence(),
+            format_regex: None,
+            known_plates: BTreeMap::new(),
+        }
+    }
+}
+
 pub const DEFAULT_ATTRIBUTE_LABELS: [&str; 9] = [
     "face",
     "license_plate",
@@ -1198,6 +1233,19 @@ pub struct ObjectsConfig {
 
 fn default_tracked_objects() -> Vec<String> {
     vec!["person".to_string()]
+}
+
+impl ObjectsConfig {
+    /// Removes any label present in `self.track` (such as `license_plate` on dedicated zoomed LPR cameras)
+    /// from `self.attribute_labels` so `ByteTracker` tracks it as a standalone primary object.
+    pub fn normalize_standalone_tracked_attributes(&mut self) {
+        let tracked = self.track.clone();
+        self.attribute_labels.retain(|attr| {
+            !tracked
+                .iter()
+                .any(|trk_lbl| trk_lbl.eq_ignore_ascii_case(attr))
+        });
+    }
 }
 
 impl Default for ObjectsConfig {
@@ -1676,6 +1724,8 @@ impl NinjaConfig {
                 .insert("detector01".to_string(), DetectorEntryConfig::default());
         }
 
+        cfg.objects.normalize_standalone_tracked_attributes();
+
         for (cam_name, cam) in cfg.cameras.iter_mut() {
             if cam.live.streams.is_empty() {
                 cam.live
@@ -1694,6 +1744,7 @@ impl NinjaConfig {
             {
                 cam.objects.attribute_labels = cfg.objects.attribute_labels.clone();
             }
+            cam.objects.normalize_standalone_tracked_attributes();
             if !cam.record.alert_backup.enabled && cfg.record.alert_backup.enabled {
                 cam.record.alert_backup = cfg.record.alert_backup.clone();
             }
@@ -1951,7 +2002,7 @@ impl NinjaConfig {
                         "rotate": cam.live.rotate
                     },
                     "lpr": {
-                        "enabled": false,
+                        "enabled": self.lpr.enabled,
                         "expire_time": 3,
                         "min_area": 1000,
                         "enhancement": 0
@@ -2428,14 +2479,18 @@ impl NinjaConfig {
                 "blur_confidence_filter": true
             },
             "lpr": {
-                "enabled": false,
+                "enabled": self.lpr.enabled,
+                "detector_model_path": self.lpr.detector_model_path,
+                "ocr_model_path": self.lpr.ocr_model_path,
+                "min_confidence": self.lpr.min_confidence,
+                "format_regex": self.lpr.format_regex,
+                "known_plates": self.lpr.known_plates,
                 "model_size": "small",
                 "detection_threshold": 0.7,
                 "min_area": 1000,
-                "recognition_threshold": 0.9,
+                "recognition_threshold": self.lpr.min_confidence,
                 "min_plate_length": 4,
                 "match_distance": 1,
-                "known_plates": {},
                 "enhancement": 0,
                 "debug_save_plates": false,
                 "replace_rules": []
@@ -2597,6 +2652,10 @@ impl NinjaConfig {
         if let Some(objects_val) = obj.get("objects") {
             self.objects =
                 serde_json::from_value(objects_val.clone()).context("invalid objects config")?;
+            self.objects.normalize_standalone_tracked_attributes();
+        }
+        if let Some(lpr_val) = obj.get("lpr") {
+            self.lpr = serde_json::from_value(lpr_val.clone()).context("invalid lpr config")?;
         }
         if let Some(record_val) = obj.get("record") {
             self.record =
@@ -2746,6 +2805,7 @@ impl NinjaConfig {
                     cam.review.alerts.exclude_sub_labels =
                         self.review.alerts.exclude_sub_labels.clone();
                 }
+                cam.objects.normalize_standalone_tracked_attributes();
             }
             self.cameras = next_cams;
         }
@@ -4398,5 +4458,75 @@ version: 0.18-0
         assert_eq!(cfg.face_recognition.min_face_area, 800);
         assert!(!cfg.face_recognition.unknown_alert);
         assert_eq!(cfg.review.alerts.exclude_sub_labels, vec!["Bruno"]);
+    }
+
+    #[test]
+    fn lpr_config_known_plates_and_standalone_license_plate_track_roundtrip() {
+        let yaml = r#"
+lpr:
+  enabled: true
+  detector_model_path: /config/models/lpr_det.onnx
+  ocr_model_path: /config/models/lpr_ocr.onnx
+  min_confidence: 0.82
+  format_regex: "^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$"
+  known_plates:
+    ABC1D23: "Family SUV"
+    XYZ9876: "Courier Van"
+cameras:
+  gate_lpr:
+    enabled: true
+    objects:
+      track: [license_plate]
+version: 0.18-0
+"#;
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/lpr.yml")).unwrap();
+        assert!(cfg.lpr.enabled);
+        assert_eq!(
+            cfg.lpr.detector_model_path,
+            Some(PathBuf::from("/config/models/lpr_det.onnx"))
+        );
+        assert_eq!(
+            cfg.lpr.ocr_model_path,
+            Some(PathBuf::from("/config/models/lpr_ocr.onnx"))
+        );
+        assert!((cfg.lpr.min_confidence - 0.82).abs() < 1e-5);
+        assert_eq!(
+            cfg.lpr.format_regex.as_deref(),
+            Some("^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$")
+        );
+        assert_eq!(
+            cfg.lpr.known_plates.get("ABC1D23").map(String::as_str),
+            Some("Family SUV")
+        );
+        assert!(
+            !cfg.cameras["gate_lpr"]
+                .objects
+                .attribute_labels
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case("license_plate")),
+            "standalone license_plate in objects.track must not remain in attribute_labels"
+        );
+
+        let api_val = cfg.to_api_value();
+        assert_eq!(api_val["lpr"]["enabled"], true);
+        assert_eq!(api_val["lpr"]["known_plates"]["ABC1D23"], "Family SUV");
+        assert_eq!(api_val["cameras"]["gate_lpr"]["lpr"]["enabled"], true);
+
+        let patch = json!({
+            "lpr": {
+                "enabled": true,
+                "min_confidence": 0.85,
+                "format_regex": "^[A-Z]{3}[0-9]{4}$",
+                "known_plates": {
+                    "BRA2E19": "Visitor Sedan"
+                }
+            }
+        });
+        cfg.apply_structured_json(&patch).unwrap();
+        assert!((cfg.lpr.min_confidence - 0.85).abs() < 1e-5);
+        assert_eq!(
+            cfg.lpr.known_plates.get("BRA2E19").map(String::as_str),
+            Some("Visitor Sedan")
+        );
     }
 }

@@ -500,6 +500,26 @@ export function buildCleanYamlFromDraft(
         : {}),
       filters: draft.objects?.filters || {},
     },
+    ...(draft.lpr
+      ? {
+          lpr: {
+            enabled: draft.lpr.enabled ?? false,
+            ...(draft.lpr.detector_model_path
+              ? { detector_model_path: draft.lpr.detector_model_path }
+              : {}),
+            ...(draft.lpr.ocr_model_path
+              ? { ocr_model_path: draft.lpr.ocr_model_path }
+              : {}),
+            min_confidence: Number(
+              (draft.lpr.min_confidence ?? 0.75).toFixed(2)
+            ),
+            ...(draft.lpr.format_regex
+              ? { format_regex: draft.lpr.format_regex }
+              : {}),
+            known_plates: draft.lpr.known_plates || {},
+          },
+        }
+      : {}),
     record: {
       enabled: draft.record?.enabled ?? true,
       expire_interval: draft.record?.expire_interval ?? 60,
@@ -578,4 +598,74 @@ export function buildCleanYamlFromDraft(
   };
 
   return `${toYamlLines(rootObj).join("\n")}\n`;
+}
+
+export const DEFAULT_LPR_FORMAT_REGEX =
+  "^([A-Z]{3}[0-9][A-Z0-9][0-9]{2}|[A-Z]{2,3}[0-9]{3,4}|[A-Z]{1,3}[0-9]{1,4}[A-Z]{1,3}|[0-9][A-Z]{3}[0-9]{3})$";
+
+/**
+ * Normalizes a raw license plate string by keeping ASCII alphanumeric characters and uppercasing.
+ */
+export function normalizeLicensePlate(raw: string): string {
+  return (raw || "")
+    .replace(/[^a-zA-Z0-9]/g, "")
+    .toUpperCase();
+}
+
+/**
+ * Validates a license plate string against `formatRegex` (or `DEFAULT_LPR_FORMAT_REGEX` supporting Mercosul & legacy formats).
+ */
+export function validateLicensePlateFormat(
+  plate: string,
+  formatRegex?: string | null
+): boolean {
+  const norm = normalizeLicensePlate(plate);
+  if (norm.length < 4 || norm.length > 10) return false;
+  const pattern =
+    formatRegex && formatRegex.trim().length > 0
+      ? formatRegex.trim()
+      : DEFAULT_LPR_FORMAT_REGEX;
+  try {
+    const anchored =
+      pattern.startsWith("^") && pattern.endsWith("$")
+        ? pattern
+        : `^(?:${pattern.replace(/^\^/, "").replace(/\$$/, "")})$`;
+    return new RegExp(anchored).test(norm);
+  } catch {
+    return new RegExp(DEFAULT_LPR_FORMAT_REGEX).test(norm);
+  }
+}
+
+/**
+ * Looks up a friendly label for a plate in `knownPlates` (case- and hyphen-insensitive).
+ */
+export function resolveKnownPlateLabel(
+  plate: string,
+  knownPlates?: Record<string, string> | null
+): string | null {
+  const norm = normalizeLicensePlate(plate);
+  if (!norm || !knownPlates) return null;
+  if (knownPlates[norm]) return knownPlates[norm];
+  for (const [k, v] of Object.entries(knownPlates)) {
+    if (normalizeLicensePlate(k) === norm) {
+      return v;
+    }
+  }
+  return null;
+}
+
+/**
+ * Formats a monospace license plate badge string with optional `knownPlates` or `subLabel` match.
+ */
+export function formatLicensePlateBadge(
+  plate: string,
+  knownPlates?: Record<string, string> | null,
+  subLabel?: string | null
+): string {
+  const norm = normalizeLicensePlate(plate);
+  if (!norm) return "";
+  const resolved =
+    resolveKnownPlateLabel(norm, knownPlates) ||
+    (subLabel && subLabel.trim().length > 0 ? subLabel.trim() : null);
+  return resolved ? `${norm} · ${resolved.toUpperCase()}` : norm;
 }

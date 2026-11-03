@@ -610,7 +610,13 @@ impl VisionPipeline {
 
         let active_profile = self.comms.get_active_profile();
         let cam_rt_flags = self.comms.get_camera_flags(camera);
-        let (camera_suppressed_in_profile, camera_record_disabled_in_profile, genai_cfg, face_cfg) = {
+        let (
+            camera_suppressed_in_profile,
+            camera_record_disabled_in_profile,
+            genai_cfg,
+            face_cfg,
+            lpr_cfg,
+        ) = {
             let cfg_guard = self.config.read().await;
             let sup_alerts =
                 is_camera_alert_suppressed_in_profile(&cfg_guard, &active_profile, camera);
@@ -630,6 +636,7 @@ impl VisionPipeline {
                 sup_rec,
                 cfg_guard.genai.clone(),
                 cfg_guard.face_recognition.clone(),
+                cfg_guard.lpr.clone(),
             )
         };
         let faces_dir = self.media_dir.join("faces");
@@ -677,9 +684,32 @@ impl VisionPipeline {
                 .map(|p| p.zones != trk.entered_zones || p.stationary != trk.stationary)
                 .unwrap_or(false);
 
-            let mut effective_sub_label = trk
-                .inferred_sub_label
-                .clone()
+            let lpr_consensus = if lpr_cfg.enabled {
+                if let Some(ref cand) = trk.inferred_sub_label
+                    && ninjanvr_infer::validate_license_plate(cand, lpr_cfg.format_regex.as_deref())
+                {
+                    let read_score = trk
+                        .attributes
+                        .iter()
+                        .find(|a| a.label.eq_ignore_ascii_case("license_plate"))
+                        .map(|a| a.score)
+                        .unwrap_or(trk.score);
+                    self.detector.record_lpr_track_read(
+                        &trk.id,
+                        ninjanvr_infer::OcrPlateRead::new(cand.clone(), read_score),
+                        &lpr_cfg,
+                    )
+                } else {
+                    self.detector.lpr_consensus_for_track(&trk.id, &lpr_cfg)
+                }
+            } else {
+                None
+            };
+            let recognized_license_plate = lpr_consensus.as_ref().map(|c| c.plate.clone());
+            let mut effective_sub_label = lpr_consensus
+                .as_ref()
+                .and_then(|c| c.sub_label.clone())
+                .or_else(|| trk.inferred_sub_label.clone())
                 .or_else(|| prev.as_ref().and_then(|p| p.sub_label.clone()));
             let mut effective_sub_label_score: Option<f32> =
                 prev.as_ref().and_then(|p| p.sub_label_score);
@@ -922,6 +952,11 @@ impl VisionPipeline {
                         attr_tags.push(a.label.clone());
                     }
                 }
+                if let Some(ref plate_str) = recognized_license_plate
+                    && !attr_tags.contains(plate_str)
+                {
+                    attr_tags.push(plate_str.clone());
+                }
                 let face_box = merged_attrs
                     .iter()
                     .find(|a| a.label.eq_ignore_ascii_case("face"))
@@ -929,7 +964,14 @@ impl VisionPipeline {
                 let license_plate_box = merged_attrs
                     .iter()
                     .find(|a| a.label.eq_ignore_ascii_case("license_plate"))
-                    .map(|a| a.norm_bbox);
+                    .map(|a| a.norm_bbox)
+                    .or_else(|| {
+                        if trk.label.eq_ignore_ascii_case("license_plate") {
+                            Some(norm_box)
+                        } else {
+                            None
+                        }
+                    });
 
                 let ev_dto = EventDto {
                     id: trk.id.clone(),
@@ -959,6 +1001,7 @@ impl VisionPipeline {
                         "detected_attributes": merged_attrs,
                         "face_box": face_box,
                         "license_plate_box": license_plate_box,
+                        "recognized_license_plate": recognized_license_plate,
                         "type": "object",
                         "max_severity": severity,
                         "provenance": trk.provenance
@@ -1181,9 +1224,16 @@ impl VisionPipeline {
                 .as_ref()
                 .map(|s| s.best_score.max(trk.top_score))
                 .unwrap_or(trk.top_score);
-            let effective_sub_label = trk
-                .inferred_sub_label
-                .clone()
+            let lpr_consensus = if lpr_cfg.enabled {
+                self.detector.finalize_lpr_track(&trk.id, &lpr_cfg)
+            } else {
+                None
+            };
+            let recognized_license_plate = lpr_consensus.as_ref().map(|c| c.plate.clone());
+            let effective_sub_label = lpr_consensus
+                .as_ref()
+                .and_then(|c| c.sub_label.clone())
+                .or_else(|| trk.inferred_sub_label.clone())
                 .or_else(|| removed_snap.as_ref().and_then(|s| s.sub_label.clone()));
             let effective_sub_label_score = removed_snap.as_ref().and_then(|s| s.sub_label_score);
             let mut merged_attrs = removed_snap
@@ -1224,6 +1274,11 @@ impl VisionPipeline {
                     attr_tags.push(a.label.clone());
                 }
             }
+            if let Some(ref plate_str) = recognized_license_plate
+                && !attr_tags.contains(plate_str)
+            {
+                attr_tags.push(plate_str.clone());
+            }
             let face_box = merged_attrs
                 .iter()
                 .find(|a| a.label.eq_ignore_ascii_case("face"))
@@ -1231,7 +1286,14 @@ impl VisionPipeline {
             let license_plate_box = merged_attrs
                 .iter()
                 .find(|a| a.label.eq_ignore_ascii_case("license_plate"))
-                .map(|a| a.norm_bbox);
+                .map(|a| a.norm_bbox)
+                .or_else(|| {
+                    if trk.label.eq_ignore_ascii_case("license_plate") {
+                        Some(norm_box)
+                    } else {
+                        None
+                    }
+                });
 
             let ev_dto = EventDto {
                 id: trk.id.clone(),
@@ -1260,6 +1322,7 @@ impl VisionPipeline {
                     "detected_attributes": merged_attrs,
                     "face_box": face_box,
                     "license_plate_box": license_plate_box,
+                    "recognized_license_plate": recognized_license_plate,
                     "type": "object",
                     "max_severity": severity,
                     "provenance": trk.provenance
@@ -2285,6 +2348,41 @@ mod tests {
             body_bytes.starts_with(b"RIFF") && &body_bytes[8..12] == b"WEBP",
             "GET /api/events/{{id}}/snapshot-clean.webp must return valid WebP magic bytes"
         );
+
+        // 4. Verify LPR multi-frame voting + known_plates -> sub_label & recognized_license_plate
+        {
+            let mut cfg = pipeline.config.write().await;
+            cfg.lpr.enabled = true;
+            cfg.lpr
+                .known_plates
+                .insert("ABC1D23".to_string(), "Family SUV".to_string());
+        }
+        let mut lpr_trk = trk.clone();
+        lpr_trk.id = "1700002100.000000-lpr001".to_string();
+        lpr_trk.label = "license_plate".to_string();
+        lpr_trk.attributes.clear();
+        for read_str in ["ABC1D23", "ABC1023", "ABC1D23"] {
+            lpr_trk.inferred_sub_label = Some(read_str.to_string());
+            let lpr_ctx = FrameLifecycleCtx {
+                camera,
+                cam_cfg: &cam_cfg,
+                frame: &yuv_frame,
+                now: 2100.0,
+            };
+            pipeline
+                .process_lifecycle_events(
+                    &lpr_ctx,
+                    std::slice::from_ref(&lpr_trk),
+                    &[],
+                    &mut active_review,
+                    &mut track_snapshots,
+                )
+                .await;
+        }
+        let lpr_ev = pipeline.db.get_event(&lpr_trk.id).unwrap().unwrap();
+        assert_eq!(lpr_ev["data"]["recognized_license_plate"], json!("ABC1D23"));
+        assert_eq!(lpr_ev["sub_label"], json!("Family SUV"));
+        assert!(lpr_ev["data"]["license_plate_box"].is_array());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

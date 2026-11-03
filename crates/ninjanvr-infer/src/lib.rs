@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
-use ninjanvr_config::{DetectorEntryConfig, NinjaConfig};
+use ninjanvr_config::{DetectorEntryConfig, LprConfig, NinjaConfig};
 use ninjanvr_vision::BoundingBox;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -259,6 +259,7 @@ pub struct AiDetectorEngine {
     cumulative_infer_us: AtomicU64,
     pool: Mutex<BTreeMap<String, Arc<AiDetectorEngine>>>,
     face_gallery: Arc<Mutex<FaceGallery>>,
+    lpr_voter: Mutex<LprTrackVoter>,
 }
 
 /// Registry of named `AiDetectorEngine` instances supporting multi-detector routing per camera.
@@ -399,6 +400,7 @@ impl AiDetectorEngine {
             cumulative_infer_us: AtomicU64::new(0),
             pool: Mutex::new(pool_map),
             face_gallery: Arc::new(Mutex::new(FaceGallery::new())),
+            lpr_voter: Mutex::new(LprTrackVoter::new(12)),
         }
     }
 
@@ -410,6 +412,7 @@ impl AiDetectorEngine {
             cumulative_infer_us: AtomicU64::new(0),
             pool: Mutex::new(BTreeMap::new()),
             face_gallery: Arc::new(Mutex::new(FaceGallery::new())),
+            lpr_voter: Mutex::new(LprTrackVoter::new(12)),
         }
     }
 
@@ -692,6 +695,44 @@ impl AiDetectorEngine {
 
     pub fn cumulative_infer_us(&self) -> u64 {
         self.cumulative_infer_us.load(Ordering::Relaxed)
+    }
+
+    /// Records a single-frame OCR plate read for `track_id` into the engine's rolling multi-frame
+    /// voter and returns the consolidated consensus result if it passes `lpr_cfg` validation.
+    pub fn record_lpr_track_read(
+        &self,
+        track_id: &str,
+        read: OcrPlateRead,
+        lpr_cfg: &LprConfig,
+    ) -> Option<LprConsensusResult> {
+        self.lpr_voter
+            .lock()
+            .expect("lpr_voter mutex poisoned")
+            .record_read(track_id, read, lpr_cfg)
+    }
+
+    /// Returns the current consolidated LPR consensus for `track_id`, if any.
+    pub fn lpr_consensus_for_track(
+        &self,
+        track_id: &str,
+        lpr_cfg: &LprConfig,
+    ) -> Option<LprConsensusResult> {
+        self.lpr_voter
+            .lock()
+            .expect("lpr_voter mutex poisoned")
+            .consensus_for_track(track_id, lpr_cfg)
+    }
+
+    /// Removes buffered LPR reads for a finalized track and returns its final consensus if valid.
+    pub fn finalize_lpr_track(
+        &self,
+        track_id: &str,
+        lpr_cfg: &LprConfig,
+    ) -> Option<LprConsensusResult> {
+        let mut voter = self.lpr_voter.lock().expect("lpr_voter mutex poisoned");
+        let consensus = voter.consensus_for_track(track_id, lpr_cfg);
+        voter.remove_track(track_id);
+        consensus
     }
 
     /// Returns hardware plugin availability, discovered model files on disk, and active compiled tensor telemetry.
@@ -2425,6 +2466,592 @@ pub fn nms_detections(
     kept
 }
 
+/// Default license plate format regular expression supporting Mercosul (`[A-Z]{3}[0-9][A-Z0-9][0-9]{2}`,
+/// e.g. `ABC1D23`), legacy 3-letter/4-digit (`ABC1234`), and standard international alphanumeric formats.
+pub const DEFAULT_LPR_FORMAT_REGEX: &str = r"^([A-Z]{3}[0-9][A-Z0-9][0-9]{2}|[A-Z]{2,3}[0-9]{3,4}|[A-Z]{1,3}[0-9]{1,4}[A-Z]{1,3}|[0-9][A-Z]{3}[0-9]{3})$";
+
+/// Standard 36-character alphanumeric CTC alphabet (`0-9` followed by `A-Z`).
+pub const LPR_CTC_ALPHABET: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// Single-frame OCR plate read with overall and per-character confidence weights.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OcrPlateRead {
+    pub text: String,
+    pub confidence: f32,
+    pub char_confidences: Vec<f32>,
+}
+
+impl OcrPlateRead {
+    pub fn new(text: impl Into<String>, confidence: f32) -> Self {
+        let normalized = normalize_license_plate(&text.into());
+        let char_count = normalized.chars().count();
+        Self {
+            text: normalized,
+            confidence,
+            char_confidences: vec![confidence; char_count],
+        }
+    }
+
+    pub fn with_char_confidences(
+        text: impl Into<String>,
+        confidence: f32,
+        char_confidences: Vec<f32>,
+    ) -> Self {
+        let normalized = normalize_license_plate(&text.into());
+        Self {
+            text: normalized,
+            confidence,
+            char_confidences,
+        }
+    }
+}
+
+/// Consolidated multi-frame LPR consensus result after confidence-weighted character voting,
+/// regex format validation, and `known_plates` lookup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LprConsensusResult {
+    pub plate: String,
+    pub confidence: f32,
+    pub sub_label: Option<String>,
+    pub votes: usize,
+}
+
+/// Normalizes a raw license plate string by keeping ASCII alphanumeric characters and uppercasing.
+pub fn normalize_license_plate(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Looks up a normalized license plate in `known_plates` (case- and hyphen-insensitive)
+/// and returns its mapped friendly vehicle/owner label (e.g., `"ABC1D23"` -> `"Family SUV"`).
+pub fn lookup_known_plate(plate: &str, known_plates: &BTreeMap<String, String>) -> Option<String> {
+    let norm = normalize_license_plate(plate);
+    if norm.is_empty() {
+        return None;
+    }
+    if let Some(exact) = known_plates.get(&norm) {
+        return Some(exact.clone());
+    }
+    for (k, v) in known_plates {
+        if normalize_license_plate(k) == norm {
+            return Some(v.clone());
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone)]
+enum RegexNode {
+    Alternation(Vec<RegexNode>),
+    Sequence(Vec<RegexAtom>),
+}
+
+#[derive(Debug, Clone)]
+struct RegexAtom {
+    matcher: AtomMatcher,
+    min_rep: usize,
+    max_rep: usize,
+}
+
+#[derive(Debug, Clone)]
+enum AtomMatcher {
+    Group(Box<RegexNode>),
+    CharClass {
+        ranges: Vec<(char, char)>,
+        chars: Vec<char>,
+        negated: bool,
+    },
+    Digit,
+    Word,
+    Any,
+    Literal(char),
+}
+
+impl AtomMatcher {
+    fn matches_char(&self, ch: char) -> bool {
+        match self {
+            AtomMatcher::CharClass {
+                ranges,
+                chars,
+                negated,
+            } => {
+                let in_range = ranges.iter().any(|&(lo, hi)| ch >= lo && ch <= hi);
+                let in_chars = chars.contains(&ch);
+                let hit = in_range || in_chars;
+                if *negated { !hit } else { hit }
+            }
+            AtomMatcher::Digit => ch.is_ascii_digit(),
+            AtomMatcher::Word => ch.is_ascii_alphanumeric() || ch == '_',
+            AtomMatcher::Any => true,
+            AtomMatcher::Literal(c) => *c == ch,
+            AtomMatcher::Group(_) => false,
+        }
+    }
+}
+
+fn parse_regex_node(chars: &[char], pos: &mut usize) -> RegexNode {
+    let mut branches = Vec::new();
+    branches.push(parse_regex_sequence(chars, pos));
+    while *pos < chars.len() && chars[*pos] == '|' {
+        *pos += 1;
+        branches.push(parse_regex_sequence(chars, pos));
+    }
+    if branches.len() == 1 {
+        branches.pop().unwrap()
+    } else {
+        RegexNode::Alternation(branches)
+    }
+}
+
+fn parse_regex_sequence(chars: &[char], pos: &mut usize) -> RegexNode {
+    let mut atoms = Vec::new();
+    while *pos < chars.len() {
+        let ch = chars[*pos];
+        if ch == '|' || ch == ')' {
+            break;
+        }
+        if ch == '^' || ch == '$' {
+            *pos += 1;
+            continue;
+        }
+        let matcher = match ch {
+            '(' => {
+                *pos += 1;
+                if *pos + 1 < chars.len() && chars[*pos] == '?' && chars[*pos + 1] == ':' {
+                    *pos += 2;
+                }
+                let inner = parse_regex_node(chars, pos);
+                if *pos < chars.len() && chars[*pos] == ')' {
+                    *pos += 1;
+                }
+                AtomMatcher::Group(Box::new(inner))
+            }
+            '[' => {
+                *pos += 1;
+                let mut negated = false;
+                if *pos < chars.len() && chars[*pos] == '^' {
+                    negated = true;
+                    *pos += 1;
+                }
+                let mut ranges = Vec::new();
+                let mut single_chars = Vec::new();
+                while *pos < chars.len() && chars[*pos] != ']' {
+                    let c1 = if chars[*pos] == '\\' && *pos + 1 < chars.len() {
+                        *pos += 1;
+                        chars[*pos]
+                    } else {
+                        chars[*pos]
+                    };
+                    *pos += 1;
+                    if *pos + 1 < chars.len() && chars[*pos] == '-' && chars[*pos + 1] != ']' {
+                        *pos += 1;
+                        let c2 = chars[*pos];
+                        *pos += 1;
+                        ranges.push((c1, c2));
+                    } else {
+                        single_chars.push(c1);
+                    }
+                }
+                if *pos < chars.len() && chars[*pos] == ']' {
+                    *pos += 1;
+                }
+                AtomMatcher::CharClass {
+                    ranges,
+                    chars: single_chars,
+                    negated,
+                }
+            }
+            '\\' => {
+                *pos += 1;
+                if *pos < chars.len() {
+                    let esc = chars[*pos];
+                    *pos += 1;
+                    match esc {
+                        'd' => AtomMatcher::Digit,
+                        'w' => AtomMatcher::Word,
+                        other => AtomMatcher::Literal(other),
+                    }
+                } else {
+                    AtomMatcher::Literal('\\')
+                }
+            }
+            '.' => {
+                *pos += 1;
+                AtomMatcher::Any
+            }
+            lit => {
+                *pos += 1;
+                AtomMatcher::Literal(lit)
+            }
+        };
+
+        let (min_rep, max_rep) = parse_quantifier(chars, pos);
+        atoms.push(RegexAtom {
+            matcher,
+            min_rep,
+            max_rep,
+        });
+    }
+    RegexNode::Sequence(atoms)
+}
+
+fn parse_quantifier(chars: &[char], pos: &mut usize) -> (usize, usize) {
+    if *pos >= chars.len() {
+        return (1, 1);
+    }
+    match chars[*pos] {
+        '?' => {
+            *pos += 1;
+            (0, 1)
+        }
+        '*' => {
+            *pos += 1;
+            (0, 32)
+        }
+        '+' => {
+            *pos += 1;
+            (1, 32)
+        }
+        '{' => {
+            let start = *pos;
+            *pos += 1;
+            let mut min_s = String::new();
+            while *pos < chars.len() && chars[*pos].is_ascii_digit() {
+                min_s.push(chars[*pos]);
+                *pos += 1;
+            }
+            if min_s.is_empty() {
+                *pos = start;
+                return (1, 1);
+            }
+            let min_v = min_s.parse::<usize>().unwrap_or(1);
+            if *pos < chars.len() && chars[*pos] == '}' {
+                *pos += 1;
+                return (min_v, min_v);
+            }
+            if *pos < chars.len() && chars[*pos] == ',' {
+                *pos += 1;
+                let mut max_s = String::new();
+                while *pos < chars.len() && chars[*pos].is_ascii_digit() {
+                    max_s.push(chars[*pos]);
+                    *pos += 1;
+                }
+                if *pos < chars.len() && chars[*pos] == '}' {
+                    *pos += 1;
+                    let max_v = if max_s.is_empty() {
+                        32
+                    } else {
+                        max_s.parse::<usize>().unwrap_or(min_v)
+                    };
+                    return (min_v, max_v.max(min_v));
+                }
+            }
+            *pos = start;
+            (1, 1)
+        }
+        _ => (1, 1),
+    }
+}
+
+fn eval_node(node: &RegexNode, input: &[char], idx: usize) -> Vec<usize> {
+    match node {
+        RegexNode::Alternation(branches) => {
+            let mut ends = Vec::new();
+            for b in branches {
+                for end_idx in eval_node(b, input, idx) {
+                    if !ends.contains(&end_idx) {
+                        ends.push(end_idx);
+                    }
+                }
+            }
+            ends
+        }
+        RegexNode::Sequence(atoms) => eval_sequence(atoms, 0, input, idx),
+    }
+}
+
+fn eval_sequence(atoms: &[RegexAtom], atom_idx: usize, input: &[char], idx: usize) -> Vec<usize> {
+    if atom_idx >= atoms.len() {
+        return vec![idx];
+    }
+    let atom = &atoms[atom_idx];
+    let mut positions_after_k = vec![vec![idx]];
+    for _step in 0..atom.max_rep {
+        let prev_positions = positions_after_k.last().unwrap();
+        let mut next_positions = Vec::new();
+        for &p in prev_positions {
+            match &atom.matcher {
+                AtomMatcher::Group(g) => {
+                    for end_p in eval_node(g, input, p) {
+                        if end_p > p && !next_positions.contains(&end_p) {
+                            next_positions.push(end_p);
+                        }
+                    }
+                }
+                other => {
+                    if p < input.len() && other.matches_char(input[p]) {
+                        let end_p = p + 1;
+                        if !next_positions.contains(&end_p) {
+                            next_positions.push(end_p);
+                        }
+                    }
+                }
+            }
+        }
+        if next_positions.is_empty() {
+            break;
+        }
+        positions_after_k.push(next_positions);
+    }
+
+    let mut out = Vec::new();
+    for (rep_count, pos_list) in positions_after_k.iter().enumerate() {
+        if rep_count >= atom.min_rep && rep_count <= atom.max_rep {
+            for &p in pos_list {
+                for final_p in eval_sequence(atoms, atom_idx + 1, input, p) {
+                    if !out.contains(&final_p) {
+                        out.push(final_p);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Validates a license plate string against `format_regex` (or `DEFAULT_LPR_FORMAT_REGEX` when `None`/empty).
+/// Supports Mercosul (`[A-Z]{3}[0-9][A-Z0-9][0-9]{2}`, e.g. `ABC1D23`), legacy (`ABC1234`), and custom patterns.
+pub fn validate_license_plate(plate: &str, format_regex: Option<&str>) -> bool {
+    let normalized = normalize_license_plate(plate);
+    if normalized.len() < 4 || normalized.len() > 10 {
+        return false;
+    }
+    let pattern = format_regex
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_LPR_FORMAT_REGEX);
+    let pat_chars: Vec<char> = pattern.chars().collect();
+    let mut pos = 0usize;
+    let ast = parse_regex_node(&pat_chars, &mut pos);
+    let in_chars: Vec<char> = normalized.chars().collect();
+    eval_node(&ast, &in_chars, 0).contains(&in_chars.len())
+}
+
+/// Decodes a `[timesteps, num_classes]` CTC output probability/logit tensor using greedy CTC collapse
+/// (collapsing repeated non-blank indices and skipping `blank_idx`).
+pub fn decode_lpr_ctc_logits(
+    logits: &[f32],
+    timesteps: usize,
+    num_classes: usize,
+    blank_idx: usize,
+) -> Option<OcrPlateRead> {
+    if timesteps == 0 || num_classes < 2 || logits.len() < timesteps * num_classes {
+        return None;
+    }
+    let mut decoded_chars = String::new();
+    let mut char_confs = Vec::new();
+    let mut prev_class: Option<usize> = None;
+
+    for t in 0..timesteps {
+        let row = &logits[t * num_classes..(t + 1) * num_classes];
+        let mut best_c = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (c, &v) in row.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_c = c;
+            }
+        }
+        // Convert logit to probability if outside [0.0, 1.0]
+        let prob =
+            if (0.0..=1.0).contains(&best_val) && row.iter().all(|&x| (0.0..=1.001).contains(&x)) {
+                best_val
+            } else {
+                let max_v = best_val;
+                let sum_exp: f32 = row.iter().map(|&x| (x - max_v).exp()).sum();
+                if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 }
+            };
+
+        if best_c != blank_idx && prev_class != Some(best_c) {
+            let alpha_idx = if best_c > blank_idx {
+                best_c - 1
+            } else {
+                best_c
+            };
+            if let Some(&ch_byte) = LPR_CTC_ALPHABET.get(alpha_idx) {
+                decoded_chars.push(ch_byte as char);
+                char_confs.push(prob);
+            }
+        }
+        prev_class = Some(best_c);
+    }
+
+    if decoded_chars.is_empty() {
+        return None;
+    }
+    let avg_conf = char_confs.iter().sum::<f32>() / (char_confs.len() as f32);
+    Some(OcrPlateRead {
+        text: decoded_chars,
+        confidence: avg_conf,
+        char_confidences: char_confs,
+    })
+}
+
+/// Aggregates character predictions across consecutive frames of the same track using
+/// confidence-weighted majority voting, validates against `lpr_cfg.format_regex`, and resolves `known_plates`.
+pub fn vote_license_plate_reads(
+    reads: &[OcrPlateRead],
+    lpr_cfg: &LprConfig,
+) -> Option<LprConsensusResult> {
+    let cleaned: Vec<(Vec<char>, f32, Vec<f32>)> = reads
+        .iter()
+        .filter_map(|r| {
+            let norm = normalize_license_plate(&r.text);
+            if norm.is_empty() || r.confidence <= 0.0 {
+                return None;
+            }
+            let chars: Vec<char> = norm.chars().collect();
+            let c_confs = if r.char_confidences.len() == chars.len() {
+                r.char_confidences.clone()
+            } else {
+                vec![r.confidence; chars.len()]
+            };
+            Some((chars, r.confidence, c_confs))
+        })
+        .collect();
+
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    // Group candidate reads by plate character length and rank lengths by total confidence weight
+    let mut len_weights: BTreeMap<usize, f32> = BTreeMap::new();
+    for (chars, conf, _) in &cleaned {
+        *len_weights.entry(chars.len()).or_default() += *conf;
+    }
+    let mut ranked_lengths: Vec<(usize, f32)> = len_weights.into_iter().collect();
+    ranked_lengths.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.0.cmp(&a.0))
+    });
+
+    for (target_len, _) in ranked_lengths {
+        let same_len: Vec<&(Vec<char>, f32, Vec<f32>)> = cleaned
+            .iter()
+            .filter(|(c, _, _)| c.len() == target_len)
+            .collect();
+        if same_len.is_empty() {
+            continue;
+        }
+
+        let mut voted_plate = String::with_capacity(target_len);
+        let mut pos_conf_sum = 0.0f32;
+
+        for pos in 0..target_len {
+            let mut char_votes: BTreeMap<char, (f32, usize)> = BTreeMap::new();
+            for (chars, read_conf, c_confs) in &same_len {
+                let ch = chars[pos];
+                let w = c_confs.get(pos).copied().unwrap_or(*read_conf).max(0.01);
+                let entry = char_votes.entry(ch).or_insert((0.0, 0));
+                entry.0 += w;
+                entry.1 += 1;
+            }
+            let (best_ch, (best_weight, best_count)) = char_votes
+                .into_iter()
+                .max_by(|a, b| {
+                    a.1.0
+                        .partial_cmp(&b.1.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.1.cmp(&b.1.1))
+                })
+                .unwrap();
+            voted_plate.push(best_ch);
+            pos_conf_sum += best_weight / (best_count.max(1) as f32);
+        }
+
+        let consolidated_conf = pos_conf_sum / (target_len as f32);
+        if consolidated_conf >= lpr_cfg.min_confidence
+            && validate_license_plate(&voted_plate, lpr_cfg.format_regex.as_deref())
+        {
+            let sub_label = lookup_known_plate(&voted_plate, &lpr_cfg.known_plates);
+            return Some(LprConsensusResult {
+                plate: voted_plate,
+                confidence: consolidated_conf,
+                sub_label,
+                votes: same_len.len(),
+            });
+        }
+    }
+
+    None
+}
+
+/// Convenience helper that performs rolling majority voting over unweighted/uniformly-weighted plate strings.
+pub fn vote_license_plate_strings(
+    candidates: &[&str],
+    lpr_cfg: &LprConfig,
+) -> Option<LprConsensusResult> {
+    let reads: Vec<OcrPlateRead> = candidates
+        .iter()
+        .map(|s| OcrPlateRead::new(*s, 0.90))
+        .collect();
+    vote_license_plate_reads(&reads, lpr_cfg)
+}
+
+/// Stateful per-track rolling multi-frame LPR voter that buffers OCR reads across consecutive frames
+/// of each active track (`car`, `truck`, `motorcycle`, or standalone `license_plate`).
+#[derive(Debug, Clone)]
+pub struct LprTrackVoter {
+    max_window: usize,
+    tracks: BTreeMap<String, Vec<OcrPlateRead>>,
+}
+
+impl Default for LprTrackVoter {
+    fn default() -> Self {
+        Self::new(12)
+    }
+}
+
+impl LprTrackVoter {
+    pub fn new(max_window: usize) -> Self {
+        Self {
+            max_window: max_window.max(1),
+            tracks: BTreeMap::new(),
+        }
+    }
+
+    pub fn record_read(
+        &mut self,
+        track_id: &str,
+        read: OcrPlateRead,
+        lpr_cfg: &LprConfig,
+    ) -> Option<LprConsensusResult> {
+        let entry = self.tracks.entry(track_id.to_string()).or_default();
+        entry.push(read);
+        if entry.len() > self.max_window {
+            let drain_count = entry.len() - self.max_window;
+            entry.drain(0..drain_count);
+        }
+        vote_license_plate_reads(entry, lpr_cfg)
+    }
+
+    pub fn consensus_for_track(
+        &self,
+        track_id: &str,
+        lpr_cfg: &LprConfig,
+    ) -> Option<LprConsensusResult> {
+        let reads = self.tracks.get(track_id)?;
+        vote_license_plate_reads(reads, lpr_cfg)
+    }
+
+    pub fn remove_track(&mut self, track_id: &str) -> Option<Vec<OcrPlateRead>> {
+        self.tracks.remove(track_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3247,5 +3874,99 @@ version: 0.18-0
         assert!(fallback_head.inside(&person_box));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn lpr_ctc_decoding_multi_frame_voting_regex_validation_and_known_plates() {
+        // 1. Validate Mercosul (ABC1D23), legacy (ABC1234 / ABC-1234), and international plates
+        assert!(validate_license_plate("ABC1D23", None));
+        assert!(validate_license_plate("abc-1d23", None));
+        assert!(validate_license_plate("ABC1234", None));
+        assert!(validate_license_plate("ABC-1234", None));
+        assert!(validate_license_plate("AB12CDE", None));
+        assert!(!validate_license_plate("12", None));
+        assert!(!validate_license_plate("INVALIDPLATE12345", None));
+
+        // Strict Mercosul-only custom regex
+        let strict_mercosul = Some("^[A-Z]{3}[0-9][A-Z][0-9]{2}$");
+        assert!(validate_license_plate("ABC1D23", strict_mercosul));
+        assert!(!validate_license_plate("ABC1234", strict_mercosul));
+
+        // 2. Greedy CTC decoding collapses duplicate tokens and skips blank token (idx 36)
+        // Alphabet: 0..10 = '0'..'9', 10..36 = 'A'..'Z', 36 = blank
+        let num_classes = 37;
+        let blank = 36;
+        // Sequence of classes: A (10), A (10), blank (36), B (11), C (12), 1 (1), D (13), 2 (2), 3 (3)
+        let seq = [10usize, 10, 36, 11, 12, 1, 13, 2, 3];
+        let mut logits = vec![0.01f32; seq.len() * num_classes];
+        for (t, &cls) in seq.iter().enumerate() {
+            logits[t * num_classes + cls] = 0.94;
+        }
+        let decoded = decode_lpr_ctc_logits(&logits, seq.len(), num_classes, blank).unwrap();
+        assert_eq!(decoded.text, "ABC1D23");
+        assert!((decoded.confidence - 0.94).abs() < 1e-3);
+        assert_eq!(decoded.char_confidences.len(), 7);
+
+        // 3. Multi-frame rolling character majority voting + known_plates lookup
+        let mut known_plates = BTreeMap::new();
+        known_plates.insert("ABC1D23".to_string(), "Family SUV".to_string());
+        known_plates.insert("XYZ9876".to_string(), "Delivery Truck".to_string());
+
+        let lpr_cfg = LprConfig {
+            enabled: true,
+            detector_model_path: None,
+            ocr_model_path: None,
+            min_confidence: 0.75,
+            format_regex: Some("^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$".to_string()),
+            known_plates,
+        };
+
+        let string_vote =
+            vote_license_plate_strings(&["ABC1D23", "ABC1023", "ABC1D23"], &lpr_cfg).unwrap();
+        assert_eq!(string_vote.plate, "ABC1D23");
+        assert_eq!(string_vote.sub_label.as_deref(), Some("Family SUV"));
+        assert_eq!(string_vote.votes, 3);
+
+        // 4. Confidence-weighted voting across consecutive frames on AiDetectorEngine / LprTrackVoter
+        let cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/lpr_eng.yml"))
+                .unwrap();
+        let engine = AiDetectorEngine::new(&cfg);
+
+        // Frame 1: slightly blurred read "ABC1023" (conf 0.76)
+        let r1 = engine
+            .record_lpr_track_read("trk_car_1", OcrPlateRead::new("ABC1023", 0.76), &lpr_cfg)
+            .unwrap();
+        assert_eq!(r1.plate, "ABC1023");
+        assert_eq!(r1.sub_label, None);
+
+        // Frame 2: sharp read "ABC1D23" with higher confidence (0.93) outweighs single blurred frame!
+        let r2 = engine
+            .record_lpr_track_read("trk_car_1", OcrPlateRead::new("ABC1D23", 0.93), &lpr_cfg)
+            .unwrap();
+        assert_eq!(r2.plate, "ABC1D23");
+        assert_eq!(r2.sub_label.as_deref(), Some("Family SUV"));
+
+        // Frame 3: confirming read "ABC1D23" (0.91)
+        let r3 = engine
+            .record_lpr_track_read("trk_car_1", OcrPlateRead::new("ABC1D23", 0.91), &lpr_cfg)
+            .unwrap();
+        assert_eq!(r3.plate, "ABC1D23");
+        assert_eq!(r3.votes, 3);
+        assert_eq!(
+            engine
+                .lpr_consensus_for_track("trk_car_1", &lpr_cfg)
+                .unwrap()
+                .plate,
+            "ABC1D23"
+        );
+
+        let finalized = engine.finalize_lpr_track("trk_car_1", &lpr_cfg).unwrap();
+        assert_eq!(finalized.plate, "ABC1D23");
+        assert!(
+            engine
+                .lpr_consensus_for_track("trk_car_1", &lpr_cfg)
+                .is_none()
+        );
     }
 }
