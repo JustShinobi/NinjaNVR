@@ -7100,15 +7100,25 @@ async fn api_event_clip_mp4(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    if let Ok(Some(ev)) = state.db.get_event(&id)
-        && let (Some(cam), Some(start)) = (ev["camera"].as_str(), ev["start_time"].as_f64())
-    {
-        let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
-        if let Ok(recs) = state.db.query_recordings(cam, start - 5.0, end + 5.0) {
-            for rec in recs {
-                let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
-                if let Ok(bytes) = tokio::fs::read(&disk_path).await {
-                    return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
+    let direct_clip = state.media_dir.join("clips").join(format!("{id}.mp4"));
+    if let Ok(bytes) = tokio::fs::read(&direct_clip).await {
+        return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
+    }
+    if let Ok(Some(ev)) = state.db.get_event(&id) {
+        if let Some(mock_vid) = ev["data"]["mock_video"].as_str() {
+            let mock_path = state.media_dir.join("clips/mocks").join(mock_vid);
+            if let Ok(bytes) = tokio::fs::read(&mock_path).await {
+                return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
+            }
+        }
+        if let (Some(cam), Some(start)) = (ev["camera"].as_str(), ev["start_time"].as_f64()) {
+            let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
+            if let Ok(recs) = state.db.query_recordings(cam, start - 5.0, end + 5.0) {
+                for rec in recs {
+                    let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+                    if let Ok(bytes) = tokio::fs::read(&disk_path).await {
+                        return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
+                    }
                 }
             }
         }

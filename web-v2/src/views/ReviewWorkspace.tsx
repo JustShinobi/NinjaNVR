@@ -1091,14 +1091,36 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
               )}
 
               <div className="nvr-cam-tile" style={{ flex: 1 }}>
-                <VodHlsPlayer
-                  camera={activeReview.camera}
-                  startTime={activeReview.start_time - 4}
-                  endTime={(activeReview.end_time || activeReview.start_time + 20) + 6}
-                  fallbackPreviewId={activeReview.id}
-                  playbackRate={briefingActive ? briefingSpeed : playbackSpeed}
-                  onEnded={briefingActive ? handleAdvanceBriefing : undefined}
-                />
+                {(activeReview.data as Record<string, unknown> | undefined)
+                  ?.mock_video ? (
+                  <video
+                    src={`/clips/mocks/${encodeURIComponent(
+                      String(
+                        (activeReview.data as Record<string, unknown>).mock_video
+                      )
+                    )}`}
+                    controls
+                    autoPlay
+                    loop
+                    muted
+                    playsInline
+                    style={{
+                      width: "100%",
+                      height: "100%",
+                      objectFit: "contain",
+                      background: "var(--video-stage-bg)",
+                    }}
+                  />
+                ) : (
+                  <VodHlsPlayer
+                    camera={activeReview.camera}
+                    startTime={activeReview.start_time - 4}
+                    endTime={(activeReview.end_time || activeReview.start_time + 20) + 6}
+                    fallbackPreviewId={activeReview.id}
+                    playbackRate={briefingActive ? briefingSpeed : playbackSpeed}
+                    onEnded={briefingActive ? handleAdvanceBriefing : undefined}
+                  />
+                )}
               </div>
 
               <div

@@ -1453,7 +1453,17 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   />
                 ) : (
                   <video
-                    src={`/api/events/${encodeURIComponent(selectedEvent.id)}/clip.mp4`}
+                    src={
+                      (selectedEvent.data as Record<string, unknown> | undefined)
+                        ?.mock_video
+                        ? `/clips/mocks/${encodeURIComponent(
+                            String(
+                              (selectedEvent.data as Record<string, unknown>)
+                                .mock_video
+                            )
+                          )}`
+                        : `/api/events/${encodeURIComponent(selectedEvent.id)}/clip.mp4`
+                    }
                     controls
                     autoPlay
                     muted
