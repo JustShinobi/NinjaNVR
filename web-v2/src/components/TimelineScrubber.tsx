@@ -28,7 +28,10 @@ const ZOOM_LEVELS: TimelineZoomMinutes[] = [5, 15, 60, 360, 1440];
 interface TimelineScrubberProps {
   camera: string;
   cameras?: string[];
+  stageCameras?: string[];
+  cameraGroups?: Record<string, import("../types/nvr").CameraGroupConfig>;
   onSelectCamera?: (cam: string) => void;
+  onFocusCamera?: (cam: string) => void;
   segments: RecordingSegment[];
   reviews: ReviewItem[];
   currentTs: number | null; // null = LIVE EDGE
@@ -101,7 +104,10 @@ function toLocalTimeInputValue(unixSec: number): string {
 export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   camera,
   cameras,
+  stageCameras,
+  cameraGroups,
   onSelectCamera,
+  onFocusCamera,
   segments: initialSegments,
   reviews: initialReviews,
   currentTs,
@@ -1306,14 +1312,74 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               {titlePrefix}
             </span>
           )}
+          {stageCameras &&
+            stageCameras.length > 1 &&
+            stageCameras.length <= 4 &&
+            cameras &&
+            cameras.length > stageCameras.length &&
+            onSelectCamera && (
+              <div
+                className="mono"
+                role="group"
+                aria-label="On-stage cameras"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 3,
+                  background: "var(--bg-subcard)",
+                  border: "1px solid var(--border-hairline)",
+                  borderRadius: 3,
+                  padding: "1px 4px",
+                }}
+              >
+                <span
+                  style={{
+                    fontSize: "var(--text-xs)",
+                    color: "var(--text-muted)",
+                    padding: "0 3px",
+                  }}
+                  title="Cameras currently visible on the stage page above"
+                >
+                  STAGE:
+                </span>
+                {stageCameras.map((sc) => (
+                  <button
+                    key={sc}
+                    type="button"
+                    className={`nvr-btn mono ${camera === sc ? "active" : ""}`}
+                    style={{
+                      height: 22,
+                      padding: "0 7px",
+                      fontSize: "var(--text-xs)",
+                      textTransform: "uppercase",
+                    }}
+                    onClick={() => onSelectCamera(sc)}
+                  >
+                    {sc}
+                  </button>
+                ))}
+              </div>
+            )}
           {cameras && cameras.length > 0 && onSelectCamera && (
             <TacticalCameraPicker
               cameras={cameras}
               selectedCamera={camera}
               onSelect={onSelectCamera}
+              cameraGroups={cameraGroups}
               ariaLabel="Timeline camera selector"
               openUpward={true}
             />
+          )}
+          {onFocusCamera && (
+            <button
+              type="button"
+              className="nvr-btn mono"
+              style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+              title="Expand active timeline camera into Focus stage view"
+              onClick={() => onFocusCamera(camera)}
+            >
+              ⤢ Focus
+            </button>
           )}
 
           {/* Direct Recording Calendar Popover (neutral when closed) */}

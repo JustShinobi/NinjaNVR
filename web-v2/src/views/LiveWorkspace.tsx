@@ -1286,10 +1286,50 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     effectiveCameraGroups,
   ]);
 
-  const { visibleMatrixCams, totalPages, safePage } = useMemo(
+  const { visibleMatrixCams, pageSize, totalPages, safePage } = useMemo(
     () => sliceMatrixPage(groupCams, matrixPage, matrixDensity),
     [groupCams, matrixPage, matrixDensity]
   );
+
+  // Bi-directional Stage <-> Timeline synchronization:
+  // 1. When matrix page, density, or group changes and the active timeline camera is no longer
+  //    visible on stage, automatically sync the timeline to the first camera on the active page.
+  useEffect(() => {
+    if (
+      liveLayout === "2x2" &&
+      visibleMatrixCams.length > 0 &&
+      !visibleMatrixCams.includes(selectedCamera)
+    ) {
+      setSelectedCamera(visibleMatrixCams[0]);
+    }
+  }, [liveLayout, safePage, activeCameraGroup, matrixDensity, visibleMatrixCams]);
+
+  // 2. When the operator selects ANY camera from the Timeline or Search picker, automatically
+  //    jump the Matrix Page (and group if needed) so that camera is immediately visible on stage.
+  const selectCameraAndRevealOnStage = (cam: string) => {
+    setSelectedCamera(cam);
+    if (liveLayout === "2x2") {
+      const idxInGroup = groupCams.indexOf(cam);
+      if (idxInGroup >= 0) {
+        const targetPage = Math.floor(idxInGroup / Math.max(1, pageSize));
+        if (targetPage !== safePage) {
+          setMatrixPage(targetPage);
+        }
+      } else {
+        setActiveCameraGroup("all");
+        const allOrdered = resolveOrderedDashboardCameras(
+          effectiveCameraNames,
+          effectiveCamerasConfig,
+          "all",
+          effectiveCameraGroups
+        );
+        const idxInAll = allOrdered.indexOf(cam);
+        if (idxInAll >= 0) {
+          setMatrixPage(Math.floor(idxInAll / Math.max(1, pageSize)));
+        }
+      }
+    }
+  };
 
   useEffect(() => {
     if (liveLayout !== "2x2" || !matrixTourEnabled || totalPages <= 1) return;
@@ -1797,8 +1837,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 key={cam}
                 className={`nvr-cam-tile ${isTimeShifted ? "has-native-controls" : ""}`}
                 style={{
-                  outline: isTimelineCam ? "1px solid var(--signal-accent)" : "none",
-                  outlineOffset: -1,
+                  outline: isTimelineCam ? "2px solid var(--signal-accent)" : "none",
+                  outlineOffset: -2,
                 }}
               >
                 {isTimeShifted && timeShiftTs !== null ? (
@@ -1831,6 +1871,18 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       ? ` @ ${formatTs(timeShiftTs)}`
                       : ""}
                   </span>
+                  {isTimelineCam && visibleMatrixCams.length > 1 && (
+                    <span
+                      className="nvr-badge mono"
+                      style={{
+                        borderColor: "var(--signal-accent)",
+                        color: "var(--signal-accent-text)",
+                      }}
+                      title="Active camera bound to the bottom Timeline scrubber"
+                    >
+                      ● TIMELINE
+                    </span>
+                  )}
                   <span className="nvr-badge">
                     {camCfg?.detect?.width || 1280}×{camCfg?.detect?.height || 720} ·{" "}
                     {camStat?.camera_fps?.toFixed(1) || "5.0"} FPS
@@ -4996,8 +5048,18 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
       <TimelineScrubber
         camera={selectedCamera}
-        cameras={effectiveCameraNames}
-        onSelectCamera={(cam) => setSelectedCamera(cam)}
+        cameras={groupCams}
+        stageCameras={liveLayout === "2x2" ? visibleMatrixCams : undefined}
+        cameraGroups={effectiveCameraGroups}
+        onSelectCamera={selectCameraAndRevealOnStage}
+        onFocusCamera={
+          liveLayout !== "focus"
+            ? (cam) => {
+                setSelectedCamera(cam);
+                setLiveLayout("focus");
+              }
+            : undefined
+        }
         segments={focusSegments}
         reviews={reviews}
         currentTs={timeShiftTs}
