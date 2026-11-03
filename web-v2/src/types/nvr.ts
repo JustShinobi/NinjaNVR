@@ -140,6 +140,46 @@ export interface ZoneConfig {
   min_area?: number;
   max_area?: number;
   min_score?: number;
+  preset?: string | null;
+}
+
+export interface OnvifCameraConfig {
+  host?: string | null;
+  port?: number;
+  user?: string | null;
+  password?: string | null;
+  has_password?: boolean;
+  clear_password?: boolean;
+  autotracking?: boolean;
+  return_preset?: string | null;
+  timeout_sec?: number;
+}
+
+export interface OnvifPresetItem {
+  token: string;
+  name: string;
+}
+
+export interface CameraPtzInfoResponse {
+  enabled: boolean;
+  online?: boolean;
+  camera?: string;
+  host?: string | null;
+  port?: number;
+  autotracking?: boolean;
+  return_preset?: string | null;
+  active_preset?: string | null;
+  features?: string[];
+  presets?: OnvifPresetItem[];
+  preset_names?: string[];
+  status?: {
+    pan: number;
+    tilt: number;
+    zoom: number;
+    move_status: string;
+    error?: string | null;
+  };
+  error?: string | null;
 }
 
 export interface LineConfig {
@@ -222,6 +262,7 @@ export interface CameraConfig {
   privacy_mask?: unknown;
   ui?: CameraUiConfig;
   map?: CameraMapPlacement;
+  onvif?: OnvifCameraConfig;
   ffmpeg?: CameraFfmpegConfig;
   live?: CameraLiveConfig;
   detect: CameraDetectConfig;

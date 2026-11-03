@@ -105,6 +105,7 @@ export const VisionZonesMotionSection: React.FC<{
   const [zoneNameInput, setZoneNameInput] = useState("entrada");
   const [zoneInertia, setZoneInertia] = useState(3);
   const [zoneLoitering, setZoneLoitering] = useState(0);
+  const [zonePresetInput, setZonePresetInput] = useState("");
   const [zoneObjects, setZoneObjects] = useState<string[]>(["person", "car"]);
   const [lineDirection, setLineDirection] = useState<"any" | "a_to_b" | "b_to_a">("any");
 
@@ -213,6 +214,7 @@ export const VisionZonesMotionSection: React.FC<{
         notify("Enter a zone name with at least 2 characters");
         return;
       }
+      const cleanPreset = zonePresetInput.trim();
       updateDraft((next) => {
         const cam = next.cameras[inspectorCam];
         if (!cam) return;
@@ -222,10 +224,15 @@ export const VisionZonesMotionSection: React.FC<{
           objects: zoneObjects,
           inertia: zoneInertia,
           loitering_time: zoneLoitering,
+          ...(cleanPreset ? { preset: cleanPreset } : {}),
         };
       });
       setDraftPoints([]);
-      notify(`Staged zone '${zSlug}' on ${inspectorCam}`);
+      notify(
+        cleanPreset
+          ? `Staged zone '${zSlug}' bound to PTZ preset '${cleanPreset}' on ${inspectorCam}`
+          : `Staged zone '${zSlug}' on ${inspectorCam}`
+      );
     } else if (polyType === "motion_mask") {
       updateDraft((next) => {
         const cam = next.cameras[inspectorCam];
@@ -474,6 +481,30 @@ export const VisionZonesMotionSection: React.FC<{
                     />
                   </div>
                 </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: "var(--text-xs)",
+                      color: "var(--text-secondary)",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {isPt ? "PTZ Preset:" : "PTZ Preset:"}
+                  </span>
+                  <input
+                    className="nvr-input mono"
+                    style={{ flex: 1, height: 24, fontSize: "var(--text-xs)" }}
+                    placeholder={
+                      isPt
+                        ? "Preset PTZ opcional (ex: entry_gate)"
+                        : "Optional PTZ Preset binding (e.g. entry_gate)"
+                    }
+                    aria-label="Zone PTZ Preset"
+                    value={zonePresetInput}
+                    onChange={(e) => setZonePresetInput(e.target.value)}
+                  />
+                </div>
                 <div className="nvr-chip-group">
                   {STANDARD_LABELS.slice(0, 6).map((lbl) => {
                     const active = zoneObjects.includes(lbl);
@@ -707,6 +738,7 @@ export const VisionZonesMotionSection: React.FC<{
                     >
                       ZONE: {zName.toUpperCase()} · inertia={zCfg.inertia ?? 3} · loiter=
                       {zCfg.loitering_time ?? 0}s
+                      {zCfg.preset ? ` · preset=${zCfg.preset}` : ""}
                     </div>
                     <div
                       className="mono"
@@ -732,6 +764,7 @@ export const VisionZonesMotionSection: React.FC<{
                         setZoneNameInput(zName);
                         setZoneInertia(zCfg.inertia ?? 3);
                         setZoneLoitering(zCfg.loitering_time ?? 0);
+                        setZonePresetInput(zCfg.preset || "");
                         setZoneObjects(zCfg.objects || ["person"]);
                         setDraftPoints(
                           coordStringToPoints(String(zCfg.coordinates), detW, detH)

@@ -1382,6 +1382,80 @@ impl Default for CameraMapPlacement {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnvifCameraConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default = "default_onvif_port")]
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_autotracking_bool")]
+    pub autotracking: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_preset: Option<String>,
+    #[serde(default = "default_onvif_timeout_sec")]
+    pub timeout_sec: u64,
+}
+
+fn default_onvif_port() -> u16 {
+    80
+}
+
+fn default_onvif_timeout_sec() -> u64 {
+    5
+}
+
+fn deserialize_autotracking_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = Value::deserialize(deserializer)?;
+    match val {
+        Value::Bool(b) => Ok(b),
+        Value::Object(map) => Ok(map
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)),
+        _ => Ok(false),
+    }
+}
+
+impl Default for OnvifCameraConfig {
+    fn default() -> Self {
+        Self {
+            host: None,
+            port: default_onvif_port(),
+            user: None,
+            password: None,
+            autotracking: false,
+            return_preset: None,
+            timeout_sec: default_onvif_timeout_sec(),
+        }
+    }
+}
+
+impl OnvifCameraConfig {
+    pub fn is_unconfigured(&self) -> bool {
+        self.host.as_deref().is_none_or(|h| h.trim().is_empty())
+            && self.user.as_deref().is_none_or(|u| u.trim().is_empty())
+            && self.password.as_deref().is_none_or(|p| p.is_empty())
+            && !self.autotracking
+            && self
+                .return_preset
+                .as_deref()
+                .is_none_or(|r| r.trim().is_empty())
+            && self.port == default_onvif_port()
+            && self.timeout_sec == default_onvif_timeout_sec()
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.host.as_deref().is_some_and(|h| !h.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraConfig {
     #[serde(default = "default_true")]
@@ -1398,6 +1472,8 @@ pub struct CameraConfig {
     pub ui: CameraUiConfig,
     #[serde(default)]
     pub map: CameraMapPlacement,
+    #[serde(default, skip_serializing_if = "OnvifCameraConfig::is_unconfigured")]
+    pub onvif: OnvifCameraConfig,
     #[serde(default)]
     pub ffmpeg: CameraFfmpegConfig,
     #[serde(default)]
@@ -1432,6 +1508,7 @@ impl Default for CameraConfig {
             privacy_mask: Value::Null,
             ui: CameraUiConfig::default(),
             map: CameraMapPlacement::default(),
+            onvif: OnvifCameraConfig::default(),
             ffmpeg: CameraFfmpegConfig::default(),
             live: CameraLiveConfig::default(),
             detect: DetectConfig::default(),
@@ -1480,6 +1557,8 @@ pub struct ZoneConfig {
     pub max_area: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
 }
 
 fn default_zone_inertia() -> u32 {
@@ -1949,22 +2028,18 @@ impl NinjaConfig {
                         "enabled_in_config": false
                     },
                     "onvif": {
-                        "host": "",
-                        "port": 8000,
-                        "tls_insecure": false,
-                        "ignore_time_mismatch": false,
-                        "autotracking": {
-                            "enabled": false,
-                            "enabled_in_config": false,
-                            "calibrate_on_startup": false,
-                            "zooming": "disabled",
-                            "zoom_factor": 0.3,
-                            "track": ["person"],
-                            "required_zones": [],
-                            "return_preset": "home",
-                            "timeout": 10,
-                            "movement_weights": []
-                        }
+                        "host": cam.onvif.host,
+                        "port": cam.onvif.port,
+                        "user": cam.onvif.user,
+                        "password": if cam.onvif.password.as_ref().is_some_and(|p| !p.is_empty() && p != "***") {
+                            json!("***")
+                        } else {
+                            Value::Null
+                        },
+                        "has_password": cam.onvif.password.as_ref().is_some_and(|p| !p.is_empty() && p != "***"),
+                        "autotracking": cam.onvif.autotracking,
+                        "return_preset": cam.onvif.return_preset,
+                        "timeout_sec": cam.onvif.timeout_sec
                     },
                     "ui": {
                         "order": if cam.ui.order != 0 { cam.ui.order } else { order_idx as i32 },
@@ -2530,6 +2605,56 @@ impl NinjaConfig {
             let mut next_cams: BTreeMap<String, CameraConfig> =
                 serde_json::from_value(cams_val.clone()).context("invalid cameras config")?;
             for (cam_name, cam) in next_cams.iter_mut() {
+                let clear_onvif_pass = cams_val
+                    .get(cam_name)
+                    .and_then(|c| c.get("onvif"))
+                    .and_then(|o| o.get("clear_password"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let prev_onvif_pass = self
+                    .cameras
+                    .get(cam_name)
+                    .and_then(|prev| prev.onvif.password.clone());
+                if clear_onvif_pass {
+                    cam.onvif.password = None;
+                } else if cam
+                    .onvif
+                    .password
+                    .as_deref()
+                    .map(|p| p.is_empty() || p == "***" || p == "*")
+                    .unwrap_or(true)
+                {
+                    cam.onvif.password = prev_onvif_pass;
+                }
+                if cam
+                    .onvif
+                    .host
+                    .as_deref()
+                    .is_some_and(|h| h.trim().is_empty())
+                {
+                    cam.onvif.host = None;
+                }
+                if cam
+                    .onvif
+                    .user
+                    .as_deref()
+                    .is_some_and(|u| u.trim().is_empty())
+                {
+                    cam.onvif.user = None;
+                }
+                if cam
+                    .onvif
+                    .return_preset
+                    .as_deref()
+                    .is_some_and(|r| r.trim().is_empty())
+                {
+                    cam.onvif.return_preset = None;
+                }
+                for zcfg in cam.zones.values_mut() {
+                    if zcfg.preset.as_deref().is_some_and(|p| p.trim().is_empty()) {
+                        zcfg.preset = None;
+                    }
+                }
                 if cam.live.streams.is_empty() {
                     cam.live
                         .streams
@@ -2693,7 +2818,7 @@ pub fn scrub_rtsp_credentials(input: &str) -> String {
     }
 }
 
-/// Scrubs credentials from all RTSP/HTTP URLs embedded in a raw YAML configuration string.
+/// Scrubs credentials from all RTSP/HTTP URLs and `password:` fields embedded in a raw YAML configuration string.
 pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
     let mut out = String::with_capacity(raw_yaml.len());
     let mut cursor = 0usize;
@@ -2740,7 +2865,35 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
         cursor = url_end;
     }
     out.push_str(&raw_yaml[cursor..]);
-    out
+
+    let mut scrubbed_lines = String::with_capacity(out.len());
+    for chunk in out.split_inclusive('\n') {
+        let (line_body, newline) = if let Some(stripped) = chunk.strip_suffix("\r\n") {
+            (stripped, "\r\n")
+        } else if let Some(stripped) = chunk.strip_suffix('\n') {
+            (stripped, "\n")
+        } else {
+            (chunk, "")
+        };
+        let trimmed_start = line_body.trim_start();
+        if let Some(after_key) = trimmed_start.strip_prefix("password:") {
+            let leading_ws = &line_body[..line_body.len() - trimmed_start.len()];
+            let val_part = after_key.trim();
+            let unquoted = val_part.trim_matches('"').trim_matches('\'').trim();
+            if !unquoted.is_empty()
+                && !unquoted.eq_ignore_ascii_case("null")
+                && unquoted != "~"
+                && !unquoted.starts_with('#')
+            {
+                scrubbed_lines.push_str(leading_ws);
+                scrubbed_lines.push_str("password: \"***\"");
+                scrubbed_lines.push_str(newline);
+                continue;
+            }
+        }
+        scrubbed_lines.push_str(chunk);
+    }
+    scrubbed_lines
 }
 
 /// Recursively scrubs credentials from any URL strings inside a JSON `Value`.
@@ -3974,5 +4127,115 @@ version: 0.18-0
         assert_eq!(cfg.genai.model, "gemini-2.5-flash");
         assert!(!cfg.genai.verify_ambiguous_alerts);
         assert_eq!(cfg.genai.timeout_ms, 4500);
+    }
+
+    #[test]
+    fn onvif_config_and_preset_zones_scrub_and_roundtrip_passwords() {
+        let yaml = r#"
+cameras:
+  ptz_gate:
+    enabled: true
+    onvif:
+      host: 192.0.2.90
+      port: 8000
+      user: onvif_operator
+      password: super_secret_onvif_pw
+      autotracking: true
+      return_preset: entry_gate
+      timeout_sec: 7
+    zones:
+      gate_zone:
+        coordinates: "0.1,0.1,0.8,0.1,0.8,0.9,0.1,0.9"
+        objects: [person, car]
+        inertia: 3
+        loitering_time: 2
+        preset: entry_gate
+      global_zone:
+        coordinates: "0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0"
+        objects: [person]
+  default_onvif_cam:
+    enabled: true
+version: 0.18-0
+"#;
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/onvif.yml")).unwrap();
+        let onvif = &cfg.cameras["ptz_gate"].onvif;
+        assert!(onvif.is_configured());
+        assert!(!onvif.is_unconfigured());
+        assert_eq!(onvif.host.as_deref(), Some("192.0.2.90"));
+        assert_eq!(onvif.port, 8000);
+        assert_eq!(onvif.user.as_deref(), Some("onvif_operator"));
+        assert_eq!(onvif.password.as_deref(), Some("super_secret_onvif_pw"));
+        assert!(onvif.autotracking);
+        assert_eq!(onvif.return_preset.as_deref(), Some("entry_gate"));
+        assert_eq!(onvif.timeout_sec, 7);
+
+        let def_onvif = &cfg.cameras["default_onvif_cam"].onvif;
+        assert!(!def_onvif.is_configured());
+        assert!(def_onvif.is_unconfigured());
+        assert_eq!(def_onvif.port, 80);
+        assert_eq!(def_onvif.timeout_sec, 5);
+        assert!(!def_onvif.autotracking);
+
+        assert_eq!(
+            cfg.cameras["ptz_gate"].zones["gate_zone"].preset.as_deref(),
+            Some("entry_gate")
+        );
+        assert_eq!(cfg.cameras["ptz_gate"].zones["global_zone"].preset, None);
+
+        // 1. scrub_yaml_credentials scrubs ONVIF password in raw YAML
+        let scrubbed_yaml = scrub_yaml_credentials(yaml);
+        assert!(!scrubbed_yaml.contains("super_secret_onvif_pw"));
+        assert!(scrubbed_yaml.contains("password: \"***\""));
+
+        // 2. to_api_value() / to_api_config() scrubs ONVIF password
+        let mut api = cfg.to_api_value();
+        let api_str = serde_json::to_string(&api).unwrap();
+        assert!(!api_str.contains("super_secret_onvif_pw"));
+        assert_eq!(api["cameras"]["ptz_gate"]["onvif"]["password"], "***");
+        assert_eq!(api["cameras"]["ptz_gate"]["onvif"]["has_password"], true);
+        assert_eq!(api["cameras"]["ptz_gate"]["onvif"]["host"], "192.0.2.90");
+        assert_eq!(api["cameras"]["ptz_gate"]["onvif"]["port"], 8000);
+        assert_eq!(api["cameras"]["ptz_gate"]["onvif"]["autotracking"], true);
+        assert_eq!(
+            api["cameras"]["ptz_gate"]["onvif"]["return_preset"],
+            "entry_gate"
+        );
+        assert_eq!(api["cameras"]["ptz_gate"]["onvif"]["timeout_sec"], 7);
+        assert_eq!(
+            api["cameras"]["ptz_gate"]["zones"]["gate_zone"]["preset"],
+            "entry_gate"
+        );
+
+        // 3. apply_structured_json preserves scrubbed "***" password while updating port & zone preset
+        api["cameras"]["ptz_gate"]["onvif"]["port"] = json!(8080);
+        api["cameras"]["ptz_gate"]["zones"]["gate_zone"]["preset"] = json!("driveway");
+        cfg.apply_structured_json(&api).unwrap();
+        assert_eq!(cfg.cameras["ptz_gate"].onvif.port, 8080);
+        assert_eq!(
+            cfg.cameras["ptz_gate"].onvif.password.as_deref(),
+            Some("super_secret_onvif_pw")
+        );
+        assert_eq!(
+            cfg.cameras["ptz_gate"].zones["gate_zone"].preset.as_deref(),
+            Some("driveway")
+        );
+
+        // 4. apply_structured_json updates password when a new non-masked password is sent
+        api["cameras"]["ptz_gate"]["onvif"]["password"] = json!("rotated_onvif_pw");
+        cfg.apply_structured_json(&api).unwrap();
+        assert_eq!(
+            cfg.cameras["ptz_gate"].onvif.password.as_deref(),
+            Some("rotated_onvif_pw")
+        );
+
+        // 5. apply_structured_json clears password when clear_password is true
+        api["cameras"]["ptz_gate"]["onvif"]["password"] = json!("***");
+        api["cameras"]["ptz_gate"]["onvif"]["clear_password"] = json!(true);
+        cfg.apply_structured_json(&api).unwrap();
+        assert!(cfg.cameras["ptz_gate"].onvif.password.is_none());
+        assert_eq!(
+            cfg.to_api_value()["cameras"]["ptz_gate"]["onvif"]["has_password"],
+            false
+        );
     }
 }
