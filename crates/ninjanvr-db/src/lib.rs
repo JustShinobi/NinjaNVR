@@ -337,7 +337,9 @@ impl NinjaDatabase {
                 "name" VARCHAR(100) NOT NULL,
                 "description" TEXT NULL,
                 "created_at" DATETIME NOT NULL,
-                "updated_at" DATETIME NOT NULL
+                "updated_at" DATETIME NOT NULL,
+                "event_ids" JSON NOT NULL DEFAULT '[]',
+                "export_ids" JSON NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS "user" (
                 "username" VARCHAR(30) NOT NULL PRIMARY KEY,
@@ -421,6 +423,14 @@ impl NinjaDatabase {
             "ALTER TABLE recordings ADD COLUMN stream_tier TEXT NOT NULL DEFAULT 'main'",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE exportcase ADD COLUMN event_ids JSON NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE exportcase ADD COLUMN export_ids JSON NOT NULL DEFAULT '[]'",
+            [],
+        );
         Ok(())
     }
 
@@ -474,9 +484,15 @@ impl NinjaDatabase {
                 FROM recordings r
                 WHERE r.camera = ?1
                   AND r.end_time < ?2
-                  AND r.objects = 0
-                  AND r.motion = 0
+                  AND COALESCE(r.objects, 0) = 0
+                  AND COALESCE(r.motion, 0) = 0
                   AND COALESCE(r.stream_tier, 'main') = 'main'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM event e
+                      WHERE e.camera = r.camera
+                        AND e.start_time <= r.end_time
+                        AND COALESCE(e.end_time, e.start_time + 15.0) >= r.start_time
+                  )
                 ORDER BY r.start_time ASC
                 LIMIT 200
                 "#,
@@ -1081,6 +1097,10 @@ impl NinjaDatabase {
         Ok(out)
     }
 
+    pub fn query_review_ids(&self, ids: &[String]) -> Result<Vec<ReviewItemDto>> {
+        self.get_reviews_by_ids(ids)
+    }
+
     pub fn query_review_summary(&self, cameras: Option<&[String]>) -> Result<Value> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let now = Utc::now().timestamp() as f64;
@@ -1649,6 +1669,10 @@ impl NinjaDatabase {
             }
         }
         Ok(out)
+    }
+
+    pub fn query_event_ids(&self, ids: &[String]) -> Result<Vec<Value>> {
+        self.get_events_by_ids(ids)
     }
 
     pub fn set_event_retain(&self, id: &str, retain: bool) -> Result<usize> {
@@ -2636,6 +2660,34 @@ impl NinjaDatabase {
         Ok(out)
     }
 
+    pub fn list_exports(&self) -> Result<Vec<Value>> {
+        self.query_exports()
+    }
+
+    pub fn get_export(&self, id: &str) -> Result<Option<Value>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT id, camera, name, date, video_path, thumb_path, in_progress, export_case_id FROM export WHERE id = ?1",
+                params![id],
+                |r| {
+                    let date = value_to_f64(&r.get_ref(3)?).unwrap_or(0.0);
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "camera": r.get::<_, String>(1)?,
+                        "name": r.get::<_, String>(2)?,
+                        "date": date,
+                        "video_path": r.get::<_, String>(4)?,
+                        "thumb_path": r.get::<_, String>(5)?,
+                        "in_progress": r.get::<_, i64>(6).unwrap_or(0) != 0,
+                        "export_case_id": r.get::<_, Option<String>>(7).ok().flatten()
+                    }))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn insert_export(&self, exp: &ExportRow) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(
@@ -2683,18 +2735,68 @@ impl NinjaDatabase {
         Ok(paths)
     }
 
+    pub fn delete_exports_bulk(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut deleted_paths = Vec::new();
+        for id in ids {
+            if let Some(paths) = self.delete_export(id)? {
+                deleted_paths.push(paths);
+            }
+        }
+        Ok(deleted_paths)
+    }
+
+    pub fn create_case(
+        &self,
+        id: &str,
+        name: &str,
+        description: Option<&str>,
+        event_ids: &[String],
+        export_ids: &[String],
+    ) -> Result<Value> {
+        let now = Utc::now().timestamp() as f64;
+        let events_json = serde_json::to_string(event_ids)?;
+        let exports_json = serde_json::to_string(export_ids)?;
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            r#"
+            INSERT INTO exportcase (id, name, description, created_at, updated_at, event_ids, export_ids)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                description = excluded.description,
+                updated_at = excluded.updated_at,
+                event_ids = excluded.event_ids,
+                export_ids = excluded.export_ids
+            "#,
+            params![id, name, description, now, now, events_json, exports_json],
+        )?;
+        Ok(json!({
+            "id": id,
+            "name": name,
+            "description": description,
+            "created_at": now,
+            "updated_at": now,
+            "event_ids": event_ids,
+            "export_ids": export_ids
+        }))
+    }
+
     pub fn query_cases(&self) -> Result<Vec<Value>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at, updated_at FROM exportcase ORDER BY created_at DESC",
+            "SELECT id, name, description, created_at, updated_at, COALESCE(event_ids, '[]'), COALESCE(export_ids, '[]') FROM exportcase ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
+            let ev_raw: Option<String> = r.get(5).ok();
+            let ex_raw: Option<String> = r.get(6).ok();
             Ok(json!({
                 "id": r.get::<_, String>(0)?,
                 "name": r.get::<_, String>(1)?,
                 "description": r.get::<_, Option<String>>(2).ok().flatten(),
                 "created_at": value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
-                "updated_at": value_to_f64(&r.get_ref(4)?).unwrap_or(0.0)
+                "updated_at": value_to_f64(&r.get_ref(4)?).unwrap_or(0.0),
+                "event_ids": parse_json_or(ev_raw, json!([])),
+                "export_ids": parse_json_or(ex_raw, json!([]))
             }))
         })?;
         let mut out = Vec::new();
@@ -2702,6 +2804,34 @@ impl NinjaDatabase {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    pub fn list_cases(&self) -> Result<Vec<Value>> {
+        self.query_cases()
+    }
+
+    pub fn get_case(&self, id: &str) -> Result<Option<Value>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT id, name, description, created_at, updated_at, COALESCE(event_ids, '[]'), COALESCE(export_ids, '[]') FROM exportcase WHERE id = ?1",
+                params![id],
+                |r| {
+                    let ev_raw: Option<String> = r.get(5).ok();
+                    let ex_raw: Option<String> = r.get(6).ok();
+                    Ok(json!({
+                        "id": r.get::<_, String>(0)?,
+                        "name": r.get::<_, String>(1)?,
+                        "description": r.get::<_, Option<String>>(2).ok().flatten(),
+                        "created_at": value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
+                        "updated_at": value_to_f64(&r.get_ref(4)?).unwrap_or(0.0),
+                        "event_ids": parse_json_or(ev_raw, json!([])),
+                        "export_ids": parse_json_or(ex_raw, json!([]))
+                    }))
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     pub fn query_previews(&self, camera: &str, after: f64, before: f64) -> Result<Vec<Value>> {
@@ -3115,6 +3245,992 @@ mod tests {
 
         let remaining = db.query_recordings("sala", 800.0, 1100.0).unwrap();
         assert_eq!(remaining.len(), 3);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn review_segment_lifecycle_filters_notes_and_summary_work() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr-review-lifecycle-{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        let now = Utc::now().timestamp() as f64;
+        let t_recent_1 = now - 1800.0;
+        let t_recent_2 = now - 900.0;
+        let t_older_day = now - 3.0 * 86400.0;
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_alert_1".to_string(),
+            camera: "front_door".to_string(),
+            start_time: t_recent_1,
+            end_time: Some(t_recent_1 + 15.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-rev_alert_1.webp".to_string(),
+            data: json!({
+                "detections": ["ev_101", "ev_102"],
+                "objects": ["person-verified", "car"],
+                "zones": ["driveway", "porch"],
+                "audio": ["speech"],
+                "provenance": {
+                    "top_score": 0.94,
+                    "stationary": false
+                }
+            }),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_det_2".to_string(),
+            camera: "backyard".to_string(),
+            start_time: t_recent_2,
+            end_time: Some(t_recent_2 + 10.0),
+            severity: "detection".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-rev_det_2.webp".to_string(),
+            data: json!({
+                "detections": ["ev_202"],
+                "objects": ["dog"],
+                "zones": ["lawn"],
+                "audio": ["bark"],
+                "provenance": {
+                    "top_score": 0.78,
+                    "stationary": true
+                }
+            }),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_old_alert_3".to_string(),
+            camera: "front_door".to_string(),
+            start_time: t_older_day,
+            end_time: Some(t_older_day + 20.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-rev_old_alert_3.webp".to_string(),
+            data: json!({
+                "detections": ["ev_303"],
+                "objects": ["car"],
+                "zones": ["street"],
+                "audio": [],
+                "provenance": {
+                    "top_score": 0.88,
+                    "stationary": false
+                }
+            }),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        // Filter by camera
+        let by_cam = db
+            .query_reviews(&ReviewFilter {
+                cameras: Some(vec!["front_door".to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_cam.len(), 2);
+
+        // Filter by label (matches "person-verified" via base label "person", and audio label "bark")
+        let by_person = db
+            .query_reviews(&ReviewFilter {
+                labels: Some(vec!["person".to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_person.len(), 1);
+        assert_eq!(by_person[0].id, "rev_alert_1");
+
+        let by_audio = db
+            .query_reviews(&ReviewFilter {
+                labels: Some(vec!["bark".to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(by_audio.len(), 1);
+        assert_eq!(by_audio[0].id, "rev_det_2");
+
+        // Filter by exclude_labels, zones, severity, min_score, stationary, before/after
+        let filtered = db
+            .query_reviews(&ReviewFilter {
+                cameras: Some(vec!["front_door".to_string()]),
+                labels: Some(vec!["car".to_string()]),
+                exclude_labels: Some(vec!["dog".to_string()]),
+                zones: Some(vec!["driveway".to_string()]),
+                severity: Some("alert".to_string()),
+                reviewed: Some(false),
+                min_score: Some(0.90),
+                stationary: Some(false),
+                after: Some(t_recent_1 - 5.0),
+                before: Some(t_recent_1 + 5.0),
+                limit: Some(10),
+            })
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "rev_alert_1");
+
+        // Direct lookups: get_review_by_id, get_review_by_event_id, get_reviews_by_ids, query_review_ids
+        let one = db.get_review_by_id("rev_alert_1").unwrap().unwrap();
+        assert_eq!(one.camera, "front_door");
+        assert!(!one.has_been_reviewed);
+        assert!(db.get_review_by_id("non_existent").unwrap().is_none());
+
+        let by_ev = db.get_review_by_event_id("ev_102").unwrap().unwrap();
+        assert_eq!(by_ev.id, "rev_alert_1");
+        assert!(db.get_review_by_event_id("ev_999").unwrap().is_none());
+
+        let batch_ids = vec![
+            "rev_alert_1".to_string(),
+            "rev_det_2".to_string(),
+            "missing".to_string(),
+        ];
+        let by_ids = db.get_reviews_by_ids(&batch_ids).unwrap();
+        assert_eq!(by_ids.len(), 2);
+        let queried_ids = db.query_review_ids(&batch_ids).unwrap();
+        assert_eq!(queried_ids.len(), 2);
+
+        // Mark viewed (true) and unview (false), and set_review_notes
+        assert_eq!(
+            db.mark_reviews_viewed(&["rev_alert_1".to_string()], true)
+                .unwrap(),
+            1
+        );
+        let viewed = db
+            .query_reviews(&ReviewFilter {
+                reviewed: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(viewed.len(), 1);
+        assert_eq!(viewed[0].id, "rev_alert_1");
+        assert!(viewed[0].has_been_reviewed);
+
+        assert_eq!(
+            db.set_review_notes("rev_alert_1", "Verified delivery van in driveway")
+                .unwrap(),
+            1
+        );
+        let with_notes = db.get_review_by_id("rev_alert_1").unwrap().unwrap();
+        assert_eq!(
+            with_notes.data["notes"],
+            "Verified delivery van in driveway"
+        );
+
+        // Summary query (24h and per-day breakdown)
+        let summary_all = db.query_review_summary(None).unwrap();
+        assert_eq!(summary_all["last24Hours"]["total_alert"], 1);
+        assert_eq!(summary_all["last24Hours"]["reviewed_alert"], 1);
+        assert_eq!(summary_all["last24Hours"]["total_detection"], 1);
+        assert_eq!(summary_all["last24Hours"]["reviewed_detection"], 0);
+
+        let summary_front = db
+            .query_review_summary(Some(&["front_door".to_string()]))
+            .unwrap();
+        assert_eq!(summary_front["last24Hours"]["total_alert"], 1);
+        assert_eq!(summary_front["last24Hours"]["total_detection"], 0);
+
+        // Unview (reviewed = false)
+        assert_eq!(
+            db.mark_reviews_viewed(&["rev_alert_1".to_string()], false)
+                .unwrap(),
+            1
+        );
+        let after_unview = db.get_review_by_id("rev_alert_1").unwrap().unwrap();
+        assert!(!after_unview.has_been_reviewed);
+
+        // Batch delete_reviews
+        let deleted = db
+            .delete_reviews(&["rev_alert_1".to_string(), "rev_det_2".to_string()])
+            .unwrap();
+        assert_eq!(deleted, 2);
+        let remaining = db.query_reviews(&ReviewFilter::default()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "rev_old_alert_3");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn retention_tier_expiration_and_retain_indefinitely_guardrails_work() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr-retention-tiers-{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. cleanup_expired_events_and_reviews:
+        //    - expired alert event (retain_indefinitely = false) -> deleted + disk paths returned
+        //    - expired detection event (retain_indefinitely = false) -> deleted + disk paths returned
+        //    - pinned old event (retain_indefinitely = true) -> strictly preserved
+        //    - expired review segment -> deleted + thumb_path returned
+        //    - expired preview & timeline entry -> deleted + preview path returned
+        db.upsert_event(&EventDto {
+            id: "ev_expired_alert".to_string(),
+            camera: "cam_a".to_string(),
+            label: "person".to_string(),
+            zones: json!(["gate"]),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.92),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"max_severity": "alert"}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.92),
+            stationary: false,
+        })
+        .unwrap();
+
+        db.upsert_event(&EventDto {
+            id: "ev_expired_det".to_string(),
+            camera: "cam_a".to_string(),
+            label: "car".to_string(),
+            zones: json!([]),
+            start_time: 1100.0,
+            end_time: Some(1110.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.81),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"max_severity": "detection"}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.81),
+            stationary: false,
+        })
+        .unwrap();
+
+        db.upsert_event(&EventDto {
+            id: "ev_pinned_forever".to_string(),
+            camera: "cam_a".to_string(),
+            label: "person".to_string(),
+            zones: json!(["gate"]),
+            start_time: 900.0,
+            end_time: Some(910.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: true,
+            sub_label: Some("VIP".to_string()),
+            top_score: Some(0.99),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"max_severity": "alert"}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.99),
+            stationary: false,
+        })
+        .unwrap();
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_expired_1".to_string(),
+            camera: "cam_a".to_string(),
+            start_time: 1000.0,
+            end_time: Some(1015.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-rev_expired_1.webp".to_string(),
+            data: json!({"detections": ["ev_expired_alert"]}),
+            has_been_reviewed: true,
+        })
+        .unwrap();
+        db.mark_reviews_viewed(&["rev_expired_1".to_string()], true)
+            .unwrap();
+
+        db.insert_preview(
+            "prev_expired_1",
+            "cam_a",
+            "/media/ninjanvr/previews/cam_a/1000.mp4",
+            1000.0,
+            1060.0,
+            60.0,
+        )
+        .unwrap();
+        db.insert_timeline_entry(
+            1005.0,
+            "cam_a",
+            "tracked_object",
+            Some("ev_expired_alert"),
+            " entered_zone",
+            &json!({"zone": "gate"}),
+        )
+        .unwrap();
+
+        let removed_files = db
+            .cleanup_expired_events_and_reviews("cam_a", 2000.0, 2000.0)
+            .unwrap();
+        assert!(
+            removed_files.contains(&"/media/ninjanvr/clips/review/thumb-rev_expired_1.webp".into())
+        );
+        assert!(removed_files.contains(&"/media/ninjanvr/clips/ev_expired_alert.jpg".into()));
+        assert!(
+            removed_files.contains(&"/media/ninjanvr/clips/cam_a-ev_expired_alert.webp".into())
+        );
+        assert!(removed_files.contains(&"/media/ninjanvr/clips/ev_expired_det.jpg".into()));
+        assert!(removed_files.contains(&"/media/ninjanvr/previews/cam_a/1000.mp4".into()));
+        assert!(
+            !removed_files
+                .iter()
+                .any(|p| p.contains("ev_pinned_forever"))
+        );
+
+        assert!(db.get_event("ev_expired_alert").unwrap().is_none());
+        assert!(db.get_event("ev_expired_det").unwrap().is_none());
+        assert!(db.get_event("ev_pinned_forever").unwrap().is_some());
+        assert!(db.get_review_by_id("rev_expired_1").unwrap().is_none());
+        assert!(
+            db.query_timeline(Some("cam_a"), None, 50)
+                .unwrap()
+                .is_empty()
+        );
+
+        // 2. Hybrid stream tiering: set_recording_stream_tier & delete_expired_idle_main_recordings
+        //    Event at [5000, 5010] on cam_tier
+        db.upsert_event(&EventDto {
+            id: "ev_active_overlap".to_string(),
+            camera: "cam_tier".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 5000.0,
+            end_time: Some(5010.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.9),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.9),
+            stationary: false,
+        })
+        .unwrap();
+
+        for (id, start, end, motion, objects, tier) in [
+            ("tier_idle_sub", 4000.0, 4010.0, 0, 0, "sub"),
+            ("tier_idle_main_old", 4010.0, 4020.0, 0, 0, "main"),
+            ("tier_obj_main_old", 4020.0, 4030.0, 0, 2, "main"),
+            ("tier_ev_overlap_main", 5000.0, 5010.0, 0, 0, "main"),
+            ("tier_idle_main_recent", 7000.0, 7010.0, 0, 0, "main"),
+        ] {
+            db.insert_recording(&RecordingRow {
+                id: id.to_string(),
+                camera: "cam_tier".to_string(),
+                path: format!("/media/ninjanvr/recordings/cam_tier/{id}.mp4"),
+                start_time: start,
+                end_time: end,
+                duration: 10.0,
+                motion,
+                objects,
+                dbfs: -30,
+                segment_size: 2.0,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+            assert_eq!(db.set_recording_stream_tier(id, tier).unwrap(), 1);
+        }
+
+        let pruned_idle_main = db
+            .delete_expired_idle_main_recordings("cam_tier", 6000.0)
+            .unwrap();
+        assert_eq!(
+            pruned_idle_main,
+            vec!["/media/ninjanvr/recordings/cam_tier/tier_idle_main_old.mp4"]
+        );
+        let rem_tier = db.query_recordings("cam_tier", 3900.0, 7100.0).unwrap();
+        let rem_ids: Vec<&str> = rem_tier.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            rem_ids,
+            vec![
+                "tier_idle_sub",
+                "tier_obj_main_old",
+                "tier_ev_overlap_main",
+                "tier_idle_main_recent"
+            ]
+        );
+
+        // 3. delete_expired_recordings & delete_expired_recordings_with_window (all vs motion vs active_objects)
+        for (id, start, end, motion, objects) in [
+            ("rec_all_idle", 1000.0, 1010.0, 0, 0),
+            ("rec_motion_only", 1020.0, 1030.0, 45, 0),
+            ("rec_active_objects", 1040.0, 1050.0, 80, 3),
+        ] {
+            db.insert_recording(&RecordingRow {
+                id: id.to_string(),
+                camera: "cam_ret".to_string(),
+                path: format!("/media/ninjanvr/recordings/cam_ret/{id}.mp4"),
+                start_time: start,
+                end_time: end,
+                duration: 10.0,
+                motion,
+                objects,
+                dbfs: 0,
+                segment_size: 1.5,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        }
+
+        // Step A: continuous_before_ts=1500, motion_before_ts=900, event_before_ts=900 -> prunes only idle continuous segment
+        let pruned_continuous = db
+            .delete_expired_recordings_with_window("cam_ret", 1500.0, 900.0, 900.0, 0.0, 0.0)
+            .unwrap();
+        assert_eq!(
+            pruned_continuous,
+            vec!["/media/ninjanvr/recordings/cam_ret/rec_all_idle.mp4"]
+        );
+
+        // Step B: continuous_before_ts=1500, motion_before_ts=1500, event_before_ts=900 -> prunes motion_only while keeping active_objects
+        let pruned_motion = db
+            .delete_expired_recordings("cam_ret", 1500.0, 900.0)
+            .unwrap();
+        assert_eq!(
+            pruned_motion,
+            vec!["/media/ninjanvr/recordings/cam_ret/rec_motion_only.mp4"]
+        );
+
+        // Step C: event_before_ts=1500 -> prunes active_objects
+        let pruned_objects = db
+            .delete_expired_recordings("cam_ret", 1500.0, 1500.0)
+            .unwrap();
+        assert_eq!(
+            pruned_objects,
+            vec!["/media/ninjanvr/recordings/cam_ret/rec_active_objects.mp4"]
+        );
+        assert!(
+            db.query_recordings("cam_ret", 900.0, 1600.0)
+                .unwrap()
+                .is_empty()
+        );
+
+        // 4. delete_global_recordings_over_quota_mb across multiple cameras + compaction/tier helpers
+        for (id, cam, start, size_mb) in [
+            ("g_1", "cam_a", 2000.0, 100.0),
+            ("g_2", "cam_b", 2010.0, 100.0),
+            ("g_3", "cam_a", 2020.0, 100.0),
+            ("g_4", "cam_b", 2030.0, 100.0),
+        ] {
+            db.insert_recording(&RecordingRow {
+                id: id.to_string(),
+                camera: cam.to_string(),
+                path: format!("/media/ninjanvr/recordings/{cam}/{id}.mp4"),
+                start_time: start,
+                end_time: start + 10.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: -999,
+                segment_size: size_mb,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        }
+
+        // Verify dbfs listing/updating, cold compaction candidates, and tier migration helpers
+        let need_dbfs = db.list_recordings_by_dbfs(-999, 10).unwrap();
+        assert!(need_dbfs.len() >= 4);
+        assert_eq!(db.update_recording_dbfs("g_1", -24).unwrap(), 1);
+
+        let compact_cands = db
+            .list_cold_compaction_candidates("cam_a", 2500.0, true, 5.0, 5.0, 10)
+            .unwrap();
+        assert!(!compact_cands.is_empty());
+        let compact_all_cands = db
+            .list_cold_compaction_candidates("cam_a", 2500.0, false, 5.0, 5.0, 10)
+            .unwrap();
+        assert!(!compact_all_cands.is_empty());
+        db.update_recording_compacted("g_1", 80.0).unwrap();
+
+        let mig = db
+            .list_recordings_for_tier_migration(2500.0, "/media/ninjanvr/recordings/%", 10)
+            .unwrap();
+        assert!(!mig.is_empty());
+        assert!(
+            db.update_recording_path("g_1", "/media/ninjanvr/recordings/cam_a/g_1_cold.mp4")
+                .unwrap()
+        );
+
+        // Remove cam_tier segments so global quota test only evaluates cam_a + cam_b (80 + 100 + 100 + 100 = 380 MB)
+        for id in [
+            "tier_idle_sub",
+            "tier_obj_main_old",
+            "tier_ev_overlap_main",
+            "tier_idle_main_recent",
+        ] {
+            assert_eq!(db.delete_recording_by_id(id).unwrap(), 1);
+        }
+
+        assert!(
+            db.delete_global_recordings_over_quota_mb(0.0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.delete_global_recordings_over_quota_mb(500.0)
+                .unwrap()
+                .is_empty()
+        );
+        let global_evicted = db.delete_global_recordings_over_quota_mb(200.0).unwrap();
+        assert_eq!(
+            global_evicted,
+            vec![
+                "/media/ninjanvr/recordings/cam_a/g_1_cold.mp4",
+                "/media/ninjanvr/recordings/cam_b/g_2.mp4"
+            ]
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cases_api_tokens_and_exports_lifecycle_work() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr-cases-tokens-{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. Cases (create_case, list_cases, query_cases, get_case) with JSON event_ids & export_ids
+        let created_case = db
+            .create_case(
+                "case_001",
+                "Perimeter Breach Investigation",
+                Some("Gate entry at 02:14 UTC"),
+                &["ev_101".to_string(), "ev_102".to_string()],
+                &["exp_1".to_string()],
+            )
+            .unwrap();
+        assert_eq!(created_case["id"], "case_001");
+        assert_eq!(created_case["event_ids"], json!(["ev_101", "ev_102"]));
+        assert_eq!(created_case["export_ids"], json!(["exp_1"]));
+
+        let fetched_case = db.get_case("case_001").unwrap().unwrap();
+        assert_eq!(fetched_case["name"], "Perimeter Breach Investigation");
+        assert_eq!(
+            fetched_case["description"],
+            json!("Gate entry at 02:14 UTC")
+        );
+        assert_eq!(fetched_case["event_ids"], json!(["ev_101", "ev_102"]));
+        assert_eq!(fetched_case["export_ids"], json!(["exp_1"]));
+        assert!(db.get_case("missing_case").unwrap().is_none());
+
+        let all_cases = db.list_cases().unwrap();
+        assert_eq!(all_cases.len(), 1);
+        assert_eq!(db.query_cases().unwrap().len(), 1);
+
+        // 2. API Tokens (create_api_token, list_api_tokens, verify_api_token, delete_api_token)
+        assert!(db.create_api_token("", "read_only", None).is_err());
+        assert!(
+            db.create_api_token("bad-scope", "superadmin", None)
+                .is_err()
+        );
+
+        let (tok_meta, plaintext) = db
+            .create_api_token("prometheus-scraper", "metrics", Some(5000.0))
+            .unwrap();
+        let tok_id = tok_meta["id"].as_str().unwrap().to_string();
+        assert_eq!(tok_meta["name"], "prometheus-scraper");
+        assert_eq!(tok_meta["scope"], "metrics");
+        assert!(plaintext.starts_with("nnvr_"));
+
+        let (_full_meta, full_plain) = db.create_api_token("automation", "full", None).unwrap();
+        let (_ro_meta, _ro_plain) = db
+            .create_api_token("dashboard-ro", "read_only", None)
+            .unwrap();
+
+        let listed_tokens = db.list_api_tokens().unwrap();
+        assert_eq!(listed_tokens.len(), 3);
+
+        // Valid verification updates last_used_at
+        let verified = db.verify_api_token(&plaintext, 4000.0).unwrap();
+        assert_eq!(
+            verified,
+            Some(("prometheus-scraper".to_string(), "metrics".to_string()))
+        );
+        let after_use = db
+            .list_api_tokens()
+            .unwrap()
+            .into_iter()
+            .find(|t| t["id"] == tok_id)
+            .unwrap();
+        assert_eq!(after_use["last_used_at"], json!(4000.0));
+
+        // Expired token rejected
+        assert!(db.verify_api_token(&plaintext, 5000.0).unwrap().is_none());
+        assert!(db.verify_api_token(&plaintext, 6000.0).unwrap().is_none());
+        // Non-expired token without expires_at succeeds
+        assert_eq!(
+            db.verify_api_token(&full_plain, 999999.0).unwrap(),
+            Some(("automation".to_string(), "full".to_string()))
+        );
+        // Invalid prefix or unknown token rejected
+        assert!(
+            db.verify_api_token("invalid_token", 1000.0)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.verify_api_token("nnvr_00000000000000000000000000000000", 1000.0)
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(db.delete_api_token(&tok_id).unwrap());
+        assert!(!db.delete_api_token(&tok_id).unwrap());
+        assert_eq!(db.list_api_tokens().unwrap().len(), 2);
+
+        // 3. Exports (insert_export, list_exports, get_export, rename_export, delete_export, delete_exports_bulk)
+        for (id, cam, name, date) in [
+            ("exp_1", "front_door", "Front Clip 1", 1700000100.0),
+            ("exp_2", "backyard", "Backyard Clip 2", 1700000200.0),
+            ("exp_3", "garage", "Garage Clip 3", 1700000300.0),
+        ] {
+            db.insert_export(&ExportRow {
+                id: id.to_string(),
+                camera: cam.to_string(),
+                name: name.to_string(),
+                date,
+                video_path: format!("/media/ninjanvr/exports/{id}.mp4"),
+                thumb_path: format!("/media/ninjanvr/clips/{id}.webp"),
+                in_progress: false,
+            })
+            .unwrap();
+        }
+
+        let exports = db.list_exports().unwrap();
+        assert_eq!(exports.len(), 3);
+        assert_eq!(db.query_exports().unwrap().len(), 3);
+
+        let exp1 = db.get_export("exp_1").unwrap().unwrap();
+        assert_eq!(exp1["name"], "Front Clip 1");
+        assert_eq!(exp1["camera"], "front_door");
+        assert!(db.get_export("exp_missing").unwrap().is_none());
+
+        assert_eq!(db.rename_export("exp_1", "Renamed Front Clip").unwrap(), 1);
+        assert_eq!(
+            db.get_export("exp_1").unwrap().unwrap()["name"],
+            "Renamed Front Clip"
+        );
+
+        let del_single = db.delete_export("exp_1").unwrap().unwrap();
+        assert_eq!(
+            del_single,
+            (
+                "/media/ninjanvr/exports/exp_1.mp4".to_string(),
+                "/media/ninjanvr/clips/exp_1.webp".to_string()
+            )
+        );
+        assert!(db.delete_export("exp_1").unwrap().is_none());
+
+        let del_bulk = db
+            .delete_exports_bulk(&[
+                "exp_2".to_string(),
+                "exp_3".to_string(),
+                "exp_non_existent".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(del_bulk.len(), 2);
+        assert!(db.list_exports().unwrap().is_empty());
+
+        // Additional user camera scoping helpers
+        db.ensure_default_admin(1000).unwrap();
+        assert!(db.ensure_default_admin(1000).unwrap().is_none());
+        db.create_user_with_cameras(
+            "scoped_op",
+            "pass1234",
+            "operator",
+            "front_door,garage",
+            1000,
+        )
+        .unwrap();
+        let scoped = db.get_user("scoped_op").unwrap().unwrap();
+        assert_eq!(scoped.allowed_cameras, "front_door,garage");
+        assert!(
+            db.update_user_allowed_cameras("scoped_op", "backyard")
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_user("scoped_op").unwrap().unwrap().allowed_cameras,
+            "backyard"
+        );
+        assert_eq!(db.list_users().unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn event_mutations_timeline_previews_summaries_and_maintenance_work() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr-events-summaries-{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+        assert_eq!(db.path(), tmp.as_path());
+        db.init_schema().unwrap();
+
+        let now = Utc::now().timestamp() as f64;
+        let t1 = now - 600.0;
+        let t2 = now - 300.0;
+        let t3 = now - 120.0;
+
+        for (id, cam, label, start, score) in [
+            ("ev_m1", "front_door", "person", t1, 0.95),
+            ("ev_m2", "front_door", "person", t2, 0.89),
+            ("ev_m3", "backyard", "car", t3, 0.91),
+        ] {
+            db.upsert_event(&EventDto {
+                id: id.to_string(),
+                camera: cam.to_string(),
+                label: label.to_string(),
+                zones: json!(["zone_a"]),
+                start_time: start,
+                end_time: Some(start + 12.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(score),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.1, 0.2, 0.4, 0.8])),
+                data: json!({"top_score": score}),
+                thumbnail: Some("base64thumb".to_string()),
+                area: Some(1200),
+                ratio: Some(0.75),
+                score: Some(score as f32),
+                stationary: false,
+            })
+            .unwrap();
+        }
+
+        // get_event, get_events_by_ids, query_event_ids, query_events_explore, query_events_summary
+        let ev1 = db.get_event("ev_m1").unwrap().unwrap();
+        assert_eq!(ev1["camera"], "front_door");
+        assert_eq!(ev1["label"], "person");
+
+        let batch = db
+            .get_events_by_ids(&["ev_m1".to_string(), "ev_m3".to_string()])
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(
+            db.query_event_ids(&["ev_m1".to_string(), "ev_m3".to_string()])
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let explore = db.query_events_explore(1).unwrap();
+        assert_eq!(explore.len(), 2); // 1 per distinct label ("person" and "car")
+        let person_explore = explore.iter().find(|e| e["label"] == "person").unwrap();
+        assert_eq!(person_explore["event_count"], 2);
+
+        let ev_summary = db.query_events_summary().unwrap();
+        assert!(!ev_summary.is_empty());
+
+        let counts_by_cam = db.query_event_counts_by_camera_and_label().unwrap();
+        assert_eq!(
+            counts_by_cam,
+            vec![
+                ("backyard".to_string(), "car".to_string(), 1),
+                ("front_door".to_string(), "person".to_string(), 2),
+            ]
+        );
+
+        // AI digest summary
+        let digest = db
+            .query_ai_digest_summary(t1 - 60.0, now + 60.0, Some(&["front_door".to_string()]))
+            .unwrap();
+        assert_eq!(digest["total_events"], 2);
+        assert_eq!(digest["counts_by_camera"]["front_door"], 2);
+
+        // Event mutations: retain, false_positive, sub_label, description, notes
+        assert_eq!(db.set_event_retain("ev_m1", true).unwrap(), 1);
+        assert_eq!(db.set_event_false_positive("ev_m1", true).unwrap(), 1);
+        assert_eq!(db.set_event_sub_label("ev_m1", Some("Courier")).unwrap(), 1);
+        assert_eq!(
+            db.set_event_description("ev_m1", "Package left at door")
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.set_event_description("missing", "noop").unwrap(), 0);
+        assert_eq!(
+            db.set_event_notes("ev_m1", "Confirmed by operator")
+                .unwrap(),
+            1
+        );
+
+        let mutated = db.get_event("ev_m1").unwrap().unwrap();
+        assert_eq!(mutated["retain_indefinitely"], true);
+        assert_eq!(mutated["false_positive"], true);
+        assert_eq!(mutated["sub_label"], "Courier");
+        assert_eq!(mutated["data"]["description"], "Package left at door");
+        assert_eq!(mutated["data"]["notes"], "Confirmed by operator");
+
+        assert_eq!(db.set_event_retain("ev_m1", false).unwrap(), 1);
+        assert_eq!(db.set_event_false_positive("ev_m1", false).unwrap(), 1);
+        assert_eq!(db.set_event_sub_label("ev_m1", None).unwrap(), 1);
+
+        // delete_event and delete_events_bulk
+        assert_eq!(db.delete_event("ev_m1").unwrap(), 1);
+        assert!(db.get_event("ev_m1").unwrap().is_none());
+        assert_eq!(
+            db.delete_events_bulk(&["ev_m2".to_string(), "ev_m3".to_string()])
+                .unwrap(),
+            2
+        );
+        assert!(db.query_events(&EventFilter::default()).unwrap().is_empty());
+
+        // Timeline: insert_timeline_entry & query_timeline
+        db.insert_timeline_entry(
+            t1,
+            "front_door",
+            "tracked_object",
+            Some("src_1"),
+            "visible",
+            &json!({"label": "person"}),
+        )
+        .unwrap();
+        db.insert_timeline_entry(
+            t2,
+            "front_door",
+            "tracked_object",
+            Some("src_2"),
+            "entered_zone",
+            &json!({"zone": "zone_a"}),
+        )
+        .unwrap();
+        db.insert_timeline_entry(
+            t3,
+            "backyard",
+            "audio",
+            Some("src_3"),
+            "heard",
+            &json!({"label": "bark"}),
+        )
+        .unwrap();
+
+        let tl_cam = db.query_timeline(Some("front_door"), None, 10).unwrap();
+        assert_eq!(tl_cam.len(), 2);
+        let tl_src = db
+            .query_timeline(Some("all"), Some("src_1,src_3"), 10)
+            .unwrap();
+        assert_eq!(tl_src.len(), 2);
+
+        // Recordings summaries, storage usage, and motion activity
+        db.insert_recording(&RecordingRow {
+            id: "sum_rec_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/front_door/sum_rec_1.mp4".to_string(),
+            start_time: t1,
+            end_time: t1 + 10.0,
+            duration: 10.0,
+            motion: 150,
+            objects: 2,
+            dbfs: -18,
+            segment_size: 4.5,
+            regions: 3,
+            motion_heatmap: Some(json!([[1, 2], [3, 4]])),
+        })
+        .unwrap();
+        db.upsert_event(&EventDto {
+            id: "ev_for_rec_summary".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: t1 + 2.0,
+            end_time: Some(t1 + 8.0),
+            has_clip: false,
+            has_snapshot: false,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.9),
+            false_positive: None,
+            box_coords: None,
+            data: json!({}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: None,
+            stationary: false,
+        })
+        .unwrap();
+
+        let rec_summary = db.query_recordings_summary("front_door").unwrap();
+        assert_eq!(rec_summary.len(), 1);
+        assert_eq!(rec_summary[0]["duration"], 10);
+        assert_eq!(rec_summary[0]["motion"], 150);
+        assert_eq!(rec_summary[0]["events"], 1);
+
+        let all_rec_summary = db.query_all_recordings_summary().unwrap();
+        assert!(!all_rec_summary.as_object().unwrap().is_empty());
+
+        let storage_usage = db.query_recordings_storage_usage().unwrap();
+        assert_eq!(storage_usage["front_door"]["usage"], 4.5);
+        assert!(storage_usage["front_door"]["bandwidth"].as_f64().unwrap() > 0.0);
+
+        let motion_act = db
+            .query_motion_activity(Some(&["front_door".to_string()]), t1 - 10.0, t1 + 20.0)
+            .unwrap();
+        assert_eq!(motion_act.len(), 1);
+        assert_eq!(motion_act[0]["motion"], 150);
+
+        // Previews & strip_media_root & run_maintenance
+        assert_eq!(
+            strip_media_root("/media/ninjanvr/previews/front_door/p1.mp4"),
+            Some("previews/front_door/p1.mp4")
+        );
+        assert_eq!(strip_media_root("/media/ninjanvr/"), None);
+        assert_eq!(strip_media_root("/other/path.mp4"), None);
+
+        assert!(db.last_preview_end_time("front_door").unwrap().is_none());
+        db.insert_preview(
+            "prev_1",
+            "front_door",
+            "/media/ninjanvr/previews/front_door/p1.mp4",
+            t1,
+            t1 + 60.0,
+            60.0,
+        )
+        .unwrap();
+        assert_eq!(
+            db.last_preview_end_time("front_door").unwrap(),
+            Some(t1 + 60.0)
+        );
+
+        let previews_cam = db
+            .query_previews("front_door", t1 - 5.0, t1 + 65.0)
+            .unwrap();
+        assert_eq!(previews_cam.len(), 1);
+        assert_eq!(previews_cam[0]["src"], "/previews/front_door/p1.mp4");
+
+        let previews_all = db.query_previews("all", t1 - 5.0, t1 + 65.0).unwrap();
+        assert_eq!(previews_all.len(), 1);
+
+        db.run_maintenance().unwrap();
 
         let _ = std::fs::remove_file(&tmp);
     }
