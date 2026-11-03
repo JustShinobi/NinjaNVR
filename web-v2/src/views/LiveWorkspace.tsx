@@ -39,6 +39,13 @@ import { resolveCanvasThemePalette } from "../utils/themeTokens";
 import { LiveMsePlayer, PushToTalkButton, VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
+import {
+  computeLiveStageDescriptors,
+  resolvePersistentStageContainerStyle,
+  resolvePersistentTileStyle,
+  resolveTileClickAction,
+  triggerMainStreamPrewarmIfNeeded,
+} from "../utils/liveStageLayout";
 
 export const MAX_DOCK_LIVE_DECODERS = 6;
 
@@ -1431,9 +1438,19 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     (spotlightTrail.length > 0
       ? spotlightTrail[spotlightTrail.length - 1].cam
       : selectedCamera);
-  const spotlightActiveCams = [spotlightHeroCam];
-  const spotlightIdleCams = groupCams.filter((c) => c !== spotlightHeroCam);
-  const focusDockCams = groupCams.filter((c) => c !== selectedCamera);
+
+  const stageDescriptors = computeLiveStageDescriptors({
+    liveLayout,
+    visibleMatrixCams,
+    groupCams,
+    selectedCamera,
+    spotlightHeroCam,
+    spotlightPromotedCams,
+    hoveredDockCam,
+    useMainStream,
+    timeShiftTs,
+    maxDockLiveDecoders: MAX_DOCK_LIVE_DECODERS,
+  });
 
   return (
     <>
@@ -1880,44 +1897,101 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         </div>
       )}
 
-      {liveLayout === "2x2" && (
+      {liveLayout !== "map" && (
         <div
-          className={`nvr-matrix-${matrixDensity}`}
-          style={resolveAdaptiveMatrixGridStyle(
-            visibleMatrixCams.length,
-            matrixDensity
+          className={`nvr-persistent-stage ${
+            liveLayout === "2x2"
+              ? `is-layout-grid nvr-matrix-${matrixDensity}`
+              : liveLayout === "single"
+              ? "is-layout-single nvr-matrix-single"
+              : liveLayout === "spotlight"
+              ? "is-layout-spotlight nvr-focus-layout"
+              : "is-layout-focus nvr-focus-layout"
+          }`}
+          style={resolvePersistentStageContainerStyle(
+            liveLayout,
+            stageDescriptors,
+            matrixDensity,
+            resolveAdaptiveMatrixGridStyle(
+              visibleMatrixCams.length,
+              matrixDensity
+            )
           )}
         >
-          {visibleMatrixCams.map((cam) => {
+          {stageDescriptors.map((descriptor) => {
+            const cam = descriptor.camera;
             const realCam = resolveRealCameraSource(
               cam,
               config?.cameras || cameraNames
             );
-            const camCfg = effectiveCamerasConfig?.[cam] ?? config?.cameras?.[realCam];
+            const camCfg =
+              effectiveCamerasConfig?.[cam] ?? config?.cameras?.[realCam];
             const camStat = stats?.cameras?.[cam] ?? stats?.cameras?.[realCam];
             const act = cameraActivity[cam] ?? cameraActivity[realCam];
             const activeLabels = Array.from(
               new Set((act?.objects || []).map((o) => o.label.toUpperCase()))
             );
             const hasObjects = activeLabels.length > 0;
-            const hasMotion = Boolean(act?.motion && (act?.max_Area ?? 5000) >= 3500);
-            const isTimelineCam = selectedCamera === cam;
-            const isTimeShifted = isTimelineCam && timeShiftTs !== null;
+            const hasMotion = Boolean(
+              act?.motion && (act?.max_Area ?? 5000) >= 3500
+            );
+            const isTimelineCam = descriptor.isTimelineSelected;
+            const isTimeShifted = descriptor.renderMode === "vod";
+            const isDock = descriptor.role === "dock";
+            const isHero = descriptor.role === "hero";
+            const isGrid = descriptor.role === "grid";
+
+            const handleTileActivate = (isDoubleClick = false) => {
+              const action = resolveTileClickAction({
+                liveLayout,
+                role: descriptor.role,
+                camera: cam,
+                selectedCamera,
+                isDoubleClick,
+              });
+              triggerMainStreamPrewarmIfNeeded(
+                realCam,
+                action.shouldPrewarmMainStream
+              );
+              if (liveLayout === "spotlight" && isDock) {
+                const ts = Math.floor(Date.now() / 1000);
+                lastActiveRef.current[cam] = ts;
+                lastSurgeRef.current[cam] = ts;
+                setNowTick(ts);
+              }
+              if (action.nextSelectedCamera !== selectedCamera) {
+                setSelectedCamera(action.nextSelectedCamera);
+              }
+              if (action.nextLayout !== liveLayout) {
+                setLiveLayout(action.nextLayout);
+              }
+            };
 
             return (
               <div
                 key={cam}
-                className={`nvr-cam-tile ${isTimeShifted ? "has-native-controls" : ""} ${
-                  isTimelineCam && visibleMatrixCams.length > 1
+                data-role={descriptor.role}
+                className={`nvr-cam-tile ${
+                  isTimeShifted ? "has-native-controls" : ""
+                } ${
+                  isGrid && isTimelineCam && visibleMatrixCams.length > 1
                     ? "is-timeline-focused"
                     : ""
                 }`}
+                style={resolvePersistentTileStyle(liveLayout, descriptor)}
+                onPointerEnter={
+                  isDock ? () => setHoveredDockCam(cam) : undefined
+                }
+                onPointerLeave={
+                  isDock
+                    ? () => setHoveredDockCam((c) => (c === cam ? null : c))
+                    : undefined
+                }
+                onDoubleClick={() => handleTileActivate(true)}
+                onClick={isDock ? () => handleTileActivate(false) : undefined}
               >
-                {isTimelineCam && visibleMatrixCams.length > 1 && (
-                  <div
-                    className="nvr-timeline-reticle"
-                    aria-hidden="true"
-                  >
+                {isGrid && isTimelineCam && visibleMatrixCams.length > 1 && (
+                  <div className="nvr-timeline-reticle" aria-hidden="true">
                     <span className="nvr-reticle-corner tl" />
                     <span className="nvr-reticle-corner tr" />
                     <span className="nvr-reticle-corner bl" />
@@ -1927,237 +2001,123 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     </span>
                   </div>
                 )}
-                {isTimeShifted && timeShiftTs !== null ? (
+
+                {descriptor.renderMode === "vod" && timeShiftTs !== null ? (
                   <VodHlsPlayer
                     camera={realCam}
                     startTime={timeShiftTs}
                     endTime={timeShiftTs + 180}
                     playbackRate={playbackSpeed}
                   />
+                ) : descriptor.renderMode === "snapshot" ? (
+                  <img
+                    className="nvr-cam-poster"
+                    src={`/api/${encodeURIComponent(realCam)}/latest.webp?height=360`}
+                    alt={`${cam} dock snapshot`}
+                    loading="lazy"
+                  />
                 ) : (
                   <LiveMsePlayer
                     camera={cam}
-                    useMainStream={useMainStream}
+                    useMainStream={descriptor.useMainStream}
                     cameraConfig={camCfg}
                     showVectors={showVectors}
-                    onClick={() => {
-                      if (selectedCamera === cam) {
-                        setLiveLayout("focus");
-                      } else {
-                        setSelectedCamera(cam);
-                      }
-                    }}
+                    onClick={() => handleTileActivate(false)}
                   />
                 )}
-                <div className={`nvr-cam-hud pos-${hudPosition}`}>
-                  <span className={`nvr-badge ${isTimeShifted ? "rewind" : "live"}`}>
-                    <span className={`nvr-dot ${isTimeShifted ? "motion" : "live"}`} />
-                    {cam.toUpperCase()}
-                    {isTimeShifted && timeShiftTs !== null
-                      ? ` @ ${formatTs(timeShiftTs)}`
-                      : ""}
-                  </span>
-                  {isTimelineCam && visibleMatrixCams.length > 1 && (
-                    <span
-                      className="nvr-badge mono"
-                      style={{
-                        borderColor: "var(--signal-accent)",
-                        color: "var(--signal-accent-text)",
-                      }}
-                      title="Active camera bound to the bottom Timeline scrubber"
-                    >
-                      ● TIMELINE
-                    </span>
-                  )}
-                  <span className="nvr-badge">
-                    {camCfg?.detect?.width || 1280}×{camCfg?.detect?.height || 720} ·{" "}
-                    {camStat?.camera_fps?.toFixed(1) || "5.0"} FPS
-                  </span>
-                  {hasObjects && (
-                    <span className="nvr-badge alert">{activeLabels.join(", ")}</span>
-                  )}
-                  {hasMotion && !hasObjects && (
-                    <span className="nvr-badge motion">{t.live.motionActive}</span>
-                  )}
-                  {Boolean(act?.tamper) && (
-                    <span
-                      className="nvr-badge alert mono"
-                      title="Camera tamper / blind-feed occlusion detected"
-                    >
-                      TAMPER
-                    </span>
-                  )}
-                  {Boolean(act?.night_mode || camStat?.night_mode) && (
-                    <span
-                      className="nvr-badge mono"
-                      title="Infrared (IR) monochrome night profile active — spider/insect flash filter engaged"
-                    >
-                      IR NIGHT
-                    </span>
-                  )}
-                  {resolveCameraRoiStateBadges(camCfg, act, camStat).map((badge) => (
-                    <span
-                      key={`roi-${badge.roiName}`}
-                      data-testid={`roi-badge-${cam}-${badge.roiName}`}
-                      className={`nvr-badge mono ${badge.isAnomaly ? "alert" : ""}`}
-                      style={
-                        badge.isAnomaly
-                          ? {
-                              color: "var(--signal-alert-text)",
-                              borderColor: "var(--signal-alert)",
-                            }
-                          : undefined
-                      }
-                      title={
-                        badge.isAnomaly
-                          ? `Anomalous ROI state (${badge.label}) — alert after ${badge.anomalyTimeoutSec}s`
-                          : `ROI state (${badge.label})`
-                      }
-                    >
-                      {badge.label}
-                    </span>
-                  ))}
-                  <span className="nvr-badge">
-                    AI {camStat?.detection_fps?.toFixed(1) || "0.0"} FPS
-                  </span>
-                  {(
-                    [
-                      ["enabled", "EN", act?.config?.enabled ?? act?.enabled ?? true],
-                      ["detect", "DET", act?.config?.detect ?? true],
-                      ["record", "REC", act?.config?.record ?? true],
-                      ["alerts", "ALR", act?.config?.alerts ?? true],
-                    ] as Array<["enabled" | "detect" | "record" | "alerts", string, boolean]>
-                  ).map(([flagKey, shortLbl, isOn]) => (
-                    <button
-                      key={flagKey}
-                      type="button"
-                      className={`nvr-btn nvr-tile-action mono ${isOn ? "active" : ""}`}
-                      style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                      title={`Toggle ${flagKey} at runtime without server restart`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        fetch(`/api/${encodeURIComponent(realCam)}/state`, {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          credentials: "include",
-                          body: JSON.stringify({ [flagKey]: !isOn }),
-                        }).catch(() => {});
-                      }}
-                    >
-                      {shortLbl}:{isOn ? "ON" : "OFF"}
-                    </button>
-                  ))}
-                  <button
-                    className="nvr-btn nvr-tile-action mono"
-                    style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setSelectedCamera(cam);
-                      setTimeShiftTs(Math.floor(Date.now() / 1000) - 30);
-                    }}
-                  >
-                    {t.live.rewind30s}
-                  </button>
-                  {isTimeShifted && (
-                    <button
-                      className="nvr-btn success mono"
-                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setTimeShiftTs(null);
-                      }}
-                    >
-                      LIVE
-                    </button>
-                  )}
-                  <button
-                    className="nvr-btn nvr-tile-action"
-                    style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setSelectedCamera(cam);
-                      setLiveLayout("focus");
-                    }}
-                  >
-                    Expand
-                  </button>
-                  {!isTimeShifted && <PushToTalkButton camera={realCam} height={22} />}
-                  <a
-                    href={`/api/${encodeURIComponent(realCam)}/latest.jpg`}
-                    download={`${cam}-snapshot.jpg`}
-                    className="nvr-btn nvr-tile-action"
-                    style={{
-                      height: 22,
-                      padding: "0 6px",
-                      fontSize: "var(--text-xs)",
-                      textDecoration: "none",
-                    }}
-                    onClick={(e) => e.stopPropagation()}
-                    title={t.live.snapshot}
-                    aria-label={`Download ${cam} snapshot`}
-                  >
-                    <Camera size={11} />
-                  </a>
-                  <TacticalPtzHudOverlay
-                    camera={realCam}
-                    cameraConfig={camCfg}
-                    ptzInfo={ptzInfoByCam[realCam]}
-                    onPtzUpdate={handlePtzUpdate}
-                  />
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
 
-      {liveLayout === "spotlight" && (
-        <div className="nvr-focus-layout">
-          <div
-            className={
-              spotlightActiveCams.length > 1 ? "nvr-matrix-2x2" : "nvr-focus-stage"
-            }
-            style={{ flex: 1, minHeight: 0 }}
-          >
-            {spotlightActiveCams.map((cam) => {
-              const realCam = resolveRealCameraSource(
-                cam,
-                config?.cameras || cameraNames
-              );
-              const camCfg = effectiveCamerasConfig?.[cam] ?? config?.cameras?.[realCam];
-              const camStat = stats?.cameras?.[cam] ?? stats?.cameras?.[realCam];
-              const act = cameraActivity[cam] ?? cameraActivity[realCam];
-              const activeLabels = (act?.objects || [])
-                .filter((o) => !o.stationary)
-                .map((o) => o.label.toUpperCase());
-              const isHeld = spotlightPromotedCams.includes(cam);
-              return (
-                <div
-                  key={cam}
-                  className="nvr-cam-tile"
-                  style={{
-                    flex: 1,
-                    outline: isHeld
-                      ? "1px solid var(--signal-alert)"
-                      : "1px solid var(--border-strong)",
-                    outlineOffset: -1,
-                  }}
-                >
-                  <LiveMsePlayer
-                    camera={cam}
-                    useMainStream={spotlightActiveCams.length === 1 || useMainStream}
-                    cameraConfig={camCfg}
-                    showVectors={showVectors}
-                    onClick={() => setSelectedCamera(cam)}
-                  />
+                {isDock ? (
                   <div className={`nvr-cam-hud pos-${hudPosition}`}>
-                    <span className={`nvr-badge ${isHeld ? "alert" : "live"}`}>
-                      <span className={`nvr-dot ${isHeld ? "motion" : "live"}`} />
-                      SPOTLIGHT // {cam.toUpperCase()}
+                    <span
+                      className={`nvr-badge ${
+                        liveLayout === "spotlight" ? "mono" : "live"
+                      }`}
+                    >
+                      {cam.toUpperCase()}
+                      {liveLayout === "spotlight"
+                        ? ` · ${
+                            descriptor.renderMode === "mse"
+                              ? "STANDBY"
+                              : "SNAPSHOT"
+                          }`
+                        : ""}
                     </span>
+                    {liveLayout !== "spotlight" && (
+                      <span className="nvr-badge">
+                        {descriptor.renderMode === "mse"
+                          ? `${camStat?.camera_fps?.toFixed(1) || "5.0"} FPS`
+                          : "WEBP"}
+                      </span>
+                    )}
+                    {Boolean(act?.night_mode || camStat?.night_mode) && (
+                      <span className="nvr-badge mono">IR NIGHT</span>
+                    )}
+                  </div>
+                ) : (
+                  <div className={`nvr-cam-hud pos-${hudPosition}`}>
+                    <span
+                      className={`nvr-badge ${
+                        isTimeShifted
+                          ? "rewind"
+                          : descriptor.isSpotlightHeld
+                          ? "alert"
+                          : "live"
+                      }`}
+                    >
+                      <span
+                        className={`nvr-dot ${
+                          isTimeShifted || descriptor.isSpotlightHeld
+                            ? "motion"
+                            : "live"
+                        }`}
+                      />
+                      {liveLayout === "spotlight"
+                        ? `SPOTLIGHT // ${cam.toUpperCase()}`
+                        : isHero
+                        ? `${cam.toUpperCase()} // ${
+                            isTimeShifted && timeShiftTs !== null
+                              ? `${t.live.timeShiftBadge} @ ${formatTs(
+                                  timeShiftTs
+                                )}`
+                              : t.live.liveBadge
+                          }`
+                        : `${cam.toUpperCase()}${
+                            isTimeShifted && timeShiftTs !== null
+                              ? ` @ ${formatTs(timeShiftTs)}`
+                              : ""
+                          }`}
+                    </span>
+                    {isGrid && isTimelineCam && visibleMatrixCams.length > 1 && (
+                      <span
+                        className="nvr-badge mono"
+                        style={{
+                          borderColor: "var(--signal-accent)",
+                          color: "var(--signal-accent-text)",
+                        }}
+                        title="Active camera bound to the bottom Timeline scrubber"
+                      >
+                        ● TIMELINE
+                      </span>
+                    )}
                     <span className="nvr-badge">
-                      {camStat?.camera_fps?.toFixed(1) || "5.0"} FPS
+                      {isHero
+                        ? `${camStat?.camera_fps?.toFixed(1) || "5.0"} FPS · AI ${
+                            camStat?.detection_fps?.toFixed(1) || "0.0"
+                          } FPS`
+                        : `${camCfg?.detect?.width || 1280}×${
+                            camCfg?.detect?.height || 720
+                          } · ${camStat?.camera_fps?.toFixed(1) || "5.0"} FPS`}
                     </span>
+                    {hasObjects && (
+                      <span className="nvr-badge alert">
+                        {activeLabels.join(", ")}
+                      </span>
+                    )}
+                    {hasMotion && !hasObjects && (
+                      <span className="nvr-badge motion">
+                        {t.live.motionActive}
+                      </span>
+                    )}
                     {Boolean(act?.tamper) && (
                       <span
                         className="nvr-badge alert mono"
@@ -2169,32 +2129,173 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     {Boolean(act?.night_mode || camStat?.night_mode) && (
                       <span
                         className="nvr-badge mono"
-                        title="Infrared (IR) monochrome night profile active"
+                        title="Infrared (IR) monochrome night profile active — spider/insect flash filter engaged"
                       >
                         IR NIGHT
                       </span>
                     )}
-                    {resolveCameraRoiStateBadges(camCfg, act, camStat).map((badge) => (
-                      <span
-                        key={`roi-${badge.roiName}`}
-                        data-testid={`roi-badge-spotlight-${cam}-${badge.roiName}`}
-                        className={`nvr-badge mono ${badge.isAnomaly ? "alert" : ""}`}
-                        style={
-                          badge.isAnomaly
-                            ? {
-                                color: "var(--signal-alert-text)",
-                                borderColor: "var(--signal-alert)",
-                              }
-                            : undefined
-                        }
+                    {resolveCameraRoiStateBadges(camCfg, act, camStat).map(
+                      (badge) => (
+                        <span
+                          key={`roi-${badge.roiName}`}
+                          data-testid={
+                            liveLayout === "spotlight"
+                              ? `roi-badge-spotlight-${cam}-${badge.roiName}`
+                              : isHero
+                              ? `roi-badge-focus-${cam}-${badge.roiName}`
+                              : `roi-badge-${cam}-${badge.roiName}`
+                          }
+                          className={`nvr-badge mono ${
+                            badge.isAnomaly ? "alert" : ""
+                          }`}
+                          style={
+                            badge.isAnomaly
+                              ? {
+                                  color: "var(--signal-alert-text)",
+                                  borderColor: "var(--signal-alert)",
+                                }
+                              : undefined
+                          }
+                          title={
+                            badge.isAnomaly
+                              ? `Anomalous ROI state (${badge.label}) — alert after ${badge.anomalyTimeoutSec}s`
+                              : `ROI state (${badge.label})`
+                          }
+                        >
+                          {badge.label}
+                        </span>
+                      )
+                    )}
+                    {isGrid && (
+                      <>
+                        <span className="nvr-badge">
+                          AI {camStat?.detection_fps?.toFixed(1) || "0.0"} FPS
+                        </span>
+                        {(
+                          [
+                            [
+                              "enabled",
+                              "EN",
+                              act?.config?.enabled ?? act?.enabled ?? true,
+                            ],
+                            ["detect", "DET", act?.config?.detect ?? true],
+                            ["record", "REC", act?.config?.record ?? true],
+                            ["alerts", "ALR", act?.config?.alerts ?? true],
+                          ] as Array<
+                            [
+                              "enabled" | "detect" | "record" | "alerts",
+                              string,
+                              boolean,
+                            ]
+                          >
+                        ).map(([flagKey, shortLbl, isOn]) => (
+                          <button
+                            key={flagKey}
+                            type="button"
+                            className={`nvr-btn nvr-tile-action mono ${
+                              isOn ? "active" : ""
+                            }`}
+                            style={{
+                              height: 22,
+                              padding: "0 5px",
+                              fontSize: "var(--text-xs)",
+                            }}
+                            title={`Toggle ${flagKey} at runtime without server restart`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              fetch(
+                                `/api/${encodeURIComponent(realCam)}/state`,
+                                {
+                                  method: "POST",
+                                  headers: {
+                                    "Content-Type": "application/json",
+                                  },
+                                  credentials: "include",
+                                  body: JSON.stringify({ [flagKey]: !isOn }),
+                                }
+                              ).catch(() => {});
+                            }}
+                          >
+                            {shortLbl}:{isOn ? "ON" : "OFF"}
+                          </button>
+                        ))}
+                        <button
+                          className="nvr-btn nvr-tile-action mono"
+                          style={{
+                            height: 22,
+                            padding: "0 6px",
+                            fontSize: "var(--text-xs)",
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedCamera(cam);
+                            setTimeShiftTs(Math.floor(Date.now() / 1000) - 30);
+                          }}
+                        >
+                          {t.live.rewind30s}
+                        </button>
+                        {isTimeShifted && (
+                          <button
+                            className="nvr-btn success mono"
+                            style={{
+                              height: 22,
+                              padding: "0 6px",
+                              fontSize: "var(--text-xs)",
+                            }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setTimeShiftTs(null);
+                            }}
+                          >
+                            LIVE
+                          </button>
+                        )}
+                        <button
+                          className="nvr-btn nvr-tile-action"
+                          style={{
+                            height: 22,
+                            padding: "0 6px",
+                            fontSize: "var(--text-xs)",
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            triggerMainStreamPrewarmIfNeeded(realCam, true);
+                            setSelectedCamera(cam);
+                            setLiveLayout("focus");
+                          }}
+                        >
+                          Expand
+                        </button>
+                      </>
+                    )}
+                    {isHero && isTimeShifted ? (
+                      <button
+                        className="nvr-btn success"
+                        onClick={() => setTimeShiftTs(null)}
                       >
-                        {badge.label}
-                      </span>
-                    ))}
-                    {activeLabels.length > 0 && (
-                      <span className="nvr-badge alert">
-                        {activeLabels.join(", ")}
-                      </span>
+                        <Play size={12} />
+                        {t.live.returnToLive}
+                      </button>
+                    ) : !isTimeShifted ? (
+                      <PushToTalkButton camera={realCam} height={22} />
+                    ) : null}
+                    {isGrid && (
+                      <a
+                        href={`/api/${encodeURIComponent(realCam)}/latest.jpg`}
+                        download={`${cam}-snapshot.jpg`}
+                        className="nvr-btn nvr-tile-action"
+                        style={{
+                          height: 22,
+                          padding: "0 6px",
+                          fontSize: "var(--text-xs)",
+                          textDecoration: "none",
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        title={t.live.snapshot}
+                        aria-label={`Download ${cam} snapshot`}
+                      >
+                        <Camera size={11} />
+                      </a>
                     )}
                     <TacticalPtzHudOverlay
                       camera={realCam}
@@ -2203,305 +2304,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       onPtzUpdate={handlePtzUpdate}
                     />
                   </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {spotlightIdleCams.length > 0 && (
-            <div className="nvr-focus-dock">
-              {spotlightIdleCams.map((cam, idx) => {
-                const realCam = resolveRealCameraSource(
-                  cam,
-                  config?.cameras || cameraNames
-                );
-                const tileMode = resolveDockTileMode(
-                  idx,
-                  cam,
-                  hoveredDockCam,
-                  MAX_DOCK_LIVE_DECODERS,
-                  spotlightIdleCams
-                );
-                const promoteCam = () => {
-                  const ts = Math.floor(Date.now() / 1000);
-                  lastActiveRef.current[cam] = ts;
-                  lastSurgeRef.current[cam] = ts;
-                  setSelectedCamera(cam);
-                  setNowTick(ts);
-                };
-                return (
-                  <div
-                    key={cam}
-                    className="nvr-cam-tile"
-                    style={{ height: "33.33%", minHeight: 140, opacity: 0.78, cursor: "pointer" }}
-                    onPointerEnter={() => setHoveredDockCam(cam)}
-                    onPointerLeave={() =>
-                      setHoveredDockCam((c) => (c === cam ? null : c))
-                    }
-                    onClick={promoteCam}
-                  >
-                    {tileMode === "mse" ? (
-                      <LiveMsePlayer
-                        camera={cam}
-                        useMainStream={false}
-                        cameraConfig={
-                          effectiveCamerasConfig?.[cam] ?? config?.cameras?.[realCam]
-                        }
-                        showVectors={showVectors}
-                        onClick={promoteCam}
-                      />
-                    ) : (
-                      <img
-                        className="nvr-cam-poster"
-                        src={`/api/${encodeURIComponent(realCam)}/latest.webp`}
-                        alt={`${cam} standby snapshot`}
-                        loading="lazy"
-                      />
-                    )}
-                    <div className={`nvr-cam-hud pos-${hudPosition}`}>
-                      <span className="nvr-badge mono">
-                        {cam.toUpperCase()} · {tileMode === "mse" ? "STANDBY" : "SNAPSHOT"}
-                      </span>
-                      {Boolean(
-                        cameraActivity[cam]?.night_mode ||
-                          cameraActivity[realCam]?.night_mode ||
-                          stats?.cameras?.[cam]?.night_mode ||
-                          stats?.cameras?.[realCam]?.night_mode
-                      ) && <span className="nvr-badge mono">IR NIGHT</span>}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      )}
-
-      {(liveLayout === "focus" || liveLayout === "single") && (
-        <div
-          className={
-            liveLayout === "focus" ? "nvr-focus-layout" : "nvr-matrix-single"
-          }
-        >
-          <div className="nvr-focus-stage">
-            <div
-              className={`nvr-cam-tile ${timeShiftTs !== null ? "has-native-controls" : ""}`}
-              style={{ flex: 1 }}
-            >
-              {timeShiftTs === null ? (
-                <LiveMsePlayer
-                  camera={selectedCamera}
-                  useMainStream={true}
-                  cameraConfig={
-                    effectiveCamerasConfig?.[selectedCamera] ??
-                    config?.cameras?.[
-                      resolveRealCameraSource(
-                        selectedCamera,
-                        config?.cameras || cameraNames
-                      )
-                    ]
-                  }
-                  showVectors={showVectors}
-                />
-              ) : (
-                <VodHlsPlayer
-                  camera={resolveRealCameraSource(
-                    selectedCamera,
-                    config?.cameras || cameraNames
-                  )}
-                  startTime={timeShiftTs}
-                  endTime={timeShiftTs + 180}
-                  playbackRate={playbackSpeed}
-                />
-              )}
-              <div className={`nvr-cam-hud pos-${hudPosition}`}>
-                <span className={`nvr-badge ${timeShiftTs === null ? "live" : "rewind"}`}>
-                  <span
-                    className={`nvr-dot ${timeShiftTs === null ? "live" : "motion"}`}
-                  />
-                  {selectedCamera.toUpperCase()} //{" "}
-                  {timeShiftTs === null
-                    ? t.live.liveBadge
-                    : `${t.live.timeShiftBadge} @ ${formatTs(timeShiftTs)}`}
-                </span>
-                <span className="nvr-badge">
-                  {(
-                    stats?.cameras?.[selectedCamera]?.camera_fps ??
-                    stats?.cameras?.[
-                      resolveRealCameraSource(
-                        selectedCamera,
-                        config?.cameras || cameraNames
-                      )
-                    ]?.camera_fps
-                  )?.toFixed(1) || "5.0"}{" "}
-                  FPS · AI{" "}
-                  {(
-                    stats?.cameras?.[selectedCamera]?.detection_fps ??
-                    stats?.cameras?.[
-                      resolveRealCameraSource(
-                        selectedCamera,
-                        config?.cameras || cameraNames
-                      )
-                    ]?.detection_fps
-                  )?.toFixed(1) || "0.0"}{" "}
-                  FPS
-                </span>
-                {(cameraActivity[selectedCamera]?.objects || []).length > 0 ? (
-                  <span className="nvr-badge alert">
-                    {Array.from(
-                      new Set(
-                        (cameraActivity[selectedCamera]?.objects || []).map((o) =>
-                          o.label.toUpperCase()
-                        )
-                      )
-                    ).join(", ")}
-                  </span>
-                ) : Boolean(
-                    cameraActivity[selectedCamera]?.motion &&
-                      (cameraActivity[selectedCamera]?.max_Area ?? 5000) >= 3500
-                  ) ? (
-                  <span className="nvr-badge motion">{t.live.motionActive}</span>
-                ) : null}
-                {Boolean(cameraActivity[selectedCamera]?.tamper) && (
-                  <span className="nvr-badge alert mono">TAMPER</span>
                 )}
-                {Boolean(
-                  cameraActivity[selectedCamera]?.night_mode ||
-                    stats?.cameras?.[selectedCamera]?.night_mode
-                ) && <span className="nvr-badge mono">IR NIGHT</span>}
-                {resolveCameraRoiStateBadges(
-                  effectiveCamerasConfig?.[selectedCamera] ??
-                    config?.cameras?.[
-                      resolveRealCameraSource(
-                        selectedCamera,
-                        config?.cameras || cameraNames
-                      )
-                    ],
-                  cameraActivity[selectedCamera],
-                  stats?.cameras?.[selectedCamera]
-                ).map((badge) => (
-                  <span
-                    key={`roi-${badge.roiName}`}
-                    data-testid={`roi-badge-focus-${selectedCamera}-${badge.roiName}`}
-                    className={`nvr-badge mono ${badge.isAnomaly ? "alert" : ""}`}
-                    style={
-                      badge.isAnomaly
-                        ? {
-                            color: "var(--signal-alert-text)",
-                            borderColor: "var(--signal-alert)",
-                          }
-                        : undefined
-                    }
-                  >
-                    {badge.label}
-                  </span>
-                ))}
-                {timeShiftTs === null ? (
-                  <PushToTalkButton
-                    camera={resolveRealCameraSource(
-                      selectedCamera,
-                      config?.cameras || cameraNames
-                    )}
-                    height={22}
-                  />
-                ) : (
-                  <button
-                    className="nvr-btn success"
-                    onClick={() => setTimeShiftTs(null)}
-                  >
-                    <Play size={12} />
-                    {t.live.returnToLive}
-                  </button>
-                )}
-                <TacticalPtzHudOverlay
-                  camera={resolveRealCameraSource(
-                    selectedCamera,
-                    config?.cameras || cameraNames
-                  )}
-                  cameraConfig={
-                    effectiveCamerasConfig?.[selectedCamera] ??
-                    config?.cameras?.[
-                      resolveRealCameraSource(
-                        selectedCamera,
-                        config?.cameras || cameraNames
-                      )
-                    ]
-                  }
-                  ptzInfo={
-                    ptzInfoByCam[
-                      resolveRealCameraSource(
-                        selectedCamera,
-                        config?.cameras || cameraNames
-                      )
-                    ]
-                  }
-                  onPtzUpdate={handlePtzUpdate}
-                />
               </div>
-            </div>
-          </div>
-
-          {liveLayout === "focus" && (
-            <div className="nvr-focus-dock">
-              {focusDockCams.map((cam, idx) => {
-                const realCam = resolveRealCameraSource(
-                  cam,
-                  config?.cameras || cameraNames
-                );
-                const tileMode = resolveDockTileMode(
-                  idx,
-                  cam,
-                  hoveredDockCam,
-                  MAX_DOCK_LIVE_DECODERS,
-                  focusDockCams
-                );
-                return (
-                  <div
-                    key={cam}
-                    className="nvr-cam-tile"
-                    style={{ height: "33.33%", minHeight: 160, cursor: "pointer" }}
-                    onPointerEnter={() => setHoveredDockCam(cam)}
-                    onPointerLeave={() =>
-                      setHoveredDockCam((c) => (c === cam ? null : c))
-                    }
-                    onClick={() => setSelectedCamera(cam)}
-                  >
-                    {tileMode === "mse" ? (
-                      <LiveMsePlayer
-                        camera={cam}
-                        useMainStream={false}
-                        cameraConfig={
-                          effectiveCamerasConfig?.[cam] ?? config?.cameras?.[realCam]
-                        }
-                        showVectors={showVectors}
-                        onClick={() => setSelectedCamera(cam)}
-                      />
-                    ) : (
-                      <img
-                        className="nvr-cam-poster"
-                        src={`/api/${encodeURIComponent(realCam)}/latest.webp`}
-                        alt={`${cam} dock snapshot`}
-                        loading="lazy"
-                      />
-                    )}
-                    <div className={`nvr-cam-hud pos-${hudPosition}`}>
-                      <span className="nvr-badge live">{cam.toUpperCase()}</span>
-                      <span className="nvr-badge">
-                        {tileMode === "mse"
-                          ? `${
-                              (
-                                stats?.cameras?.[cam]?.camera_fps ??
-                                stats?.cameras?.[realCam]?.camera_fps
-                              )?.toFixed(1) || "5.0"
-                            } FPS`
-                          : "WEBP"}
-                      </span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+            );
+          })}
         </div>
       )}
 
