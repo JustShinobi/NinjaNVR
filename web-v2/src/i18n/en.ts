@@ -124,6 +124,16 @@ export const en = {
     resumeStream: "Resume",
     copyLogs: "Copy Buffer",
   },
+  theme: {
+    label: "Console Theme Mode",
+    dark: "Tactical Dark",
+    light: "Daylight / Light",
+    system: "System Auto",
+    highContrast: "High-Contrast Monitor Boost",
+    highContrastDesc:
+      "Strengthens structural borders (+15%), promotes muted text to >= 7:1 AAA contrast, and applies 1.5px border weight.",
+    cycleTooltip: "Cycle Console Theme (Dark / Light / System)",
+  },
 };
 
 export interface TranslationDict {
@@ -251,5 +261,14 @@ export interface TranslationDict {
     pauseStream: string;
     resumeStream: string;
     copyLogs: string;
+  };
+  theme: {
+    label: string;
+    dark: string;
+    light: string;
+    system: string;
+    highContrast: string;
+    highContrastDesc: string;
+    cycleTooltip: string;
   };
 }

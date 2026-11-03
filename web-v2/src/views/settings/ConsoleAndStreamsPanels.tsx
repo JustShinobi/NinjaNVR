@@ -7,7 +7,12 @@ import {
   FfprobeItem,
   NinjaConfigResponse,
 } from "../../types/nvr";
-import { FirstWeekday, HudPosition, LiveLayoutMode } from "../../utils/format";
+import {
+  FirstWeekday,
+  HudPosition,
+  LiveLayoutMode,
+  ThemeMode,
+} from "../../utils/format";
 import { TacticalCameraPicker } from "../../components/TacticalCameraPicker";
 
 export const ToggleSwitch: React.FC<{
@@ -50,6 +55,10 @@ export const ConsoleUiSection: React.FC<{
   const setPlaybackSpeed = useNvrStore((s) => s.setPlaybackSpeed);
   const firstWeekday = useNvrStore((s) => s.firstWeekday);
   const setFirstWeekday = useNvrStore((s) => s.setFirstWeekday);
+  const themeMode = useNvrStore((s) => s.themeMode);
+  const setThemeMode = useNvrStore((s) => s.setThemeMode);
+  const highContrast = useNvrStore((s) => s.highContrast);
+  const setHighContrast = useNvrStore((s) => s.setHighContrast);
   const resetUiPreferences = useNvrStore((s) => s.resetUiPreferences);
 
   return (
@@ -317,6 +326,86 @@ export const ConsoleUiSection: React.FC<{
           </button>
         </div>
         <div className="nvr-cfg-card-body">
+          <div className="nvr-subcard">
+            <div className="nvr-subcard-header">
+              <span>
+                {isPt
+                  ? "TEMA DO CONSOLE & CONTRASTE DE MONITOR"
+                  : "CONSOLE THEME & MONITOR CONTRAST"}
+              </span>
+              <span className="nvr-badge live">WCAG AA / 16-235 SAFE</span>
+            </div>
+
+            <div className="nvr-field-row">
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt ? "Modo de Tema do Console" : "Console Theme Mode"}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Escolha entre Tático Escuro, Luz do Dia / Claro (seguro contra estourar branco RGB >= 235) ou Automático do Sistema."
+                    : "Switch between Tactical Dark, Daylight / Light (anchored below RGB 235 white-crush ceiling), or System Auto."}
+                </div>
+              </div>
+              <select
+                className="nvr-select mono"
+                aria-label="Console Theme Mode"
+                data-testid="select-theme-mode"
+                value={themeMode}
+                onChange={(e) => {
+                  const nextTheme = e.target.value as ThemeMode;
+                  setThemeMode(nextTheme);
+                  notify(
+                    isPt
+                      ? `Tema do console alterado para ${nextTheme.toUpperCase()}`
+                      : `Console theme switched to ${nextTheme.toUpperCase()}`
+                  );
+                }}
+              >
+                <option value="dark">
+                  {isPt ? "Tático Escuro" : "Tactical Dark"}
+                </option>
+                <option value="light">
+                  {isPt ? "Luz do Dia / Claro" : "Daylight / Light"}
+                </option>
+                <option value="system">
+                  {isPt ? "Automático do Sistema" : "System Auto"}
+                </option>
+              </select>
+            </div>
+
+            <div className="nvr-field-row">
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? "Reforço de Alto Contraste para Monitor"
+                    : "High-Contrast Monitor Boost"}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Reforça bordas estruturais em +15%, promove texto secundário para contraste AAA (>= 7:1) e aplica bordas de 1.5px."
+                    : "Strengthens structural borders (+15%), promotes muted text to >= 7:1 AAA contrast, and applies 1.5px border weight."}
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={highContrast}
+                onChange={(v) => {
+                  setHighContrast(v);
+                  notify(
+                    v
+                      ? isPt
+                        ? "Reforço de alto contraste ativado"
+                        : "High-Contrast Monitor Boost enabled"
+                      : isPt
+                      ? "Reforço de alto contraste desativado"
+                      : "High-Contrast Monitor Boost disabled"
+                  );
+                }}
+                label="High-Contrast Monitor Boost"
+              />
+            </div>
+          </div>
+
           <div className="nvr-field-row">
             <div className="nvr-field-meta">
               <div className="nvr-field-label">

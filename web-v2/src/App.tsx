@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { LogOut } from "lucide-react";
+import { LogOut, Monitor, Moon, Sun } from "lucide-react";
 import { useI18n } from "./i18n";
 import {
   EventItem,
@@ -10,7 +10,12 @@ import {
   RecordingSegment,
   ReviewItem,
 } from "./types/nvr";
-import { WorkspaceTab, formatTs } from "./utils/format";
+import {
+  WorkspaceTab,
+  applyThemeToDocument,
+  cycleThemeMode,
+  formatTs,
+} from "./utils/format";
 import { useNvrStore } from "./store/useNvrStore";
 import { LiveWorkspace } from "./views/LiveWorkspace";
 import { SyncWorkspace } from "./views/SyncWorkspace";
@@ -52,6 +57,9 @@ export const App: React.FC = () => {
   const setSecurityProfile = useNvrStore((s) => s.setSecurityProfile);
   const audibleAlertChime = useNvrStore((s) => s.audibleAlertChime);
   const browserNotifications = useNvrStore((s) => s.browserNotifications);
+  const themeMode = useNvrStore((s) => s.themeMode);
+  const setThemeMode = useNvrStore((s) => s.setThemeMode);
+  const highContrast = useNvrStore((s) => s.highContrast);
   const selectedCamera = useNvrStore((s) => s.selectedCamera);
   const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
   const timeShiftTs = useNvrStore((s) => s.timeShiftTs);
@@ -136,6 +144,26 @@ export const App: React.FC = () => {
       setToastMsg((curr) => (curr === msg ? null : curr));
     }, 3200);
   }, []);
+
+  // Synchronize documentElement data-theme and data-high-contrast attributes + OS prefers-color-scheme listener
+  useEffect(() => {
+    applyThemeToDocument(themeMode, highContrast);
+    if (
+      themeMode !== "system" ||
+      typeof window === "undefined" ||
+      typeof window.matchMedia !== "function"
+    ) {
+      return;
+    }
+    const mql = window.matchMedia("(prefers-color-scheme: light)");
+    const onChange = (ev: MediaQueryListEvent) => {
+      applyThemeToDocument("system", highContrast, ev.matches);
+    };
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", onChange);
+      return () => mql.removeEventListener("change", onChange);
+    }
+  }, [themeMode, highContrast]);
 
   const cameraNames = useMemo(() => {
     if (!config?.cameras) return ["escritorio", "sala", "quarto", "cozinha"];
@@ -1086,6 +1114,53 @@ export const App: React.FC = () => {
             <span>OV {inferMs}ms</span>
             <span className="nvr-divider" aria-hidden="true" />
             <span>{totalFps} FPS</span>
+          </button>
+          <button
+            type="button"
+            data-testid="topbar-theme-toggle"
+            className="nvr-btn mono"
+            style={{
+              height: 26,
+              padding: "0 8px",
+              fontSize: "var(--text-xs)",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+            }}
+            title={`${t.theme.cycleTooltip} — Current: ${
+              themeMode === "dark"
+                ? t.theme.dark
+                : themeMode === "light"
+                ? t.theme.light
+                : t.theme.system
+            }${highContrast ? " (High-Contrast Boost)" : ""}`}
+            aria-label="Cycle Console Theme (Dark / Light / System)"
+            onClick={() => {
+              const nextMode = cycleThemeMode(themeMode);
+              setThemeMode(nextMode);
+              const nextLabel =
+                nextMode === "dark"
+                  ? t.theme.dark
+                  : nextMode === "light"
+                  ? t.theme.light
+                  : t.theme.system;
+              notify(`${t.theme.label}: ${nextLabel}`);
+            }}
+          >
+            {themeMode === "dark" ? (
+              <Moon size={12} />
+            ) : themeMode === "light" ? (
+              <Sun size={12} />
+            ) : (
+              <Monitor size={12} />
+            )}
+            <span>
+              {themeMode === "dark"
+                ? "DARK"
+                : themeMode === "light"
+                ? "LIGHT"
+                : "AUTO"}
+            </span>
           </button>
           <button
             type="button"

@@ -20,6 +20,69 @@ export type LiveLayoutMode = "2x2" | "focus" | "single" | "spotlight" | "map";
 export type MatrixDensity = "2x2" | "3x3" | "4x4";
 export type SpotlightFilter = "all_activity" | "objects" | "person" | "vehicle";
 export type FirstWeekday = "sunday" | "monday";
+export type ThemeMode = "dark" | "light" | "system";
+export type EffectiveTheme = "dark" | "light";
+
+export function resolveInitialThemeMode(
+  fallback: ThemeMode = "dark"
+): ThemeMode {
+  if (typeof window === "undefined") return fallback;
+  const saved = window.localStorage?.getItem("ninjanvr_theme_mode");
+  if (saved === "dark" || saved === "light" || saved === "system") {
+    return saved;
+  }
+  return fallback;
+}
+
+export function resolveEffectiveTheme(
+  mode: ThemeMode,
+  prefersLight?: boolean
+): EffectiveTheme {
+  if (mode === "light") return "light";
+  if (mode === "dark") return "dark";
+  if (typeof prefersLight === "boolean") {
+    return prefersLight ? "light" : "dark";
+  }
+  if (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function"
+  ) {
+    try {
+      return window.matchMedia("(prefers-color-scheme: light)").matches
+        ? "light"
+        : "dark";
+    } catch {
+      return "dark";
+    }
+  }
+  return "dark";
+}
+
+export function cycleThemeMode(current: ThemeMode): ThemeMode {
+  if (current === "dark") return "light";
+  if (current === "light") return "system";
+  return "dark";
+}
+
+export function applyThemeToDocument(
+  mode: ThemeMode,
+  highContrast: boolean,
+  prefersLight?: boolean
+): EffectiveTheme {
+  const effective = resolveEffectiveTheme(mode, prefersLight);
+  if (typeof document !== "undefined" && document.documentElement) {
+    const root = document.documentElement;
+    if (root.dataset) {
+      root.dataset.theme = effective;
+      root.dataset.highContrast = highContrast ? "true" : "false";
+    }
+    if (typeof root.setAttribute === "function") {
+      root.setAttribute("data-theme", effective);
+      root.setAttribute("data-high-contrast", highContrast ? "true" : "false");
+    }
+  }
+  return effective;
+}
 
 export function resolveInitialTab(): WorkspaceTab {
   if (typeof window === "undefined") return "live";

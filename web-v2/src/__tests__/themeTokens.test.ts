@@ -1,18 +1,31 @@
 import { describe, expect, test } from "bun:test";
+import { useNvrStore } from "../store/useNvrStore";
 import {
   ADJACENT_STRUCTURAL_PAIRS,
   CONTRAST_SURFACE_TOKENS,
+  DARK_HIGH_CONTRAST_TOKENS,
   DARK_THEME_TOKENS,
+  LIGHT_ADJACENT_STRUCTURAL_PAIRS,
+  LIGHT_ANTI_WHITE_CRUSH_SURFACE_TOKENS,
+  LIGHT_HIGH_CONTRAST_TOKENS,
+  LIGHT_THEME_TOKENS,
   READABLE_TEXT_TOKENS,
   STRUCTURAL_SURFACE_TOKENS,
+  applyThemeToDocument,
   cieLightnessFromLuminance,
   cieLightnessLStar,
+  cycleThemeMode,
   degradedDeltaLStar,
   deltaLStar,
+  extractLightThemeCssVariables,
   extractRootCssVariables,
+  extractSelectorCssVariables,
   parseHexColor,
   quantizeHdmiLimitedRange,
   relativeLuminance,
+  resolveCanvasThemePalette,
+  resolveEffectiveTheme,
+  resolveInitialThemeMode,
   rgbToHex,
   simulateGamma24Transfer,
   srgbChannelToLinear,
@@ -219,5 +232,262 @@ describe("themeTokens colorimetric utilities & cross-monitor invariants (#88)", 
       const content = await readSrcFile(settingsFile);
       expect(content).toContain("nvr-subcard");
     }
+  });
+
+  test("Light Theme ([data-theme='light']) tokens pass WCAG 2.1 AA (>= 4.5:1) contrast across all light surfaces (#89)", () => {
+    for (const surfaceToken of CONTRAST_SURFACE_TOKENS) {
+      const bgHex = LIGHT_THEME_TOKENS[surfaceToken];
+      for (const textToken of READABLE_TEXT_TOKENS) {
+        const fgHex = LIGHT_THEME_TOKENS[textToken];
+        const ratio = wcagContrastRatio(fgHex, bgHex);
+        expect(ratio).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+
+    // --text-primary exceeds 14:1 and --text-secondary exceeds 8.5:1 on --bg-panel and --bg-input
+    expect(
+      wcagContrastRatio(
+        LIGHT_THEME_TOKENS["--text-primary"],
+        LIGHT_THEME_TOKENS["--bg-panel"]
+      )
+    ).toBeGreaterThanOrEqual(14);
+    expect(
+      wcagContrastRatio(
+        LIGHT_THEME_TOKENS["--text-secondary"],
+        LIGHT_THEME_TOKENS["--bg-panel"]
+      )
+    ).toBeGreaterThanOrEqual(8.5);
+    expect(
+      wcagContrastRatio(
+        LIGHT_THEME_TOKENS["--text-muted"],
+        LIGHT_THEME_TOKENS["--bg-panel"]
+      )
+    ).toBeGreaterThanOrEqual(5.3);
+  });
+
+  test("Light Theme HDMI 16-235 white-crush clipping & high-brightness simulation preserves tier separation and >= 3:1 control borders (#89)", () => {
+    // Naive white-on-near-white (#ffffff on #f8fafc or #f1f5f9) collapses to identical RGB 235,235,235 under HDMI 16-235 clipping
+    expect(quantizeHdmiLimitedRange("#ffffff")).toEqual({ r: 235, g: 235, b: 235 });
+    expect(quantizeHdmiLimitedRange("#f8fafc")).toEqual({ r: 235, g: 235, b: 235 });
+    expect(degradedDeltaLStar("#ffffff", "#f8fafc", 2.4)).toBe(0);
+
+    // Every intermediate surface in LIGHT_ANTI_WHITE_CRUSH_SURFACE_TOKENS has R < 235 and G <= 235 so it never clips to solid 235,235,235
+    for (const token of LIGHT_ANTI_WHITE_CRUSH_SURFACE_TOKENS) {
+      const hex = LIGHT_THEME_TOKENS[token];
+      const quantized = quantizeHdmiLimitedRange(hex);
+      expect(quantized).not.toEqual({ r: 235, g: 235, b: 235 });
+      expect(degradedDeltaLStar(hex, "#ffffff", 2.4)).toBeGreaterThan(0);
+    }
+
+    // Main light surface tiers (--bg-deep < --bg-canvas < --bg-card-header < --bg-subcard < --bg-panel < --bg-input) are strictly monotonic
+    const lDeep = cieLightnessLStar(LIGHT_THEME_TOKENS["--bg-deep"]);
+    const lCanvas = cieLightnessLStar(LIGHT_THEME_TOKENS["--bg-canvas"]);
+    const lHeader = cieLightnessLStar(LIGHT_THEME_TOKENS["--bg-card-header"]);
+    const lSubcard = cieLightnessLStar(LIGHT_THEME_TOKENS["--bg-subcard"]);
+    const lPanel = cieLightnessLStar(LIGHT_THEME_TOKENS["--bg-panel"]);
+    const lInput = cieLightnessLStar(LIGHT_THEME_TOKENS["--bg-input"]);
+
+    expect(lDeep).toBeLessThan(lCanvas);
+    expect(lCanvas).toBeLessThan(lHeader);
+    expect(lHeader).toBeLessThan(lSubcard);
+    expect(lSubcard).toBeLessThan(lPanel);
+    expect(lPanel).toBeLessThan(lInput);
+
+    // Adjacent structural pairs in Light Theme maintain strictly positive degradedDeltaLStar under HDMI 16-235 + gamma 2.4
+    for (const [tokenA, tokenB] of LIGHT_ADJACENT_STRUCTURAL_PAIRS) {
+      const hexA = LIGHT_THEME_TOKENS[tokenA];
+      const hexB = LIGHT_THEME_TOKENS[tokenB];
+      expect(degradedDeltaLStar(hexA, hexB, 2.4)).toBeGreaterThan(0);
+    }
+
+    // Control boundary contrast: --border-input (#5b6b82) and --border-strong (#64748b) achieve >= 3:1 against --bg-panel, --bg-subcard, and --bg-input
+    for (const bgToken of ["--bg-panel", "--bg-subcard", "--bg-input"] as const) {
+      expect(
+        wcagContrastRatio(
+          LIGHT_THEME_TOKENS["--border-input"],
+          LIGHT_THEME_TOKENS[bgToken]
+        )
+      ).toBeGreaterThanOrEqual(3.0);
+      expect(
+        wcagContrastRatio(
+          LIGHT_THEME_TOKENS["--border-strong"],
+          LIGHT_THEME_TOKENS[bgToken]
+        )
+      ).toBeGreaterThanOrEqual(3.0);
+    }
+  });
+
+  test("High-Contrast Monitor Boost ([data-high-contrast='true']) strengthens borders and promotes --text-muted to >= 7:1 WCAG AAA (#89)", async () => {
+    // Dark High-Contrast: --text-muted achieves >= 7:1 across all dark surfaces
+    for (const surface of CONTRAST_SURFACE_TOKENS) {
+      const ratio = wcagContrastRatio(
+        DARK_HIGH_CONTRAST_TOKENS["--text-muted"],
+        DARK_THEME_TOKENS[surface]
+      );
+      expect(ratio).toBeGreaterThanOrEqual(7.0);
+    }
+
+    // Light High-Contrast: --text-muted achieves >= 7:1 across all light surfaces
+    for (const surface of CONTRAST_SURFACE_TOKENS) {
+      const ratio = wcagContrastRatio(
+        LIGHT_HIGH_CONTRAST_TOKENS["--text-muted"],
+        LIGHT_THEME_TOKENS[surface]
+      );
+      expect(ratio).toBeGreaterThanOrEqual(7.0);
+    }
+
+    // Borders in High-Contrast have higher contrast against --bg-panel than standard borders in both themes
+    for (const borderKey of [
+      "--border-divider",
+      "--border-hairline",
+      "--border-card",
+      "--border-strong",
+      "--border-input",
+    ] as const) {
+      expect(
+        wcagContrastRatio(
+          DARK_HIGH_CONTRAST_TOKENS[borderKey],
+          DARK_THEME_TOKENS["--bg-panel"]
+        )
+      ).toBeGreaterThan(
+        wcagContrastRatio(
+          DARK_THEME_TOKENS[borderKey],
+          DARK_THEME_TOKENS["--bg-panel"]
+        )
+      );
+      expect(
+        wcagContrastRatio(
+          LIGHT_HIGH_CONTRAST_TOKENS[borderKey],
+          LIGHT_THEME_TOKENS["--bg-panel"]
+        )
+      ).toBeGreaterThan(
+        wcagContrastRatio(
+          LIGHT_THEME_TOKENS[borderKey],
+          LIGHT_THEME_TOKENS["--bg-panel"]
+        )
+      );
+    }
+
+    const cssText = await readSrcFile("../styles.css");
+    const lightVars = extractLightThemeCssVariables(cssText);
+    for (const [tokenName, expectedHex] of Object.entries(LIGHT_THEME_TOKENS)) {
+      expect(lightVars[tokenName]?.toLowerCase()).toBe(expectedHex.toLowerCase());
+    }
+    expect(lightVars["--shadow-card"]).toBe("0 2px 6px rgba(15, 23, 42, 0.08)");
+
+    const darkHcVars = extractSelectorCssVariables(
+      cssText,
+      '[data-high-contrast="true"]'
+    );
+    for (const [tokenName, expectedHex] of Object.entries(DARK_HIGH_CONTRAST_TOKENS)) {
+      expect(darkHcVars[tokenName]?.toLowerCase()).toBe(expectedHex.toLowerCase());
+    }
+
+    const lightHcVars = extractSelectorCssVariables(
+      cssText,
+      '[data-theme="light"][data-high-contrast="true"]'
+    );
+    for (const [tokenName, expectedHex] of Object.entries(LIGHT_HIGH_CONTRAST_TOKENS)) {
+      expect(lightHcVars[tokenName]?.toLowerCase()).toBe(expectedHex.toLowerCase());
+    }
+
+    expect(cssText).toMatch(
+      /\[data-high-contrast="true"\]\s*\.nvr-cfg-card[\s\S]*?border-width:\s*1\.5px/
+    );
+  });
+
+  test("resolveEffectiveTheme, cycleThemeMode, applyThemeToDocument, resolveCanvasThemePalette, and useNvrStore theme actions (#89)", () => {
+    expect(resolveEffectiveTheme("dark", true)).toBe("dark");
+    expect(resolveEffectiveTheme("dark", false)).toBe("dark");
+    expect(resolveEffectiveTheme("light", true)).toBe("light");
+    expect(resolveEffectiveTheme("light", false)).toBe("light");
+    expect(resolveEffectiveTheme("system", true)).toBe("light");
+    expect(resolveEffectiveTheme("system", false)).toBe("dark");
+
+    expect(cycleThemeMode("dark")).toBe("light");
+    expect(cycleThemeMode("light")).toBe("system");
+    expect(cycleThemeMode("system")).toBe("dark");
+
+    const store = new Map<string, string>();
+    const attrs = new Map<string, string>();
+    const dataset: Record<string, string> = {};
+    let prefersLightMedia = false;
+
+    (globalThis as unknown as { window: unknown; document: unknown }).window = {
+      location: { pathname: "/" },
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => store.set(k, v),
+        removeItem: (k: string) => store.delete(k),
+      },
+      matchMedia: (query: string) => ({
+        matches: query.includes("light") ? prefersLightMedia : !prefersLightMedia,
+      }),
+    };
+    (globalThis as unknown as { document: unknown }).document = {
+      documentElement: {
+        dataset,
+        setAttribute: (k: string, v: string) => attrs.set(k, v),
+      },
+    };
+
+    expect(resolveInitialThemeMode()).toBe("dark");
+    store.set("ninjanvr_theme_mode", "light");
+    expect(resolveInitialThemeMode()).toBe("light");
+    store.set("ninjanvr_theme_mode", "system");
+    expect(resolveInitialThemeMode()).toBe("system");
+
+    prefersLightMedia = true;
+    expect(resolveEffectiveTheme("system")).toBe("light");
+    prefersLightMedia = false;
+    expect(resolveEffectiveTheme("system")).toBe("dark");
+
+    expect(applyThemeToDocument("light", true)).toBe("light");
+    expect(dataset.theme).toBe("light");
+    expect(dataset.highContrast).toBe("true");
+    expect(attrs.get("data-theme")).toBe("light");
+    expect(attrs.get("data-high-contrast")).toBe("true");
+
+    const lightPalette = resolveCanvasThemePalette("light");
+    const darkPalette = resolveCanvasThemePalette("dark");
+    expect(lightPalette.theme).toBe("light");
+    expect(darkPalette.theme).toBe("dark");
+    expect(lightPalette.floorplanRoomLabelFill.toLowerCase()).toBe(
+      LIGHT_THEME_TOKENS["--text-primary"].toLowerCase()
+    );
+    expect(darkPalette.floorplanRoomLabelFill.toLowerCase()).toBe(
+      DARK_THEME_TOKENS["--text-primary"].toLowerCase()
+    );
+    expect(lightPalette.gridLineStroke).not.toBe(darkPalette.gridLineStroke);
+
+    // Store actions & server config fallback
+    useNvrStore.getState().resetUiPreferences();
+    expect(useNvrStore.getState().themeMode).toBe("dark");
+    expect(useNvrStore.getState().highContrast).toBe(false);
+    expect(dataset.theme).toBe("dark");
+    expect(dataset.highContrast).toBe("false");
+
+    // When no browser localStorage override exists, setConfig adopts ui.theme and ui.high_contrast from server config
+    useNvrStore.getState().setConfig({
+      version: "0.18-0",
+      safe_mode: false,
+      ui: {
+        theme: "light",
+        high_contrast: true,
+      },
+      cameras: {},
+    });
+    expect(useNvrStore.getState().themeMode).toBe("light");
+    expect(useNvrStore.getState().highContrast).toBe(true);
+    expect(dataset.theme).toBe("light");
+    expect(dataset.highContrast).toBe("true");
+
+    // Explicit operator override persists in localStorage and takes precedence over server config
+    useNvrStore.getState().setThemeMode("system");
+    useNvrStore.getState().setHighContrast((prev) => !prev);
+    expect(store.get("ninjanvr_theme_mode")).toBe("system");
+    expect(store.get("ninjanvr_high_contrast")).toBe("false");
+    expect(useNvrStore.getState().themeMode).toBe("system");
+    expect(useNvrStore.getState().highContrast).toBe(false);
   });
 });

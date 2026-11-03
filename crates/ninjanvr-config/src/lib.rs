@@ -142,6 +142,10 @@ pub struct UiConfig {
     pub time_format: String,
     #[serde(default = "default_ui_unit_system")]
     pub unit_system: String,
+    #[serde(default = "default_ui_theme")]
+    pub theme: String,
+    #[serde(default)]
+    pub high_contrast: bool,
     #[serde(default)]
     pub floorplan: FloorplanConfig,
 }
@@ -154,11 +158,25 @@ fn default_ui_unit_system() -> String {
     "metric".to_string()
 }
 
+fn default_ui_theme() -> String {
+    "dark".to_string()
+}
+
+pub fn normalize_ui_theme(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "light" => "light".to_string(),
+        "system" => "system".to_string(),
+        _ => "dark".to_string(),
+    }
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             time_format: default_ui_time_format(),
             unit_system: default_ui_unit_system(),
+            theme: default_ui_theme(),
+            high_contrast: false,
             floorplan: FloorplanConfig::default(),
         }
     }
@@ -1777,6 +1795,7 @@ impl NinjaConfig {
         }
 
         cfg.objects.normalize_standalone_tracked_attributes();
+        cfg.ui.theme = normalize_ui_theme(&cfg.ui.theme);
 
         for (cam_name, cam) in cfg.cameras.iter_mut() {
             if cam.live.streams.is_empty() {
@@ -2317,6 +2336,8 @@ impl NinjaConfig {
             "ui": {
                 "time_format": self.ui.time_format,
                 "unit_system": self.ui.unit_system,
+                "theme": self.ui.theme,
+                "high_contrast": self.ui.high_contrast,
                 "floorplan": {
                     "background_data_url": self.ui.floorplan.background_data_url,
                     "opacity": self.ui.floorplan.opacity,
@@ -2756,6 +2777,9 @@ impl NinjaConfig {
         if let Some(ui_val) = obj.get("ui") {
             let prev_time_format = self.ui.time_format.clone();
             let prev_unit_system = self.ui.unit_system.clone();
+            let prev_theme = self.ui.theme.clone();
+            let prev_high_contrast = self.ui.high_contrast;
+            let prev_floorplan = self.ui.floorplan.clone();
             let mut next_ui: UiConfig =
                 serde_json::from_value(ui_val.clone()).context("invalid ui config")?;
             if ui_val.get("time_format").is_none() {
@@ -2764,15 +2788,27 @@ impl NinjaConfig {
             if ui_val.get("unit_system").is_none() {
                 next_ui.unit_system = prev_unit_system;
             }
-            if next_ui
-                .floorplan
-                .background_data_url
-                .as_ref()
-                .is_some_and(|s| s.trim().is_empty())
-            {
-                next_ui.floorplan.background_data_url = None;
+            if ui_val.get("theme").is_none() {
+                next_ui.theme = prev_theme;
+            } else {
+                next_ui.theme = normalize_ui_theme(&next_ui.theme);
             }
-            next_ui.floorplan.opacity = next_ui.floorplan.opacity.clamp(0.10, 1.0);
+            if ui_val.get("high_contrast").is_none() {
+                next_ui.high_contrast = prev_high_contrast;
+            }
+            if ui_val.get("floorplan").is_none() {
+                next_ui.floorplan = prev_floorplan;
+            } else {
+                if next_ui
+                    .floorplan
+                    .background_data_url
+                    .as_ref()
+                    .is_some_and(|s| s.trim().is_empty())
+                {
+                    next_ui.floorplan.background_data_url = None;
+                }
+                next_ui.floorplan.opacity = next_ui.floorplan.opacity.clamp(0.10, 1.0);
+            }
             self.ui = next_ui;
         }
         if let Some(fp_val) = obj.get("floorplan") {
@@ -4702,5 +4738,104 @@ version: 0.18-0
             cfg.cameras["portao"].state_rois["driveway_spot"].anomaly_timeout_sec,
             600
         );
+    }
+
+    #[test]
+    fn ui_config_theme_and_high_contrast_defaults_yaml_and_structured_json_roundtrip() {
+        // 1. Default values when omitted in YAML
+        let default_yaml = "version: 0.18-0\n";
+        let mut cfg =
+            NinjaConfig::from_yaml_str(default_yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(cfg.ui.theme, "dark");
+        assert!(!cfg.ui.high_contrast);
+
+        let api_default = cfg.to_api_value();
+        assert_eq!(api_default["ui"]["theme"], "dark");
+        assert_eq!(api_default["ui"]["high_contrast"], false);
+
+        // 2. Explicit light theme and high_contrast: true in YAML
+        let light_yaml = r#"
+ui:
+  theme: light
+  high_contrast: true
+  time_format: 24h
+  unit_system: metric
+version: 0.18-0
+"#;
+        let mut light_cfg =
+            NinjaConfig::from_yaml_str(light_yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(light_cfg.ui.theme, "light");
+        assert!(light_cfg.ui.high_contrast);
+
+        let api_light = light_cfg.to_api_value();
+        assert_eq!(api_light["ui"]["theme"], "light");
+        assert_eq!(api_light["ui"]["high_contrast"], true);
+
+        // 3. System auto theme and invalid fallback normalization
+        let system_yaml = r#"
+ui:
+  theme: SYSTEM
+  high_contrast: false
+version: 0.18-0
+"#;
+        let sys_cfg =
+            NinjaConfig::from_yaml_str(system_yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(sys_cfg.ui.theme, "system");
+        assert!(!sys_cfg.ui.high_contrast);
+
+        let invalid_yaml = r#"
+ui:
+  theme: neon_cyberpunk
+version: 0.18-0
+"#;
+        let invalid_cfg =
+            NinjaConfig::from_yaml_str(invalid_yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(invalid_cfg.ui.theme, "dark");
+
+        // 4. apply_structured_json round-trip and partial patch preservation
+        let patch = json!({
+            "ui": {
+                "theme": "light",
+                "high_contrast": true
+            }
+        });
+        cfg.apply_structured_json(&patch).unwrap();
+        assert_eq!(cfg.ui.theme, "light");
+        assert!(cfg.ui.high_contrast);
+        assert_eq!(cfg.ui.time_format, "browser");
+        assert_eq!(cfg.ui.unit_system, "metric");
+
+        // Partial floorplan update preserves theme and high_contrast
+        let fp_patch = json!({
+            "ui": {
+                "floorplan": {
+                    "opacity": 0.60,
+                    "rooms": [],
+                    "walls": []
+                }
+            }
+        });
+        cfg.apply_structured_json(&fp_patch).unwrap();
+        assert_eq!(cfg.ui.theme, "light");
+        assert!(cfg.ui.high_contrast);
+        assert!((cfg.ui.floorplan.opacity - 0.60).abs() < 1e-4);
+
+        // Switch to system mode and disable high_contrast, then roundtrip via raw_yaml
+        light_cfg
+            .apply_structured_json(&json!({
+                "ui": {
+                    "theme": "system",
+                    "high_contrast": false
+                }
+            }))
+            .unwrap();
+        assert_eq!(light_cfg.ui.theme, "system");
+        assert!(!light_cfg.ui.high_contrast);
+
+        let reparsed =
+            NinjaConfig::from_yaml_str(&light_cfg.raw_yaml, PathBuf::from("/tmp/config.yml"))
+                .unwrap();
+        assert_eq!(reparsed.ui.theme, "system");
+        assert!(!reparsed.ui.high_contrast);
     }
 }

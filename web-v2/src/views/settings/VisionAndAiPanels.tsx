@@ -4767,17 +4767,7 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
           </div>
 
-          <div
-            style={{
-              padding: "8px 10px",
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 6,
-            }}
-          >
+          <div className="nvr-subcard" style={{ padding: "8px 10px" }}>
             <div
               style={{
                 display: "flex",
@@ -4819,8 +4809,8 @@ export const AiDetectionObjectsSection: React.FC<{
               style={{
                 display: "block",
                 padding: "6px 8px",
-                background: "var(--bg-deep)",
-                border: "1px solid var(--border-hairline)",
+                background: "var(--bg-input)",
+                border: "1px solid var(--border-input)",
                 borderRadius: 2,
                 fontSize: "var(--text-xs)",
                 color: "var(--signal-live-text)",

@@ -1072,4 +1072,25 @@ cameras:
     expect(payload.height).toBe(640);
     expect(payload.labelmap?.split("\n").length).toBe(15);
   });
+
+  test("serializes ui.theme and ui.high_contrast in buildCleanYamlFromDraft (#89)", () => {
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      ui: {
+        time_format: "24h",
+        unit_system: "metric",
+        theme: "light",
+        high_contrast: true,
+      },
+      cameras: {},
+    };
+
+    const yamlText = buildCleanYamlFromDraft(draft, "");
+    expect(yamlText).toContain("ui:");
+    expect(yamlText).toContain("time_format: 24h");
+    expect(yamlText).toContain("unit_system: metric");
+    expect(yamlText).toContain("theme: light");
+    expect(yamlText).toContain("high_contrast: true");
+  });
 });
