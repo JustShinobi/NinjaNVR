@@ -21,7 +21,7 @@ ENV NINJANVR_RELEASE_VERSION=${NINJANVR_RELEASE_VERSION}
 RUN cargo build --release --bin ninjanvr
 
 FROM alexxit/go2rtc:1.9.15 AS go2rtc-bin
-FROM mwader/static-ffmpeg:8.1.2 AS ffmpeg-bin
+FROM mwader/static-ffmpeg:9.0.2-1 AS ffmpeg-bin
 
 FROM python:3.12-slim-trixie AS openvino-assets
 
