@@ -173,6 +173,18 @@ export interface CameraMapPlacement {
   range: number;
 }
 
+export interface CameraUiConfig {
+  order?: number;
+  dashboard?: boolean;
+  review?: boolean;
+}
+
+export interface CameraGroupConfig {
+  cameras: string[];
+  icon?: string | null;
+  order?: number;
+}
+
 export interface CameraConfig {
   name?: string;
   enabled: boolean;
@@ -180,6 +192,7 @@ export interface CameraConfig {
   webui_url?: string;
   notes?: string;
   privacy_mask?: unknown;
+  ui?: CameraUiConfig;
   map?: CameraMapPlacement;
   ffmpeg?: CameraFfmpegConfig;
   live?: CameraLiveConfig;
@@ -312,6 +325,7 @@ export interface NinjaConfigResponse {
     streams: Record<string, unknown>;
   };
   peers?: Record<string, PeerNodeConfig>;
+  camera_groups?: Record<string, CameraGroupConfig>;
   cameras: Record<string, CameraConfig>;
 }
 
@@ -352,6 +366,8 @@ export interface CameraRuntimeStats {
   capture_cpu?: string;
   detect_cpu?: string;
 }
+
+export type CameraStats = CameraRuntimeStats;
 
 export interface DetectorStats {
   inference_speed: number;

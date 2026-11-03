@@ -16,6 +16,7 @@ import {
   ReviewItem,
 } from "../types/nvr";
 import { RecordingCalendarPopover } from "./RecordingCalendarPopover";
+import { TacticalCameraPicker } from "./TacticalCameraPicker";
 import { formatDuration } from "../utils/format";
 
 export type TimelineZoomMinutes = 5 | 15 | 60 | 360 | 1440;
@@ -1297,23 +1298,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             </span>
           )}
           {cameras && cameras.length > 0 && onSelectCamera && (
-            <div style={{ display: "flex", gap: 3 }}>
-              {cameras.map((cam) => (
-                <button
-                  key={cam}
-                  className={`nvr-btn mono ${camera === cam ? "active" : ""}`}
-                  style={{
-                    height: 24,
-                    padding: "0 7px",
-                    fontSize: "var(--text-xs)",
-                    textTransform: "uppercase",
-                  }}
-                  onClick={() => onSelectCamera(cam)}
-                >
-                  {cam}
-                </button>
-              ))}
-            </div>
+            <TacticalCameraPicker
+              cameras={cameras}
+              selectedCamera={camera}
+              onSelect={onSelectCamera}
+              ariaLabel="Timeline camera selector"
+            />
           )}
 
           {/* Direct Recording Calendar Popover (neutral when closed) */}

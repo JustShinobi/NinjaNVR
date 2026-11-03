@@ -2,9 +2,76 @@ import React from "react";
 import { AlertTriangle, CheckCircle2, Copy, Pause, Play } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
-import { HeuristicAlertItem, NinjaConfigResponse, NinjaStatsResponse } from "../types/nvr";
+import {
+  CameraRuntimeStats,
+  HeuristicAlertItem,
+  NinjaConfigResponse,
+  NinjaStatsResponse,
+} from "../types/nvr";
 import { formatUptime } from "../utils/format";
 import { CanvasSparkline } from "../components/VideoPlayers";
+
+export type HealthStatusFilter = "all" | "offline" | "active_ai";
+export type HealthSortColumn =
+  | "channel"
+  | "camera_fps"
+  | "detection_fps"
+  | "ffmpeg_cpu";
+export type HealthSortDirection = "asc" | "desc";
+
+export function filterAndSortCameraHealth(
+  cameraNames: string[],
+  statsMap: Record<string, CameraRuntimeStats> | undefined,
+  options: {
+    searchQuery?: string;
+    statusFilter?: HealthStatusFilter;
+    sortColumn?: HealthSortColumn;
+    sortDirection?: HealthSortDirection;
+  } = {}
+): string[] {
+  const {
+    searchQuery = "",
+    statusFilter = "all",
+    sortColumn = "channel",
+    sortDirection = "asc",
+  } = options;
+  const q = searchQuery.trim().toLowerCase();
+
+  const filtered = cameraNames.filter((cam) => {
+    if (q && !cam.toLowerCase().includes(q)) {
+      return false;
+    }
+    const cs = statsMap?.[cam];
+    if (statusFilter === "offline") {
+      return (cs?.camera_fps ?? 0) <= 0;
+    }
+    if (statusFilter === "active_ai") {
+      return (cs?.detection_fps ?? 0) > 0;
+    }
+    return true;
+  });
+
+  const dir = sortDirection === "desc" ? -1 : 1;
+  return [...filtered].sort((a, b) => {
+    const csA = statsMap?.[a];
+    const csB = statsMap?.[b];
+    let diff = 0;
+    if (sortColumn === "channel") {
+      diff = a.localeCompare(b, undefined, { numeric: true });
+    } else if (sortColumn === "camera_fps") {
+      diff = (csA?.camera_fps ?? 0) - (csB?.camera_fps ?? 0);
+    } else if (sortColumn === "detection_fps") {
+      diff = (csA?.detection_fps ?? 0) - (csB?.detection_fps ?? 0);
+    } else if (sortColumn === "ffmpeg_cpu") {
+      diff =
+        parseFloat(csA?.ffmpeg_cpu || "0") - parseFloat(csB?.ffmpeg_cpu || "0");
+    }
+    if (diff !== 0) {
+      return diff * dir;
+    }
+    return a.localeCompare(b, undefined, { numeric: true });
+  });
+}
 
 function buildClientFallbackHeuristics(
   config: NinjaConfigResponse | null,
@@ -237,6 +304,40 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   const [aiBriefText, setAiBriefText] = React.useState<string | null>(null);
   const [aiBriefBusy, setAiBriefBusy] = React.useState(false);
   const [rightMode, setRightMode] = React.useState<"alerts" | "logs">("alerts");
+  const [healthSearch, setHealthSearch] = React.useState("");
+  const [healthStatusFilter, setHealthStatusFilter] =
+    React.useState<HealthStatusFilter>("all");
+  const [healthSortCol, setHealthSortCol] =
+    React.useState<HealthSortColumn>("channel");
+  const [healthSortDir, setHealthSortDir] =
+    React.useState<HealthSortDirection>("asc");
+
+  const filteredHealthCameras = React.useMemo(
+    () =>
+      filterAndSortCameraHealth(cameraNames, stats?.cameras, {
+        searchQuery: healthSearch,
+        statusFilter: healthStatusFilter,
+        sortColumn: healthSortCol,
+        sortDirection: healthSortDir,
+      }),
+    [
+      cameraNames,
+      stats?.cameras,
+      healthSearch,
+      healthStatusFilter,
+      healthSortCol,
+      healthSortDir,
+    ]
+  );
+
+  const toggleHealthSort = (col: HealthSortColumn) => {
+    if (healthSortCol === col) {
+      setHealthSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setHealthSortCol(col);
+      setHealthSortDir(col === "channel" ? "asc" : "desc");
+    }
+  };
 
   const heuristicAlerts = React.useMemo(
     () => buildClientFallbackHeuristics(config, stats),
@@ -469,22 +570,110 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               borderRadius: 3,
             }}
           >
-            <div className="nvr-panel-header">
-              <span>{t.system.cameraHealth}</span>
+            <div
+              className="nvr-panel-header"
+              style={{
+                height: "auto",
+                minHeight: 36,
+                padding: "6px 12px",
+                flexWrap: "wrap",
+              }}
+            >
+              <span>
+                {t.system.cameraHealth} ({filteredHealthCameras.length}/
+                {cameraNames.length})
+              </span>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  flexWrap: "wrap",
+                }}
+              >
+                <input
+                  type="text"
+                  className="nvr-input mono"
+                  style={{ height: 22, width: 136, fontSize: "var(--text-xs)" }}
+                  placeholder="Search camera..."
+                  aria-label="Search camera health"
+                  value={healthSearch}
+                  onChange={(e) => setHealthSearch(e.target.value)}
+                />
+                {(
+                  [
+                    ["all", "All"],
+                    ["offline", "Offline / 0 FPS"],
+                    ["active_ai", "Active AI"],
+                  ] as Array<[HealthStatusFilter, string]>
+                ).map(([flt, label]) => (
+                  <button
+                    key={flt}
+                    type="button"
+                    className={`nvr-btn mono ${
+                      healthStatusFilter === flt ? "active" : ""
+                    }`}
+                    style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    onClick={() => setHealthStatusFilter(flt)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
             <table className="nvr-table mono">
               <thead>
                 <tr>
-                  <th>Channel</th>
-                  <th>Cam FPS</th>
+                  <th
+                    style={{ cursor: "pointer" }}
+                    onClick={() => toggleHealthSort("channel")}
+                  >
+                    Channel{" "}
+                    {healthSortCol === "channel"
+                      ? healthSortDir === "asc"
+                        ? "▲"
+                        : "▼"
+                      : ""}
+                  </th>
+                  <th
+                    style={{ cursor: "pointer" }}
+                    onClick={() => toggleHealthSort("camera_fps")}
+                  >
+                    Cam FPS{" "}
+                    {healthSortCol === "camera_fps"
+                      ? healthSortDir === "asc"
+                        ? "▲"
+                        : "▼"
+                      : ""}
+                  </th>
                   <th>Proc FPS</th>
-                  <th>AI Detect FPS</th>
-                  <th>FFmpeg CPU</th>
+                  <th
+                    style={{ cursor: "pointer" }}
+                    onClick={() => toggleHealthSort("detection_fps")}
+                  >
+                    AI Detect FPS{" "}
+                    {healthSortCol === "detection_fps"
+                      ? healthSortDir === "asc"
+                        ? "▲"
+                        : "▼"
+                      : ""}
+                  </th>
+                  <th
+                    style={{ cursor: "pointer" }}
+                    onClick={() => toggleHealthSort("ffmpeg_cpu")}
+                  >
+                    FFmpeg CPU{" "}
+                    {healthSortCol === "ffmpeg_cpu"
+                      ? healthSortDir === "asc"
+                        ? "▲"
+                        : "▼"
+                      : ""}
+                  </th>
                   <th>Capture CPU</th>
                 </tr>
               </thead>
               <tbody>
-                {cameraNames.map((cam) => {
+                {filteredHealthCameras.map((cam) => {
                   const cs = stats?.cameras?.[cam];
                   return (
                     <tr key={cam}>

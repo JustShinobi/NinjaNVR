@@ -40,6 +40,33 @@ pub struct ProfileOverrideConfig {
     pub disabled_record_cameras: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraGroupConfig {
+    #[serde(default)]
+    pub cameras: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub order: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraUiConfig {
+    #[serde(default)]
+    pub order: i32,
+    #[serde(default = "default_true")]
+    pub dashboard: bool,
+}
+
+impl Default for CameraUiConfig {
+    fn default() -> Self {
+        Self {
+            order: 0,
+            dashboard: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NinjaConfig {
     #[serde(default = "default_version")]
@@ -72,6 +99,8 @@ pub struct NinjaConfig {
     pub profiles: BTreeMap<String, ProfileOverrideConfig>,
     #[serde(default)]
     pub peers: BTreeMap<String, PeerNodeConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub camera_groups: BTreeMap<String, CameraGroupConfig>,
     #[serde(default)]
     pub go2rtc: Go2RtcConfig,
     #[serde(default)]
@@ -1182,6 +1211,8 @@ pub struct CameraConfig {
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub privacy_mask: Value,
     #[serde(default)]
+    pub ui: CameraUiConfig,
+    #[serde(default)]
     pub map: CameraMapPlacement,
     #[serde(default)]
     pub ffmpeg: CameraFfmpegConfig,
@@ -1215,6 +1246,7 @@ impl Default for CameraConfig {
             webui_url: None,
             notes: None,
             privacy_mask: Value::Null,
+            ui: CameraUiConfig::default(),
             map: CameraMapPlacement::default(),
             ffmpeg: CameraFfmpegConfig::default(),
             live: CameraLiveConfig::default(),
@@ -1428,6 +1460,11 @@ impl NinjaConfig {
             map.insert(idx.to_string(), label.to_string());
         }
         map
+    }
+
+    /// Alias for `to_api_config()` returning the `/api/config` JSON object.
+    pub fn to_api_value(&self) -> Value {
+        self.to_api_config()
     }
 
     /// Generates the complete `/api/config` JSON object expected by the React SPA.
@@ -1739,8 +1776,8 @@ impl NinjaConfig {
                         }
                     },
                     "ui": {
-                        "order": order_idx,
-                        "dashboard": true,
+                        "order": if cam.ui.order != 0 { cam.ui.order } else { order_idx as i32 },
+                        "dashboard": cam.ui.dashboard,
                         "review": true
                     },
                     "webui_url": cam.webui_url,
@@ -2057,7 +2094,7 @@ impl NinjaConfig {
                 "debug_save_plates": false,
                 "replace_rules": []
             },
-            "camera_groups": {},
+            "camera_groups": self.camera_groups,
             "profiles": {},
             "peers": self.peers,
             "plus": { "enabled": false }
@@ -2214,6 +2251,10 @@ impl NinjaConfig {
         if let Some(peers_val) = obj.get("peers") {
             self.peers =
                 serde_json::from_value(peers_val.clone()).context("invalid peers config")?;
+        }
+        if let Some(groups_val) = obj.get("camera_groups") {
+            self.camera_groups = serde_json::from_value(groups_val.clone())
+                .context("invalid camera_groups config")?;
         }
         if let Some(go2rtc_val) = obj.get("go2rtc")
             && let Some(streams_val) = go2rtc_val.get("streams")
@@ -2681,6 +2722,112 @@ version: 0.18-0
         assert_eq!(
             cfg.detectors["ort_cuda"].normalized_backend_type(),
             "onnxruntime"
+        );
+    }
+
+    #[test]
+    fn camera_groups_and_camera_ui_roundtrip_yaml_and_json() {
+        let yaml = r#"
+camera_groups:
+  perimeter:
+    cameras: [gate_north, gate_south]
+    icon: shield
+    order: 1
+  warehouse:
+    cameras: [dock_01]
+    order: 2
+cameras:
+  gate_north:
+    enabled: true
+    ui:
+      order: 10
+      dashboard: true
+  gate_south:
+    enabled: true
+    ui:
+      order: 5
+      dashboard: true
+  dock_01:
+    enabled: true
+    ui:
+      order: 20
+      dashboard: false
+  default_ui_cam:
+    enabled: true
+version: 0.18-0
+"#;
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(cfg.camera_groups.len(), 2);
+        assert_eq!(
+            cfg.camera_groups["perimeter"].cameras,
+            vec!["gate_north".to_string(), "gate_south".to_string()]
+        );
+        assert_eq!(
+            cfg.camera_groups["perimeter"].icon.as_deref(),
+            Some("shield")
+        );
+        assert_eq!(cfg.camera_groups["perimeter"].order, 1);
+        assert_eq!(cfg.camera_groups["warehouse"].icon, None);
+        assert_eq!(cfg.camera_groups["warehouse"].order, 2);
+
+        assert_eq!(cfg.cameras["gate_north"].ui.order, 10);
+        assert!(cfg.cameras["gate_north"].ui.dashboard);
+        assert_eq!(cfg.cameras["dock_01"].ui.order, 20);
+        assert!(!cfg.cameras["dock_01"].ui.dashboard);
+        // Default CameraUiConfig when omitted in YAML
+        assert_eq!(cfg.cameras["default_ui_cam"].ui.order, 0);
+        assert!(cfg.cameras["default_ui_cam"].ui.dashboard);
+
+        let api_val = cfg.to_api_value();
+        assert_eq!(
+            api_val["camera_groups"]["perimeter"]["cameras"],
+            json!(["gate_north", "gate_south"])
+        );
+        assert_eq!(api_val["camera_groups"]["perimeter"]["icon"], "shield");
+        assert_eq!(api_val["camera_groups"]["perimeter"]["order"], 1);
+        assert_eq!(api_val["cameras"]["gate_north"]["ui"]["order"], 10);
+        assert_eq!(api_val["cameras"]["gate_north"]["ui"]["dashboard"], true);
+        assert_eq!(api_val["cameras"]["dock_01"]["ui"]["order"], 20);
+        assert_eq!(api_val["cameras"]["dock_01"]["ui"]["dashboard"], false);
+
+        // Apply structured JSON update modifying camera_groups and camera.ui
+        let patch = json!({
+            "camera_groups": {
+                "perimeter": {
+                    "cameras": ["gate_north", "gate_south", "dock_01"],
+                    "icon": "lock",
+                    "order": 1
+                },
+                "interior": {
+                    "cameras": ["default_ui_cam"],
+                    "order": 3
+                }
+            },
+            "cameras": {
+                "gate_north": {
+                    "enabled": true,
+                    "ui": { "order": 1, "dashboard": true }
+                },
+                "dock_01": {
+                    "enabled": true,
+                    "ui": { "order": 2, "dashboard": true }
+                }
+            }
+        });
+        cfg.apply_structured_json(&patch).unwrap();
+        assert_eq!(cfg.camera_groups.len(), 2);
+        assert_eq!(cfg.camera_groups["perimeter"].cameras.len(), 3);
+        assert_eq!(cfg.camera_groups["perimeter"].icon.as_deref(), Some("lock"));
+        assert_eq!(cfg.camera_groups["interior"].order, 3);
+        assert_eq!(cfg.cameras["gate_north"].ui.order, 1);
+        assert!(cfg.cameras["dock_01"].ui.dashboard);
+
+        let roundtripped =
+            NinjaConfig::from_yaml_str(&cfg.raw_yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(roundtripped.camera_groups, cfg.camera_groups);
+        assert_eq!(
+            roundtripped.cameras["gate_north"].ui,
+            cfg.cameras["gate_north"].ui
         );
     }
 }

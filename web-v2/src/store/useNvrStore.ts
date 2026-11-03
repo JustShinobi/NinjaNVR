@@ -8,12 +8,14 @@ import {
   FirstWeekday,
   HudPosition,
   LiveLayoutMode,
+  MatrixDensity,
   SpotlightFilter,
   WorkspaceTab,
   resolveInitialBool,
   resolveInitialFirstWeekday,
   resolveInitialHudPosition,
   resolveInitialLiveLayout,
+  resolveInitialMatrixDensity,
   resolveInitialPlaybackSpeed,
   resolveInitialTab,
 } from "../utils/format";
@@ -21,6 +23,12 @@ import {
 interface NvrRealtimeState {
   activeTab: WorkspaceTab;
   liveLayout: LiveLayoutMode;
+  activeCameraGroup: string;
+  matrixDensity: MatrixDensity;
+  matrixPage: number;
+  matrixTourEnabled: boolean;
+  matrixTourIntervalSec: number;
+  syncQuadCameras: string[];
   spotlightFilter: SpotlightFilter;
   spotlightHoldSec: number;
   securityProfile: "armed" | "home" | "disarmed";
@@ -42,6 +50,14 @@ interface NvrRealtimeState {
 
   setActiveTab: (tab: WorkspaceTab) => void;
   setLiveLayout: (layout: LiveLayoutMode) => void;
+  setActiveCameraGroup: (group: string) => void;
+  setMatrixDensity: (density: MatrixDensity) => void;
+  setMatrixPage: (pageOrFn: number | ((prev: number) => number)) => void;
+  setMatrixTourEnabled: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
+  setMatrixTourIntervalSec: (sec: number) => void;
+  setSyncQuadCameras: (
+    camsOrFn: string[] | ((prev: string[]) => string[])
+  ) => void;
   setSpotlightFilter: (filter: SpotlightFilter) => void;
   setSpotlightHoldSec: (sec: number) => void;
   setSecurityProfile: (profile: "armed" | "home" | "disarmed") => void;
@@ -66,6 +82,12 @@ interface NvrRealtimeState {
 export const useNvrStore = create<NvrRealtimeState>((set) => ({
   activeTab: resolveInitialTab(),
   liveLayout: resolveInitialLiveLayout(),
+  activeCameraGroup: "all",
+  matrixDensity: resolveInitialMatrixDensity(),
+  matrixPage: 0,
+  matrixTourEnabled: false,
+  matrixTourIntervalSec: 15,
+  syncQuadCameras: [],
   spotlightFilter: "all_activity",
   spotlightHoldSec: 15,
   securityProfile: "armed",
@@ -92,6 +114,33 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
     }
     set({ liveLayout });
   },
+  setActiveCameraGroup: (activeCameraGroup) =>
+    set({ activeCameraGroup, matrixPage: 0 }),
+  setMatrixDensity: (matrixDensity) => {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem("ninjanvr_matrix_density", matrixDensity);
+    }
+    set({ matrixDensity, matrixPage: 0 });
+  },
+  setMatrixPage: (pageOrFn) =>
+    set((s) => {
+      const next =
+        typeof pageOrFn === "function" ? pageOrFn(s.matrixPage) : pageOrFn;
+      return { matrixPage: Math.max(0, next) };
+    }),
+  setMatrixTourEnabled: (fnOrVal) =>
+    set((s) => ({
+      matrixTourEnabled:
+        typeof fnOrVal === "function" ? fnOrVal(s.matrixTourEnabled) : fnOrVal,
+    })),
+  setMatrixTourIntervalSec: (matrixTourIntervalSec) =>
+    set({ matrixTourIntervalSec: Math.max(3, matrixTourIntervalSec) }),
+  setSyncQuadCameras: (camsOrFn) =>
+    set((s) => {
+      const next =
+        typeof camsOrFn === "function" ? camsOrFn(s.syncQuadCameras) : camsOrFn;
+      return { syncQuadCameras: Array.from(new Set(next)).slice(0, 4) };
+    }),
   setSpotlightFilter: (spotlightFilter) => set({ spotlightFilter }),
   setSpotlightHoldSec: (spotlightHoldSec) => set({ spotlightHoldSec }),
   setSecurityProfile: (securityProfile) => set({ securityProfile }),
@@ -156,6 +205,7 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
     if (typeof window !== "undefined") {
       [
         "ninjanvr_live_layout",
+        "ninjanvr_matrix_density",
         "ninjanvr_hud_position",
         "ninjanvr_use_main_stream",
         "ninjanvr_show_vectors",
@@ -168,6 +218,12 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
     }
     set({
       liveLayout: "2x2",
+      activeCameraGroup: "all",
+      matrixDensity: "2x2",
+      matrixPage: 0,
+      matrixTourEnabled: false,
+      matrixTourIntervalSec: 15,
+      syncQuadCameras: [],
       hudPosition: "bottom-right",
       useMainStream: false,
       showVectors: false,

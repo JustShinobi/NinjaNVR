@@ -15,6 +15,7 @@ import {
 import { useI18n } from "../i18n";
 import { FfprobeItem, NinjaConfigResponse } from "../types/nvr";
 import { buildCleanYamlFromDraft } from "../utils/configYaml";
+import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 import {
   ChannelsStreamsSection,
   ConsoleUiSection,
@@ -376,50 +377,29 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 >
                   {isPt ? "PADRÃO GLOBAL" : "GLOBAL DEFAULTS"}
                 </button>
-                {displayCams.map((cam) => {
-                  const isCamScope = scope !== "global" && inspectorCam === cam;
-                  return (
-                    <button
-                      key={cam}
-                      type="button"
-                      className={`nvr-btn mono ${isCamScope ? "active" : ""}`}
-                      style={{
-                        height: 24,
-                        padding: "0 8px",
-                        fontSize: "var(--text-xs)",
-                        textTransform: "uppercase",
-                      }}
-                      onClick={() => {
-                        setScope("camera");
-                        switchInspectorCamera(cam);
-                      }}
-                    >
-                      {cam}
-                    </button>
-                  );
-                })}
+                <TacticalCameraPicker
+                  cameras={displayCams}
+                  selectedCamera={scope === "global" ? "" : inspectorCam}
+                  onSelect={(cam) => {
+                    setScope("camera");
+                    switchInspectorCamera(cam);
+                  }}
+                  cameraGroups={draftConfig?.camera_groups}
+                  ariaLabel="Settings camera scope selector"
+                />
               </>
             )}
 
             {supportsCameraOnlyBar && (
               <>
                 <span className="nvr-divider" aria-hidden="true" />
-                {displayCams.map((cam) => (
-                  <button
-                    key={cam}
-                    type="button"
-                    className={`nvr-btn mono ${inspectorCam === cam ? "active" : ""}`}
-                    style={{
-                      height: 24,
-                      padding: "0 8px",
-                      fontSize: "var(--text-xs)",
-                      textTransform: "uppercase",
-                    }}
-                    onClick={() => switchInspectorCamera(cam)}
-                  >
-                    {cam}
-                  </button>
-                ))}
+                <TacticalCameraPicker
+                  cameras={displayCams}
+                  selectedCamera={inspectorCam}
+                  onSelect={(cam) => switchInspectorCamera(cam)}
+                  cameraGroups={draftConfig?.camera_groups}
+                  ariaLabel="Settings channel selector"
+                />
                 <a
                   href={`/api/camera-proxy/${encodeURIComponent(inspectorCam)}/`}
                   target="_blank"

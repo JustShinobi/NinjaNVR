@@ -17,6 +17,7 @@ export type WorkspaceTab =
   | "system";
 
 export type LiveLayoutMode = "2x2" | "focus" | "single" | "spotlight" | "map";
+export type MatrixDensity = "2x2" | "3x3" | "4x4";
 export type SpotlightFilter = "all_activity" | "objects" | "person" | "vehicle";
 export type FirstWeekday = "sunday" | "monday";
 
@@ -57,6 +58,15 @@ export function resolveInitialLiveLayout(): LiveLayoutMode {
     saved === "spotlight" ||
     saved === "map"
   ) {
+    return saved;
+  }
+  return "2x2";
+}
+
+export function resolveInitialMatrixDensity(): MatrixDensity {
+  if (typeof window === "undefined") return "2x2";
+  const saved = window.localStorage?.getItem("ninjanvr_matrix_density");
+  if (saved === "2x2" || saved === "3x3" || saved === "4x4") {
     return saved;
   }
   return "2x2";

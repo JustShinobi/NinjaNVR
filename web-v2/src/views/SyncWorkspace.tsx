@@ -1,10 +1,94 @@
-import React from "react";
+import React, { useMemo } from "react";
+import { Sparkles } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
 import { RecordingSegment, ReviewItem } from "../types/nvr";
 import { formatDateTime, formatTs } from "../utils/format";
 import { VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
+
+export const MAX_SYNC_QUAD_SLOTS = 4;
+
+export function resolveSyncQuadCameras(
+  cameraNames: string[],
+  syncQuadCameras: string[]
+): string[] {
+  const validSet = new Set(cameraNames);
+  const picked: string[] = [];
+  for (const cam of syncQuadCameras) {
+    if (validSet.has(cam) && !picked.includes(cam)) {
+      picked.push(cam);
+      if (picked.length >= MAX_SYNC_QUAD_SLOTS) break;
+    }
+  }
+  for (const cam of cameraNames) {
+    if (picked.length >= Math.min(MAX_SYNC_QUAD_SLOTS, cameraNames.length)) {
+      break;
+    }
+    if (!picked.includes(cam)) {
+      picked.push(cam);
+    }
+  }
+  return picked.slice(0, MAX_SYNC_QUAD_SLOTS);
+}
+
+export function assignSyncQuadSlot(
+  currentQuad: string[],
+  slotIndex: number,
+  camera: string,
+  allCameras: string[]
+): string[] {
+  const resolved = resolveSyncQuadCameras(allCameras, currentQuad);
+  if (resolved.length === 0) return [];
+  const safeSlot = Math.max(0, Math.min(slotIndex, resolved.length - 1));
+  const next = [...resolved];
+  const existingIdx = next.indexOf(camera);
+  if (existingIdx !== -1 && existingIdx !== safeSlot) {
+    next[existingIdx] = next[safeSlot];
+  }
+  next[safeSlot] = camera;
+  return next.slice(0, MAX_SYNC_QUAD_SLOTS);
+}
+
+export function autoPickActiveCamerasAtTimestamp(
+  cameraNames: string[],
+  reviews: ReviewItem[],
+  timestampSec: number,
+  windowSec: number = 60
+): string[] {
+  const scores = new Map<string, number>();
+  for (const cam of cameraNames) {
+    scores.set(cam, 0);
+  }
+  for (const rev of reviews) {
+    if (!scores.has(rev.camera)) continue;
+    const revStart = rev.start_time;
+    const revEnd = rev.end_time ?? revStart + 15;
+    if (
+      revStart <= timestampSec + windowSec &&
+      revEnd >= timestampSec - windowSec
+    ) {
+      const dist = Math.abs(revStart - timestampSec);
+      const proximityBonus = Math.max(1, windowSec - Math.min(windowSec, dist));
+      const severityWeight = rev.severity === "alert" ? 200 : 100;
+      scores.set(
+        rev.camera,
+        (scores.get(rev.camera) || 0) + severityWeight + proximityBonus
+      );
+    }
+  }
+
+  const indexMap = new Map<string, number>();
+  cameraNames.forEach((cam, idx) => indexMap.set(cam, idx));
+
+  const sorted = [...cameraNames].sort((a, b) => {
+    const scoreDiff = (scores.get(b) || 0) - (scores.get(a) || 0);
+    if (scoreDiff !== 0) return scoreDiff;
+    return (indexMap.get(a) ?? 0) - (indexMap.get(b) ?? 0);
+  });
+
+  return sorted.slice(0, MAX_SYNC_QUAD_SLOTS);
+}
 
 interface SyncWorkspaceProps {
   cameraNames: string[];
@@ -36,11 +120,18 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
   const selectedCamera = useNvrStore((s) => s.selectedCamera);
   const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
   const hudPosition = useNvrStore((s) => s.hudPosition);
+  const syncQuadCameras = useNvrStore((s) => s.syncQuadCameras);
+  const setSyncQuadCameras = useNvrStore((s) => s.setSyncQuadCameras);
+
+  const activeQuadCameras = useMemo(
+    () => resolveSyncQuadCameras(cameraNames, syncQuadCameras),
+    [cameraNames, syncQuadCameras]
+  );
 
   return (
     <>
       <div className="nvr-subbar">
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           <span className="nvr-badge rewind">{t.sync.syncLocked}</span>
           <span className="mono" style={{ fontWeight: 700, color: "var(--text-primary)" }}>
             {formatDateTime(syncMasterTs)}
@@ -56,6 +147,46 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
           </button>
           <button className="nvr-btn" onClick={() => setSyncMasterTs((ts) => ts + 30)}>
             {t.sync.jumpFwd30}
+          </button>
+          <span className="nvr-divider" aria-hidden="true" />
+          {activeQuadCameras.map((slotCam, slotIdx) => (
+            <select
+              key={`slot-${slotIdx}`}
+              className="nvr-select mono"
+              aria-label={`Sync Quad Slot ${slotIdx + 1}`}
+              style={{ height: 24, fontSize: "var(--text-xs)", padding: "0 6px" }}
+              value={slotCam}
+              onChange={(e) =>
+                setSyncQuadCameras(
+                  assignSyncQuadSlot(
+                    activeQuadCameras,
+                    slotIdx,
+                    e.target.value,
+                    cameraNames
+                  )
+                )
+              }
+            >
+              {cameraNames.map((c) => (
+                <option key={c} value={c}>
+                  S{slotIdx + 1}: {c.toUpperCase()}
+                </option>
+              ))}
+            </select>
+          ))}
+          <button
+            type="button"
+            className="nvr-btn mono"
+            style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+            onClick={() =>
+              setSyncQuadCameras(
+                autoPickActiveCamerasAtTimestamp(cameraNames, reviews, syncMasterTs)
+              )
+            }
+            title="Automatically select the 4 cameras with active alerts or detections near the current timestamp"
+          >
+            <Sparkles size={11} />
+            Auto-Pick 4 Active @ Timestamp
           </button>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -141,8 +272,8 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
         </div>
 
         <div className="nvr-matrix-2x2">
-          {cameraNames.map((cam) => (
-            <div key={cam} className="nvr-cam-tile">
+          {activeQuadCameras.map((cam, slotIdx) => (
+            <div key={`${cam}-${slotIdx}`} className="nvr-cam-tile">
               <VodHlsPlayer
                 camera={cam}
                 startTime={syncMasterTs}
@@ -152,7 +283,7 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
               />
               <div className={`nvr-cam-hud pos-${hudPosition}`}>
                 <span className="nvr-badge rewind">
-                  {cam.toUpperCase()} // SYNC @ {formatTs(syncMasterTs)}
+                  S{slotIdx + 1} · {cam.toUpperCase()} // SYNC @ {formatTs(syncMasterTs)}
                 </span>
                 <button
                   className="nvr-btn nvr-tile-action"

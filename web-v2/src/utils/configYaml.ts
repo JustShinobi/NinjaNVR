@@ -262,6 +262,15 @@ export function buildCleanYamlFromDraft(
       zones: cam.zones || {},
       lines: cam.lines || {},
       privacy_mask: cam.privacy_mask || [],
+      ...(cam.ui &&
+      (cam.ui.order !== undefined || cam.ui.dashboard !== undefined)
+        ? {
+            ui: {
+              order: cam.ui.order ?? 0,
+              dashboard: cam.ui.dashboard ?? true,
+            },
+          }
+        : {}),
     };
   }
 
@@ -353,6 +362,9 @@ export function buildCleanYamlFromDraft(
     go2rtc: {
       streams: streamsOut,
     },
+    ...(draft.camera_groups && Object.keys(draft.camera_groups).length > 0
+      ? { camera_groups: draft.camera_groups }
+      : {}),
     cameras: camerasOut,
     version: draft.version || "0.18-0",
   };
