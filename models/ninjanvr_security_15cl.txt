@@ -1,0 +1,15 @@
+person
+face
+car
+motorcycle
+bicycle
+truck
+bus
+license_plate
+dog
+cat
+bird
+package
+waste_bin
+backpack
+umbrella

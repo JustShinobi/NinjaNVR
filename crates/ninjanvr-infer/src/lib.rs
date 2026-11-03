@@ -3969,4 +3969,131 @@ version: 0.18-0
                 .is_none()
         );
     }
+
+    #[test]
+    fn loads_canonical_15_class_security_labelmap_and_decodes_all_15_classes() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        let labelmap_path = repo_root.join("models/ninjanvr_security_15cl.txt");
+        let taxonomy_path = repo_root.join("scripts/ai/taxonomy.json");
+
+        assert!(
+            labelmap_path.exists(),
+            "models/ninjanvr_security_15cl.txt must exist"
+        );
+        assert!(
+            taxonomy_path.exists(),
+            "scripts/ai/taxonomy.json must exist"
+        );
+
+        let taxonomy_raw = std::fs::read_to_string(&taxonomy_path).unwrap();
+        assert!(taxonomy_raw.contains("\"num_classes\": 15"));
+        let classes_section = taxonomy_raw
+            .split("\"classes\": [")
+            .nth(1)
+            .and_then(|s| s.split(']').next())
+            .expect("taxonomy.json must contain classes array");
+        let tax_classes: Vec<String> = classes_section
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim().trim_end_matches(',');
+                if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+                    Some(trimmed[1..trimmed.len() - 1].to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(tax_classes.len(), 15);
+
+        let expected_15 = [
+            "person",
+            "face",
+            "car",
+            "motorcycle",
+            "bicycle",
+            "truck",
+            "bus",
+            "license_plate",
+            "dog",
+            "cat",
+            "bird",
+            "package",
+            "waste_bin",
+            "backpack",
+            "umbrella",
+        ];
+
+        let mut cfg = NinjaConfig::from_yaml_str(
+            "version: 0.18-0\n",
+            PathBuf::from("/tmp/ninjanvr_15cl_test.yml"),
+        )
+        .unwrap();
+        cfg.model.labelmap_path = labelmap_path.to_string_lossy().to_string();
+        cfg.model.model_type = "yolo-generic".to_string();
+        cfg.model.width = 320;
+        cfg.model.height = 320;
+        cfg.model.input_tensor = "nchw".to_string();
+        cfg.model.input_pixel_format = "rgb".to_string();
+
+        let loaded_labelmap = cfg.load_labelmap();
+        assert_eq!(loaded_labelmap.len(), 15);
+        for (idx, &expected_label) in expected_15.iter().enumerate() {
+            let key = idx.to_string();
+            assert_eq!(
+                loaded_labelmap.get(&key).map(String::as_str),
+                Some(expected_label),
+                "labelmap index {idx} must match canonical class '{expected_label}'"
+            );
+            assert_eq!(
+                tax_classes[idx].as_str(),
+                expected_label,
+                "taxonomy.json classes[{idx}] must match '{expected_label}'"
+            );
+            assert!(
+                taxonomy_raw.contains(&format!("\"{key}\": \"{expected_label}\"")),
+                "taxonomy.json id_to_name must map {key} -> {expected_label}"
+            );
+            assert!(
+                taxonomy_raw.contains(&format!("\"{expected_label}\": {idx}")),
+                "taxonomy.json name_to_id must map {expected_label} -> {idx}"
+            );
+        }
+
+        let engine = AiDetectorEngine::new(&cfg);
+        let region = BoundingBox::new(0, 0, 1280, 720);
+        let num_anchors = 2100usize;
+        assert_eq!(expected_yolo_anchors(320, 320), num_anchors);
+
+        // Synthetic [1, 19, 2100] transposed YOLO output tensor with 1 detection per class (0..14)
+        let mut tensor = vec![0.0f32; 19 * num_anchors];
+        for cls_idx in 0..15usize {
+            let anchor = cls_idx * 20;
+            let col = (cls_idx % 5) as f32;
+            let row = (cls_idx / 5) as f32;
+            let cx = 40.0 + col * 60.0;
+            let cy = 50.0 + row * 90.0;
+            let score = 0.96 - (cls_idx as f32) * 0.01;
+
+            tensor[anchor] = cx;
+            tensor[num_anchors + anchor] = cy;
+            tensor[2 * num_anchors + anchor] = 28.0;
+            tensor[3 * num_anchors + anchor] = 36.0;
+            tensor[(4 + cls_idx) * num_anchors + anchor] = score;
+        }
+
+        let dets = engine.parse_raw_output_slice(&tensor, region, 1280, 720, 0.50);
+        assert_eq!(
+            dets.len(),
+            15,
+            "all 15 canonical security classes must be decoded from [1, 19, 2100] tensor"
+        );
+        for (cls_idx, &expected_label) in expected_15.iter().enumerate() {
+            assert_eq!(dets[cls_idx].label, expected_label);
+            let expected_score = 0.96 - (cls_idx as f32) * 0.01;
+            assert!((dets[cls_idx].score - expected_score).abs() < 1e-4);
+        }
+    }
 }

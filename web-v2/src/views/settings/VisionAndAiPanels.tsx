@@ -28,6 +28,7 @@ import {
   FalsePositiveSignatureItem,
   GenAiConfig,
   LprConfig,
+  ModelConfig,
   ModelUploadPayload,
   NinjaConfigResponse,
   ObjectFilterConfig,
@@ -195,6 +196,54 @@ export function buildModelUploadPayload(params: {
     input_pixel_format: params.inputPixelFormat || "rgb",
     activate: true,
   };
+}
+
+export const NINJANVR_SECURITY_15CL_LABELMAP_PATH =
+  "/openvino-model/ninjanvr_security_15cl.txt";
+
+export const COLAB_MODEL_FACTORY_URL =
+  "https://colab.research.google.com/github/JustShinobi/NinjaNVR/blob/dev/notebooks/NinjaNVR_Model_Factory.ipynb";
+
+export function applySecurity15ClassPreset(
+  currentModel?: Partial<ModelConfig> | null
+): ModelConfig {
+  const prevWidth = Number(currentModel?.width || 640);
+  const prevHeight = Number(currentModel?.height || 640);
+  const resolvedDim = prevWidth === 320 || prevWidth === 640 ? prevWidth : 640;
+  const resolvedH = prevHeight === 320 || prevHeight === 640 ? prevHeight : resolvedDim;
+  const prevPath = (currentModel?.path || "").trim();
+  const nextPath =
+    !prevPath || prevPath.includes("ssdlite_mobilenet_v2")
+      ? "/config/models/ninjanvr_security_15cl.onnx"
+      : prevPath;
+  return {
+    path: nextPath,
+    labelmap_path: NINJANVR_SECURITY_15CL_LABELMAP_PATH,
+    width: resolvedDim,
+    height: resolvedH,
+    input_tensor: "nchw",
+    input_pixel_format: "rgb",
+    model_type: "yolo-generic",
+  };
+}
+
+export function buildLocalFinetuneCliCommand(params?: {
+  nvrUrl?: string;
+  datasetPath?: string;
+  modelArch?: string;
+  imgsz?: number;
+  epochs?: number;
+  freeze?: number;
+  nvrToken?: string;
+}): string {
+  const dataset = (params?.datasetPath || "ninjanvr-dataset.zip").trim();
+  const modelArch = (params?.modelArch || "yolo11s.pt").trim();
+  const imgsz = params?.imgsz === 320 ? 320 : 640;
+  const epochs = Math.max(1, Math.trunc(Number(params?.epochs ?? 30)));
+  const freeze = Math.max(0, Math.trunc(Number(params?.freeze ?? 10)));
+  const rawUrl = (params?.nvrUrl || "http://localhost:5000").trim().replace(/\/+$/, "");
+  const token = (params?.nvrToken || "$NINJANVR_API_TOKEN").trim();
+  return `python3 scripts/ai/train_ninjanvr_model.py --mode finetune --dataset ${dataset} --model ${modelArch} --imgsz ${imgsz} --epochs ${epochs} --freeze ${freeze} --nvr-url ${rawUrl} --nvr-token ${token}`;
 }
 
 export function formatDhash64Hex(dhash?: number | null): string {
@@ -4703,6 +4752,164 @@ export const AiDetectionObjectsSection: React.FC<{
               )}
             </div>
           )}
+        </div>
+      </div>
+
+      {/* NinjaNVR Model Factory (Colab G4 / Local RTX Fine-Tuning) Card */}
+      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="nvr-cfg-card-header">
+          <span>
+            {isPt
+              ? "FÁBRICA DE MODELOS NINJANVR (COLAB G4 / FINE-TUNING LOCAL RTX)"
+              : "NinjaNVR Model Factory (Colab G4 / Local RTX Fine-Tuning)"}
+          </span>
+          <span className="nvr-badge live">
+            15-CLASS SECURITY · FREEZE=10 · ONNX / OPENVINO FP16
+          </span>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 8,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <span
+                className="mono"
+                style={{
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 700,
+                  color: "var(--signal-accent-text)",
+                }}
+              >
+                {isPt
+                  ? "PRESET DE 15 CLASSES DE SEGURANÇA & TRANSFER LEARNING (FREEZE=10)"
+                  : "15-CLASS SECURITY TAXONOMY PRESET & FROZEN-BACKBONE TRANSFER LEARNING"}
+              </span>
+              <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                {isPt
+                  ? `Labelmap atual: ${modelCfg.labelmap_path} (${modelCfg.model_type})`
+                  : `Active labelmap: ${modelCfg.labelmap_path} (${modelCfg.model_type})`}
+              </span>
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <button
+                type="button"
+                className={`nvr-btn mono ${
+                  modelCfg.labelmap_path === NINJANVR_SECURITY_15CL_LABELMAP_PATH &&
+                  modelCfg.model_type === "yolo-generic"
+                    ? "active"
+                    : "primary"
+                }`}
+                style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                onClick={() => {
+                  updateDraft((next) => {
+                    next.model = applySecurity15ClassPreset(next.model);
+                  });
+                  notify(
+                    "Applied 15-Class Security Labelmap Preset (/openvino-model/ninjanvr_security_15cl.txt · yolo-generic)"
+                  );
+                }}
+              >
+                <CheckCircle2 size={11} />
+                Apply 15-Class Security Labelmap Preset
+              </button>
+
+              <a
+                href={COLAB_MODEL_FACTORY_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="nvr-btn success mono"
+                style={{
+                  height: 26,
+                  padding: "0 10px",
+                  fontSize: "var(--text-xs)",
+                  textDecoration: "none",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 5,
+                }}
+              >
+                <Sparkles size={11} />
+                Launch Google Colab Notebook (G4 / A100 / T4)
+              </a>
+            </div>
+          </div>
+
+          <div
+            style={{
+              padding: "8px 10px",
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              display: "flex",
+              flexDirection: "column",
+              gap: 6,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 8,
+                flexWrap: "wrap",
+              }}
+            >
+              <span
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                LOCAL GPU (RTX 4070 Ti Super 16GB · ~60s) / CPU FROZEN-BACKBONE (freeze=10) CLI:
+              </span>
+              <button
+                type="button"
+                className="nvr-btn mono"
+                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                onClick={() => {
+                  const origin =
+                    typeof window !== "undefined" && window.location?.origin
+                      ? window.location.origin
+                      : "http://localhost:5000";
+                  const cmd = buildLocalFinetuneCliCommand({
+                    nvrUrl: origin,
+                    imgsz: modelCfg.width === 320 ? 320 : 640,
+                  });
+                  navigator.clipboard?.writeText(cmd);
+                  notify("Copied local RTX / CPU fine-tuning CLI command to clipboard");
+                }}
+              >
+                <Copy size={11} />
+                Copy CLI Command
+              </button>
+            </div>
+            <code
+              className="mono"
+              style={{
+                display: "block",
+                padding: "6px 8px",
+                background: "var(--bg-deep)",
+                border: "1px solid var(--border-hairline)",
+                borderRadius: 2,
+                fontSize: "var(--text-xs)",
+                color: "var(--signal-live-text)",
+                wordBreak: "break-all",
+              }}
+            >
+              {buildLocalFinetuneCliCommand({
+                nvrUrl:
+                  typeof window !== "undefined" && window.location?.origin
+                    ? window.location.origin
+                    : "http://localhost:5000",
+                imgsz: modelCfg.width === 320 ? 320 : 640,
+              })}
+            </code>
+          </div>
         </div>
       </div>
 
