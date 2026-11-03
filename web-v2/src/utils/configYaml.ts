@@ -582,11 +582,17 @@ export function buildCleanYamlFromDraft(
     ...(draft.ui &&
     (draft.ui.floorplan ||
       draft.ui.time_format !== undefined ||
-      draft.ui.unit_system !== undefined)
+      draft.ui.unit_system !== undefined ||
+      draft.ui.theme !== undefined ||
+      draft.ui.high_contrast !== undefined)
       ? {
           ui: {
             ...(draft.ui.time_format ? { time_format: draft.ui.time_format } : {}),
             ...(draft.ui.unit_system ? { unit_system: draft.ui.unit_system } : {}),
+            ...(draft.ui.theme ? { theme: draft.ui.theme } : {}),
+            ...(draft.ui.high_contrast !== undefined
+              ? { high_contrast: Boolean(draft.ui.high_contrast) }
+              : {}),
             ...(draft.ui.floorplan
               ? {
                   floorplan: {

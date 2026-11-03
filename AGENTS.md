@@ -19,7 +19,11 @@
 - `web-v2/`: NinjaNVR Console (`v2`) React 19 + TypeScript + Vite SPA.
 
 ## UI v2 (`web-v2/`) Design & Engineering Guardrails
-- **Tactical Dark Surface:** Low-luminance dark palette (`color-scheme: dark`) defined via CSS custom properties in `web-v2/src/styles.css` (`--bg-deep`, `--bg-canvas`, `--bg-panel`, `--border-hairline`). Maintain WCAG AA contrast (`>= 4.5:1`) and never use font sizes below `11px` (`--text-xs`).
+- **Dual-Theme Hardware-Safe Surface Engine (`dark` | `light` | `system` + `high-contrast`):**
+  - **Tactical Dark Surface (`:root`, `color-scheme: dark`):** Anchored above the HDMI Limited-Range (`16–235`) black-crush floor (`--bg-canvas: #111722`, `--bg-panel: #192231`, `--bg-card-header: #212c3f`, `--bg-subcard: #141c29`, `--bg-input: #0d131d`).
+  - **Daylight / Light Surface (`[data-theme="light"]`, `color-scheme: light`):** Anchored safely below the `RGB 235` highlight-clipping ceiling (`--bg-deep: #cdd6e4`, `--bg-canvas: #dce3ee`, `--bg-card-header: #e4eaf4`, `--bg-subcard: #eaeff7`, `--bg-panel: #f5f7fb`, `--bg-input: #ffffff`) with high-contrast slate borders (`--border-card: #8fa0ba`, `--border-input: #5b6b82`) and WCAG AA tactical ink accents (`--signal-*-text`).
+  - **High-Contrast Monitor Boost (`[data-high-contrast="true"]`):** Strengthens structural borders (`+15%`), promotes `--text-muted` to `--text-secondary` luminance (`>= 7:1` WCAG AAA), and applies `1.5px` border weight to `.nvr-cfg-card`, `.nvr-subcard`, `.nvr-input`, and `.nvr-select`.
+  - **Dark Cinema Video Stage (`--video-stage-bg`):** Always keep `.nvr-cam-tile` video letterboxes and HUD overlays anchored to `--video-stage-bg` in both themes so camera corner OSD timestamps and video feeds are never washed out. Maintain WCAG AA contrast (`>= 4.5:1`) and never use font sizes below `11px` (`--text-xs`).
 - **Typography:** System sans-serif stack (`--font-sans`) for UI labels; locally bundled `JetBrains Mono` (`--font-mono`, `font-variant-numeric: tabular-nums`) in `web-v2/src/fonts/` for timestamps, FPS, telemetry metrics, polygon coordinates, YAML, and logs.
 - **Video Aspect Integrity:** Always keep `object-fit: contain` on live and VOD video elements so camera corner OSD timestamps are never cropped.
 - **Zero-Decoder-Bloat:** Timeline and review MP4 previews must mount only on pointer hover and unmount immediately on pointer leave.

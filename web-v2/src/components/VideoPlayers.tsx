@@ -4,7 +4,8 @@ import { Camera, ChevronLeft, ChevronRight, Mic, MicOff } from "lucide-react";
 import { useI18n } from "../i18n";
 import { CameraConfig } from "../types/nvr";
 import { useNvrStore } from "../store/useNvrStore";
-import { formatRelTime, formatTs } from "../utils/format";
+import { formatRelTime, formatTs, resolveEffectiveTheme } from "../utils/format";
+import { resolveCanvasThemePalette } from "../utils/themeTokens";
 
 export interface PushToTalkTrackLike {
   stop: () => void;
@@ -1042,7 +1043,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         alignItems: "center",
         justifyContent: "center",
         overflow: "hidden",
-        background: "#040507",
+        background: "var(--video-stage-bg)",
         cursor: onPlotPoint ? "crosshair" : onClick ? "pointer" : "default",
       }}
       onClick={
@@ -1559,7 +1560,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
             height: "100%",
             objectFit: "contain",
             transform: vodRotateTransform,
-            background: "#000",
+            background: "var(--video-stage-bg)",
           }}
         />
       </ZoomableVideoStage>
@@ -1593,7 +1594,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           height: "100%",
           objectFit: "contain",
           transform: vodRotateTransform,
-          background: "#000",
+          background: "var(--video-stage-bg)",
         }}
       />
     </ZoomableVideoStage>
@@ -1618,6 +1619,9 @@ export const CanvasSparkline: React.FC<CanvasSparklineProps> = ({
   height = 68,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const themeMode = useNvrStore((s) => s.themeMode);
+  const highContrast = useNvrStore((s) => s.highContrast);
+  const effectiveTheme = resolveEffectiveTheme(themeMode);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -1625,6 +1629,7 @@ export const CanvasSparkline: React.FC<CanvasSparklineProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    const palette = resolveCanvasThemePalette(effectiveTheme);
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth || 300;
     const h = height;
@@ -1634,7 +1639,7 @@ export const CanvasSparkline: React.FC<CanvasSparklineProps> = ({
 
     ctx.clearRect(0, 0, w, h);
 
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
+    ctx.strokeStyle = palette.sparklineGridStroke;
     ctx.lineWidth = 1;
     for (const frac of [0.25, 0.5, 0.75]) {
       const y = Math.round(h * frac) + 0.5;
@@ -1663,7 +1668,7 @@ export const CanvasSparkline: React.FC<CanvasSparklineProps> = ({
     ctx.closePath();
     ctx.fillStyle = `${color}22`;
     ctx.fill();
-  }, [values, color, maxVal, height]);
+  }, [values, color, maxVal, height, effectiveTheme, highContrast]);
 
   return (
     <canvas

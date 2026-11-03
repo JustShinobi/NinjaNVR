@@ -15,7 +15,14 @@ import {
   ReviewItem,
   StateRoiConfig,
 } from "../types/nvr";
-import { HudPosition, MatrixDensity, SpotlightFilter, formatTs } from "../utils/format";
+import {
+  HudPosition,
+  MatrixDensity,
+  SpotlightFilter,
+  formatTs,
+  resolveEffectiveTheme,
+} from "../utils/format";
+import { resolveCanvasThemePalette } from "../utils/themeTokens";
 import { LiveMsePlayer, PushToTalkButton, VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
@@ -595,6 +602,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const timeShiftTs = useNvrStore((s) => s.timeShiftTs);
   const setTimeShiftTs = useNvrStore((s) => s.setTimeShiftTs);
   const playbackSpeed = useNvrStore((s) => s.playbackSpeed);
+  const themeMode = useNvrStore((s) => s.themeMode);
+  const highContrast = useNvrStore((s) => s.highContrast);
+  const effectiveTheme = resolveEffectiveTheme(themeMode);
+  const mapTheme = useMemo(
+    () => resolveCanvasThemePalette(effectiveTheme),
+    [effectiveTheme, highContrast]
+  );
   const config = useNvrStore((s) => s.config);
   const setConfig = useNvrStore((s) => s.setConfig);
   const stats = useNvrStore((s) => s.stats);
@@ -2073,8 +2087,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     : mapEditMode && (mapTool === "draw_room" || mapTool === "draw_wall")
                     ? "crosshair"
                     : "default",
-                background:
-                  "radial-gradient(circle at 50% 50%, rgba(14, 165, 233, 0.06), rgba(7, 10, 15, 0.98))",
+                background: mapTheme.floorplanStageBg,
               }}
               onPointerDown={(e) => {
                 if (!mapEditMode || !mapSvgRef.current) return;
@@ -2252,7 +2265,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   <path
                     d="M 50 0 L 0 0 0 50"
                     fill="none"
-                    stroke="rgba(148, 163, 184, 0.12)"
+                    stroke={mapTheme.floorplanGridStroke}
                     strokeWidth="1"
                   />
                 </pattern>
@@ -2275,7 +2288,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 width="880"
                 height="510"
                 fill="none"
-                stroke="rgba(56, 189, 248, 0.25)"
+                stroke={mapTheme.floorplanBorderStroke}
                 strokeWidth="1.5"
                 strokeDasharray="6 4"
               />
@@ -2307,8 +2320,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       height={rh}
                       fill={
                         isRoomSelected
-                          ? "rgba(56, 189, 248, 0.18)"
-                          : "rgba(15, 23, 42, 0.55)"
+                          ? mapTheme.floorplanRoomSelectedFill
+                          : mapTheme.floorplanRoomFill
                       }
                       fillOpacity={floorplanOpacity}
                       stroke={strokeCol}
@@ -2319,7 +2332,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       x={rx + rw / 2}
                       y={ry + rh / 2 + 4}
                       textAnchor="middle"
-                      fill="#e2e8f0"
+                      fill={mapTheme.floorplanRoomLabelFill}
                       fontSize="12"
                       fontFamily="JetBrains Mono, monospace"
                       fontWeight="700"
@@ -2366,7 +2379,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                             width={10}
                             height={10}
                             fill="#38bdf8"
-                            stroke="#070a0f"
+                            stroke={mapTheme.floorplanCamNodeStroke}
                             strokeWidth={1.5}
                             style={{ cursor: "nwse-resize" }}
                             onPointerDown={(e) => {
@@ -2420,7 +2433,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       y1={y1 * 600}
                       x2={x2 * 1000}
                       y2={y2 * 600}
-                      stroke="#94a3b8"
+                      stroke={mapTheme.floorplanWallStroke}
                       strokeWidth="4"
                       strokeLinecap="round"
                       style={{ cursor: mapEditMode ? "pointer" : "default" }}
@@ -2442,13 +2455,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       cx={x1 * 1000}
                       cy={y1 * 600}
                       r={3.5}
-                      fill="#cbd5e1"
+                      fill={mapTheme.floorplanWallNodeFill}
                     />
                     <circle
                       cx={x2 * 1000}
                       cy={y2 * 600}
                       r={3.5}
-                      fill="#cbd5e1"
+                      fill={mapTheme.floorplanWallNodeFill}
                     />
                   </g>
                 );
@@ -2572,13 +2585,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       cy={cy}
                       r={isSelected ? 9 : 7}
                       fill={hasObjects ? "#ef4444" : hasMotion ? "#f59e0b" : "#0ea5e9"}
-                      stroke="#070a0f"
+                      stroke={mapTheme.floorplanCamNodeStroke}
                       strokeWidth="2"
                     />
                     <text
                       x={cx + 12}
                       y={cy + 4}
-                      fill="#f8fafc"
+                      fill={mapTheme.floorplanCamLabelFill}
                       fontSize="12"
                       fontFamily="JetBrains Mono, monospace"
                       fontWeight="700"
@@ -2590,7 +2603,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         key={`${obj.id}-${oIdx}`}
                         x={cx + 12}
                         y={cy + 19 + oIdx * 14}
-                        fill="#fca5a5"
+                        fill={mapTheme.floorplanObjectLabelFill}
                         fontSize="11"
                         fontFamily="JetBrains Mono, monospace"
                       >
@@ -2759,7 +2772,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       gap: 6,
                       padding: "4px 6px",
                       border: `1px solid ${
-                        isSel ? "var(--accent-primary)" : "var(--border-hairline)"
+                        isSel ? "var(--signal-accent)" : "var(--border-hairline)"
                       }`,
                       background: "var(--bg-deep)",
                     }}

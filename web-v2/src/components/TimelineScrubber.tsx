@@ -17,7 +17,9 @@ import {
 } from "../types/nvr";
 import { RecordingCalendarPopover } from "./RecordingCalendarPopover";
 import { TacticalCameraPicker } from "./TacticalCameraPicker";
-import { formatDuration } from "../utils/format";
+import { formatDuration, resolveEffectiveTheme } from "../utils/format";
+import { resolveCanvasThemePalette } from "../utils/themeTokens";
+import { useNvrStore } from "../store/useNvrStore";
 
 export type TimelineZoomMinutes = 5 | 15 | 60 | 360 | 1440;
 
@@ -110,6 +112,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 }) => {
   const trackRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const themeMode = useNvrStore((s) => s.themeMode);
+  const highContrast = useNvrStore((s) => s.highContrast);
+  const effectiveTheme = resolveEffectiveTheme(themeMode);
   const [trackWidth, setTrackWidth] = useState<number>(800);
   const [zoomMin, setZoomMin] = useState<TimelineZoomMinutes>(60);
   const [nowSec, setNowSec] = useState<number>(() => Math.floor(Date.now() / 1000));
@@ -804,6 +809,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    const palette = resolveCanvasThemePalette(effectiveTheme);
     const w = Math.max(100, trackWidth);
     const h = 36;
     const dpr = window.devicePixelRatio || 1;
@@ -813,7 +819,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     ctx.clearRect(0, 0, w, h);
 
     // 1. Vertical tick grid lines
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.06)";
+    ctx.strokeStyle = palette.gridLineStroke;
     ctx.lineWidth = 1;
     for (const tk of ticks) {
       const x = Math.round((tk.pct / 100) * w) + 0.5;
@@ -830,7 +836,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       const segW = Math.max(1.5, (seg.duration / windowSpanSec) * w);
 
       // Continuous recording base lane (bottom 5px)
-      ctx.fillStyle = "rgba(16, 185, 129, 0.42)";
+      ctx.fillStyle = palette.continuousBarFill;
       ctx.fillRect(x0, h - 5, segW, 5);
 
       // Acoustic activity layer (cyan/emerald waveform bar when segment has non-zero dBFS above ambient noise floor)
@@ -841,16 +847,16 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             : Math.max(0, Math.min(1, seg.dbfs / 100));
         if (normAudio > 0.05) {
           const audioH = Math.max(4, Math.round(normAudio * 14));
-          ctx.fillStyle = "rgba(6, 182, 212, 0.78)";
+          ctx.fillStyle = palette.audioWaveformFill;
           ctx.fillRect(x0, h - 5 - audioH, segW, audioH);
         }
       }
 
       if (seg.objects > 0) {
-        ctx.fillStyle = "rgba(239, 68, 68, 0.72)";
+        ctx.fillStyle = palette.objectBarFill;
         ctx.fillRect(x0, h - 23, segW, 18);
       } else if (seg.motion > 0) {
-        ctx.fillStyle = "rgba(245, 158, 11, 0.48)";
+        ctx.fillStyle = palette.motionBarFill;
         ctx.fillRect(x0, h - 15, segW, 10);
       }
     }
@@ -861,13 +867,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       const gx0 = Math.max(0, Math.min(w, ((gap.start_time - winStart) / windowSpanSec) * w));
       const gx1 = Math.max(0, Math.min(w, ((gap.end_time - winStart) / windowSpanSec) * w));
       const gw = Math.max(2, gx1 - gx0);
-      ctx.fillStyle = "rgba(239, 68, 68, 0.22)";
+      ctx.fillStyle = palette.gapFill;
       ctx.fillRect(gx0, h - 9, gw, 9);
       ctx.save();
       ctx.beginPath();
       ctx.rect(gx0, h - 9, gw, 9);
       ctx.clip();
-      ctx.strokeStyle = "rgba(245, 158, 11, 0.65)";
+      ctx.strokeStyle = palette.gapHatchStroke;
       ctx.lineWidth = 1;
       for (let sx = gx0 - 9; sx < gx0 + gw + 9; sx += 6) {
         ctx.beginPath();
@@ -883,10 +889,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       const x0 = Math.max(0, Math.min(w, ((rev.start_time - winStart) / windowSpanSec) * w));
       const dur = Math.max(15, (rev.end_time || rev.start_time + 15) - rev.start_time);
       const revW = Math.max(3, (dur / windowSpanSec) * w);
-      ctx.fillStyle = rev.severity === "alert" ? "#ef4444" : "#f59e0b";
+      ctx.fillStyle =
+        rev.severity === "alert" ? palette.alertPinFill : palette.motionPinFill;
       ctx.fillRect(x0, 4, revW, 6);
     }
   }, [
+    effectiveTheme,
+    highContrast,
     trackWidth,
     ticks,
     windowSegments,
@@ -1105,7 +1114,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                         ? "1px solid rgba(239, 68, 68, 0.55)"
                         : hasRecording
                         ? "1px solid rgba(16, 185, 129, 0.35)"
-                        : "1px solid rgba(255, 255, 255, 0.05)",
+                        : "1px solid var(--border-divider)",
                       background: isSelected
                         ? "rgba(14, 165, 233, 0.28)"
                         : hasEvents

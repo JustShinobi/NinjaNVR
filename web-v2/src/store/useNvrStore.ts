@@ -10,7 +10,9 @@ import {
   LiveLayoutMode,
   MatrixDensity,
   SpotlightFilter,
+  ThemeMode,
   WorkspaceTab,
+  applyThemeToDocument,
   resolveInitialBool,
   resolveInitialFirstWeekday,
   resolveInitialHudPosition,
@@ -18,6 +20,7 @@ import {
   resolveInitialMatrixDensity,
   resolveInitialPlaybackSpeed,
   resolveInitialTab,
+  resolveInitialThemeMode,
 } from "../utils/format";
 
 interface NvrRealtimeState {
@@ -40,6 +43,8 @@ interface NvrRealtimeState {
   audibleAlertChime: boolean;
   browserNotifications: boolean;
   firstWeekday: FirstWeekday;
+  themeMode: ThemeMode;
+  highContrast: boolean;
   timeShiftTs: number | null;
   playbackSpeed: number;
   wsOnline: boolean;
@@ -69,6 +74,8 @@ interface NvrRealtimeState {
   setAudibleAlertChime: (val: boolean) => void;
   setBrowserNotifications: (val: boolean) => void;
   setFirstWeekday: (day: FirstWeekday) => void;
+  setThemeMode: (mode: ThemeMode) => void;
+  setHighContrast: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
   setTimeShiftTs: (ts: number | null) => void;
   setPlaybackSpeed: (spd: number) => void;
   resetUiPreferences: () => void;
@@ -79,7 +86,7 @@ interface NvrRealtimeState {
   setCameraActivity: (activity: Record<string, CameraLiveActivity>) => void;
 }
 
-export const useNvrStore = create<NvrRealtimeState>((set) => ({
+export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   activeTab: resolveInitialTab(),
   liveLayout: resolveInitialLiveLayout(),
   activeCameraGroup: "all",
@@ -99,6 +106,8 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
   audibleAlertChime: resolveInitialBool("ninjanvr_audible_chime", false),
   browserNotifications: resolveInitialBool("ninjanvr_browser_notifications", false),
   firstWeekday: resolveInitialFirstWeekday(),
+  themeMode: resolveInitialThemeMode(),
+  highContrast: resolveInitialBool("ninjanvr_high_contrast", false),
   timeShiftTs: null,
   playbackSpeed: resolveInitialPlaybackSpeed(),
   wsOnline: false,
@@ -194,6 +203,23 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
     }
     set({ firstWeekday });
   },
+  setThemeMode: (themeMode) => {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem("ninjanvr_theme_mode", themeMode);
+    }
+    applyThemeToDocument(themeMode, get().highContrast);
+    set({ themeMode });
+  },
+  setHighContrast: (fnOrVal) =>
+    set((s) => {
+      const next =
+        typeof fnOrVal === "function" ? fnOrVal(s.highContrast) : fnOrVal;
+      if (typeof window !== "undefined") {
+        window.localStorage?.setItem("ninjanvr_high_contrast", String(next));
+      }
+      applyThemeToDocument(s.themeMode, next);
+      return { highContrast: next };
+    }),
   setTimeShiftTs: (timeShiftTs) => set({ timeShiftTs }),
   setPlaybackSpeed: (playbackSpeed) => {
     if (typeof window !== "undefined") {
@@ -213,9 +239,12 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
         "ninjanvr_audible_chime",
         "ninjanvr_browser_notifications",
         "ninjanvr_first_weekday",
+        "ninjanvr_theme_mode",
+        "ninjanvr_high_contrast",
         "ninjanvr_playback_speed",
       ].forEach((k) => window.localStorage?.removeItem(k));
     }
+    applyThemeToDocument("dark", false);
     set({
       liveLayout: "2x2",
       activeCameraGroup: "all",
@@ -231,11 +260,40 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
       audibleAlertChime: false,
       browserNotifications: false,
       firstWeekday: "sunday",
+      themeMode: "dark",
+      highContrast: false,
       playbackSpeed: 1,
     });
   },
   setWsOnline: (wsOnline) => set({ wsOnline }),
-  setConfig: (config) => set({ config }),
+  setConfig: (config) =>
+    set((s) => {
+      let nextThemeMode = s.themeMode;
+      let nextHighContrast = s.highContrast;
+      const hasLocalTheme =
+        typeof window !== "undefined" &&
+        window.localStorage?.getItem("ninjanvr_theme_mode") !== null;
+      const hasLocalHc =
+        typeof window !== "undefined" &&
+        window.localStorage?.getItem("ninjanvr_high_contrast") !== null;
+
+      const cfgTheme = config?.ui?.theme;
+      if (
+        !hasLocalTheme &&
+        (cfgTheme === "dark" || cfgTheme === "light" || cfgTheme === "system")
+      ) {
+        nextThemeMode = cfgTheme;
+      }
+      if (!hasLocalHc && typeof config?.ui?.high_contrast === "boolean") {
+        nextHighContrast = config.ui.high_contrast;
+      }
+      applyThemeToDocument(nextThemeMode, nextHighContrast);
+      return {
+        config,
+        themeMode: nextThemeMode,
+        highContrast: nextHighContrast,
+      };
+    }),
   setStats: (stats) => set({ stats }),
   setStatsHistory: (statsHistory) => set({ statsHistory }),
   setCameraActivity: (cameraActivity) => set({ cameraActivity }),

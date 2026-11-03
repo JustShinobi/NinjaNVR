@@ -261,9 +261,13 @@ export interface FloorplanConfig {
   walls: FloorplanWall[];
 }
 
+export type ThemeMode = "dark" | "light" | "system";
+
 export interface UiConfig {
   time_format?: string;
   unit_system?: string;
+  theme?: ThemeMode | string;
+  high_contrast?: boolean;
   floorplan?: FloorplanConfig;
 }
 

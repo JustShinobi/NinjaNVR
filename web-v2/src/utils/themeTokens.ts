@@ -1,3 +1,12 @@
+export {
+  type EffectiveTheme,
+  type ThemeMode,
+  applyThemeToDocument,
+  cycleThemeMode,
+  resolveEffectiveTheme,
+  resolveInitialThemeMode,
+} from "./format";
+
 export interface RgbColor {
   r: number;
   g: number;
@@ -33,13 +42,75 @@ export const DARK_THEME_TOKENS = {
   "--signal-accent-text": "#38bdf8",
 } as const;
 
+export const LIGHT_THEME_TOKENS = {
+  "--video-stage-bg": "#070a0f",
+  "--bg-deep": "#cdd6e4",
+  "--bg-canvas": "#dce3ee",
+  "--bg-panel": "#f5f7fb",
+  "--bg-card-header": "#e4eaf4",
+  "--bg-subcard": "#eaeff7",
+  "--bg-input": "#ffffff",
+  "--bg-elevated": "#e2e8f2",
+  "--bg-hover": "#d2dceb",
+  "--bg-active": "#c2d0e5",
+  "--border-divider": "#c5d0e0",
+  "--border-hairline": "#a8b7cc",
+  "--border-card": "#8fa0ba",
+  "--border-strong": "#64748b",
+  "--border-input": "#5b6b82",
+  "--text-primary": "#0f172a",
+  "--text-secondary": "#2d3c52",
+  "--text-muted": "#475569",
+  "--signal-live": "#059669",
+  "--signal-live-text": "#065f46",
+  "--signal-motion": "#d97706",
+  "--signal-motion-text": "#92400e",
+  "--signal-alert": "#dc2626",
+  "--signal-alert-text": "#991b1b",
+  "--signal-accent": "#0284c7",
+  "--signal-accent-text": "#075985",
+} as const;
+
+export const DARK_HIGH_CONTRAST_TOKENS = {
+  "--border-divider": "#3b4d6b",
+  "--border-hairline": "#4a6084",
+  "--border-card": "#58729c",
+  "--border-strong": "#6e8cbe",
+  "--border-input": "#7595ca",
+  "--text-primary": "#ffffff",
+  "--text-secondary": "#d0ddef",
+  "--text-muted": "#b0bfd4",
+} as const;
+
+export const LIGHT_HIGH_CONTRAST_TOKENS = {
+  "--border-divider": "#94a3b8",
+  "--border-hairline": "#7588a3",
+  "--border-card": "#5b6e8a",
+  "--border-strong": "#3e4c63",
+  "--border-input": "#334155",
+  "--text-primary": "#020617",
+  "--text-secondary": "#1e293b",
+  "--text-muted": "#2d3c52",
+} as const;
+
 export type DarkThemeTokenName = keyof typeof DARK_THEME_TOKENS;
+export type LightThemeTokenName = keyof typeof LIGHT_THEME_TOKENS;
 
 export const STRUCTURAL_SURFACE_TOKENS = [
   "--bg-canvas",
   "--bg-panel",
   "--bg-card-header",
   "--bg-elevated",
+] as const;
+
+export const LIGHT_ANTI_WHITE_CRUSH_SURFACE_TOKENS = [
+  "--bg-deep",
+  "--bg-canvas",
+  "--bg-card-header",
+  "--bg-subcard",
+  "--bg-elevated",
+  "--bg-hover",
+  "--bg-active",
 ] as const;
 
 export const CONTRAST_SURFACE_TOKENS = [
@@ -68,6 +139,18 @@ export const ADJACENT_STRUCTURAL_PAIRS: ReadonlyArray<
   ["--bg-panel", "--bg-subcard"],
   ["--bg-subcard", "--bg-input"],
   ["--bg-panel", "--border-card"],
+] as const;
+
+export const LIGHT_ADJACENT_STRUCTURAL_PAIRS: ReadonlyArray<
+  readonly [LightThemeTokenName, LightThemeTokenName]
+> = [
+  ["--bg-deep", "--bg-canvas"],
+  ["--bg-canvas", "--bg-card-header"],
+  ["--bg-card-header", "--bg-subcard"],
+  ["--bg-subcard", "--bg-input"],
+  ["--bg-panel", "--border-card"],
+  ["--bg-panel", "--border-input"],
+  ["--bg-subcard", "--border-input"],
 ] as const;
 
 export function parseHexColor(hex: string): RgbColor {
@@ -193,10 +276,15 @@ export function degradedDeltaLStar(
   return Math.abs(simA.lStar - simB.lStar);
 }
 
-export function extractRootCssVariables(cssContent: string): Record<string, string> {
-  const rootMatch = cssContent.match(/:root\s*\{([\s\S]*?)\}/);
-  if (!rootMatch) return {};
-  const body = rootMatch[1];
+export function extractSelectorCssVariables(
+  cssContent: string,
+  selector: string
+): Record<string, string> {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const blockRegex = new RegExp(`${escaped}\\s*\\{([\\s\\S]*?)\\}`);
+  const blockMatch = cssContent.match(blockRegex);
+  if (!blockMatch) return {};
+  const body = blockMatch[1];
   const vars: Record<string, string> = {};
   const declRegex = /(--[a-zA-Z0-9-]+)\s*:\s*([^;]+);/g;
   let match: RegExpExecArray | null;
@@ -204,4 +292,116 @@ export function extractRootCssVariables(cssContent: string): Record<string, stri
     vars[match[1].trim()] = match[2].trim();
   }
   return vars;
+}
+
+export function extractRootCssVariables(cssContent: string): Record<string, string> {
+  return extractSelectorCssVariables(cssContent, ":root");
+}
+
+export function extractLightThemeCssVariables(cssContent: string): Record<string, string> {
+  return extractSelectorCssVariables(cssContent, '[data-theme="light"]');
+}
+
+export interface CanvasThemePalette {
+  theme: "dark" | "light";
+  gridLineStroke: string;
+  sparklineGridStroke: string;
+  continuousBarFill: string;
+  audioWaveformFill: string;
+  objectBarFill: string;
+  motionBarFill: string;
+  gapFill: string;
+  gapHatchStroke: string;
+  alertPinFill: string;
+  motionPinFill: string;
+  floorplanStageBg: string;
+  floorplanGridStroke: string;
+  floorplanBorderStroke: string;
+  floorplanRoomFill: string;
+  floorplanRoomSelectedFill: string;
+  floorplanRoomLabelFill: string;
+  floorplanWallStroke: string;
+  floorplanWallNodeFill: string;
+  floorplanCamNodeStroke: string;
+  floorplanCamLabelFill: string;
+  floorplanObjectLabelFill: string;
+}
+
+export function resolveCanvasThemePalette(
+  themeHint?: "dark" | "light"
+): CanvasThemePalette {
+  const domTheme =
+    typeof document !== "undefined"
+      ? document.documentElement?.dataset?.theme
+      : undefined;
+  const isLight =
+    themeHint === "light" || (themeHint === undefined && domTheme === "light");
+  const baseTokens = isLight ? LIGHT_THEME_TOKENS : DARK_THEME_TOKENS;
+
+  const computedStyle =
+    typeof window !== "undefined" &&
+    typeof window.getComputedStyle === "function" &&
+    typeof document !== "undefined" &&
+    document.documentElement
+      ? window.getComputedStyle(document.documentElement)
+      : null;
+
+  const readToken = (name: keyof typeof DARK_THEME_TOKENS): string => {
+    const fromCss = computedStyle?.getPropertyValue(name)?.trim();
+    return fromCss || baseTokens[name];
+  };
+
+  if (isLight) {
+    return {
+      theme: "light",
+      gridLineStroke: "rgba(15, 23, 42, 0.14)",
+      sparklineGridStroke: "rgba(15, 23, 42, 0.12)",
+      continuousBarFill: "rgba(5, 150, 105, 0.52)",
+      audioWaveformFill: "rgba(2, 132, 199, 0.82)",
+      objectBarFill: "rgba(220, 38, 38, 0.78)",
+      motionBarFill: "rgba(217, 119, 6, 0.58)",
+      gapFill: "rgba(220, 38, 38, 0.20)",
+      gapHatchStroke: "rgba(180, 83, 9, 0.72)",
+      alertPinFill: readToken("--signal-alert"),
+      motionPinFill: readToken("--signal-motion"),
+      floorplanStageBg:
+        "radial-gradient(circle at 50% 50%, rgba(2, 132, 199, 0.08), rgba(220, 227, 238, 0.98))",
+      floorplanGridStroke: "rgba(71, 85, 105, 0.22)",
+      floorplanBorderStroke: "rgba(2, 132, 199, 0.42)",
+      floorplanRoomFill: "rgba(245, 247, 251, 0.84)",
+      floorplanRoomSelectedFill: "rgba(2, 132, 199, 0.18)",
+      floorplanRoomLabelFill: readToken("--text-primary"),
+      floorplanWallStroke: "#475569",
+      floorplanWallNodeFill: "#334155",
+      floorplanCamNodeStroke: readToken("--bg-panel"),
+      floorplanCamLabelFill: readToken("--text-primary"),
+      floorplanObjectLabelFill: readToken("--signal-alert-text"),
+    };
+  }
+
+  return {
+    theme: "dark",
+    gridLineStroke: "rgba(255, 255, 255, 0.06)",
+    sparklineGridStroke: "rgba(255, 255, 255, 0.06)",
+    continuousBarFill: "rgba(16, 185, 129, 0.42)",
+    audioWaveformFill: "rgba(6, 182, 212, 0.78)",
+    objectBarFill: "rgba(239, 68, 68, 0.72)",
+    motionBarFill: "rgba(245, 158, 11, 0.48)",
+    gapFill: "rgba(239, 68, 68, 0.22)",
+    gapHatchStroke: "rgba(245, 158, 11, 0.65)",
+    alertPinFill: readToken("--signal-alert"),
+    motionPinFill: readToken("--signal-motion"),
+    floorplanStageBg:
+      "radial-gradient(circle at 50% 50%, rgba(14, 165, 233, 0.06), rgba(7, 10, 15, 0.98))",
+    floorplanGridStroke: "rgba(148, 163, 184, 0.14)",
+    floorplanBorderStroke: "rgba(56, 189, 248, 0.25)",
+    floorplanRoomFill: "rgba(15, 23, 42, 0.55)",
+    floorplanRoomSelectedFill: "rgba(56, 189, 248, 0.18)",
+    floorplanRoomLabelFill: readToken("--text-primary"),
+    floorplanWallStroke: "#94a3b8",
+    floorplanWallNodeFill: "#cbd5e1",
+    floorplanCamNodeStroke: "#070a0f",
+    floorplanCamLabelFill: readToken("--text-primary"),
+    floorplanObjectLabelFill: readToken("--signal-alert-text"),
+  };
 }
