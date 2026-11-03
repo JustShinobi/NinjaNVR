@@ -392,11 +392,23 @@ fn iou_corners(a: [f64; 4], b: [f64; 4]) -> f64 {
 /// (as returned by `BoundingBox::to_normalized`).
 pub fn compute_norm_box_iou(a: [f64; 4], b: [f64; 4]) -> f64 {
     let xyxy = iou_corners(a, b);
-    let xywh = iou_corners(
-        [a[0], a[1], a[0] + a[2], a[1] + a[3]],
-        [b[0], b[1], b[0] + b[2], b[1] + b[3]],
-    );
-    xyxy.max(xywh)
+    let can_be_xywh = a[2] > 0.0
+        && a[3] > 0.0
+        && b[2] > 0.0
+        && b[3] > 0.0
+        && a[0] + a[2] <= 1.0001
+        && a[1] + a[3] <= 1.0001
+        && b[0] + b[2] <= 1.0001
+        && b[1] + b[3] <= 1.0001;
+    if can_be_xywh {
+        let xywh = iou_corners(
+            [a[0], a[1], a[0] + a[2], a[1] + a[3]],
+            [b[0], b[1], b[0] + b[2], b[1] + b[3]],
+        );
+        xyxy.max(xywh)
+    } else {
+        xyxy
+    }
 }
 
 impl NinjaDatabase {
@@ -1484,10 +1496,12 @@ impl NinjaDatabase {
         if let Some(after) = filter.after {
             sql.push_str(&format!(" AND COALESCE(end_time, start_time) >= {after}"));
         }
-        if let Some(fav) = filter.favorites
-            && fav
-        {
-            sql.push_str(" AND retain_indefinitely = 1");
+        if let Some(fav) = filter.favorites {
+            if fav {
+                sql.push_str(" AND retain_indefinitely = 1");
+            } else {
+                sql.push_str(" AND COALESCE(retain_indefinitely, 0) = 0");
+            }
         }
         if let Some(ref cams) = filter.cameras
             && !cams.is_empty()
@@ -1774,7 +1788,7 @@ impl NinjaDatabase {
             r#"
             SELECT
                 r.id, r.camera, r.start_time, r.end_time, r.severity, r.data,
-                COALESCE(u.has_been_reviewed, 0) as reviewed
+                COALESCE(MAX(u.has_been_reviewed), 0) as reviewed
             FROM reviewsegment r
             LEFT JOIN userreviewstatus u ON u.review_segment_id = r.id
             WHERE r.start_time >= ?1 AND r.start_time <= ?2
@@ -1791,7 +1805,7 @@ impl NinjaDatabase {
                 rev_sql.push_str(&format!(" AND r.camera IN ({})", list.join(",")));
             }
         }
-        rev_sql.push_str(" ORDER BY r.start_time DESC LIMIT 1000");
+        rev_sql.push_str(" GROUP BY r.id ORDER BY r.start_time DESC LIMIT 1000");
 
         let mut by_severity: BTreeMap<String, usize> = BTreeMap::new();
         let mut unreviewed_alerts = Vec::new();
@@ -1897,6 +1911,10 @@ impl NinjaDatabase {
                         obj.entry("sub_label_score".to_string())
                             .or_insert_with(|| json!(sc));
                     }
+                    let is_stationary = data_json["provenance"]["stationary"]
+                        .as_bool()
+                        .or_else(|| data_json["stationary"].as_bool())
+                        .unwrap_or(false);
                     Ok(json!({
                         "id": row.get::<_, String>(0)?,
                         "camera": row.get::<_, String>(1)?,
@@ -1913,6 +1931,7 @@ impl NinjaDatabase {
                         "top_score": row.get::<_, Option<f64>>(11).ok().flatten(),
                         "false_positive": row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v != 0),
                         "box": parse_json_or(box_raw, Value::Null),
+                        "stationary": is_stationary,
                         "data": data_json,
                         "thumbnail": row.get::<_, Option<String>>(15).ok().flatten()
                     }))
@@ -2229,6 +2248,14 @@ impl NinjaDatabase {
     ) -> Result<usize> {
         let normalized_sub = sub_label.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn.lock().expect("db mutex poisoned");
+        let prev_sub_label: Option<String> = conn
+            .query_row(
+                "SELECT sub_label FROM event WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
         let updated = match (normalized_sub, score) {
             (Some(sl), Some(sc)) => conn.execute(
                 "UPDATE event SET sub_label = ?1, sub_label_score = ?2, data = json_set(COALESCE(data, '{}'), '$.sub_label', ?1, '$.sub_label_score', ?2) WHERE id = ?3",
@@ -2263,12 +2290,16 @@ impl NinjaDatabase {
             let Some(obj) = data_val.as_object_mut() else {
                 continue;
             };
-            let has_det = obj
+            let det_ids: Vec<String> = obj
                 .get("detections")
                 .and_then(|d| d.as_array())
-                .map(|arr| arr.iter().any(|v| v.as_str() == Some(id)))
-                .unwrap_or(false);
-            if !has_det {
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !det_ids.iter().any(|d| d == id) {
                 continue;
             }
             let mut sub_labels: Vec<String> = obj
@@ -2280,6 +2311,34 @@ impl NinjaDatabase {
                         .collect()
                 })
                 .unwrap_or_default();
+
+            // If this event previously had a sub_label that changed or was cleared,
+            // remove it unless another sibling detection in the same reviewsegment still carries it.
+            if let Some(ref old_sl) = prev_sub_label
+                && normalized_sub != Some(old_sl.as_str())
+            {
+                let sibling_still_has_old =
+                    det_ids
+                        .iter()
+                        .filter(|d| d.as_str() != id)
+                        .any(|sibling_id| {
+                            conn.query_row(
+                                "SELECT sub_label FROM event WHERE id = ?1",
+                                params![sibling_id],
+                                |r| r.get::<_, Option<String>>(0),
+                            )
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                                == Some(old_sl.as_str())
+                        });
+                if !sibling_still_has_old {
+                    sub_labels.retain(|x| x != old_sl);
+                }
+            } else if normalized_sub.is_none() && det_ids.len() == 1 {
+                sub_labels.clear();
+            }
+
             if let Some(sl) = normalized_sub {
                 if !sub_labels.iter().any(|x| x == sl) {
                     sub_labels.push(sl.to_string());
@@ -2289,8 +2348,10 @@ impl NinjaDatabase {
                     obj.insert("sub_label_score".to_string(), json!(sc));
                 }
             } else {
-                obj.insert("sub_labels".to_string(), json!(Vec::<String>::new()));
-                obj.remove("sub_label_score");
+                obj.insert("sub_labels".to_string(), json!(sub_labels));
+                if sub_labels.is_empty() {
+                    obj.remove("sub_label_score");
+                }
             }
             if let Ok(new_data) = serde_json::to_string(&data_val) {
                 let _ = conn.execute(
@@ -2453,8 +2514,50 @@ impl NinjaDatabase {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let data_str = serde_json::to_string(&ev.data)?;
-        let sub_label_score = ev.data.get("sub_label_score").and_then(|v| v.as_f64());
+        let mut merged_data = if ev.data.is_object() {
+            ev.data.clone()
+        } else {
+            json!({})
+        };
+        if let Some(obj) = merged_data.as_object_mut() {
+            if ev.stationary
+                && obj.get("stationary").is_none()
+                && obj
+                    .get("provenance")
+                    .and_then(|p| p.get("stationary"))
+                    .is_none()
+            {
+                obj.insert("stationary".to_string(), json!(true));
+            }
+            if let Ok(Some(existing_raw)) = conn
+                .query_row(
+                    "SELECT data FROM event WHERE id = ?1",
+                    params![ev.id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map(|opt| opt.flatten())
+                && let Ok(Value::Object(prev_obj)) = serde_json::from_str::<Value>(&existing_raw)
+            {
+                for preserved_key in [
+                    "ai_verification",
+                    "suppressed_by_fp_signature",
+                    "description",
+                    "notes",
+                    "sub_label",
+                    "sub_label_score",
+                ] {
+                    if obj.get(preserved_key).is_none_or(Value::is_null)
+                        && let Some(prev_val) = prev_obj.get(preserved_key)
+                        && !prev_val.is_null()
+                    {
+                        obj.insert(preserved_key.to_string(), prev_val.clone());
+                    }
+                }
+            }
+        }
+        let data_str = serde_json::to_string(&merged_data)?;
+        let sub_label_score = merged_data.get("sub_label_score").and_then(|v| v.as_f64());
 
         conn.execute(
             r#"
@@ -5581,6 +5684,320 @@ mod tests {
         assert_eq!(summary_after["total_samples"], 2);
         assert_eq!(summary_after["hard_negative_count"], 0);
 
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn security_taxonomy_class_lookup_normalizes_case_hyphens_and_spaces() {
+        assert_eq!(NINJANVR_SECURITY_CLASSES.len(), 15);
+        for (idx, &canonical) in NINJANVR_SECURITY_CLASSES.iter().enumerate() {
+            assert_eq!(security_class_label(idx), Some(canonical));
+            assert_eq!(security_class_id(canonical), Some(idx));
+        }
+        assert_eq!(security_class_label(15), None);
+        assert_eq!(security_class_id("  License-Plate  "), Some(7));
+        assert_eq!(security_class_id("LICENSE PLATE"), Some(7));
+        assert_eq!(security_class_id("Waste-Bin"), Some(12));
+        assert_eq!(security_class_id("  waste bin "), Some(12));
+        assert_eq!(security_class_id("MotorCycle"), Some(3));
+        assert_eq!(security_class_id("unknown_ufo"), None);
+        assert_eq!(security_class_id(""), None);
+    }
+
+    #[test]
+    fn password_hashing_generates_unique_salts_and_rejects_malformed_hashes() {
+        let h1 = hash_password("TacticalPass!2026", None, 1_000);
+        let h2 = hash_password("TacticalPass!2026", None, 1_000);
+        assert_ne!(h1, h2, "random salt must make each hash unique");
+        assert!(verify_password("TacticalPass!2026", &h1));
+        assert!(verify_password("TacticalPass!2026", &h2));
+        assert!(!verify_password("WrongPassword", &h1));
+
+        // Malformed hash strings must safely return false without panicking
+        assert!(!verify_password("pass", ""));
+        assert!(!verify_password("pass", "pbkdf2_sha256$1000$only_three"));
+        assert!(!verify_password("pass", "argon2id$1000$salt$abcd"));
+        assert!(!verify_password(
+            "pass",
+            "pbkdf2_sha256$not_a_number$salt$abcd"
+        ));
+        assert!(!verify_password("pass", "pbkdf2_sha256$1000$salt$short"));
+    }
+
+    #[test]
+    fn pure_json_and_sqlite_value_helpers_handle_edge_cases() {
+        use rusqlite::types::ValueRef;
+
+        // 1. extract_dhash64_from_value
+        assert_eq!(
+            extract_dhash64_from_value(&json!(0x1234_5678_9abc_def0u64)),
+            Some(0x1234_5678_9abc_def0u64)
+        );
+        assert_eq!(extract_dhash64_from_value(&json!(-1i64)), Some(u64::MAX));
+        assert_eq!(
+            extract_dhash64_from_value(&json!("  0xdeadbeefcafebabe ")),
+            Some(0xdead_beef_cafe_babeu64)
+        );
+        assert_eq!(
+            extract_dhash64_from_value(&json!("0X00000000000000ff")),
+            Some(255)
+        );
+        assert_eq!(extract_dhash64_from_value(&json!("not_a_hex_hash")), None);
+        assert_eq!(extract_dhash64_from_value(&json!(null)), None);
+
+        // 2. extract_norm_box_from_event priority chain
+        let ev_top = json!({
+            "box": [0.1, 0.2, 0.3, 0.4],
+            "data": { "box": [0.5, 0.5, 0.6, 0.6] }
+        });
+        assert_eq!(extract_norm_box_from_event(&ev_top), [0.1, 0.2, 0.3, 0.4]);
+
+        let ev_data = json!({
+            "data": {
+                "box": [0.2, 0.3, 0.4, 0.5],
+                "provenance": { "norm_bbox": [0.7, 0.7, 0.8, 0.8] }
+            }
+        });
+        assert_eq!(extract_norm_box_from_event(&ev_data), [0.2, 0.3, 0.4, 0.5]);
+
+        let ev_prov = json!({
+            "data": { "provenance": { "norm_bbox": [0.15, 0.25, 0.35, 0.45] } }
+        });
+        assert_eq!(
+            extract_norm_box_from_event(&ev_prov),
+            [0.15, 0.25, 0.35, 0.45]
+        );
+        assert_eq!(
+            extract_norm_box_from_event(&json!({})),
+            [0.0, 0.0, 0.0, 0.0]
+        );
+
+        // 3. json_array_matches_any with and without "-verified" suffix matching
+        let arr = json!(["person-verified", "car"]);
+        let allowed_person = vec!["person".to_string()];
+        assert!(json_array_matches_any(&arr, &allowed_person, true));
+        assert!(!json_array_matches_any(&arr, &allowed_person, false));
+        assert!(!json_array_matches_any(
+            &json!("not_an_array"),
+            &allowed_person,
+            true
+        ));
+
+        // 4. value_to_f64 across SQLite storage classes
+        assert_eq!(value_to_f64(&ValueRef::Real(123.5)), Some(123.5));
+        assert_eq!(value_to_f64(&ValueRef::Integer(42)), Some(42.0));
+        assert_eq!(
+            value_to_f64(&ValueRef::Text(b"1700000000.25")),
+            Some(1700000000.25)
+        );
+        assert_eq!(
+            value_to_f64(&ValueRef::Text(b"1970-01-01T00:01:00Z")),
+            Some(60.0)
+        );
+        assert_eq!(
+            value_to_f64(&ValueRef::Text(b"1970-01-01 00:02:00.500")),
+            Some(120.5)
+        );
+        assert_eq!(value_to_f64(&ValueRef::Text(b"invalid_timestamp")), None);
+        assert_eq!(value_to_f64(&ValueRef::Null), None);
+    }
+
+    #[test]
+    fn user_creation_validates_username_password_role_and_camera_scope_normalization() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_user_validation_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // Reject invalid usernames, passwords, and roles
+        assert!(
+            db.create_user_with_cameras("", "secret123", "admin", "*", 1_000)
+                .is_err()
+        );
+        assert!(
+            db.create_user_with_cameras(&"a".repeat(31), "secret123", "admin", "*", 1_000)
+                .is_err()
+        );
+        assert!(
+            db.create_user_with_cameras("bad user!", "secret123", "admin", "*", 1_000)
+                .is_err()
+        );
+        assert!(
+            db.create_user_with_cameras("valid_user", "", "admin", "*", 1_000)
+                .is_err()
+        );
+        assert!(
+            db.create_user_with_cameras("valid_user", "secret123", "superadmin", "*", 1_000)
+                .is_err()
+        );
+
+        // Normalize role case/whitespace and blank allowed_cameras -> "*"
+        db.create_user_with_cameras("op.user-1", "secret123", "  OpErAtOr ", "   ", 1_000)
+            .unwrap();
+        let users = db.list_users().unwrap();
+        let created = users.iter().find(|u| u["username"] == "op.user-1").unwrap();
+        assert_eq!(created["role"], "operator");
+        assert_eq!(created["allowed_cameras"], "*");
+
+        // Duplicate username must fail
+        assert!(
+            db.create_user_with_cameras("op.user-1", "otherpass", "viewer", "*", 1_000)
+                .is_err()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn db_bugfixes_disjoint_xyxy_iou_upsert_preservation_digest_dedup_and_sibling_sub_labels() {
+        // 1. Disjoint [x1, y1, x2, y2] boxes in bottom-right quadrant must have IoU == 0.0
+        let box_a = [0.75, 0.75, 0.85, 0.85];
+        let box_b = [0.75, 0.85, 0.85, 0.95];
+        assert_eq!(compute_norm_box_iou(box_a, box_b), 0.0);
+
+        // Normalized [x, y, w, h] boxes from BoundingBox::to_normalized still compute exact IoU
+        assert!(
+            (compute_norm_box_iou([0.75, 0.75, 0.10, 0.10], [0.75, 0.75, 0.10, 0.10]) - 1.0).abs()
+                < 1e-6
+        );
+
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_db_bugfixes_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 2. upsert_event persists stationary: true, and subsequent upserts preserve ai_verification,
+        // suppressed_by_fp_signature, description, and notes
+        let mut ev1 = EventDto {
+            id: "ev_1".to_string(),
+            camera: "front_door".to_string(),
+            label: "car".to_string(),
+            zones: json!(["driveway"]),
+            start_time: 1_000.0,
+            end_time: None,
+            has_clip: false,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: true,
+            sub_label: Some("Alice".to_string()),
+            top_score: Some(0.88),
+            false_positive: Some(false),
+            box_coords: Some(json!([0.1, 0.1, 0.3, 0.3])),
+            data: json!({
+                "suppressed_by_fp_signature": 7,
+                "description": "Parked courier car",
+                "notes": "Verified by operator"
+            }),
+            thumbnail: None,
+            area: Some(5000),
+            ratio: Some(1.0),
+            score: Some(0.88),
+            stationary: true,
+        };
+        db.upsert_event(&ev1).unwrap();
+        db.set_event_ai_verification(
+            "ev_1",
+            &json!({ "verdict": "true_positive", "confidence": 0.95 }),
+        )
+        .unwrap();
+
+        // Simulate track termination upsert where pipeline reconstructs ev.data without those fields
+        ev1.end_time = Some(1_015.0);
+        ev1.data = json!({ "box": [0.1, 0.1, 0.3, 0.3], "type": "object" });
+        db.upsert_event(&ev1).unwrap();
+
+        let fetched = db.get_event("ev_1").unwrap().unwrap();
+        assert_eq!(fetched["stationary"], true);
+        assert_eq!(fetched["data"]["suppressed_by_fp_signature"], 7);
+        assert_eq!(fetched["data"]["description"], "Parked courier car");
+        assert_eq!(fetched["data"]["notes"], "Verified by operator");
+        assert_eq!(
+            fetched["data"]["ai_verification"]["verdict"],
+            "true_positive"
+        );
+
+        // 3. Second event with retain_indefinitely: false -> test favorites: Some(false) filter
+        let ev2 = EventDto {
+            id: "ev_2".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!(["driveway"]),
+            start_time: 1_002.0,
+            end_time: Some(1_010.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: Some("Bruno".to_string()),
+            top_score: Some(0.91),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.91),
+            stationary: false,
+        };
+        db.upsert_event(&ev2).unwrap();
+
+        let non_favs = db
+            .query_events(&EventFilter {
+                favorites: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(non_favs.len(), 1);
+        assert_eq!(non_favs[0]["id"], "ev_2");
+
+        // 4. Multi-detection reviewsegment + multi-user review status + sibling sub_label preservation
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_multi_1".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 1_000.0,
+            end_time: Some(1_015.0),
+            severity: "alert".to_string(),
+            thumb_path: "/clips/rev_multi_1.webp".to_string(),
+            data: json!({
+                "detections": ["ev_1", "ev_2"],
+                "objects": ["car", "person"],
+                "sub_labels": ["Alice", "Bruno"],
+                "zones": ["driveway"]
+            }),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        // Insert unreviewed status rows for two distinct users -> query_ai_digest_summary must not duplicate rev_multi_1
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO userreviewstatus (user_id, review_segment_id, has_been_reviewed) VALUES ('user_a', 'rev_multi_1', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO userreviewstatus (user_id, review_segment_id, has_been_reviewed) VALUES ('user_b', 'rev_multi_1', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let digest = db.query_ai_digest_summary(900.0, 1_100.0, None).unwrap();
+        assert_eq!(digest["counts_by_severity"]["alert"], 1);
+        assert_eq!(digest["unreviewed_alerts"].as_array().unwrap().len(), 1);
+
+        // Clear ev_1's sub_label ("Alice") -> "Bruno" (from sibling ev_2) must remain on rev_multi_1
+        db.set_event_sub_label_with_score("ev_1", None, None)
+            .unwrap();
+        let revs = db.query_reviews(&ReviewFilter::default()).unwrap();
+        assert_eq!(
+            revs[0].data["sub_labels"],
+            json!(["Bruno"]),
+            "clearing ev_1 sub_label must preserve sibling ev_2 sub_label on shared reviewsegment"
+        );
+
+        drop(db);
         let _ = std::fs::remove_file(&tmp);
     }
 }
