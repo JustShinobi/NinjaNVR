@@ -19,6 +19,7 @@ export interface TacticalCameraPickerProps {
   cameraStats?: Record<string, CameraStats>;
   cameraActivity?: Record<string, CameraLiveActivity>;
   ariaLabel?: string;
+  openUpward?: boolean;
 }
 
 export function resolvePickerMode(
@@ -123,6 +124,7 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
   cameraStats,
   cameraActivity,
   ariaLabel = "Camera selector",
+  openUpward = false,
 }) => {
   const mode = resolvePickerMode(cameras.length, threshold);
   const [open, setOpen] = useState(false);
@@ -261,6 +263,11 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
           className="nvr-picker-popover"
           role="dialog"
           aria-label="Searchable camera selector"
+          style={
+            openUpward
+              ? { top: "auto", bottom: "calc(100% + 4px)" }
+              : undefined
+          }
           onKeyDown={(e) => {
             if (e.key === "Escape") {
               e.preventDefault();

@@ -16,7 +16,7 @@ import {
   cycleThemeMode,
   formatTs,
 } from "./utils/format";
-import { useNvrStore } from "./store/useNvrStore";
+import { expandSimulatedFleet, useNvrStore } from "./store/useNvrStore";
 import { LiveWorkspace } from "./views/LiveWorkspace";
 import { SyncWorkspace } from "./views/SyncWorkspace";
 import { ReviewWorkspace } from "./views/ReviewWorkspace";
@@ -171,10 +171,21 @@ export const App: React.FC = () => {
     }
   }, [themeMode, highContrast]);
 
+  const simulatedFleetCount = useNvrStore((s) => s.simulatedFleetCount);
   const cameraNames = useMemo(() => {
-    if (!config?.cameras) return ["escritorio", "sala", "quarto", "cozinha"];
-    return Object.keys(config.cameras).filter((k) => config.cameras[k].enabled);
-  }, [config]);
+    const base = !config?.cameras
+      ? ["escritorio", "sala", "quarto", "cozinha"]
+      : Object.keys(config.cameras).filter((k) => config.cameras[k].enabled);
+    if (simulatedFleetCount > 0) {
+      return expandSimulatedFleet(
+        base,
+        config?.cameras,
+        config?.camera_groups,
+        simulatedFleetCount
+      ).cameraNames;
+    }
+    return base;
+  }, [config, simulatedFleetCount]);
 
   const unreviewedAlerts = useMemo(
     () => reviews.filter((r) => !r.has_been_reviewed),

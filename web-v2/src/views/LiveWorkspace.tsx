@@ -1567,48 +1567,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <div
-            className="mono"
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 3,
-              background: "var(--bg-subcard)",
-              border: "1px solid var(--border-strong)",
-              borderRadius: 3,
-              padding: "1px 4px",
-              fontSize: "var(--text-xs)",
-            }}
-            aria-label="Simulate Fleet (12 / 36 / 100 Cams)"
-          >
-            <span style={{ color: "var(--text-secondary)", padding: "0 2px" }}>
-              Simulate Fleet:
-            </span>
-            {([12, 36, 100] as const).map((cnt) => (
-              <button
-                key={cnt}
-                type="button"
-                className={`nvr-btn mono ${simulatedFleetCount === cnt ? "active" : ""}`}
-                style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                aria-label={`Simulate Fleet ${cnt} Cams`}
-                title={`Clone configured cameras to ${cnt} virtual channels`}
-                onClick={() =>
-                  setSimulatedFleetCount(simulatedFleetCount === cnt ? 0 : cnt)
-                }
-              >
-                {cnt} Cams
-              </button>
-            ))}
-          </div>
           {simulatedFleetCount > 0 && (
             <button
               type="button"
               className="nvr-btn danger mono"
               style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)", fontWeight: 700 }}
-              aria-label={`Exit Simulation (Restore ${cameraNames.length || 4} Cameras)`}
+              aria-label={`Exit Simulation (Restore ${cameraNames.filter((c) => !/_sim_\d+$/.test(c)).length || 4} Cameras)`}
               onClick={() => setSimulatedFleetCount(0)}
             >
-              Exit Simulation (Restore {cameraNames.length || 4} Cameras)
+              Exit Simulation ({simulatedFleetCount} Cams → {cameraNames.filter((c) => !/_sim_\d+$/.test(c)).length || 4})
             </button>
           )}
           <select
@@ -5029,7 +4996,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
       <TimelineScrubber
         camera={selectedCamera}
-        cameras={cameraNames}
+        cameras={effectiveCameraNames}
         onSelectCamera={(cam) => setSelectedCamera(cam)}
         segments={focusSegments}
         reviews={reviews}

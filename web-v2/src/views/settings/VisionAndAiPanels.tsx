@@ -903,7 +903,16 @@ export const VisionZonesMotionSection: React.FC<{
             </div>
 
             {polyType === "state_roi" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div
+                className="nvr-subcard"
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 8,
+                  padding: "8px 10px",
+                  overflow: "hidden",
+                }}
+              >
                 <div
                   className="mono"
                   style={{
@@ -913,14 +922,14 @@ export const VisionZonesMotionSection: React.FC<{
                   }}
                 >
                   {isPt
-                    ? "PASSO 1 — O QUE VOCÊ QUER MONITORAR?"
-                    : "STEP 1 — WHAT DO YOU WANT TO MONITOR?"}
+                    ? "1. O QUE MONITORAR NESTA ÁREA?"
+                    : "1. WHAT TO MONITOR IN THIS AREA?"}
                 </div>
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))",
-                    gap: 5,
+                    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                    gap: 4,
                   }}
                 >
                   {STATE_ROI_SCENARIO_PRESETS.map((preset) => {
@@ -940,41 +949,50 @@ export const VisionZonesMotionSection: React.FC<{
                         key={preset.id}
                         type="button"
                         className={`nvr-btn ${active ? "active" : ""}`}
+                        title={isPt ? preset.descPt : preset.descEn}
                         style={{
-                          height: "auto",
-                          padding: "6px 8px",
-                          flexDirection: "column",
-                          alignItems: "flex-start",
-                          textAlign: "left",
-                          gap: 2,
+                          height: 26,
+                          padding: "0 8px",
+                          justifyContent: "flex-start",
+                          gap: 5,
                           minWidth: 0,
+                          width: "100%",
+                          overflow: "hidden",
                         }}
                         onClick={() => applyZoneRoiPreset(preset)}
                       >
+                        <IconComp size={12} style={{ flexShrink: 0 }} />
                         <span
                           style={{
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: 5,
-                            fontWeight: 700,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
                             fontSize: "var(--text-xs)",
                           }}
                         >
-                          <IconComp size={12} />
                           {isPt ? preset.titlePt : preset.titleEn}
-                        </span>
-                        <span
-                          className="mono"
-                          style={{
-                            fontSize: "var(--text-xs)",
-                            color: "var(--text-muted)",
-                          }}
-                        >
-                          {isPt ? preset.descPt : preset.descEn}
                         </span>
                       </button>
                     );
                   })}
+                </div>
+                <div
+                  className="mono"
+                  style={{
+                    fontSize: "var(--text-xs)",
+                    color: "var(--text-secondary)",
+                    background: "var(--bg-input)",
+                    border: "1px solid var(--border-divider)",
+                    borderRadius: 2,
+                    padding: "4px 8px",
+                    whiteSpace: "normal",
+                    wordBreak: "break-word",
+                  }}
+                >
+                  {isPt ? "Estados monitorados: " : "Monitored states: "}
+                  <strong style={{ color: "var(--text-primary)" }}>
+                    {parseRoiClassesInput(roiClassesInput).join(" ↔ ")}
+                  </strong>
                 </div>
 
                 <div>
@@ -983,17 +1001,17 @@ export const VisionZonesMotionSection: React.FC<{
                     style={{
                       display: "flex",
                       justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 6,
                       fontSize: "var(--text-xs)",
                       color: "var(--text-secondary)",
-                      marginBottom: 2,
+                      marginBottom: 3,
                     }}
                   >
                     <span>
-                      {isPt
-                        ? "PASSO 2 — NOME DO LOCAL (Location Name)"
-                        : "STEP 2 — LOCATION NAME"}
+                      {isPt ? "2. NOME DO LOCAL" : "2. LOCATION NAME"}
                     </span>
-                    <span>
+                    <span style={{ color: "var(--text-muted)" }}>
                       ID: <strong>{slugifyRoiLocationName(zoneNameInput) || "gate"}</strong>
                     </span>
                   </div>
@@ -1003,7 +1021,7 @@ export const VisionZonesMotionSection: React.FC<{
                     placeholder={
                       isPt
                         ? "Ex: Porta do Escritório, Portão da Garagem"
-                        : "e.g. Porta do Escritório, Portão da Garagem"
+                        : "e.g. Office Door, Garage Gate"
                     }
                     aria-label="State ROI Name"
                     value={zoneNameInput}
@@ -1041,18 +1059,18 @@ export const VisionZonesMotionSection: React.FC<{
                       color: "var(--text-secondary)",
                     }}
                   >
-                    {isPt ? "REGRA DE ALERTA (Alert Rule):" : "ALERT RULE:"}
+                    {isPt ? "3. QUANDO DISPARAR ALERTA?" : "3. WHEN TO TRIGGER ALERT?"}
                   </div>
                   <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                     <button
                       type="button"
                       className={`nvr-btn mono ${!roiAnomalyState.trim() ? "active" : ""}`}
-                      style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                      style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
                       onClick={() => setRoiAnomalyState("")}
                     >
                       {isPt
-                        ? "Apenas Crachá (Sem Alerta)"
-                        : "Status Badge Only (No Alert)"}
+                        ? "Apenas Status (Sem Alerta)"
+                        : "Status Only (No Alert)"}
                     </button>
                     {parseRoiClassesInput(roiClassesInput).map((st) => {
                       const isSel =
@@ -1062,10 +1080,10 @@ export const VisionZonesMotionSection: React.FC<{
                           key={st}
                           type="button"
                           className={`nvr-btn mono ${isSel ? "active" : ""}`}
-                          style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                          style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
                           onClick={() => setRoiAnomalyState(st)}
                         >
-                          {isPt ? `Alertar quando '${st}'` : `Alert when ${st}`}
+                          {isPt ? `Se ficar "${st}"` : `When "${st}"`}
                         </button>
                       );
                     })}
@@ -1077,6 +1095,7 @@ export const VisionZonesMotionSection: React.FC<{
                         alignItems: "center",
                         gap: 4,
                         flexWrap: "wrap",
+                        marginTop: 2,
                       }}
                     >
                       <span
@@ -1086,7 +1105,7 @@ export const VisionZonesMotionSection: React.FC<{
                           color: "var(--text-muted)",
                         }}
                       >
-                        {isPt ? "Após:" : "For:"}
+                        {isPt ? "Tempo:" : "Duration:"}
                       </span>
                       {ROI_ALERT_DURATION_PILLS.map((pill) => (
                         <button
@@ -1095,7 +1114,7 @@ export const VisionZonesMotionSection: React.FC<{
                           className={`nvr-btn mono ${
                             roiAnomalyTimeoutSec === pill.sec ? "active" : ""
                           }`}
-                          style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                          style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
                           onClick={() => setRoiAnomalyTimeoutSec(pill.sec)}
                         >
                           {pill.label}
@@ -1111,6 +1130,8 @@ export const VisionZonesMotionSection: React.FC<{
                     padding: "5px 8px",
                     borderRadius: 2,
                     fontSize: "var(--text-xs)",
+                    whiteSpace: "normal",
+                    wordBreak: "break-word",
                     background:
                       draftPoints.length >= 2
                         ? "rgba(16, 185, 129, 0.14)"
@@ -1127,11 +1148,11 @@ export const VisionZonesMotionSection: React.FC<{
                 >
                   {draftPoints.length >= 2
                     ? isPt
-                      ? "✓ Área selecionada no vídeo (Pronto para salvar)"
-                      : "Area selected on video (Ready to save)"
+                      ? "✓ Área demarcada no vídeo (Pronto para salvar)"
+                      : "✓ Area marked on video (Ready to save)"
                     : isPt
-                    ? "Clique 2 ou 4 cantos no vídeo para marcar a área a monitorar"
-                    : "Click 2 or 4 corners on the video to mark the area to monitor"}
+                    ? "Clique 2 ou 4 cantos no vídeo ao lado para demarcar a área"
+                    : "Click 2 or 4 corners on the video to mark the area"}
                 </div>
 
                 <details
@@ -1150,7 +1171,9 @@ export const VisionZonesMotionSection: React.FC<{
                       color: "var(--text-secondary)",
                     }}
                   >
-                    Advanced Technical Tuning / Coordenadas &amp; Histerese
+                    {isPt
+                      ? "Ajustes Avançados (Coordenadas & Histerese)"
+                      : "Advanced Tuning (Coordinates & Hysteresis)"}
                   </summary>
                   <div
                     style={{
@@ -5381,6 +5404,8 @@ export const AiDetectionObjectsSection: React.FC<{
                       textAlign: "left",
                       gap: 2,
                       minWidth: 0,
+                      overflow: "hidden",
+                      whiteSpace: "normal",
                     }}
                     onClick={() => {
                       setNewRoiScenario(preset.id);
@@ -5401,9 +5426,13 @@ export const AiDetectionObjectsSection: React.FC<{
                         gap: 5,
                         fontWeight: 700,
                         fontSize: "var(--text-xs)",
+                        maxWidth: "100%",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
                       }}
                     >
-                      <IconComp size={12} />
+                      <IconComp size={12} style={{ flexShrink: 0 }} />
                       {isPt ? preset.titlePt : preset.titleEn}
                     </span>
                     <span
@@ -5411,6 +5440,10 @@ export const AiDetectionObjectsSection: React.FC<{
                       style={{
                         fontSize: "var(--text-xs)",
                         color: "var(--text-muted)",
+                        maxWidth: "100%",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
                       }}
                     >
                       {isPt ? preset.descPt : preset.descEn}

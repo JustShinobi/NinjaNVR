@@ -109,9 +109,10 @@ export function expandSimulatedFleet(
   cameraGroups?: Record<string, CameraGroupConfig> | null,
   simulatedFleetCount: SimulatedFleetCount = 0
 ): ExpandedSimulatedFleet {
+  const nonSimCams = realCameraNames.filter((c) => !/_sim_\d+$/.test(c));
   const baseCams =
-    realCameraNames.length > 0
-      ? realCameraNames
+    nonSimCams.length > 0
+      ? nonSimCams
       : ["escritorio", "sala", "quarto", "cozinha"];
   const baseCfgMap: Record<string, CameraConfig> = { ...(camerasConfig || {}) };
   const baseGroups: Record<string, CameraGroupConfig> = {

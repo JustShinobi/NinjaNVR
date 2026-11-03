@@ -319,6 +319,19 @@ export const ConsoleUiSection: React.FC<{
               </div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              <button
+                type="button"
+                className={`nvr-btn mono ${simulatedFleetCount === 0 ? "active" : ""}`}
+                style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                onClick={() => {
+                  if (simulatedFleetCount !== 0) {
+                    setSimulatedFleetCount(0);
+                    notify(`Restored ${realCameraCount} physical cameras`);
+                  }
+                }}
+              >
+                {isPt ? "Desativado (Padrão)" : "Off (Default)"}
+              </button>
               {([12, 36, 100] as const).map((cnt) => (
                 <button
                   key={cnt}

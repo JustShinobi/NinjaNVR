@@ -1312,6 +1312,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               selectedCamera={camera}
               onSelect={onSelectCamera}
               ariaLabel="Timeline camera selector"
+              openUpward={true}
             />
           )}
 
