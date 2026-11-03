@@ -504,6 +504,18 @@ impl Default for DetectorEntryConfig {
     }
 }
 
+impl DetectorEntryConfig {
+    /// Normalizes the configured detector backend type to `"openvino"` or `"onnxruntime"`.
+    pub fn normalized_backend_type(&self) -> &'static str {
+        let t = self.detector_type.trim().to_ascii_lowercase();
+        if t == "onnxruntime" || t == "ort" || t == "onnx" {
+            "onnxruntime"
+        } else {
+            "openvino"
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     #[serde(default = "default_model_width")]
@@ -1433,22 +1445,23 @@ impl NinjaConfig {
 
         let mut detectors_json = serde_json::Map::new();
         for (name, det) in &self.detectors {
+            let eff_model = det.model.as_ref().unwrap_or(&self.model);
             detectors_json.insert(
                 name.clone(),
                 json!({
                     "type": det.detector_type,
                     "device": det.device,
                     "model": {
-                        "path": self.model.path,
-                        "labelmap_path": self.model.labelmap_path,
-                        "width": self.model.width,
-                        "height": self.model.height,
+                        "path": eff_model.path,
+                        "labelmap_path": eff_model.labelmap_path,
+                        "width": eff_model.width,
+                        "height": eff_model.height,
                         "labelmap": labelmap,
                         "attributes_map": attributes_map,
-                        "input_tensor": self.model.input_tensor,
-                        "input_pixel_format": self.model.input_pixel_format,
+                        "input_tensor": eff_model.input_tensor,
+                        "input_pixel_format": eff_model.input_pixel_format,
                         "input_dtype": "int",
-                        "model_type": self.model.model_type
+                        "model_type": eff_model.model_type
                     }
                 }),
             );
@@ -2607,5 +2620,67 @@ go2rtc:
         assert!((cam_map.range - 0.35).abs() < 1e-4);
         let api_json = cfg.to_api_config();
         assert_eq!(api_json["cameras"]["front_door"]["map"]["fov_deg"], 110.0);
+    }
+
+    #[test]
+    fn detector_backend_types_and_accelerators_roundtrip_yaml_and_json() {
+        let yaml = r#"
+detectors:
+  ov_cpu:
+    type: openvino
+    device: CPU
+  ort_cuda:
+    type: onnxruntime
+    device: CUDA
+    model:
+      width: 640
+      height: 640
+      input_tensor: nchw
+      input_pixel_format: rgb
+      path: /config/models/yolo11s.onnx
+      model_type: yolo-generic
+  ort_alias:
+    type: ort
+    device: ROCM
+version: 0.18-0
+"#;
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert_eq!(
+            cfg.detectors["ov_cpu"].normalized_backend_type(),
+            "openvino"
+        );
+        assert_eq!(
+            cfg.detectors["ort_cuda"].normalized_backend_type(),
+            "onnxruntime"
+        );
+        assert_eq!(
+            cfg.detectors["ort_alias"].normalized_backend_type(),
+            "onnxruntime"
+        );
+        assert_eq!(cfg.detectors["ort_cuda"].device, "CUDA");
+
+        let api_val = cfg.to_api_config();
+        assert_eq!(api_val["detectors"]["ort_cuda"]["type"], "onnxruntime");
+        assert_eq!(api_val["detectors"]["ort_cuda"]["device"], "CUDA");
+        assert_eq!(
+            api_val["detectors"]["ort_cuda"]["model"]["path"],
+            "/config/models/yolo11s.onnx"
+        );
+        assert_eq!(api_val["detectors"]["ort_cuda"]["model"]["width"], 640);
+
+        let patch = json!({
+            "detectors": {
+                "ort_cuda": {
+                    "type": "onnxruntime",
+                    "device": "TensorRT"
+                }
+            }
+        });
+        cfg.apply_structured_json(&patch).unwrap();
+        assert_eq!(cfg.detectors["ort_cuda"].device, "TensorRT");
+        assert_eq!(
+            cfg.detectors["ort_cuda"].normalized_backend_type(),
+            "onnxruntime"
+        );
     }
 }

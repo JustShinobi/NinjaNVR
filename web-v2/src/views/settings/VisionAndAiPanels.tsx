@@ -1397,6 +1397,7 @@ export const AiDetectionObjectsSection: React.FC<{
           </span>
           <span className="nvr-badge live">
             <CheckCircle2 size={11} />
+            {(primaryDet.type || "openvino").toUpperCase()} ·{" "}
             {primaryDet.device || "CPU"} ACTIVE · {liveInferMs}ms
           </span>
         </div>
@@ -1468,7 +1469,62 @@ export const AiDetectionObjectsSection: React.FC<{
             })}
           </div>
 
-          {/* Step 2: Hardware Accelerator */}
+          {/* Step 2: Inference Runtime Backend & Hardware Accelerator */}
+          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                <Cpu size={13} />
+                {isPt ? "Motor de Inferência (Runtime)" : "Inference Runtime Backend"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "OpenVINO para x86_64/Intel; ONNX Runtime para NVIDIA CUDA/TensorRT, AMD ROCm e ARM64."
+                  : "OpenVINO for x86_64/Intel; ONNX Runtime for NVIDIA CUDA/TensorRT, AMD ROCm, and ARM64."}
+              </div>
+            </div>
+            <select
+              className="nvr-select mono"
+              aria-label="Inference Runtime Backend"
+              value={
+                (primaryDet.type || "openvino").toLowerCase() === "onnxruntime" ||
+                (primaryDet.type || "openvino").toLowerCase() === "ort"
+                  ? "onnxruntime"
+                  : "openvino"
+              }
+              onChange={(e) => {
+                const nextType = e.target.value;
+                updateDraft((next) => {
+                  if (!next.detectors) next.detectors = {};
+                  const currDev = primaryDet.device || "CPU";
+                  const nextDev =
+                    nextType === "openvino" &&
+                    (currDev === "CUDA" || currDev === "TensorRT" || currDev === "ROCM")
+                      ? "CPU"
+                      : nextType === "onnxruntime" &&
+                        (currDev === "GPU" || currDev === "NPU")
+                      ? "CUDA"
+                      : currDev;
+                  next.detectors[primaryDetKey] = {
+                    ...primaryDet,
+                    type: nextType,
+                    device: nextDev,
+                  };
+                });
+              }}
+            >
+              <option value="openvino">
+                {isPt
+                  ? "OpenVINO C-API — x86_64 CPU / Intel iGPU / NPU (Padrão)"
+                  : "OpenVINO C-API — x86_64 CPU / Intel iGPU / NPU (Default)"}
+              </option>
+              <option value="onnxruntime">
+                {isPt
+                  ? "ONNX Runtime C-API — NVIDIA CUDA / TensorRT / ROCm / ARM64"
+                  : "ONNX Runtime C-API — NVIDIA CUDA / TensorRT / ROCm / ARM64"}
+              </option>
+            </select>
+          </div>
+
           <div className="nvr-field-row" style={{ padding: "4px 0" }}>
             <div className="nvr-field-meta">
               <div className="nvr-field-label">
@@ -1491,7 +1547,7 @@ export const AiDetectionObjectsSection: React.FC<{
                   if (!next.detectors) next.detectors = {};
                   next.detectors[primaryDetKey] = {
                     ...primaryDet,
-                    type: "openvino",
+                    type: primaryDet.type || "openvino",
                     device: dev,
                   };
                 });
@@ -1503,8 +1559,19 @@ export const AiDetectionObjectsSection: React.FC<{
               <option value="AUTO">
                 {isPt ? "AUTO — Melhor Disponível" : "AUTO — Best Available"}
               </option>
-              <option value="GPU">GPU — Intel iGPU / Arc</option>
-              <option value="NPU">NPU — Intel AI Boost</option>
+              {(primaryDet.type || "openvino").toLowerCase() === "onnxruntime" ||
+              (primaryDet.type || "openvino").toLowerCase() === "ort" ? (
+                <>
+                  <option value="CUDA">CUDA — NVIDIA GPU (CUDA)</option>
+                  <option value="TensorRT">TensorRT — NVIDIA GPU (FP16/INT8)</option>
+                  <option value="ROCM">ROCM — AMD GPU (ROCm / MIGraphX)</option>
+                </>
+              ) : (
+                <>
+                  <option value="GPU">GPU — Intel iGPU / Arc</option>
+                  <option value="NPU">NPU — Intel AI Boost</option>
+                </>
+              )}
             </select>
           </div>
 
@@ -1727,7 +1794,9 @@ export const AiDetectionObjectsSection: React.FC<{
                 </option>
                 {detKeys.map((dk) => (
                   <option key={dk} value={dk}>
-                    {dk} ({draftConfig.detectors?.[dk]?.device || "CPU"})
+                    {dk} (
+                    {(draftConfig.detectors?.[dk]?.type || "openvino").toUpperCase()}{" "}
+                    · {draftConfig.detectors?.[dk]?.device || "CPU"})
                   </option>
                 ))}
               </select>

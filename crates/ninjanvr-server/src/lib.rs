@@ -7006,6 +7006,27 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
+        // Verify /api/detectors/catalog exposes dual-backend telemetry & devices
+        let resp_cat = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/detectors/catalog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cat.status(), StatusCode::OK);
+        let cat_json: Value =
+            serde_json::from_slice(&to_bytes(resp_cat.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(cat_json["active_backend"], "openvino");
+        assert!(cat_json["openvino_available"].is_boolean());
+        assert!(cat_json["ort_available"].is_boolean());
+        let dev_arr = cat_json["devices"].as_array().unwrap();
+        assert!(dev_arr.iter().any(|d| d["id"] == "CUDA"));
+        assert!(dev_arr.iter().any(|d| d["id"] == "ROCM"));
+
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

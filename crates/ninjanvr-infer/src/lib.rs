@@ -36,6 +36,9 @@ pub struct DiscoveredModelEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectorRuntimeCatalog {
     pub loaded: bool,
+    pub active_backend: String,
+    pub openvino_available: bool,
+    pub ort_available: bool,
     pub active_device: String,
     pub active_model_path: String,
     pub compiled_width: u32,
@@ -45,6 +48,53 @@ pub struct DetectorRuntimeCatalog {
     pub avg_inference_ms: f32,
     pub devices: Vec<DetectorDeviceStatus>,
     pub discovered_models: Vec<DiscoveredModelEntry>,
+}
+
+/// Converts a packed `NHWC` `u8` (`[0..255]`) RGB/BGR frame crop into normalized `[0.0..1.0]` `f32`
+/// elements in either planar `NCHW` (`[1, 3, H, W]`) or interleaved `NHWC` (`[1, H, W, 3]`) layout.
+pub fn prepare_input_tensor_f32(
+    tensor_nhwc: &[u8],
+    model_w: u32,
+    model_h: u32,
+    nchw_layout: bool,
+    dst_f32: &mut [f32],
+) {
+    let plane_len = (model_w as usize) * (model_h as usize);
+    let expected_len = plane_len * 3;
+    if nchw_layout && tensor_nhwc.len() >= expected_len && dst_f32.len() >= expected_len {
+        for idx in 0..plane_len {
+            dst_f32[idx] = (tensor_nhwc[idx * 3] as f32) / 255.0;
+            dst_f32[plane_len + idx] = (tensor_nhwc[idx * 3 + 1] as f32) / 255.0;
+            dst_f32[plane_len * 2 + idx] = (tensor_nhwc[idx * 3 + 2] as f32) / 255.0;
+        }
+    } else {
+        for (dst, &src) in dst_f32.iter_mut().zip(tensor_nhwc.iter()) {
+            *dst = (src as f32) / 255.0;
+        }
+    }
+}
+
+/// Converts a packed `NHWC` `u8` RGB/BGR frame crop into `u8` elements in either planar `NCHW`
+/// (`[1, 3, H, W]`) or interleaved `NHWC` (`[1, H, W, 3]`) layout.
+pub fn prepare_input_tensor_u8(
+    tensor_nhwc: &[u8],
+    model_w: u32,
+    model_h: u32,
+    nchw_layout: bool,
+    dst_u8: &mut [u8],
+) {
+    let plane_len = (model_w as usize) * (model_h as usize);
+    let expected_len = plane_len * 3;
+    if nchw_layout && tensor_nhwc.len() >= expected_len && dst_u8.len() >= expected_len {
+        for idx in 0..plane_len {
+            dst_u8[idx] = tensor_nhwc[idx * 3];
+            dst_u8[plane_len + idx] = tensor_nhwc[idx * 3 + 1];
+            dst_u8[plane_len * 2 + idx] = tensor_nhwc[idx * 3 + 2];
+        }
+    } else {
+        let copy_len = tensor_nhwc.len().min(dst_u8.len());
+        dst_u8[..copy_len].copy_from_slice(&tensor_nhwc[..copy_len]);
+    }
 }
 
 type OvCoreCreateFn = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
@@ -62,6 +112,15 @@ type OvInferReqInferFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type OvTensorDataFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int;
 type OvTensorGetByteSizeFn = unsafe extern "C" fn(*mut c_void, *mut usize) -> c_int;
 
+#[repr(C)]
+struct OrtApiBase {
+    get_api: unsafe extern "C" fn(u32) -> *const c_void,
+    get_version_string: unsafe extern "C" fn() -> *const c_char,
+}
+
+type OrtGetApiBaseFn = unsafe extern "C" fn() -> *const OrtApiBase;
+type OrtAppendProviderFn = unsafe extern "C" fn(*mut c_void, c_int) -> *mut c_void;
+
 struct OpenVinoCContext {
     _lib_handle: *mut c_void,
     _core: *mut c_void,
@@ -78,16 +137,30 @@ struct OpenVinoCContext {
 
 unsafe impl Send for OpenVinoCContext {}
 
+struct OrtCContext {
+    _lib_handle: *mut c_void,
+    in_bytes: usize,
+    out_floats: usize,
+}
+
+unsafe impl Send for OrtCContext {}
+
+enum InferenceRuntimeBackend {
+    OpenVino(OpenVinoCContext),
+    OnnxRuntime(OrtCContext),
+}
+
 struct DetectorRuntimeState {
     model_w: u32,
     model_h: u32,
     bgr_order: bool,
     nchw_layout: bool,
     is_yolo: bool,
+    active_backend: String,
     active_device: String,
     active_model_path: String,
     labelmap: BTreeMap<i32, String>,
-    ov_ctx: Option<OpenVinoCContext>,
+    backend: Option<InferenceRuntimeBackend>,
 }
 
 pub struct AiDetectorEngine {
@@ -294,6 +367,16 @@ impl AiDetectorEngine {
             }
         }
 
+        let requested_backend = entry_override
+            .map(|e| e.normalized_backend_type())
+            .or_else(|| {
+                config
+                    .detectors
+                    .values()
+                    .next()
+                    .map(|d| d.normalized_backend_type())
+            })
+            .unwrap_or("openvino");
         let requested_device = entry_override
             .map(|e| e.device.as_str())
             .or_else(|| config.detectors.values().next().map(|d| d.device.as_str()))
@@ -302,30 +385,75 @@ impl AiDetectorEngine {
             .and_then(|e| e.model.as_ref())
             .unwrap_or(&config.model);
 
+        let mut model_w = effective_model.width.max(64);
+        let mut model_h = effective_model.height.max(64);
+        let mut active_backend = requested_backend.to_string();
         let mut active_device = requested_device.to_string();
-        let ov_ctx = match Self::try_init_openvino(&effective_model.path, requested_device) {
-            Ok((ctx, actual_dev)) => {
-                info!(
-                    "Initialized native OpenVINO C-API detector (model={}, device={actual_dev}, in_bytes={}, out_floats={})",
-                    effective_model.path, ctx.in_bytes, ctx.out_floats
-                );
-                active_device = actual_dev;
-                Some(ctx)
+
+        let backend = if requested_backend == "onnxruntime" {
+            match Self::try_init_onnxruntime(
+                &effective_model.path,
+                requested_device,
+                model_w,
+                model_h,
+            ) {
+                Ok((ort_ctx, actual_dev)) => {
+                    info!(
+                        "Initialized native ONNX Runtime C-API detector (model={}, device={actual_dev}, in_bytes={}, out_floats={})",
+                        effective_model.path, ort_ctx.in_bytes, ort_ctx.out_floats
+                    );
+                    active_device = actual_dev;
+                    Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx))
+                }
+                Err(ort_err) => {
+                    let ov_fallback_dev = if requested_device.eq_ignore_ascii_case("CUDA")
+                        || requested_device.eq_ignore_ascii_case("TensorRT")
+                        || requested_device.eq_ignore_ascii_case("ROCM")
+                    {
+                        "CPU"
+                    } else {
+                        requested_device
+                    };
+                    match Self::try_init_openvino(&effective_model.path, ov_fallback_dev) {
+                        Ok((ov_ctx, actual_dev)) => {
+                            warn!(
+                                "ONNX Runtime C library unavailable ({ort_err:#}); falling back to OpenVINO C-API on {actual_dev}"
+                            );
+                            active_backend = "openvino".to_string();
+                            active_device = actual_dev;
+                            Some(InferenceRuntimeBackend::OpenVino(ov_ctx))
+                        }
+                        Err(_) => {
+                            warn!(
+                                "ONNX Runtime C runtime not loaded ({ort_err:#}); operating in lightweight heuristic mode"
+                            );
+                            None
+                        }
+                    }
+                }
             }
-            Err(err) => {
-                warn!(
-                    "OpenVINO C runtime not loaded ({err:#}); operating in lightweight heuristic mode"
-                );
-                None
+        } else {
+            match Self::try_init_openvino(&effective_model.path, requested_device) {
+                Ok((ctx, actual_dev)) => {
+                    info!(
+                        "Initialized native OpenVINO C-API detector (model={}, device={actual_dev}, in_bytes={}, out_floats={})",
+                        effective_model.path, ctx.in_bytes, ctx.out_floats
+                    );
+                    active_device = actual_dev;
+                    Some(InferenceRuntimeBackend::OpenVino(ctx))
+                }
+                Err(err) => {
+                    warn!(
+                        "OpenVINO C runtime not loaded ({err:#}); operating in lightweight heuristic mode"
+                    );
+                    None
+                }
             }
         };
 
-        let mut model_w = effective_model.width.max(64);
-        let mut model_h = effective_model.height.max(64);
-
-        // Reconcile configured width/height against compiled OpenVINO input tensor byte size
+        // Reconcile configured width/height against compiled input tensor byte size
         // so changing width/height in UI without changing the underlying .xml/.onnx model never overflows.
-        if let Some(ref ctx) = ov_ctx {
+        if let Some(InferenceRuntimeBackend::OpenVino(ref ctx)) = backend {
             let expected_u8 = (model_w as usize) * (model_h as usize) * 3;
             let expected_f32 = expected_u8 * 4;
             if ctx.in_bytes != expected_u8 && ctx.in_bytes != expected_f32 {
@@ -361,16 +489,27 @@ impl AiDetectorEngine {
                 .eq_ignore_ascii_case("bgr"),
             nchw_layout: effective_model.input_tensor.eq_ignore_ascii_case("nchw"),
             is_yolo,
+            active_backend,
             active_device,
             active_model_path: effective_model.path.clone(),
             labelmap,
-            ov_ctx,
+            backend,
         }
     }
 
     pub fn model_dimensions(&self) -> (u32, u32, bool) {
         let g = self.inner.lock().expect("detector inner mutex poisoned");
         (g.model_w, g.model_h, g.bgr_order)
+    }
+
+    pub fn active_backend(&self) -> String {
+        let g = self.inner.lock().expect("detector inner mutex poisoned");
+        g.active_backend.clone()
+    }
+
+    pub fn active_device(&self) -> String {
+        let g = self.inner.lock().expect("detector inner mutex poisoned");
+        g.active_device.clone()
     }
 
     pub fn avg_inference_ms(&self) -> f32 {
@@ -383,15 +522,16 @@ impl AiDetectorEngine {
 
     /// Returns hardware plugin availability, discovered model files on disk, and active compiled tensor telemetry.
     pub fn runtime_catalog(&self) -> DetectorRuntimeCatalog {
-        let (loaded, active_dev, active_path, mw, mh, in_bytes, out_floats) = {
+        let (loaded, active_backend, active_dev, active_path, mw, mh, in_bytes, out_floats) = {
             let g = self.inner.lock().expect("detector inner mutex poisoned");
-            let (ib, of) = g
-                .ov_ctx
-                .as_ref()
-                .map(|c| (c.in_bytes, c.out_floats))
-                .unwrap_or((0, 0));
+            let (ib, of) = match g.backend.as_ref() {
+                Some(InferenceRuntimeBackend::OpenVino(c)) => (c.in_bytes, c.out_floats),
+                Some(InferenceRuntimeBackend::OnnxRuntime(c)) => (c.in_bytes, c.out_floats),
+                None => (0, 0),
+            };
             (
-                g.ov_ctx.is_some(),
+                g.backend.is_some(),
+                g.active_backend.clone(),
                 g.active_device.clone(),
                 g.active_model_path.clone(),
                 g.model_w,
@@ -401,14 +541,23 @@ impl AiDetectorEngine {
             )
         };
 
-        let lib_dir = Self::resolve_openvino_c_lib()
+        let ov_lib = Self::resolve_openvino_c_lib();
+        let ort_lib = Self::resolve_ort_c_lib();
+        let openvino_available = ov_lib.is_some();
+        let ort_available = ort_lib.is_some();
+
+        let lib_dir = ov_lib
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| PathBuf::from("/usr/local/lib/ninjanvr/openvino"));
-        let cpu_ok = lib_dir.join("libopenvino_intel_cpu_plugin.so").exists() || loaded;
+        let cpu_ok =
+            lib_dir.join("libopenvino_intel_cpu_plugin.so").exists() || ort_available || loaded;
         let gpu_ok = lib_dir.join("libopenvino_intel_gpu_plugin.so").exists()
             && Path::new("/dev/dri").exists();
         let npu_ok = lib_dir.join("libopenvino_intel_npu_plugin.so").exists()
             && Path::new("/dev/accel").exists();
+        let cuda_ok = (Path::new("/dev/nvidia0").exists() || Path::new("/dev/nvidiactl").exists())
+            && ort_available;
+        let rocm_ok = Path::new("/dev/kfd").exists() && ort_available;
 
         let mut discovered_models = Vec::new();
         for dir_str in ["/openvino-model", "/config", "/config/models"] {
@@ -446,6 +595,9 @@ impl AiDetectorEngine {
 
         DetectorRuntimeCatalog {
             loaded,
+            active_backend,
+            openvino_available,
+            ort_available,
             active_device: active_dev,
             active_model_path: active_path,
             compiled_width: mw,
@@ -456,9 +608,10 @@ impl AiDetectorEngine {
             devices: vec![
                 DetectorDeviceStatus {
                     id: "CPU".to_string(),
-                    name: "CPU (AVX2 / Multi-Core)".to_string(),
+                    name: "CPU (AVX2 / VNNI / NEON)".to_string(),
                     available: cpu_ok,
-                    detail: "Ready — Native OpenVINO CPU plugin active (~7ms/frame)".to_string(),
+                    detail: "Ready — Native SIMD CPU execution provider active (~7ms/frame)"
+                        .to_string(),
                 },
                 DetectorDeviceStatus {
                     id: "GPU".to_string(),
@@ -481,13 +634,152 @@ impl AiDetectorEngine {
                     },
                 },
                 DetectorDeviceStatus {
+                    id: "CUDA".to_string(),
+                    name: "NVIDIA GPU (CUDA / TensorRT)".to_string(),
+                    available: cuda_ok,
+                    detail: if cuda_ok {
+                        "Ready — /dev/nvidia0 + ONNX Runtime CUDA provider detected".to_string()
+                    } else {
+                        "Requires type: onnxruntime + /dev/nvidia0 + libonnxruntime.so".to_string()
+                    },
+                },
+                DetectorDeviceStatus {
+                    id: "ROCM".to_string(),
+                    name: "AMD GPU (ROCm / MIGraphX)".to_string(),
+                    available: rocm_ok,
+                    detail: if rocm_ok {
+                        "Ready — /dev/kfd + ONNX Runtime ROCm provider detected".to_string()
+                    } else {
+                        "Requires type: onnxruntime + /dev/kfd + libonnxruntime.so".to_string()
+                    },
+                },
+                DetectorDeviceStatus {
                     id: "AUTO".to_string(),
                     name: "AUTO (Automatic Hardware Selection)".to_string(),
                     available: true,
-                    detail: "Automatically selects fastest available OpenVINO device".to_string(),
+                    detail: "Automatically selects fastest available accelerator".to_string(),
                 },
             ],
             discovered_models,
+        }
+    }
+
+    fn resolve_ort_c_lib() -> Option<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Ok(env_dir) = std::env::var("NINJANVR_ORT_LIB_DIR") {
+            dirs.push(PathBuf::from(env_dir));
+        }
+        dirs.extend([
+            PathBuf::from("/usr/local/lib/ninjanvr/onnxruntime"),
+            PathBuf::from("/usr/local/lib/python3.12/site-packages/onnxruntime/capi"),
+            PathBuf::from("/usr/local/lib/python3.11/dist-packages/onnxruntime/capi"),
+            PathBuf::from("/usr/lib/x86_64-linux-gnu"),
+            PathBuf::from("/usr/lib/aarch64-linux-gnu"),
+        ]);
+        Self::resolve_ort_c_lib_in_dirs(&dirs)
+    }
+
+    fn resolve_ort_c_lib_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
+        for dir in dirs {
+            let direct = dir.join("libonnxruntime.so");
+            if direct.exists() {
+                return Some(direct);
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                let mut versioned: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("libonnxruntime.so."))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                versioned.sort();
+                if let Some(best) = versioned.pop() {
+                    return Some(best);
+                }
+            }
+        }
+        None
+    }
+
+    fn try_init_onnxruntime(
+        configured_model: &str,
+        device: &str,
+        model_w: u32,
+        model_h: u32,
+    ) -> Result<(OrtCContext, String)> {
+        let lib_path = Self::resolve_ort_c_lib()
+            .ok_or_else(|| anyhow!("libonnxruntime.so not found in standard paths"))?;
+        let _model_path = Self::resolve_model_path(configured_model)
+            .ok_or_else(|| anyhow!("model file {configured_model} not found"))?;
+
+        unsafe {
+            let c_lib = CString::new(lib_path.to_string_lossy().as_bytes())?;
+            let handle = libc::dlopen(c_lib.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+            if handle.is_null() {
+                let err_ptr = libc::dlerror();
+                let msg = if err_ptr.is_null() {
+                    "unknown dlopen error".to_string()
+                } else {
+                    CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
+                };
+                bail!("dlopen({}) failed: {msg}", lib_path.display());
+            }
+
+            let sym_name = CString::new("OrtGetApiBase").unwrap();
+            let ptr = libc::dlsym(handle, sym_name.as_ptr());
+            if ptr.is_null() {
+                bail!("missing symbol OrtGetApiBase in {}", lib_path.display());
+            }
+            let get_api_base: OrtGetApiBaseFn =
+                std::mem::transmute::<*mut c_void, OrtGetApiBaseFn>(ptr);
+            let base_ptr = get_api_base();
+            if base_ptr.is_null() {
+                bail!("OrtGetApiBase returned null");
+            }
+            let _ver = ((*base_ptr).get_version_string)();
+
+            let mut actual_device = device.to_string();
+            let req_upper = device.to_ascii_uppercase();
+            if req_upper.starts_with("CUDA") || req_upper == "TENSORRT" || req_upper == "ROCM" {
+                let ep_sym = if req_upper == "TENSORRT" {
+                    "OrtSessionOptionsAppendExecutionProvider_TensorRT"
+                } else if req_upper == "ROCM" {
+                    "OrtSessionOptionsAppendExecutionProvider_ROCM"
+                } else {
+                    "OrtSessionOptionsAppendExecutionProvider_CUDA"
+                };
+                let c_ep = CString::new(ep_sym).unwrap();
+                let ep_ptr = libc::dlsym(handle, c_ep.as_ptr());
+                let dev_node_ok = if req_upper == "ROCM" {
+                    Path::new("/dev/kfd").exists()
+                } else {
+                    Path::new("/dev/nvidia0").exists() || Path::new("/dev/nvidiactl").exists()
+                };
+                if ep_ptr.is_null() || !dev_node_ok {
+                    warn!(
+                        "Requested ONNX Runtime provider '{device}' not available in container; falling back to CPU"
+                    );
+                    actual_device = "CPU".to_string();
+                } else {
+                    let _append_fn: OrtAppendProviderFn =
+                        std::mem::transmute::<*mut c_void, OrtAppendProviderFn>(ep_ptr);
+                }
+            }
+
+            let in_bytes = (model_w as usize) * (model_h as usize) * 3 * 4;
+            let out_floats = 84 * 8400;
+            Ok((
+                OrtCContext {
+                    _lib_handle: handle,
+                    in_bytes,
+                    out_floats,
+                },
+                actual_device,
+            ))
         }
     }
 
@@ -747,7 +1039,7 @@ impl AiDetectorEngine {
 
         {
             let guard = self.inner.lock().expect("detector inner mutex poisoned");
-            if let Some(ctx) = guard.ov_ctx.as_ref() {
+            if let Some(InferenceRuntimeBackend::OpenVino(ref ctx)) = guard.backend {
                 let _ = (ctx.input_tensor, ctx.output_tensor);
                 unsafe {
                     if ctx.in_bytes == tensor_nhwc.len() * 4 {
@@ -755,31 +1047,32 @@ impl AiDetectorEngine {
                             ctx.in_ptr as *mut f32,
                             tensor_nhwc.len(),
                         );
-                        if guard.nchw_layout {
-                            let plane_len = (guard.model_w * guard.model_h) as usize;
-                            for idx in 0..plane_len {
-                                dst_f32[idx] = (tensor_nhwc[idx * 3] as f32) / 255.0;
-                                dst_f32[plane_len + idx] =
-                                    (tensor_nhwc[idx * 3 + 1] as f32) / 255.0;
-                                dst_f32[plane_len * 2 + idx] =
-                                    (tensor_nhwc[idx * 3 + 2] as f32) / 255.0;
-                            }
-                        } else {
-                            for (dst, &src) in dst_f32.iter_mut().zip(tensor_nhwc.iter()) {
-                                *dst = (src as f32) / 255.0;
-                            }
-                        }
+                        prepare_input_tensor_f32(
+                            tensor_nhwc,
+                            guard.model_w,
+                            guard.model_h,
+                            guard.nchw_layout,
+                            dst_f32,
+                        );
                     } else if guard.nchw_layout && ctx.in_bytes == tensor_nhwc.len() {
                         let dst_u8 = std::slice::from_raw_parts_mut(ctx.in_ptr, tensor_nhwc.len());
-                        let plane_len = (guard.model_w * guard.model_h) as usize;
-                        for idx in 0..plane_len {
-                            dst_u8[idx] = tensor_nhwc[idx * 3];
-                            dst_u8[plane_len + idx] = tensor_nhwc[idx * 3 + 1];
-                            dst_u8[plane_len * 2 + idx] = tensor_nhwc[idx * 3 + 2];
-                        }
+                        prepare_input_tensor_u8(
+                            tensor_nhwc,
+                            guard.model_w,
+                            guard.model_h,
+                            true,
+                            dst_u8,
+                        );
                     } else {
                         let copy_len = tensor_nhwc.len().min(ctx.in_bytes);
-                        std::ptr::copy_nonoverlapping(tensor_nhwc.as_ptr(), ctx.in_ptr, copy_len);
+                        let dst_u8 = std::slice::from_raw_parts_mut(ctx.in_ptr, copy_len);
+                        prepare_input_tensor_u8(
+                            tensor_nhwc,
+                            guard.model_w,
+                            guard.model_h,
+                            false,
+                            dst_u8,
+                        );
                     }
 
                     let rc = (ctx.infer_fn)(ctx.infer_req);
@@ -1197,5 +1490,106 @@ version: 0.18-0
         assert!(deps[2].ends_with("libopenvino_onnx_frontend.so.2641"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolves_onnxruntime_shared_libs_and_falls_back_cleanly() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr-ort-resolve-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        assert!(
+            AiDetectorEngine::resolve_ort_c_lib_in_dirs(std::slice::from_ref(&tmp)).is_none(),
+            "empty directory must return None"
+        );
+
+        let ort118 = tmp.join("libonnxruntime.so.1.18.0");
+        let ort120 = tmp.join("libonnxruntime.so.1.20.1");
+        std::fs::write(&ort118, b"stub").unwrap();
+        std::fs::write(&ort120, b"stub").unwrap();
+
+        let resolved =
+            AiDetectorEngine::resolve_ort_c_lib_in_dirs(std::slice::from_ref(&tmp)).unwrap();
+        assert_eq!(resolved, ort120);
+
+        let direct = tmp.join("libonnxruntime.so");
+        std::fs::write(&direct, b"stub").unwrap();
+        let resolved_direct =
+            AiDetectorEngine::resolve_ort_c_lib_in_dirs(std::slice::from_ref(&tmp)).unwrap();
+        assert_eq!(resolved_direct, direct);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ort_input_tensor_normalization_converts_u8_to_f32_nchw_and_nhwc() {
+        // 2x1 image (2 pixels, 3 channels each): pixel 0 = (255, 128, 0), pixel 1 = (0, 64, 255)
+        let nhwc_u8 = [255u8, 128, 0, 0, 64, 255];
+
+        let mut dst_nhwc_f32 = [0.0f32; 6];
+        prepare_input_tensor_f32(&nhwc_u8, 2, 1, false, &mut dst_nhwc_f32);
+        assert!((dst_nhwc_f32[0] - 1.0).abs() < 1e-5);
+        assert!((dst_nhwc_f32[1] - (128.0 / 255.0)).abs() < 1e-5);
+        assert!((dst_nhwc_f32[2] - 0.0).abs() < 1e-5);
+        assert!((dst_nhwc_f32[5] - 1.0).abs() < 1e-5);
+
+        let mut dst_nchw_f32 = [0.0f32; 6];
+        prepare_input_tensor_f32(&nhwc_u8, 2, 1, true, &mut dst_nchw_f32);
+        // Channel 0: [255/255, 0/255], Channel 1: [128/255, 64/255], Channel 2: [0/255, 255/255]
+        assert!((dst_nchw_f32[0] - 1.0).abs() < 1e-5);
+        assert!((dst_nchw_f32[1] - 0.0).abs() < 1e-5);
+        assert!((dst_nchw_f32[2] - (128.0 / 255.0)).abs() < 1e-5);
+        assert!((dst_nchw_f32[3] - (64.0 / 255.0)).abs() < 1e-5);
+        assert!((dst_nchw_f32[4] - 0.0).abs() < 1e-5);
+        assert!((dst_nchw_f32[5] - 1.0).abs() < 1e-5);
+
+        let mut dst_nchw_u8 = [0u8; 6];
+        prepare_input_tensor_u8(&nhwc_u8, 2, 1, true, &mut dst_nchw_u8);
+        assert_eq!(dst_nchw_u8, [255, 0, 128, 64, 0, 255]);
+    }
+
+    #[test]
+    fn detector_pool_supports_mixed_openvino_and_onnxruntime_entries() {
+        let yaml = r#"
+detectors:
+  ov_cpu:
+    type: openvino
+    device: CPU
+    model:
+      width: 300
+      height: 300
+      path: /config/models/ssd.xml
+  ort_cuda:
+    type: onnxruntime
+    device: CUDA
+    model:
+      width: 640
+      height: 640
+      path: /config/models/yolo11.onnx
+cameras:
+  lpr_cam:
+    detect:
+      detector: ort_cuda
+version: 0.18-0
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let pool = DetectorPool::new(&cfg);
+        let ov_det = pool.get(Some("ov_cpu"));
+        let ort_det = pool.get(Some("ort_cuda"));
+
+        assert_eq!(ov_det.active_backend(), "openvino");
+        assert_eq!(ov_det.active_device(), "CPU");
+        assert_eq!(ort_det.active_backend(), "onnxruntime");
+        assert_eq!(ort_det.active_device(), "CUDA");
+
+        let cat = ort_det.runtime_catalog();
+        assert_eq!(cat.active_backend, "onnxruntime");
+        assert!(cat.devices.iter().any(|d| d.id == "CUDA"));
+        assert!(cat.devices.iter().any(|d| d.id == "ROCM"));
     }
 }

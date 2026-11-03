@@ -194,9 +194,31 @@ export interface CameraConfig {
   audio?: AudioConfig;
 }
 
+export interface DetectorDeviceStatus {
+  id: string;
+  name: string;
+  available: boolean;
+  detail: string;
+}
+
+export interface DetectorRuntimeCatalog {
+  loaded: boolean;
+  active_backend: "openvino" | "onnxruntime" | string;
+  openvino_available?: boolean;
+  ort_available?: boolean;
+  active_device: string;
+  active_model_path: string;
+  compiled_width: number;
+  compiled_height: number;
+  in_bytes: number;
+  out_floats: number;
+  avg_inference_ms: number;
+  devices: DetectorDeviceStatus[];
+}
+
 export interface DetectorEntryConfig {
-  type: string;
-  device: string;
+  type: "openvino" | "onnxruntime" | string;
+  device: "CPU" | "GPU" | "NPU" | "AUTO" | "CUDA" | "TensorRT" | "ROCM" | string;
   model?: ModelConfig;
 }
 

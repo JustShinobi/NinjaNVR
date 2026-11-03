@@ -50,16 +50,16 @@ If you are evaluating NinjaNVR for existing NVR hardware, check the support matr
 * **`ARM64` (`aarch64` / Raspberry Pi / Rockchip)**: No prebuilt container images are published today. The Rust workspace compiles on ARM64 Linux from source, but the bundled OpenVINO runtime in the container targets `x86_64`.
 
 ### 2. AI Inference Accelerators (`ninjanvr-infer`)
-NinjaNVR uses the **Intel OpenVINO C Runtime (`2026.4.1`)** exclusively for AI inference (`.xml`/`.bin` IR and `.onnx` models):
+NinjaNVR supports a **Dual-Backend Inference Engine**: **Intel OpenVINO C Runtime (`2026.4.1`, `type: openvino`)** bundled by default in the container image, plus dynamic **ONNX Runtime C-API (`type: onnxruntime`)** when `libonnxruntime.so` is mounted or installed:
 
-| Hardware / Accelerator | Status | Notes |
-| :--- | :--- | :--- |
-| **x86_64 CPU (Intel & AMD)** | **Supported (Default)** | Uses `libopenvino_intel_cpu_plugin.so` (AVX2 / AVX-512 / VNNI). Because SIMD motion detection gates inference, 4 cameras at 5 FPS typically use < 4% CPU without a discrete accelerator. |
-| **Intel iGPU / Arc (`device: GPU`)** | **Experimental** | `libopenvino_intel_gpu_plugin.so` is bundled. Requires passing `/dev/dri` into the container and host/container OpenCL ICD runtime drivers. Automatically falls back to `CPU` if initialization fails. |
-| **Intel Core Ultra NPU (`device: NPU`)** | **Experimental** | `libopenvino_intel_npu_plugin.so` is bundled. Requires passing `/dev/accel` into the container and Linux NPU driver support. Automatically falls back to `CPU` if unavailable. |
-| **Google Coral EdgeTPU (USB / PCIe)** | **Not Supported** | Coral `libedgetpu` / TFLite models are not used. Switch `detectors:` in `config.yml` to `type: openvino` (`device: CPU`). |
-| **Hailo-8 / Hailo-8L** | **Not Supported** | HailoRT is not integrated. |
-| **NVIDIA GPU (CUDA / TensorRT)** | **Not Supported** | ONNX Runtime CUDA / TensorRT execution providers are not bundled in the runtime image. |
+| Hardware / Accelerator | Backend & Config | Status | Notes |
+| :--- | :--- | :--- | :--- |
+| **x86_64 CPU (Intel & AMD)** | `type: openvino`<br>`device: CPU` | **Supported (Default)** | Uses `libopenvino_intel_cpu_plugin.so` (AVX2 / AVX-512 / VNNI). Because SIMD motion detection gates inference, 4 cameras at 5 FPS typically use < 4% CPU without a discrete accelerator. |
+| **Intel iGPU / Arc** | `type: openvino`<br>`device: GPU` | **Experimental** | `libopenvino_intel_gpu_plugin.so` is bundled. Requires `/dev/dri` passthrough and OpenCL ICD runtime drivers. Automatically falls back to `CPU` if unavailable. |
+| **Intel Core Ultra NPU** | `type: openvino`<br>`device: NPU` | **Experimental** | `libopenvino_intel_npu_plugin.so` is bundled. Requires `/dev/accel` passthrough and Linux NPU driver support. Automatically falls back to `CPU` if unavailable. |
+| **NVIDIA GPU (CUDA / TensorRT)** | `type: onnxruntime`<br>`device: CUDA` or `TensorRT` | **Supported (External ORT)** | Dynamically loads `libonnxruntime.so` (`NINJANVR_ORT_LIB_DIR` or `/usr/local/lib/ninjanvr/onnxruntime`) with `/dev/nvidia0` passthrough; falls back to OpenVINO/CPU if unavailable. |
+| **AMD GPU (ROCm)** | `type: onnxruntime`<br>`device: ROCM` | **Supported (External ORT)** | Dynamically loads `libonnxruntime.so` with `/dev/kfd` + `/dev/dri` passthrough; falls back to OpenVINO/CPU if unavailable. |
+| **Google Coral EdgeTPU / Hailo-8** | — | **Not Supported** | `libedgetpu` (TFLite) and HailoRT are not used. Switch `detectors:` in `config.yml` to `type: openvino` (`device: CPU`) or `type: onnxruntime`. |
 
 ### 3. Video Decoding, Recording & Cameras
 * **Recording (`record` role)**: Uses FFmpeg stream copy (`-c:v copy`) directly to 10-second MP4 segments on disk. H.264 and H.265 main streams (1080p/4K) add negligible CPU load.

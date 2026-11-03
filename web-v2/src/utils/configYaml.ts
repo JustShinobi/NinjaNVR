@@ -151,7 +151,7 @@ function toYamlLines(val: unknown, indent = 0): string[] {
  */
 export function buildCleanYamlFromDraft(
   draft: NinjaConfigResponse,
-  originalRawYaml: string
+  originalRawYaml: string = ""
 ): string {
   const originals = extractOriginalUrls(originalRawYaml);
 
@@ -272,6 +272,7 @@ export function buildCleanYamlFromDraft(
     detectorsOut[dName] = {
       type: dCfg.type || "openvino",
       device: dCfg.device || "CPU",
+      ...(dCfg.model ? { model: dCfg.model } : {}),
     };
   }
 
