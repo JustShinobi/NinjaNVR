@@ -96,6 +96,20 @@ export function formatTs(unixSec: number): string {
   });
 }
 
+export function formatClockTime(unixSec: number): string {
+  return formatTs(unixSec);
+}
+
+export function formatDuration(sec: number): string {
+  const total = Math.max(1, Math.round(sec));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m === 0) return `${s}s`;
+  return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
 export function formatDateTime(unixSec: number): string {
   const d = new Date(unixSec * 1000);
   return d.toLocaleString([], {

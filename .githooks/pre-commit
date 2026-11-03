@@ -115,8 +115,9 @@ if [[ "$has_rust" -eq 1 ]]; then
 fi
 
 if [[ "$has_web" -eq 1 ]]; then
-  echo "==> [pre-commit] Verifying web-v2 TypeScript types..."
+  echo "==> [pre-commit] Verifying web-v2 TypeScript types and unit tests..."
   bun run --cwd web-v2 typecheck
+  bun run --cwd web-v2 test
 fi
 
 if [[ "$has_docs" -eq 1 ]]; then

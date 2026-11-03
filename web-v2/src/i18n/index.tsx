@@ -3,7 +3,7 @@ import { en, TranslationDict } from "./en";
 
 export type SupportedLocale = "en" | "pt";
 
-const pt: TranslationDict = {
+export const pt: TranslationDict = {
   brand: {
     name: "NinjaNVR",
     release: "CONSOLE",
@@ -131,12 +131,12 @@ const pt: TranslationDict = {
   },
 };
 
-const locales: Record<SupportedLocale, TranslationDict> = {
+export const locales: Record<SupportedLocale, TranslationDict> = {
   en,
   pt,
 };
 
-function resolveInitialLocale(): SupportedLocale {
+export function resolveInitialLocale(): SupportedLocale {
   if (typeof window === "undefined") return "en";
   const saved = window.localStorage?.getItem("ninjanvr_locale");
   if (saved === "pt" || saved === "en") return saved;

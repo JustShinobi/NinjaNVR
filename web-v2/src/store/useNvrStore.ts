@@ -160,6 +160,8 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
         "ninjanvr_use_main_stream",
         "ninjanvr_show_vectors",
         "ninjanvr_show_alert_ribbon",
+        "ninjanvr_audible_chime",
+        "ninjanvr_browser_notifications",
         "ninjanvr_first_weekday",
         "ninjanvr_playback_speed",
       ].forEach((k) => window.localStorage?.removeItem(k));
@@ -170,6 +172,8 @@ export const useNvrStore = create<NvrRealtimeState>((set) => ({
       useMainStream: false,
       showVectors: false,
       showAlertRibbon: true,
+      audibleAlertChime: false,
+      browserNotifications: false,
       firstWeekday: "sunday",
       playbackSpeed: 1,
     });

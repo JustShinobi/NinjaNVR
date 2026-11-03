@@ -341,14 +341,14 @@ export function coordStringToPoints(
   return out;
 }
 
-interface ContainedBox {
+export interface ContainedBox {
   left: number;
   top: number;
   width: number;
   height: number;
 }
 
-function computeContainedBox(
+export function computeContainedBox(
   containerW: number,
   containerH: number,
   mediaW: number,

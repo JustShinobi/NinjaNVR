@@ -5838,10 +5838,22 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    #[tokio::test]
-    async fn router_serves_version_config_stats_and_auth() {
+    struct TestApp {
+        tmp_dir: PathBuf,
+        cfg_path: PathBuf,
+        state: AppState,
+        app: Router,
+    }
+
+    impl Drop for TestApp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.tmp_dir);
+        }
+    }
+
+    async fn setup_test_app() -> TestApp {
         let tmp_dir =
-            std::env::temp_dir().join(format!("ninjanvr-srv-test-{}", rand::random::<u32>()));
+            std::env::temp_dir().join(format!("ninjanvr-srv-test-{}", rand::random::<u64>()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let db_path = tmp_dir.join("ninjanvr.db");
         let cfg_path = tmp_dir.join("config.yml");
@@ -5882,7 +5894,117 @@ version: 0.18-0
             .unwrap();
         let app = build_router(state.clone());
 
-        // 1. Test /api/version
+        TestApp {
+            tmp_dir,
+            cfg_path,
+            state,
+            app,
+        }
+    }
+
+    fn make_mp4_box(box_type: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let total = (8 + payload.len()) as u32;
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(box_type);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn make_mp4_full_box(box_type: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
+        let total = (12 + body.len()) as u32;
+        let mut out = Vec::with_capacity(12 + body.len());
+        out.extend_from_slice(&total.to_be_bytes());
+        out.extend_from_slice(box_type);
+        let vf = ((version as u32) << 24) | (flags & 0x00FF_FFFF);
+        out.extend_from_slice(&vf.to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn build_synthetic_mp4_bytes() -> Vec<u8> {
+        let ftyp = make_mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+        let video_sample = vec![0x65u8; 64];
+        let mdat_offset = (ftyp.len() + 8) as u32;
+        let mdat = make_mp4_box(b"mdat", &video_sample);
+
+        let mut tkhd_body = vec![0u8; 80];
+        tkhd_body[8..12].copy_from_slice(&1u32.to_be_bytes());
+        tkhd_body[72..76].copy_from_slice(&(640u32 << 16).to_be_bytes());
+        tkhd_body[76..80].copy_from_slice(&(480u32 << 16).to_be_bytes());
+        let tkhd = make_mp4_full_box(b"tkhd", 0, 3, &tkhd_body);
+
+        let mut mdhd_body = vec![0u8; 20];
+        mdhd_body[8..12].copy_from_slice(&90000u32.to_be_bytes());
+        mdhd_body[12..16].copy_from_slice(&900000u32.to_be_bytes());
+        let mdhd = make_mp4_full_box(b"mdhd", 0, 0, &mdhd_body);
+
+        let mut hdlr_body = vec![0u8; 20];
+        hdlr_body[4..8].copy_from_slice(b"vide");
+        let hdlr = make_mp4_full_box(b"hdlr", 0, 0, &hdlr_body);
+
+        let stsd = make_mp4_full_box(b"stsd", 0, 0, &[0, 0, 0, 1]);
+        let mut stsz_body = Vec::new();
+        stsz_body.extend_from_slice(&(video_sample.len() as u32).to_be_bytes());
+        stsz_body.extend_from_slice(&1u32.to_be_bytes());
+        let stsz = make_mp4_full_box(b"stsz", 0, 0, &stsz_body);
+
+        let mut stts_body = Vec::new();
+        stts_body.extend_from_slice(&1u32.to_be_bytes());
+        stts_body.extend_from_slice(&1u32.to_be_bytes());
+        stts_body.extend_from_slice(&900000u32.to_be_bytes());
+        let stts = make_mp4_full_box(b"stts", 0, 0, &stts_body);
+
+        let mut stsc_body = Vec::new();
+        stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        let stsc = make_mp4_full_box(b"stsc", 0, 0, &stsc_body);
+
+        let mut stco_body = Vec::new();
+        stco_body.extend_from_slice(&1u32.to_be_bytes());
+        stco_body.extend_from_slice(&mdat_offset.to_be_bytes());
+        let stco = make_mp4_full_box(b"stco", 0, 0, &stco_body);
+
+        let mut stbl_children = Vec::new();
+        stbl_children.extend_from_slice(&stsd);
+        stbl_children.extend_from_slice(&stsz);
+        stbl_children.extend_from_slice(&stts);
+        stbl_children.extend_from_slice(&stsc);
+        stbl_children.extend_from_slice(&stco);
+        let stbl = make_mp4_box(b"stbl", &stbl_children);
+        let minf = make_mp4_box(b"minf", &stbl);
+
+        let mut mdia_children = Vec::new();
+        mdia_children.extend_from_slice(&mdhd);
+        mdia_children.extend_from_slice(&hdlr);
+        mdia_children.extend_from_slice(&minf);
+        let mdia = make_mp4_box(b"mdia", &mdia_children);
+
+        let mut trak_children = Vec::new();
+        trak_children.extend_from_slice(&tkhd);
+        trak_children.extend_from_slice(&mdia);
+        let vide_trak = make_mp4_box(b"trak", &trak_children);
+
+        let mvhd = make_mp4_full_box(b"mvhd", 0, 0, &[0u8; 96]);
+        let mut moov_children = Vec::new();
+        moov_children.extend_from_slice(&mvhd);
+        moov_children.extend_from_slice(&vide_trak);
+        let moov = make_mp4_box(b"moov", &moov_children);
+
+        let mut mp4_bytes = Vec::new();
+        mp4_bytes.extend_from_slice(&ftyp);
+        mp4_bytes.extend_from_slice(&mdat);
+        mp4_bytes.extend_from_slice(&moov);
+        mp4_bytes
+    }
+
+    #[tokio::test]
+    async fn router_serves_version_config_and_dual_ui_routing() {
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+
         let resp = app
             .clone()
             .oneshot(
@@ -5897,7 +6019,6 @@ version: 0.18-0
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], NINJANVR_VERSION.as_bytes());
 
-        // 2. Test /api/config and verify RTSP password scrubbing
         let resp = app
             .clone()
             .oneshot(
@@ -5916,7 +6037,6 @@ version: 0.18-0
         let val: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(val["cameras"]["front_door"]["detect"]["width"], 640);
 
-        // 3. Test unknown /api/* returns 404 JSON instead of SPA index.html
         let resp = app
             .clone()
             .oneshot(
@@ -5929,7 +6049,6 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // 4. Test SPA index fallback (always serves Console v2, even with legacy ninjanvr_ui=v1 cookie)
         let resp = app
             .clone()
             .oneshot(
@@ -5990,53 +6109,6 @@ version: 0.18-0
                 .contains("ninjanvr_ui=v2")
         );
 
-        // 5. Test /exports/*.mp4 is served uncompressed with Accept-Ranges and exact Content-Length
-        let exports_dir = tmp_dir.join("exports");
-        std::fs::create_dir_all(&exports_dir).unwrap();
-        let dummy_mp4 = vec![0x42u8; 4096];
-        std::fs::write(exports_dir.join("sample.mp4"), &dummy_mp4).unwrap();
-
-        let resp_mp4 = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/exports/sample.mp4")
-                    .header(header::ACCEPT_ENCODING, "gzip, br")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_mp4.status(), StatusCode::OK);
-        assert!(
-            resp_mp4.headers().get(header::CONTENT_ENCODING).is_none(),
-            "MP4 exports must not be Brotli/Gzip compressed by CompressionLayer"
-        );
-        assert_eq!(
-            resp_mp4
-                .headers()
-                .get(header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok()),
-            Some("4096")
-        );
-
-        // 6. Test POST /api/export with no segments returns 400 and cleans up in_progress row
-        let resp_exp_err = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/export/front_door/start/1000/end/1060")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"name":"missing_clip"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_exp_err.status(), StatusCode::BAD_REQUEST);
-        assert!(state.db.query_exports().unwrap().is_empty());
-
-        // 7. Test /api/config/structured preserves scrubbed credentials and persists config.yml
         let mut cfg_patch = val.clone();
         cfg_patch["cameras"]["front_door"]["detect"]["fps"] = json!(8);
         let resp_struct = app
@@ -6060,10 +6132,159 @@ version: 0.18-0
             struct_body["config"]["cameras"]["front_door"]["detect"]["fps"],
             8
         );
-        let on_disk_yaml = std::fs::read_to_string(&cfg_path).unwrap();
+        let on_disk_yaml = std::fs::read_to_string(&ctx.cfg_path).unwrap();
         assert!(on_disk_yaml.contains("admin:supersecret@192.0.2.10:554/stream1"));
 
-        // 8. Test /api/users CRUD endpoints
+        let resp_probe_err = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/streams/probe")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"url":"rtsp://admin:topsecretpass@192.0.2.99:554/unreachable_stream"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_probe_err.status(), StatusCode::OK);
+        let probe_err_bytes = to_bytes(resp_probe_err.into_body(), 8192).await.unwrap();
+        let probe_err_str = std::str::from_utf8(&probe_err_bytes).unwrap();
+        assert!(
+            !probe_err_str.contains("topsecretpass"),
+            "probe output must scrub RTSP credentials"
+        );
+        let probe_err_json: Value = serde_json::from_slice(&probe_err_bytes).unwrap();
+        assert_eq!(probe_err_json["ok"], false);
+
+        let resp_prof_set = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/profile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"profile":"home"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_prof_set.status(), StatusCode::OK);
+        let resp_prof_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/profile/active")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let prof_json: Value =
+            serde_json::from_slice(&to_bytes(resp_prof_get.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(prof_json["active_profile"], "home");
+
+        for aux_uri in [
+            "/version",
+            "/api/ui/version",
+            "/api/profile",
+            "/api/config/raw",
+            "/api/config/raw_paths",
+            "/api/config/schema.json",
+            "/api/detectors/catalog",
+            "/api/ffmpeg/presets",
+            "/api/ffprobe",
+            "/api/keyframe_analysis",
+            "/api/profiles",
+            "/api/labels",
+            "/api/sub_labels",
+            "/api/audio_labels",
+            "/api/recognized_license_plates",
+            "/api/classification/attributes",
+            "/api/classification/custom",
+            "/api/genai/models",
+            "/api/plus/models",
+            "/api/faces",
+            "/login",
+        ] {
+            let r = app
+                .clone()
+                .oneshot(Request::builder().uri(aux_uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "failed on {aux_uri}");
+        }
+
+        let resp_cfg_set = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/config/set")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cfg_set.status(), StatusCode::OK);
+
+        let resp_restart = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/restart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_restart.status(), StatusCode::OK);
+
+        let raw_disk = std::fs::read_to_string(&ctx.cfg_path).unwrap();
+        let resp_cfg_save = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/save")
+                    .body(Body::from(raw_disk))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cfg_save.status(), StatusCode::OK);
+
+        let resp_cat = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/detectors/catalog")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cat.status(), StatusCode::OK);
+        let cat_json: Value =
+            serde_json::from_slice(&to_bytes(resp_cat.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(cat_json["active_backend"], "openvino");
+        assert!(cat_json["openvino_available"].is_boolean());
+        assert!(cat_json["ort_available"].is_boolean());
+        let dev_arr = cat_json["devices"].as_array().unwrap();
+        assert!(dev_arr.iter().any(|d| d["id"] == "CUDA"));
+        assert!(dev_arr.iter().any(|d| d["id"] == "ROCM"));
+    }
+
+    #[tokio::test]
+    async fn router_enforces_rbac_camera_scoping_and_api_tokens() {
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+        let state = &ctx.state;
+
         let resp_create_user = app
             .clone()
             .oneshot(
@@ -6094,6 +6315,20 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_role.status(), StatusCode::OK);
 
+        let resp_cams = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/users/operator2/cameras")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"allowed_cameras":"front_door"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cams.status(), StatusCode::OK);
+
         let resp_pw = app
             .clone()
             .oneshot(
@@ -6121,7 +6356,77 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_del_user.status(), StatusCode::OK);
 
-        // 9. Test enforce_auth=true router blocks unauthenticated /api/config with 401
+        let resp_users_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/users")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_users_list.status(), StatusCode::OK);
+
+        let resp_tok_http_create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/tokens")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"temp_tok","scope":"read_only"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_tok_http_create.status(), StatusCode::OK);
+        let tok_http_json: Value = serde_json::from_slice(
+            &to_bytes(resp_tok_http_create.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let created_tok_id = tok_http_json["metadata"]["id"].as_str().unwrap();
+
+        let resp_tok_http_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/tokens/{created_tok_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_tok_http_del.status(), StatusCode::OK);
+
+        let resp_logout = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/logout")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_logout.status(), StatusCode::SEE_OTHER);
+
+        let resp_proxy_sub = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/camera-proxy/non_existent_cam/cgi-bin/config.cgi")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_proxy_sub.status(), StatusCode::NOT_FOUND);
+
         let auth_app = build_router_with_auth(state.clone(), true);
         let resp = auth_app
             .clone()
@@ -6135,243 +6440,6 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // 10. Test degraded storage mount guard: unwritable media_dir boots cleanly and reports storage_degraded=true
-        let blocked_media_path = tmp_dir.join("unwritable_mount_file");
-        std::fs::write(&blocked_media_path, b"not_a_directory").unwrap();
-        let degraded_state = new_app_state(
-            &cfg_path,
-            tmp_dir.join("web-v2"),
-            blocked_media_path.clone(),
-            false,
-        )
-        .await
-        .expect("server must boot even when media_dir is unwritable");
-        let degraded_app = build_router(degraded_state);
-        let resp_deg = degraded_app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/stats")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_deg.status(), StatusCode::OK);
-        let deg_json: Value =
-            serde_json::from_slice(&to_bytes(resp_deg.into_body(), 65536).await.unwrap()).unwrap();
-        assert_eq!(deg_json["service"]["storage_degraded"], true);
-        assert!(deg_json["service"]["storage_error"].is_string());
-
-        // Auto-recovery when mount becomes a writable directory
-        std::fs::remove_file(&blocked_media_path).unwrap();
-        std::fs::create_dir_all(&blocked_media_path).unwrap();
-        let resp_rec = degraded_app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/stats")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let rec_json: Value =
-            serde_json::from_slice(&to_bytes(resp_rec.into_body(), 65536).await.unwrap()).unwrap();
-        assert_eq!(rec_json["service"]["storage_degraded"], false);
-
-        // 11. Test DELETE /api/:camera/recordings and POST /api/recordings/sync
-        let rec_subdir = tmp_dir.join("recordings/2026-11-01/00/front_door");
-        std::fs::create_dir_all(&rec_subdir).unwrap();
-        let disk_seg_1 = rec_subdir.join("00.00.mp4");
-        std::fs::write(&disk_seg_1, vec![0x11u8; 1024]).unwrap();
-
-        state
-            .db
-            .insert_recording(&ninjanvr_db::RecordingRow {
-                id: "seg_on_disk".to_string(),
-                camera: "front_door".to_string(),
-                path: "/media/ninjanvr/recordings/2026-11-01/00/front_door/00.00.mp4".to_string(),
-                start_time: 2000.0,
-                end_time: 2010.0,
-                duration: 10.0,
-                motion: 1,
-                objects: 0,
-                dbfs: 0,
-                segment_size: 0.001,
-                regions: 0,
-                motion_heatmap: None,
-            })
-            .unwrap();
-        state
-            .db
-            .insert_recording(&ninjanvr_db::RecordingRow {
-                id: "seg_ghost".to_string(),
-                camera: "front_door".to_string(),
-                path: "/media/ninjanvr/recordings/2026-11-01/00/front_door/00.10.mp4".to_string(),
-                start_time: 2010.0,
-                end_time: 2020.0,
-                duration: 10.0,
-                motion: 0,
-                objects: 0,
-                dbfs: 0,
-                segment_size: 0.001,
-                regions: 0,
-                motion_heatmap: None,
-            })
-            .unwrap();
-
-        let resp_sync = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/recordings/sync")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_sync.status(), StatusCode::OK);
-        let sync_json: Value =
-            serde_json::from_slice(&to_bytes(resp_sync.into_body(), 4096).await.unwrap()).unwrap();
-        assert_eq!(sync_json["removed_orphans"], 1);
-
-        let resp_del_rec = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri("/api/front_door/recordings?after=1995&before=2015")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_del_rec.status(), StatusCode::OK);
-        let del_rec_json: Value =
-            serde_json::from_slice(&to_bytes(resp_del_rec.into_body(), 4096).await.unwrap())
-                .unwrap();
-        assert_eq!(del_rec_json["deleted_segments"], 1);
-        assert_eq!(del_rec_json["freed_bytes"], 1024);
-        assert!(!disk_seg_1.exists());
-
-        // 12. Test GET /api/:camera/latest.jpg serves persisted last-online snapshot and X-Last-Frame-Timestamp header
-        let clips_dir = tmp_dir.join("clips");
-        std::fs::create_dir_all(&clips_dir).unwrap();
-        let disk_latest = clips_dir.join("latest_front_door.jpg");
-        let fake_jpeg = vec![
-            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0xFF, 0xD9,
-        ];
-        std::fs::write(&disk_latest, &fake_jpeg).unwrap();
-        state.camera_metrics.write().await.insert(
-            "front_door".to_string(),
-            pipeline::CameraRuntimeMetrics {
-                camera_fps: 0.0,
-                process_fps: 0.0,
-                detection_fps: 0.0,
-                pid: 123,
-                last_frame_ts: 1730500123.0,
-                night_mode: false,
-            },
-        );
-
-        let resp_latest = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/front_door/latest.jpg")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_latest.status(), StatusCode::OK);
-        assert_eq!(
-            resp_latest
-                .headers()
-                .get("x-last-frame-timestamp")
-                .and_then(|v| v.to_str().ok()),
-            Some("1730500123")
-        );
-        let latest_body = to_bytes(resp_latest.into_body(), 4096).await.unwrap();
-        assert_eq!(&latest_body[..], &fake_jpeg[..]);
-
-        // 13. Test POST /api/streams/probe never leaks RTSP credentials on probe errors
-        let resp_probe_err = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/streams/probe")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"url":"rtsp://admin:topsecretpass@192.0.2.99:554/unreachable_stream"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_probe_err.status(), StatusCode::OK);
-        let probe_err_bytes = to_bytes(resp_probe_err.into_body(), 8192).await.unwrap();
-        let probe_err_str = std::str::from_utf8(&probe_err_bytes).unwrap();
-        assert!(
-            !probe_err_str.contains("topsecretpass"),
-            "probe output must scrub RTSP credentials"
-        );
-        let probe_err_json: Value = serde_json::from_slice(&probe_err_bytes).unwrap();
-        assert_eq!(probe_err_json["ok"], false);
-
-        // 14. Test POST /api/profile switches operational security profile and persists state
-        let resp_prof_set = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/profile")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"profile":"home"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_prof_set.status(), StatusCode::OK);
-        let resp_prof_get = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/profile/active")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let prof_json: Value =
-            serde_json::from_slice(&to_bytes(resp_prof_get.into_body(), 4096).await.unwrap())
-                .unwrap();
-        assert_eq!(prof_json["active_profile"], "home");
-
-        // 15. Test GET/POST /api/:camera/state updates runtime camera flags dynamically
-        let resp_cam_state = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/front_door/state")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"detect":false,"alerts":false}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_cam_state.status(), StatusCode::OK);
-        let state_json: Value =
-            serde_json::from_slice(&to_bytes(resp_cam_state.into_body(), 4096).await.unwrap())
-                .unwrap();
-        assert_eq!(state_json["detect"], false);
-        assert_eq!(state_json["alerts"], false);
-        assert_eq!(state_json["record"], true);
-
-        // 16. Test RBAC (admin, operator, viewer) and per-camera user scoping
         state
             .db
             .create_user_with_cameras("guard1", "guard-pass", "viewer", "front_door", 1000)
@@ -6390,7 +6458,6 @@ version: 0.18-0
         )
         .unwrap();
 
-        // Viewer is blocked from POST /api/config/save with 403 Forbidden
         let resp_viewer_save = auth_app
             .clone()
             .oneshot(
@@ -6405,7 +6472,6 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_viewer_save.status(), StatusCode::FORBIDDEN);
 
-        // Viewer is allowed to read permitted camera (/api/front_door/recordings)
         let resp_viewer_ok_cam = auth_app
             .clone()
             .oneshot(
@@ -6419,7 +6485,6 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_viewer_ok_cam.status(), StatusCode::OK);
 
-        // Viewer is blocked from accessing unpermitted camera (/api/indoor_bedroom/recordings) with 403 Forbidden
         let resp_viewer_unauth_cam = auth_app
             .clone()
             .oneshot(
@@ -6433,105 +6498,31 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_viewer_unauth_cam.status(), StatusCode::FORBIDDEN);
 
-        // 17. Test HMAC-signed shareable links (/api/share, /share/:token, /share/:token/video.mp4)
-        let resp_share = app
+        let resp_proxy_viewer = auth_app
             .clone()
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri("/api/share")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"kind":"export","target_id":"sample","expires_in_sec":3600}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_share.status(), StatusCode::OK);
-        let share_json: Value =
-            serde_json::from_slice(&to_bytes(resp_share.into_body(), 4096).await.unwrap()).unwrap();
-        let share_token = share_json["token"].as_str().unwrap();
-
-        // Valid unauthenticated request to /share/:token and /share/:token/video.mp4 on auth_app
-        let resp_share_page = auth_app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/share/{share_token}"))
+                    .uri("/api/camera-proxy/front_door/")
+                    .header(header::AUTHORIZATION, format!("Bearer {guard_token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp_share_page.status(), StatusCode::OK);
+        assert_eq!(resp_proxy_viewer.status(), StatusCode::FORBIDDEN);
 
-        let resp_share_vid = auth_app
+        let resp_proxy_unconf = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/share/{share_token}/video.mp4"))
+                    .uri("/api/camera-proxy/non_existent_cam/")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp_share_vid.status(), StatusCode::OK);
+        assert_eq!(resp_proxy_unconf.status(), StatusCode::NOT_FOUND);
 
-        // HTTP Range request on /share/:token/video.mp4 returns 206 Partial Content
-        let resp_share_range = auth_app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/share/{share_token}/video.mp4"))
-                    .header(header::RANGE, "bytes=0-3")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_share_range.status(), StatusCode::PARTIAL_CONTENT);
-        assert!(
-            resp_share_range
-                .headers()
-                .contains_key(header::CONTENT_RANGE)
-        );
-
-        // Tampered signature is rejected with 403 Forbidden
-        let resp_tampered = auth_app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/share/{share_token}tampered"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_tampered.status(), StatusCode::FORBIDDEN);
-
-        // Expired token is rejected with 410 Gone
-        let expired_tok = sign_share_token(
-            &state.jwt_secret,
-            &ShareTokenPayload {
-                k: "export".to_string(),
-                id: "sample".to_string(),
-                exp: 1000,
-            },
-        );
-        let resp_expired = auth_app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/share/{expired_tok}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_expired.status(), StatusCode::GONE);
-
-        // 18. Test scoped API Bearer tokens (nnvr_...) creation, scope enforcement, and revocation
         let (tok_meta, raw_ro_tok) = state
             .db
             .create_api_token("ha_sensor", "read_only", None)
@@ -6539,7 +6530,6 @@ version: 0.18-0
         assert!(raw_ro_tok.starts_with("nnvr_"));
         let tok_id = tok_meta["id"].as_str().unwrap();
 
-        // read_only token can query GET /api/stats and GET /api/events
         let resp_ro_stats = auth_app
             .clone()
             .oneshot(
@@ -6566,7 +6556,6 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_ro_events.status(), StatusCode::OK);
 
-        // read_only token is blocked from GET /api/users, GET /api/tokens, and GET /api/config/raw (403 Forbidden)
         for admin_path in ["/api/users", "/api/tokens", "/api/config/raw"] {
             let resp_ro_admin = auth_app
                 .clone()
@@ -6582,7 +6571,6 @@ version: 0.18-0
             assert_eq!(resp_ro_admin.status(), StatusCode::FORBIDDEN);
         }
 
-        // read_only token is rejected (403 Forbidden) on POST/DELETE mutations
         let resp_ro_mutate = auth_app
             .clone()
             .oneshot(
@@ -6598,7 +6586,6 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_ro_mutate.status(), StatusCode::FORBIDDEN);
 
-        // metrics token can query GET /api/stats and GET /api/metrics, but is rejected (403) on GET /api/events
         let (_, raw_metrics_tok) = state
             .db
             .create_api_token("prom_scraper", "metrics", None)
@@ -6615,6 +6602,7 @@ version: 0.18-0
             .await
             .unwrap();
         assert_eq!(resp_metrics_ok.status(), StatusCode::OK);
+
         let resp_metrics_events = auth_app
             .clone()
             .oneshot(
@@ -6628,7 +6616,6 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_metrics_events.status(), StatusCode::FORBIDDEN);
 
-        // full token has admin-equivalent access to /api/tokens CRUD
         let (_, raw_full_tok) = state
             .db
             .create_api_token("cli_admin", "full", None)
@@ -6646,7 +6633,6 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_full_list.status(), StatusCode::OK);
 
-        // Revoking the token blocks subsequent requests with 401 Unauthorized
         assert!(state.db.delete_api_token(tok_id).unwrap());
         let resp_revoked = auth_app
             .clone()
@@ -6661,7 +6647,420 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_revoked.status(), StatusCode::UNAUTHORIZED);
 
-        // 19. Test GET /api/ai/context and POST /api/mcp (tools/list and tools/call)
+        let resp_first = auth_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/first_time_login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_first.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn router_validates_oidc_roles_and_trusted_proxy_cidrs() {
+        let ctx = setup_test_app().await;
+        let auth_app = build_router_with_auth(ctx.state.clone(), true);
+
+        let oidc_cfg = ninjanvr_config::OidcAuthConfig::default();
+        assert_eq!(
+            resolve_oidc_role(&json!({ "groups": ["users", "admins"] }), &oidc_cfg),
+            "admin"
+        );
+        assert_eq!(
+            resolve_oidc_role(
+                &json!({
+                    "urn:zitadel:iam:org:project:roles": {
+                        "ninjanvr-operator": { "12345": "org" }
+                    }
+                }),
+                &oidc_cfg
+            ),
+            "operator"
+        );
+        assert_eq!(
+            resolve_oidc_role(
+                &json!({
+                    "urn:zitadel:iam:org:project:roles": {
+                        "ninjanvr-viewer": { "12345": "org" }
+                    }
+                }),
+                &oidc_cfg
+            ),
+            "viewer"
+        );
+        assert!(ip_matches_trusted_proxies(
+            "10.42.5.19",
+            &["127.0.0.1/32".to_string(), "10.42.0.0/16".to_string()]
+        ));
+        assert!(!ip_matches_trusted_proxies(
+            "203.0.113.99",
+            &["127.0.0.1/32".to_string(), "10.42.0.0/16".to_string()]
+        ));
+
+        let resp_spoofed = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .header("Remote-User", "admin")
+                    .header("x-real-ip", "203.0.113.99")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_spoofed.status(), StatusCode::UNAUTHORIZED);
+
+        let resp_providers = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_providers.status(), StatusCode::OK);
+        let prov_json: Value =
+            serde_json::from_slice(&to_bytes(resp_providers.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(prov_json["local_login_enabled"], true);
+        assert!(prov_json["oidc"].is_object());
+
+        let tls_cfg = generate_self_signed_tls_config_with_sans(&[
+            "192.0.2.10".to_string(),
+            "nvr.example.com".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            tls_cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        let default_tls = generate_self_signed_tls_config().unwrap();
+        assert_eq!(default_tls.alpn_protocols, tls_cfg.alpn_protocols);
+
+        let resp_oidc_login = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_oidc_login.status(), StatusCode::BAD_REQUEST);
+
+        let resp_oidc_cb = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/callback")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_oidc_cb.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn router_serves_hmac_share_links_and_http_range_video() {
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+        let state = &ctx.state;
+        let auth_app = build_router_with_auth(state.clone(), true);
+
+        let exports_dir = ctx.tmp_dir.join("exports");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        let dummy_mp4 = vec![0x42u8; 4096];
+        std::fs::write(exports_dir.join("sample.mp4"), &dummy_mp4).unwrap();
+
+        let resp_mp4 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/exports/sample.mp4")
+                    .header(header::ACCEPT_ENCODING, "gzip, br")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_mp4.status(), StatusCode::OK);
+        assert!(
+            resp_mp4.headers().get(header::CONTENT_ENCODING).is_none(),
+            "MP4 exports must not be Brotli/Gzip compressed by CompressionLayer"
+        );
+        assert_eq!(
+            resp_mp4
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("4096")
+        );
+
+        let resp_exp_err = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export/front_door/start/1000/end/1060")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"missing_clip"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_exp_err.status(), StatusCode::BAD_REQUEST);
+        assert!(state.db.query_exports().unwrap().is_empty());
+
+        let resp_share = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"sample","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_share.status(), StatusCode::OK);
+        let share_json: Value =
+            serde_json::from_slice(&to_bytes(resp_share.into_body(), 4096).await.unwrap()).unwrap();
+        let share_token = share_json["token"].as_str().unwrap();
+
+        let resp_share_page = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_share_page.status(), StatusCode::OK);
+
+        let resp_share_vid = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_token}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_share_vid.status(), StatusCode::OK);
+
+        let resp_share_range = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_token}/video.mp4"))
+                    .header(header::RANGE, "bytes=0-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_share_range.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(
+            resp_share_range
+                .headers()
+                .contains_key(header::CONTENT_RANGE)
+        );
+
+        let resp_tampered = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_token}tampered"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_tampered.status(), StatusCode::FORBIDDEN);
+
+        let expired_tok = sign_share_token(
+            &state.jwt_secret,
+            &ShareTokenPayload {
+                k: "export".to_string(),
+                id: "sample".to_string(),
+                exp: 1000,
+            },
+        );
+        let resp_expired = auth_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{expired_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_expired.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn router_handles_storage_degradation_and_prometheus_metrics() {
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+        let state = &ctx.state;
+
+        let blocked_media_path = ctx.tmp_dir.join("unwritable_mount_file");
+        std::fs::write(&blocked_media_path, b"not_a_directory").unwrap();
+        let degraded_state = new_app_state(
+            &ctx.cfg_path,
+            ctx.tmp_dir.join("web-v2"),
+            blocked_media_path.clone(),
+            false,
+        )
+        .await
+        .expect("server must boot even when media_dir is unwritable");
+        let degraded_app = build_router(degraded_state);
+        let resp_deg = degraded_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_deg.status(), StatusCode::OK);
+        let deg_json: Value =
+            serde_json::from_slice(&to_bytes(resp_deg.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(deg_json["service"]["storage_degraded"], true);
+        assert!(deg_json["service"]["storage_error"].is_string());
+
+        std::fs::remove_file(&blocked_media_path).unwrap();
+        std::fs::create_dir_all(&blocked_media_path).unwrap();
+        let resp_rec = degraded_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let rec_json: Value =
+            serde_json::from_slice(&to_bytes(resp_rec.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(rec_json["service"]["storage_degraded"], false);
+
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_prom_seed".to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!(["driveway"]),
+                start_time: 1700000100.0,
+                end_time: Some(1700000112.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.92),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.1, 0.1, 0.3, 0.5])),
+                data: json!({ "score": 0.92, "top_score": 0.92, "type": "object" }),
+                thumbnail: None,
+                area: Some(12000),
+                ratio: Some(0.5),
+                score: Some(0.92),
+                stationary: false,
+            })
+            .unwrap();
+
+        let resp_notif_test = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/notifications/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_notif_test.status(), StatusCode::OK);
+        let notif_json: Value =
+            serde_json::from_slice(&to_bytes(resp_notif_test.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(notif_json["success"], true);
+        assert_eq!(notif_json["ws_delivered"], true);
+
+        let resp_hist = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_hist.status(), StatusCode::OK);
+
+        state.db.run_maintenance().unwrap();
+        let resp_prom = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_prom.status(), StatusCode::OK);
+        assert!(
+            resp_prom
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .starts_with("text/plain; version=0.0.4")
+        );
+        let prom_body = String::from_utf8(
+            to_bytes(resp_prom.into_body(), 32768)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(prom_body.contains("ninjanvr_camera_fps{camera=\"front_door\",role=\"camera\"}"));
+        assert!(prom_body.contains("ninjanvr_camera_online{camera=\"front_door\"}"));
+        assert!(prom_body.contains("ninjanvr_detector_inference_ms{detector=\"detector01\"}"));
+        assert!(prom_body.contains("ninjanvr_storage_used_bytes{mount=\"recordings\"}"));
+        assert!(prom_body.contains("ninjanvr_cpu_usage_percent "));
+        assert!(prom_body.contains("ninjanvr_memory_usage_bytes "));
+        assert!(
+            prom_body.contains("ninjanvr_events_total{camera=\"front_door\",label=\"person\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn router_serves_ai_context_mcp_and_debug_reprocess() {
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+
         let resp_ai_ctx = app
             .clone()
             .oneshot(
@@ -6723,77 +7122,6 @@ version: 0.18-0
                 .unwrap();
         assert!(mcp_call_json["result"]["structuredContent"]["digest"].is_object());
 
-        // 20. Test OIDC role claim mapping (Authelia array & Zitadel object map) and Trusted-Proxy CIDR verification
-        let oidc_cfg = ninjanvr_config::OidcAuthConfig::default();
-        assert_eq!(
-            resolve_oidc_role(&json!({ "groups": ["users", "admins"] }), &oidc_cfg),
-            "admin"
-        );
-        assert_eq!(
-            resolve_oidc_role(
-                &json!({
-                    "urn:zitadel:iam:org:project:roles": {
-                        "ninjanvr-operator": { "12345": "org" }
-                    }
-                }),
-                &oidc_cfg
-            ),
-            "operator"
-        );
-        assert_eq!(
-            resolve_oidc_role(
-                &json!({
-                    "urn:zitadel:iam:org:project:roles": {
-                        "ninjanvr-viewer": { "12345": "org" }
-                    }
-                }),
-                &oidc_cfg
-            ),
-            "viewer"
-        );
-        assert!(ip_matches_trusted_proxies(
-            "10.42.5.19",
-            &["127.0.0.1/32".to_string(), "10.42.0.0/16".to_string()]
-        ));
-        assert!(!ip_matches_trusted_proxies(
-            "203.0.113.99",
-            &["127.0.0.1/32".to_string(), "10.42.0.0/16".to_string()]
-        ));
-
-        // Spoofed Remote-User header from untrusted IP (or when proxy.enabled == false) is strictly rejected (401)
-        let resp_spoofed = auth_app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/stats")
-                    .header("Remote-User", "admin")
-                    .header("x-real-ip", "203.0.113.99")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_spoofed.status(), StatusCode::UNAUTHORIZED);
-
-        // Public /api/auth/providers endpoint works without authentication
-        let resp_providers = auth_app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/auth/providers")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_providers.status(), StatusCode::OK);
-        let prov_json: Value =
-            serde_json::from_slice(&to_bytes(resp_providers.into_body(), 4096).await.unwrap())
-                .unwrap();
-        assert_eq!(prov_json["local_login_enabled"], true);
-        assert!(prov_json["oidc"].is_object());
-
-        // 21. Test POST /api/debug/reprocess replays clip window and returns accepted and filtered detections
         let resp_reprocess = app
             .clone()
             .oneshot(
@@ -6817,40 +7145,185 @@ version: 0.18-0
         let frames_arr = reproc_json["frames"].as_array().unwrap();
         assert!(!frames_arr.is_empty());
         assert!(frames_arr[0]["filtered_reasons"].is_array());
+    }
 
-        // 22. Test Camera Web-UI Reverse Proxy (/api/camera-proxy/:camera/) SSRF & Admin RBAC enforcement
-        // Viewer role is blocked with 403 Forbidden
-        let resp_proxy_viewer = auth_app
+    #[tokio::test]
+    async fn router_serves_vod_hls_playlists_init_and_m4s_segments() {
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+        let state = &ctx.state;
+
+        let rec_subdir = ctx.tmp_dir.join("recordings/2026-11-01/00/front_door");
+        std::fs::create_dir_all(&rec_subdir).unwrap();
+        let disk_seg = rec_subdir.join("00.00.mp4");
+        let mp4_bytes = build_synthetic_mp4_bytes();
+        std::fs::write(&disk_seg, &mp4_bytes).unwrap();
+
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "vod_seg_1".to_string(),
+                camera: "front_door".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-01/00/front_door/00.00.mp4".to_string(),
+                start_time: 1000.0,
+                end_time: 1010.0,
+                duration: 10.0,
+                motion: 12,
+                objects: 1,
+                dbfs: -22,
+                segment_size: 0.25,
+                regions: 1,
+                motion_heatmap: None,
+            })
+            .unwrap();
+
+        let resp_master = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/camera-proxy/front_door/")
-                    .header(header::AUTHORIZATION, format!("Bearer {guard_token}"))
+                    .uri("/vod/front_door/start/1000/end/1020/master.m3u8")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp_proxy_viewer.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp_master.status(), StatusCode::OK);
+        assert_eq!(
+            resp_master
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/vnd.apple.mpegurl")
+        );
+        let master_body = String::from_utf8(
+            to_bytes(resp_master.into_body(), 4096)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(master_body.contains("index-v1-a1.m3u8"));
 
-        // Unconfigured camera host returns 404 Not Found (prevents arbitrary SSRF)
-        let resp_proxy_unconf = app
+        let resp_idx = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/camera-proxy/non_existent_cam/")
+                    .uri("/vod/front_door/start/1000/end/1020/index-v1-a1.m3u8")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp_proxy_unconf.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp_idx.status(), StatusCode::OK);
+        assert_eq!(
+            resp_idx
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/vnd.apple.mpegurl")
+        );
+        let idx_body =
+            String::from_utf8(to_bytes(resp_idx.into_body(), 4096).await.unwrap().to_vec())
+                .unwrap();
+        assert!(idx_body.contains("#EXT-X-MAP:URI=\"init-v1-a1.mp4\""));
+        assert!(idx_body.contains("seg-1-v1-a1.m4s"));
 
-        // 23. Test forensic operator notes on Events (PUT /api/events/:id/notes) and Reviews (PUT /api/review/:id/notes)
+        let resp_init = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/vod/front_door/start/1000/end/1020/init-v1-a1.mp4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_init.status(), StatusCode::OK);
+        assert_eq!(
+            resp_init
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("video/mp4")
+        );
+        let init_bytes = to_bytes(resp_init.into_body(), 65536).await.unwrap();
+        assert!(init_bytes.len() > 64);
+
+        let resp_seg = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/vod/front_door/start/1000/end/1020/seg-1-v1-a1.m4s")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_seg.status(), StatusCode::OK);
+        assert_eq!(
+            resp_seg
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("video/iso.segment")
+        );
+        let seg_bytes = to_bytes(resp_seg.into_body(), 65536).await.unwrap();
+        assert!(seg_bytes.ends_with(&[0x65u8; 64]));
+
+        let resp_empty = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/vod/front_door/start/9000/end/9010/index.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_empty.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn router_manages_reviews_events_timeline_and_exports() {
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+        let state = &ctx.state;
+
+        let rec_subdir = ctx.tmp_dir.join("recordings/2026-11-01/00/front_door");
+        std::fs::create_dir_all(&rec_subdir).unwrap();
+        let disk_seg = rec_subdir.join("00.00.mp4");
+        std::fs::write(&disk_seg, build_synthetic_mp4_bytes()).unwrap();
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "rev_ev_seg".to_string(),
+                camera: "front_door".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-01/00/front_door/00.00.mp4".to_string(),
+                start_time: 1700000100.0,
+                end_time: 1700000115.0,
+                duration: 15.0,
+                motion: 40,
+                objects: 2,
+                dbfs: -18,
+                segment_size: 0.5,
+                regions: 2,
+                motion_heatmap: None,
+            })
+            .unwrap();
+
+        let clips_dir = ctx.tmp_dir.join("clips");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        std::fs::write(clips_dir.join("ev_test_1.jpg"), [0xFF, 0xD8, 0xFF, 0xD9]).unwrap();
+        std::fs::write(
+            clips_dir.join("front_door-ev_test_1.webp"),
+            b"RIFF\x0c\x00\x00\x00WEBPVP8 ",
+        )
+        .unwrap();
+
         state
             .db
             .upsert_event(&ninjanvr_db::EventDto {
-                id: "ev_note_test".to_string(),
+                id: "ev_test_1".to_string(),
                 camera: "front_door".to_string(),
                 label: "person".to_string(),
                 zones: json!(["driveway"]),
@@ -6872,12 +7345,315 @@ version: 0.18-0
                 stationary: false,
             })
             .unwrap();
+
+        state
+            .db
+            .insert_review_segment(&ninjanvr_db::ReviewItemDto {
+                id: "rev_test_1".to_string(),
+                camera: "front_door".to_string(),
+                start_time: 1700000100.0,
+                end_time: Some(1700000112.0),
+                severity: "alert".to_string(),
+                thumb_path: "/media/ninjanvr/clips/front_door-ev_test_1.webp".to_string(),
+                data: json!({
+                    "detections": ["ev_test_1"],
+                    "objects": ["person"],
+                    "zones": ["driveway"]
+                }),
+                has_been_reviewed: false,
+            })
+            .unwrap();
+
+        state
+            .db
+            .insert_timeline_entry(
+                1700000101.0,
+                "front_door",
+                "tracked_object",
+                Some("ev_test_1"),
+                "visible",
+                &json!({ "label": "person", "score": 0.92 }),
+            )
+            .unwrap();
+
+        let resp_rev = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/review?cameras=front_door")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev.status(), StatusCode::OK);
+        let rev_list: Value =
+            serde_json::from_slice(&to_bytes(resp_rev.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(rev_list.as_array().unwrap().len(), 1);
+
+        let resp_rev_sum = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/review/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev_sum.status(), StatusCode::OK);
+
+        let resp_motion = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/review/activity/motion?after=1700000000&before=1700000200")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_motion.status(), StatusCode::OK);
+        let motion_arr: Value =
+            serde_json::from_slice(&to_bytes(resp_motion.into_body(), 16384).await.unwrap())
+                .unwrap();
+        assert!(!motion_arr.as_array().unwrap().is_empty());
+
+        let resp_rev_by_ev = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/review/event/ev_test_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev_by_ev.status(), StatusCode::OK);
+
+        let resp_rev_by_id = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/review/rev_test_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev_by_id.status(), StatusCode::OK);
+
+        let resp_rev_prev = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/review/rev_test_1/preview")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev_prev.status(), StatusCode::OK);
+
+        let resp_rev_viewed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/reviews/viewed")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ids":["rev_test_1"],"reviewed":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev_viewed.status(), StatusCode::OK);
+        assert!(
+            state
+                .db
+                .get_review_by_id("rev_test_1")
+                .unwrap()
+                .unwrap()
+                .has_been_reviewed
+        );
+
+        let resp_rev_unview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/review/rev_test_1/viewed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev_unview.status(), StatusCode::OK);
+        assert!(
+            !state
+                .db
+                .get_review_by_id("rev_test_1")
+                .unwrap()
+                .unwrap()
+                .has_been_reviewed
+        );
+
+        let resp_rev_notes = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/review/rev_test_1/notes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"notes":"Verified alert segment"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev_notes.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .db
+                .get_review_by_id("rev_test_1")
+                .unwrap()
+                .unwrap()
+                .data["notes"],
+            "Verified alert segment"
+        );
+
+        let resp_rev_ids = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/review_ids?ids=rev_test_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev_ids.status(), StatusCode::OK);
+
+        let resp_rev_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/reviews/delete")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ids":["rev_test_1"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev_del.status(), StatusCode::OK);
+        assert!(state.db.get_review_by_id("rev_test_1").unwrap().is_none());
+
+        let resp_ev_exp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events/explore?limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ev_exp.status(), StatusCode::OK);
+
+        let resp_ev_sum = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ev_sum.status(), StatusCode::OK);
+
+        let resp_ret_on = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/events/ev_test_1/retain")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ret_on.status(), StatusCode::OK);
+        assert_eq!(
+            state.db.get_event("ev_test_1").unwrap().unwrap()["retain_indefinitely"],
+            true
+        );
+
+        let resp_ret_off = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/events/ev_test_1/retain")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ret_off.status(), StatusCode::OK);
+        assert_eq!(
+            state.db.get_event("ev_test_1").unwrap().unwrap()["retain_indefinitely"],
+            false
+        );
+
+        let resp_fp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/events/ev_test_1/false_positive")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"false_positive":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_fp.status(), StatusCode::OK);
+
+        let resp_sub = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/events/ev_test_1/sub_label")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"sub_label":"courier"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_sub.status(), StatusCode::OK);
+
+        let resp_desc = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/events/ev_test_1/description")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"description":"Delivery driver at gate"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_desc.status(), StatusCode::OK);
+
         let resp_ev_notes = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("PUT")
-                    .uri("/api/events/ev_note_test/notes")
+                    .uri("/api/events/ev_test_1/notes")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{"notes":"Courier left parcel behind planter — verified by guard"}"#,
@@ -6887,81 +7663,455 @@ version: 0.18-0
             .await
             .unwrap();
         assert_eq!(resp_ev_notes.status(), StatusCode::OK);
-        let ev_with_note = state.db.get_event("ev_note_test").unwrap().unwrap();
+        let ev_updated = state.db.get_event("ev_test_1").unwrap().unwrap();
+        assert_eq!(ev_updated["sub_label"], "courier");
+        assert_eq!(ev_updated["data"]["description"], "Delivery driver at gate");
         assert_eq!(
-            ev_with_note["data"]["notes"],
+            ev_updated["data"]["notes"],
             "Courier left parcel behind planter — verified by guard"
         );
 
-        // 24. Test POST /api/notifications/test broadcasts synthetic alert across WS & MQTT
-        let resp_notif_test = app
+        let resp_thumb = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events/ev_test_1/thumbnail.webp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_thumb.status(), StatusCode::OK);
+
+        let resp_snap = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events/ev_test_1/snapshot.jpg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_snap.status(), StatusCode::OK);
+
+        let resp_clip = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events/ev_test_1/clip.mp4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_clip.status(), StatusCode::OK);
+
+        for ev_uri in [
+            "/api/events?cameras=front_door",
+            "/api/events/search?cameras=front_door",
+            "/api/event_ids?ids=ev_test_1",
+            "/api/events/ev_test_1",
+            "/api/events/ev_test_1/thumbnail.jpg",
+            "/api/events/ev_test_1/snapshot-clean.webp",
+            "/api/jobs/export",
+        ] {
+            let r = app
+                .clone()
+                .oneshot(Request::builder().uri(ev_uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "failed on {ev_uri}");
+        }
+
+        let resp_ev_bulk_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/events")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"event_ids":["non_existent_ev"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ev_bulk_del.status(), StatusCode::OK);
+
+        let resp_ev_del_one = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/events/ev_test_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ev_del_one.status(), StatusCode::OK);
+        assert!(state.db.get_event("ev_test_1").unwrap().is_none());
+
+        let resp_tl = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/timeline?camera=front_door&source_id=ev_test_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_tl.status(), StatusCode::OK);
+        let tl_arr: Value =
+            serde_json::from_slice(&to_bytes(resp_tl.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(tl_arr.as_array().unwrap().len(), 1);
+
+        let resp_logs = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/logs/ninjanvr")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_logs.status(), StatusCode::OK);
+        let logs_json: Value =
+            serde_json::from_slice(&to_bytes(resp_logs.into_body(), 16384).await.unwrap()).unwrap();
+        assert!(logs_json["lines"].as_array().unwrap().len() >= 2);
+
+        state
+            .db
+            .insert_export(&ExportRow {
+                id: "exp_1".to_string(),
+                camera: "front_door".to_string(),
+                name: "Initial clip".to_string(),
+                date: 1700000200.0,
+                video_path: "/media/ninjanvr/exports/exp_1.mp4".to_string(),
+                thumb_path: "/media/ninjanvr/clips/exp_1.webp".to_string(),
+                in_progress: false,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_export(&ExportRow {
+                id: "exp_2".to_string(),
+                camera: "front_door".to_string(),
+                name: "Second clip".to_string(),
+                date: 1700000210.0,
+                video_path: "/media/ninjanvr/exports/exp_2.mp4".to_string(),
+                thumb_path: "/media/ninjanvr/clips/exp_2.webp".to_string(),
+                in_progress: false,
+            })
+            .unwrap();
+
+        let resp_exps = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/exports")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_exps.status(), StatusCode::OK);
+        let exps_arr: Value =
+            serde_json::from_slice(&to_bytes(resp_exps.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(exps_arr.as_array().unwrap().len(), 2);
+
+        let resp_ren = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/export/exp_1/rename")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"Renamed clip"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ren.status(), StatusCode::OK);
+
+        let resp_del_one = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/export/exp_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_del_one.status(), StatusCode::OK);
+        assert_eq!(state.db.query_exports().unwrap().len(), 1);
+
+        let resp_del_bulk = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/notifications/test")
-                    .body(Body::empty())
+                    .uri("/api/exports/delete")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ids":["exp_2"]}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp_notif_test.status(), StatusCode::OK);
-        let notif_json: Value =
-            serde_json::from_slice(&to_bytes(resp_notif_test.into_body(), 4096).await.unwrap())
-                .unwrap();
-        assert_eq!(notif_json["success"], true);
-        assert_eq!(notif_json["ws_delivered"], true);
+        assert_eq!(resp_del_bulk.status(), StatusCode::OK);
+        assert!(state.db.query_exports().unwrap().is_empty());
+    }
 
-        // 25. Test Prometheus OpenMetrics exposition format at GET /api/metrics and SQLite run_maintenance()
-        state.db.run_maintenance().unwrap();
-        let resp_prom = app
+    #[tokio::test]
+    async fn router_manages_cases_recordings_previews_camera_state_and_federation() {
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+        let state = &ctx.state;
+
+        let resp_cases_get = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/metrics")
+                    .uri("/api/cases")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp_prom.status(), StatusCode::OK);
-        assert!(
-            resp_prom
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .starts_with("text/plain; version=0.0.4")
+        assert_eq!(resp_cases_get.status(), StatusCode::OK);
+
+        let resp_cases_post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cases")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cases_post.status(), StatusCode::OK);
+
+        let rec_subdir = ctx.tmp_dir.join("recordings/2026-11-01/00/front_door");
+        std::fs::create_dir_all(&rec_subdir).unwrap();
+        let disk_seg_1 = rec_subdir.join("00.00.mp4");
+        std::fs::write(&disk_seg_1, vec![0x11u8; 1024]).unwrap();
+
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "seg_on_disk".to_string(),
+                camera: "front_door".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-01/00/front_door/00.00.mp4".to_string(),
+                start_time: 2000.0,
+                end_time: 2010.0,
+                duration: 10.0,
+                motion: 1,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 0.001,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "seg_ghost".to_string(),
+                camera: "front_door".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-01/00/front_door/00.10.mp4".to_string(),
+                start_time: 2010.0,
+                end_time: 2020.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 0.001,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+
+        let resp_rec_sum = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recordings/summary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rec_sum.status(), StatusCode::OK);
+
+        let resp_rec_stor = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recordings/storage")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rec_stor.status(), StatusCode::OK);
+
+        let resp_cam_recs = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/recordings?after=1990&before=2030")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cam_recs.status(), StatusCode::OK);
+        let cam_recs_arr: Value =
+            serde_json::from_slice(&to_bytes(resp_cam_recs.into_body(), 8192).await.unwrap())
+                .unwrap();
+        assert_eq!(cam_recs_arr.as_array().unwrap().len(), 2);
+
+        let resp_sync = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/recordings/sync")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_sync.status(), StatusCode::OK);
+        let sync_json: Value =
+            serde_json::from_slice(&to_bytes(resp_sync.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(sync_json["removed_orphans"], 1);
+
+        let resp_del_rec = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/front_door/recordings?after=1995&before=2015")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_del_rec.status(), StatusCode::OK);
+        let del_rec_json: Value =
+            serde_json::from_slice(&to_bytes(resp_del_rec.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(del_rec_json["deleted_segments"], 1);
+        assert_eq!(del_rec_json["freed_bytes"], 1024);
+        assert!(!disk_seg_1.exists());
+
+        state
+            .db
+            .insert_preview(
+                "prev_1",
+                "front_door",
+                "/media/ninjanvr/clips/previews/front_door/prev_1.mp4",
+                1000.0,
+                1060.0,
+                60.0,
+            )
+            .unwrap();
+        let resp_prev = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/preview/front_door/start/900/end/1100")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_prev.status(), StatusCode::OK);
+        let prev_arr: Value =
+            serde_json::from_slice(&to_bytes(resp_prev.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(prev_arr.as_array().unwrap().len(), 1);
+
+        let resp_cam_state_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cam_state_get.status(), StatusCode::OK);
+
+        let resp_cam_state = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/state")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"detect":false,"alerts":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_cam_state.status(), StatusCode::OK);
+        let state_json: Value =
+            serde_json::from_slice(&to_bytes(resp_cam_state.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(state_json["detect"], false);
+        assert_eq!(state_json["alerts"], false);
+        assert_eq!(state_json["record"], true);
+
+        let clips_dir = ctx.tmp_dir.join("clips");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        let disk_latest = clips_dir.join("latest_front_door.jpg");
+        let fake_jpeg = vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0xFF, 0xD9,
+        ];
+        std::fs::write(&disk_latest, &fake_jpeg).unwrap();
+        state.camera_metrics.write().await.insert(
+            "front_door".to_string(),
+            pipeline::CameraRuntimeMetrics {
+                camera_fps: 0.0,
+                process_fps: 0.0,
+                detection_fps: 0.0,
+                pid: 123,
+                last_frame_ts: 1730500123.0,
+                night_mode: false,
+            },
         );
-        let prom_body = String::from_utf8(
-            to_bytes(resp_prom.into_body(), 32768)
+
+        for latest_uri in ["/api/front_door/latest.webp", "/api/front_door/latest.jpg"] {
+            let resp_latest = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(latest_uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        assert!(prom_body.contains("ninjanvr_camera_fps{camera=\"front_door\",role=\"camera\"}"));
-        assert!(prom_body.contains("ninjanvr_camera_online{camera=\"front_door\"}"));
-        assert!(prom_body.contains("ninjanvr_detector_inference_ms{detector=\"detector01\"}"));
-        assert!(prom_body.contains("ninjanvr_storage_used_bytes{mount=\"recordings\"}"));
-        assert!(prom_body.contains("ninjanvr_cpu_usage_percent "));
-        assert!(prom_body.contains("ninjanvr_memory_usage_bytes "));
-        assert!(
-            prom_body.contains("ninjanvr_events_total{camera=\"front_door\",label=\"person\"}")
-        );
+                .unwrap();
+            assert_eq!(resp_latest.status(), StatusCode::OK);
+            assert_eq!(
+                resp_latest
+                    .headers()
+                    .get("x-last-frame-timestamp")
+                    .and_then(|v| v.to_str().ok()),
+                Some("1730500123")
+            );
+            let latest_body = to_bytes(resp_latest.into_body(), 4096).await.unwrap();
+            assert_eq!(&latest_body[..], &fake_jpeg[..]);
+        }
 
-        // 26. Test Apple-compliant self-signed TLS certificate generation with custom SAN hosts
-        let tls_cfg = generate_self_signed_tls_config_with_sans(&[
-            "192.0.2.10".to_string(),
-            "nvr.example.com".to_string(),
-        ])
-        .unwrap();
-        assert_eq!(
-            tls_cfg.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
-
-        // 27. Test Multi-Node Federation endpoints (/api/federation/nodes and /api/federation/:node/*)
         let resp_fed_nodes = app
             .clone()
             .oneshot(
@@ -6981,7 +8131,6 @@ version: 0.18-0
         assert_eq!(nodes_arr[0]["id"], "local");
         assert_eq!(nodes_arr[0]["online"], true);
 
-        // Unconfigured federated peer node returns 404 Not Found
         let resp_fed_unconf = app
             .clone()
             .oneshot(
@@ -6994,39 +8143,63 @@ version: 0.18-0
             .unwrap();
         assert_eq!(resp_fed_unconf.status(), StatusCode::NOT_FOUND);
 
-        // Public bootstrap endpoint /api/auth/first_time_login remains accessible
-        let resp = auth_app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/auth/first_time_login")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        for extra_uri in [
+            "/api/recordings/unavailable",
+            "/api/front_door/recordings/summary",
+            "/api/front_door/ptz/info",
+            "/api/preview/front_door/start/900/end/1100/frames",
+            "/api/preview/preview_front_door-1000/thumbnail.webp",
+            "/api/preview/preview_front_door-1000/thumbnail.jpg",
+            "/api/go2rtc/streams",
+            "/api/go2rtc/streams/front_door",
+        ] {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(extra_uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "failed on {extra_uri}");
+        }
 
-        // Verify /api/detectors/catalog exposes dual-backend telemetry & devices
-        let resp_cat = app
+        let resp_webrtc = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/detectors/catalog")
-                    .body(Body::empty())
+                    .method("POST")
+                    .uri("/api/go2rtc/webrtc?src=front_door")
+                    .body(Body::from("v=0"))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp_cat.status(), StatusCode::OK);
-        let cat_json: Value =
-            serde_json::from_slice(&to_bytes(resp_cat.into_body(), 16384).await.unwrap()).unwrap();
-        assert_eq!(cat_json["active_backend"], "openvino");
-        assert!(cat_json["openvino_available"].is_boolean());
-        assert!(cat_json["ort_available"].is_boolean());
-        let dev_arr = cat_json["devices"].as_array().unwrap();
-        assert!(dev_arr.iter().any(|d| d["id"] == "CUDA"));
-        assert!(dev_arr.iter().any(|d| d["id"] == "ROCM"));
+        assert!(
+            resp_webrtc.status() == StatusCode::BAD_GATEWAY || resp_webrtc.status().is_success()
+        );
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ws_router = app.clone();
+        let srv_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, ws_router).await;
+        });
+        let (mut ws_stream, ws_resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        assert_eq!(ws_resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+        let first_msg = ws_stream.next().await.unwrap().unwrap();
+        assert!(first_msg.into_text().unwrap().contains("topic"));
+        let _ = ws_stream.close(None).await;
+
+        let (_, mse_ws_resp) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/live/mse/api/ws?src=front_door"))
+                .await
+                .unwrap();
+        assert_eq!(mse_ws_resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+        srv_handle.abort();
     }
 }

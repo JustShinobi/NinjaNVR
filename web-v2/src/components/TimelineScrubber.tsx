@@ -16,6 +16,7 @@ import {
   ReviewItem,
 } from "../types/nvr";
 import { RecordingCalendarPopover } from "./RecordingCalendarPopover";
+import { formatDuration } from "../utils/format";
 
 export type TimelineZoomMinutes = 5 | 15 | 60 | 360 | 1440;
 
@@ -76,16 +77,6 @@ function formatDayShort(dayStr: string): string {
   if (parts.length !== 3) return dayStr;
   const d = new Date(parts[0], parts[1] - 1, parts[2]);
   return d.toLocaleDateString([], { weekday: "short", month: "short", day: "2-digit" });
-}
-
-function formatDuration(sec: number): string {
-  const total = Math.max(1, Math.round(sec));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  if (h > 0) return `${h}h ${m}m ${s}s`;
-  if (m === 0) return `${s}s`;
-  return `${m}m ${s.toString().padStart(2, "0")}s`;
 }
 
 function toLocalDateInputValue(unixSec: number): string {
