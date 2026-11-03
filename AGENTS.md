@@ -32,7 +32,7 @@
 Run all commands from the repository root:
 
 - `make hooks` (or `./scripts/ci/install-hooks`): Configures `git config core.hooksPath .githooks` across the repository and all worktrees:
-  - `.githooks/pre-commit`: Runs `./scripts/ci/check-privacy`, `./scripts/ci/check-semver --staged` (blocks manual edits to `CHANGELOG.md` and SemVer manifest versions), blocks forbidden secrets/artifacts/conflict markers, and runs fast staged checks (`cargo fmt`, `cargo clippy`, `web-v2` typecheck, `docs` build).
+  - `.githooks/pre-commit`: Runs `./scripts/ci/check-privacy`, `./scripts/ci/check-semver --staged` (blocks manual edits to `CHANGELOG.md` and SemVer manifest versions), blocks forbidden secrets/artifacts/conflict markers, and runs fast staged checks (`cargo fmt`, `cargo clippy`, `web-v2` typecheck + `bun test`, `docs` build).
   - `.githooks/commit-msg`: Enforces strict scoped Conventional Commits (`<type>(<scope>): <description>`, 12–120 chars, no trailing period, no WIP/todo markers) via `./scripts/ci/check-commit-msg`.
   - `.githooks/pre-push`: Blocks force-pushes and branch deletion on `dev`/`main`, blocks manual SemVer tag pushes (`v*`), blocks direct commits to `main` bypassing `dev`, audits all unpushed commit messages, and runs `./scripts/ci/verify`.
 - `make verify` (or `./scripts/ci/verify`): Mandatory pre-commit/pre-PR gate. Runs:
@@ -42,11 +42,19 @@ Run all commands from the repository root:
   4. `cargo fmt --all --check`
   5. `cargo clippy --workspace --all-targets -- -D warnings`
   6. `cargo test --workspace`
-  7. `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 build`
+  7. `bun run --cwd web-v2 typecheck && bun run --cwd web-v2 test && bun run --cwd web-v2 build`
 - `make build-ui`: Type-checks and builds `web-v2/dist` (`< 2s`). Note: `web-v2/dist/` is gitignored and built automatically inside CI and the multi-stage `Dockerfile`.
 - `make build`: Builds both `web-v2/dist` and `target/release/ninjanvr`.
 - `make image`: Builds the multi-stage container image (`Dockerfile`) tagged with the current workspace version.
 - `make fast-ui`: Local development helper that hot-syncs `web-v2/dist` into the running K3s pod via `kubectl cp` for rapid visual preview.
+
+### Test Coverage & Regression Policy
+- **Mandatory Tests for Features & Fixes:** Every new feature (`feat(...)`) and bug fix (`fix(...)`) must include automated tests in the same change before completion or commit:
+  - **Bug Fixes (`fix`):** Add a deterministic regression test that reproduces the failure mode or edge case and proves the fix.
+  - **New Features (`feat`) & Refactors (`refactor`):** Add unit/integration tests covering happy paths, state transitions, coordinate/geometry calculations, serialization/parsing, and boundary/error conditions.
+  - **Rust Backend (`crates/*`):** Add unit tests in `#[cfg(test)] mod tests` or integration tests in `tests/` and verify with `cargo test --workspace`.
+  - **Console UI (`web-v2/`):** Keep domain logic, Zustand store actions, geometry/CAD math, and formatters/parsers modular and cover them under `web-v2/src/__tests__/*.test.ts`, verified with `bun run --cwd web-v2 test`.
+  - **No Gate Loosening:** Never delete, skip (`#[ignore]`, `test.skip`), or weaken existing tests, types (`as any`), or lint rules to force a green build.
 
 ### Versioning, Releases & GitOps Promotion (Two-Track: `dev` ➔ `main`)
 - **Default Branch (`dev`):** All day-to-day development and pull requests target `dev`.
