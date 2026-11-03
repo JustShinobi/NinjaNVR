@@ -832,25 +832,8 @@ export const ChannelsStreamsSection: React.FC<{
             </div>
             <div className="nvr-cfg-card-body">
               {(activeCamCfg.ffmpeg?.inputs || []).map((inp, idx) => (
-                <div
-                  key={idx}
-                  style={{
-                    padding: 10,
-                    background: "var(--bg-canvas)",
-                    border: "1px solid var(--border-hairline)",
-                    borderRadius: 3,
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 8,
-                  }}
-                >
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                    }}
-                  >
+                <div key={idx} className="nvr-subcard">
+                  <div className="nvr-subcard-header">
                     <span
                       className="mono"
                       style={{
@@ -923,14 +906,12 @@ export const ChannelsStreamsSection: React.FC<{
 
               {/* Video Orientation / Corridor Mode Rotation Selector */}
               <div
+                className="nvr-subcard"
                 style={{
-                  display: "flex",
+                  flexDirection: "row",
                   alignItems: "center",
                   justifyContent: "space-between",
                   padding: "6px 8px",
-                  background: "var(--bg-canvas)",
-                  border: "1px solid var(--border-hairline)",
-                  borderRadius: 3,
                 }}
               >
                 <span className="mono" style={{ fontSize: "var(--text-xs)" }}>
@@ -967,24 +948,8 @@ export const ChannelsStreamsSection: React.FC<{
               </div>
 
               {/* ONVIF PTZ & Resilient Auto-Tracking Configuration */}
-              <div
-                style={{
-                  padding: 10,
-                  background: "var(--bg-canvas)",
-                  border: "1px solid var(--border-hairline)",
-                  borderRadius: 3,
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 8,
-                }}
-              >
-                <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                  }}
-                >
+              <div className="nvr-subcard">
+                <div className="nvr-subcard-header">
                   <span
                     className="mono"
                     style={{
@@ -1214,17 +1179,13 @@ export const ChannelsStreamsSection: React.FC<{
               </div>
               {probeResult && (
                 <div
-                  className="mono"
+                  className="nvr-subcard mono"
                   style={{
                     padding: 8,
-                    background: "var(--bg-canvas)",
-                    border: `1px solid ${
-                      probeResult.ok ? "var(--signal-live)" : "var(--signal-alert)"
-                    }`,
-                    borderRadius: 3,
+                    borderColor: probeResult.ok
+                      ? "var(--signal-live)"
+                      : "var(--signal-alert)",
                     fontSize: "var(--text-xs)",
-                    display: "flex",
-                    flexDirection: "column",
                     gap: 4,
                   }}
                 >
@@ -1270,15 +1231,10 @@ export const ChannelsStreamsSection: React.FC<{
                   return (
                     <div
                       key={pIdx}
-                      className="mono"
+                      className="nvr-subcard mono"
                       style={{
                         padding: 8,
-                        background: "var(--bg-canvas)",
-                        border: "1px solid var(--border-hairline)",
-                        borderRadius: 3,
                         fontSize: "var(--text-xs)",
-                        display: "flex",
-                        flexDirection: "column",
                         gap: 3,
                       }}
                     >
@@ -1400,7 +1356,7 @@ export const ChannelsStreamsSection: React.FC<{
                       alignItems: "center",
                       gap: 8,
                       padding: "4px 0",
-                      borderBottom: "1px solid rgba(255,255,255,0.04)",
+                      borderBottom: "1px solid var(--border-divider)",
                     }}
                   >
                     <span

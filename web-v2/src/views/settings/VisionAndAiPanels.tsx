@@ -676,24 +676,15 @@ export const VisionZonesMotionSection: React.FC<{
         >
           {/* Polygon Plotter Controls */}
           <div
+            className="nvr-subcard"
             style={{
-              padding: 10,
-              background: "var(--bg-canvas)",
-              border: "1px solid rgba(245, 158, 11, 0.45)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
+              borderColor: "rgba(245, 158, 11, 0.45)",
             }}
           >
             <div
-              className="mono"
+              className="nvr-subcard-header mono"
               style={{
-                fontSize: "var(--text-xs)",
-                fontWeight: 700,
                 color: "var(--signal-motion-text)",
-                display: "flex",
-                justifyContent: "space-between",
               }}
             >
               <span>
@@ -896,7 +887,7 @@ export const VisionZonesMotionSection: React.FC<{
                 className="mono"
                 style={{
                   padding: "6px 8px",
-                  background: "var(--bg-deep)",
+                  background: "var(--bg-input)",
                   border: "1px solid var(--signal-accent)",
                   borderRadius: 2,
                   fontSize: "var(--text-xs)",
@@ -1077,7 +1068,8 @@ export const VisionZonesMotionSection: React.FC<{
                 color: "var(--signal-motion-text)",
                 wordBreak: currentCoordStr ? "break-all" : "normal",
                 padding: "4px 6px",
-                background: "var(--bg-deep)",
+                background: "var(--bg-input)",
+                border: "1px solid var(--border-divider)",
                 borderRadius: 2,
               }}
             >
@@ -1180,12 +1172,12 @@ export const VisionZonesMotionSection: React.FC<{
               {Object.entries(camCfg?.state_rois || {}).map(([rName, rCfg]) => (
                 <div
                   key={`roi-${rName}`}
+                  className="nvr-subcard"
                   style={{
                     padding: 6,
-                    background: "var(--bg-canvas)",
-                    border: "1px solid rgba(245, 158, 11, 0.45)",
+                    borderColor: "rgba(245, 158, 11, 0.45)",
                     borderRadius: 2,
-                    display: "flex",
+                    flexDirection: "row",
                     alignItems: "center",
                     justifyContent: "space-between",
                     gap: 6,
@@ -1271,12 +1263,12 @@ export const VisionZonesMotionSection: React.FC<{
               {Object.entries(camCfg?.lines || {}).map(([lName, lCfg]) => (
                 <div
                   key={`line-${lName}`}
+                  className="nvr-subcard"
                   style={{
                     padding: 6,
-                    background: "var(--bg-canvas)",
-                    border: "1px solid rgba(16, 185, 129, 0.45)",
+                    borderColor: "rgba(16, 185, 129, 0.45)",
                     borderRadius: 2,
-                    display: "flex",
+                    flexDirection: "row",
                     alignItems: "center",
                     justifyContent: "space-between",
                     gap: 6,
@@ -1350,12 +1342,12 @@ export const VisionZonesMotionSection: React.FC<{
               {Object.entries(zonesMap).map(([zName, zCfg]) => (
                 <div
                   key={zName}
+                  className="nvr-subcard"
                   style={{
                     padding: 6,
-                    background: "var(--bg-canvas)",
-                    border: "1px solid rgba(14, 165, 233, 0.35)",
+                    borderColor: "rgba(14, 165, 233, 0.35)",
                     borderRadius: 2,
-                    display: "flex",
+                    flexDirection: "row",
                     alignItems: "center",
                     justifyContent: "space-between",
                     gap: 6,
@@ -1427,12 +1419,12 @@ export const VisionZonesMotionSection: React.FC<{
               {privacyMasks.map((m, idx) => (
                 <div
                   key={`pm-${idx}`}
+                  className="nvr-subcard"
                   style={{
                     padding: 6,
-                    background: "var(--bg-canvas)",
-                    border: "1px solid #475569",
+                    borderColor: "var(--border-strong)",
                     borderRadius: 2,
-                    display: "flex",
+                    flexDirection: "row",
                     alignItems: "center",
                     justifyContent: "space-between",
                     gap: 6,
@@ -1447,7 +1439,7 @@ export const VisionZonesMotionSection: React.FC<{
                       whiteSpace: "nowrap",
                     }}
                   >
-                    <strong style={{ color: "#e2e8f0" }}>
+                    <strong style={{ color: "var(--text-primary)" }}>
                       PRIVACY REDACT #{idx + 1}:
                     </strong>{" "}
                     {m}
@@ -1476,12 +1468,12 @@ export const VisionZonesMotionSection: React.FC<{
               {motionMasks.map((m, idx) => (
                 <div
                   key={`mm-${idx}`}
+                  className="nvr-subcard"
                   style={{
                     padding: 6,
-                    background: "var(--bg-canvas)",
-                    border: "1px solid rgba(239, 68, 68, 0.35)",
+                    borderColor: "rgba(239, 68, 68, 0.35)",
                     borderRadius: 2,
-                    display: "flex",
+                    flexDirection: "row",
                     alignItems: "center",
                     justifyContent: "space-between",
                     gap: 6,
@@ -1536,12 +1528,12 @@ export const VisionZonesMotionSection: React.FC<{
               {objectMasks.map((m, idx) => (
                 <div
                   key={`om-${idx}`}
+                  className="nvr-subcard"
                   style={{
                     padding: 6,
-                    background: "var(--bg-canvas)",
-                    border: "1px solid rgba(168, 85, 247, 0.4)",
+                    borderColor: "rgba(168, 85, 247, 0.4)",
                     borderRadius: 2,
-                    display: "flex",
+                    flexDirection: "row",
                     alignItems: "center",
                     justifyContent: "space-between",
                     gap: 6,
@@ -1556,7 +1548,7 @@ export const VisionZonesMotionSection: React.FC<{
                       whiteSpace: "nowrap",
                     }}
                   >
-                    <strong style={{ color: "#d8b4fe" }}>
+                    <strong style={{ color: "var(--signal-accent-text)" }}>
                       OBJECT MASK #{idx + 1}:
                     </strong>{" "}
                     {m}
@@ -2404,18 +2396,16 @@ export const AiDetectionObjectsSection: React.FC<{
                       selectModelProfile(prof.id);
                     }
                   }}
+                  className="nvr-subcard"
                   style={{
                     padding: "7px 10px",
                     background: isSelected
                       ? "rgba(14, 165, 233, 0.12)"
-                      : "var(--bg-canvas)",
-                    border: `1px solid ${
-                      isSelected ? "var(--signal-accent)" : "var(--border-hairline)"
-                    }`,
-                    borderRadius: 3,
+                      : "var(--bg-subcard)",
+                    borderColor: isSelected
+                      ? "var(--signal-accent)"
+                      : "var(--border-hairline)",
                     cursor: "pointer",
-                    display: "flex",
-                    flexDirection: "column",
                     gap: 2,
                   }}
                 >
@@ -2602,17 +2592,7 @@ export const AiDetectionObjectsSection: React.FC<{
           </button>
 
           {showAdvancedModel && (
-            <div
-              style={{
-                padding: 10,
-                background: "var(--bg-canvas)",
-                border: "1px solid var(--border-hairline)",
-                borderRadius: 3,
-                display: "flex",
-                flexDirection: "column",
-                gap: 8,
-              }}
-            >
+            <div className="nvr-subcard">
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6 }}>
                 <div>
                   <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
@@ -3003,11 +2983,9 @@ export const AiDetectionObjectsSection: React.FC<{
 
           {showAdvancedByteTrack && (
             <div
+              className="nvr-subcard"
               style={{
                 padding: 8,
-                background: "var(--bg-canvas)",
-                border: "1px solid var(--border-hairline)",
-                borderRadius: 3,
                 display: "grid",
                 gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr",
                 gap: 6,
@@ -3165,17 +3143,7 @@ export const AiDetectionObjectsSection: React.FC<{
             </button>
           </div>
 
-          <div
-            style={{
-              padding: "8px 10px",
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
+          <div className="nvr-subcard" style={{ padding: "8px 10px" }}>
             <div
               style={{
                 display: "flex",
@@ -3265,17 +3233,7 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
           </div>
 
-          <div
-            style={{
-              padding: "8px 10px",
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
+          <div className="nvr-subcard" style={{ padding: "8px 10px" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                 <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-accent-text)", display: "flex", alignItems: "center", gap: 5 }}>
@@ -3980,17 +3938,7 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
 
           {/* Alert Suppression for Known Residents (exclude_sub_labels) */}
-          <div
-            style={{
-              padding: "8px 10px",
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 6,
-            }}
-          >
+          <div className="nvr-subcard" style={{ padding: "8px 10px", gap: 6 }}>
             <div
               style={{
                 display: "flex",
@@ -4070,17 +4018,7 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
 
           {/* Enrolled Profiles Gallery & Upload */}
-          <div
-            style={{
-              padding: "8px 10px",
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
+          <div className="nvr-subcard" style={{ padding: "8px 10px" }}>
             <div
               style={{
                 display: "flex",
@@ -4145,7 +4083,7 @@ export const AiDetectionObjectsSection: React.FC<{
                     alignItems: "center",
                     gap: 8,
                     padding: "4px 8px",
-                    background: "var(--bg-deep)",
+                    background: "var(--bg-input)",
                     border: "1px solid var(--border-hairline)",
                     borderRadius: 3,
                     fontSize: "var(--text-xs)",
@@ -4331,17 +4269,7 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
           </div>
 
-          <div
-            style={{
-              padding: "8px 10px",
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
-            }}
-          >
+          <div className="nvr-subcard" style={{ padding: "8px 10px" }}>
             <div
               style={{
                 display: "flex",
@@ -4659,12 +4587,10 @@ export const AiDetectionObjectsSection: React.FC<{
                 ([rName, rCfg]) => (
                   <div
                     key={rName}
+                    className="nvr-subcard"
                     style={{
                       padding: "6px 8px",
-                      background: "var(--bg-canvas)",
-                      border: "1px solid var(--border-hairline)",
-                      borderRadius: 3,
-                      display: "flex",
+                      flexDirection: "row",
                       alignItems: "center",
                       justifyContent: "space-between",
                       gap: 8,
@@ -4970,12 +4896,10 @@ export const DatasetStudioSection: React.FC<{
           }}
         >
           <div
-            className="mono"
+            className="nvr-subcard mono"
             style={{
               padding: 8,
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
+              gap: 2,
               fontSize: "var(--text-xs)",
             }}
           >
@@ -4989,12 +4913,10 @@ export const DatasetStudioSection: React.FC<{
           </div>
 
           <div
-            className="mono"
+            className="nvr-subcard mono"
             style={{
               padding: 8,
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
+              gap: 2,
               fontSize: "var(--text-xs)",
             }}
           >
@@ -5012,12 +4934,10 @@ export const DatasetStudioSection: React.FC<{
           </div>
 
           <div
-            className="mono"
+            className="nvr-subcard mono"
             style={{
               padding: 8,
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
+              gap: 2,
               fontSize: "var(--text-xs)",
             }}
           >
@@ -5034,12 +4954,10 @@ export const DatasetStudioSection: React.FC<{
           </div>
 
           <div
-            className="mono"
+            className="nvr-subcard mono"
             style={{
               padding: 8,
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
+              gap: 2,
               fontSize: "var(--text-xs)",
             }}
           >
@@ -5074,13 +4992,9 @@ export const DatasetStudioSection: React.FC<{
           }}
         >
           <div
+            className="nvr-subcard"
             style={{
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
               padding: 8,
-              display: "flex",
-              flexDirection: "column",
               gap: 6,
             }}
           >
@@ -5163,14 +5077,9 @@ export const DatasetStudioSection: React.FC<{
 
           {/* Interactive SVG Bounding-Box Stage */}
           <div
+            className="nvr-subcard"
             style={{
-              background: "var(--bg-canvas)",
-              border: "1px solid var(--border-hairline)",
-              borderRadius: 3,
               padding: 8,
-              display: "flex",
-              flexDirection: "column",
-              gap: 8,
             }}
           >
             <div
@@ -5243,7 +5152,7 @@ export const DatasetStudioSection: React.FC<{
                 style={{
                   position: "relative",
                   height: 210,
-                  background: "var(--bg-deep)",
+                  background: "var(--video-stage-bg)",
                   border: "1px solid var(--border-hairline)",
                   borderRadius: 3,
                   overflow: "hidden",
@@ -5283,13 +5192,13 @@ export const DatasetStudioSection: React.FC<{
                           width={(x2 - x1) * 1000}
                           height={(y2 - y1) * 1000}
                           fill="rgba(14, 165, 233, 0.16)"
-                          stroke="#38bdf8"
+                          stroke="var(--signal-accent-text)"
                           strokeWidth={4}
                         />
                         <text
                           x={x1 * 1000 + 8}
                           y={Math.max(24, y1 * 1000 + 22)}
-                          fill="#f8fafc"
+                          fill="var(--text-primary)"
                           fontSize={22}
                           fontFamily="monospace"
                         >
@@ -5320,12 +5229,10 @@ export const DatasetStudioSection: React.FC<{
 
         {/* Zero-Downtime Custom Model Upload & Hot-Reload Bar */}
         <div
+          className="nvr-subcard"
           style={{
             padding: 8,
-            background: "var(--bg-canvas)",
-            border: "1px solid var(--border-hairline)",
-            borderRadius: 3,
-            display: "flex",
+            flexDirection: "row",
             alignItems: "center",
             justifyContent: "space-between",
             flexWrap: "wrap",

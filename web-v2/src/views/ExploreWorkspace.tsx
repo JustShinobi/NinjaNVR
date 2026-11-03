@@ -780,7 +780,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                       width: 80,
                       height: 46,
                       objectFit: "contain",
-                      background: "var(--bg-deep)",
+                      background: "var(--video-stage-bg)",
                       borderRadius: 3,
                       border: "1px solid var(--border-hairline)",
                     }}
@@ -1091,7 +1091,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 <div
                   className="mono"
                   style={{
-                    background: "var(--bg-canvas)",
+                    background: "var(--bg-subcard)",
                     borderBottom: "1px solid var(--border-strong)",
                     padding: "7px 12px",
                     display: "flex",
@@ -1145,7 +1145,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 <div
                   className="mono"
                   style={{
-                    background: "var(--bg-canvas)",
+                    background: "var(--bg-subcard)",
                     borderBottom: "1px solid var(--border-strong)",
                     padding: "8px 12px",
                     display: "flex",
@@ -1265,7 +1265,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 <div
                   className="mono"
                   style={{
-                    background: "var(--bg-canvas)",
+                    background: "var(--bg-subcard)",
                     borderBottom: "1px solid var(--border-strong)",
                     padding: "8px 12px",
                     display: "flex",
@@ -1348,13 +1348,13 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                         >
                           <span>TS: {f.ts.toFixed(1)}s</span>
                           <span>Motion Boxes: {f.motion_boxes.length}</span>
-                          <span style={{ color: "#34d399" }}>
+                          <span style={{ color: "var(--signal-live-text)" }}>
                             Confirmed Tracks:{" "}
                             {f.active_tracks
                               .map((t) => `${t.label} (${Math.round(t.score * 100)}%, ${t.area_px}px²)`)
                               .join(", ") || "NONE"}
                           </span>
-                          <span style={{ color: "#fca5a5" }}>
+                          <span style={{ color: "var(--signal-alert-text)" }}>
                             Filtered/Rejected:{" "}
                             {f.filtered_reasons
                               .map(

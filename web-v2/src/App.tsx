@@ -797,7 +797,7 @@ export const App: React.FC = () => {
                 padding: "8px 10px",
                 background: "rgba(239, 68, 68, 0.14)",
                 border: "1px solid rgba(239, 68, 68, 0.5)",
-                color: "#fca5a5",
+                color: "var(--signal-alert-text)",
                 fontSize: 12,
                 borderRadius: 3,
               }}
@@ -898,7 +898,7 @@ export const App: React.FC = () => {
                   padding: "1px 5px",
                   background: "rgba(14, 165, 233, 0.16)",
                   border: "1px solid rgba(14, 165, 233, 0.45)",
-                  color: "#38bdf8",
+                  color: "var(--signal-accent-text)",
                   borderRadius: 2,
                 }}
               >
@@ -1009,7 +1009,7 @@ export const App: React.FC = () => {
               display: "inline-flex",
               alignItems: "center",
               gap: 2,
-              background: "var(--bg-canvas)",
+              background: "var(--bg-subcard)",
               border: "1px solid var(--border-strong)",
               borderRadius: 3,
               padding: 2,
