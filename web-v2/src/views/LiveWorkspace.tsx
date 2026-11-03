@@ -105,6 +105,53 @@ export function getMatrixPageSize(density: MatrixDensity): number {
   return 4;
 }
 
+export function resolveAdaptiveMatrixGridStyle(
+  visibleCount: number,
+  density: MatrixDensity
+): React.CSSProperties | undefined {
+  const maxSlots = getMatrixPageSize(density);
+  if (visibleCount <= 0 || visibleCount >= maxSlots) {
+    return undefined;
+  }
+  if (visibleCount === 1) {
+    return {
+      gridTemplateColumns: "minmax(0, 1fr)",
+      gridTemplateRows: "minmax(0, 1fr)",
+    };
+  }
+  if (visibleCount === 2) {
+    return {
+      gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+      gridTemplateRows: "minmax(0, 1fr)",
+    };
+  }
+  if (visibleCount <= 4) {
+    return {
+      gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+      gridTemplateRows: "repeat(2, minmax(0, 1fr))",
+    };
+  }
+  if (visibleCount <= 6) {
+    return {
+      gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+      gridTemplateRows: "repeat(2, minmax(0, 1fr))",
+    };
+  }
+  if (visibleCount <= 9) {
+    return {
+      gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+      gridTemplateRows: "repeat(3, minmax(0, 1fr))",
+    };
+  }
+  if (visibleCount <= 12) {
+    return {
+      gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+      gridTemplateRows: "repeat(3, minmax(0, 1fr))",
+    };
+  }
+  return undefined;
+}
+
 export function resolveOrderedDashboardCameras(
   cameraNames: string[],
   camerasConfig?: Record<string, CameraConfig>,
@@ -1292,21 +1339,38 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   );
 
   // Bi-directional Stage <-> Timeline synchronization:
-  // 1. When matrix page, density, or group changes and the active timeline camera is no longer
-  //    visible on stage, automatically sync the timeline to the first camera on the active page.
+  // Track explicit camera jumps initiated from the Timeline/Search picker so the page-change
+  // effect never clobbers a newly selected camera on another page back to visibleMatrixCams[0].
+  const pendingStageCameraRef = useRef<string | null>(null);
+
   useEffect(() => {
-    if (
-      liveLayout === "2x2" &&
-      visibleMatrixCams.length > 0 &&
-      !visibleMatrixCams.includes(selectedCamera)
-    ) {
+    if (liveLayout !== "2x2" || visibleMatrixCams.length === 0) return;
+    if (pendingStageCameraRef.current) {
+      if (visibleMatrixCams.includes(pendingStageCameraRef.current)) {
+        if (selectedCamera !== pendingStageCameraRef.current) {
+          setSelectedCamera(pendingStageCameraRef.current);
+        }
+        pendingStageCameraRef.current = null;
+      }
+      return;
+    }
+    if (!visibleMatrixCams.includes(selectedCamera)) {
       setSelectedCamera(visibleMatrixCams[0]);
     }
-  }, [liveLayout, safePage, activeCameraGroup, matrixDensity, visibleMatrixCams]);
+  }, [
+    liveLayout,
+    safePage,
+    activeCameraGroup,
+    matrixDensity,
+    visibleMatrixCams,
+    selectedCamera,
+    setSelectedCamera,
+  ]);
 
-  // 2. When the operator selects ANY camera from the Timeline or Search picker, automatically
-  //    jump the Matrix Page (and group if needed) so that camera is immediately visible on stage.
+  // When the operator selects ANY camera from the Timeline or Search picker, automatically
+  // jump the Matrix Page (and group if needed) so that camera is immediately visible on stage.
   const selectCameraAndRevealOnStage = (cam: string) => {
+    pendingStageCameraRef.current = cam;
     setSelectedCamera(cam);
     if (liveLayout === "2x2") {
       const idxInGroup = groupCams.indexOf(cam);
@@ -1314,6 +1378,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         const targetPage = Math.floor(idxInGroup / Math.max(1, pageSize));
         if (targetPage !== safePage) {
           setMatrixPage(targetPage);
+        } else {
+          pendingStageCameraRef.current = null;
         }
       } else {
         setActiveCameraGroup("all");
@@ -1815,7 +1881,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       )}
 
       {liveLayout === "2x2" && (
-        <div className={`nvr-matrix-${matrixDensity}`}>
+        <div
+          className={`nvr-matrix-${matrixDensity}`}
+          style={resolveAdaptiveMatrixGridStyle(
+            visibleMatrixCams.length,
+            matrixDensity
+          )}
+        >
           {visibleMatrixCams.map((cam) => {
             const realCam = resolveRealCameraSource(
               cam,
@@ -1835,12 +1907,26 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             return (
               <div
                 key={cam}
-                className={`nvr-cam-tile ${isTimeShifted ? "has-native-controls" : ""}`}
-                style={{
-                  outline: isTimelineCam ? "2px solid var(--signal-accent)" : "none",
-                  outlineOffset: -2,
-                }}
+                className={`nvr-cam-tile ${isTimeShifted ? "has-native-controls" : ""} ${
+                  isTimelineCam && visibleMatrixCams.length > 1
+                    ? "is-timeline-focused"
+                    : ""
+                }`}
               >
+                {isTimelineCam && visibleMatrixCams.length > 1 && (
+                  <div
+                    className="nvr-timeline-reticle"
+                    aria-hidden="true"
+                  >
+                    <span className="nvr-reticle-corner tl" />
+                    <span className="nvr-reticle-corner tr" />
+                    <span className="nvr-reticle-corner bl" />
+                    <span className="nvr-reticle-corner br" />
+                    <span className="nvr-timeline-focus-tab mono">
+                      ▼ TIMELINE · {cam.toUpperCase()}
+                    </span>
+                  </div>
+                )}
                 {isTimeShifted && timeShiftTs !== null ? (
                   <VodHlsPlayer
                     camera={realCam}

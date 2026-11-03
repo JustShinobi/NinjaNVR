@@ -23,6 +23,7 @@ import {
   normalizeFloorplanRoomRect,
   resizeRoomByMeters,
   resizeWallToLengthMeters,
+  resolveAdaptiveMatrixGridStyle,
   resolveDockTileMode,
   resolveOrderedDashboardCameras,
   rotateWallToAngleDegrees,
@@ -329,6 +330,30 @@ describe("Adaptive Tactical Map ceil(sqrt(N)) coordinate placement", () => {
       snapStep: 0.005,
     });
     expect(orthoHoriz.y).toBe(0.3);
+  });
+
+  test("adapts partial last-page matrix grid dimensions so remaining cameras fill the stage", () => {
+    expect(resolveAdaptiveMatrixGridStyle(16, "4x4")).toBeUndefined();
+    expect(resolveAdaptiveMatrixGridStyle(9, "3x3")).toBeUndefined();
+    expect(resolveAdaptiveMatrixGridStyle(4, "2x2")).toBeUndefined();
+
+    // 4 remaining cameras on Page 7/7 of a 100-camera 4x4 grid fill the stage as 2x2
+    expect(resolveAdaptiveMatrixGridStyle(4, "4x4")).toEqual({
+      gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+      gridTemplateRows: "repeat(2, minmax(0, 1fr))",
+    });
+    expect(resolveAdaptiveMatrixGridStyle(1, "4x4")).toEqual({
+      gridTemplateColumns: "minmax(0, 1fr)",
+      gridTemplateRows: "minmax(0, 1fr)",
+    });
+    expect(resolveAdaptiveMatrixGridStyle(2, "3x3")).toEqual({
+      gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+      gridTemplateRows: "minmax(0, 1fr)",
+    });
+    expect(resolveAdaptiveMatrixGridStyle(6, "4x4")).toEqual({
+      gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+      gridTemplateRows: "repeat(2, minmax(0, 1fr))",
+    });
   });
 });
 

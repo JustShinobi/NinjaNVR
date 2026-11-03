@@ -498,6 +498,73 @@ textarea:focus {
 }
 
 /* Camera Grid Layouts */
+.nvr-cam-tile.is-timeline-focused {
+  box-shadow: inset 0 0 0 2px var(--signal-accent), inset 0 0 22px rgba(56, 189, 248, 0.14);
+}
+
+.nvr-timeline-reticle {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 6;
+}
+
+.nvr-reticle-corner {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-color: var(--signal-accent);
+  border-style: solid;
+  border-width: 0;
+  opacity: 0.95;
+}
+
+.nvr-reticle-corner.tl {
+  top: 6px;
+  left: 6px;
+  border-top-width: 2px;
+  border-left-width: 2px;
+}
+
+.nvr-reticle-corner.tr {
+  top: 6px;
+  right: 6px;
+  border-top-width: 2px;
+  border-right-width: 2px;
+}
+
+.nvr-reticle-corner.bl {
+  bottom: 6px;
+  left: 6px;
+  border-bottom-width: 2px;
+  border-left-width: 2px;
+}
+
+.nvr-reticle-corner.br {
+  bottom: 6px;
+  right: 6px;
+  border-bottom-width: 2px;
+  border-right-width: 2px;
+}
+
+.nvr-timeline-focus-tab {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(9, 13, 22, 0.9);
+  border: 1px solid var(--signal-accent);
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  padding: 1px 9px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: #38bdf8;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.55);
+}
+
 .nvr-matrix-2x2 {
   flex: 1;
   min-width: 0;
