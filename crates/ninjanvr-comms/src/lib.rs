@@ -49,6 +49,7 @@ fn default_camera_activity_entry() -> Value {
         "audio_dbfs": -90,
         "audio_active": false,
         "objects": [],
+        "states": {},
         "count": 0,
         "max_Area": 0,
         "config": {
@@ -235,6 +236,53 @@ impl CommsHub {
         self.publish_ws_only("camera_activity", snapshot_str);
     }
 
+    /// Publishes `<camera>/state/<roi_name>` over MQTT (`<prefix>/<camera>/state/<roi_name>`) and `/ws`,
+    /// and updates `camera_activity.<camera>.states.<roi_name>` in the real-time activity snapshot.
+    pub fn publish_roi_state(&self, camera: &str, roi_name: &str, state: &str) {
+        let snapshot_str = {
+            let mut map = self
+                .camera_states
+                .write()
+                .expect("camera_states lock poisoned");
+            let entry = map
+                .entry(camera.to_string())
+                .or_insert_with(default_camera_activity_entry);
+            if let Some(obj) = entry.as_object_mut() {
+                let states_entry = obj.entry("states".to_string()).or_insert_with(|| json!({}));
+                if !states_entry.is_object() {
+                    *states_entry = json!({});
+                }
+                if let Some(states_obj) = states_entry.as_object_mut() {
+                    states_obj.insert(roi_name.to_string(), json!(state));
+                }
+            }
+            serde_json::to_string(&*map).unwrap_or_else(|_| "{}".to_string())
+        };
+        self.publish_topic(&format!("{camera}/state/{roi_name}"), state);
+        self.publish_ws_only("camera_activity", snapshot_str);
+    }
+
+    /// Returns a cloned map of the current ROI states (`roi_name -> state`) for `camera`.
+    pub fn get_camera_roi_states(&self, camera: &str) -> BTreeMap<String, String> {
+        let map = self
+            .camera_states
+            .read()
+            .expect("camera_states lock poisoned");
+        let Some(entry) = map.get(camera) else {
+            return BTreeMap::new();
+        };
+        let Some(states_obj) = entry.get("states").and_then(|v| v.as_object()) else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for (k, v) in states_obj {
+            if let Some(s) = v.as_str() {
+                out.insert(k.clone(), s.to_string());
+            }
+        }
+        out
+    }
+
     /// Returns a cloned JSON snapshot of all current camera activity states.
     pub fn get_camera_activity_snapshot(&self) -> Value {
         let map = self
@@ -265,6 +313,21 @@ impl CommsHub {
                 .or_insert_with(default_camera_activity_entry);
             if let Some(obj) = entry.as_object_mut() {
                 obj.insert("enabled".to_string(), json!(cam_cfg.enabled));
+                if !cam_cfg.state_rois.is_empty() {
+                    let states_entry = obj.entry("states".to_string()).or_insert_with(|| json!({}));
+                    if let Some(states_obj) = states_entry.as_object_mut() {
+                        for (roi_name, roi_cfg) in &cam_cfg.state_rois {
+                            let initial_state = roi_cfg
+                                .classes
+                                .first()
+                                .cloned()
+                                .unwrap_or_else(|| "closed".to_string());
+                            states_obj
+                                .entry(roi_name.clone())
+                                .or_insert_with(|| json!(initial_state));
+                        }
+                    }
+                }
             }
             if let Some(cfg_obj) = entry.get_mut("config").and_then(|c| c.as_object_mut()) {
                 cfg_obj.insert("enabled".to_string(), json!(cam_cfg.enabled));
@@ -518,6 +581,19 @@ impl CommsHub {
                     })
                     .to_string(),
                 );
+                if let Some(states_obj) = entry.get("states").and_then(|v| v.as_object()) {
+                    for (roi_name, state_val) in states_obj {
+                        if let Some(state_str) = state_val.as_str() {
+                            msgs.push(
+                                json!({
+                                    "topic": format!("{cam}/state/{roi_name}"),
+                                    "payload": state_str
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                }
             }
             serde_json::to_string(&*map).unwrap_or_else(|_| "{}".to_string())
         };
@@ -1302,5 +1378,63 @@ cameras:
         assert_eq!(tail.len(), 2);
         assert!(tail[0].contains("msg 3"));
         assert!(tail[1].contains("msg 4"));
+    }
+
+    #[tokio::test]
+    async fn publish_roi_state_updates_camera_activity_states_and_emits_ws_broadcasts() {
+        let yaml = r#"
+cameras:
+  driveway:
+    enabled: true
+    state_rois:
+      gate:
+        crop: [0.1, 0.2, 0.5, 0.8]
+        classes: [closed, open]
+        interval_sec: 5
+        hysteresis: 3
+        anomaly_state: open
+        anomaly_timeout_sec: 180
+      parking_spot:
+        crop: [0.5, 0.4, 0.9, 0.9]
+        classes: [empty, occupied]
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let hub = CommsHub::new();
+        hub.init_from_config(&cfg);
+
+        // Initial defaults seeded from config
+        let init_states = hub.get_camera_roi_states("driveway");
+        assert_eq!(init_states.get("gate").map(String::as_str), Some("closed"));
+        assert_eq!(
+            init_states.get("parking_spot").map(String::as_str),
+            Some("empty")
+        );
+
+        let mut rx = hub.subscribe_ws();
+        hub.publish_roi_state("driveway", "gate", "open");
+
+        let topic_msg: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(topic_msg.topic, "driveway/state/gate");
+        assert_eq!(topic_msg.payload, "open");
+
+        let act_msg: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(act_msg.topic, "camera_activity");
+        let act_val: Value = serde_json::from_str(&act_msg.payload).unwrap();
+        assert_eq!(act_val["driveway"]["states"]["gate"], "open");
+        assert_eq!(act_val["driveway"]["states"]["parking_spot"], "empty");
+
+        // Subsequent update_camera_activity preserves states map
+        hub.update_camera_activity("driveway", true, vec![], 900);
+        let next_act: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        let next_val: Value = serde_json::from_str(&next_act.payload).unwrap();
+        assert_eq!(next_val["driveway"]["states"]["gate"], "open");
+
+        // initial_ws_snapshots includes <camera>/state/<roi_name>
+        let snaps = hub.initial_ws_snapshots(&["driveway".to_string()]);
+        assert!(
+            snaps
+                .iter()
+                .any(|s| s.contains("driveway/state/gate") && s.contains("open"))
+        );
     }
 }

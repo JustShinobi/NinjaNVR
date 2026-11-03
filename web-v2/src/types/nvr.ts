@@ -205,6 +205,15 @@ export interface LineConfig {
   objects?: string[];
 }
 
+export interface StateRoiConfig {
+  crop: [number, number, number, number];
+  classes: string[];
+  interval_sec?: number;
+  hysteresis?: number;
+  anomaly_state?: string | null;
+  anomaly_timeout_sec?: number;
+}
+
 export interface CameraFfmpegInput {
   path: string;
   roles: string[];
@@ -287,6 +296,7 @@ export interface CameraConfig {
   objects?: ObjectsConfig;
   zones: Record<string, ZoneConfig>;
   lines?: Record<string, LineConfig>;
+  state_rois?: Record<string, StateRoiConfig>;
   record: RecordConfig;
   snapshots: SnapshotsConfig;
   review?: ReviewConfig;
@@ -501,6 +511,7 @@ export interface CameraRuntimeStats {
   ffmpeg_pid: number;
   last_frame_ts?: number;
   night_mode?: boolean;
+  states?: Record<string, string>;
   ffmpeg_cpu?: string;
   capture_cpu?: string;
   detect_cpu?: string;
@@ -708,6 +719,7 @@ export interface CameraLiveActivity {
   tamper?: boolean;
   motion: boolean;
   max_Area?: number;
+  states?: Record<string, string>;
   objects: Array<{
     id: string;
     label: string;

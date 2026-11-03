@@ -21,17 +21,22 @@ import {
 import {
   TacticalPtzHudOverlay,
   buildPtzMovePayload,
+  formatRoiStateBadge,
   isCameraPtzEnabled,
   resolveCameraPtzPresets,
+  resolveCameraRoiStateBadges,
 } from "../views/LiveWorkspace";
 import {
   DEFAULT_ATTRIBUTE_LABELS,
+  buildStateRoiConfig,
   formatDhash64Hex,
   formatSignatureBbox,
-  removeKnownPlateEntry,
-  STANDARD_LABELS,
   normalizeFaceProfileName,
   parseFacesApiResponse,
+  parseRoiClassesInput,
+  parseRoiCropInput,
+  removeKnownPlateEntry,
+  STANDARD_LABELS,
   toggleAttributeLabelList,
   toggleSubLabelRuleList,
   upsertKnownPlateEntry,
@@ -915,5 +920,99 @@ cameras:
         "XYZ9999"
       )
     ).toBe(false);
+  });
+
+  test("serializes state_rois in configYaml and formats ROI state badges in LiveWorkspace", () => {
+    const gateRoi = buildStateRoiConfig({
+      cropInput: "0.10, 0.20, 0.60, 0.80",
+      classesInput: "closed, open",
+      intervalSec: 5,
+      hysteresis: 3,
+      anomalyState: "open",
+      anomalyTimeoutSec: 180,
+    });
+    expect(gateRoi).toEqual({
+      crop: [0.1, 0.2, 0.6, 0.8],
+      classes: ["closed", "open"],
+      interval_sec: 5,
+      hysteresis: 3,
+      anomaly_state: "open",
+      anomaly_timeout_sec: 180,
+    });
+
+    expect(
+      parseRoiCropInput("", [
+        [0.8, 0.9],
+        [0.2, 0.3],
+      ])
+    ).toEqual([0.2, 0.3, 0.8, 0.9]);
+    expect(parseRoiClassesInput("Empty, Occupied")).toEqual(["empty", "occupied"]);
+
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      cameras: {
+        portao: {
+          name: "portao",
+          enabled: true,
+          ffmpeg: {
+            inputs: [{ path: "rtsp://192.0.2.88:554/sub", roles: ["detect"] }],
+          },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {},
+          state_rois: {
+            gate: gateRoi,
+            parking_spot: {
+              crop: [0.4, 0.5, 0.9, 0.95],
+              classes: ["empty", "occupied"],
+              interval_sec: 10,
+              hysteresis: 4,
+            },
+          },
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+      },
+    };
+
+    const yamlText = buildCleanYamlFromDraft(draft, "");
+    expect(yamlText).toContain("state_rois:");
+    expect(yamlText).toContain("gate:");
+    expect(yamlText).toContain("anomaly_state: open");
+    expect(yamlText).toContain("anomaly_timeout_sec: 180");
+    expect(yamlText).toContain("hysteresis: 3");
+    expect(yamlText).toContain("parking_spot:");
+    expect(yamlText).toContain("- occupied");
+
+    // Verify LiveWorkspace ROI badge status formatting and anomaly highlighting
+    const normalBadge = formatRoiStateBadge("gate", "closed", gateRoi);
+    expect(normalBadge.label).toBe("GATE: CLOSED");
+    expect(normalBadge.isAnomaly).toBe(false);
+    expect(normalBadge.color).toBe("var(--text-primary)");
+
+    const anomalyBadge = formatRoiStateBadge("gate", "open", gateRoi);
+    expect(anomalyBadge.label).toBe("GATE: OPEN");
+    expect(anomalyBadge.isAnomaly).toBe(true);
+    expect(anomalyBadge.color).toBe("var(--signal-alert-text)");
+
+    const resolvedBadges = resolveCameraRoiStateBadges(
+      draft.cameras.portao,
+      {
+        motion: false,
+        objects: [],
+        states: {
+          gate: "open",
+          parking_spot: "empty",
+        },
+      },
+      undefined
+    );
+    expect(resolvedBadges.length).toBe(2);
+    expect(resolvedBadges[0].label).toBe("GATE: OPEN");
+    expect(resolvedBadges[0].isAnomaly).toBe(true);
+    expect(resolvedBadges[0].color).toBe("var(--signal-alert-text)");
+    expect(resolvedBadges[1].label).toBe("PARKING_SPOT: EMPTY");
+    expect(resolvedBadges[1].isAnomaly).toBe(false);
   });
 });

@@ -1590,6 +1590,8 @@ pub struct CameraConfig {
     pub zones: BTreeMap<String, ZoneConfig>,
     #[serde(default)]
     pub lines: BTreeMap<String, LineConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub state_rois: BTreeMap<String, StateRoiConfig>,
 }
 
 impl Default for CameraConfig {
@@ -1614,6 +1616,56 @@ impl Default for CameraConfig {
             review: ReviewConfig::default(),
             zones: BTreeMap::new(),
             lines: BTreeMap::new(),
+            state_rois: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateRoiConfig {
+    #[serde(default = "default_state_roi_crop")]
+    pub crop: [f32; 4],
+    #[serde(default = "default_state_roi_classes")]
+    pub classes: Vec<String>,
+    #[serde(default = "default_state_roi_interval_sec")]
+    pub interval_sec: u32,
+    #[serde(default = "default_state_roi_hysteresis")]
+    pub hysteresis: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anomaly_state: Option<String>,
+    #[serde(default = "default_state_roi_anomaly_timeout_sec")]
+    pub anomaly_timeout_sec: u32,
+}
+
+fn default_state_roi_crop() -> [f32; 4] {
+    [0.25, 0.25, 0.75, 0.75]
+}
+
+fn default_state_roi_classes() -> Vec<String> {
+    vec!["closed".to_string(), "open".to_string()]
+}
+
+fn default_state_roi_interval_sec() -> u32 {
+    5
+}
+
+fn default_state_roi_hysteresis() -> u32 {
+    3
+}
+
+fn default_state_roi_anomaly_timeout_sec() -> u32 {
+    300
+}
+
+impl Default for StateRoiConfig {
+    fn default() -> Self {
+        Self {
+            crop: default_state_roi_crop(),
+            classes: default_state_roi_classes(),
+            interval_sec: default_state_roi_interval_sec(),
+            hysteresis: default_state_roi_hysteresis(),
+            anomaly_state: None,
+            anomaly_timeout_sec: default_state_roi_anomaly_timeout_sec(),
         }
     }
 }
@@ -1755,6 +1807,21 @@ impl NinjaConfig {
                 && !cfg.review.alerts.exclude_sub_labels.is_empty()
             {
                 cam.review.alerts.exclude_sub_labels = cfg.review.alerts.exclude_sub_labels.clone();
+            }
+            for roi in cam.state_rois.values_mut() {
+                if roi.classes.is_empty() {
+                    roi.classes = default_state_roi_classes();
+                }
+                roi.interval_sec = roi.interval_sec.max(1);
+                roi.hysteresis = roi.hysteresis.max(1);
+                roi.anomaly_timeout_sec = roi.anomaly_timeout_sec.max(1);
+                if roi
+                    .anomaly_state
+                    .as_ref()
+                    .is_some_and(|s| s.trim().is_empty())
+                {
+                    roi.anomaly_state = None;
+                }
             }
         }
 
@@ -2160,6 +2227,7 @@ impl NinjaConfig {
                     "profiles": {},
                     "zones": cam.zones,
                     "lines": cam.lines,
+                    "state_rois": cam.state_rois,
                     "ffmpeg_cmds": []
                 }),
             );
@@ -2806,6 +2874,21 @@ impl NinjaConfig {
                         self.review.alerts.exclude_sub_labels.clone();
                 }
                 cam.objects.normalize_standalone_tracked_attributes();
+                for roi in cam.state_rois.values_mut() {
+                    if roi.classes.is_empty() {
+                        roi.classes = default_state_roi_classes();
+                    }
+                    roi.interval_sec = roi.interval_sec.max(1);
+                    roi.hysteresis = roi.hysteresis.max(1);
+                    roi.anomaly_timeout_sec = roi.anomaly_timeout_sec.max(1);
+                    if roi
+                        .anomaly_state
+                        .as_ref()
+                        .is_some_and(|s| s.trim().is_empty())
+                    {
+                        roi.anomaly_state = None;
+                    }
+                }
             }
             self.cameras = next_cams;
         }
@@ -4527,6 +4610,97 @@ version: 0.18-0
         assert_eq!(
             cfg.lpr.known_plates.get("BRA2E19").map(String::as_str),
             Some("Visitor Sedan")
+        );
+    }
+
+    #[test]
+    fn state_rois_roundtrip_yaml_and_structured_json_with_defaults() {
+        let yaml = r#"
+cameras:
+  portao:
+    enabled: true
+    state_rois:
+      gate:
+        crop: [0.1, 0.2, 0.6, 0.8]
+        classes: [closed, open]
+        interval_sec: 5
+        hysteresis: 3
+        anomaly_state: open
+        anomaly_timeout_sec: 180
+      parking_spot:
+        crop: [0.5, 0.5, 0.9, 0.9]
+version: 0.18-0
+"#;
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        let gate = &cfg.cameras["portao"].state_rois["gate"];
+        assert_eq!(gate.crop, [0.1, 0.2, 0.6, 0.8]);
+        assert_eq!(gate.classes, vec!["closed", "open"]);
+        assert_eq!(gate.interval_sec, 5);
+        assert_eq!(gate.hysteresis, 3);
+        assert_eq!(gate.anomaly_state.as_deref(), Some("open"));
+        assert_eq!(gate.anomaly_timeout_sec, 180);
+
+        let spot = &cfg.cameras["portao"].state_rois["parking_spot"];
+        assert_eq!(spot.classes, vec!["closed", "open"]);
+        assert_eq!(spot.interval_sec, 5);
+        assert_eq!(spot.hysteresis, 3);
+        assert!(spot.anomaly_state.is_none());
+        assert_eq!(spot.anomaly_timeout_sec, 300);
+
+        let api_val = cfg.to_api_value();
+        assert_eq!(
+            api_val["cameras"]["portao"]["state_rois"]["gate"]["anomaly_state"],
+            "open"
+        );
+        assert_eq!(
+            api_val["cameras"]["portao"]["state_rois"]["gate"]["anomaly_timeout_sec"],
+            180
+        );
+
+        let patch = json!({
+            "cameras": {
+                "portao": {
+                    "enabled": true,
+                    "state_rois": {
+                        "gate": {
+                            "crop": [0.15, 0.25, 0.65, 0.85],
+                            "classes": ["closed", "open"],
+                            "interval_sec": 4,
+                            "hysteresis": 4,
+                            "anomaly_state": "open",
+                            "anomaly_timeout_sec": 240
+                        },
+                        "driveway_spot": {
+                            "crop": [0.4, 0.4, 0.9, 0.9],
+                            "classes": ["empty", "occupied"],
+                            "interval_sec": 10,
+                            "hysteresis": 2,
+                            "anomaly_state": "occupied",
+                            "anomaly_timeout_sec": 600
+                        }
+                    }
+                }
+            }
+        });
+        cfg.apply_structured_json(&patch).unwrap();
+        assert_eq!(cfg.cameras["portao"].state_rois.len(), 2);
+        assert_eq!(
+            cfg.cameras["portao"].state_rois["driveway_spot"].classes,
+            vec!["empty", "occupied"]
+        );
+        assert_eq!(
+            cfg.cameras["portao"].state_rois["driveway_spot"].hysteresis,
+            2
+        );
+        assert_eq!(
+            cfg.cameras["portao"].state_rois["driveway_spot"]
+                .anomaly_state
+                .as_deref(),
+            Some("occupied")
+        );
+        assert_eq!(
+            cfg.cameras["portao"].state_rois["driveway_spot"].anomaly_timeout_sec,
+            600
         );
     }
 }

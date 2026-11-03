@@ -5,12 +5,15 @@ import { useNvrStore } from "../store/useNvrStore";
 import {
   CameraConfig,
   CameraGroupConfig,
+  CameraLiveActivity,
   CameraMapPlacement,
   CameraPtzInfoResponse,
+  CameraRuntimeStats,
   FloorplanRoom,
   FloorplanWall,
   RecordingSegment,
   ReviewItem,
+  StateRoiConfig,
 } from "../types/nvr";
 import { HudPosition, MatrixDensity, SpotlightFilter, formatTs } from "../utils/format";
 import { LiveMsePlayer, PushToTalkButton, VodHlsPlayer } from "../components/VideoPlayers";
@@ -18,6 +21,63 @@ import { TimelineScrubber } from "../components/TimelineScrubber";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 
 export const MAX_DOCK_LIVE_DECODERS = 6;
+
+export interface RoiStateBadgeItem {
+  roiName: string;
+  state: string;
+  label: string;
+  isAnomaly: boolean;
+  anomalyState?: string | null;
+  anomalyTimeoutSec: number;
+  color: string;
+}
+
+export function formatRoiStateBadge(
+  roiName: string,
+  state: string,
+  roiCfg?: StateRoiConfig
+): RoiStateBadgeItem {
+  const cleanRoi = roiName.trim();
+  const cleanState = state.trim() || "closed";
+  const anomalyState = roiCfg?.anomaly_state ?? null;
+  const isAnomaly = Boolean(
+    anomalyState &&
+      anomalyState.trim().toLowerCase() === cleanState.toLowerCase()
+  );
+  const anomalyTimeoutSec = roiCfg?.anomaly_timeout_sec ?? 300;
+  return {
+    roiName: cleanRoi,
+    state: cleanState,
+    label: `${cleanRoi.toUpperCase()}: ${cleanState.toUpperCase()}`,
+    isAnomaly,
+    anomalyState,
+    anomalyTimeoutSec,
+    color: isAnomaly ? "var(--signal-alert-text)" : "var(--text-primary)",
+  };
+}
+
+export function resolveCameraRoiStateBadges(
+  camCfg?: CameraConfig,
+  act?: CameraLiveActivity,
+  camStat?: CameraRuntimeStats
+): RoiStateBadgeItem[] {
+  const configuredRois = camCfg?.state_rois || {};
+  const liveStates: Record<string, string> = {
+    ...(camStat?.states || {}),
+    ...(act?.states || {}),
+  };
+  const roiKeys = Array.from(
+    new Set([...Object.keys(configuredRois), ...Object.keys(liveStates)])
+  );
+  if (roiKeys.length === 0) return [];
+  return roiKeys.map((roiName) => {
+    const roiCfg = configuredRois[roiName];
+    const fallbackState =
+      roiCfg?.classes && roiCfg.classes.length > 0 ? roiCfg.classes[0] : "closed";
+    const state = liveStates[roiName] ?? fallbackState;
+    return formatRoiStateBadge(roiName, state, roiCfg);
+  });
+}
 
 export function getMatrixPageSize(density: MatrixDensity): number {
   if (density === "3x3") return 9;
@@ -1352,6 +1412,28 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       IR NIGHT
                     </span>
                   )}
+                  {resolveCameraRoiStateBadges(camCfg, act, camStat).map((badge) => (
+                    <span
+                      key={`roi-${badge.roiName}`}
+                      data-testid={`roi-badge-${cam}-${badge.roiName}`}
+                      className={`nvr-badge mono ${badge.isAnomaly ? "alert" : ""}`}
+                      style={
+                        badge.isAnomaly
+                          ? {
+                              color: "var(--signal-alert-text)",
+                              borderColor: "var(--signal-alert)",
+                            }
+                          : undefined
+                      }
+                      title={
+                        badge.isAnomaly
+                          ? `Anomalous ROI state (${badge.label}) — alert after ${badge.anomalyTimeoutSec}s`
+                          : `ROI state (${badge.label})`
+                      }
+                    >
+                      {badge.label}
+                    </span>
+                  ))}
                   <span className="nvr-badge">
                     AI {camStat?.detection_fps?.toFixed(1) || "0.0"} FPS
                   </span>
@@ -1505,6 +1587,23 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         IR NIGHT
                       </span>
                     )}
+                    {resolveCameraRoiStateBadges(camCfg, act, camStat).map((badge) => (
+                      <span
+                        key={`roi-${badge.roiName}`}
+                        data-testid={`roi-badge-spotlight-${cam}-${badge.roiName}`}
+                        className={`nvr-badge mono ${badge.isAnomaly ? "alert" : ""}`}
+                        style={
+                          badge.isAnomaly
+                            ? {
+                                color: "var(--signal-alert-text)",
+                                borderColor: "var(--signal-alert)",
+                              }
+                            : undefined
+                        }
+                      >
+                        {badge.label}
+                      </span>
+                    ))}
                     {activeLabels.length > 0 && (
                       <span className="nvr-badge alert">
                         {activeLabels.join(", ")}
@@ -1646,6 +1745,27 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   cameraActivity[selectedCamera]?.night_mode ||
                     stats?.cameras?.[selectedCamera]?.night_mode
                 ) && <span className="nvr-badge mono">IR NIGHT</span>}
+                {resolveCameraRoiStateBadges(
+                  config?.cameras?.[selectedCamera],
+                  cameraActivity[selectedCamera],
+                  stats?.cameras?.[selectedCamera]
+                ).map((badge) => (
+                  <span
+                    key={`roi-${badge.roiName}`}
+                    data-testid={`roi-badge-focus-${selectedCamera}-${badge.roiName}`}
+                    className={`nvr-badge mono ${badge.isAnomaly ? "alert" : ""}`}
+                    style={
+                      badge.isAnomaly
+                        ? {
+                            color: "var(--signal-alert-text)",
+                            borderColor: "var(--signal-alert)",
+                          }
+                        : undefined
+                    }
+                  >
+                    {badge.label}
+                  </span>
+                ))}
                 {timeShiftTs === null ? (
                   <PushToTalkButton camera={selectedCamera} height={22} />
                 ) : (
