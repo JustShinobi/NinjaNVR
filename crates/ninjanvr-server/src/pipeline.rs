@@ -17,8 +17,9 @@ use ninjanvr_track::{
 pub use ninjanvr_vision::classify_dominant_color_tag;
 use ninjanvr_vision::{
     BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, apply_privacy_masks_from_value,
-    check_frame_tamper, compute_inference_regions, crop_yuv420p_to_tensor_nhwc, encode_image_jpeg,
-    encode_image_webp, is_monochrome_ir, yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
+    check_frame_tamper, compute_crop_dhash64, compute_inference_regions,
+    crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp, is_monochrome_ir,
+    yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -70,6 +71,9 @@ pub struct TrackPersistSnapshot {
     pub detected_attributes: Vec<TrackedAttribute>,
     pub zones: Vec<String>,
     pub stationary: bool,
+    pub dhash64: Option<u64>,
+    pub suppressed_fp: bool,
+    pub ai_verify_triggered: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -603,7 +607,7 @@ impl VisionPipeline {
 
         let active_profile = self.comms.get_active_profile();
         let cam_rt_flags = self.comms.get_camera_flags(camera);
-        let (camera_suppressed_in_profile, camera_record_disabled_in_profile) = {
+        let (camera_suppressed_in_profile, camera_record_disabled_in_profile, genai_cfg) = {
             let cfg_guard = self.config.read().await;
             let sup_alerts =
                 is_camera_alert_suppressed_in_profile(&cfg_guard, &active_profile, camera);
@@ -618,23 +622,25 @@ impl VisionPipeline {
                         .any(|c| c == camera || c == "*")
                 })
                 .unwrap_or(false);
-            (sup_alerts, sup_rec)
+            (sup_alerts, sup_rec, cfg_guard.genai.clone())
         };
         let snapshots_active = cam_cfg.snapshots.enabled && cam_rt_flags.snapshots;
         let record_active =
             cam_cfg.record.enabled && cam_rt_flags.record && !camera_record_disabled_in_profile;
         for trk in active_tracks {
-            let prev = track_snapshots.get(&trk.id);
+            let prev = track_snapshots.get(&trk.id).cloned();
             let is_new = prev.is_none();
-            let prev_zones: Vec<String> = prev.map(|p| p.zones.clone()).unwrap_or_default();
+            let prev_zones: Vec<String> =
+                prev.as_ref().map(|p| p.zones.clone()).unwrap_or_default();
             let newly_entered_zones: Vec<String> = trk
                 .entered_zones
                 .iter()
                 .filter(|z| !prev_zones.contains(z))
                 .cloned()
                 .collect();
-            let prev_best_score = prev.map(|p| p.best_score).unwrap_or(0.0);
-            let prev_best_attr_quality = prev.map(|p| p.best_attribute_score).unwrap_or(0.0);
+            let prev_best_score = prev.as_ref().map(|p| p.best_score).unwrap_or(0.0);
+            let prev_best_attr_quality =
+                prev.as_ref().map(|p| p.best_attribute_score).unwrap_or(0.0);
             let attr_q_from_boxes = trk
                 .attributes
                 .iter()
@@ -652,19 +658,22 @@ impl VisionPipeline {
                 0.0
             };
             let is_better_score = prev
+                .as_ref()
                 .map(|p| trk.score > p.best_score + 0.05)
                 .unwrap_or(true);
             let is_better_attr = (prev_best_attr_quality <= 0.0 && new_attr_quality > 0.0)
                 || new_attr_quality > prev_best_attr_quality + 0.02;
             let state_changed = prev
+                .as_ref()
                 .map(|p| p.zones != trk.entered_zones || p.stationary != trk.stationary)
                 .unwrap_or(false);
 
             let effective_sub_label = trk
                 .inferred_sub_label
                 .clone()
-                .or_else(|| prev.and_then(|p| p.sub_label.clone()));
+                .or_else(|| prev.as_ref().and_then(|p| p.sub_label.clone()));
             let mut merged_attrs: Vec<TrackedAttribute> = prev
+                .as_ref()
                 .map(|p| p.detected_attributes.clone())
                 .unwrap_or_default();
             for attr in &trk.attributes {
@@ -677,14 +686,51 @@ impl VisionPipeline {
                 }
             }
             let attrs_changed = prev
+                .as_ref()
                 .map(|p| {
                     p.sub_label != effective_sub_label || p.detected_attributes != merged_attrs
                 })
                 .unwrap_or(!merged_attrs.is_empty() || effective_sub_label.is_some());
 
+            let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
+            let crop_dhash64 =
+                compute_crop_dhash64(&frame.data, frame.width, frame.height, trk.bbox);
+            let mut suppressed_fp = prev.as_ref().is_some_and(|p| p.suppressed_fp);
+            let mut matched_fp_sig_id: Option<i64> = None;
+            if is_new
+                && !suppressed_fp
+                && let Ok(Some(sig_val)) = self.db.match_false_positive_signature(
+                    camera,
+                    &trk.label,
+                    norm_box,
+                    Some(crop_dhash64),
+                )
+            {
+                suppressed_fp = true;
+                matched_fp_sig_id = sig_val["id"].as_i64();
+                self.log_hub.push_ninjanvr(
+                    "INFO",
+                    &format!("ninjanvr.vision.{camera}"),
+                    &format!(
+                        "Suppressed recurring false-positive track {} ({}) matching signature #{:?}",
+                        trk.id, trk.label, matched_fp_sig_id
+                    ),
+                );
+            }
+            let mut ai_verify_triggered = prev.as_ref().is_some_and(|p| p.ai_verify_triggered);
+
             if is_new || is_better_score || is_better_attr || state_changed || attrs_changed {
                 let best_score = prev_best_score.max(trk.score);
                 let best_attr_score = prev_best_attr_quality.max(new_attr_quality);
+                let should_trigger_ai = !suppressed_fp
+                    && !ai_verify_triggered
+                    && genai_cfg.enabled
+                    && genai_cfg.verify_ambiguous_alerts
+                    && trk.score >= genai_cfg.ambiguous_score_min
+                    && trk.score <= genai_cfg.ambiguous_score_max;
+                if should_trigger_ai {
+                    ai_verify_triggered = true;
+                }
                 track_snapshots.insert(
                     trk.id.clone(),
                     TrackPersistSnapshot {
@@ -694,6 +740,9 @@ impl VisionPipeline {
                         detected_attributes: merged_attrs.clone(),
                         zones: trk.entered_zones.clone(),
                         stationary: trk.stationary,
+                        dhash64: Some(crop_dhash64),
+                        suppressed_fp,
+                        ai_verify_triggered,
                     },
                 );
 
@@ -804,9 +853,8 @@ impl VisionPipeline {
                     }
                 }
 
-                let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
                 let norm_reg = trk.region.to_normalized(frame.width, frame.height);
-                let severity = if !cam_rt_flags.alerts {
+                let severity = if suppressed_fp || !cam_rt_flags.alerts {
                     "detection"
                 } else {
                     compute_track_severity_for_profile(
@@ -849,11 +897,13 @@ impl VisionPipeline {
                     retain_indefinitely: false,
                     sub_label: effective_sub_label.clone(),
                     top_score: Some(best_score as f64),
-                    false_positive: Some(false),
+                    false_positive: Some(suppressed_fp),
                     box_coords: Some(json!(norm_box)),
                     data: json!({
                         "box": norm_box,
                         "region": norm_reg,
+                        "dhash64": crop_dhash64,
+                        "suppressed_by_fp_signature": matched_fp_sig_id,
                         "score": trk.score,
                         "top_score": best_score,
                         "attributes": attr_tags,
@@ -873,6 +923,21 @@ impl VisionPipeline {
                 let _ = self.db.upsert_event(&ev_dto);
                 if let Some(ref sl) = effective_sub_label {
                     let _ = self.db.set_event_sub_label(&trk.id, Some(sl));
+                }
+                if should_trigger_ai {
+                    let cfg_clone = self.config.clone();
+                    let db_clone = self.db.clone();
+                    let media_clone = self.media_dir.clone();
+                    let ev_id_owned = trk.id.clone();
+                    tokio::spawn(async move {
+                        let _ = crate::verify_event_with_genai_components(
+                            cfg_clone,
+                            db_clone,
+                            media_clone,
+                            &ev_id_owned,
+                        )
+                        .await;
+                    });
                 }
                 if is_new {
                     let _ = self.db.insert_timeline_entry(
@@ -928,6 +993,10 @@ impl VisionPipeline {
                         ),
                     );
                 }
+            }
+
+            if suppressed_fp {
+                continue;
             }
 
             // Update or open ReviewSegment if enabled
@@ -1034,6 +1103,13 @@ impl VisionPipeline {
         // Finalize ended tracks
         for trk in ended_tracks {
             let removed_snap = track_snapshots.remove(&trk.id);
+            let suppressed_fp = removed_snap.as_ref().is_some_and(|s| s.suppressed_fp);
+            let crop_dhash64 = removed_snap
+                .as_ref()
+                .and_then(|s| s.dhash64)
+                .unwrap_or_else(|| {
+                    compute_crop_dhash64(&frame.data, frame.width, frame.height, trk.bbox)
+                });
             let best_score = removed_snap
                 .as_ref()
                 .map(|s| s.best_score.max(trk.top_score))
@@ -1056,7 +1132,7 @@ impl VisionPipeline {
             }
             let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
             let norm_reg = trk.region.to_normalized(frame.width, frame.height);
-            let severity = if !cam_rt_flags.alerts {
+            let severity = if suppressed_fp || !cam_rt_flags.alerts {
                 "detection"
             } else {
                 compute_track_severity_for_profile(
@@ -1098,11 +1174,12 @@ impl VisionPipeline {
                 retain_indefinitely: false,
                 sub_label: effective_sub_label.clone(),
                 top_score: Some(best_score as f64),
-                false_positive: Some(false),
+                false_positive: Some(suppressed_fp),
                 box_coords: Some(json!(norm_box)),
                 data: json!({
                     "box": norm_box,
                     "region": norm_reg,
+                    "dhash64": crop_dhash64,
                     "score": trk.score,
                     "top_score": best_score,
                     "attributes": attr_tags,
@@ -2104,6 +2181,114 @@ mod tests {
             body_bytes.starts_with(b"RIFF") && &body_bytes[8..12] == b"WEBP",
             "GET /api/events/{{id}}/snapshot-clean.webp must return valid WebP magic bytes"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn pipeline_suppresses_recurring_detection_matching_false_positive_signature() {
+        let (pipeline, tmp_dir) = build_isolated_pipeline("fp_suppress");
+        let camera = "patio";
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.snapshots.enabled = true;
+        cam_cfg.snapshots.from_main_stream = false;
+        cam_cfg.review.alerts.enabled = true;
+        cam_cfg.review.alerts.labels = vec!["person".to_string()];
+
+        let w = 320u32;
+        let h = 180u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        let mut yuv_bytes = vec![120u8; y_len + uv_len * 2];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                yuv_bytes[y * (w as usize) + x] = (30 + (x * 180) / (w as usize)) as u8;
+            }
+        }
+        let yuv_frame = YuvFrame {
+            camera: Arc::from(camera),
+            timestamp: 3000.0,
+            width: w,
+            height: h,
+            data: Arc::new(yuv_bytes),
+        };
+
+        // 1. First detection of static patio plant misclassified as "person"
+        let mut active_review = None;
+        let mut track_snapshots = HashMap::new();
+        let mut trk1 = sample_track();
+        trk1.id = "1730503000.000000-plant1".to_string();
+        trk1.label = "person".to_string();
+        trk1.bbox = BoundingBox::new(40, 20, 120, 150);
+
+        let ctx1 = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 3000.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx1,
+                std::slice::from_ref(&trk1),
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+
+        let ev1 = pipeline.db.get_event(&trk1.id).unwrap().unwrap();
+        assert_eq!(ev1["false_positive"], json!(false));
+        assert!(ev1["data"]["dhash64"].as_u64().is_some());
+        assert!(active_review.is_some(), "unmarked track opens alert review");
+
+        // 2. Operator marks ev1 as False Positive -> stores spatial + dhash64 signature
+        pipeline
+            .db
+            .set_event_false_positive(&trk1.id, true)
+            .unwrap();
+        let sigs = pipeline
+            .db
+            .list_false_positive_signatures(Some(camera))
+            .unwrap();
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0]["hit_count"], 1);
+
+        // 3. Subsequent track at virtually identical bbox & visual pattern is suppressed immediately
+        let mut active_review_2 = None;
+        let mut trk2 = sample_track();
+        trk2.id = "1730503010.000000-plant2".to_string();
+        trk2.label = "person".to_string();
+        trk2.bbox = BoundingBox::new(41, 21, 120, 150);
+
+        let ctx2 = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 3010.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx2,
+                std::slice::from_ref(&trk2),
+                &[],
+                &mut active_review_2,
+                &mut track_snapshots,
+            )
+            .await;
+
+        let ev2 = pipeline.db.get_event(&trk2.id).unwrap().unwrap();
+        assert_eq!(ev2["false_positive"], json!(true));
+        assert_eq!(ev2["data"]["max_severity"], json!("detection"));
+        assert!(
+            active_review_2.is_none(),
+            "suppressed recurring false positive must not open an alert review segment"
+        );
+        let sigs_after = pipeline
+            .db
+            .list_false_positive_signatures(Some(camera))
+            .unwrap();
+        assert_eq!(sigs_after[0]["hit_count"], 2);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

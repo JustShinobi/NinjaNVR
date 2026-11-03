@@ -20,10 +20,28 @@ import { useNvrStore } from "../../store/useNvrStore";
 import {
   CameraDetectConfig,
   CameraMotionConfig,
+  FalsePositiveSignatureItem,
+  GenAiConfig,
   NinjaConfigResponse,
   ObjectFilterConfig,
 } from "../../types/nvr";
+import { formatDateTime } from "../../utils/format";
 import { ToggleSwitch } from "./ConsoleAndStreamsPanels";
+
+export function formatDhash64Hex(dhash?: number | null): string {
+  if (dhash === null || dhash === undefined || Number.isNaN(Number(dhash))) {
+    return "—";
+  }
+  const big = BigInt.asUintN(64, BigInt(Math.trunc(Number(dhash))));
+  return `0x${big.toString(16).padStart(16, "0")}`;
+}
+
+export function formatSignatureBbox(
+  normBbox?: [number, number, number, number] | null
+): string {
+  if (!normBbox || normBbox.length < 4) return "[0.00, 0.00, 0.00, 0.00]";
+  return `[${normBbox.map((v) => Number(v).toFixed(2)).join(", ")}]`;
+}
 
 export const STANDARD_LABELS = [
   "person",
@@ -1159,6 +1177,65 @@ export const AiDetectionObjectsSection: React.FC<{
   const [showAdvancedByteTrack, setShowAdvancedByteTrack] = useState(false);
   const [showAdvancedFilterBox, setShowAdvancedFilterBox] = useState(false);
   const [isCustomResolution, setIsCustomResolution] = useState(false);
+  const [fpSignatures, setFpSignatures] = useState<FalsePositiveSignatureItem[]>([]);
+  const [fpLoading, setFpLoading] = useState(false);
+
+  const loadFpSignatures = async () => {
+    setFpLoading(true);
+    try {
+      const res = await fetch("/api/false_positives/signatures", {
+        credentials: "include",
+      });
+      if (res.ok) {
+        const rows = await res.json();
+        if (Array.isArray(rows)) {
+          setFpSignatures(rows);
+        }
+      }
+    } catch {
+      // ignore
+    } finally {
+      setFpLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadFpSignatures();
+  }, []);
+
+  const handleDeleteFpSignature = async (id: number) => {
+    const res = await fetch(`/api/false_positives/signatures/${id}`, {
+      method: "DELETE",
+      credentials: "include",
+    });
+    if (res.ok) {
+      setFpSignatures((prev) => prev.filter((item) => item.id !== id));
+      notify(`Deleted false-positive memory signature #${id}`);
+    }
+  };
+
+  const genaiCfg: GenAiConfig = draftConfig.genai || {
+    enabled: false,
+    provider: "gemini",
+    base_url: null,
+    api_key_env: "GEMINI_API_KEY",
+    model: "gemini-2.5-flash",
+    verify_ambiguous_alerts: false,
+    ambiguous_score_min: 0.45,
+    ambiguous_score_max: 0.72,
+    auto_suppress_false_positives: true,
+    timeout_ms: 5000,
+  };
+
+  const updateGenAi = (patch: Partial<GenAiConfig>) => {
+    updateDraft((next) => {
+      next.genai = {
+        ...genaiCfg,
+        ...(next.genai || {}),
+        ...patch,
+      };
+    });
+  };
 
   const detKeys = Object.keys(draftConfig.detectors || { detector01: {} });
   const primaryDetKey = detKeys[0] || "detector01";
@@ -2572,6 +2649,364 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
             )}
           </div>
+        </div>
+      </div>
+
+      {/* Vision AI Judge (genai) Configuration Card */}
+      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="nvr-cfg-card-header">
+          <span>
+            {isPt
+              ? "JUIZ DE IA VISUAL (GENAI) — AUDITORIA DE ALERTAS AMBÍGUOS & FALSOS POSITIVOS"
+              : "VISION AI JUDGE (GENAI) — AMBIGUOUS ALERT VERIFICATION & AUTO-SUPPRESSION"}
+          </span>
+          <span className={`nvr-badge ${genaiCfg.enabled ? "live" : ""}`}>
+            <Sparkles size={11} />
+            {(genaiCfg.provider || "gemini").toUpperCase()} ·{" "}
+            {genaiCfg.model || "gemini-2.5-flash"} ·{" "}
+            {genaiCfg.enabled ? "ACTIVE" : "STANDBY"}
+          </span>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
+          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+            <div className="nvr-field-meta">
+              <div className="nvr-field-label">
+                {isPt
+                  ? "Ativar Juiz de IA Visual (Gemini / OpenAI / Ollama Local)"
+                  : "Enable Vision AI Judge (Gemini / OpenAI / Local Ollama)"}
+              </div>
+              <div className="nvr-field-desc">
+                {isPt
+                  ? "Permite verificar snapshots com IA sob demanda ou auditar automaticamente detecções limítrofes."
+                  : "Allows on-demand AI snapshot verification and optional automatic auditing of borderline alerts."}
+              </div>
+            </div>
+            <ToggleSwitch
+              checked={genaiCfg.enabled}
+              label="Enable Vision AI Judge"
+              onChange={(v) => updateGenAi({ enabled: v })}
+            />
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1.2fr 1.2fr 1.6fr",
+              gap: 8,
+            }}
+          >
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt ? "Provedor (provider)" : "Provider"}
+              </div>
+              <select
+                className="nvr-select mono"
+                aria-label="Vision AI Judge Provider"
+                style={{ width: "100%", marginTop: 2 }}
+                value={genaiCfg.provider || "gemini"}
+                onChange={(e) => {
+                  const p = e.target.value;
+                  if (p === "gemini") {
+                    updateGenAi({
+                      provider: "gemini",
+                      model: "gemini-2.5-flash",
+                      api_key_env: "GEMINI_API_KEY",
+                    });
+                  } else if (p === "openai") {
+                    updateGenAi({
+                      provider: "openai",
+                      model: "gpt-4o-mini",
+                      api_key_env: "OPENAI_API_KEY",
+                    });
+                  } else {
+                    updateGenAi({
+                      provider: "ollama",
+                      model: "qwen2.5vl:7b",
+                      base_url: genaiCfg.base_url || "http://127.0.0.1:11434",
+                    });
+                  }
+                }}
+              >
+                <option value="gemini">Google Gemini (gemini)</option>
+                <option value="openai">OpenAI / Compatible (openai)</option>
+                <option value="ollama">Local Ollama (ollama)</option>
+              </select>
+            </div>
+
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt ? "Modelo Visual (model)" : "Vision Model"}
+              </div>
+              <input
+                className="nvr-input mono"
+                aria-label="Vision AI Judge Model"
+                style={{ width: "100%", marginTop: 2 }}
+                placeholder="gemini-2.5-flash"
+                value={genaiCfg.model}
+                onChange={(e) => updateGenAi({ model: e.target.value })}
+              />
+            </div>
+
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt ? "Variável da Chave API (api_key_env)" : "API Key Env Var"}
+              </div>
+              <input
+                className="nvr-input mono"
+                aria-label="Vision AI Judge API Key Env"
+                style={{ width: "100%", marginTop: 2 }}
+                placeholder="GEMINI_API_KEY"
+                value={genaiCfg.api_key_env}
+                onChange={(e) => updateGenAi({ api_key_env: e.target.value })}
+              />
+            </div>
+
+            <div>
+              <div
+                className="mono"
+                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+              >
+                {isPt
+                  ? "Endpoint Customizado (base_url)"
+                  : "Custom Endpoint Base URL"}
+              </div>
+              <input
+                className="nvr-input mono"
+                aria-label="Vision AI Judge Base URL"
+                style={{ width: "100%", marginTop: 2 }}
+                placeholder={
+                  genaiCfg.provider === "ollama"
+                    ? "http://127.0.0.1:11434"
+                    : "Optional endpoint override..."
+                }
+                value={genaiCfg.base_url || ""}
+                onChange={(e) =>
+                  updateGenAi({
+                    base_url: e.target.value.trim() ? e.target.value.trim() : null,
+                  })
+                }
+              />
+            </div>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: 12,
+              paddingTop: 4,
+            }}
+          >
+            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? "Auditar Alertas Ambíguos Automaticamente"
+                    : "Auto-Verify Ambiguous Alerts"}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? `Aciona o Juiz de IA quando a pontuação cair na faixa [${Math.round(
+                        (genaiCfg.ambiguous_score_min ?? 0.45) * 100
+                      )}%, ${Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}%].`
+                    : `Triggers Vision AI Judge when score falls in [${Math.round(
+                        (genaiCfg.ambiguous_score_min ?? 0.45) * 100
+                      )}%, ${Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}%].`}
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={genaiCfg.verify_ambiguous_alerts}
+                label="Verify Ambiguous Alerts"
+                onChange={(v) => updateGenAi({ verify_ambiguous_alerts: v })}
+              />
+            </div>
+
+            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? "Auto-Suprimir Falsos Positivos Rejeitados"
+                    : "Auto-Suppress Rejected False Positives"}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Grava assinatura espacial + dhash64 no SQLite quando a IA rejeita o alerta."
+                    : "Persists spatial IoU + dhash64 signature in SQLite when AI rejects a detection."}
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={genaiCfg.auto_suppress_false_positives}
+                label="Auto-Suppress False Positives"
+                onChange={(v) => updateGenAi({ auto_suppress_false_positives: v })}
+              />
+            </div>
+          </div>
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label mono">
+                  Ambiguous Score Min ({Math.round((genaiCfg.ambiguous_score_min ?? 0.45) * 100)}%)
+                </div>
+              </div>
+              <input
+                type="range"
+                min={25}
+                max={80}
+                aria-label="Ambiguous Score Minimum"
+                value={Math.round((genaiCfg.ambiguous_score_min ?? 0.45) * 100)}
+                onChange={(e) =>
+                  updateGenAi({
+                    ambiguous_score_min: Number(
+                      (Number(e.target.value) / 100).toFixed(2)
+                    ),
+                  })
+                }
+              />
+            </div>
+
+            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label mono">
+                  Ambiguous Score Max ({Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}%)
+                </div>
+              </div>
+              <input
+                type="range"
+                min={40}
+                max={95}
+                aria-label="Ambiguous Score Maximum"
+                value={Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}
+                onChange={(e) =>
+                  updateGenAi({
+                    ambiguous_score_max: Number(
+                      (Number(e.target.value) / 100).toFixed(2)
+                    ),
+                  })
+                }
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Active False-Positive Memory Signatures Table */}
+      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="nvr-cfg-card-header">
+          <span>
+            {isPt
+              ? "MEMÓRIA DE FALSOS POSITIVOS ATIVA (ASSINATURAS ESPACIAIS + DHASH64)"
+              : "ACTIVE FALSE-POSITIVE MEMORY SIGNATURES (SPATIAL IOU >= 0.72 + DHASH64 <= 12)"}
+          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span className="mono">{fpSignatures.length} SIGNATURES</span>
+            <button
+              type="button"
+              className="nvr-btn mono"
+              style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              onClick={() => void loadFpSignatures()}
+            >
+              {fpLoading ? "Refreshing..." : "Refresh"}
+            </button>
+          </div>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 6 }}>
+          {fpSignatures.length === 0 ? (
+            <div
+              className="mono"
+              style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}
+            >
+              {isPt
+                ? "Nenhuma assinatura de falso positivo aprendida ainda. Marque um evento como Falso Positivo na aba Explorar para suprimir recorrências instantaneamente."
+                : "No learned false-positive signatures yet. Mark an event as False Positive in Explore or via the Vision AI Judge to suppress recurring static triggers at 0ms."}
+            </div>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              <table
+                className="mono"
+                style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                  fontSize: "var(--text-xs)",
+                  fontVariantNumeric: "tabular-nums",
+                }}
+              >
+                <thead>
+                  <tr
+                    style={{
+                      textAlign: "left",
+                      color: "var(--text-secondary)",
+                      borderBottom: "1px solid var(--border-hairline)",
+                    }}
+                  >
+                    <th style={{ padding: "4px 6px" }}>CAMERA</th>
+                    <th style={{ padding: "4px 6px" }}>LABEL</th>
+                    <th style={{ padding: "4px 6px" }}>NORM BBOX</th>
+                    <th style={{ padding: "4px 6px" }}>DHASH64</th>
+                    <th style={{ padding: "4px 6px" }}>HITS</th>
+                    <th style={{ padding: "4px 6px" }}>LAST SEEN</th>
+                    <th style={{ padding: "4px 6px" }}>REASON</th>
+                    <th style={{ padding: "4px 6px", textAlign: "right" }}>ACTION</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {fpSignatures.map((sig) => (
+                    <tr
+                      key={sig.id}
+                      style={{ borderBottom: "1px solid var(--border-hairline)" }}
+                    >
+                      <td style={{ padding: "5px 6px", fontWeight: 700 }}>
+                        {sig.camera.toUpperCase()}
+                      </td>
+                      <td style={{ padding: "5px 6px" }}>{sig.label.toUpperCase()}</td>
+                      <td style={{ padding: "5px 6px" }}>
+                        {formatSignatureBbox(sig.norm_bbox)}
+                      </td>
+                      <td style={{ padding: "5px 6px" }}>
+                        {formatDhash64Hex(sig.dhash64)}
+                      </td>
+                      <td style={{ padding: "5px 6px" }}>{sig.hit_count}</td>
+                      <td style={{ padding: "5px 6px" }}>
+                        {formatDateTime(sig.last_seen_at)}
+                      </td>
+                      <td
+                        style={{
+                          padding: "5px 6px",
+                          color: "var(--text-secondary)",
+                          maxWidth: 260,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                      >
+                        {sig.reason || sig.dominant_color || "operator_marked"}
+                      </td>
+                      <td style={{ padding: "5px 6px", textAlign: "right" }}>
+                        <button
+                          type="button"
+                          className="nvr-btn danger mono"
+                          style={{ height: 22, padding: "0 6px" }}
+                          aria-label={`Delete false-positive signature ${sig.id}`}
+                          onClick={() => void handleDeleteFpSignature(sig.id)}
+                        >
+                          <Trash2 size={11} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </div>
     </div>

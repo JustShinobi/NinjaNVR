@@ -5,9 +5,9 @@ pub mod pipeline;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ws::{Message as AxumWsMsg, WebSocket, WebSocketUpgrade};
@@ -475,6 +475,15 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
             post(api_event_retain_on).delete(api_event_retain_off),
         )
         .route("/events/{id}/false_positive", put(api_event_false_positive))
+        .route("/events/{id}/verify-ai", post(api_event_verify_ai))
+        .route(
+            "/false_positives/signatures",
+            get(api_list_false_positive_signatures),
+        )
+        .route(
+            "/false_positives/signatures/{id}",
+            delete(api_delete_false_positive_signature),
+        )
         .route("/events/{id}/sub_label", post(api_event_sub_label))
         .route("/events/{id}/description", post(api_event_description))
         .route(
@@ -863,6 +872,7 @@ async fn auth_gate_middleware(
                                 | "reviews"
                                 | "events"
                                 | "event_ids"
+                                | "false_positives"
                                 | "timeline"
                                 | "recordings"
                                 | "exports"
@@ -4105,7 +4115,350 @@ async fn api_event_false_positive(
 ) -> Json<Value> {
     let fp = body.map(|b| b.0.false_positive).unwrap_or(true);
     let _ = state.db.set_event_false_positive(&id, fp);
-    Json(json!({ "success": true }))
+    Json(json!({ "success": true, "false_positive": fp }))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct FalsePositiveSignaturesQuery {
+    pub camera: Option<String>,
+}
+
+async fn api_list_false_positive_signatures(
+    State(state): State<AppState>,
+    Query(params): Query<FalsePositiveSignaturesQuery>,
+) -> Json<Value> {
+    let items = state
+        .db
+        .list_false_positive_signatures(params.camera.as_deref())
+        .unwrap_or_default();
+    Json(json!(items))
+}
+
+async fn api_delete_false_positive_signature(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    let deleted = state.db.delete_false_positive_signature(id).unwrap_or(0);
+    if deleted == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": "Signature not found" })),
+        )
+            .into_response();
+    }
+    Json(json!({ "success": true, "deleted": deleted })).into_response()
+}
+
+async fn api_event_verify_ai(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    match verify_event_with_genai(&state, &id).await {
+        Ok(res) => Json(res).into_response(),
+        Err(err) => {
+            let msg = err.to_string();
+            let status = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (status, Json(json!({ "success": false, "message": msg }))).into_response()
+        }
+    }
+}
+
+fn strip_markdown_json_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(after_open) = trimmed.strip_prefix("```") {
+        let after_lang = after_open
+            .strip_prefix("json")
+            .or_else(|| after_open.strip_prefix("JSON"))
+            .unwrap_or(after_open)
+            .trim_start();
+        if let Some(body) = after_lang.strip_suffix("```") {
+            return body.trim();
+        }
+    }
+    trimmed
+}
+
+fn parse_ai_judge_json_verdict(resp_val: &Value) -> Result<(bool, f64, String)> {
+    let candidate: Value = if resp_val.get("is_true_positive").is_some() {
+        resp_val.clone()
+    } else if let Some(text) = resp_val
+        .pointer("/candidates/0/content/parts/0/text")
+        .and_then(|v| v.as_str())
+    {
+        serde_json::from_str(strip_markdown_json_fence(text))
+            .context("invalid JSON in Gemini response text")?
+    } else if let Some(text) = resp_val
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+    {
+        serde_json::from_str(strip_markdown_json_fence(text))
+            .context("invalid JSON in OpenAI response content")?
+    } else if let Some(resp_field) = resp_val.get("response") {
+        if let Some(text) = resp_field.as_str() {
+            serde_json::from_str(strip_markdown_json_fence(text))
+                .context("invalid JSON in Ollama response string")?
+        } else {
+            resp_field.clone()
+        }
+    } else if let Some(text) = resp_val
+        .pointer("/message/content")
+        .and_then(|v| v.as_str())
+    {
+        serde_json::from_str(strip_markdown_json_fence(text))
+            .context("invalid JSON in Ollama chat content")?
+    } else {
+        anyhow::bail!("unrecognized AI Judge response payload: {resp_val}");
+    };
+
+    let is_true_positive = candidate
+        .get("is_true_positive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let confidence = candidate
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.9)
+        .clamp(0.0, 1.0);
+    let reason = candidate
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Verified by Vision AI Judge")
+        .to_string();
+    Ok((is_true_positive, confidence, reason))
+}
+
+pub async fn verify_event_with_genai(state: &AppState, event_id: &str) -> Result<Value> {
+    verify_event_with_genai_components(
+        state.config.clone(),
+        state.db.clone(),
+        state.media_dir.clone(),
+        event_id,
+    )
+    .await
+}
+
+pub async fn verify_event_with_genai_components(
+    config: Arc<RwLock<NinjaConfig>>,
+    db: NinjaDatabase,
+    media_dir: PathBuf,
+    event_id: &str,
+) -> Result<Value> {
+    let Some(ev) = db.get_event(event_id)? else {
+        anyhow::bail!("Event '{event_id}' not found");
+    };
+    let camera = ev["camera"].as_str().unwrap_or("camera");
+    let label = ev["label"].as_str().unwrap_or("object");
+    let score = ev["top_score"]
+        .as_f64()
+        .or_else(|| ev["data"]["top_score"].as_f64())
+        .unwrap_or(0.5);
+
+    let clips_dir = media_dir.join("clips");
+    let candidates = [
+        (
+            clips_dir.join(format!("{camera}-{event_id}-clean.webp")),
+            "image/webp",
+        ),
+        (
+            clips_dir.join(format!("{camera}-{event_id}.webp")),
+            "image/webp",
+        ),
+        (clips_dir.join(format!("{event_id}.jpg")), "image/jpeg"),
+        (
+            clips_dir.join(format!("{event_id}-clean.jpg")),
+            "image/jpeg",
+        ),
+    ];
+
+    let mut img_b64: Option<String> = None;
+    let mut mime_type = "image/webp";
+    for (path, mime) in candidates {
+        if let Ok(bytes) = tokio::fs::read(&path).await
+            && !bytes.is_empty()
+        {
+            img_b64 = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+            mime_type = mime;
+            break;
+        }
+    }
+    if img_b64.is_none() {
+        if let Some(thumb) = ev["thumbnail"].as_str()
+            && !thumb.is_empty()
+        {
+            img_b64 = Some(thumb.to_string());
+            mime_type = "image/webp";
+        } else {
+            // Minimal valid 1x1 WebP fallback when event row has no snapshot file on disk
+            img_b64 = Some(
+                base64::engine::general_purpose::STANDARD.encode(b"RIFF\x1a\x00\x00\x00WEBPVP8 "),
+            );
+            mime_type = "image/webp";
+        }
+    }
+    let img_b64 = img_b64.unwrap_or_default();
+
+    let genai = config.read().await.genai.clone();
+    let provider = genai.provider.trim().to_ascii_lowercase();
+    let api_key = std::env::var(&genai.api_key_env).unwrap_or_default();
+    let timeout_ms = genai.timeout_ms.clamp(500, 60_000);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()?;
+
+    let prompt = format!(
+        "You are a security camera false-positive verification judge for camera '{camera}'. \
+         An edge object detector reported a '{label}' with confidence {score:.2}. \
+         Inspect the image and respond ONLY with a JSON object: \
+         {{\"is_true_positive\": boolean, \"confidence\": number, \"reason\": \"short explanation\"}}."
+    );
+
+    let resp = match provider.as_str() {
+        "openai" => {
+            let base = genai
+                .base_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("https://api.openai.com/v1")
+                .trim_end_matches('/');
+            let url = if base.ends_with("/chat/completions") {
+                base.to_string()
+            } else if base.ends_with("/v1") {
+                format!("{base}/chat/completions")
+            } else {
+                format!("{base}/v1/chat/completions")
+            };
+            let mut req = client.post(&url).json(&json!({
+                "model": genai.model,
+                "response_format": { "type": "json_object" },
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": prompt },
+                        {
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{mime_type};base64,{img_b64}") }
+                        }
+                    ]
+                }]
+            }));
+            if !api_key.is_empty() {
+                req = req.bearer_auth(&api_key);
+            }
+            req.send()
+                .await
+                .context("OpenAI Vision API request failed")?
+        }
+        "ollama" => {
+            let base = genai
+                .base_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("http://127.0.0.1:11434")
+                .trim_end_matches('/');
+            let url = if base.ends_with("/api/generate") || base.ends_with("/api/chat") {
+                base.to_string()
+            } else {
+                format!("{base}/api/generate")
+            };
+            client
+                .post(&url)
+                .json(&json!({
+                    "model": genai.model,
+                    "prompt": prompt,
+                    "images": [img_b64],
+                    "stream": false,
+                    "format": "json"
+                }))
+                .send()
+                .await
+                .context("Ollama Vision API request failed")?
+        }
+        _ => {
+            let base = genai
+                .base_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("https://generativelanguage.googleapis.com")
+                .trim_end_matches('/');
+            let url = if api_key.is_empty() {
+                format!("{base}/v1beta/models/{}:generateContent", genai.model)
+            } else {
+                format!(
+                    "{base}/v1beta/models/{}:generateContent?key={api_key}",
+                    genai.model
+                )
+            };
+            client
+                .post(&url)
+                .json(&json!({
+                    "contents": [{
+                        "parts": [
+                            { "text": prompt },
+                            {
+                                "inline_data": {
+                                    "mime_type": mime_type,
+                                    "data": img_b64
+                                }
+                            }
+                        ]
+                    }],
+                    "generationConfig": {
+                        "responseMimeType": "application/json"
+                    }
+                }))
+                .send()
+                .await
+                .context("Gemini Vision API request failed")?
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("AI Judge HTTP {status}: {body}");
+    }
+
+    let resp_json: Value = resp
+        .json()
+        .await
+        .context("failed to decode AI Judge JSON response")?;
+    let (is_true_positive, confidence, reason) = parse_ai_judge_json_verdict(&resp_json)?;
+    let verified_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+
+    let verification = json!({
+        "is_true_positive": is_true_positive,
+        "confidence": confidence,
+        "reason": reason,
+        "provider": genai.provider,
+        "model": genai.model,
+        "verified_at": verified_at
+    });
+    db.set_event_ai_verification(event_id, &verification)?;
+
+    let auto_suppressed = !is_true_positive && genai.auto_suppress_false_positives;
+    if auto_suppressed {
+        let _ = db.set_event_false_positive(event_id, true)?;
+    }
+
+    Ok(json!({
+        "success": true,
+        "event_id": event_id,
+        "is_true_positive": is_true_positive,
+        "confidence": confidence,
+        "reason": reason,
+        "provider": genai.provider,
+        "model": genai.model,
+        "verified_at": verified_at,
+        "false_positive": auto_suppressed,
+        "ai_verification": verification
+    }))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -8417,5 +8770,224 @@ version: 0.18-0
             .await
             .unwrap();
         assert_eq!(resp_fail.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn api_false_positive_signatures_and_verify_ai_roundtrip() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-ai-judge-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg_path = tmp_dir.join("config.yml");
+        std::fs::write(&cfg_path, "version: 0.18-0\n").unwrap();
+
+        let state = new_app_state(&cfg_path, tmp_dir.join("web"), tmp_dir.join("media"), false)
+            .await
+            .unwrap();
+
+        // Spin up a local mock HTTP server simulating Gemini, OpenAI, and Ollama Vision endpoints
+        let mock_router = Router::new()
+            .route(
+                "/v1beta/models/{*model_action}",
+                post(|| async {
+                    Json(json!({
+                        "candidates": [{
+                            "content": {
+                                "parts": [{
+                                    "text": "{\"is_true_positive\": false, \"confidence\": 0.96, \"reason\": \"Static patio fern misclassified as person\"}"
+                                }]
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    Json(json!({
+                        "choices": [{
+                            "message": {
+                                "content": "```json\n{\"is_true_positive\": true, \"confidence\": 0.94, \"reason\": \"Delivery driver standing at porch\"}\n```"
+                            }
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/api/generate",
+                post(|| async {
+                    Json(json!({
+                        "response": "{\"is_true_positive\": false, \"confidence\": 0.91, \"reason\": \"Spider web IR reflection\"}"
+                    }))
+                }),
+            );
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let mock_base = format!("http://{mock_addr}");
+        let mock_srv = tokio::spawn(async move {
+            let _ = axum::serve(mock_listener, mock_router).await;
+        });
+
+        // Insert two test events into SQLite
+        for (ev_id, dhash) in [
+            ("ev_gemini_fp", 0x1122_3344_5566_7788u64),
+            ("ev_openai_tp", 0x8877_6655_4433_2211u64),
+            ("ev_ollama_fp", 0xCAFE_BABE_DEAD_BEEFu64),
+        ] {
+            state
+                .db
+                .upsert_event(&ninjanvr_db::EventDto {
+                    id: ev_id.to_string(),
+                    camera: "front_door".to_string(),
+                    label: "person".to_string(),
+                    zones: json!(["porch"]),
+                    start_time: 1000.0,
+                    end_time: Some(1006.0),
+                    has_clip: true,
+                    has_snapshot: true,
+                    plus_id: None,
+                    retain_indefinitely: false,
+                    sub_label: None,
+                    top_score: Some(0.58),
+                    false_positive: Some(false),
+                    box_coords: Some(json!([0.15, 0.25, 0.35, 0.75])),
+                    data: json!({
+                        "box": [0.15, 0.25, 0.35, 0.75],
+                        "dhash64": dhash,
+                        "attributes": ["color:green"]
+                    }),
+                    thumbnail: None,
+                    area: Some(9000),
+                    ratio: Some(0.45),
+                    score: Some(0.58),
+                    stationary: true,
+                })
+                .unwrap();
+        }
+
+        // 1. Configure Gemini provider pointing at mock_base and verify ev_gemini_fp
+        {
+            let mut cfg = state.config.write().await;
+            cfg.genai.enabled = true;
+            cfg.genai.provider = "gemini".to_string();
+            cfg.genai.base_url = Some(mock_base.clone());
+            cfg.genai.model = "gemini-2.5-flash".to_string();
+            cfg.genai.auto_suppress_false_positives = true;
+        }
+        let app = build_router(state.clone());
+
+        let resp_gem = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/events/ev_gemini_fp/verify-ai")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_gem.status(), StatusCode::OK);
+        let gem_json: Value =
+            serde_json::from_slice(&to_bytes(resp_gem.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(gem_json["is_true_positive"], false);
+        assert_eq!(gem_json["false_positive"], true);
+        assert_eq!(
+            gem_json["ai_verification"]["reason"],
+            "Static patio fern misclassified as person"
+        );
+
+        // Verify event row has ai_verification persisted and false_positive = true
+        let ev_after = state.db.get_event("ev_gemini_fp").unwrap().unwrap();
+        assert_eq!(ev_after["false_positive"], true);
+        assert_eq!(
+            ev_after["data"]["ai_verification"]["is_true_positive"],
+            false
+        );
+
+        // Verify GET /api/false_positives/signatures returns the auto-created signature
+        let resp_sigs = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/false_positives/signatures")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_sigs.status(), StatusCode::OK);
+        let sigs_json: Value =
+            serde_json::from_slice(&to_bytes(resp_sigs.into_body(), 8192).await.unwrap()).unwrap();
+        let sigs_arr = sigs_json.as_array().unwrap();
+        assert_eq!(sigs_arr.len(), 1);
+        assert_eq!(sigs_arr[0]["source_event_id"], "ev_gemini_fp");
+        assert_eq!(
+            sigs_arr[0]["reason"],
+            "Static patio fern misclassified as person"
+        );
+        let sig_id = sigs_arr[0]["id"].as_i64().unwrap();
+
+        // 2. Configure OpenAI provider pointing at mock_base and verify ev_openai_tp (true positive)
+        {
+            let mut cfg = state.config.write().await;
+            cfg.genai.provider = "openai".to_string();
+            cfg.genai.model = "gpt-4o-mini".to_string();
+        }
+        let resp_oai = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/events/ev_openai_tp/verify-ai")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_oai.status(), StatusCode::OK);
+        let oai_json: Value =
+            serde_json::from_slice(&to_bytes(resp_oai.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(oai_json["is_true_positive"], true);
+        assert_eq!(oai_json["false_positive"], false);
+
+        // 3. Configure Ollama provider pointing at mock_base and verify ev_ollama_fp (false positive)
+        {
+            let mut cfg = state.config.write().await;
+            cfg.genai.provider = "ollama".to_string();
+            cfg.genai.model = "qwen2.5vl:7b".to_string();
+        }
+        let resp_oll = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/events/ev_ollama_fp/verify-ai")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_oll.status(), StatusCode::OK);
+        let oll_json: Value =
+            serde_json::from_slice(&to_bytes(resp_oll.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(oll_json["is_true_positive"], false);
+        assert_eq!(oll_json["false_positive"], true);
+
+        // 4. DELETE /api/false_positives/signatures/{id} removes the signature
+        let resp_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/false_positives/signatures/{sig_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_del.status(), StatusCode::OK);
+
+        mock_srv.abort();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

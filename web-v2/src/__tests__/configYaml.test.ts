@@ -2,11 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { NinjaConfigResponse } from "../types/nvr";
 import { buildCleanYamlFromDraft } from "../utils/configYaml";
 import {
+  formatAiVerificationBadge,
   formatDetectedAttributePill,
   formatEventLabelWithSubLabel,
 } from "../views/ExploreWorkspace";
 import {
   DEFAULT_ATTRIBUTE_LABELS,
+  formatDhash64Hex,
+  formatSignatureBbox,
   STANDARD_LABELS,
   toggleAttributeLabelList,
 } from "../views/settings/VisionAndAiPanels";
@@ -481,5 +484,58 @@ go2rtc:
     expect(yamlText).toContain("angle_deg: 135");
     expect(yamlText).toContain("fov_deg: 95");
     expect(yamlText).toContain("range: 0.32");
+  });
+
+  test("serializes genai Vision AI Judge configuration and formats false-positive memory & AI badges", () => {
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      genai: {
+        enabled: true,
+        provider: "ollama",
+        base_url: "http://127.0.0.1:11434",
+        api_key_env: "OLLAMA_API_KEY",
+        model: "qwen2.5vl:7b",
+        verify_ambiguous_alerts: true,
+        ambiguous_score_min: 0.45,
+        ambiguous_score_max: 0.72,
+        auto_suppress_false_positives: true,
+        timeout_ms: 5000,
+      },
+      cameras: {},
+    };
+
+    const yamlText = buildCleanYamlFromDraft(draft, "");
+    expect(yamlText).toContain("genai:");
+    expect(yamlText).toContain("provider: ollama");
+    expect(yamlText).toContain('base_url: "http://127.0.0.1:11434"');
+    expect(yamlText).toContain("api_key_env: OLLAMA_API_KEY");
+    expect(yamlText).toContain('model: "qwen2.5vl:7b"');
+    expect(yamlText).toContain("verify_ambiguous_alerts: true");
+    expect(yamlText).toContain("ambiguous_score_min: 0.45");
+    expect(yamlText).toContain("ambiguous_score_max: 0.72");
+    expect(yamlText).toContain("auto_suppress_false_positives: true");
+    expect(yamlText).toContain("timeout_ms: 5000");
+
+    expect(
+      formatAiVerificationBadge({
+        is_true_positive: false,
+        confidence: 0.96,
+        reason: "Static patio fern",
+      })
+    ).toBe("AI JUDGE: FALSE POSITIVE (96%)");
+    expect(
+      formatAiVerificationBadge({
+        is_true_positive: true,
+        confidence: 0.91,
+        reason: "Person walking",
+      })
+    ).toBe("AI JUDGE: TRUE POSITIVE (91%)");
+
+    expect(formatDhash64Hex(0x1234abcd)).toBe("0x000000001234abcd");
+    expect(formatDhash64Hex(null)).toBe("—");
+    expect(formatSignatureBbox([0.15, 0.25, 0.35, 0.75])).toBe(
+      "[0.15, 0.25, 0.35, 0.75]"
+    );
   });
 });

@@ -1223,6 +1223,68 @@ pub fn apply_privacy_masks_from_value(img: &mut RgbImage, mask_val: &Value) {
     }
 }
 
+/// Computes a fast 64-bit horizontal difference perceptual hash (`dhash64`) of a `BoundingBox`
+/// crop from the Y (luma) plane of a `YUV420p` frame by box-averaging onto a 9x8 grid and setting
+/// bit `(r * 8 + c)` to `1` when `luma[r][c] > luma[r][c + 1]`.
+pub fn compute_crop_dhash64(yuv: &[u8], width: u32, height: u32, bbox: BoundingBox) -> u64 {
+    let fw = width as usize;
+    let fh = height as usize;
+    let y_size = fw.saturating_mul(fh);
+    if fw == 0 || fh == 0 || yuv.len() < y_size {
+        return 0;
+    }
+    let y_plane = &yuv[..y_size];
+
+    let x1 = (bbox.x_min as usize).min(fw - 1);
+    let y1 = (bbox.y_min as usize).min(fh - 1);
+    let x2 = (bbox.x_max as usize).clamp(x1 + 1, fw);
+    let y2 = (bbox.y_max as usize).clamp(y1 + 1, fh);
+    let bw = (x2 - x1).max(1);
+    let bh = (y2 - y1).max(1);
+
+    let mut grid = [[0u8; 9]; 8];
+    for (r, grid_row) in grid.iter_mut().enumerate() {
+        let cy0 = y1 + (r * bh) / 8;
+        let cy1 = (y1 + ((r + 1) * bh) / 8).max(cy0 + 1).min(fh);
+        let step_y = ((cy1 - cy0) / 16).max(1);
+        for (c, cell) in grid_row.iter_mut().enumerate() {
+            let cx0 = x1 + (c * bw) / 9;
+            let cx1 = (x1 + ((c + 1) * bw) / 9).max(cx0 + 1).min(fw);
+            let step_x = ((cx1 - cx0) / 16).max(1);
+            let mut sum = 0u64;
+            let mut count = 0u64;
+            let mut sy = cy0;
+            while sy < cy1 {
+                let row = &y_plane[sy * fw..(sy + 1) * fw];
+                let mut sx = cx0;
+                while sx < cx1 {
+                    sum += row[sx] as u64;
+                    count += 1;
+                    sx += step_x;
+                }
+                sy += step_y;
+            }
+            *cell = (sum + count / 2).checked_div(count).unwrap_or(0) as u8;
+        }
+    }
+
+    let mut hash = 0u64;
+    for (r, grid_row) in grid.iter().enumerate() {
+        for c in 0..8 {
+            if grid_row[c] > grid_row[c + 1] {
+                hash |= 1u64 << (r * 8 + c);
+            }
+        }
+    }
+    hash
+}
+
+/// Returns the Hamming distance (number of differing bits) between two 64-bit perceptual hashes.
+#[inline]
+pub fn hamming_distance_u64(a: u64, b: u64) -> u32 {
+    (a ^ b).count_ones()
+}
+
 /// Draws 2px bounding boxes onto an existing `RgbImage` (e.g. a high-resolution main-stream frame).
 pub fn annotate_rgb_image_with_boxes(img: &mut RgbImage, boxes: &[(BoundingBox, [u8; 3])]) {
     let w = img.width();
@@ -1716,5 +1778,59 @@ mod tests {
         );
         // Subsequent frame at the new luminance level is also quiet because avg_frame was reset to the flash level
         assert!(detector.detect(&flash_frame).is_empty());
+    }
+
+    #[test]
+    fn compute_crop_dhash64_is_invariant_to_minor_noise_and_distinct_across_patterns() {
+        let w = 160u32;
+        let h = 120u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+
+        // Pattern A: horizontal left-to-right gradient inside crop (x: 20..110, y: 16..96)
+        let mut frame_a = vec![128u8; y_len + uv_len * 2];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                // Decreasing left-to-right so luma[r][c] > luma[r][c+1] on most columns
+                frame_a[y * (w as usize) + x] =
+                    (240usize.saturating_sub((x * 200) / (w as usize))) as u8;
+            }
+        }
+        let bbox = BoundingBox::new(20, 16, 110, 96);
+        let hash_a1 = compute_crop_dhash64(&frame_a, w, h, bbox);
+        let hash_a2 = compute_crop_dhash64(&frame_a, w, h, bbox);
+        assert_eq!(hamming_distance_u64(hash_a1, hash_a2), 0);
+
+        // Pattern A with minor sensor/compression noise (+/- 2 luma on every 5th pixel)
+        let mut frame_noisy = frame_a.clone();
+        for i in (0..y_len).step_by(5) {
+            frame_noisy[i] = frame_noisy[i].saturating_add(2);
+        }
+        let hash_noisy = compute_crop_dhash64(&frame_noisy, w, h, bbox);
+        assert!(
+            hamming_distance_u64(hash_a1, hash_noisy) <= 4,
+            "expected minor noise hamming <= 4, got {}",
+            hamming_distance_u64(hash_a1, hash_noisy)
+        );
+
+        // Pattern B: inverted left-to-right gradient (increasing left-to-right) + checkerboard
+        let mut frame_b = vec![128u8; y_len + uv_len * 2];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                frame_b[y * (w as usize) + x] = (20 + (x * 200) / (w as usize)) as u8;
+            }
+        }
+        let hash_b = compute_crop_dhash64(&frame_b, w, h, bbox);
+        assert!(
+            hamming_distance_u64(hash_a1, hash_b) >= 24,
+            "expected distinct pattern hamming >= 24, got {}",
+            hamming_distance_u64(hash_a1, hash_b)
+        );
+
+        // Out-of-bounds bbox and undersized buffer edge cases
+        let oob_bbox = BoundingBox::new(140, 100, 9999, 9999);
+        let _ = compute_crop_dhash64(&frame_a, w, h, oob_bbox);
+        assert_eq!(compute_crop_dhash64(&[1, 2, 3], w, h, bbox), 0);
+        assert_eq!(compute_crop_dhash64(&frame_a, 0, h, bbox), 0);
     }
 }

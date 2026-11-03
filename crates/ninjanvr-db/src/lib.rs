@@ -240,6 +240,77 @@ fn json_array_matches_any(arr_val: &Value, allowed: &[String], also_verified: bo
     false
 }
 
+fn parse_four_f64(val: &Value) -> Option<[f64; 4]> {
+    let arr = val.as_array()?;
+    if arr.len() < 4 {
+        return None;
+    }
+    Some([
+        arr[0].as_f64()?,
+        arr[1].as_f64()?,
+        arr[2].as_f64()?,
+        arr[3].as_f64()?,
+    ])
+}
+
+fn extract_norm_box_from_event(ev: &Value) -> [f64; 4] {
+    parse_four_f64(&ev["box"])
+        .or_else(|| parse_four_f64(&ev["data"]["box"]))
+        .or_else(|| parse_four_f64(&ev["data"]["provenance"]["norm_bbox"]))
+        .unwrap_or([0.0, 0.0, 0.0, 0.0])
+}
+
+fn extract_dhash64_from_value(val: &Value) -> Option<u64> {
+    if let Some(u) = val.as_u64() {
+        return Some(u);
+    }
+    if let Some(i) = val.as_i64() {
+        return Some(i as u64);
+    }
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        let hex_part = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        return u64::from_str_radix(hex_part, 16)
+            .ok()
+            .or_else(|| trimmed.parse::<u64>().ok());
+    }
+    None
+}
+
+fn iou_corners(a: [f64; 4], b: [f64; 4]) -> f64 {
+    let aw = a[2] - a[0];
+    let ah = a[3] - a[1];
+    let bw = b[2] - b[0];
+    let bh = b[3] - b[1];
+    if aw <= 0.0 || ah <= 0.0 || bw <= 0.0 || bh <= 0.0 {
+        return 0.0;
+    }
+    let ix1 = a[0].max(b[0]);
+    let iy1 = a[1].max(b[1]);
+    let ix2 = a[2].min(b[2]);
+    let iy2 = a[3].min(b[3]);
+    if ix2 <= ix1 || iy2 <= iy1 {
+        return 0.0;
+    }
+    let inter = (ix2 - ix1) * (iy2 - iy1);
+    let union = aw * ah + bw * bh - inter;
+    if union <= 0.0 { 0.0 } else { inter / union }
+}
+
+/// Computes normalized bounding-box IoU supporting both `[x1, y1, x2, y2]` and `[x, y, w, h]`
+/// (as returned by `BoundingBox::to_normalized`).
+pub fn compute_norm_box_iou(a: [f64; 4], b: [f64; 4]) -> f64 {
+    let xyxy = iou_corners(a, b);
+    let xywh = iou_corners(
+        [a[0], a[1], a[0] + a[2], a[1] + a[3]],
+        [b[0], b[1], b[0] + b[2], b[1] + b[3]],
+    );
+    xyxy.max(xywh)
+}
+
 impl NinjaDatabase {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -413,6 +484,23 @@ impl NinjaDatabase {
                 "last_used_at" REAL NULL,
                 "expires_at" REAL NULL
             );
+            CREATE TABLE IF NOT EXISTS false_positive_signature (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                camera TEXT NOT NULL,
+                label TEXT NOT NULL,
+                norm_x1 REAL NOT NULL,
+                norm_y1 REAL NOT NULL,
+                norm_x2 REAL NOT NULL,
+                norm_y2 REAL NOT NULL,
+                dhash64 INTEGER,
+                dominant_color TEXT,
+                hit_count INTEGER NOT NULL DEFAULT 1,
+                source_event_id TEXT UNIQUE,
+                reason TEXT,
+                created_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_fp_sig_cam_label ON false_positive_signature(camera, label);
             "#,
         )?;
         let _ = conn.execute(
@@ -1685,12 +1773,275 @@ impl NinjaDatabase {
     }
 
     pub fn set_event_false_positive(&self, id: &str, fp: bool) -> Result<usize> {
+        let ev_opt = self.get_event(id)?;
         let conn = self.conn.lock().expect("db mutex poisoned");
         let val = if fp { 1 } else { 0 };
-        Ok(conn.execute(
+        let updated = conn.execute(
             "UPDATE event SET false_positive = ?1 WHERE id = ?2",
             params![val, id],
+        )?;
+        if fp {
+            if let Some(ev) = ev_opt {
+                let camera = ev["camera"].as_str().unwrap_or_default().to_string();
+                let label = ev["label"].as_str().unwrap_or_default().to_string();
+                let [nx1, ny1, nx2, ny2] = extract_norm_box_from_event(&ev);
+                let dhash64 = extract_dhash64_from_value(&ev["data"]["dhash64"]);
+                let dominant_color = ev["data"]["attributes"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .or_else(|| ev["data"]["dominant_color"].as_str())
+                    .map(String::from);
+                let reason = ev["data"]["ai_verification"]["reason"]
+                    .as_str()
+                    .or_else(|| ev["data"]["fp_reason"].as_str())
+                    .map(String::from);
+                let now = Utc::now().timestamp_millis() as f64 / 1000.0;
+                if !camera.is_empty() && !label.is_empty() {
+                    conn.execute(
+                        r#"
+                        INSERT OR REPLACE INTO false_positive_signature (
+                            camera, label, norm_x1, norm_y1, norm_x2, norm_y2,
+                            dhash64, dominant_color, hit_count, source_event_id,
+                            reason, created_at, last_seen_at
+                        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?11)
+                        "#,
+                        params![
+                            camera,
+                            label,
+                            nx1,
+                            ny1,
+                            nx2,
+                            ny2,
+                            dhash64.map(|h| h as i64),
+                            dominant_color,
+                            id,
+                            reason,
+                            now
+                        ],
+                    )?;
+                }
+            }
+        } else {
+            conn.execute(
+                "DELETE FROM false_positive_signature WHERE source_event_id = ?1",
+                params![id],
+            )?;
+        }
+        Ok(updated)
+    }
+
+    pub fn set_event_ai_verification(&self, id: &str, verification: &Value) -> Result<usize> {
+        let Some(mut ev) = self.get_event(id)? else {
+            return Ok(0);
+        };
+        if let Some(data_obj) = ev["data"].as_object_mut() {
+            data_obj.insert("ai_verification".to_string(), verification.clone());
+        }
+        let data_str = serde_json::to_string(&ev["data"])?;
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        Ok(conn.execute(
+            "UPDATE event SET data = ?1 WHERE id = ?2",
+            params![data_str, id],
         )?)
+    }
+
+    /// Matches `(camera, label)` against active `false_positive_signature` rows where normalized
+    /// bounding-box IoU `>= 0.72` AND (if both `dhash64` values are present, Hamming distance `<= 12`).
+    /// Increments `hit_count` and updates `last_seen_at` when matched.
+    pub fn match_false_positive_signature(
+        &self,
+        camera: &str,
+        label: &str,
+        norm_box: [f64; 4],
+        dhash64: Option<u64>,
+    ) -> Result<Option<Value>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                id, camera, label, norm_x1, norm_y1, norm_x2, norm_y2,
+                dhash64, dominant_color, hit_count, source_event_id,
+                reason, created_at, last_seen_at
+            FROM false_positive_signature
+            WHERE camera = ?1 AND label = ?2
+            ORDER BY id DESC
+            "#,
+        )?;
+        type SigRow = (
+            i64,
+            String,
+            String,
+            f64,
+            f64,
+            f64,
+            f64,
+            Option<i64>,
+            Option<String>,
+            i64,
+            Option<String>,
+            Option<String>,
+            f64,
+            f64,
+        );
+        let rows = stmt.query_map(params![camera, label], |r| -> rusqlite::Result<SigRow> {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+                r.get(11)?,
+                r.get(12)?,
+                r.get(13)?,
+            ))
+        })?;
+
+        let mut matched: Option<(SigRow, f64, Option<u32>)> = None;
+        for row_res in rows {
+            let row = row_res?;
+            let sig_box = [row.3, row.4, row.5, row.6];
+            let iou = compute_norm_box_iou(sig_box, norm_box);
+            if iou < 0.72 {
+                continue;
+            }
+            let sig_hash = row.7.map(|v| v as u64);
+            let hamming = match (sig_hash, dhash64) {
+                (Some(sh), Some(ch)) => {
+                    let dist = (sh ^ ch).count_ones();
+                    if dist > 12 {
+                        continue;
+                    }
+                    Some(dist)
+                }
+                _ => None,
+            };
+            matched = Some((row, iou, hamming));
+            break;
+        }
+        drop(stmt);
+
+        if let Some((row, iou, hamming)) = matched {
+            let new_hits = row.9 + 1;
+            let now = Utc::now().timestamp_millis() as f64 / 1000.0;
+            conn.execute(
+                "UPDATE false_positive_signature SET hit_count = ?2, last_seen_at = ?3 WHERE id = ?1",
+                params![row.0, new_hits, now],
+            )?;
+            let sig_hash_u64 = row.7.map(|v| v as u64);
+            return Ok(Some(json!({
+                "id": row.0,
+                "camera": row.1,
+                "label": row.2,
+                "norm_bbox": [row.3, row.4, row.5, row.6],
+                "norm_x1": row.3,
+                "norm_y1": row.4,
+                "norm_x2": row.5,
+                "norm_y2": row.6,
+                "dhash64": sig_hash_u64,
+                "dominant_color": row.8,
+                "hit_count": new_hits,
+                "source_event_id": row.10,
+                "reason": row.11,
+                "created_at": row.12,
+                "last_seen_at": now,
+                "iou": iou,
+                "hamming_distance": hamming
+            })));
+        }
+        Ok(None)
+    }
+
+    pub fn list_false_positive_signatures(&self, camera: Option<&str>) -> Result<Vec<Value>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let filter_cam = camera.filter(|c| !c.is_empty() && *c != "all");
+        let sql = if filter_cam.is_some() {
+            r#"
+            SELECT
+                id, camera, label, norm_x1, norm_y1, norm_x2, norm_y2,
+                dhash64, dominant_color, hit_count, source_event_id,
+                reason, created_at, last_seen_at
+            FROM false_positive_signature
+            WHERE camera = ?1
+            ORDER BY last_seen_at DESC, id DESC
+            "#
+        } else {
+            r#"
+            SELECT
+                id, camera, label, norm_x1, norm_y1, norm_x2, norm_y2,
+                dhash64, dominant_color, hit_count, source_event_id,
+                reason, created_at, last_seen_at
+            FROM false_positive_signature
+            ORDER BY last_seen_at DESC, id DESC
+            "#
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
+            let nx1: f64 = r.get(3)?;
+            let ny1: f64 = r.get(4)?;
+            let nx2: f64 = r.get(5)?;
+            let ny2: f64 = r.get(6)?;
+            let dhash_i64: Option<i64> = r.get(7)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "camera": r.get::<_, String>(1)?,
+                "label": r.get::<_, String>(2)?,
+                "norm_bbox": [nx1, ny1, nx2, ny2],
+                "norm_x1": nx1,
+                "norm_y1": ny1,
+                "norm_x2": nx2,
+                "norm_y2": ny2,
+                "dhash64": dhash_i64.map(|v| v as u64),
+                "dominant_color": r.get::<_, Option<String>>(8)?,
+                "hit_count": r.get::<_, i64>(9)?,
+                "source_event_id": r.get::<_, Option<String>>(10)?,
+                "reason": r.get::<_, Option<String>>(11)?,
+                "created_at": r.get::<_, f64>(12)?,
+                "last_seen_at": r.get::<_, f64>(13)?,
+            }))
+        };
+        let mut out = Vec::new();
+        if let Some(cam) = filter_cam {
+            let rows = stmt.query_map(params![cam], map_row)?;
+            for r in rows {
+                out.push(r?);
+            }
+        } else {
+            let rows = stmt.query_map([], map_row)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn delete_false_positive_signature(&self, id: i64) -> Result<usize> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let src_ev: Option<String> = conn
+            .query_row(
+                "SELECT source_event_id FROM false_positive_signature WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let deleted = conn.execute(
+            "DELETE FROM false_positive_signature WHERE id = ?1",
+            params![id],
+        )?;
+        if let Some(ev_id) = src_ev {
+            let _ = conn.execute(
+                "UPDATE event SET false_positive = 0 WHERE id = ?1",
+                params![ev_id],
+            );
+        }
+        Ok(deleted)
     }
 
     pub fn set_event_sub_label(&self, id: &str, sub_label: Option<&str>) -> Result<usize> {
@@ -1780,6 +2131,10 @@ impl NinjaDatabase {
             ON CONFLICT(id) DO UPDATE SET
                 end_time = excluded.end_time,
                 top_score = excluded.top_score,
+                false_positive = CASE
+                    WHEN event.false_positive = 1 OR excluded.false_positive = 1 THEN 1
+                    ELSE COALESCE(excluded.false_positive, event.false_positive)
+                END,
                 zones = excluded.zones,
                 thumbnail = COALESCE(excluded.thumbnail, event.thumbnail),
                 has_clip = excluded.has_clip,
@@ -4231,6 +4586,114 @@ mod tests {
         assert_eq!(previews_all.len(), 1);
 
         db.run_maintenance().unwrap();
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn false_positive_signature_lifecycle_and_iou_dhash_matching() {
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_fp_sig_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        let base_hash: u64 = 0xA5A5_5A5A_F0F0_0F0F;
+        db.upsert_event(&EventDto {
+            id: "ev_fp_patio_plant".to_string(),
+            camera: "patio".to_string(),
+            label: "person".to_string(),
+            zones: json!(["yard"]),
+            start_time: 1000.0,
+            end_time: Some(1008.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.76),
+            false_positive: Some(false),
+            box_coords: Some(json!([0.20, 0.30, 0.40, 0.80])),
+            data: json!({
+                "box": [0.20, 0.30, 0.40, 0.80],
+                "dhash64": base_hash,
+                "attributes": ["color:green"]
+            }),
+            thumbnail: None,
+            area: Some(12000),
+            ratio: Some(0.40),
+            score: Some(0.76),
+            stationary: true,
+        })
+        .unwrap();
+
+        // 1. Mark event as false positive -> creates false_positive_signature in SQLite
+        assert_eq!(
+            db.set_event_false_positive("ev_fp_patio_plant", true)
+                .unwrap(),
+            1
+        );
+        let sigs = db.list_false_positive_signatures(Some("patio")).unwrap();
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0]["camera"], "patio");
+        assert_eq!(sigs[0]["label"], "person");
+        assert_eq!(sigs[0]["dhash64"].as_u64(), Some(base_hash));
+        assert_eq!(sigs[0]["dominant_color"], "color:green");
+        assert_eq!(sigs[0]["hit_count"], 1);
+
+        // 2. Matching box (IoU >= 0.72) and visually close crop (hamming <= 12) matches & increments hit_count
+        let minor_noise_hash = base_hash ^ 0b1011; // hamming distance = 3 <= 12
+        let matched = db
+            .match_false_positive_signature(
+                "patio",
+                "person",
+                [0.21, 0.31, 0.40, 0.79],
+                Some(minor_noise_hash),
+            )
+            .unwrap();
+        assert!(matched.is_some());
+        let matched_val = matched.unwrap();
+        assert_eq!(matched_val["hit_count"], 2);
+        assert!(matched_val["iou"].as_f64().unwrap() >= 0.72);
+        assert_eq!(matched_val["hamming_distance"], 3);
+
+        // 3. Visually distinct crop at the same coordinates (hamming > 12) is NOT suppressed
+        let distinct_hash = !base_hash; // hamming distance = 64 > 12
+        let rejected_hash = db
+            .match_false_positive_signature(
+                "patio",
+                "person",
+                [0.20, 0.30, 0.40, 0.80],
+                Some(distinct_hash),
+            )
+            .unwrap();
+        assert!(rejected_hash.is_none());
+
+        // 4. Non-overlapping bounding box (IoU < 0.72) is NOT suppressed
+        let rejected_box = db
+            .match_false_positive_signature(
+                "patio",
+                "person",
+                [0.65, 0.15, 0.85, 0.55],
+                Some(base_hash),
+            )
+            .unwrap();
+        assert!(rejected_box.is_none());
+
+        // 5. Unmarking false positive (fp = false) removes the signature
+        assert_eq!(
+            db.set_event_false_positive("ev_fp_patio_plant", false)
+                .unwrap(),
+            1
+        );
+        assert!(db.list_false_positive_signatures(None).unwrap().is_empty());
+
+        // 6. Re-mark and delete via delete_false_positive_signature(id)
+        db.set_event_false_positive("ev_fp_patio_plant", true)
+            .unwrap();
+        let sigs_again = db.list_false_positive_signatures(None).unwrap();
+        assert_eq!(sigs_again.len(), 1);
+        let sig_id = sigs_again[0]["id"].as_i64().unwrap();
+        assert_eq!(db.delete_false_positive_signature(sig_id).unwrap(), 1);
+        assert!(db.list_false_positive_signatures(None).unwrap().is_empty());
 
         let _ = std::fs::remove_file(&tmp);
     }

@@ -165,6 +165,66 @@ impl Default for UiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenAiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_genai_provider")]
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default = "default_genai_api_key_env")]
+    pub api_key_env: String,
+    #[serde(default = "default_genai_model")]
+    pub model: String,
+    #[serde(default)]
+    pub verify_ambiguous_alerts: bool,
+    #[serde(default = "default_ambiguous_score_min")]
+    pub ambiguous_score_min: f32,
+    #[serde(default = "default_ambiguous_score_max")]
+    pub ambiguous_score_max: f32,
+    #[serde(default = "default_true")]
+    pub auto_suppress_false_positives: bool,
+    #[serde(default = "default_genai_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_genai_provider() -> String {
+    "gemini".to_string()
+}
+fn default_genai_api_key_env() -> String {
+    "GEMINI_API_KEY".to_string()
+}
+fn default_genai_model() -> String {
+    "gemini-2.5-flash".to_string()
+}
+fn default_ambiguous_score_min() -> f32 {
+    0.45
+}
+fn default_ambiguous_score_max() -> f32 {
+    0.72
+}
+fn default_genai_timeout_ms() -> u64 {
+    5000
+}
+
+impl Default for GenAiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_genai_provider(),
+            base_url: None,
+            api_key_env: default_genai_api_key_env(),
+            model: default_genai_model(),
+            verify_ambiguous_alerts: false,
+            ambiguous_score_min: default_ambiguous_score_min(),
+            ambiguous_score_max: default_ambiguous_score_max(),
+            auto_suppress_false_positives: true,
+            timeout_ms: default_genai_timeout_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NinjaConfig {
     #[serde(default = "default_version")]
     pub version: String,
@@ -180,6 +240,8 @@ pub struct NinjaConfig {
     pub detectors: BTreeMap<String, DetectorEntryConfig>,
     #[serde(default)]
     pub model: ModelConfig,
+    #[serde(default)]
+    pub genai: GenAiConfig,
     #[serde(default)]
     pub record: RecordConfig,
     #[serde(default)]
@@ -2028,7 +2090,18 @@ impl NinjaConfig {
                 "all_attributes": ["face", "license_plate"],
                 "non_logo_attributes": ["face", "license_plate"]
             },
-            "genai": {},
+            "genai": {
+                "enabled": self.genai.enabled,
+                "provider": self.genai.provider,
+                "base_url": self.genai.base_url,
+                "api_key_env": self.genai.api_key_env,
+                "model": self.genai.model,
+                "verify_ambiguous_alerts": self.genai.verify_ambiguous_alerts,
+                "ambiguous_score_min": self.genai.ambiguous_score_min,
+                "ambiguous_score_max": self.genai.ambiguous_score_max,
+                "auto_suppress_false_positives": self.genai.auto_suppress_false_positives,
+                "timeout_ms": self.genai.timeout_ms
+            },
             "cameras": cameras_json,
             "audio": {
                 "enabled": self.audio.enabled,
@@ -2365,6 +2438,12 @@ impl NinjaConfig {
         if let Some(model_val) = obj.get("model") {
             self.model =
                 serde_json::from_value(model_val.clone()).context("invalid model config")?;
+        }
+        if let Some(genai_val) = obj.get("genai")
+            && genai_val.as_object().is_some_and(|m| !m.is_empty())
+        {
+            self.genai =
+                serde_json::from_value(genai_val.clone()).context("invalid genai config")?;
         }
         if let Some(detect_val) = obj.get("detect") {
             self.detect =
@@ -3840,5 +3919,60 @@ version: 0.18-0
         let roundtripped =
             NinjaConfig::from_yaml_str(&cfg.raw_yaml, PathBuf::from("/tmp/config.yml")).unwrap();
         assert_eq!(roundtripped.ui.floorplan, cfg.ui.floorplan);
+    }
+
+    #[test]
+    fn genai_config_roundtrips_yaml_and_structured_json() {
+        let yaml = r#"
+genai:
+  enabled: true
+  provider: ollama
+  base_url: http://127.0.0.1:11434
+  api_key_env: OLLAMA_API_KEY
+  model: qwen2.5vl:7b
+  verify_ambiguous_alerts: true
+  ambiguous_score_min: 0.42
+  ambiguous_score_max: 0.74
+  auto_suppress_false_positives: true
+  timeout_ms: 6000
+version: 0.18-0
+"#;
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert!(cfg.genai.enabled);
+        assert_eq!(cfg.genai.provider, "ollama");
+        assert_eq!(
+            cfg.genai.base_url.as_deref(),
+            Some("http://127.0.0.1:11434")
+        );
+        assert_eq!(cfg.genai.model, "qwen2.5vl:7b");
+        assert!(cfg.genai.verify_ambiguous_alerts);
+        assert!((cfg.genai.ambiguous_score_min - 0.42).abs() < 1e-4);
+        assert!((cfg.genai.ambiguous_score_max - 0.74).abs() < 1e-4);
+        assert!(cfg.genai.auto_suppress_false_positives);
+        assert_eq!(cfg.genai.timeout_ms, 6000);
+
+        let api_val = cfg.to_api_value();
+        assert_eq!(api_val["genai"]["enabled"], true);
+        assert_eq!(api_val["genai"]["provider"], "ollama");
+        assert_eq!(api_val["genai"]["model"], "qwen2.5vl:7b");
+
+        let patch = json!({
+            "genai": {
+                "enabled": true,
+                "provider": "gemini",
+                "api_key_env": "GEMINI_API_KEY",
+                "model": "gemini-2.5-flash",
+                "verify_ambiguous_alerts": false,
+                "ambiguous_score_min": 0.48,
+                "ambiguous_score_max": 0.70,
+                "auto_suppress_false_positives": true,
+                "timeout_ms": 4500
+            }
+        });
+        cfg.apply_structured_json(&patch).unwrap();
+        assert_eq!(cfg.genai.provider, "gemini");
+        assert_eq!(cfg.genai.model, "gemini-2.5-flash");
+        assert!(!cfg.genai.verify_ambiguous_alerts);
+        assert_eq!(cfg.genai.timeout_ms, 4500);
     }
 }
