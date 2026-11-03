@@ -234,6 +234,9 @@ export function buildCleanYamlFromDraft(
           retain: { days: 14, mode: "motion" },
         },
         preview: cam.record?.preview || { quality: "medium" },
+        ...(cam.record?.cold_compaction
+          ? { cold_compaction: cam.record.cold_compaction }
+          : {}),
       },
       snapshots: {
         enabled: cam.snapshots?.enabled ?? true,
@@ -335,6 +338,9 @@ export function buildCleanYamlFromDraft(
         post_capture: 5,
         retain: { days: 14, mode: "motion" },
       },
+      ...(draft.record?.cold_compaction
+        ? { cold_compaction: draft.record.cold_compaction }
+        : {}),
     },
     snapshots: {
       enabled: draft.snapshots?.enabled ?? true,

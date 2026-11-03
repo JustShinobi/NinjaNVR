@@ -343,7 +343,7 @@ export const RecordingReviewSection: React.FC<{
                 <input
                   type="number"
                   min={0}
-                  max={60}
+                  max={300}
                   className="nvr-input mono"
                   style={{ width: "100%", marginTop: 2 }}
                   value={activeRec.alerts?.pre_capture ?? 5}
@@ -361,7 +361,7 @@ export const RecordingReviewSection: React.FC<{
                 <input
                   type="number"
                   min={0}
-                  max={60}
+                  max={300}
                   className="nvr-input mono"
                   style={{ width: "100%", marginTop: 2 }}
                   value={activeRec.alerts?.post_capture ?? 5}
@@ -441,7 +441,7 @@ export const RecordingReviewSection: React.FC<{
                 <input
                   type="number"
                   min={0}
-                  max={60}
+                  max={300}
                   className="nvr-input mono"
                   style={{ width: "100%", marginTop: 2 }}
                   value={activeRec.detections?.pre_capture ?? 5}
@@ -459,7 +459,7 @@ export const RecordingReviewSection: React.FC<{
                 <input
                   type="number"
                   min={0}
-                  max={60}
+                  max={300}
                   className="nvr-input mono"
                   style={{ width: "100%", marginTop: 2 }}
                   value={activeRec.detections?.post_capture ?? 5}
@@ -553,6 +553,198 @@ export const RecordingReviewSection: React.FC<{
                     });
                   }}
                 />
+              </div>
+            </div>
+          </div>
+
+          {/* Cold Compaction (Background CRF Compression of Idle Segments) */}
+          <div
+            style={{
+              padding: 10,
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-accent-text)" }}>
+                {isPt
+                  ? "COMPACTAÇÃO FRIA EM BACKGROUND (COLD COMPACTION)"
+                  : "BACKGROUND COLD COMPACTION (CRF RE-ENCODE)"}
+              </span>
+              <ToggleSwitch
+                checked={Boolean(activeRec.cold_compaction?.enabled)}
+                label="Enable Cold Compaction"
+                onChange={(v) =>
+                  mutateRec((r) => {
+                    r.cold_compaction = {
+                      enabled: v,
+                      after_hours: r.cold_compaction?.after_hours ?? 24,
+                      crf: r.cold_compaction?.crf ?? 28,
+                      idle_only: r.cold_compaction?.idle_only ?? true,
+                      codec: r.cold_compaction?.codec || "h264",
+                      preset: r.cold_compaction?.preset || "veryfast",
+                      hwaccel: r.cold_compaction?.hwaccel || "none",
+                    };
+                  })
+                }
+              />
+            </div>
+            <div className="nvr-field-desc">
+              {isPt
+                ? "Re-compacta em background segmentos antigos estáticos (sem eventos dentro da janela Pré/Pós-Captura), preservando 100% da qualidade original nos eventos."
+                : "Compresses older idle segments in background while preserving untouched 1080p quality on all events and their pre/post-capture windows."}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1.2fr", gap: 8 }}>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Compactar Após (h)" : "Compact After (h)"}
+                </div>
+                <input
+                  type="number"
+                  min={1}
+                  max={720}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeRec.cold_compaction?.after_hours ?? 24}
+                  onChange={(e) =>
+                    mutateRec((r) => {
+                      r.cold_compaction = {
+                        ...r.cold_compaction,
+                        enabled: Boolean(r.cold_compaction?.enabled),
+                        after_hours: Math.max(1, Number(e.target.value)),
+                      };
+                    })
+                  }
+                />
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Fator CRF/QP (18-36)" : "CRF/QP Factor (18-36)"}
+                </div>
+                <input
+                  type="number"
+                  min={18}
+                  max={36}
+                  className="nvr-input mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeRec.cold_compaction?.crf ?? 28}
+                  onChange={(e) =>
+                    mutateRec((r) => {
+                      r.cold_compaction = {
+                        ...r.cold_compaction,
+                        enabled: Boolean(r.cold_compaction?.enabled),
+                        crf: Math.min(36, Math.max(18, Number(e.target.value))),
+                      };
+                    })
+                  }
+                />
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Escopo" : "Target Scope"}
+                </div>
+                <select
+                  className="nvr-select mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeRec.cold_compaction?.idle_only === false ? "all" : "idle_only"}
+                  onChange={(e) =>
+                    mutateRec((r) => {
+                      r.cold_compaction = {
+                        ...r.cold_compaction,
+                        enabled: Boolean(r.cold_compaction?.enabled),
+                        idle_only: e.target.value === "idle_only",
+                      };
+                    })
+                  }
+                >
+                  <option value="idle_only">
+                    {isPt ? "Apenas Ociosos (Preservar Eventos)" : "Idle Only (Preserve Events)"}
+                  </option>
+                  <option value="all">
+                    {isPt ? "Todos Segmentos Antigos" : "All Aged Segments"}
+                  </option>
+                </select>
+              </div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr 1fr", gap: 8 }}>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Aceleração de Hardware" : "Hardware Accel"}
+                </div>
+                <select
+                  className="nvr-select mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeRec.cold_compaction?.hwaccel || "none"}
+                  onChange={(e) =>
+                    mutateRec((r) => {
+                      r.cold_compaction = {
+                        ...r.cold_compaction,
+                        enabled: Boolean(r.cold_compaction?.enabled),
+                        hwaccel: e.target.value,
+                      };
+                    })
+                  }
+                >
+                  <option value="none">
+                    {isPt ? "CPU (Software c/ Fallback)" : "CPU (Software)"}
+                  </option>
+                  <option value="vaapi">VAAPI (Intel / AMD iGPU)</option>
+                  <option value="qsv">Intel QuickSync (QSV)</option>
+                  <option value="nvenc">NVIDIA NVENC (CUDA)</option>
+                </select>
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Codec de Vídeo" : "Video Codec"}
+                </div>
+                <select
+                  className="nvr-select mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeRec.cold_compaction?.codec || "h264"}
+                  onChange={(e) =>
+                    mutateRec((r) => {
+                      r.cold_compaction = {
+                        ...r.cold_compaction,
+                        enabled: Boolean(r.cold_compaction?.enabled),
+                        codec: e.target.value,
+                      };
+                    })
+                  }
+                >
+                  <option value="h264">H.264 / AVC (Universal)</option>
+                  <option value="hevc">H.265 / HEVC (hvc1)</option>
+                </select>
+              </div>
+              <div>
+                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Preset do Encoder" : "Encoder Preset"}
+                </div>
+                <select
+                  className="nvr-select mono"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={activeRec.cold_compaction?.preset || "veryfast"}
+                  onChange={(e) =>
+                    mutateRec((r) => {
+                      r.cold_compaction = {
+                        ...r.cold_compaction,
+                        enabled: Boolean(r.cold_compaction?.enabled),
+                        preset: e.target.value,
+                      };
+                    })
+                  }
+                >
+                  <option value="ultrafast">ultrafast</option>
+                  <option value="superfast">superfast</option>
+                  <option value="veryfast">veryfast</option>
+                  <option value="faster">faster</option>
+                  <option value="fast">fast</option>
+                  <option value="medium">medium</option>
+                  <option value="slow">slow</option>
+                </select>
               </div>
             </div>
           </div>

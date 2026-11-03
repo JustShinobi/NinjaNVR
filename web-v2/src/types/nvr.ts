@@ -69,6 +69,16 @@ export interface AlertBackupConfig {
   include_snapshot?: boolean;
 }
 
+export interface ColdCompactionConfig {
+  enabled: boolean;
+  after_hours?: number;
+  crf?: number;
+  idle_only?: boolean;
+  codec?: "h264" | "hevc" | string;
+  preset?: "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" | "medium" | "slow" | string;
+  hwaccel?: "none" | "vaapi" | "qsv" | "nvenc" | string;
+}
+
 export interface RecordConfig {
   enabled: boolean;
   expire_interval?: number;
@@ -78,6 +88,7 @@ export interface RecordConfig {
   min_free_gb?: number | null;
   storage_tiers?: StorageTiersConfig;
   alert_backup?: AlertBackupConfig;
+  cold_compaction?: ColdCompactionConfig;
   continuous?: {
     days: number;
   };
