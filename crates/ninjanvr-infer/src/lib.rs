@@ -498,19 +498,78 @@ impl AiDetectorEngine {
         }
         dirs.extend([
             PathBuf::from("/usr/local/lib/ninjanvr/openvino"),
+            PathBuf::from("/usr/local/lib/python3.12/site-packages/openvino/libs"),
             PathBuf::from("/usr/local/lib/python3.11/dist-packages/openvino/libs"),
             PathBuf::from("/usr/lib/x86_64-linux-gnu"),
         ]);
+        Self::resolve_openvino_c_lib_in_dirs(&dirs)
+    }
 
+    fn resolve_openvino_c_lib_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
         for dir in dirs {
-            for name in ["libopenvino_c.so.2541", "libopenvino_c.so"] {
-                let candidate = dir.join(name);
-                if candidate.exists() {
-                    return Some(candidate);
+            let direct = dir.join("libopenvino_c.so");
+            if direct.exists() {
+                return Some(direct);
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                let mut versioned: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("libopenvino_c.so."))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                versioned.sort();
+                if let Some(best) = versioned.pop() {
+                    return Some(best);
                 }
             }
         }
         None
+    }
+
+    fn discover_openvino_preload_deps(lib_dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let prefixes = [
+            "libtbb.so",
+            "libhwloc.so",
+            "libopenvino.so",
+            "libopenvino_ir_frontend.so",
+            "libopenvino_onnx_frontend.so",
+        ];
+        let Ok(entries) = std::fs::read_dir(lib_dir) else {
+            return out;
+        };
+        let files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        for prefix in prefixes {
+            let exact = lib_dir.join(prefix);
+            if exact.exists() {
+                out.push(exact);
+                continue;
+            }
+            let mut matches: Vec<PathBuf> = files
+                .iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| {
+                            n == prefix
+                                || (n.starts_with(prefix)
+                                    && n.as_bytes().get(prefix.len()) == Some(&b'.'))
+                        })
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            matches.sort();
+            if let Some(best) = matches.pop() {
+                out.push(best);
+            }
+        }
+        out
     }
 
     fn resolve_model_path(configured: &str) -> Option<PathBuf> {
@@ -534,17 +593,8 @@ impl AiDetectorEngine {
         let lib_dir = lib_path.parent().unwrap_or_else(|| Path::new("/"));
 
         unsafe {
-            for dep in [
-                "libtbb.so.12",
-                "libhwloc.so.15",
-                "libopenvino.so.2541",
-                "libopenvino_ir_frontend.so.2541",
-                "libopenvino_onnx_frontend.so.2541",
-            ] {
-                let dep_path = lib_dir.join(dep);
-                if dep_path.exists()
-                    && let Ok(c_dep) = CString::new(dep_path.to_string_lossy().as_bytes())
-                {
+            for dep_path in Self::discover_openvino_preload_deps(lib_dir) {
+                if let Ok(c_dep) = CString::new(dep_path.to_string_lossy().as_bytes()) {
                     let _ = libc::dlopen(c_dep.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
                 }
             }
@@ -1115,5 +1165,37 @@ version: 0.18-0
 
         let acc = pool.get(cfg.cameras["driveway"].detect.detector.as_deref());
         assert_eq!(acc.model_dimensions().0, 640);
+    }
+
+    #[test]
+    fn resolves_versioned_and_unversioned_openvino_shared_libs() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr-ov-resolve-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let v2541 = tmp.join("libopenvino_c.so.2541");
+        let v2641 = tmp.join("libopenvino_c.so.2641");
+        std::fs::write(&v2541, b"stub").unwrap();
+        std::fs::write(&v2641, b"stub").unwrap();
+        std::fs::write(tmp.join("libopenvino.so.2641"), b"stub").unwrap();
+        std::fs::write(tmp.join("libopenvino_onnx_frontend.so.2641"), b"stub").unwrap();
+        std::fs::write(tmp.join("libtbb.so.12"), b"stub").unwrap();
+
+        let resolved =
+            AiDetectorEngine::resolve_openvino_c_lib_in_dirs(std::slice::from_ref(&tmp)).unwrap();
+        assert_eq!(resolved, v2641);
+
+        let deps = AiDetectorEngine::discover_openvino_preload_deps(&tmp);
+        assert_eq!(deps.len(), 3);
+        assert!(deps[0].ends_with("libtbb.so.12"));
+        assert!(deps[1].ends_with("libopenvino.so.2641"));
+        assert!(deps[2].ends_with("libopenvino_onnx_frontend.so.2641"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
