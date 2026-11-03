@@ -738,6 +738,12 @@ export function buildCleanYamlFromDraft(
                     opacity: Number(
                       (draft.ui.floorplan.opacity ?? 0.45).toFixed(2)
                     ),
+                    ...(draft.ui.floorplan.width_m !== undefined
+                      ? { width_m: Number(draft.ui.floorplan.width_m.toFixed(2)) }
+                      : {}),
+                    ...(draft.ui.floorplan.height_m !== undefined
+                      ? { height_m: Number(draft.ui.floorplan.height_m.toFixed(2)) }
+                      : {}),
                     rooms: (draft.ui.floorplan.rooms || []).map((r) => ({
                       id: r.id,
                       label: r.label,
@@ -749,6 +755,8 @@ export function buildCleanYamlFromDraft(
                     })),
                     walls: (draft.ui.floorplan.walls || []).map((w) => ({
                       points: w.points.map((p) => Number(p.toFixed(3))),
+                      ...(w.label ? { label: w.label } : {}),
+                      ...(w.kind && w.kind !== "wall" ? { kind: w.kind } : {}),
                     })),
                   },
                 }

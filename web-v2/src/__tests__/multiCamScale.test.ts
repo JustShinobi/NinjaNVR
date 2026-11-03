@@ -14,13 +14,21 @@ import {
   computeCameraAimFromTip,
   computeDefaultMapPlacement,
   computeFovConeTipSvgPoint,
+  computeRoomMetrics,
+  computeWallMetrics,
+  extractRoomBoundaryWalls,
   getMatrixPageSize,
+  mapClientPointToFloorplan,
   nextMatrixTourPage,
   normalizeFloorplanRoomRect,
+  resizeRoomByMeters,
+  resizeWallToLengthMeters,
   resolveDockTileMode,
   resolveOrderedDashboardCameras,
+  rotateWallToAngleDegrees,
   sliceMatrixPage,
   snapFloorplanCoord,
+  snapWallEndpoint,
 } from "../views/LiveWorkspace";
 import {
   MAX_SYNC_QUAD_SLOTS,
@@ -242,6 +250,85 @@ describe("Adaptive Tactical Map ceil(sqrt(N)) coordinate placement", () => {
     expect(snapFloorplanCoord(0.113, 0.02)).toBe(0.12);
     expect(snapFloorplanCoord(-0.5, 0.02)).toBe(0);
     expect(snapFloorplanCoord(1.4, 0.02)).toBe(1);
+  });
+
+  test("mapClientPointToFloorplan accurately converts mouse coordinates across letterboxed/pillarboxed SVG viewports", () => {
+    // Wide container (1600x600) with 1000x600 viewBox -> scale = 1.0, drawnW = 1000, offsetX = 300
+    const wideRect = { left: 100, top: 50, width: 1600, height: 600 };
+    // Clicking at left edge of rendered 1000x600 viewBox (clientX = 100 + 300 = 400) -> x = 0
+    expect(mapClientPointToFloorplan(400, 50, wideRect, 1000, 600)).toEqual({
+      x: 0,
+      y: 0,
+    });
+    // Clicking at center of rendered viewBox (clientX = 100 + 300 + 500 = 900, clientY = 50 + 300 = 350) -> (0.5, 0.5)
+    expect(mapClientPointToFloorplan(900, 350, wideRect, 1000, 600)).toEqual({
+      x: 0.5,
+      y: 0.5,
+    });
+    // Clicking at right edge of rendered viewBox (clientX = 100 + 300 + 1000 = 1400) -> x = 1
+    expect(mapClientPointToFloorplan(1400, 650, wideRect, 1000, 600)).toEqual({
+      x: 1,
+      y: 1,
+    });
+  });
+
+  test("computeRoomMetrics, resizeRoomByMeters, computeWallMetrics, resizeWallToLengthMeters, rotateWallToAngleDegrees, and snapWallEndpoint support exact metric editing", () => {
+    const room = {
+      id: "sala",
+      label: "SALA",
+      x: 0.1,
+      y: 0.25,
+      w: 0.25,
+      h: 0.5,
+      color: "#0ea5e9",
+    };
+    const rmMetrics = computeRoomMetrics(room, 20, 12);
+    expect(rmMetrics.widthM).toBe(5);
+    expect(rmMetrics.heightM).toBe(6);
+    expect(rmMetrics.areaSqM).toBe(30);
+    expect(rmMetrics.xM).toBe(2);
+    expect(rmMetrics.yM).toBe(3);
+
+    const resizedRoom = resizeRoomByMeters(room, 4.0, 3.0, 20, 12);
+    expect(resizedRoom.w).toBe(0.2);
+    expect(resizedRoom.h).toBe(0.25);
+
+    const boundaryWalls = extractRoomBoundaryWalls(resizedRoom);
+    expect(boundaryWalls.length).toBe(4);
+    expect(boundaryWalls[0].points).toEqual([0.1, 0.25, 0.3, 0.25]);
+
+    // Horizontal 4.0m wall on a 20m x 12m floorplan -> dx = 0.20
+    const wallPts: [number, number, number, number] = [0.1, 0.2, 0.3, 0.2];
+    const wMetrics = computeWallMetrics(wallPts, 20, 12);
+    expect(wMetrics.lengthM).toBe(4);
+    expect(wMetrics.angleDeg).toBe(0);
+
+    // Resize wall to 6.5m horizontally -> x2 = 0.1 + 6.5 / 20 = 0.425
+    const resizedWall = resizeWallToLengthMeters(wallPts, 6.5, 20, 12);
+    expect(resizedWall).toEqual([0.1, 0.2, 0.425, 0.2]);
+    expect(computeWallMetrics(resizedWall, 20, 12).lengthM).toBe(6.5);
+
+    // Rotate 6.0m wall to 90 degrees (vertical) -> dy = 6.0 / 12 = 0.5
+    const wall6m: [number, number, number, number] = [0.2, 0.1, 0.5, 0.1];
+    const rotated90 = rotateWallToAngleDegrees(wall6m, 90, 20, 12);
+    expect(rotated90).toEqual([0.2, 0.1, 0.2, 0.6]);
+    expect(computeWallMetrics(rotated90, 20, 12).lengthM).toBe(6);
+    expect(computeWallMetrics(rotated90, 20, 12).angleDeg).toBe(90);
+
+    // Magnetic vertex snap & orthogonal snap
+    const vSnap = snapWallEndpoint(0.1, 0.1, 0.304, 0.252, {
+      vertices: [{ x: 0.3, y: 0.25 }],
+      vertexSnapRadius: 0.015,
+    });
+    expect(vSnap.snappedToVertex).toBe(true);
+    expect(vSnap.x).toBe(0.3);
+    expect(vSnap.y).toBe(0.25);
+
+    const orthoHoriz = snapWallEndpoint(0.2, 0.3, 0.5, 0.306, {
+      orthoSnap: true,
+      snapStep: 0.005,
+    });
+    expect(orthoHoriz.y).toBe(0.3);
   });
 });
 

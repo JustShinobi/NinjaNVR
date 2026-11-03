@@ -207,6 +207,9 @@ export function computeDefaultMapPlacement(
 
 export type FloorplanStudioTool = "select" | "draw_room" | "draw_wall";
 
+export const DEFAULT_FLOORPLAN_WIDTH_M = 20;
+export const DEFAULT_FLOORPLAN_HEIGHT_M = 12;
+
 export const DEFAULT_ROOM_LABELS = [
   "SALA",
   "ESCRITÓRIO",
@@ -216,6 +219,15 @@ export const DEFAULT_ROOM_LABELS = [
   "CORREDOR",
   "VARANDA",
   "HALL",
+];
+
+export const ROOM_COLOR_PALETTE = [
+  "#0ea5e9",
+  "#10b981",
+  "#f59e0b",
+  "#8b5cf6",
+  "#ec4899",
+  "#64748b",
 ];
 
 export function computeCameraAimFromTip(
@@ -247,6 +259,43 @@ export function computeFovConeTipSvgPoint(
   };
 }
 
+/**
+ * Accurately maps a browser client pointer (clientX, clientY) into normalized [0, 1]
+ * floorplan coordinates inside the SVG viewBox (default 1000x600), accounting for
+ * `preserveAspectRatio="xMidYMid meet"` letterboxing/pillarboxing when the SVG element
+ * aspect ratio differs from 1000:600.
+ */
+export function mapClientPointToFloorplan(
+  clientX: number,
+  clientY: number,
+  rect: { left: number; top: number; width: number; height: number },
+  viewBoxWidth: number = 1000,
+  viewBoxHeight: number = 600
+): { x: number; y: number } {
+  if (
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    viewBoxWidth <= 0 ||
+    viewBoxHeight <= 0
+  ) {
+    return { x: 0.5, y: 0.5 };
+  }
+  const scale = Math.min(
+    rect.width / viewBoxWidth,
+    rect.height / viewBoxHeight
+  );
+  const drawnW = viewBoxWidth * scale;
+  const drawnH = viewBoxHeight * scale;
+  const offsetX = (rect.width - drawnW) / 2;
+  const offsetY = (rect.height - drawnH) / 2;
+  const normX = (clientX - rect.left - offsetX) / drawnW;
+  const normY = (clientY - rect.top - offsetY) / drawnH;
+  return {
+    x: Number(Math.max(0, Math.min(1, normX)).toFixed(4)),
+    y: Number(Math.max(0, Math.min(1, normY)).toFixed(4)),
+  };
+}
+
 export function snapFloorplanCoord(val: number, step: number = 0.02): number {
   const clamped = Math.max(0, Math.min(1, val));
   if (step <= 0) return Number(clamped.toFixed(3));
@@ -273,6 +322,252 @@ export function normalizeFloorplanRoomRect(
   const x = Number(Math.max(0, Math.min(1 - w, rawX)).toFixed(3));
   const y = Number(Math.max(0, Math.min(1 - h, rawY)).toFixed(3));
   return { x, y, w, h };
+}
+
+export function computeRoomMetrics(
+  room: Pick<FloorplanRoom, "x" | "y" | "w" | "h">,
+  floorplanWidthM: number = DEFAULT_FLOORPLAN_WIDTH_M,
+  floorplanHeightM: number = DEFAULT_FLOORPLAN_HEIGHT_M
+): {
+  widthM: number;
+  heightM: number;
+  areaSqM: number;
+  xM: number;
+  yM: number;
+} {
+  const safeW = Math.max(1, floorplanWidthM);
+  const safeH = Math.max(1, floorplanHeightM);
+  const widthM = Number((room.w * safeW).toFixed(2));
+  const heightM = Number((room.h * safeH).toFixed(2));
+  const areaSqM = Number((widthM * heightM).toFixed(2));
+  const xM = Number((room.x * safeW).toFixed(2));
+  const yM = Number((room.y * safeH).toFixed(2));
+  return { widthM, heightM, areaSqM, xM, yM };
+}
+
+export function resizeRoomByMeters(
+  room: FloorplanRoom,
+  targetWidthM: number,
+  targetHeightM: number,
+  floorplanWidthM: number = DEFAULT_FLOORPLAN_WIDTH_M,
+  floorplanHeightM: number = DEFAULT_FLOORPLAN_HEIGHT_M
+): FloorplanRoom {
+  const safeW = Math.max(1, floorplanWidthM);
+  const safeH = Math.max(1, floorplanHeightM);
+  const normW = Math.max(0.01, Math.min(1, targetWidthM / safeW));
+  const normH = Math.max(0.01, Math.min(1, targetHeightM / safeH));
+  const w = Number(normW.toFixed(3));
+  const h = Number(normH.toFixed(3));
+  const x = Number(Math.max(0, Math.min(1 - w, room.x)).toFixed(3));
+  const y = Number(Math.max(0, Math.min(1 - h, room.y)).toFixed(3));
+  return { ...room, x, y, w, h };
+}
+
+export function computeWallMetrics(
+  points: [number, number, number, number],
+  floorplanWidthM: number = DEFAULT_FLOORPLAN_WIDTH_M,
+  floorplanHeightM: number = DEFAULT_FLOORPLAN_HEIGHT_M
+): {
+  lengthM: number;
+  angleDeg: number;
+  dxM: number;
+  dyM: number;
+  midX: number;
+  midY: number;
+} {
+  const [x1, y1, x2, y2] = points;
+  const safeW = Math.max(1, floorplanWidthM);
+  const safeH = Math.max(1, floorplanHeightM);
+  const dxM = (x2 - x1) * safeW;
+  const dyM = (y2 - y1) * safeH;
+  const lengthM = Number(Math.hypot(dxM, dyM).toFixed(2));
+  const rawDeg = (Math.atan2(dyM, dxM) * 180) / Math.PI;
+  const angleDeg = Number((((rawDeg % 360) + 360) % 360).toFixed(1)) % 360;
+  const midX = Number(((x1 + x2) / 2).toFixed(3));
+  const midY = Number(((y1 + y2) / 2).toFixed(3));
+  return { lengthM, angleDeg, dxM, dyM, midX, midY };
+}
+
+export function resizeWallToLengthMeters(
+  points: [number, number, number, number],
+  targetLengthM: number,
+  floorplanWidthM: number = DEFAULT_FLOORPLAN_WIDTH_M,
+  floorplanHeightM: number = DEFAULT_FLOORPLAN_HEIGHT_M
+): [number, number, number, number] {
+  const [x1, y1, x2, y2] = points;
+  const safeW = Math.max(1, floorplanWidthM);
+  const safeH = Math.max(1, floorplanHeightM);
+  const maxPossibleM = Math.hypot(safeW, safeH);
+  const clampedLen = Math.max(0.1, Math.min(maxPossibleM, targetLengthM));
+  const dxM = (x2 - x1) * safeW;
+  const dyM = (y2 - y1) * safeH;
+  const currentLen = Math.hypot(dxM, dyM);
+  const angleRad = currentLen > 1e-4 ? Math.atan2(dyM, dxM) : 0;
+  const nextDxNorm = (clampedLen * Math.cos(angleRad)) / safeW;
+  const nextDyNorm = (clampedLen * Math.sin(angleRad)) / safeH;
+  let nx1 = x1;
+  let ny1 = y1;
+  let nx2 = x1 + nextDxNorm;
+  let ny2 = y1 + nextDyNorm;
+  if (nx2 > 1) {
+    const over = nx2 - 1;
+    nx1 = Math.max(0, nx1 - over);
+    nx2 = 1;
+  } else if (nx2 < 0) {
+    const under = -nx2;
+    nx1 = Math.min(1, nx1 + under);
+    nx2 = 0;
+  }
+  if (ny2 > 1) {
+    const over = ny2 - 1;
+    ny1 = Math.max(0, ny1 - over);
+    ny2 = 1;
+  } else if (ny2 < 0) {
+    const under = -ny2;
+    ny1 = Math.min(1, ny1 + under);
+    ny2 = 0;
+  }
+  return [
+    Number(Math.max(0, Math.min(1, nx1)).toFixed(3)),
+    Number(Math.max(0, Math.min(1, ny1)).toFixed(3)),
+    Number(Math.max(0, Math.min(1, nx2)).toFixed(3)),
+    Number(Math.max(0, Math.min(1, ny2)).toFixed(3)),
+  ];
+}
+
+export function rotateWallToAngleDegrees(
+  points: [number, number, number, number],
+  targetAngleDeg: number,
+  floorplanWidthM: number = DEFAULT_FLOORPLAN_WIDTH_M,
+  floorplanHeightM: number = DEFAULT_FLOORPLAN_HEIGHT_M
+): [number, number, number, number] {
+  const [x1, y1, x2, y2] = points;
+  const safeW = Math.max(1, floorplanWidthM);
+  const safeH = Math.max(1, floorplanHeightM);
+  const lenM = Math.max(0.2, Math.hypot((x2 - x1) * safeW, (y2 - y1) * safeH));
+  const rad = (targetAngleDeg * Math.PI) / 180;
+  let nx1 = x1;
+  let ny1 = y1;
+  let nx2 = x1 + (lenM * Math.cos(rad)) / safeW;
+  let ny2 = y1 + (lenM * Math.sin(rad)) / safeH;
+  if (nx2 > 1) {
+    nx1 = Math.max(0, nx1 - (nx2 - 1));
+    nx2 = 1;
+  } else if (nx2 < 0) {
+    nx1 = Math.min(1, nx1 - nx2);
+    nx2 = 0;
+  }
+  if (ny2 > 1) {
+    ny1 = Math.max(0, ny1 - (ny2 - 1));
+    ny2 = 1;
+  } else if (ny2 < 0) {
+    ny1 = Math.min(1, ny1 - ny2);
+    ny2 = 0;
+  }
+  return [
+    Number(Math.max(0, Math.min(1, nx1)).toFixed(3)),
+    Number(Math.max(0, Math.min(1, ny1)).toFixed(3)),
+    Number(Math.max(0, Math.min(1, nx2)).toFixed(3)),
+    Number(Math.max(0, Math.min(1, ny2)).toFixed(3)),
+  ];
+}
+
+export function snapWallEndpoint(
+  startX: number | null,
+  startY: number | null,
+  rawX: number,
+  rawY: number,
+  options: {
+    snapStep?: number;
+    orthoSnap?: boolean;
+    vertices?: Array<{ x: number; y: number }>;
+    vertexSnapRadius?: number;
+    floorplanWidthM?: number;
+    floorplanHeightM?: number;
+  } = {}
+): { x: number; y: number; snappedToVertex: boolean } {
+  const {
+    snapStep = 0.005,
+    orthoSnap = true,
+    vertices = [],
+    vertexSnapRadius = 0.015,
+    floorplanWidthM = DEFAULT_FLOORPLAN_WIDTH_M,
+    floorplanHeightM = DEFAULT_FLOORPLAN_HEIGHT_M,
+  } = options;
+
+  // 1. Check magnetic vertex snap to existing wall endpoints / room corners
+  let bestVertex: { x: number; y: number } | null = null;
+  let bestDist = vertexSnapRadius;
+  for (const v of vertices) {
+    const d = Math.hypot(rawX - v.x, rawY - v.y);
+    if (d <= bestDist) {
+      bestDist = d;
+      bestVertex = v;
+    }
+  }
+  if (bestVertex) {
+    return {
+      x: Number(bestVertex.x.toFixed(3)),
+      y: Number(bestVertex.y.toFixed(3)),
+      snappedToVertex: true,
+    };
+  }
+
+  let nextX = snapFloorplanCoord(rawX, snapStep);
+  let nextY = snapFloorplanCoord(rawY, snapStep);
+
+  // 2. Apply orthogonal / 45-degree angle snap if start point is known
+  if (orthoSnap && startX !== null && startY !== null) {
+    const safeW = Math.max(1, floorplanWidthM);
+    const safeH = Math.max(1, floorplanHeightM);
+    const dxM = (nextX - startX) * safeW;
+    const dyM = (nextY - startY) * safeH;
+    const distM = Math.hypot(dxM, dyM);
+    if (distM >= 0.15) {
+      const deg = (((Math.atan2(dyM, dxM) * 180) / Math.PI) + 360) % 360;
+      const snapAngles = [0, 45, 90, 135, 180, 225, 270, 315, 360];
+      for (const targetDeg of snapAngles) {
+        if (Math.abs(deg - targetDeg) <= 7) {
+          if (targetDeg === 0 || targetDeg === 180 || targetDeg === 360) {
+            nextY = Number(startY.toFixed(3));
+          } else if (targetDeg === 90 || targetDeg === 270) {
+            nextX = Number(startX.toFixed(3));
+          } else {
+            const rad = (targetDeg * Math.PI) / 180;
+            nextX = snapFloorplanCoord(
+              startX + (distM * Math.cos(rad)) / safeW,
+              snapStep
+            );
+            nextY = snapFloorplanCoord(
+              startY + (distM * Math.sin(rad)) / safeH,
+              snapStep
+            );
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    x: Number(Math.max(0, Math.min(1, nextX)).toFixed(3)),
+    y: Number(Math.max(0, Math.min(1, nextY)).toFixed(3)),
+    snappedToVertex: false,
+  };
+}
+
+export function extractRoomBoundaryWalls(room: FloorplanRoom): FloorplanWall[] {
+  const x1 = Number(room.x.toFixed(3));
+  const y1 = Number(room.y.toFixed(3));
+  const x2 = Number(Math.min(1, room.x + room.w).toFixed(3));
+  const y2 = Number(Math.min(1, room.y + room.h).toFixed(3));
+  const baseLabel = room.label || "ROOM";
+  return [
+    { points: [x1, y1, x2, y1], label: `${baseLabel} N`, kind: "wall" },
+    { points: [x2, y1, x2, y2], label: `${baseLabel} E`, kind: "wall" },
+    { points: [x2, y2, x1, y2], label: `${baseLabel} S`, kind: "wall" },
+    { points: [x1, y2, x1, y1], label: `${baseLabel} W`, kind: "wall" },
+  ];
 }
 
 function buildFovConeSvgPath(
@@ -631,19 +926,43 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     }
   });
   const [floorplanOpacity, setFloorplanOpacity] = useState<number>(0.45);
+  const [floorplanWidthM, setFloorplanWidthM] = useState<number>(
+    DEFAULT_FLOORPLAN_WIDTH_M
+  );
+  const [floorplanHeightM, setFloorplanHeightM] = useState<number>(
+    DEFAULT_FLOORPLAN_HEIGHT_M
+  );
   const [floorplanRooms, setFloorplanRooms] = useState<FloorplanRoom[]>([]);
   const [floorplanWalls, setFloorplanWalls] = useState<FloorplanWall[]>([]);
   const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
+  const [selectedWallIdx, setSelectedWallIdx] = useState<number | null>(null);
+  const [showMeasurements, setShowMeasurements] = useState<boolean>(true);
+  const [snapStep, setSnapStep] = useState<number>(0.005);
+  const [orthoSnap, setOrthoSnap] = useState<boolean>(true);
+  const [wallKindDraft, setWallKindDraft] = useState<"wall" | "door">("wall");
+  const [quickWallLenM, setQuickWallLenM] = useState<number>(3.0);
+  const [cursorNorm, setCursorNorm] = useState<{ x: number; y: number } | null>(
+    null
+  );
   const [roomDraft, setRoomDraft] = useState<{
     startX: number;
     startY: number;
     currentX: number;
     currentY: number;
   } | null>(null);
+  const [draggingRoom, setDraggingRoom] = useState<{
+    id: string;
+    startNormX: number;
+    startNormY: number;
+    origX: number;
+    origY: number;
+  } | null>(null);
   const [resizingRoom, setResizingRoom] = useState<{
     id: string;
+    handle: "nw" | "ne" | "sw" | "se" | "n" | "s" | "e" | "w";
     anchorX: number;
     anchorY: number;
+    origRoom: FloorplanRoom;
   } | null>(null);
   const [wallStartPoint, setWallStartPoint] = useState<{
     x: number;
@@ -652,6 +971,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const [wallPreviewPoint, setWallPreviewPoint] = useState<{
     x: number;
     y: number;
+    snappedToVertex?: boolean;
+  } | null>(null);
+  const [draggingWall, setDraggingWall] = useState<{
+    index: number;
+    handle: "start" | "end" | "move";
+    startNormX: number;
+    startNormY: number;
+    origPoints: [number, number, number, number];
   } | null>(null);
   const [mapPlacements, setMapPlacements] = useState<Record<string, CameraMapPlacement>>({});
   const [mapSaveStatus, setMapSaveStatus] = useState<string | null>(null);
@@ -659,12 +986,65 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const mapSvgRef = useRef<SVGSVGElement | null>(null);
   const floorplanFileInputRef = useRef<HTMLInputElement | null>(null);
 
+  const snapVertices = useMemo(() => {
+    const pts: Array<{ x: number; y: number }> = [];
+    for (const w of floorplanWalls) {
+      pts.push({ x: w.points[0], y: w.points[1] });
+      pts.push({ x: w.points[2], y: w.points[3] });
+    }
+    for (const r of floorplanRooms) {
+      pts.push({ x: r.x, y: r.y });
+      pts.push({ x: r.x + r.w, y: r.y });
+      pts.push({ x: r.x, y: r.y + r.h });
+      pts.push({ x: r.x + r.w, y: r.y + r.h });
+    }
+    return pts;
+  }, [floorplanWalls, floorplanRooms]);
+
+  useEffect(() => {
+    if (liveLayout !== "map" || !mapEditMode) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      if (e.key === "Escape") {
+        setRoomDraft(null);
+        setWallStartPoint(null);
+        setWallPreviewPoint(null);
+        setSelectedRoomId(null);
+        setSelectedWallIdx(null);
+      } else if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedRoomId) {
+          e.preventDefault();
+          setFloorplanRooms((prev) =>
+            prev.filter((r) => r.id !== selectedRoomId)
+          );
+          setSelectedRoomId(null);
+        } else if (selectedWallIdx !== null) {
+          e.preventDefault();
+          setFloorplanWalls((prev) =>
+            prev.filter((_, idx) => idx !== selectedWallIdx)
+          );
+          setSelectedWallIdx(null);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [liveLayout, mapEditMode, selectedRoomId, selectedWallIdx]);
+
   useEffect(() => {
     if (mapEditMode) return;
     const fp = config?.ui?.floorplan;
     if (fp) {
       if (typeof fp.opacity === "number" && !Number.isNaN(fp.opacity)) {
         setFloorplanOpacity(Math.max(0.1, Math.min(1, fp.opacity)));
+      }
+      if (typeof fp.width_m === "number" && fp.width_m >= 2) {
+        setFloorplanWidthM(fp.width_m);
+      }
+      if (typeof fp.height_m === "number" && fp.height_m >= 2) {
+        setFloorplanHeightM(fp.height_m);
       }
       if (Array.isArray(fp.rooms)) {
         setFloorplanRooms(fp.rooms);
@@ -781,6 +1161,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               ? mapFloorplanUrl.trim()
               : null,
             opacity: Number(floorplanOpacity.toFixed(2)),
+            width_m: Number(Math.max(2, Math.min(500, floorplanWidthM)).toFixed(2)),
+            height_m: Number(Math.max(2, Math.min(500, floorplanHeightM)).toFixed(2)),
             rooms: floorplanRooms,
             walls: floorplanWalls,
           },
@@ -1857,7 +2239,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       {liveLayout === "map" && (
         <div
           className="nvr-focus-layout"
-          style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 8, flex: 1, minHeight: 0 }}
+          style={{ display: "grid", gridTemplateColumns: "1fr 370px", gap: 8, flex: 1, minHeight: 0 }}
         >
           <div
             className="nvr-panel"
@@ -1883,9 +2265,65 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               }}
             >
               <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700 }}>
-                TACTICAL FLOORPLAN // SECTOR FOV CONES & LIVE ACTIVITY PULSE
+                TACTICAL FLOORPLAN // SECTOR FOV CONES &amp; LIVE ACTIVITY PULSE
               </span>
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <label
+                  className="mono"
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 4,
+                    fontSize: "var(--text-xs)",
+                    color: "var(--text-secondary)",
+                  }}
+                  title="Total real-world floorplan scale in meters (Width × Height)"
+                >
+                  <span>SCALE:</span>
+                  <input
+                    type="number"
+                    className="nvr-input mono"
+                    aria-label="Floorplan total width in meters"
+                    min={2}
+                    max={500}
+                    step={1}
+                    style={{ height: 24, width: 52, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                    value={floorplanWidthM}
+                    onChange={(e) => {
+                      const v = Math.max(2, Math.min(500, Number(e.target.value) || 20));
+                      setFloorplanWidthM(v);
+                      setMapEditMode(true);
+                    }}
+                  />
+                  <span>m ×</span>
+                  <input
+                    type="number"
+                    className="nvr-input mono"
+                    aria-label="Floorplan total height in meters"
+                    min={2}
+                    max={500}
+                    step={1}
+                    style={{ height: 24, width: 52, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                    value={floorplanHeightM}
+                    onChange={(e) => {
+                      const v = Math.max(2, Math.min(500, Number(e.target.value) || 12));
+                      setFloorplanHeightM(v);
+                      setMapEditMode(true);
+                    }}
+                  />
+                  <span>m</span>
+                </label>
+
+                <button
+                  type="button"
+                  className={`nvr-btn mono ${showMeasurements ? "active" : ""}`}
+                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  onClick={() => setShowMeasurements((v) => !v)}
+                  title="Toggle metric dimensions (meters & m²) on rooms and walls"
+                >
+                  Medidas (m)
+                </button>
+
                 <input
                   ref={floorplanFileInputRef}
                   type="file"
@@ -1915,8 +2353,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 )}
                 <input
                   className="nvr-input mono"
-                  style={{ height: 24, width: 165, fontSize: "var(--text-xs)" }}
-                  placeholder="Floorplan SVG/PNG URL (optional)"
+                  style={{ height: 24, width: 150, fontSize: "var(--text-xs)" }}
+                  placeholder="Floorplan SVG/PNG URL"
                   value={
                     mapFloorplanUrl.startsWith("data:")
                       ? "[Uploaded Floorplan Image]"
@@ -1952,7 +2390,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     min={10}
                     max={100}
                     value={Math.round(floorplanOpacity * 100)}
-                    style={{ width: 68 }}
+                    style={{ width: 60 }}
                     onChange={(e) => {
                       const nextOp = Number(e.target.value) / 100;
                       setFloorplanOpacity(nextOp);
@@ -1969,6 +2407,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     setWallStartPoint(null);
                     setWallPreviewPoint(null);
                     setRoomDraft(null);
+                    setDraggingRoom(null);
+                    setResizingRoom(null);
+                    setDraggingWall(null);
                   }}
                 >
                   {mapEditMode ? "Lock Map" : "Edit Map"}
@@ -1990,86 +2431,664 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               <div
                 style={{
                   display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  padding: "5px 10px",
+                  flexDirection: "column",
                   borderBottom: "1px solid var(--border-hairline)",
                   background: "var(--bg-canvas)",
-                  gap: 8,
-                  flexWrap: "wrap",
                 }}
               >
-                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                  <span
-                    className="mono"
-                    style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
-                  >
-                    STUDIO TOOL:
-                  </span>
-                  <button
-                    type="button"
-                    className={`nvr-btn mono ${mapTool === "select" ? "active" : ""}`}
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
-                    onClick={() => {
-                      setMapTool("select");
-                      setWallStartPoint(null);
-                      setWallPreviewPoint(null);
-                    }}
-                  >
-                    Select / Move Cameras
-                  </button>
-                  <button
-                    type="button"
-                    className={`nvr-btn mono ${mapTool === "draw_room" ? "active" : ""}`}
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
-                    onClick={() => {
-                      setMapTool("draw_room");
-                      setWallStartPoint(null);
-                      setWallPreviewPoint(null);
-                    }}
-                  >
-                    Draw Room (Rect)
-                  </button>
-                  <button
-                    type="button"
-                    className={`nvr-btn mono ${mapTool === "draw_wall" ? "active" : ""}`}
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
-                    onClick={() => {
-                      setMapTool("draw_wall");
-                      setWallStartPoint(null);
-                      setWallPreviewPoint(null);
-                    }}
-                  >
-                    Draw Wall / Door
-                  </button>
-                </div>
-
                 <div
-                  className="mono"
                   style={{
                     display: "flex",
                     alignItems: "center",
+                    justifyContent: "space-between",
+                    padding: "5px 10px",
                     gap: 8,
-                    fontSize: "var(--text-xs)",
-                    color: "var(--text-secondary)",
+                    flexWrap: "wrap",
                   }}
                 >
-                  {mapTool === "select" && (
-                    <span>
-                      Drag camera node (x, y), FOV cone tip handle (angle &amp; range), or room corners
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                    <span
+                      className="mono"
+                      style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                    >
+                      STUDIO TOOL:
                     </span>
-                  )}
-                  {mapTool === "draw_room" && (
-                    <span>Click and drag on grid to create a labeled room rectangle</span>
-                  )}
-                  {mapTool === "draw_wall" && (
-                    <span>
-                      {wallStartPoint
-                        ? "Click second point on grid to complete wall segment"
-                        : "Click first point on grid to start wall / door segment"}
-                    </span>
-                  )}
+                    <button
+                      type="button"
+                      className={`nvr-btn mono ${mapTool === "select" ? "active" : ""}`}
+                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      onClick={() => {
+                        setMapTool("select");
+                        setWallStartPoint(null);
+                        setWallPreviewPoint(null);
+                        setRoomDraft(null);
+                      }}
+                    >
+                      Select / Move / Resize
+                    </button>
+                    <button
+                      type="button"
+                      className={`nvr-btn mono ${mapTool === "draw_room" ? "active" : ""}`}
+                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      onClick={() => {
+                        setMapTool("draw_room");
+                        setWallStartPoint(null);
+                        setWallPreviewPoint(null);
+                      }}
+                    >
+                      Draw Room (Rect)
+                    </button>
+                    <button
+                      type="button"
+                      className={`nvr-btn mono ${
+                        mapTool === "draw_wall" && wallKindDraft === "wall" ? "active" : ""
+                      }`}
+                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      onClick={() => {
+                        setMapTool("draw_wall");
+                        setWallKindDraft("wall");
+                        setWallStartPoint(null);
+                        setWallPreviewPoint(null);
+                      }}
+                    >
+                      Draw Wall
+                    </button>
+                    <button
+                      type="button"
+                      className={`nvr-btn mono ${
+                        mapTool === "draw_wall" && wallKindDraft === "door" ? "active" : ""
+                      }`}
+                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      onClick={() => {
+                        setMapTool("draw_wall");
+                        setWallKindDraft("door");
+                        setWallStartPoint(null);
+                        setWallPreviewPoint(null);
+                      }}
+                    >
+                      Draw Door
+                    </button>
+
+                    <span className="nvr-divider" aria-hidden="true" />
+
+                    <label
+                      className="mono"
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 4,
+                        fontSize: "var(--text-xs)",
+                        color: "var(--text-secondary)",
+                      }}
+                      title="Grid snap precision in meters"
+                    >
+                      <span>SNAP:</span>
+                      <select
+                        className="nvr-select mono"
+                        aria-label="Floorplan grid snap step"
+                        style={{ height: 24, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                        value={String(snapStep)}
+                        onChange={(e) => setSnapStep(Number(e.target.value))}
+                      >
+                        <option value="0">Free (1cm)</option>
+                        <option value="0.005">0.10m (Fine)</option>
+                        <option value="0.0125">0.25m</option>
+                        <option value="0.025">0.50m (Grid)</option>
+                      </select>
+                    </label>
+
+                    <button
+                      type="button"
+                      className={`nvr-btn mono ${orthoSnap ? "active" : ""}`}
+                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      onClick={() => setOrthoSnap((v) => !v)}
+                      title="Snap wall angles to 0° / 45° / 90° and snap endpoints to corners"
+                    >
+                      Ortho 90°
+                    </button>
+                  </div>
+
+                  <div
+                    className="mono"
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      fontSize: "var(--text-xs)",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    {cursorNorm && (
+                      <span
+                        className="nvr-badge mono"
+                        style={{ height: 22, padding: "0 6px" }}
+                      >
+                        X: {(cursorNorm.x * floorplanWidthM).toFixed(2)}m · Y:{" "}
+                        {(cursorNorm.y * floorplanHeightM).toFixed(2)}m
+                      </span>
+                    )}
+                    {mapTool === "select" && (
+                      <span>
+                        Click room/wall to edit meters · Drag room/wall to move · Drag handles to resize
+                      </span>
+                    )}
+                    {mapTool === "draw_room" && (
+                      <span>
+                        Click &amp; drag anywhere on canvas to draw room with live dimensions (m)
+                      </span>
+                    )}
+                    {mapTool === "draw_wall" && (
+                      <span>
+                        {wallStartPoint
+                          ? "Click end point (or release drag) to finish wall segment"
+                          : "Click & drag (or click two points) to draw wall / door with meter readout"}
+                      </span>
+                    )}
+                  </div>
                 </div>
+
+                {/* Quick Metric Editor Bar for Selected Room / Selected Wall / Quick Wall Creation */}
+                {(() => {
+                  const selRoom = floorplanRooms.find((r) => r.id === selectedRoomId);
+                  const selWall =
+                    selectedWallIdx !== null ? floorplanWalls[selectedWallIdx] : null;
+
+                  if (selRoom) {
+                    const rmMetrics = computeRoomMetrics(
+                      selRoom,
+                      floorplanWidthM,
+                      floorplanHeightM
+                    );
+                    return (
+                      <div
+                        data-testid="floorplan-quick-room-bar"
+                        className="mono"
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "5px 10px",
+                          borderTop: "1px solid var(--border-hairline)",
+                          background: "var(--bg-subcard)",
+                          fontSize: "var(--text-xs)",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span style={{ fontWeight: 700, color: "var(--signal-accent-text)" }}>
+                          ROOM SELECTED:
+                        </span>
+                        <input
+                          className="nvr-input mono"
+                          aria-label="Selected room label"
+                          style={{ height: 24, width: 115, fontSize: "var(--text-xs)" }}
+                          value={selRoom.label}
+                          onChange={(e) => {
+                            const nextLabel = e.target.value;
+                            setFloorplanRooms((prev) =>
+                              prev.map((r) =>
+                                r.id === selRoom.id ? { ...r, label: nextLabel } : r
+                              )
+                            );
+                          }}
+                        />
+                        <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                          <span>Largura W (m):</span>
+                          <input
+                            type="number"
+                            className="nvr-input mono"
+                            aria-label="Selected room width in meters"
+                            step={0.1}
+                            min={0.3}
+                            max={floorplanWidthM}
+                            style={{ height: 24, width: 64, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                            value={rmMetrics.widthM}
+                            onChange={(e) => {
+                              const nextW = Math.max(0.2, Number(e.target.value) || 0.5);
+                              setFloorplanRooms((prev) =>
+                                prev.map((r) =>
+                                  r.id === selRoom.id
+                                    ? resizeRoomByMeters(
+                                        r,
+                                        nextW,
+                                        rmMetrics.heightM,
+                                        floorplanWidthM,
+                                        floorplanHeightM
+                                      )
+                                    : r
+                                )
+                              );
+                            }}
+                          />
+                        </label>
+                        <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                          <span>Comprimento H (m):</span>
+                          <input
+                            type="number"
+                            className="nvr-input mono"
+                            aria-label="Selected room height in meters"
+                            step={0.1}
+                            min={0.3}
+                            max={floorplanHeightM}
+                            style={{ height: 24, width: 64, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                            value={rmMetrics.heightM}
+                            onChange={(e) => {
+                              const nextH = Math.max(0.2, Number(e.target.value) || 0.5);
+                              setFloorplanRooms((prev) =>
+                                prev.map((r) =>
+                                  r.id === selRoom.id
+                                    ? resizeRoomByMeters(
+                                        r,
+                                        rmMetrics.widthM,
+                                        nextH,
+                                        floorplanWidthM,
+                                        floorplanHeightM
+                                      )
+                                    : r
+                                )
+                              );
+                            }}
+                          />
+                        </label>
+                        <span className="nvr-badge mono" style={{ height: 22, padding: "0 6px" }}>
+                          {rmMetrics.areaSqM.toFixed(2)} m²
+                        </span>
+                        <div style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
+                          {ROOM_COLOR_PALETTE.map((col) => (
+                            <button
+                              key={col}
+                              type="button"
+                              aria-label={`Set room color ${col}`}
+                              onClick={() =>
+                                setFloorplanRooms((prev) =>
+                                  prev.map((r) =>
+                                    r.id === selRoom.id ? { ...r, color: col } : r
+                                  )
+                                )
+                              }
+                              style={{
+                                width: 16,
+                                height: 16,
+                                borderRadius: 3,
+                                background: col,
+                                border:
+                                  (selRoom.color || "#0ea5e9") === col
+                                    ? "2px solid #ffffff"
+                                    : "1px solid var(--border-strong)",
+                                cursor: "pointer",
+                              }}
+                            />
+                          ))}
+                        </div>
+                        <button
+                          type="button"
+                          className="nvr-btn mono"
+                          style={{ height: 24, fontSize: "var(--text-xs)" }}
+                          title="Generate 4 individual editable walls around this room"
+                          onClick={() => {
+                            const newWalls = extractRoomBoundaryWalls(selRoom);
+                            setFloorplanWalls((prev) => [...prev, ...newWalls]);
+                          }}
+                        >
+                          + 4 Walls
+                        </button>
+                        <button
+                          type="button"
+                          className="nvr-btn mono"
+                          style={{ height: 24, fontSize: "var(--text-xs)" }}
+                          title="Duplicate room"
+                          onClick={() => {
+                            const dupId = `room_${Date.now()}_${floorplanRooms.length + 1}`;
+                            const dupRoom: FloorplanRoom = {
+                              ...selRoom,
+                              id: dupId,
+                              label: `${selRoom.label} 2`,
+                              x: Number(Math.min(1 - selRoom.w, selRoom.x + 0.04).toFixed(3)),
+                              y: Number(Math.min(1 - selRoom.h, selRoom.y + 0.04).toFixed(3)),
+                            };
+                            setFloorplanRooms((prev) => [...prev, dupRoom]);
+                            setSelectedRoomId(dupId);
+                          }}
+                        >
+                          Duplicate
+                        </button>
+                        <button
+                          type="button"
+                          className="nvr-btn danger mono"
+                          style={{ height: 24, fontSize: "var(--text-xs)" }}
+                          onClick={() => {
+                            setFloorplanRooms((prev) =>
+                              prev.filter((r) => r.id !== selRoom.id)
+                            );
+                            setSelectedRoomId(null);
+                          }}
+                        >
+                          Delete Room
+                        </button>
+                      </div>
+                    );
+                  }
+
+                  if (selWall && selectedWallIdx !== null) {
+                    const wMetrics = computeWallMetrics(
+                      selWall.points,
+                      floorplanWidthM,
+                      floorplanHeightM
+                    );
+                    const wallIdx = selectedWallIdx;
+                    return (
+                      <div
+                        data-testid="floorplan-quick-wall-bar"
+                        className="mono"
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "5px 10px",
+                          borderTop: "1px solid var(--border-hairline)",
+                          background: "var(--bg-subcard)",
+                          fontSize: "var(--text-xs)",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span style={{ fontWeight: 700, color: "var(--signal-accent-text)" }}>
+                          WALL #{wallIdx + 1}:
+                        </span>
+                        <input
+                          className="nvr-input mono"
+                          placeholder={`Wall #${wallIdx + 1}`}
+                          aria-label="Selected wall label"
+                          style={{ height: 24, width: 100, fontSize: "var(--text-xs)" }}
+                          value={selWall.label || ""}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            setFloorplanWalls((prev) =>
+                              prev.map((w, idx) =>
+                                idx === wallIdx ? { ...w, label: val } : w
+                              )
+                            );
+                          }}
+                        />
+                        <select
+                          className="nvr-select mono"
+                          aria-label="Selected wall kind"
+                          style={{ height: 24, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                          value={selWall.kind || "wall"}
+                          onChange={(e) => {
+                            const nextKind = e.target.value;
+                            setFloorplanWalls((prev) =>
+                              prev.map((w, idx) =>
+                                idx === wallIdx ? { ...w, kind: nextKind } : w
+                              )
+                            );
+                          }}
+                        >
+                          <option value="wall">Wall (Parede)</option>
+                          <option value="door">Door (Porta)</option>
+                        </select>
+                        <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                          <span>Medida (m):</span>
+                          <input
+                            type="number"
+                            className="nvr-input mono"
+                            aria-label="Selected wall length in meters"
+                            step={0.1}
+                            min={0.1}
+                            max={Math.hypot(floorplanWidthM, floorplanHeightM)}
+                            style={{ height: 24, width: 68, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                            value={wMetrics.lengthM}
+                            onChange={(e) => {
+                              const targetM = Math.max(0.1, Number(e.target.value) || 0.5);
+                              setFloorplanWalls((prev) =>
+                                prev.map((w, idx) =>
+                                  idx === wallIdx
+                                    ? {
+                                        ...w,
+                                        points: resizeWallToLengthMeters(
+                                          w.points,
+                                          targetM,
+                                          floorplanWidthM,
+                                          floorplanHeightM
+                                        ),
+                                      }
+                                    : w
+                                )
+                              );
+                            }}
+                          />
+                        </label>
+                        {[1, 2, 3, 4, 5].map((presetM) => (
+                          <button
+                            key={presetM}
+                            type="button"
+                            className="nvr-btn mono"
+                            style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                            title={`Set wall length to ${presetM}.0m`}
+                            onClick={() => {
+                              setFloorplanWalls((prev) =>
+                                prev.map((w, idx) =>
+                                  idx === wallIdx
+                                    ? {
+                                        ...w,
+                                        points: resizeWallToLengthMeters(
+                                          w.points,
+                                          presetM,
+                                          floorplanWidthM,
+                                          floorplanHeightM
+                                        ),
+                                      }
+                                    : w
+                                )
+                              );
+                            }}
+                          >
+                            {presetM}m
+                          </button>
+                        ))}
+                        <label style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                          <span>Ângulo (°):</span>
+                          <input
+                            type="number"
+                            className="nvr-input mono"
+                            aria-label="Selected wall angle in degrees"
+                            step={15}
+                            min={0}
+                            max={360}
+                            style={{ height: 24, width: 58, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                            value={Math.round(wMetrics.angleDeg)}
+                            onChange={(e) => {
+                              const deg = Number(e.target.value) || 0;
+                              setFloorplanWalls((prev) =>
+                                prev.map((w, idx) =>
+                                  idx === wallIdx
+                                    ? {
+                                        ...w,
+                                        points: rotateWallToAngleDegrees(
+                                          w.points,
+                                          deg,
+                                          floorplanWidthM,
+                                          floorplanHeightM
+                                        ),
+                                      }
+                                    : w
+                                )
+                              );
+                            }}
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          className="nvr-btn mono"
+                          style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                          onClick={() =>
+                            setFloorplanWalls((prev) =>
+                              prev.map((w, idx) =>
+                                idx === wallIdx
+                                  ? {
+                                      ...w,
+                                      points: rotateWallToAngleDegrees(
+                                        w.points,
+                                        0,
+                                        floorplanWidthM,
+                                        floorplanHeightM
+                                      ),
+                                    }
+                                  : w
+                              )
+                            )
+                          }
+                        >
+                          0° Horiz
+                        </button>
+                        <button
+                          type="button"
+                          className="nvr-btn mono"
+                          style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                          onClick={() =>
+                            setFloorplanWalls((prev) =>
+                              prev.map((w, idx) =>
+                                idx === wallIdx
+                                  ? {
+                                      ...w,
+                                      points: rotateWallToAngleDegrees(
+                                        w.points,
+                                        90,
+                                        floorplanWidthM,
+                                        floorplanHeightM
+                                      ),
+                                    }
+                                  : w
+                              )
+                            )
+                          }
+                        >
+                          90° Vert
+                        </button>
+                        <button
+                          type="button"
+                          className="nvr-btn danger mono"
+                          style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                          onClick={() => {
+                            setFloorplanWalls((prev) =>
+                              prev.filter((_, idx) => idx !== wallIdx)
+                            );
+                            setSelectedWallIdx(null);
+                          }}
+                        >
+                          Delete Wall
+                        </button>
+                      </div>
+                    );
+                  }
+
+                  if (mapTool === "draw_wall") {
+                    return (
+                      <div
+                        className="mono"
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "5px 10px",
+                          borderTop: "1px solid var(--border-hairline)",
+                          background: "var(--bg-subcard)",
+                          fontSize: "var(--text-xs)",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span style={{ color: "var(--text-secondary)" }}>
+                          QUICK INSERT WALL BY METERS:
+                        </span>
+                        <input
+                          type="number"
+                          className="nvr-input mono"
+                          aria-label="Quick insert wall length in meters"
+                          step={0.1}
+                          min={0.2}
+                          max={floorplanWidthM}
+                          style={{ height: 24, width: 64, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                          value={quickWallLenM}
+                          onChange={(e) =>
+                            setQuickWallLenM(Math.max(0.2, Number(e.target.value) || 1))
+                          }
+                        />
+                        <span>m</span>
+                        <button
+                          type="button"
+                          className="nvr-btn mono"
+                          style={{ height: 24, fontSize: "var(--text-xs)" }}
+                          onClick={() => {
+                            const startX = 0.2;
+                            const startY = Number(
+                              Math.min(0.85, 0.2 + floorplanWalls.length * 0.05).toFixed(3)
+                            );
+                            const pts = resizeWallToLengthMeters(
+                              [startX, startY, startX + 0.1, startY],
+                              quickWallLenM,
+                              floorplanWidthM,
+                              floorplanHeightM
+                            );
+                            const newWall: FloorplanWall = {
+                              points: pts,
+                              kind: wallKindDraft,
+                            };
+                            setFloorplanWalls((prev) => {
+                              const next = [...prev, newWall];
+                              setSelectedWallIdx(next.length - 1);
+                              return next;
+                            });
+                            setSelectedRoomId(null);
+                          }}
+                        >
+                          + Insert Horiz ({quickWallLenM}m)
+                        </button>
+                        <button
+                          type="button"
+                          className="nvr-btn mono"
+                          style={{ height: 24, fontSize: "var(--text-xs)" }}
+                          onClick={() => {
+                            const startX = Number(
+                              Math.min(0.85, 0.2 + floorplanWalls.length * 0.05).toFixed(3)
+                            );
+                            const startY = 0.2;
+                            const pts = resizeWallToLengthMeters(
+                              [startX, startY, startX, startY + 0.1],
+                              quickWallLenM,
+                              floorplanWidthM,
+                              floorplanHeightM
+                            );
+                            const newWall: FloorplanWall = {
+                              points: pts,
+                              kind: wallKindDraft,
+                            };
+                            setFloorplanWalls((prev) => {
+                              const next = [...prev, newWall];
+                              setSelectedWallIdx(next.length - 1);
+                              return next;
+                            });
+                            setSelectedRoomId(null);
+                          }}
+                        >
+                          + Insert Vert ({quickWallLenM}m)
+                        </button>
+                        {wallStartPoint && (
+                          <button
+                            type="button"
+                            className="nvr-btn mono"
+                            style={{ height: 24, fontSize: "var(--text-xs)" }}
+                            onClick={() => {
+                              setWallStartPoint(null);
+                              setWallPreviewPoint(null);
+                            }}
+                          >
+                            Cancel Wall Draft (Esc)
+                          </button>
+                        )}
+                      </div>
+                    );
+                  }
+
+                  return null;
+                })()}
               </div>
             )}
 
@@ -2081,8 +3100,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 height: "100%",
                 flex: 1,
                 userSelect: "none",
+                touchAction: "none",
                 cursor:
-                  draggingCam || draggingAimCam || resizingRoom
+                  draggingCam ||
+                  draggingAimCam ||
+                  draggingRoom ||
+                  resizingRoom ||
+                  draggingWall
                     ? "grabbing"
                     : mapEditMode && (mapTool === "draw_room" || mapTool === "draw_wall")
                     ? "crosshair"
@@ -2092,13 +3116,19 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               onPointerDown={(e) => {
                 if (!mapEditMode || !mapSvgRef.current) return;
                 const rect = mapSvgRef.current.getBoundingClientRect();
-                if (rect.width <= 0 || rect.height <= 0) return;
-                const rawX = (e.clientX - rect.left) / rect.width;
-                const rawY = (e.clientY - rect.top) / rect.height;
-                const snappedX = snapFloorplanCoord(rawX, 0.02);
-                const snappedY = snapFloorplanCoord(rawY, 0.02);
+                const pt = mapClientPointToFloorplan(
+                  e.clientX,
+                  e.clientY,
+                  rect,
+                  1000,
+                  600
+                );
+                const snappedX = snapFloorplanCoord(pt.x, snapStep);
+                const snappedY = snapFloorplanCoord(pt.y, snapStep);
 
                 if (mapTool === "draw_room") {
+                  setSelectedRoomId(null);
+                  setSelectedWallIdx(null);
                   setRoomDraft({
                     startX: snappedX,
                     startY: snappedY,
@@ -2106,41 +3136,75 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     currentY: snappedY,
                   });
                 } else if (mapTool === "draw_wall") {
+                  const snappedPt = snapWallEndpoint(
+                    wallStartPoint ? wallStartPoint.x : null,
+                    wallStartPoint ? wallStartPoint.y : null,
+                    pt.x,
+                    pt.y,
+                    {
+                      snapStep,
+                      orthoSnap,
+                      vertices: snapVertices,
+                      floorplanWidthM,
+                      floorplanHeightM,
+                    }
+                  );
                   if (!wallStartPoint) {
-                    setWallStartPoint({ x: snappedX, y: snappedY });
-                    setWallPreviewPoint({ x: snappedX, y: snappedY });
+                    setWallStartPoint({ x: snappedPt.x, y: snappedPt.y });
+                    setWallPreviewPoint({
+                      x: snappedPt.x,
+                      y: snappedPt.y,
+                      snappedToVertex: snappedPt.snappedToVertex,
+                    });
+                    setSelectedRoomId(null);
+                    setSelectedWallIdx(null);
                   } else {
                     if (
                       Math.hypot(
-                        snappedX - wallStartPoint.x,
-                        snappedY - wallStartPoint.y
-                      ) >= 0.015
+                        snappedPt.x - wallStartPoint.x,
+                        snappedPt.y - wallStartPoint.y
+                      ) >= 0.01
                     ) {
-                      setFloorplanWalls((prev) => [
-                        ...prev,
-                        {
-                          points: [
-                            wallStartPoint.x,
-                            wallStartPoint.y,
-                            snappedX,
-                            snappedY,
-                          ],
-                        },
-                      ]);
+                      const createdWall: FloorplanWall = {
+                        points: [
+                          wallStartPoint.x,
+                          wallStartPoint.y,
+                          snappedPt.x,
+                          snappedPt.y,
+                        ],
+                        kind: wallKindDraft,
+                      };
+                      setFloorplanWalls((prev) => {
+                        const next = [...prev, createdWall];
+                        setSelectedWallIdx(next.length - 1);
+                        return next;
+                      });
                     }
                     setWallStartPoint(null);
                     setWallPreviewPoint(null);
                   }
                 } else {
                   setSelectedRoomId(null);
+                  setSelectedWallIdx(null);
                 }
               }}
               onPointerMove={(e) => {
-                if (!mapEditMode || !mapSvgRef.current) return;
+                if (!mapSvgRef.current) return;
                 const rect = mapSvgRef.current.getBoundingClientRect();
-                if (rect.width <= 0 || rect.height <= 0) return;
-                const rawX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                const rawY = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+                const pt = mapClientPointToFloorplan(
+                  e.clientX,
+                  e.clientY,
+                  rect,
+                  1000,
+                  600
+                );
+                const rawX = pt.x;
+                const rawY = pt.y;
+                if (mapEditMode) {
+                  setCursorNorm({ x: rawX, y: rawY });
+                }
+
+                if (!mapEditMode) return;
 
                 if (draggingAimCam) {
                   setMapPlacements((prev) => {
@@ -2170,8 +3234,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 }
 
                 if (draggingCam) {
-                  const nx = Math.max(0.05, Math.min(0.95, rawX));
-                  const ny = Math.max(0.05, Math.min(0.95, rawY));
+                  const nx = Math.max(0.03, Math.min(0.97, rawX));
+                  const ny = Math.max(0.03, Math.min(0.97, rawY));
                   setMapPlacements((prev) => ({
                     ...prev,
                     [draggingCam]: {
@@ -2189,16 +3253,126 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   return;
                 }
 
+                if (draggingWall) {
+                  const { index, handle, startNormX, startNormY, origPoints } =
+                    draggingWall;
+                  if (handle === "move") {
+                    const dx = snapFloorplanCoord(rawX - startNormX, snapStep) - snapFloorplanCoord(0, snapStep);
+                    const dy = snapFloorplanCoord(rawY - startNormY, snapStep) - snapFloorplanCoord(0, snapStep);
+                    const rawDx = snapStep > 0 ? Math.round((rawX - startNormX) / snapStep) * snapStep : rawX - startNormX;
+                    const rawDy = snapStep > 0 ? Math.round((rawY - startNormY) / snapStep) * snapStep : rawY - startNormY;
+                    void dx;
+                    void dy;
+                    const minX = Math.min(origPoints[0], origPoints[2]);
+                    const maxX = Math.max(origPoints[0], origPoints[2]);
+                    const minY = Math.min(origPoints[1], origPoints[3]);
+                    const maxY = Math.max(origPoints[1], origPoints[3]);
+                    const clampedDx = Math.max(-minX, Math.min(1 - maxX, rawDx));
+                    const clampedDy = Math.max(-minY, Math.min(1 - maxY, rawDy));
+                    const nextPts: [number, number, number, number] = [
+                      Number((origPoints[0] + clampedDx).toFixed(3)),
+                      Number((origPoints[1] + clampedDy).toFixed(3)),
+                      Number((origPoints[2] + clampedDx).toFixed(3)),
+                      Number((origPoints[3] + clampedDy).toFixed(3)),
+                    ];
+                    setFloorplanWalls((prev) =>
+                      prev.map((w, idx) =>
+                        idx === index ? { ...w, points: nextPts } : w
+                      )
+                    );
+                  } else if (handle === "start") {
+                    const snapped = snapWallEndpoint(
+                      origPoints[2],
+                      origPoints[3],
+                      rawX,
+                      rawY,
+                      {
+                        snapStep,
+                        orthoSnap,
+                        vertices: snapVertices.filter(
+                          (v) =>
+                            Math.hypot(v.x - origPoints[0], v.y - origPoints[1]) >
+                            0.005
+                        ),
+                        floorplanWidthM,
+                        floorplanHeightM,
+                      }
+                    );
+                    setFloorplanWalls((prev) =>
+                      prev.map((w, idx) =>
+                        idx === index
+                          ? {
+                              ...w,
+                              points: [
+                                snapped.x,
+                                snapped.y,
+                                origPoints[2],
+                                origPoints[3],
+                              ],
+                            }
+                          : w
+                      )
+                    );
+                  } else if (handle === "end") {
+                    const snapped = snapWallEndpoint(
+                      origPoints[0],
+                      origPoints[1],
+                      rawX,
+                      rawY,
+                      {
+                        snapStep,
+                        orthoSnap,
+                        vertices: snapVertices.filter(
+                          (v) =>
+                            Math.hypot(v.x - origPoints[2], v.y - origPoints[3]) >
+                            0.005
+                        ),
+                        floorplanWidthM,
+                        floorplanHeightM,
+                      }
+                    );
+                    setFloorplanWalls((prev) =>
+                      prev.map((w, idx) =>
+                        idx === index
+                          ? {
+                              ...w,
+                              points: [
+                                origPoints[0],
+                                origPoints[1],
+                                snapped.x,
+                                snapped.y,
+                              ],
+                            }
+                          : w
+                      )
+                    );
+                  }
+                  return;
+                }
+
                 if (resizingRoom) {
-                  const snappedX = snapFloorplanCoord(rawX, 0.02);
-                  const snappedY = snapFloorplanCoord(rawY, 0.02);
-                  const norm = normalizeFloorplanRoomRect(
-                    resizingRoom.anchorX,
-                    resizingRoom.anchorY,
-                    snappedX,
-                    snappedY,
-                    0.04
-                  );
+                  const snappedX = snapFloorplanCoord(rawX, snapStep);
+                  const snappedY = snapFloorplanCoord(rawY, snapStep);
+                  const { origRoom, handle } = resizingRoom;
+                  let x1 = origRoom.x;
+                  let y1 = origRoom.y;
+                  let x2 = origRoom.x + origRoom.w;
+                  let y2 = origRoom.y + origRoom.h;
+
+                  if (handle === "nw" || handle === "sw" || handle === "w") {
+                    x1 = snappedX;
+                  }
+                  if (handle === "ne" || handle === "se" || handle === "e") {
+                    x2 = snappedX;
+                  }
+                  if (handle === "nw" || handle === "ne" || handle === "n") {
+                    y1 = snappedY;
+                  }
+                  if (handle === "sw" || handle === "se" || handle === "s") {
+                    y2 = snappedY;
+                  }
+
+                  const norm = normalizeFloorplanRoomRect(x1, y1, x2, y2, 0.015);
                   setFloorplanRooms((prev) =>
                     prev.map((r) =>
                       r.id === resizingRoom.id ? { ...r, ...norm } : r
@@ -2207,9 +3381,33 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   return;
                 }
 
+                if (draggingRoom) {
+                  const dx = rawX - draggingRoom.startNormX;
+                  const dy = rawY - draggingRoom.startNormY;
+                  setFloorplanRooms((prev) =>
+                    prev.map((r) => {
+                      if (r.id !== draggingRoom.id) return r;
+                      const nextX = snapFloorplanCoord(
+                        Math.max(0, Math.min(1 - r.w, draggingRoom.origX + dx)),
+                        snapStep
+                      );
+                      const nextY = snapFloorplanCoord(
+                        Math.max(0, Math.min(1 - r.h, draggingRoom.origY + dy)),
+                        snapStep
+                      );
+                      return {
+                        ...r,
+                        x: Math.min(1 - r.w, nextX),
+                        y: Math.min(1 - r.h, nextY),
+                      };
+                    })
+                  );
+                  return;
+                }
+
                 if (roomDraft) {
-                  const snappedX = snapFloorplanCoord(rawX, 0.02);
-                  const snappedY = snapFloorplanCoord(rawY, 0.02);
+                  const snappedX = snapFloorplanCoord(rawX, snapStep);
+                  const snappedY = snapFloorplanCoord(rawY, snapStep);
                   setRoomDraft((prev) =>
                     prev
                       ? { ...prev, currentX: snappedX, currentY: snappedY }
@@ -2219,20 +3417,49 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 }
 
                 if (mapTool === "draw_wall" && wallStartPoint) {
-                  const snappedX = snapFloorplanCoord(rawX, 0.02);
-                  const snappedY = snapFloorplanCoord(rawY, 0.02);
-                  setWallPreviewPoint({ x: snappedX, y: snappedY });
+                  const snapped = snapWallEndpoint(
+                    wallStartPoint.x,
+                    wallStartPoint.y,
+                    rawX,
+                    rawY,
+                    {
+                      snapStep,
+                      orthoSnap,
+                      vertices: snapVertices,
+                      floorplanWidthM,
+                      floorplanHeightM,
+                    }
+                  );
+                  setWallPreviewPoint({
+                    x: snapped.x,
+                    y: snapped.y,
+                    snappedToVertex: snapped.snappedToVertex,
+                  });
                 }
               }}
               onPointerUp={() => {
                 if (roomDraft) {
-                  const norm = normalizeFloorplanRoomRect(
-                    roomDraft.startX,
-                    roomDraft.startY,
-                    roomDraft.currentX,
-                    roomDraft.currentY,
-                    0.05
+                  const dragDist = Math.hypot(
+                    roomDraft.currentX - roomDraft.startX,
+                    roomDraft.currentY - roomDraft.startY
                   );
+                  // If the user dragged a rectangle, use exact dragged bounds; if a single click, create a 3.0m x 2.4m room at click
+                  const norm =
+                    dragDist >= 0.012
+                      ? normalizeFloorplanRoomRect(
+                          roomDraft.startX,
+                          roomDraft.startY,
+                          roomDraft.currentX,
+                          roomDraft.currentY,
+                          0.015
+                        )
+                      : normalizeFloorplanRoomRect(
+                          roomDraft.startX,
+                          roomDraft.startY,
+                          Math.min(1, roomDraft.startX + 3.0 / floorplanWidthM),
+                          Math.min(1, roomDraft.startY + 2.4 / floorplanHeightM),
+                          0.02
+                        );
                   const nextIdx = floorplanRooms.length;
                   const defaultLabel =
                     DEFAULT_ROOM_LABELS[nextIdx % DEFAULT_ROOM_LABELS.length];
@@ -2244,20 +3471,62 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     y: norm.y,
                     w: norm.w,
                     h: norm.h,
-                    color: "#0ea5e9",
+                    color:
+                      ROOM_COLOR_PALETTE[nextIdx % ROOM_COLOR_PALETTE.length],
                   };
                   setFloorplanRooms((prev) => [...prev, createdRoom]);
                   setSelectedRoomId(newId);
+                  setSelectedWallIdx(null);
                   setRoomDraft(null);
+                } else if (
+                  mapTool === "draw_wall" &&
+                  wallStartPoint &&
+                  wallPreviewPoint
+                ) {
+                  // Support click-and-drag wall creation: if dragged >= 0.25m, finalize wall on pointerUp!
+                  const dragMetrics = computeWallMetrics(
+                    [
+                      wallStartPoint.x,
+                      wallStartPoint.y,
+                      wallPreviewPoint.x,
+                      wallPreviewPoint.y,
+                    ],
+                    floorplanWidthM,
+                    floorplanHeightM
+                  );
+                  if (dragMetrics.lengthM >= 0.25) {
+                    const createdWall: FloorplanWall = {
+                      points: [
+                        wallStartPoint.x,
+                        wallStartPoint.y,
+                        wallPreviewPoint.x,
+                        wallPreviewPoint.y,
+                      ],
+                      kind: wallKindDraft,
+                    };
+                    setFloorplanWalls((prev) => {
+                      const next = [...prev, createdWall];
+                      setSelectedWallIdx(next.length - 1);
+                      return next;
+                    });
+                    setSelectedRoomId(null);
+                    setWallStartPoint(null);
+                    setWallPreviewPoint(null);
+                  }
                 }
                 setDraggingCam(null);
                 setDraggingAimCam(null);
+                setDraggingRoom(null);
                 setResizingRoom(null);
+                setDraggingWall(null);
               }}
               onPointerLeave={() => {
+                setCursorNorm(null);
                 setDraggingCam(null);
                 setDraggingAimCam(null);
+                setDraggingRoom(null);
                 setResizingRoom(null);
+                setDraggingWall(null);
               }}
             >
               <defs>
@@ -2280,6 +3549,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   height="540"
                   preserveAspectRatio="xMidYMid meet"
                   opacity={floorplanOpacity}
+                  style={{ pointerEvents: "none" }}
                 />
               )}
               <rect
@@ -2291,7 +3561,23 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 stroke={mapTheme.floorplanBorderStroke}
                 strokeWidth="1.5"
                 strokeDasharray="6 4"
+                style={{ pointerEvents: "none" }}
               />
+              {showMeasurements && (
+                <text
+                  x="66"
+                  y="38"
+                  fill={mapTheme.floorplanRoomLabelFill}
+                  opacity="0.65"
+                  fontSize="11"
+                  fontFamily="JetBrains Mono, monospace"
+                  style={{ pointerEvents: "none" }}
+                >
+                  {`SCALE: ${floorplanWidthM}m × ${floorplanHeightM}m (1 grid = ${(
+                    floorplanWidthM / 20
+                  ).toFixed(2)}m)`}
+                </text>
+              )}
 
               {/* Vector Rooms Layer */}
               {floorplanRooms.map((room) => {
@@ -2301,16 +3587,41 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 const rh = room.h * 600;
                 const isRoomSelected = selectedRoomId === room.id;
                 const strokeCol = room.color || "#38bdf8";
+                const rmMetrics = computeRoomMetrics(
+                  room,
+                  floorplanWidthM,
+                  floorplanHeightM
+                );
+                const isInteractiveInSelect =
+                  mapEditMode && mapTool === "select";
 
                 return (
                   <g
                     key={room.id}
+                    style={{
+                      pointerEvents:
+                        mapEditMode && mapTool !== "select" ? "none" : "auto",
+                    }}
                     onPointerDown={(e) => {
-                      if (!mapEditMode) return;
-                      if (mapTool === "select") {
-                        e.stopPropagation();
-                        setSelectedRoomId(room.id);
-                      }
+                      if (!isInteractiveInSelect || !mapSvgRef.current) return;
+                      e.stopPropagation();
+                      setSelectedRoomId(room.id);
+                      setSelectedWallIdx(null);
+                      const rect = mapSvgRef.current.getBoundingClientRect();
+                      const pt = mapClientPointToFloorplan(
+                        e.clientX,
+                        e.clientY,
+                        rect,
+                        1000,
+                        600
+                      );
+                      setDraggingRoom({
+                        id: room.id,
+                        startNormX: pt.x,
+                        startNormY: pt.y,
+                        origX: room.x,
+                        origY: room.y,
+                      });
                     }}
                   >
                     <rect
@@ -2325,12 +3636,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       }
                       fillOpacity={floorplanOpacity}
                       stroke={strokeCol}
-                      strokeWidth={isRoomSelected ? 2.2 : 1.5}
-                      style={{ cursor: mapEditMode && mapTool === "select" ? "pointer" : "default" }}
+                      strokeWidth={isRoomSelected ? 2.5 : 1.5}
+                      style={{
+                        cursor: isInteractiveInSelect ? "move" : "default",
+                      }}
                     />
                     <text
                       x={rx + rw / 2}
-                      y={ry + rh / 2 + 4}
+                      y={ry + rh / 2 - (showMeasurements ? 4 : -4)}
                       textAnchor="middle"
                       fill={mapTheme.floorplanRoomLabelFill}
                       fontSize="12"
@@ -2340,54 +3653,124 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     >
                       {room.label}
                     </text>
+                    {showMeasurements && (
+                      <text
+                        x={rx + rw / 2}
+                        y={ry + rh / 2 + 12}
+                        textAnchor="middle"
+                        fill={strokeCol}
+                        fontSize="11"
+                        fontFamily="JetBrains Mono, monospace"
+                        fontWeight="600"
+                        style={{ pointerEvents: "none" }}
+                      >
+                        {`${rmMetrics.widthM.toFixed(2)}m × ${rmMetrics.heightM.toFixed(
+                          2
+                        )}m (${rmMetrics.areaSqM.toFixed(1)}m²)`}
+                      </text>
+                    )}
                     {mapEditMode && isRoomSelected && (
                       <>
-                        {[
-                          {
-                            key: "nw",
-                            cx: rx,
-                            cy: ry,
-                            anchorX: room.x + room.w,
-                            anchorY: room.y + room.h,
-                          },
-                          {
-                            key: "ne",
-                            cx: rx + rw,
-                            cy: ry,
-                            anchorX: room.x,
-                            anchorY: room.y + room.h,
-                          },
-                          {
-                            key: "sw",
-                            cx: rx,
-                            cy: ry + rh,
-                            anchorX: room.x + room.w,
-                            anchorY: room.y,
-                          },
-                          {
-                            key: "se",
-                            cx: rx + rw,
-                            cy: ry + rh,
-                            anchorX: room.x,
-                            anchorY: room.y,
-                          },
-                        ].map((corner) => (
+                        {/* Edge dimension callouts */}
+                        <text
+                          x={rx + rw / 2}
+                          y={Math.max(14, ry - 6)}
+                          textAnchor="middle"
+                          fill="#38bdf8"
+                          fontSize="11"
+                          fontFamily="JetBrains Mono, monospace"
+                          fontWeight="700"
+                          style={{ pointerEvents: "none" }}
+                        >
+                          {`↔ ${rmMetrics.widthM.toFixed(2)}m`}
+                        </text>
+                        <text
+                          x={Math.max(28, rx - 8)}
+                          y={ry + rh / 2 + 4}
+                          textAnchor="end"
+                          fill="#38bdf8"
+                          fontSize="11"
+                          fontFamily="JetBrains Mono, monospace"
+                          fontWeight="700"
+                          style={{ pointerEvents: "none" }}
+                        >
+                          {`↕ ${rmMetrics.heightM.toFixed(2)}m`}
+                        </text>
+                        {(
+                          [
+                            {
+                              key: "nw",
+                              cx: rx,
+                              cy: ry,
+                              cursor: "nwse-resize",
+                            },
+                            {
+                              key: "ne",
+                              cx: rx + rw,
+                              cy: ry,
+                              cursor: "nesw-resize",
+                            },
+                            {
+                              key: "sw",
+                              cx: rx,
+                              cy: ry + rh,
+                              cursor: "nesw-resize",
+                            },
+                            {
+                              key: "se",
+                              cx: rx + rw,
+                              cy: ry + rh,
+                              cursor: "nwse-resize",
+                            },
+                            {
+                              key: "n",
+                              cx: rx + rw / 2,
+                              cy: ry,
+                              cursor: "ns-resize",
+                            },
+                            {
+                              key: "s",
+                              cx: rx + rw / 2,
+                              cy: ry + rh,
+                              cursor: "ns-resize",
+                            },
+                            {
+                              key: "w",
+                              cx: rx,
+                              cy: ry + rh / 2,
+                              cursor: "ew-resize",
+                            },
+                            {
+                              key: "e",
+                              cx: rx + rw,
+                              cy: ry + rh / 2,
+                              cursor: "ew-resize",
+                            },
+                          ] as Array<{
+                            key: "nw" | "ne" | "sw" | "se" | "n" | "s" | "e" | "w";
+                            cx: number;
+                            cy: number;
+                            cursor: string;
+                          }>
+                        ).map((h) => (
                           <rect
-                            key={corner.key}
-                            x={corner.cx - 5}
-                            y={corner.cy - 5}
+                            key={h.key}
+                            x={h.cx - 5}
+                            y={h.cy - 5}
                             width={10}
                             height={10}
                             fill="#38bdf8"
                             stroke={mapTheme.floorplanCamNodeStroke}
                             strokeWidth={1.5}
-                            style={{ cursor: "nwse-resize" }}
+                            style={{ cursor: h.cursor }}
                             onPointerDown={(e) => {
                               e.stopPropagation();
                               setResizingRoom({
                                 id: room.id,
-                                anchorX: corner.anchorX,
-                                anchorY: corner.anchorY,
+                                handle: h.key,
+                                anchorX: room.x,
+                                anchorY: room.y,
+                                origRoom: room,
                               });
                             }}
                           />
@@ -2398,7 +3781,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 );
               })}
 
-              {/* Live Room Draft Preview */}
+              {/* Live Room Draft Preview with Real-Time Metric Dimensions */}
               {roomDraft && (
                 (() => {
                   const norm = normalizeFloorplanRoomRect(
@@ -2406,79 +3789,369 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     roomDraft.startY,
                     roomDraft.currentX,
                     roomDraft.currentY,
-                    0.02
+                    0.01
                   );
+                  const draftMetrics = computeRoomMetrics(
+                    norm,
+                    floorplanWidthM,
+                    floorplanHeightM
+                  );
+                  const dx = norm.x * 1000;
+                  const dy = norm.y * 600;
+                  const dw = norm.w * 1000;
+                  const dh = norm.h * 600;
                   return (
-                    <rect
-                      x={norm.x * 1000}
-                      y={norm.y * 600}
-                      width={norm.w * 1000}
-                      height={norm.h * 600}
-                      fill="rgba(56, 189, 248, 0.22)"
-                      stroke="#38bdf8"
-                      strokeWidth="2"
-                      strokeDasharray="5 3"
-                    />
+                    <g style={{ pointerEvents: "none" }}>
+                      <rect
+                        x={dx}
+                        y={dy}
+                        width={dw}
+                        height={dh}
+                        fill="rgba(56, 189, 248, 0.22)"
+                        stroke="#38bdf8"
+                        strokeWidth="2"
+                        strokeDasharray="5 3"
+                      />
+                      <rect
+                        x={dx + dw / 2 - 82}
+                        y={dy + dh / 2 - 12}
+                        width={164}
+                        height={24}
+                        rx={4}
+                        fill="rgba(7, 10, 15, 0.88)"
+                        stroke="#38bdf8"
+                        strokeWidth="1"
+                      />
+                      <text
+                        x={dx + dw / 2}
+                        y={dy + dh / 2 + 4}
+                        textAnchor="middle"
+                        fill="#f8fafc"
+                        fontSize="11"
+                        fontFamily="JetBrains Mono, monospace"
+                        fontWeight="700"
+                      >
+                        {`${draftMetrics.widthM.toFixed(2)}m × ${draftMetrics.heightM.toFixed(
+                          2
+                        )}m (${draftMetrics.areaSqM.toFixed(1)}m²)`}
+                      </text>
+                    </g>
                   );
                 })()
               )}
 
-              {/* Vector Structural Walls Layer */}
+              {/* Vector Structural Walls & Doors Layer */}
               {floorplanWalls.map((wall, wIdx) => {
                 const [x1, y1, x2, y2] = wall.points;
+                const sx1 = x1 * 1000;
+                const sy1 = y1 * 600;
+                const sx2 = x2 * 1000;
+                const sy2 = y2 * 600;
+                const isWallSelected = selectedWallIdx === wIdx;
+                const isDoor = wall.kind === "door";
+                const wMetrics = computeWallMetrics(
+                  wall.points,
+                  floorplanWidthM,
+                  floorplanHeightM
+                );
+                const midSvgX = (sx1 + sx2) / 2;
+                const midSvgY = (sy1 + sy2) / 2;
+                const isInteractiveInSelect =
+                  mapEditMode && mapTool === "select";
+
                 return (
-                  <g key={`wall-${wIdx}`}>
+                  <g
+                    key={`wall-${wIdx}`}
+                    style={{
+                      pointerEvents:
+                        mapEditMode && mapTool !== "select" ? "none" : "auto",
+                    }}
+                  >
+                    {/* Wide invisible hit target for easy selection and dragging */}
                     <line
-                      x1={x1 * 1000}
-                      y1={y1 * 600}
-                      x2={x2 * 1000}
-                      y2={y2 * 600}
-                      stroke={mapTheme.floorplanWallStroke}
-                      strokeWidth="4"
+                      x1={sx1}
+                      y1={sy1}
+                      x2={sx2}
+                      y2={sy2}
+                      stroke="transparent"
+                      strokeWidth="16"
                       strokeLinecap="round"
-                      style={{ cursor: mapEditMode ? "pointer" : "default" }}
-                      onClick={(e) => {
-                        if (!mapEditMode) return;
-                        e.stopPropagation();
-                        setFloorplanWalls((prev) =>
-                          prev.filter((_, idx) => idx !== wIdx)
-                        );
+                      style={{
+                        cursor: isInteractiveInSelect ? "move" : "default",
+                      }}
+                      onPointerDown={(e) => {
+                        if (!mapEditMode || !mapSvgRef.current) return;
+                        if (mapTool === "select") {
+                          e.stopPropagation();
+                          setSelectedWallIdx(wIdx);
+                          setSelectedRoomId(null);
+                          const rect =
+                            mapSvgRef.current.getBoundingClientRect();
+                          const pt = mapClientPointToFloorplan(
+                            e.clientX,
+                            e.clientY,
+                            rect,
+                            1000,
+                            600
+                          );
+                          setDraggingWall({
+                            index: wIdx,
+                            handle: "move",
+                            startNormX: pt.x,
+                            startNormY: pt.y,
+                            origPoints: [...wall.points] as [
+                              number,
+                              number,
+                              number,
+                              number,
+                            ],
+                          });
+                        }
                       }}
                     >
                       <title>
                         {mapEditMode
-                          ? "Click wall segment to delete"
-                          : `Wall #${wIdx + 1}`}
+                          ? `Click to select & edit ${
+                              isDoor ? "Door" : "Wall"
+                            } #${wIdx + 1} (${wMetrics.lengthM.toFixed(2)}m)`
+                          : `${isDoor ? "Door" : "Wall"} #${wIdx + 1} (${wMetrics.lengthM.toFixed(
+                              2
+                            )}m)`}
                       </title>
                     </line>
+
+                    {/* Visible wall / door line */}
+                    <line
+                      x1={sx1}
+                      y1={sy1}
+                      x2={sx2}
+                      y2={sy2}
+                      stroke={
+                        isWallSelected
+                          ? "#38bdf8"
+                          : isDoor
+                          ? "#f59e0b"
+                          : mapTheme.floorplanWallStroke
+                      }
+                      strokeWidth={isWallSelected ? 6 : isDoor ? 4 : 4.5}
+                      strokeDasharray={isDoor ? "8 4" : undefined}
+                      strokeLinecap="round"
+                      style={{ pointerEvents: "none" }}
+                    />
+
+                    {/* Endpoint nodes (draggable when selected in edit mode) */}
                     <circle
-                      cx={x1 * 1000}
-                      cy={y1 * 600}
-                      r={3.5}
-                      fill={mapTheme.floorplanWallNodeFill}
+                      cx={sx1}
+                      cy={sy1}
+                      r={isWallSelected && mapEditMode ? 6.5 : 3.5}
+                      fill={
+                        isWallSelected
+                          ? "#38bdf8"
+                          : mapTheme.floorplanWallNodeFill
+                      }
+                      stroke={
+                        isWallSelected ? "#f8fafc" : "none"
+                      }
+                      strokeWidth={isWallSelected ? 1.5 : 0}
+                      style={{
+                        cursor:
+                          isInteractiveInSelect && isWallSelected
+                            ? "crosshair"
+                            : "default",
+                      }}
+                      onPointerDown={(e) => {
+                        if (!isInteractiveInSelect || !mapSvgRef.current) return;
+                        e.stopPropagation();
+                        setSelectedWallIdx(wIdx);
+                        setSelectedRoomId(null);
+                        const rect = mapSvgRef.current.getBoundingClientRect();
+                        const pt = mapClientPointToFloorplan(
+                          e.clientX,
+                          e.clientY,
+                          rect,
+                          1000,
+                          600
+                        );
+                        setDraggingWall({
+                          index: wIdx,
+                          handle: "start",
+                          startNormX: pt.x,
+                          startNormY: pt.y,
+                          origPoints: [...wall.points] as [
+                            number,
+                            number,
+                            number,
+                            number,
+                          ],
+                        });
+                      }}
                     />
                     <circle
-                      cx={x2 * 1000}
-                      cy={y2 * 600}
-                      r={3.5}
-                      fill={mapTheme.floorplanWallNodeFill}
+                      cx={sx2}
+                      cy={sy2}
+                      r={isWallSelected && mapEditMode ? 6.5 : 3.5}
+                      fill={
+                        isWallSelected
+                          ? "#38bdf8"
+                          : mapTheme.floorplanWallNodeFill
+                      }
+                      stroke={
+                        isWallSelected ? "#f8fafc" : "none"
+                      }
+                      strokeWidth={isWallSelected ? 1.5 : 0}
+                      style={{
+                        cursor:
+                          isInteractiveInSelect && isWallSelected
+                            ? "crosshair"
+                            : "default",
+                      }}
+                      onPointerDown={(e) => {
+                        if (!isInteractiveInSelect || !mapSvgRef.current) return;
+                        e.stopPropagation();
+                        setSelectedWallIdx(wIdx);
+                        setSelectedRoomId(null);
+                        const rect = mapSvgRef.current.getBoundingClientRect();
+                        const pt = mapClientPointToFloorplan(
+                          e.clientX,
+                          e.clientY,
+                          rect,
+                          1000,
+                          600
+                        );
+                        setDraggingWall({
+                          index: wIdx,
+                          handle: "end",
+                          startNormX: pt.x,
+                          startNormY: pt.y,
+                          origPoints: [...wall.points] as [
+                            number,
+                            number,
+                            number,
+                            number,
+                          ],
+                        });
+                      }}
                     />
+
+                    {/* Wall Measurement Pill on Canvas */}
+                    {(showMeasurements || isWallSelected || mapEditMode) && (
+                      <g style={{ pointerEvents: "none" }}>
+                        <rect
+                          x={midSvgX - (isWallSelected ? 46 : 30)}
+                          y={midSvgY - 10}
+                          width={isWallSelected ? 92 : 60}
+                          height={18}
+                          rx={3}
+                          fill="rgba(7, 10, 15, 0.84)"
+                          stroke={
+                            isWallSelected
+                              ? "#38bdf8"
+                              : isDoor
+                              ? "#f59e0b"
+                              : "rgba(148, 163, 184, 0.45)"
+                          }
+                          strokeWidth={1}
+                        />
+                        <text
+                          x={midSvgX}
+                          y={midSvgY + 3}
+                          textAnchor="middle"
+                          fill={isWallSelected ? "#38bdf8" : "#f8fafc"}
+                          fontSize="11"
+                          fontFamily="JetBrains Mono, monospace"
+                          fontWeight="700"
+                        >
+                          {isWallSelected
+                            ? `${wMetrics.lengthM.toFixed(2)}m · ${Math.round(
+                                wMetrics.angleDeg
+                              )}°`
+                            : `${wMetrics.lengthM.toFixed(2)}m`}
+                        </text>
+                      </g>
+                    )}
                   </g>
                 );
               })}
 
-              {/* Live Wall Draft Preview */}
+              {/* Live Wall Draft Preview with Real-Time Meter & Angle Readout */}
               {wallStartPoint && wallPreviewPoint && (
-                <line
-                  x1={wallStartPoint.x * 1000}
-                  y1={wallStartPoint.y * 600}
-                  x2={wallPreviewPoint.x * 1000}
-                  y2={wallPreviewPoint.y * 600}
-                  stroke="#38bdf8"
-                  strokeWidth="3"
-                  strokeDasharray="6 3"
-                  strokeLinecap="round"
-                />
+                (() => {
+                  const sx1 = wallStartPoint.x * 1000;
+                  const sy1 = wallStartPoint.y * 600;
+                  const sx2 = wallPreviewPoint.x * 1000;
+                  const sy2 = wallPreviewPoint.y * 600;
+                  const draftWallMetrics = computeWallMetrics(
+                    [
+                      wallStartPoint.x,
+                      wallStartPoint.y,
+                      wallPreviewPoint.x,
+                      wallPreviewPoint.y,
+                    ],
+                    floorplanWidthM,
+                    floorplanHeightM
+                  );
+                  const midX = (sx1 + sx2) / 2;
+                  const midY = (sy1 + sy2) / 2;
+                  return (
+                    <g style={{ pointerEvents: "none" }}>
+                      <line
+                        x1={sx1}
+                        y1={sy1}
+                        x2={sx2}
+                        y2={sy2}
+                        stroke={wallKindDraft === "door" ? "#f59e0b" : "#38bdf8"}
+                        strokeWidth="3.5"
+                        strokeDasharray="6 3"
+                        strokeLinecap="round"
+                      />
+                      <circle
+                        cx={sx1}
+                        cy={sy1}
+                        r={5}
+                        fill="#38bdf8"
+                        stroke="#f8fafc"
+                        strokeWidth="1.5"
+                      />
+                      <circle
+                        cx={sx2}
+                        cy={sy2}
+                        r={wallPreviewPoint.snappedToVertex ? 8 : 5}
+                        fill={
+                          wallPreviewPoint.snappedToVertex
+                            ? "rgba(16, 185, 129, 0.35)"
+                            : "#38bdf8"
+                        }
+                        stroke={
+                          wallPreviewPoint.snappedToVertex ? "#10b981" : "#f8fafc"
+                        }
+                        strokeWidth="2"
+                      />
+                      <rect
+                        x={midX - 54}
+                        y={midY - 24}
+                        width={108}
+                        height={20}
+                        rx={4}
+                        fill="rgba(7, 10, 15, 0.9)"
+                        stroke="#38bdf8"
+                        strokeWidth="1"
+                      />
+                      <text
+                        x={midX}
+                        y={midY - 10}
+                        textAnchor="middle"
+                        fill="#f8fafc"
+                        fontSize="11"
+                        fontFamily="JetBrains Mono, monospace"
+                        fontWeight="700"
+                      >
+                        {`${draftWallMetrics.lengthM.toFixed(2)}m @ ${Math.round(
+                          draftWallMetrics.angleDeg
+                        )}°`}
+                      </text>
+                    </g>
+                  );
+                })()
               )}
 
               {cameraNames.map((cam) => {
@@ -2503,6 +4176,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 const hasObjects = objs.length > 0;
                 const hasMotion = Boolean(act?.motion && (act?.max_Area ?? 5000) >= 3500);
                 const isSelected = selectedCamera === cam;
+                const isDrawingMode =
+                  mapEditMode &&
+                  (mapTool === "draw_room" || mapTool === "draw_wall");
 
                 const coneFill = hasObjects
                   ? "rgba(239, 68, 68, 0.30)"
@@ -2520,20 +4196,17 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 return (
                   <g
                     key={cam}
-                    style={{ cursor: mapEditMode ? "grab" : "pointer" }}
-                    onPointerDown={(e) => {
-                      e.stopPropagation();
-                      setSelectedCamera(cam);
-                      setMapEditMode(true);
-                      setMapTool("select");
-                      setDraggingCam(cam);
+                    style={{
+                      pointerEvents: isDrawingMode ? "none" : "auto",
                     }}
                   >
+                    {/* FOV Cone is non-blocking so rooms/walls underneath remain clickable */}
                     <path
                       d={buildFovConeSvgPath(cx, cy, place.angle_deg, place.fov_deg, radius)}
                       fill={coneFill}
                       stroke={coneStroke}
                       strokeWidth={isSelected ? 2 : 1.2}
+                      style={{ pointerEvents: "none" }}
                     />
                     {(mapEditMode || isSelected) && (
                       <>
@@ -2546,6 +4219,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           strokeWidth="1.2"
                           strokeDasharray="3 3"
                           opacity="0.8"
+                          style={{ pointerEvents: "none" }}
                         />
                         <circle
                           cx={tipPt.x}
@@ -2556,6 +4230,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           strokeWidth="2"
                           style={{ cursor: "crosshair" }}
                           onPointerDown={(e) => {
+                            if (isDrawingMode) return;
                             e.stopPropagation();
                             setSelectedCamera(cam);
                             setMapEditMode(true);
@@ -2578,6 +4253,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         stroke={coneStroke}
                         strokeWidth="2"
                         opacity="0.75"
+                        style={{ pointerEvents: "none" }}
                       />
                     )}
                     <circle
@@ -2587,6 +4263,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       fill={hasObjects ? "#ef4444" : hasMotion ? "#f59e0b" : "#0ea5e9"}
                       stroke={mapTheme.floorplanCamNodeStroke}
                       strokeWidth="2"
+                      style={{ cursor: mapEditMode ? "grab" : "pointer" }}
+                      onPointerDown={(e) => {
+                        if (isDrawingMode) return;
+                        e.stopPropagation();
+                        setSelectedCamera(cam);
+                        setMapEditMode(true);
+                        setMapTool("select");
+                        setDraggingCam(cam);
+                      }}
                     />
                     <text
                       x={cx + 12}
@@ -2595,6 +4280,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       fontSize="12"
                       fontFamily="JetBrains Mono, monospace"
                       fontWeight="700"
+                      style={{ cursor: mapEditMode ? "grab" : "pointer" }}
+                      onPointerDown={(e) => {
+                        if (isDrawingMode) return;
+                        e.stopPropagation();
+                        setSelectedCamera(cam);
+                        setMapEditMode(true);
+                        setMapTool("select");
+                        setDraggingCam(cam);
+                      }}
                     >
                       {cam.toUpperCase()}
                     </text>
@@ -2606,6 +4300,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         fill={mapTheme.floorplanObjectLabelFill}
                         fontSize="11"
                         fontFamily="JetBrains Mono, monospace"
+                        style={{ pointerEvents: "none" }}
                       >
                         {obj.label} {Math.round((obj.score || 0.85) * 100)}%
                       </text>
@@ -2660,7 +4355,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               />
             </div>
 
-            <div className="nvr-cam-tile" style={{ height: 210, flexShrink: 0 }}>
+            <div className="nvr-cam-tile" style={{ height: 190, flexShrink: 0 }}>
               <LiveMsePlayer
                 camera={selectedCamera}
                 useMainStream={false}
@@ -2670,62 +4365,73 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             </div>
 
             {mapPlacements[selectedCamera] && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  HEADING ANGLE: {Math.round(mapPlacements[selectedCamera].angle_deg)}°
+                  HEADING ANGLE: {Math.round(mapPlacements[selectedCamera].angle_deg)}° · FOV:{" "}
+                  {Math.round(mapPlacements[selectedCamera].fov_deg)}° · RANGE:{" "}
+                  {(mapPlacements[selectedCamera].range * floorplanWidthM).toFixed(1)}m (
+                  {Math.round(mapPlacements[selectedCamera].range * 100)}%)
                 </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={360}
-                  value={mapPlacements[selectedCamera].angle_deg}
-                  onChange={(e) => {
-                    const v = Number(e.target.value);
-                    setMapEditMode(true);
-                    setMapPlacements((prev) => ({
-                      ...prev,
-                      [selectedCamera]: { ...prev[selectedCamera], angle_deg: v },
-                    }));
-                  }}
-                />
-                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  FOV CONE ANGLE: {Math.round(mapPlacements[selectedCamera].fov_deg)}°
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+                  <label className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    <div>Heading (°)</div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={360}
+                      style={{ width: "100%" }}
+                      value={mapPlacements[selectedCamera].angle_deg}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        setMapEditMode(true);
+                        setMapPlacements((prev) => ({
+                          ...prev,
+                          [selectedCamera]: { ...prev[selectedCamera], angle_deg: v },
+                        }));
+                      }}
+                    />
+                  </label>
+                  <label className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    <div>FOV (°)</div>
+                    <input
+                      type="range"
+                      min={30}
+                      max={180}
+                      style={{ width: "100%" }}
+                      value={mapPlacements[selectedCamera].fov_deg}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        setMapEditMode(true);
+                        setMapPlacements((prev) => ({
+                          ...prev,
+                          [selectedCamera]: { ...prev[selectedCamera], fov_deg: v },
+                        }));
+                      }}
+                    />
+                  </label>
+                  <label className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    <div>Alcance (m)</div>
+                    <input
+                      type="range"
+                      min={5}
+                      max={50}
+                      style={{ width: "100%" }}
+                      value={Math.round(mapPlacements[selectedCamera].range * 100)}
+                      onChange={(e) => {
+                        const v = Number(e.target.value) / 100;
+                        setMapEditMode(true);
+                        setMapPlacements((prev) => ({
+                          ...prev,
+                          [selectedCamera]: { ...prev[selectedCamera], range: v },
+                        }));
+                      }}
+                    />
+                  </label>
                 </div>
-                <input
-                  type="range"
-                  min={30}
-                  max={180}
-                  value={mapPlacements[selectedCamera].fov_deg}
-                  onChange={(e) => {
-                    const v = Number(e.target.value);
-                    setMapEditMode(true);
-                    setMapPlacements((prev) => ({
-                      ...prev,
-                      [selectedCamera]: { ...prev[selectedCamera], fov_deg: v },
-                    }));
-                  }}
-                />
-                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  SECTOR RANGE: {Math.round(mapPlacements[selectedCamera].range * 100)}%
-                </div>
-                <input
-                  type="range"
-                  min={5}
-                  max={50}
-                  value={Math.round(mapPlacements[selectedCamera].range * 100)}
-                  onChange={(e) => {
-                    const v = Number(e.target.value) / 100;
-                    setMapEditMode(true);
-                    setMapPlacements((prev) => ({
-                      ...prev,
-                      [selectedCamera]: { ...prev[selectedCamera], range: v },
-                    }));
-                  }}
-                />
               </div>
             )}
 
-            {/* Vector Floorplan Rooms & Walls Inspector */}
+            {/* Vector Floorplan Rooms & Walls Metric Inspector */}
             <div
               style={{
                 borderTop: "1px solid var(--border-hairline)",
@@ -2746,49 +4452,306 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 }}
               >
                 <span>
-                  FLOORPLAN ROOMS ({floorplanRooms.length}) &amp; WALLS ({floorplanWalls.length})
+                  ROOMS ({floorplanRooms.length}) // MEDIDAS EM METROS
                 </span>
-                {floorplanWalls.length > 0 && mapEditMode && (
-                  <button
-                    type="button"
-                    className="nvr-btn mono"
-                    style={{ height: 22, fontSize: "var(--text-xs)" }}
-                    onClick={() => setFloorplanWalls((prev) => prev.slice(0, -1))}
-                    title="Remove last drawn wall segment"
-                  >
-                    Undo Wall
-                  </button>
-                )}
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  style={{ height: 22, fontSize: "var(--text-xs)" }}
+                  onClick={() => {
+                    setMapEditMode(true);
+                    const nextIdx = floorplanRooms.length;
+                    const defaultLabel =
+                      DEFAULT_ROOM_LABELS[nextIdx % DEFAULT_ROOM_LABELS.length];
+                    const newId = `room_${Date.now()}_${nextIdx + 1}`;
+                    const wNorm = Number(
+                      Math.min(0.8, 4.0 / floorplanWidthM).toFixed(3)
+                    );
+                    const hNorm = Number(
+                      Math.min(0.8, 3.0 / floorplanHeightM).toFixed(3)
+                    );
+                    const newRoom: FloorplanRoom = {
+                      id: newId,
+                      label: defaultLabel,
+                      x: Number(
+                        Math.min(1 - wNorm, 0.1 + (nextIdx % 4) * 0.06).toFixed(3)
+                      ),
+                      y: Number(
+                        Math.min(1 - hNorm, 0.12 + (nextIdx % 4) * 0.06).toFixed(3)
+                      ),
+                      w: wNorm,
+                      h: hNorm,
+                      color:
+                        ROOM_COLOR_PALETTE[nextIdx % ROOM_COLOR_PALETTE.length],
+                    };
+                    setFloorplanRooms((prev) => [...prev, newRoom]);
+                    setSelectedRoomId(newId);
+                    setSelectedWallIdx(null);
+                  }}
+                >
+                  + Room (4×3m)
+                </button>
               </div>
 
               {floorplanRooms.map((room) => {
                 const isSel = selectedRoomId === room.id;
+                const rmMetrics = computeRoomMetrics(
+                  room,
+                  floorplanWidthM,
+                  floorplanHeightM
+                );
                 return (
                   <div
                     key={room.id}
+                    style={{
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: 4,
+                      padding: "6px",
+                      border: `1px solid ${
+                        isSel ? "var(--signal-accent)" : "var(--border-hairline)"
+                      }`,
+                      background: "var(--bg-deep)",
+                    }}
+                    onClick={() => {
+                      setSelectedRoomId(room.id);
+                      setSelectedWallIdx(null);
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <input
+                        className="nvr-input mono"
+                        aria-label={`Room label ${room.id}`}
+                        style={{ height: 22, flex: 1, fontSize: "var(--text-xs)" }}
+                        value={room.label}
+                        onChange={(e) => {
+                          const nextLabel = e.target.value;
+                          setMapEditMode(true);
+                          setFloorplanRooms((prev) =>
+                            prev.map((r) =>
+                              r.id === room.id ? { ...r, label: nextLabel } : r
+                            )
+                          );
+                        }}
+                      />
+                      <span
+                        className="mono"
+                        style={{ fontSize: "var(--text-xs)", color: "var(--signal-accent-text)" }}
+                      >
+                        {rmMetrics.areaSqM.toFixed(1)}m²
+                      </span>
+                      <button
+                        type="button"
+                        className="nvr-btn mono"
+                        style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setMapEditMode(true);
+                          setFloorplanRooms((prev) =>
+                            prev.filter((r) => r.id !== room.id)
+                          );
+                          if (selectedRoomId === room.id) {
+                            setSelectedRoomId(null);
+                          }
+                        }}
+                        title="Delete room"
+                      >
+                        Del
+                      </button>
+                    </div>
+                    <div
+                      className="mono"
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 6,
+                        fontSize: "var(--text-xs)",
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      <span>W:</span>
+                      <input
+                        type="number"
+                        className="nvr-input mono"
+                        aria-label={`Room width meters ${room.id}`}
+                        step={0.1}
+                        min={0.2}
+                        max={floorplanWidthM}
+                        style={{ height: 22, width: 58, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                        value={rmMetrics.widthM}
+                        onChange={(e) => {
+                          const nextW = Math.max(0.2, Number(e.target.value) || 0.5);
+                          setMapEditMode(true);
+                          setFloorplanRooms((prev) =>
+                            prev.map((r) =>
+                              r.id === room.id
+                                ? resizeRoomByMeters(
+                                    r,
+                                    nextW,
+                                    rmMetrics.heightM,
+                                    floorplanWidthM,
+                                    floorplanHeightM
+                                  )
+                                : r
+                            )
+                          );
+                        }}
+                      />
+                      <span>m × H:</span>
+                      <input
+                        type="number"
+                        className="nvr-input mono"
+                        aria-label={`Room height meters ${room.id}`}
+                        step={0.1}
+                        min={0.2}
+                        max={floorplanHeightM}
+                        style={{ height: 22, width: 58, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                        value={rmMetrics.heightM}
+                        onChange={(e) => {
+                          const nextH = Math.max(0.2, Number(e.target.value) || 0.5);
+                          setMapEditMode(true);
+                          setFloorplanRooms((prev) =>
+                            prev.map((r) =>
+                              r.id === room.id
+                                ? resizeRoomByMeters(
+                                    r,
+                                    rmMetrics.widthM,
+                                    nextH,
+                                    floorplanWidthM,
+                                    floorplanHeightM
+                                  )
+                                : r
+                            )
+                          );
+                        }}
+                      />
+                      <span>m</span>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {/* Walls & Doors Inspector Section with Direct Meter Editing */}
+              <div
+                className="mono"
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  fontSize: "var(--text-xs)",
+                  fontWeight: 700,
+                  marginTop: 6,
+                }}
+              >
+                <span>
+                  WALLS &amp; DOORS ({floorplanWalls.length}) // METROS
+                </span>
+                <div style={{ display: "flex", gap: 4 }}>
+                  <button
+                    type="button"
+                    className="nvr-btn mono"
+                    style={{ height: 22, fontSize: "var(--text-xs)" }}
+                    onClick={() => {
+                      setMapEditMode(true);
+                      const pts = resizeWallToLengthMeters(
+                        [0.2, 0.25, 0.4, 0.25],
+                        3.0,
+                        floorplanWidthM,
+                        floorplanHeightM
+                      );
+                      setFloorplanWalls((prev) => {
+                        const next = [...prev, { points: pts, kind: "wall" }];
+                        setSelectedWallIdx(next.length - 1);
+                        return next;
+                      });
+                      setSelectedRoomId(null);
+                    }}
+                  >
+                    + Wall (3m)
+                  </button>
+                  {floorplanWalls.length > 0 && mapEditMode && (
+                    <button
+                      type="button"
+                      className="nvr-btn mono"
+                      style={{ height: 22, fontSize: "var(--text-xs)" }}
+                      onClick={() => {
+                        setFloorplanWalls((prev) => prev.slice(0, -1));
+                        setSelectedWallIdx(null);
+                      }}
+                      title="Remove last drawn wall segment"
+                    >
+                      Undo Wall
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {floorplanWalls.map((wall, wIdx) => {
+                const isWallSel = selectedWallIdx === wIdx;
+                const wMetrics = computeWallMetrics(
+                  wall.points,
+                  floorplanWidthM,
+                  floorplanHeightM
+                );
+                return (
+                  <div
+                    key={`wall-row-${wIdx}`}
                     style={{
                       display: "flex",
                       alignItems: "center",
                       gap: 6,
                       padding: "4px 6px",
                       border: `1px solid ${
-                        isSel ? "var(--signal-accent)" : "var(--border-hairline)"
+                        isWallSel
+                          ? "var(--signal-accent)"
+                          : "var(--border-hairline)"
                       }`,
                       background: "var(--bg-deep)",
                     }}
-                    onClick={() => setSelectedRoomId(room.id)}
+                    onClick={() => {
+                      setSelectedWallIdx(wIdx);
+                      setSelectedRoomId(null);
+                    }}
                   >
+                    <span
+                      className="mono"
+                      style={{
+                        fontSize: "var(--text-xs)",
+                        fontWeight: 700,
+                        minWidth: 42,
+                        color:
+                          wall.kind === "door"
+                            ? "var(--signal-motion-text)"
+                            : "var(--text-primary)",
+                      }}
+                    >
+                      {wall.kind === "door" ? `D#${wIdx + 1}` : `W#${wIdx + 1}`}
+                    </span>
                     <input
+                      type="number"
                       className="nvr-input mono"
-                      aria-label={`Room label ${room.id}`}
-                      style={{ height: 22, flex: 1, fontSize: "var(--text-xs)" }}
-                      value={room.label}
+                      aria-label={`Wall ${wIdx + 1} length in meters`}
+                      step={0.1}
+                      min={0.1}
+                      max={Math.hypot(floorplanWidthM, floorplanHeightM)}
+                      style={{ height: 22, width: 62, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                      value={wMetrics.lengthM}
                       onChange={(e) => {
-                        const nextLabel = e.target.value;
+                        const targetM = Math.max(0.1, Number(e.target.value) || 0.5);
                         setMapEditMode(true);
-                        setFloorplanRooms((prev) =>
-                          prev.map((r) =>
-                            r.id === room.id ? { ...r, label: nextLabel } : r
+                        setFloorplanWalls((prev) =>
+                          prev.map((w, idx) =>
+                            idx === wIdx
+                              ? {
+                                  ...w,
+                                  points: resizeWallToLengthMeters(
+                                    w.points,
+                                    targetM,
+                                    floorplanWidthM,
+                                    floorplanHeightM
+                                  ),
+                                }
+                              : w
                           )
                         );
                       }}
@@ -2797,23 +4760,55 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       className="mono"
                       style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
                     >
-                      {Math.round(room.w * 100)}x{Math.round(room.h * 100)}%
+                      m · {Math.round(wMetrics.angleDeg)}°
                     </span>
                     <button
                       type="button"
                       className="nvr-btn mono"
-                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                      style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                      title="Rotate wall 90°"
                       onClick={(e) => {
                         e.stopPropagation();
                         setMapEditMode(true);
-                        setFloorplanRooms((prev) =>
-                          prev.filter((r) => r.id !== room.id)
+                        setFloorplanWalls((prev) =>
+                          prev.map((w, idx) =>
+                            idx === wIdx
+                              ? {
+                                  ...w,
+                                  points: rotateWallToAngleDegrees(
+                                    w.points,
+                                    (wMetrics.angleDeg + 90) % 360,
+                                    floorplanWidthM,
+                                    floorplanHeightM
+                                  ),
+                                }
+                              : w
+                          )
                         );
-                        if (selectedRoomId === room.id) {
-                          setSelectedRoomId(null);
+                      }}
+                    >
+                      90°
+                    </button>
+                    <button
+                      type="button"
+                      className="nvr-btn mono"
+                      style={{
+                        height: 22,
+                        padding: "0 6px",
+                        fontSize: "var(--text-xs)",
+                        marginLeft: "auto",
+                      }}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setMapEditMode(true);
+                        setFloorplanWalls((prev) =>
+                          prev.filter((_, idx) => idx !== wIdx)
+                        );
+                        if (selectedWallIdx === wIdx) {
+                          setSelectedWallIdx(null);
                         }
                       }}
-                      title="Delete room"
+                      title="Delete wall"
                     >
                       Del
                     </button>

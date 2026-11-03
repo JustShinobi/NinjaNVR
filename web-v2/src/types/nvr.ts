@@ -252,11 +252,15 @@ export interface FloorplanRoom {
 
 export interface FloorplanWall {
   points: [number, number, number, number];
+  label?: string | null;
+  kind?: "wall" | "door" | "window" | string | null;
 }
 
 export interface FloorplanConfig {
   background_data_url?: string | null;
   opacity: number;
+  width_m?: number;
+  height_m?: number;
   rooms: FloorplanRoom[];
   walls: FloorplanWall[];
 }
