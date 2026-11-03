@@ -152,15 +152,27 @@ impl PolygonMask {
             }
             Value::Array(arr) => {
                 for item in arr {
-                    if let Some(s) = item.as_str()
-                        && let Some(poly) = Self::parse_coord_str(s, frame_w, frame_h)
+                    if let Some(s) = item.as_str() {
+                        if let Some(poly) = Self::parse_coord_str(s, frame_w, frame_h) {
+                            polygons.push(poly);
+                        }
+                    } else if let Some(coords) = item.get("coordinates").and_then(|c| c.as_str())
+                        && let Some(poly) = Self::parse_coord_str(coords, frame_w, frame_h)
                     {
                         polygons.push(poly);
                     }
                 }
             }
             Value::Object(map) => {
-                for v in map.values() {
+                if let Some(coords) = map.get("coordinates").and_then(|c| c.as_str())
+                    && let Some(poly) = Self::parse_coord_str(coords, frame_w, frame_h)
+                {
+                    polygons.push(poly);
+                }
+                for (k, v) in map {
+                    if k == "coordinates" || k == "mode" || k == "style" {
+                        continue;
+                    }
                     if let Some(s) = v.as_str() {
                         if let Some(poly) = Self::parse_coord_str(s, frame_w, frame_h) {
                             polygons.push(poly);
@@ -1129,14 +1141,86 @@ pub fn apply_privacy_mask_rgb(img: &mut RgbImage, mask: &PolygonMask) {
     }
 }
 
+/// Redacts all pixels inside `mask` on `img` by replacing each `block_size x block_size` tile
+/// with the mean RGB value of pixels inside that tile.
+pub fn apply_privacy_mask_pixelated_rgb(img: &mut RgbImage, mask: &PolygonMask, block_size: u32) {
+    if mask.is_empty() {
+        return;
+    }
+    let w = img.width();
+    let h = img.height();
+    let bs = block_size.max(2);
+    let mut by = 0u32;
+    while by < h {
+        let y_end = (by + bs).min(h);
+        let mut bx = 0u32;
+        while bx < w {
+            let x_end = (bx + bs).min(w);
+            let mut r_sum = 0u32;
+            let mut g_sum = 0u32;
+            let mut b_sum = 0u32;
+            let mut count = 0u32;
+            let mut any_masked = false;
+            for y in by..y_end {
+                let fy = y as f32;
+                for x in bx..x_end {
+                    let px = img.get_pixel(x, y);
+                    r_sum += px[0] as u32;
+                    g_sum += px[1] as u32;
+                    b_sum += px[2] as u32;
+                    count += 1;
+                    if mask.contains_point(x as f32, fy) {
+                        any_masked = true;
+                    }
+                }
+            }
+            if any_masked && count > 0 {
+                let avg = Rgb([
+                    (r_sum / count) as u8,
+                    (g_sum / count) as u8,
+                    (b_sum / count) as u8,
+                ]);
+                for y in by..y_end {
+                    let fy = y as f32;
+                    for x in bx..x_end {
+                        if mask.contains_point(x as f32, fy) {
+                            img.put_pixel(x, y, avg);
+                        }
+                    }
+                }
+            }
+            bx += bs;
+        }
+        by += bs;
+    }
+}
+
+fn is_pixelate_value(v: &Value) -> bool {
+    v.get("mode")
+        .or_else(|| v.get("style"))
+        .and_then(|m| m.as_str())
+        .is_some_and(|m| m.eq_ignore_ascii_case("pixelate") || m.eq_ignore_ascii_case("pixelated"))
+        || v.get("pixelate").and_then(|p| p.as_bool()) == Some(true)
+}
+
 /// Parses normalized or pixel `privacy_mask` polygon coordinates against `(img.width(), img.height())`
-/// and redacts all interior pixels to `[12, 14, 18]`.
+/// and redacts all interior pixels to `[12, 14, 18]` (or 8x8 block pixelation when `mode: "pixelate"` is set).
 pub fn apply_privacy_masks_from_value(img: &mut RgbImage, mask_val: &Value) {
     if mask_val.is_null() {
         return;
     }
-    let mask = PolygonMask::from_config_value(mask_val, img.width(), img.height());
-    apply_privacy_mask_rgb(img, &mask);
+    let w = img.width();
+    let h = img.height();
+    let mask = PolygonMask::from_config_value(mask_val, w, h);
+    if is_pixelate_value(mask_val) {
+        let block_size = mask_val
+            .get("block_size")
+            .and_then(|b| b.as_u64())
+            .unwrap_or(8) as u32;
+        apply_privacy_mask_pixelated_rgb(img, &mask, block_size);
+    } else {
+        apply_privacy_mask_rgb(img, &mask);
+    }
 }
 
 /// Draws 2px bounding boxes onto an existing `RgbImage` (e.g. a high-resolution main-stream frame).
@@ -1354,6 +1438,40 @@ mod tests {
             classify_dominant_color_tag(&red_buf, w, h, bbox),
             "color:red"
         );
+
+        // Saturated blue frame: Y=60, U=240, V=110
+        let mut blue_buf = vec![60u8; y_len + uv_len * 2];
+        blue_buf[y_len..y_len + uv_len].fill(240);
+        blue_buf[y_len + uv_len..].fill(110);
+        assert_eq!(
+            classify_dominant_color_tag(&blue_buf, w, h, bbox),
+            "color:blue"
+        );
+
+        // Saturated green frame: Y=150, U=60, V=60
+        let mut green_buf = vec![150u8; y_len + uv_len * 2];
+        green_buf[y_len..y_len + uv_len].fill(60);
+        green_buf[y_len + uv_len..].fill(60);
+        assert_eq!(
+            classify_dominant_color_tag(&green_buf, w, h, bbox),
+            "color:green"
+        );
+
+        // Warm yellow frame: Y=200, U=30, V=150
+        let mut yellow_buf = vec![200u8; y_len + uv_len * 2];
+        yellow_buf[y_len..y_len + uv_len].fill(30);
+        yellow_buf[y_len + uv_len..].fill(150);
+        assert_eq!(
+            classify_dominant_color_tag(&yellow_buf, w, h, bbox),
+            "color:yellow"
+        );
+
+        // Neutral gray frame: Y=128, U=128, V=128
+        let gray_buf = vec![128u8; y_len + uv_len * 2];
+        assert_eq!(
+            classify_dominant_color_tag(&gray_buf, w, h, bbox),
+            "color:gray"
+        );
     }
 
     #[test]
@@ -1366,5 +1484,237 @@ mod tests {
         assert_eq!(*img.get_pixel(50, 50), Rgb([12, 14, 18]));
         // Exterior pixel (5, 5) remains untouched [240, 240, 240]
         assert_eq!(*img.get_pixel(5, 5), Rgb([240, 240, 240]));
+
+        // Null mask is a no-op
+        let mut untouched = RgbImage::from_pixel(32, 32, Rgb([200, 100, 50]));
+        apply_privacy_masks_from_value(&mut untouched, &Value::Null);
+        assert_eq!(*untouched.get_pixel(16, 16), Rgb([200, 100, 50]));
+
+        // Pixelation mode averages 8x8 tile colors inside the polygon while leaving exterior pixels intact
+        let mut pix_img = RgbImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let val = if (x + y) % 2 == 0 { 200u8 } else { 40u8 };
+                pix_img.put_pixel(x, y, Rgb([val, val, val]));
+            }
+        }
+        let pix_mask = serde_json::json!({
+            "mode": "pixelate",
+            "block_size": 8,
+            "coordinates": "16,16,48,16,48,48,16,48"
+        });
+        apply_privacy_masks_from_value(&mut pix_img, &pix_mask);
+        // Interior pixels (24, 24) and (25, 24) are homogenized to block mean 120
+        assert_eq!(*pix_img.get_pixel(24, 24), Rgb([120, 120, 120]));
+        assert_eq!(*pix_img.get_pixel(25, 24), Rgb([120, 120, 120]));
+        // Exterior checkerboard pixels (2, 2) and (3, 2) remain distinct (200 vs 40)
+        assert_eq!(*pix_img.get_pixel(2, 2), Rgb([200, 200, 200]));
+        assert_eq!(*pix_img.get_pixel(3, 2), Rgb([40, 40, 40]));
+    }
+
+    #[test]
+    fn crop_yuv420p_to_tensor_nhwc_respects_dimensions_and_rgb_vs_bgr_order() {
+        let w = 64u32;
+        let h = 64u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        // Saturated red YUV420p frame: Y=90, U=90, V=240 => R=255, G=10, B=10
+        let mut data = vec![90u8; y_len + uv_len * 2];
+        data[y_len..y_len + uv_len].fill(90);
+        data[y_len + uv_len..].fill(240);
+        let frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 1.0,
+            width: w,
+            height: h,
+            data: Arc::new(data),
+        };
+        let region = BoundingBox::new(0, 0, w, h);
+        let model_w = 16u32;
+        let model_h = 12u32;
+        let expected_len = (model_w * model_h * 3) as usize;
+
+        let mut rgb_tensor = vec![0u8; expected_len];
+        crop_yuv420p_to_tensor_nhwc(&frame, &region, model_w, model_h, false, &mut rgb_tensor);
+        assert_eq!(rgb_tensor.len(), expected_len);
+        // RGB order: R high (>200), B low (<30)
+        assert!(rgb_tensor[0] > 200);
+        assert!(rgb_tensor[1] < 30);
+        assert!(rgb_tensor[2] < 30);
+
+        let mut bgr_tensor = vec![0u8; expected_len];
+        crop_yuv420p_to_tensor_nhwc(&frame, &region, model_w, model_h, true, &mut bgr_tensor);
+        assert_eq!(bgr_tensor.len(), expected_len);
+        // BGR order: B low (<30) at index 0, R high (>200) at index 2
+        assert_eq!(bgr_tensor[0], rgb_tensor[2]);
+        assert_eq!(bgr_tensor[1], rgb_tensor[1]);
+        assert_eq!(bgr_tensor[2], rgb_tensor[0]);
+
+        // Undersized YUV frame zeroes out destination tensor safely
+        let short_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 1.0,
+            width: w,
+            height: h,
+            data: Arc::new(vec![128u8; 10]),
+        };
+        crop_yuv420p_to_tensor_nhwc(
+            &short_frame,
+            &region,
+            model_w,
+            model_h,
+            false,
+            &mut rgb_tensor,
+        );
+        assert!(rgb_tensor.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn yuv420p_to_rgb_image_scaled_and_image_encoders_produce_valid_webp_and_jpeg_headers() {
+        let w = 640u32;
+        let h = 360u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        let mut data = vec![180u8; y_len + uv_len * 2];
+        data[y_len..].fill(128);
+        let frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 1.0,
+            width: w,
+            height: h,
+            data: Arc::new(data),
+        };
+
+        // Unscaled full-frame conversion with bounding box overlay
+        let bbox = BoundingBox::new(100, 60, 300, 240);
+        let full_img = yuv420p_to_rgb_image(&frame, None, &[(bbox, [255, 0, 0])]);
+        assert_eq!(full_img.width(), 640);
+        assert_eq!(full_img.height(), 360);
+        assert_eq!(*full_img.get_pixel(100, 60), Rgb([255, 0, 0]));
+
+        // Downscaled conversion to max_height = 180 preserves 16:9 aspect ratio (320x180)
+        let scaled_img =
+            yuv420p_to_rgb_image_scaled(&frame, None, &[(bbox, [0, 255, 0])], Some(180));
+        assert_eq!(scaled_img.width(), 320);
+        assert_eq!(scaled_img.height(), 180);
+
+        // WebP magic bytes: "RIFF" (0..4) and "WEBP" (8..12)
+        let webp_bytes = encode_image_webp(&scaled_img).expect("webp encode");
+        assert!(webp_bytes.len() > 12);
+        assert_eq!(&webp_bytes[0..4], b"RIFF");
+        assert_eq!(&webp_bytes[8..12], b"WEBP");
+
+        // JPEG magic bytes: SOI \xFF\xD8\xFF
+        let jpeg_bytes = encode_image_jpeg(&scaled_img).expect("jpeg encode");
+        assert!(jpeg_bytes.len() > 4);
+        assert_eq!(&jpeg_bytes[0..3], &[0xFF, 0xD8, 0xFF]);
+    }
+
+    #[test]
+    fn annotate_rgb_image_with_boxes_draws_border_without_modifying_interior() {
+        let mut img = RgbImage::from_pixel(200, 150, Rgb([30, 40, 50]));
+        let bbox = BoundingBox::new(20, 30, 120, 110);
+        annotate_rgb_image_with_boxes(&mut img, &[(bbox, [10, 220, 90])]);
+
+        // Top-left border (2px thick)
+        assert_eq!(*img.get_pixel(20, 30), Rgb([10, 220, 90]));
+        assert_eq!(*img.get_pixel(21, 31), Rgb([10, 220, 90]));
+        // Bottom-right border
+        assert_eq!(*img.get_pixel(120, 110), Rgb([10, 220, 90]));
+        // Box interior and exterior remain untouched
+        assert_eq!(*img.get_pixel(70, 70), Rgb([30, 40, 50]));
+        assert_eq!(*img.get_pixel(5, 5), Rgb([30, 40, 50]));
+    }
+
+    #[test]
+    fn polygon_mask_from_config_value_handles_strings_arrays_pixel_coords_and_invalid_inputs() {
+        // 1. Normalized string
+        let m_str = PolygonMask::from_config_value(
+            &serde_json::json!("0.0,0.0,0.5,0.0,0.5,0.5,0.0,0.5"),
+            200,
+            100,
+        );
+        assert!(!m_str.is_empty());
+        assert!(m_str.contains_point(50.0, 25.0));
+        assert!(!m_str.contains_point(150.0, 75.0));
+
+        // 2. Array of polygon strings (normalized + pixel coordinates)
+        let m_arr = PolygonMask::from_config_value(
+            &serde_json::json!([
+                "0.0,0.0,0.2,0.0,0.2,0.2,0.0,0.2",
+                "120,60,190,60,190,95,120,95"
+            ]),
+            200,
+            100,
+        );
+        assert!(!m_arr.is_empty());
+        assert!(m_arr.contains_point(10.0, 10.0));
+        assert!(m_arr.contains_point(150.0, 80.0));
+        assert!(!m_arr.contains_point(80.0, 50.0));
+
+        // 3. Object map with nested coordinates
+        let m_obj = PolygonMask::from_config_value(
+            &serde_json::json!({
+                "zone_a": { "coordinates": "10,10,50,10,50,50,10,50" }
+            }),
+            200,
+            100,
+        );
+        assert!(m_obj.contains_point(25.0, 25.0));
+
+        // 4. Degenerate (< 3 points = < 6 numbers) and odd-length strings are rejected
+        let m_deg = PolygonMask::from_config_value(&serde_json::json!("0.1,0.1,0.5,0.5"), 100, 100);
+        assert!(m_deg.is_empty());
+        assert!(!m_deg.contains_point(20.0, 20.0));
+
+        let m_odd = PolygonMask::from_config_value(
+            &serde_json::json!("0.1,0.1,0.5,0.1,0.5,0.5,0.1"),
+            100,
+            100,
+        );
+        assert!(m_odd.is_empty());
+        assert!(!point_in_polygon(10.0, 10.0, &[(0.0, 0.0), (20.0, 20.0)]));
+    }
+
+    #[test]
+    fn simd_motion_detector_rejects_full_frame_lightning_flash_spikes() {
+        let cfg = MotionConfig {
+            lightning_threshold: 0.70,
+            improve_contrast: false,
+            delta_alpha: 1.0,
+            ..MotionConfig::default()
+        };
+        let mut detector = SimdMotionDetector::new(320, 180, cfg);
+        let dark_bytes = vec![30u8; 320 * 180 * 3 / 2];
+        let dark_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 1.0,
+            width: 320,
+            height: 180,
+            data: Arc::new(dark_bytes),
+        };
+
+        // Warmup 30 frames on dark baseline
+        for _ in 0..31 {
+            assert!(detector.detect(&dark_frame).is_empty());
+        }
+
+        // Sudden full-frame IR cut-filter / lightning flash (100% of pixels jump from 30 -> 230 >= lightning_threshold 0.70)
+        let flash_bytes = vec![230u8; 320 * 180 * 3 / 2];
+        let flash_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 2.0,
+            width: 320,
+            height: 180,
+            data: Arc::new(flash_bytes),
+        };
+
+        let boxes = detector.detect(&flash_frame);
+        assert!(
+            boxes.is_empty(),
+            "full-frame luminance flash exceeding lightning_threshold must be rejected"
+        );
+        // Subsequent frame at the new luminance level is also quiet because avg_frame was reset to the flash level
+        assert!(detector.detect(&flash_frame).is_empty());
     }
 }

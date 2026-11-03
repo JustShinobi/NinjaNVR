@@ -11,17 +11,22 @@ use ninjanvr_db::{EventDto, NinjaDatabase, ReviewItemDto};
 use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{SharedActivityLedger, YuvFrame, backup_alert_clip, resolve_ffmpeg_bin};
 use ninjanvr_track::{ByteTracker, TrackedObject, TriggerProvenance, should_replace_snapshot};
+pub use ninjanvr_vision::classify_dominant_color_tag;
 use ninjanvr_vision::{
     BoundingBox, SimdMotionDetector, annotate_rgb_image_with_boxes, apply_privacy_masks_from_value,
-    check_frame_tamper, classify_dominant_color_tag, compute_inference_regions,
-    crop_yuv420p_to_tensor_nhwc, encode_image_jpeg, encode_image_webp, is_monochrome_ir,
-    yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
+    check_frame_tamper, compute_inference_regions, crop_yuv420p_to_tensor_nhwc, encode_image_jpeg,
+    encode_image_webp, is_monochrome_ir, yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+/// Detects whether a YUV420p frame is in monochrome IR night mode based on U/V chroma plane variance.
+pub fn is_frame_night_ir(yuv_data: &[u8], width: u32, height: u32) -> bool {
+    is_monochrome_ir(yuv_data, width, height)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CameraRuntimeMetrics {
@@ -47,40 +52,41 @@ fn random_suffix() -> String {
     format!("{n:06x}")
 }
 
-struct FrameLifecycleCtx<'a> {
-    camera: &'a str,
-    cam_cfg: &'a CameraConfig,
-    frame: &'a YuvFrame,
-    now: f64,
+pub struct FrameLifecycleCtx<'a> {
+    pub camera: &'a str,
+    pub cam_cfg: &'a CameraConfig,
+    pub frame: &'a YuvFrame,
+    pub now: f64,
 }
 
-#[derive(Clone)]
-struct TrackPersistSnapshot {
-    best_score: f32,
-    zones: Vec<String>,
-    stationary: bool,
+#[derive(Clone, Debug)]
+pub struct TrackPersistSnapshot {
+    pub best_score: f32,
+    pub zones: Vec<String>,
+    pub stationary: bool,
 }
 
-struct ActiveReviewState {
-    id: String,
-    start_time: f64,
-    last_activity_time: f64,
-    last_backup_time: f64,
-    severity: String,
-    thumb_path: String,
-    thumb_time: f64,
-    best_score: f32,
-    detections: Vec<String>,
-    objects: Vec<String>,
-    zones: Vec<String>,
-    provenance: Option<TriggerProvenance>,
-    is_new: bool,
-    dirty: bool,
-    prev_dto: Option<ReviewItemDto>,
+#[derive(Clone, Debug)]
+pub struct ActiveReviewState {
+    pub id: String,
+    pub start_time: f64,
+    pub last_activity_time: f64,
+    pub last_backup_time: f64,
+    pub severity: String,
+    pub thumb_path: String,
+    pub thumb_time: f64,
+    pub best_score: f32,
+    pub detections: Vec<String>,
+    pub objects: Vec<String>,
+    pub zones: Vec<String>,
+    pub provenance: Option<TriggerProvenance>,
+    pub is_new: bool,
+    pub dirty: bool,
+    pub prev_dto: Option<ReviewItemDto>,
 }
 
 impl ActiveReviewState {
-    fn to_dto(&self, camera: &str, end_time: Option<f64>) -> ReviewItemDto {
+    pub fn to_dto(&self, camera: &str, end_time: Option<f64>) -> ReviewItemDto {
         ReviewItemDto {
             id: self.id.clone(),
             camera: camera.to_string(),
@@ -272,49 +278,18 @@ impl VisionPipeline {
                         height,
                         data: frame_data.clone(),
                     };
-                    let is_night_ir = is_monochrome_ir(&yuv_frame.data, width, height);
+                    let is_night_ir = is_frame_night_ir(&yuv_frame.data, width, height);
                     tracker.set_night_mode(is_night_ir);
 
-                    let tamper_report = check_frame_tamper(&yuv_frame.data, width, height);
-                    if tamper_report.is_tampered_or_blind {
-                        consecutive_tamper_frames = consecutive_tamper_frames.saturating_add(1);
-                        if consecutive_tamper_frames == tamper_threshold_frames
-                            && self.comms.set_camera_tamper(&camera, true)
-                        {
-                            self.log_hub.push_ninjanvr(
-                                "WARNING",
-                                &format!("ninjanvr.vision.{camera}"),
-                                &format!(
-                                    "Camera tamper / blind feed detected (uniform_ratio={:.2}, y_variance={:.2})",
-                                    tamper_report.uniform_ratio, tamper_report.y_variance
-                                ),
-                            );
-                            let tamper_id = format!("{now:.6}-tamper-{}", random_suffix());
-                            let _ = self.db.insert_review_segment(&ReviewItemDto {
-                                id: tamper_id,
-                                camera: camera.clone(),
-                                start_time: now,
-                                end_time: None,
-                                severity: "alert".to_string(),
-                                thumb_path: format!("/api/{camera}/latest.jpg"),
-                                data: json!({
-                                    "detections": [],
-                                    "objects": ["camera_tamper"],
-                                    "zones": [],
-                                    "audio": [],
-                                    "thumb_time": now,
-                                    "metadata": {
-                                        "uniform_ratio": tamper_report.uniform_ratio,
-                                        "y_variance": tamper_report.y_variance
-                                    }
-                                }),
-                                has_been_reviewed: false,
-                            });
-                        }
-                    } else {
-                        consecutive_tamper_frames = 0;
-                        let _ = self.comms.set_camera_tamper(&camera, false);
-                    }
+                    let _ = self.evaluate_camera_tamper(
+                        &camera,
+                        &yuv_frame.data,
+                        width,
+                        height,
+                        now,
+                        &mut consecutive_tamper_frames,
+                        tamper_threshold_frames,
+                    );
 
                     // 1. SIMD Motion Detection on Y-plane
                     let motion_boxes = if rt_flags.enabled && rt_flags.detect {
@@ -540,7 +515,69 @@ impl VisionPipeline {
         }
     }
 
-    async fn process_lifecycle_events(
+    /// Evaluates a YUV420p frame for camera tamper / occlusion hysteresis (`tamper_threshold_frames`
+    /// consecutive blind/flat frames) and updates `CommsHub`, `LogBufferHub`, and SQLite `reviewsegment`.
+    /// Returns `true` when the camera is currently in an active tamper state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_camera_tamper(
+        &self,
+        camera: &str,
+        yuv_data: &[u8],
+        width: u32,
+        height: u32,
+        now: f64,
+        consecutive_tamper_frames: &mut u32,
+        tamper_threshold_frames: u32,
+    ) -> bool {
+        let tamper_report = check_frame_tamper(yuv_data, width, height);
+        let threshold = tamper_threshold_frames.max(1);
+        if tamper_report.is_tampered_or_blind {
+            *consecutive_tamper_frames = consecutive_tamper_frames.saturating_add(1);
+            if *consecutive_tamper_frames >= threshold {
+                if *consecutive_tamper_frames == threshold
+                    && self.comms.set_camera_tamper(camera, true)
+                {
+                    self.log_hub.push_ninjanvr(
+                        "WARNING",
+                        &format!("ninjanvr.vision.{camera}"),
+                        &format!(
+                            "Camera tamper / blind feed detected (uniform_ratio={:.2}, y_variance={:.2})",
+                            tamper_report.uniform_ratio, tamper_report.y_variance
+                        ),
+                    );
+                    let tamper_id = format!("{now:.6}-tamper-{}", random_suffix());
+                    let _ = self.db.insert_review_segment(&ReviewItemDto {
+                        id: tamper_id,
+                        camera: camera.to_string(),
+                        start_time: now,
+                        end_time: None,
+                        severity: "alert".to_string(),
+                        thumb_path: format!("/api/{camera}/latest.jpg"),
+                        data: json!({
+                            "detections": [],
+                            "objects": ["camera_tamper"],
+                            "zones": [],
+                            "audio": [],
+                            "thumb_time": now,
+                            "metadata": {
+                                "uniform_ratio": tamper_report.uniform_ratio,
+                                "y_variance": tamper_report.y_variance
+                            }
+                        }),
+                        has_been_reviewed: false,
+                    });
+                }
+                return true;
+            }
+            false
+        } else {
+            *consecutive_tamper_frames = 0;
+            let _ = self.comms.set_camera_tamper(camera, false);
+            false
+        }
+    }
+
+    pub async fn process_lifecycle_events(
         &self,
         ctx: &FrameLifecycleCtx<'_>,
         active_tracks: &[TrackedObject],
@@ -559,17 +596,12 @@ impl VisionPipeline {
         let cam_rt_flags = self.comms.get_camera_flags(camera);
         let (camera_suppressed_in_profile, camera_record_disabled_in_profile) = {
             let cfg_guard = self.config.read().await;
+            let sup_alerts =
+                is_camera_alert_suppressed_in_profile(&cfg_guard, &active_profile, camera);
             let prof_cfg = cfg_guard
                 .profiles
                 .get(&active_profile)
                 .or_else(|| cfg_guard.profiles.get(&active_profile.to_ascii_uppercase()));
-            let sup_alerts = prof_cfg
-                .map(|p| {
-                    p.disabled_alerts_cameras
-                        .iter()
-                        .any(|c| c == camera || c == "*")
-                })
-                .unwrap_or(false);
             let sup_rec = prof_cfg
                 .map(|p| {
                     p.disabled_record_cameras
@@ -585,6 +617,13 @@ impl VisionPipeline {
         for trk in active_tracks {
             let prev = track_snapshots.get(&trk.id);
             let is_new = prev.is_none();
+            let prev_zones: Vec<String> = prev.map(|p| p.zones.clone()).unwrap_or_default();
+            let newly_entered_zones: Vec<String> = trk
+                .entered_zones
+                .iter()
+                .filter(|z| !prev_zones.contains(z))
+                .cloned()
+                .collect();
             let is_better_score = prev
                 .map(|p| trk.score > p.best_score + 0.05)
                 .unwrap_or(true);
@@ -756,6 +795,24 @@ impl VisionPipeline {
                         }),
                     );
                 }
+                if !newly_entered_zones.is_empty() {
+                    let _ = self.db.insert_timeline_entry(
+                        now,
+                        camera,
+                        "tracked_object",
+                        Some(&trk.id),
+                        "entered_zone",
+                        &json!({
+                            "box": norm_box,
+                            "label": trk.label,
+                            "region": norm_reg,
+                            "zones": trk.entered_zones,
+                            "entered_zones": newly_entered_zones,
+                            "score": trk.score,
+                            "top_score": best_score
+                        }),
+                    );
+                }
 
                 self.comms.publish_json(
                     "events",
@@ -790,7 +847,12 @@ impl VisionPipeline {
                 )
             };
             let is_alert = track_sev == "alert";
-            if !is_alert && !cam_cfg.review.detections.enabled {
+            let detection_zone_ok = cam_cfg.review.detections.required_zones.is_empty()
+                || trk
+                    .entered_zones
+                    .iter()
+                    .any(|z| cam_cfg.review.detections.required_zones.contains(z));
+            if !is_alert && (!cam_cfg.review.detections.enabled || !detection_zone_ok) {
                 continue;
             }
 
@@ -1023,7 +1085,25 @@ impl VisionPipeline {
     }
 }
 
-fn compute_track_severity_for_profile(
+pub fn is_camera_alert_suppressed_in_profile(
+    cfg: &NinjaConfig,
+    active_profile: &str,
+    camera: &str,
+) -> bool {
+    let prof_cfg = cfg
+        .profiles
+        .get(active_profile)
+        .or_else(|| cfg.profiles.get(&active_profile.to_ascii_uppercase()));
+    prof_cfg
+        .map(|p| {
+            p.disabled_alerts_cameras
+                .iter()
+                .any(|c| c == camera || c == "*")
+        })
+        .unwrap_or(false)
+}
+
+pub fn compute_track_severity_for_profile(
     cam_cfg: &CameraConfig,
     trk: &TrackedObject,
     active_profile: &str,
@@ -1038,7 +1118,7 @@ fn compute_track_severity_for_profile(
     compute_track_severity(cam_cfg, trk)
 }
 
-fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'static str {
+pub fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'static str {
     if cam_cfg.review.alerts.enabled
         && cam_cfg.review.alerts.labels.contains(&trk.label)
         && (cam_cfg.review.alerts.required_zones.is_empty()
@@ -1056,6 +1136,10 @@ fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ninjanvr_comms::CommsHub;
+    use ninjanvr_config::{ProfileOverrideConfig, SnapshotSelectionPolicy};
+    use ninjanvr_db::ReviewFilter;
+    use ninjanvr_media::new_activity_ledger;
     use ninjanvr_track::TriggerProvenance;
     use ninjanvr_vision::BoundingBox;
 
@@ -1108,12 +1192,53 @@ mod tests {
         }
     }
 
+    fn build_isolated_pipeline(tag: &str) -> (VisionPipeline, PathBuf) {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-pipeline-{tag}-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let media_dir = tmp_dir.join("media");
+        std::fs::create_dir_all(&media_dir).unwrap();
+
+        let cfg = NinjaConfig::from_yaml_str(
+            "version: 0.18-0\ndetectors:\n  cpu:\n    type: openvino\n    device: CPU\n",
+            tmp_dir.join("config.yml"),
+        )
+        .unwrap();
+        let db = NinjaDatabase::open(&db_path).unwrap();
+        let comms = Arc::new(CommsHub::new());
+        let detector = Arc::new(AiDetectorEngine::new(&cfg));
+
+        let pipeline = VisionPipeline {
+            config: Arc::new(RwLock::new(cfg)),
+            db,
+            comms,
+            detector,
+            activity_ledger: new_activity_ledger(),
+            latest_frames: Arc::new(RwLock::new(HashMap::new())),
+            camera_metrics: Arc::new(RwLock::new(HashMap::new())),
+            media_dir,
+            log_hub: crate::LogBufferHub::new(),
+        };
+        (pipeline, tmp_dir)
+    }
+
+    fn drain_ws_messages(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
     #[test]
     fn test_profile_alert_suppression_rules() {
         let mut cam_cfg = CameraConfig::default();
         cam_cfg.review.alerts.enabled = true;
-        cam_cfg.review.alerts.labels = vec!["person".to_string()];
-        let trk = sample_track();
+        cam_cfg.review.alerts.labels = vec!["person".to_string(), "car".to_string()];
+        let mut trk = sample_track();
 
         // ARMED promotes matching track to alert
         assert_eq!(
@@ -1139,11 +1264,495 @@ mod tests {
             "detection"
         );
 
-        // Custom profile disabled_alerts_cameras override suppresses alert promotion
+        // Custom profile disabled_alerts_cameras: ["front_door"] and ["*"] downgrade alerts to "detection"
         cam_cfg.indoor = false;
+        let mut cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/c.yml")).unwrap();
+        cfg.profiles.insert(
+            "quiet_front".to_string(),
+            ProfileOverrideConfig {
+                disabled_alerts_cameras: vec!["front_door".to_string()],
+                disabled_record_cameras: Vec::new(),
+            },
+        );
+        cfg.profiles.insert(
+            "silent_all".to_string(),
+            ProfileOverrideConfig {
+                disabled_alerts_cameras: vec!["*".to_string()],
+                disabled_record_cameras: Vec::new(),
+            },
+        );
+        assert!(is_camera_alert_suppressed_in_profile(
+            &cfg,
+            "quiet_front",
+            "front_door"
+        ));
+        assert!(!is_camera_alert_suppressed_in_profile(
+            &cfg,
+            "quiet_front",
+            "back_yard"
+        ));
+        assert!(is_camera_alert_suppressed_in_profile(
+            &cfg,
+            "silent_all",
+            "back_yard"
+        ));
         assert_eq!(
-            compute_track_severity_for_profile(&cam_cfg, &trk, "home", true),
+            compute_track_severity_for_profile(
+                &cam_cfg,
+                &trk,
+                "quiet_front",
+                is_camera_alert_suppressed_in_profile(&cfg, "quiet_front", "front_door")
+            ),
             "detection"
         );
+        assert_eq!(
+            compute_track_severity_for_profile(
+                &cam_cfg,
+                &trk,
+                "silent_all",
+                is_camera_alert_suppressed_in_profile(&cfg, "silent_all", "back_yard")
+            ),
+            "detection"
+        );
+
+        // required_zones and labels rules for alerts and detections
+        cam_cfg.review.alerts.required_zones = vec!["driveway".to_string()];
+        // Track has not entered "driveway" yet -> downgraded to "detection"
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk, "armed", false),
+            "detection"
+        );
+        // Track enters "driveway" -> promoted to "alert"
+        trk.entered_zones = vec!["driveway".to_string()];
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk, "armed", false),
+            "alert"
+        );
+        // Label not in alerts.labels ("cat") -> downgraded to "detection" even inside required_zones
+        trk.label = "cat".to_string();
+        assert_eq!(
+            compute_track_severity_for_profile(&cam_cfg, &trk, "armed", false),
+            "detection"
+        );
+    }
+
+    #[test]
+    fn dominant_color_and_night_ir_helpers_classify_synthetic_yuv420p_frames() {
+        let w = 64u32;
+        let h = 64u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        let bbox = BoundingBox::new(8, 8, 56, 56);
+
+        // Monochrome IR night frame (U=128, V=128) vs saturated color frame
+        let mut ir_frame = vec![100u8; y_len + uv_len * 2];
+        ir_frame[y_len..].fill(128);
+        assert!(is_frame_night_ir(&ir_frame, w, h));
+
+        let mut color_frame = vec![120u8; y_len + uv_len * 2];
+        color_frame[y_len..y_len + uv_len].fill(90);
+        color_frame[y_len + uv_len..].fill(210);
+        assert!(!is_frame_night_ir(&color_frame, w, h));
+
+        // Dominant color tags: red, blue, white, black, neutral gray
+        let mut red = vec![90u8; y_len + uv_len * 2];
+        red[y_len..y_len + uv_len].fill(90);
+        red[y_len + uv_len..].fill(240);
+        assert_eq!(classify_dominant_color_tag(&red, w, h, bbox), "color:red");
+
+        let mut blue = vec![60u8; y_len + uv_len * 2];
+        blue[y_len..y_len + uv_len].fill(240);
+        blue[y_len + uv_len..].fill(110);
+        assert_eq!(classify_dominant_color_tag(&blue, w, h, bbox), "color:blue");
+
+        let mut white = vec![235u8; y_len + uv_len * 2];
+        white[y_len..].fill(128);
+        assert_eq!(
+            classify_dominant_color_tag(&white, w, h, bbox),
+            "color:white"
+        );
+
+        let mut black = vec![20u8; y_len + uv_len * 2];
+        black[y_len..].fill(128);
+        assert_eq!(
+            classify_dominant_color_tag(&black, w, h, bbox),
+            "color:black"
+        );
+
+        let gray = vec![128u8; y_len + uv_len * 2];
+        assert_eq!(classify_dominant_color_tag(&gray, w, h, bbox), "color:gray");
+    }
+
+    #[test]
+    fn evaluate_camera_tamper_triggers_after_sustained_luma_drop_and_clears_on_recovery() {
+        let (pipeline, tmp_dir) = build_isolated_pipeline("tamper");
+        let mut ws_rx = pipeline.comms.subscribe_ws();
+        let w = 320u32;
+        let h = 180u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+
+        // Structured normal scene
+        let mut normal_scene = vec![128u8; y_len + uv_len * 2];
+        for (i, px) in normal_scene.iter_mut().enumerate().take(y_len) {
+            *px = ((i * 19) % 100 + 25) as u8;
+        }
+        // Occluded / blind luma-drop frame
+        let occluded_scene = vec![12u8; y_len + uv_len * 2];
+
+        let mut consecutive = 0u32;
+        let threshold = 4u32;
+
+        // Normal frame keeps counter at 0
+        assert!(!pipeline.evaluate_camera_tamper(
+            "front_door",
+            &normal_scene,
+            w,
+            h,
+            1000.0,
+            &mut consecutive,
+            threshold
+        ));
+        assert_eq!(consecutive, 0);
+
+        // Frames 1..3 of sustained luma drop increment counter without triggering yet
+        for i in 1..threshold {
+            assert!(!pipeline.evaluate_camera_tamper(
+                "front_door",
+                &occluded_scene,
+                w,
+                h,
+                1000.0 + i as f64,
+                &mut consecutive,
+                threshold
+            ));
+            assert_eq!(consecutive, i);
+        }
+
+        // Frame 4 reaches threshold: triggers tamper alert, broadcasts ON, and persists reviewsegment
+        assert!(pipeline.evaluate_camera_tamper(
+            "front_door",
+            &occluded_scene,
+            w,
+            h,
+            1004.0,
+            &mut consecutive,
+            threshold
+        ));
+        assert_eq!(consecutive, threshold);
+
+        let msgs = drain_ws_messages(&mut ws_rx);
+        assert!(
+            msgs.iter()
+                .any(|m| m["topic"] == "front_door/tamper" && m["payload"] == "ON")
+        );
+
+        let reviews = pipeline.db.query_reviews(&ReviewFilter::default()).unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].severity, "alert");
+        assert_eq!(reviews[0].data["objects"], json!(["camera_tamper"]));
+
+        // Scene restoration clears tamper state and broadcasts OFF
+        assert!(!pipeline.evaluate_camera_tamper(
+            "front_door",
+            &normal_scene,
+            w,
+            h,
+            1005.0,
+            &mut consecutive,
+            threshold
+        ));
+        assert_eq!(consecutive, 0);
+        let recovery_msgs = drain_ws_messages(&mut ws_rx);
+        assert!(
+            recovery_msgs
+                .iter()
+                .any(|m| m["topic"] == "front_door/tamper" && m["payload"] == "OFF")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn process_lifecycle_events_covers_activation_privacy_mask_upgrade_and_termination() {
+        let (pipeline, tmp_dir) = build_isolated_pipeline("lifecycle");
+        let mut ws_rx = pipeline.comms.subscribe_ws();
+        let camera = "front_door";
+
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.snapshots.enabled = true;
+        cam_cfg.snapshots.high_res = false;
+        cam_cfg.snapshots.from_main_stream = false;
+        cam_cfg.snapshots.selection = SnapshotSelectionPolicy::BestInZone;
+        cam_cfg.record.enabled = true;
+        cam_cfg.review.alerts.enabled = true;
+        cam_cfg.review.alerts.labels = vec!["person".to_string()];
+        cam_cfg.review.alerts.cutoff_time = 20;
+        // Configure privacy mask covering top-left quadrant (0.0..0.4 x 0.0..0.4)
+        cam_cfg.privacy_mask = json!(["0.0,0.0,0.4,0.0,0.4,0.4,0.0,0.4"]);
+
+        let w = 320u32;
+        let h = 180u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        // Bright white frame (Y=235, U=128, V=128) so privacy mask redaction to (12, 14, 18) is unmistakable
+        let mut frame_bytes = vec![235u8; y_len + uv_len * 2];
+        frame_bytes[y_len..].fill(128);
+        let yuv_frame = YuvFrame {
+            camera: Arc::from(camera),
+            timestamp: 1000.0,
+            width: w,
+            height: h,
+            data: Arc::new(frame_bytes),
+        };
+
+        let mut active_review: Option<ActiveReviewState> = None;
+        let mut track_snapshots: HashMap<String, TrackPersistSnapshot> = HashMap::new();
+
+        // 1. Track Activation & Snapshot Generation (score 0.82)
+        let mut trk = sample_track();
+        trk.id = "1730500000.000000-trk01".to_string();
+        trk.score = 0.82;
+        trk.top_score = 0.82;
+        trk.start_time = 1000.0;
+        trk.last_seen_time = 1000.0;
+        trk.bbox = BoundingBox::new(150, 80, 220, 170);
+
+        let ctx1 = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 1000.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx1,
+                std::slice::from_ref(&trk),
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+
+        // Verify event row in SQLite
+        let ev1 = pipeline
+            .db
+            .get_event(&trk.id)
+            .unwrap()
+            .expect("event row must be created");
+        assert!(ev1["end_time"].is_null());
+        assert_eq!(ev1["has_snapshot"], json!(true));
+        assert_eq!(ev1["has_clip"], json!(true));
+        assert!((ev1["top_score"].as_f64().unwrap() - 0.82).abs() < 1e-4);
+
+        // Verify ActiveReviewState and on-disk snapshots with privacy mask redaction
+        let rev_id = active_review
+            .as_ref()
+            .expect("ActiveReviewState must be opened")
+            .id
+            .clone();
+        let clips_dir = pipeline.media_dir.join("clips");
+        let jpg_path = clips_dir.join(format!("{}.jpg", trk.id));
+        let webp_path = clips_dir.join(format!("{camera}-{}.webp", trk.id));
+        let rev_thumb_path = clips_dir
+            .join("review")
+            .join(format!("thumb-{camera}-{rev_id}.webp"));
+        assert!(jpg_path.exists(), "snapshot JPEG must exist on disk");
+        assert!(webp_path.exists(), "snapshot WebP must exist on disk");
+        assert!(
+            rev_thumb_path.exists(),
+            "review thumbnail WebP must exist on disk"
+        );
+
+        let decoded_webp = image::open(&webp_path).unwrap().to_rgb8();
+        // Inside privacy mask at (20, 20): redacted to [12, 14, 18]
+        assert_eq!(*decoded_webp.get_pixel(20, 20), image::Rgb([12, 14, 18]));
+        // Outside privacy mask at (280, 150): bright white (> 200)
+        assert!(decoded_webp.get_pixel(280, 150)[0] > 200);
+
+        // Verify WebSocket "new" event and "visible" timeline entry
+        let ws_msgs1 = drain_ws_messages(&mut ws_rx);
+        assert!(ws_msgs1.iter().any(|m| {
+            m["topic"] == "events"
+                && serde_json::from_str::<Value>(m["payload"].as_str().unwrap_or("{}"))
+                    .map(|p| p["type"] == "new" && p["after"]["id"] == trk.id)
+                    .unwrap_or(false)
+        }));
+        let timeline1 = pipeline
+            .db
+            .query_timeline(Some(camera), Some(&trk.id), 20)
+            .unwrap();
+        assert!(timeline1.iter().any(|t| t["class_type"] == "visible"));
+
+        // 2. Snapshot Upgrade Policy (BestInZone) & Zone Entry Timeline Event (score 0.94 in "driveway")
+        trk.score = 0.94;
+        trk.top_score = 0.94;
+        trk.last_seen_time = 1002.0;
+        trk.zones = vec!["driveway".to_string()];
+        trk.entered_zones = vec!["driveway".to_string()];
+
+        let ctx2 = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 1002.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx2,
+                std::slice::from_ref(&trk),
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+
+        let ev2 = pipeline.db.get_event(&trk.id).unwrap().unwrap();
+        assert!((ev2["top_score"].as_f64().unwrap() - 0.94).abs() < 1e-4);
+        assert_eq!(ev2["zones"], json!(["driveway"]));
+
+        let timeline2 = pipeline
+            .db
+            .query_timeline(Some(camera), Some(&trk.id), 20)
+            .unwrap();
+        assert!(
+            timeline2.iter().any(|t| t["class_type"] == "entered_zone"),
+            "entering a zone must record class_type = entered_zone in timeline"
+        );
+        let ws_msgs2 = drain_ws_messages(&mut ws_rx);
+        assert!(ws_msgs2.iter().any(|m| {
+            m["topic"] == "events"
+                && serde_json::from_str::<Value>(m["payload"].as_str().unwrap_or("{}"))
+                    .map(|p| p["type"] == "update")
+                    .unwrap_or(false)
+        }));
+
+        // Verify BestInZone rejects snapshot overwrite when object leaves zone, whereas BestOverall accepts it
+        std::fs::write(&webp_path, b"sentinel").unwrap();
+        trk.score = 0.99;
+        trk.top_score = 0.99;
+        trk.zones.clear(); // stepped out of "driveway" while entered_zones still has ["driveway"]
+        let ctx_out_of_zone = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 1003.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx_out_of_zone,
+                std::slice::from_ref(&trk),
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+        assert_eq!(
+            std::fs::read(&webp_path).unwrap(),
+            b"sentinel",
+            "BestInZone must not overwrite snapshot when out of zone"
+        );
+
+        // Switch policy to FirstTrigger: even a new score surge inside zone must not overwrite sentinel
+        let mut cam_cfg_first = cam_cfg.clone();
+        cam_cfg_first.snapshots.selection = SnapshotSelectionPolicy::FirstTrigger;
+        track_snapshots.get_mut(&trk.id).unwrap().best_score = 0.70;
+        trk.zones = vec!["driveway".to_string()];
+        let ctx_first = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg_first,
+            frame: &yuv_frame,
+            now: 1003.5,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx_first,
+                std::slice::from_ref(&trk),
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+        assert_eq!(
+            std::fs::read(&webp_path).unwrap(),
+            b"sentinel",
+            "FirstTrigger must never overwrite initial snapshot"
+        );
+
+        // Switch policy to BestOverall: score improvement overwrites sentinel with a valid WebP
+        let mut cam_cfg_overall = cam_cfg.clone();
+        cam_cfg_overall.snapshots.selection = SnapshotSelectionPolicy::BestOverall;
+        track_snapshots.get_mut(&trk.id).unwrap().best_score = 0.70;
+        trk.zones.clear();
+        let ctx_overall = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg_overall,
+            frame: &yuv_frame,
+            now: 1004.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx_overall,
+                std::slice::from_ref(&trk),
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+        assert!(
+            std::fs::read(&webp_path).unwrap().starts_with(b"RIFF"),
+            "BestOverall must overwrite snapshot when score improves even out of zone"
+        );
+
+        // 3. Track Termination & Review Finalization (ended_tracks + advance past cutoff_time)
+        let _ = drain_ws_messages(&mut ws_rx);
+        trk.last_seen_time = 1005.0;
+        let ctx_end = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 1030.0, // > 1004.0 + 20s cutoff
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx_end,
+                &[],
+                std::slice::from_ref(&trk),
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+
+        assert!(
+            active_review.is_none(),
+            "ActiveReviewState must be finalized and cleared past cutoff"
+        );
+        let ev_end = pipeline.db.get_event(&trk.id).unwrap().unwrap();
+        assert_eq!(ev_end["end_time"], json!(1005.0));
+
+        let finalized_rev = pipeline
+            .db
+            .get_review_by_id(&rev_id)
+            .unwrap()
+            .expect("reviewsegment must be persisted");
+        assert_eq!(finalized_rev.severity, "alert");
+        assert!(finalized_rev.end_time.is_some());
+
+        let ws_msgs_end = drain_ws_messages(&mut ws_rx);
+        assert!(ws_msgs_end.iter().any(|m| {
+            m["topic"] == "events"
+                && serde_json::from_str::<Value>(m["payload"].as_str().unwrap_or("{}"))
+                    .map(|p| p["type"] == "end" && p["after"]["id"] == trk.id)
+                    .unwrap_or(false)
+        }));
+        assert!(ws_msgs_end.iter().any(|m| {
+            m["topic"] == "reviews"
+                && serde_json::from_str::<Value>(m["payload"].as_str().unwrap_or("{}"))
+                    .map(|p| p["type"] == "end" && p["after"]["id"] == rev_id)
+                    .unwrap_or(false)
+        }));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

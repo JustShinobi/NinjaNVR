@@ -48,6 +48,12 @@ pub struct TrackedObject {
     pub provenance: TriggerProvenance,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ZonePresenceState {
+    consecutive_in_frames: u32,
+    first_entered_ts: f64,
+}
+
 /// Multi-Object Tracker implementing 2-stage **ByteTrack** association
 /// (high-confidence pass + low-confidence occlusion recovery pass),
 /// constant-velocity Kalman state estimation, Stationary object classification,
@@ -65,6 +71,7 @@ pub struct ByteTracker {
     global_object_mask: PolygonMask,
     label_masks: BTreeMap<String, PolygonMask>,
     zones: BTreeMap<String, (PolygonMask, Vec<String>)>,
+    zone_presence: BTreeMap<String, BTreeMap<String, ZonePresenceState>>,
     tracks: BTreeMap<String, TrackedObject>,
     frame_seq: u64,
 }
@@ -114,6 +121,7 @@ impl ByteTracker {
             global_object_mask,
             label_masks,
             zones,
+            zone_presence: BTreeMap::new(),
             tracks: BTreeMap::new(),
             frame_seq: 0,
         }
@@ -236,6 +244,41 @@ impl ByteTracker {
             matched.push(zname.clone());
         }
         matched
+    }
+
+    fn resolve_zones_with_hysteresis(
+        &mut self,
+        tid: &str,
+        frame_time: f64,
+        raw_zones: &[String],
+        cfg: &CameraConfig,
+    ) -> Vec<String> {
+        let track_zone_map = self.zone_presence.entry(tid.to_string()).or_default();
+        let mut confirmed = Vec::new();
+        for zname in self.zones.keys() {
+            let in_raw = raw_zones.iter().any(|z| z == zname);
+            let (req_inertia, req_loiter) = cfg
+                .zones
+                .get(zname)
+                .map(|zc| (zc.inertia.max(1), zc.loitering_time as f64))
+                .unwrap_or((1, 0.0));
+            if in_raw {
+                let st = track_zone_map.entry(zname.clone()).or_default();
+                if st.consecutive_in_frames == 0 {
+                    st.first_entered_ts = frame_time;
+                }
+                st.consecutive_in_frames = st.consecutive_in_frames.saturating_add(1);
+                let inertia_ok = st.consecutive_in_frames >= req_inertia;
+                let loiter_ok =
+                    req_loiter <= 0.0 || (frame_time - st.first_entered_ts) >= req_loiter;
+                if inertia_ok && loiter_ok {
+                    confirmed.push(zname.clone());
+                }
+            } else if let Some(st) = track_zone_map.get_mut(zname) {
+                st.consecutive_in_frames = 0;
+            }
+        }
+        confirmed
     }
 
     /// Updates tracks using cross-region NMS + 2-stage ByteTrack association
@@ -367,11 +410,14 @@ impl ByteTracker {
                 }
                 if drop_unconfirmed {
                     self.tracks.remove(tid);
+                    self.zone_presence.remove(tid);
                 } else if self.tracks[tid].disappeared_frames > self.max_disappeared
                     && let Some(removed) = self.tracks.remove(tid)
-                    && removed.frames_tracked >= req_init
                 {
-                    ended_tracks.push(removed);
+                    self.zone_presence.remove(tid);
+                    if removed.frames_tracked >= req_init {
+                        ended_tracks.push(removed);
+                    }
                 }
             }
         }
@@ -394,7 +440,8 @@ impl ByteTracker {
                 (self.frame_seq as u32).wrapping_mul(0x9E37_79B9) ^ (d_idx as u32)
             );
             let id = format!("{frame_time:.6}-{suffix}");
-            let zones = self.evaluate_zones(&det.label, &det.bbox, det.score, cfg);
+            let raw_zones = self.evaluate_zones(&det.label, &det.bbox, det.score, cfg);
+            let zones = self.resolve_zones_with_hysteresis(&id, frame_time, &raw_zones, cfg);
             let (min_score_cfg, threshold_cfg) = cfg
                 .objects
                 .filters
@@ -466,7 +513,8 @@ impl ByteTracker {
         frame_time: f64,
         cfg: &CameraConfig,
     ) {
-        let zones = self.evaluate_zones(&det.label, &det.bbox, det.score, cfg);
+        let raw_zones = self.evaluate_zones(&det.label, &det.bbox, det.score, cfg);
+        let zones = self.resolve_zones_with_hysteresis(tid, frame_time, &raw_zones, cfg);
         let stationary_thresh = self.stationary_threshold;
         let frame_w = self.frame_w;
         let frame_h = self.frame_h;
@@ -929,6 +977,269 @@ mod tests {
             a_large
                 .iter()
                 .any(|t| t.zones.contains(&"foreground_driveway".to_string()))
+        );
+    }
+
+    #[test]
+    fn zone_loitering_time_and_inertia_hysteresis_prevent_premature_zone_entry() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 1;
+        cam_cfg.zones.insert(
+            "porch_inertia".to_string(),
+            ninjanvr_config::ZoneConfig {
+                coordinates: "0.0,0.0,0.5,0.0,0.5,1.0,0.0,1.0".into(),
+                objects: vec!["person".to_string()],
+                inertia: 3,
+                loitering_time: 0,
+                min_area: None,
+                max_area: None,
+                min_score: None,
+            },
+        );
+        cam_cfg.zones.insert(
+            "yard_loiter".to_string(),
+            ninjanvr_config::ZoneConfig {
+                coordinates: "0.5,0.0,1.0,0.0,1.0,1.0,0.5,1.0".into(),
+                objects: vec!["person".to_string()],
+                inertia: 1,
+                loitering_time: 5,
+                min_area: None,
+                max_area: None,
+                min_score: None,
+            },
+        );
+
+        let mut tracker = ByteTracker::new("front_door", 1000, 1000, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1000, 1000);
+
+        // --- Part 1: Test inertia = 3 with boundary oscillation hysteresis ---
+        let in_porch = DetectionResult {
+            label: "person".to_string(),
+            score: 0.90,
+            bbox: BoundingBox::new(440, 300, 540, 500), // bottom_center = (490, 500) inside porch_inertia (x <= 500)
+            region: reg,
+        };
+        let outside_porch = DetectionResult {
+            label: "person".to_string(),
+            score: 0.90,
+            bbox: BoundingBox::new(460, 300, 560, 500), // bottom_center = (510, 500) just outside porch_inertia (x > 500)
+            region: reg,
+        };
+
+        // Frame 1 & 2 inside porch_inertia (< 3 inertia frames) -> not yet in zone
+        let (a1, _) = tracker.update(100.0, std::slice::from_ref(&in_porch), &[reg], &cam_cfg);
+        assert!(a1[0].zones.is_empty());
+        let (a2, _) = tracker.update(100.5, std::slice::from_ref(&in_porch), &[reg], &cam_cfg);
+        assert!(a2[0].zones.is_empty());
+
+        // Frame 3 oscillates outside porch_inertia -> resets consecutive frame counter
+        let (a3, _) = tracker.update(101.0, &[outside_porch], &[reg], &cam_cfg);
+        assert!(!a3[0].zones.contains(&"porch_inertia".to_string()));
+
+        // Re-enter porch_inertia: needs 3 consecutive frames (Frames 4, 5, 6)
+        let (a4, _) = tracker.update(101.5, std::slice::from_ref(&in_porch), &[reg], &cam_cfg);
+        assert!(!a4[0].zones.contains(&"porch_inertia".to_string()));
+        let (a5, _) = tracker.update(102.0, std::slice::from_ref(&in_porch), &[reg], &cam_cfg);
+        assert!(!a5[0].zones.contains(&"porch_inertia".to_string()));
+        let (a6, _) = tracker.update(102.5, std::slice::from_ref(&in_porch), &[reg], &cam_cfg);
+        assert!(a6[0].zones.contains(&"porch_inertia".to_string()));
+        assert!(a6[0].entered_zones.contains(&"porch_inertia".to_string()));
+
+        // --- Part 2: Test loitering_time = 5s ---
+        let mut loiter_tracker = ByteTracker::new("front_door", 1000, 1000, &cam_cfg);
+        let in_yard = DetectionResult {
+            label: "person".to_string(),
+            score: 0.91,
+            bbox: BoundingBox::new(700, 300, 800, 500), // bottom_center = (750, 500) inside yard_loiter
+            region: reg,
+        };
+
+        // t=200.0s (elapsed 0.0s < 5.0s) and t=203.5s (elapsed 3.5s < 5.0s) -> not in zone
+        let (l1, _) =
+            loiter_tracker.update(200.0, std::slice::from_ref(&in_yard), &[reg], &cam_cfg);
+        assert!(l1[0].zones.is_empty());
+        let (l2, _) =
+            loiter_tracker.update(203.5, std::slice::from_ref(&in_yard), &[reg], &cam_cfg);
+        assert!(l2[0].zones.is_empty());
+
+        // t=205.2s (elapsed 5.2s >= 5.0s) -> loitering threshold met, zone entry triggers!
+        let (l3, _) =
+            loiter_tracker.update(205.2, std::slice::from_ref(&in_yard), &[reg], &cam_cfg);
+        assert!(l3[0].zones.contains(&"yard_loiter".to_string()));
+        assert!(l3[0].entered_zones.contains(&"yard_loiter".to_string()));
+    }
+
+    #[test]
+    fn night_mode_enforces_both_night_threshold_and_min_initialized_night() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 2;
+        cam_cfg.detect.min_initialized_night = Some(3);
+        if let Some(person_f) = cam_cfg.objects.filters.get_mut("person") {
+            person_f.min_score = 0.50;
+            person_f.threshold = 0.70;
+            person_f.night_threshold = Some(0.82);
+        }
+
+        let mut tracker = ByteTracker::new("front_door", 640, 360, &cam_cfg);
+        assert!(!tracker.is_night_mode());
+        tracker.set_night_mode(true);
+        assert!(tracker.is_night_mode());
+
+        let reg = BoundingBox::new(0, 0, 640, 360);
+        // Detection with score 0.75 (>= daytime 0.70, but < night_threshold 0.82) cannot initialize a track at night
+        let marginal_det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.75,
+            bbox: BoundingBox::new(100, 100, 180, 260),
+            region: reg,
+        };
+        for i in 0..4 {
+            let (act, _) = tracker.update(
+                50.0 + i as f64,
+                std::slice::from_ref(&marginal_det),
+                &[reg],
+                &cam_cfg,
+            );
+            assert!(
+                act.is_empty(),
+                "score below night_threshold must not initialize a track in night mode"
+            );
+        }
+
+        // Detection with score 0.86 (>= night_threshold 0.82) initializes after min_initialized_night (3) frames
+        let strong_det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.86,
+            bbox: BoundingBox::new(100, 100, 180, 260),
+            region: reg,
+        };
+        let (n1, _) = tracker.update(60.0, std::slice::from_ref(&strong_det), &[reg], &cam_cfg);
+        assert!(n1.is_empty());
+        let (n2, _) = tracker.update(60.5, std::slice::from_ref(&strong_det), &[reg], &cam_cfg);
+        assert!(n2.is_empty());
+        let (n3, _) = tracker.update(61.0, std::slice::from_ref(&strong_det), &[reg], &cam_cfg);
+        assert_eq!(n3.len(), 1);
+    }
+
+    #[test]
+    fn max_disappeared_expires_confirmed_track_into_ended_tracks_and_stationary_interval_scans() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 2;
+        cam_cfg.detect.max_disappeared = 5;
+        cam_cfg.detect.stationary.threshold = 10;
+        cam_cfg.detect.stationary.interval = 10;
+
+        let mut tracker = ByteTracker::new("front_door", 640, 360, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 640, 360);
+        let bbox = BoundingBox::new(120, 80, 220, 280);
+        let det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.89,
+            bbox,
+            region: reg,
+        };
+
+        // Feed 11 frames so the track is confirmed AND marked stationary (motionless_count >= 10)
+        for i in 0..11 {
+            let _ = tracker.update(
+                100.0 + i as f64,
+                std::slice::from_ref(&det),
+                &[reg],
+                &cam_cfg,
+            );
+        }
+        let active_now: Vec<_> = tracker.active_tracks().cloned().collect();
+        assert_eq!(active_now.len(), 1);
+        assert!(active_now[0].stationary);
+
+        // At frame_seq == 11 (not a multiple of stationary_interval = 10) with no motion boxes:
+        // non_stationary_boxes skips the stationary object
+        assert!(tracker.non_stationary_boxes(&[]).is_empty());
+        // When a motion box intersects the stationary track, non_stationary_boxes includes it
+        assert_eq!(tracker.non_stationary_boxes(&[bbox]), vec![bbox]);
+
+        // Advance to frame_seq == 20 (multiple of stationary_interval = 10) while keeping track stationary
+        for i in 11..20 {
+            let _ = tracker.update(
+                100.0 + i as f64,
+                std::slice::from_ref(&det),
+                &[reg],
+                &cam_cfg,
+            );
+        }
+        // At frame_seq == 20, periodic forced scan returns the stationary track's bbox even with empty motion_boxes!
+        assert_eq!(tracker.non_stationary_boxes(&[]), vec![bbox]);
+
+        // Now feed max_disappeared (5) empty frames where scanned_regions covers the bbox -> still retained
+        for i in 0..5 {
+            let (act, ended) = tracker.update(200.0 + i as f64, &[], &[reg], &cam_cfg);
+            assert!(act.is_empty());
+            assert!(
+                ended.is_empty(),
+                "track must not expire before exceeding max_disappeared"
+            );
+        }
+
+        // Frame max_disappeared + 1 (6th missed frame): track expires into ended_tracks!
+        let (act_final, ended_final) = tracker.update(206.0, &[], &[reg], &cam_cfg);
+        assert!(act_final.is_empty());
+        assert_eq!(ended_final.len(), 1);
+        assert_eq!(ended_final[0].label, "person");
+    }
+
+    #[test]
+    fn classify_segment_crossing_covers_any_direction_and_non_intersecting_segments() {
+        let l_start = (100.0, 200.0);
+        let l_end = (500.0, 200.0);
+
+        // Non-intersecting segment that stops short of the line (u > 1.0 needed to reach y=200)
+        assert_eq!(
+            classify_segment_crossing(l_start, l_end, (300.0, 100.0), (300.0, 180.0)),
+            None
+        );
+
+        // Non-intersecting segment whose x-coordinate misses the [100..500] segment (t < 0.0)
+        assert_eq!(
+            classify_segment_crossing(l_start, l_end, (50.0, 150.0), (50.0, 250.0)),
+            None
+        );
+
+        // Verify LineDirection::Any in ByteTracker triggers on both BToA and AToB crossings
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 1;
+        cam_cfg.lines.insert(
+            "any_tripwire".to_string(),
+            LineConfig {
+                points: [0.1, 0.5, 0.9, 0.5], // normalized line at y = 180 on 640x360 frame
+                direction: LineDirection::Any,
+                objects: vec!["person".to_string()],
+            },
+        );
+        let mut tracker = ByteTracker::new("front_door", 640, 360, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 640, 360);
+
+        // Frame 1: bottom_center at (300, 240) below y=180
+        let d1 = DetectionResult {
+            label: "person".to_string(),
+            score: 0.90,
+            bbox: BoundingBox::new(280, 160, 320, 240),
+            region: reg,
+        };
+        let _ = tracker.update(10.0, &[d1], &[reg], &cam_cfg);
+
+        // Frame 2: bottom_center moves upward to (300, 140) (BToA crossing) -> matches LineDirection::Any
+        let d2 = DetectionResult {
+            label: "person".to_string(),
+            score: 0.91,
+            bbox: BoundingBox::new(280, 60, 320, 140),
+            region: reg,
+        };
+        let (active, _) = tracker.update(10.5, &[d2], &[reg], &cam_cfg);
+        assert_eq!(active.len(), 1);
+        assert!(
+            active[0]
+                .crossed_lines
+                .contains(&"any_tripwire".to_string())
         );
     }
 }

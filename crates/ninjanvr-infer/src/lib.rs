@@ -2242,4 +2242,109 @@ version: 0.18-0
             "all ORT handles (type_info, shape_info, in_val, out_val, mem_info, session, opts, env) must be released"
         );
     }
+
+    #[test]
+    fn fallback_mode_covers_runtime_catalog_detect_region_reload_and_pool_routing() {
+        let yaml = r#"
+detectors:
+  primary_cpu:
+    type: openvino
+    device: CPU
+    model:
+      width: 300
+      height: 300
+      input_pixel_format: bgr
+      path: /nonexistent/ssdlite_mobilenet_v2.xml
+  aux_npu:
+    type: openvino
+    device: NPU
+    model:
+      width: 416
+      height: 416
+      input_pixel_format: rgb
+      path: /nonexistent/yolox_s.xml
+version: 0.18-0
+"#;
+        let mut cfg =
+            NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/fallback_cfg.yml")).unwrap();
+        let engine = AiDetectorEngine::new(&cfg);
+
+        // 1. runtime_catalog() when OpenVINO model/library is not loaded
+        let cat = engine.runtime_catalog();
+        assert!(!cat.loaded);
+        assert_eq!(cat.in_bytes, 0);
+        assert_eq!(cat.out_floats, 0);
+        assert_eq!(cat.active_backend, "openvino");
+        assert!(cat.devices.iter().any(|d| d.id == "CPU"));
+        assert!(cat.devices.iter().any(|d| d.id == "GPU"));
+        assert!(cat.devices.iter().any(|d| d.id == "NPU"));
+        assert!(cat.devices.iter().any(|d| d.id == "AUTO" && d.available));
+        assert!(!cat.discovered_models.is_empty());
+
+        // 2. detect_region() safe fallback execution when backend is None
+        let tensor = vec![0u8; 300 * 300 * 3];
+        let region = BoundingBox::new(0, 0, 300, 300);
+        let fallback_dets = engine.detect_region(&tensor, region, 1280, 720, 0.5);
+        assert!(fallback_dets.is_empty());
+        assert!(engine.avg_inference_ms() > 0.0);
+        let _ = engine.cumulative_infer_us();
+
+        // 3. named_detector() and avg_inference_ms_for() on AiDetectorEngine
+        let aux = engine
+            .named_detector(Some("aux_npu"))
+            .expect("aux_npu must exist in engine pool");
+        assert_eq!(aux.model_dimensions(), (416, 416, false));
+        assert_eq!(aux.active_device(), "NPU");
+        assert!(engine.named_detector(Some("missing_det")).is_none());
+        assert!(engine.named_detector(None).is_none());
+        assert!(engine.avg_inference_ms_for("aux_npu") > 0.0);
+        assert_eq!(
+            engine.avg_inference_ms_for("missing_det"),
+            engine.avg_inference_ms()
+        );
+
+        // 4. DetectorPool::get, detector_names
+        let pool = DetectorPool::new(&cfg);
+        assert_eq!(pool.detector_names(), vec!["aux_npu", "primary_cpu"]);
+        assert_eq!(
+            pool.get(Some("primary_cpu")).model_dimensions(),
+            (300, 300, true)
+        );
+        assert_eq!(
+            pool.get(Some("aux_npu")).model_dimensions(),
+            (416, 416, false)
+        );
+        // Unknown name and None fall back deterministically
+        assert_eq!(
+            pool.get(Some("unknown")).model_dimensions().0,
+            pool.get(None).model_dimensions().0
+        );
+
+        // 5. reload() updates primary dimensions, device, and internal named detector pool
+        cfg.model.width = 640;
+        cfg.model.height = 640;
+        cfg.model.input_pixel_format = "rgb".to_string();
+        cfg.detectors.clear();
+        cfg.detectors.insert(
+            "reloaded_ort".to_string(),
+            DetectorEntryConfig {
+                detector_type: "onnxruntime".to_string(),
+                device: "CPU".to_string(),
+                model: Some(ninjanvr_config::ModelConfig {
+                    width: 640,
+                    height: 640,
+                    input_tensor: "nchw".to_string(),
+                    input_pixel_format: "rgb".to_string(),
+                    path: "/nonexistent/yolov11n.onnx".to_string(),
+                    labelmap_path: "/nonexistent/labels.txt".to_string(),
+                    model_type: "yolo-generic".to_string(),
+                }),
+            },
+        );
+        engine.reload(&cfg);
+        assert_eq!(engine.model_dimensions(), (640, 640, false));
+        assert!(engine.named_detector(Some("aux_npu")).is_none());
+        let reloaded = engine.named_detector(Some("reloaded_ort")).unwrap();
+        assert_eq!(reloaded.model_dimensions(), (640, 640, false));
+    }
 }
