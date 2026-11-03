@@ -1,19 +1,405 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
-import { Camera, ChevronLeft, ChevronRight } from "lucide-react";
+import { Camera, ChevronLeft, ChevronRight, Mic, MicOff } from "lucide-react";
 import { useI18n } from "../i18n";
 import { CameraConfig } from "../types/nvr";
 import { useNvrStore } from "../store/useNvrStore";
 import { formatRelTime, formatTs } from "../utils/format";
 
+export interface PushToTalkTrackLike {
+  stop: () => void;
+  kind?: string;
+  enabled?: boolean;
+}
+
+export interface PushToTalkStreamLike {
+  getTracks: () => PushToTalkTrackLike[];
+}
+
+export interface PushToTalkPeerConnectionLike {
+  addTrack?: (track: PushToTalkTrackLike, stream: PushToTalkStreamLike) => unknown;
+  createOffer?: () => Promise<{ type?: string; sdp?: string }>;
+  setLocalDescription?: (desc: { type?: string; sdp?: string }) => Promise<void>;
+  setRemoteDescription?: (desc: { type: "answer"; sdp: string }) => Promise<void>;
+  localDescription?: { type?: string; sdp?: string } | null;
+  close: () => void;
+}
+
+export interface PushToTalkDependencies {
+  getUserMedia?: (constraints: { audio: boolean }) => Promise<PushToTalkStreamLike>;
+  createPeerConnection?: () => PushToTalkPeerConnectionLike;
+  fetchImpl?: (
+    url: string,
+    init: {
+      method: string;
+      headers: Record<string, string>;
+      credentials?: RequestCredentials;
+      body: string;
+    }
+  ) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+}
+
+export interface ActivePushToTalkSession {
+  camera: string;
+  stream: PushToTalkStreamLike;
+  pc: PushToTalkPeerConnectionLike;
+  answerSdp: string;
+  stop: () => void;
+}
+
+export type PushToTalkState = "idle" | "connecting" | "talking" | "error";
+
+export interface PushToTalkController {
+  getState: () => PushToTalkState;
+  getError: () => string | null;
+  press: () => Promise<boolean>;
+  release: () => void;
+  unmount: () => void;
+}
+
+/**
+ * Deterministically stops every microphone MediaStreamTrack and closes the
+ * auxiliary WebRTC RTCPeerConnection so macOS/iOS/Android immediately extinguish
+ * the system microphone-in-use indicator without touching the MSE video stream.
+ */
+export function closePushToTalkSession(
+  stream: PushToTalkStreamLike | null | undefined,
+  pc: PushToTalkPeerConnectionLike | null | undefined
+): void {
+  if (stream && typeof stream.getTracks === "function") {
+    stream.getTracks().forEach((track) => {
+      try {
+        track.stop();
+      } catch {
+        // Ensure every track's .stop() is attempted even if one throws
+      }
+    });
+  }
+  if (pc && typeof pc.close === "function") {
+    try {
+      pc.close();
+    } catch {
+      // ignore close errors on already-closed peer connection
+    }
+  }
+}
+
+/**
+ * Opens a lightweight auxiliary WebRTC backchannel session to `/api/go2rtc/webrtc?src=<camera>`
+ * carrying only the local microphone audio track while leaving `<LiveMsePlayer>` uninterrupted.
+ * Automatically releases all microphone tracks and closes the peer connection on any signaling failure.
+ */
+export async function startPushToTalkSession(
+  camera: string,
+  deps?: PushToTalkDependencies
+): Promise<ActivePushToTalkSession> {
+  const getUserMedia =
+    deps?.getUserMedia ??
+    ((constraints: { audio: boolean }) => {
+      if (
+        typeof navigator === "undefined" ||
+        !navigator.mediaDevices ||
+        typeof navigator.mediaDevices.getUserMedia !== "function"
+      ) {
+        return Promise.reject(
+          new Error("Microphone capture (getUserMedia) is unavailable in this browser context")
+        );
+      }
+      return navigator.mediaDevices.getUserMedia(constraints);
+    });
+
+  const createPeerConnection: () => PushToTalkPeerConnectionLike =
+    deps?.createPeerConnection ??
+    (() => {
+      if (typeof RTCPeerConnection === "undefined") {
+        throw new Error("RTCPeerConnection is unavailable in this browser context");
+      }
+      const nativePc = new RTCPeerConnection();
+      return {
+        get localDescription() {
+          return nativePc.localDescription;
+        },
+        addTrack(track, mediaStream) {
+          return nativePc.addTrack(
+            track as MediaStreamTrack,
+            mediaStream as MediaStream
+          );
+        },
+        createOffer() {
+          return nativePc.createOffer();
+        },
+        setLocalDescription(desc) {
+          return nativePc.setLocalDescription(desc as RTCLocalSessionDescriptionInit);
+        },
+        setRemoteDescription(desc) {
+          return nativePc.setRemoteDescription(desc);
+        },
+        close() {
+          nativePc.close();
+        },
+      };
+    });
+
+  const fetchImpl =
+    deps?.fetchImpl ??
+    ((url, init) => fetch(url, init));
+
+  const stream = await getUserMedia({ audio: true });
+  let pc: PushToTalkPeerConnectionLike | null = null;
+
+  try {
+    const activePc = createPeerConnection();
+    pc = activePc;
+    for (const track of stream.getTracks()) {
+      activePc.addTrack?.(track, stream);
+    }
+
+    const offer = (await activePc.createOffer?.()) ?? {
+      type: "offer",
+      sdp: "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n",
+    };
+    await activePc.setLocalDescription?.(offer);
+
+    const offerSdp =
+      activePc.localDescription?.sdp ||
+      offer.sdp ||
+      "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\n";
+
+    const resp = await fetchImpl(
+      `/api/go2rtc/webrtc?src=${encodeURIComponent(camera)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        credentials: "include",
+        body: offerSdp,
+      }
+    );
+
+    if (!resp.ok) {
+      throw new Error(`WebRTC backchannel signaling failed (${resp.status})`);
+    }
+
+    const answerSdp = await resp.text();
+    if (!answerSdp || !answerSdp.trim()) {
+      throw new Error("Empty SDP answer from go2rtc WebRTC proxy");
+    }
+
+    await activePc.setRemoteDescription?.({ type: "answer", sdp: answerSdp });
+
+    return {
+      camera,
+      stream,
+      pc: activePc,
+      answerSdp,
+      stop: () => closePushToTalkSession(stream, activePc),
+    };
+  } catch (err) {
+    closePushToTalkSession(stream, pc);
+    throw err;
+  }
+}
+
+/**
+ * Stateful Push-to-Talk lifecycle controller that guarantees deterministic
+ * microphone track release on pointer release, SDP failure, or component unmount.
+ */
+export function createPushToTalkController(
+  camera: string,
+  deps?: PushToTalkDependencies,
+  onStateChange?: (state: PushToTalkState, error: string | null) => void
+): PushToTalkController {
+  let state: PushToTalkState = "idle";
+  let error: string | null = null;
+  let activeStream: PushToTalkStreamLike | null = null;
+  let activePc: PushToTalkPeerConnectionLike | null = null;
+  let sessionToken = 0;
+  let unmounted = false;
+
+  const notify = (nextState: PushToTalkState, nextError: string | null = null) => {
+    state = nextState;
+    error = nextError;
+    if (!unmounted) {
+      onStateChange?.(state, error);
+    }
+  };
+
+  const cleanupActive = () => {
+    const streamToClose = activeStream;
+    const pcToClose = activePc;
+    activeStream = null;
+    activePc = null;
+    if (streamToClose || pcToClose) {
+      closePushToTalkSession(streamToClose, pcToClose);
+    }
+  };
+
+  return {
+    getState: () => state,
+    getError: () => error,
+    press: async () => {
+      if (unmounted || state === "connecting" || state === "talking") {
+        return false;
+      }
+      cleanupActive();
+      const myToken = ++sessionToken;
+      notify("connecting", null);
+
+      try {
+        const session = await startPushToTalkSession(camera, deps);
+        if (unmounted || myToken !== sessionToken) {
+          closePushToTalkSession(session.stream, session.pc);
+          return false;
+        }
+        activeStream = session.stream;
+        activePc = session.pc;
+        notify("talking", null);
+        return true;
+      } catch (err) {
+        cleanupActive();
+        if (!unmounted && myToken === sessionToken) {
+          const msg = err instanceof Error ? err.message : String(err);
+          notify("error", msg);
+        }
+        return false;
+      }
+    },
+    release: () => {
+      sessionToken += 1;
+      cleanupActive();
+      if (!unmounted) {
+        notify("idle", null);
+      }
+    },
+    unmount: () => {
+      unmounted = true;
+      sessionToken += 1;
+      cleanupActive();
+      state = "idle";
+      error = null;
+    },
+  };
+}
+
+export interface PushToTalkButtonProps {
+  camera: string;
+  height?: number;
+  onStateChange?: (state: PushToTalkState, error: string | null) => void;
+}
+
+export const PushToTalkButton: React.FC<PushToTalkButtonProps> = ({
+  camera,
+  height = 20,
+  onStateChange,
+}) => {
+  const [pttState, setPttState] = useState<PushToTalkState>("idle");
+  const [pttError, setPttError] = useState<string | null>(null);
+  const controllerRef = useRef<PushToTalkController | null>(null);
+  const onStateChangeRef = useRef(onStateChange);
+  onStateChangeRef.current = onStateChange;
+
+  useEffect(() => {
+    const ctrl = createPushToTalkController(camera, undefined, (nextState, nextErr) => {
+      setPttState(nextState);
+      setPttError(nextErr);
+      onStateChangeRef.current?.(nextState, nextErr);
+    });
+    controllerRef.current = ctrl;
+    return () => {
+      ctrl.unmount();
+      controllerRef.current = null;
+    };
+  }, [camera]);
+
+  const isTalking = pttState === "talking";
+  const isConnecting = pttState === "connecting";
+  const isError = pttState === "error";
+
+  return (
+    <button
+      type="button"
+      data-testid={`ptt-btn-${camera}`}
+      className={`nvr-btn nvr-tile-action mono ${isTalking ? "active" : ""}`}
+      aria-label={`Push to talk on ${camera}`}
+      aria-pressed={isTalking || isConnecting}
+      title={
+        isTalking
+          ? `Transmitting microphone audio to ${camera} — release to end`
+          : isError && pttError
+          ? `Push-to-Talk error: ${pttError}`
+          : `Hold to talk to ${camera} via WebRTC backchannel (no video reload)`
+      }
+      style={{
+        height,
+        padding: "0 6px",
+        fontSize: "var(--text-xs)",
+        borderColor: isTalking
+          ? "var(--signal-alert)"
+          : isError
+          ? "var(--signal-motion)"
+          : undefined,
+        color: isTalking
+          ? "var(--signal-alert-text)"
+          : isError
+          ? "var(--signal-motion-text)"
+          : undefined,
+        background: isTalking ? "rgba(239, 68, 68, 0.24)" : undefined,
+      }}
+      onClick={(e) => {
+        e.stopPropagation();
+      }}
+      onPointerDown={(e) => {
+        e.stopPropagation();
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        } catch {
+          // ignore
+        }
+        void controllerRef.current?.press();
+      }}
+      onPointerUp={(e) => {
+        e.stopPropagation();
+        controllerRef.current?.release();
+      }}
+      onPointerCancel={(e) => {
+        e.stopPropagation();
+        controllerRef.current?.release();
+      }}
+      onKeyDown={(e) => {
+        if ((e.key === " " || e.key === "Enter") && !e.repeat) {
+          e.preventDefault();
+          e.stopPropagation();
+          void controllerRef.current?.press();
+        }
+      }}
+      onKeyUp={(e) => {
+        if (e.key === " " || e.key === "Enter") {
+          e.preventDefault();
+          e.stopPropagation();
+          controllerRef.current?.release();
+        }
+      }}
+      onBlur={() => {
+        if (isTalking || isConnecting) {
+          controllerRef.current?.release();
+        }
+      }}
+    >
+      {isError ? <MicOff size={11} /> : <Mic size={11} />}
+      {isTalking ? "TX LIVE" : isConnecting ? "TX..." : isError ? "PTT ERR" : "PTT"}
+    </button>
+  );
+};
+
 interface ZoomableVideoStageProps {
   disabled?: boolean;
+  forceHudVisible?: boolean;
   extraHud?: React.ReactNode;
   children: React.ReactNode;
 }
 
 export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
   disabled = false,
+  forceHudVisible = false,
   extraHud,
   children,
 }) => {
@@ -186,9 +572,9 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
             padding: "3px 5px",
             fontSize: "var(--text-xs)",
             fontVariantNumeric: "tabular-nums",
-            opacity: isHovered || scale > 1.0 ? 1 : 0,
+            opacity: isHovered || scale > 1.0 || forceHudVisible ? 1 : 0,
             transition: "opacity 0.16s ease",
-            pointerEvents: isHovered || scale > 1.0 ? "auto" : "none",
+            pointerEvents: isHovered || scale > 1.0 || forceHudVisible ? "auto" : "none",
           }}
         >
           {extraHud && (
@@ -397,6 +783,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const [headerLastSeenTs, setHeaderLastSeenTs] = useState<number>(0);
   const [posterTick, setPosterTick] = useState(() => Date.now());
   const [overlayBox, setOverlayBox] = useState<ContainedBox | null>(null);
+  const [pttState, setPttState] = useState<PushToTalkState>("idle");
   const camStats = useNvrStore((s) => s.stats?.cameras?.[camera]);
 
   const isOffline =
@@ -680,19 +1067,56 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       {/* Zero-black-screen instant snapshot underlay while MSE connects — strictly object-fit: contain */}
       <ZoomableVideoStage
         disabled={Boolean(onPlotPoint)}
+        forceHudVisible={pttState !== "idle"}
         extraHud={
-          <button
-            type="button"
-            className="nvr-btn mono"
-            style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
-            title="Save high-resolution PNG photo of current frame"
-            onClick={handleCaptureLiveStill}
-          >
-            <Camera size={11} />
-            Photo
-          </button>
+          <>
+            <PushToTalkButton
+              camera={camera}
+              height={20}
+              onStateChange={(nextState) => setPttState(nextState)}
+            />
+            <button
+              type="button"
+              className="nvr-btn mono"
+              style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+              title="Save high-resolution PNG photo of current frame"
+              onClick={handleCaptureLiveStill}
+            >
+              <Camera size={11} />
+              Photo
+            </button>
+          </>
         }
       >
+        {(pttState === "talking" || pttState === "connecting") && (
+          <div
+            data-testid={`ptt-indicator-${camera}`}
+            className="mono"
+            style={{
+              position: "absolute",
+              top: 8,
+              left: 8,
+              zIndex: 14,
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              background: "rgba(127, 29, 29, 0.92)",
+              border: "1px solid var(--signal-alert)",
+              color: "#fecaca",
+              padding: "3px 8px",
+              borderRadius: 3,
+              fontSize: "var(--text-xs)",
+              fontWeight: 700,
+              fontVariantNumeric: "tabular-nums",
+              pointerEvents: "none",
+            }}
+          >
+            <span className="nvr-dot alert" />
+            {pttState === "talking"
+              ? `TX // MIC LIVE (${camera.toUpperCase()})`
+              : `TX // CONNECTING (${camera.toUpperCase()})`}
+          </div>
+        )}
         <img
           ref={imgRef}
           className="nvr-cam-poster"
