@@ -80,12 +80,13 @@ pub struct ByteTracker {
     min_initialized: u32,
     min_initialized_night: u32,
     night_mode: bool,
+    active_preset: Option<String>,
     max_disappeared: u32,
     stationary_threshold: u32,
     stationary_interval: u32,
     global_object_mask: PolygonMask,
     label_masks: BTreeMap<String, PolygonMask>,
-    zones: BTreeMap<String, (PolygonMask, Vec<String>)>,
+    zones: BTreeMap<String, (PolygonMask, Vec<String>, Option<String>)>,
     zone_presence: BTreeMap<String, BTreeMap<String, ZonePresenceState>>,
     tracks: BTreeMap<String, TrackedObject>,
     frame_seq: u64,
@@ -112,7 +113,13 @@ impl ByteTracker {
         for (zname, zcfg) in &cfg.zones {
             let poly = PolygonMask::from_config_value(&zcfg.coordinates, frame_w, frame_h);
             if !poly.is_empty() {
-                zones.insert(zname.clone(), (poly, zcfg.objects.clone()));
+                let preset = zcfg
+                    .preset
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                zones.insert(zname.clone(), (poly, zcfg.objects.clone(), preset));
             }
         }
 
@@ -122,6 +129,13 @@ impl ByteTracker {
             .min_initialized_night
             .unwrap_or(min_init + 2)
             .max(min_init);
+        let initial_preset = cfg
+            .onvif
+            .return_preset
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         Self {
             camera_name: camera_name.into(),
@@ -130,6 +144,7 @@ impl ByteTracker {
             min_initialized: min_init,
             min_initialized_night: min_init_night,
             night_mode: false,
+            active_preset: initial_preset,
             max_disappeared: cfg.detect.max_disappeared.max(5),
             stationary_threshold: cfg.detect.stationary.threshold.max(10),
             stationary_interval: cfg.detect.stationary.interval.max(10),
@@ -148,6 +163,17 @@ impl ByteTracker {
 
     pub fn is_night_mode(&self) -> bool {
         self.night_mode
+    }
+
+    pub fn set_active_preset(&mut self, preset: Option<&str>) {
+        self.active_preset = preset
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+
+    pub fn active_preset(&self) -> Option<&str> {
+        self.active_preset.as_deref()
     }
 
     fn effective_min_initialized(&self) -> u32 {
@@ -246,13 +272,24 @@ impl ByteTracker {
         let area = bbox.area();
         let frame_area = (self.frame_w as f64) * (self.frame_h as f64);
         let mut matched = Vec::new();
-        for (zname, (poly, allowed_objs)) in &self.zones {
+        for (zname, (poly, allowed_objs, cached_preset)) in &self.zones {
             if (!allowed_objs.is_empty() && !allowed_objs.iter().any(|o| o == label))
                 || !poly.contains_point(bx, by)
             {
                 continue;
             }
-            if let Some(zcfg) = cfg.zones.get(zname) {
+            let zcfg_opt = cfg.zones.get(zname);
+            let req_preset = zcfg_opt
+                .and_then(|zc| zc.preset.as_deref())
+                .or(cached_preset.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Some(req_p) = req_preset
+                && self.active_preset() != Some(req_p)
+            {
+                continue;
+            }
+            if let Some(zcfg) = zcfg_opt {
                 if let Some(min_sc) = zcfg.min_score
                     && score < min_sc
                 {
@@ -1099,6 +1136,7 @@ mod tests {
                 min_area: Some(0.05), // 5% of frame (50,000 px²) required to enter foreground zone
                 max_area: None,
                 min_score: Some(0.80),
+                preset: None,
             },
         );
 
@@ -1155,6 +1193,7 @@ mod tests {
                 min_area: None,
                 max_area: None,
                 min_score: None,
+                preset: None,
             },
         );
         cam_cfg.zones.insert(
@@ -1167,6 +1206,7 @@ mod tests {
                 min_area: None,
                 max_area: None,
                 min_score: None,
+                preset: None,
             },
         );
 
@@ -1595,5 +1635,103 @@ mod tests {
             &z_porch,
             &z_porch,
         ));
+    }
+
+    #[test]
+    fn preset_bound_zones_only_evaluate_when_camera_is_at_matching_preset() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 1;
+        cam_cfg.zones.insert(
+            "driveway_zone".to_string(),
+            ninjanvr_config::ZoneConfig {
+                coordinates: "0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0".into(),
+                objects: vec!["person".to_string()],
+                inertia: 1,
+                loitering_time: 0,
+                min_area: None,
+                max_area: None,
+                min_score: None,
+                preset: Some("driveway".to_string()),
+            },
+        );
+        cam_cfg.zones.insert(
+            "entry_gate_zone".to_string(),
+            ninjanvr_config::ZoneConfig {
+                coordinates: "0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0".into(),
+                objects: vec!["person".to_string()],
+                inertia: 1,
+                loitering_time: 0,
+                min_area: None,
+                max_area: None,
+                min_score: None,
+                preset: Some("entry_gate".to_string()),
+            },
+        );
+        cam_cfg.zones.insert(
+            "global_perimeter".to_string(),
+            ninjanvr_config::ZoneConfig {
+                coordinates: "0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0".into(),
+                objects: vec!["person".to_string()],
+                inertia: 1,
+                loitering_time: 0,
+                min_area: None,
+                max_area: None,
+                min_score: None,
+                preset: None,
+            },
+        );
+
+        let mut tracker = ByteTracker::new("ptz_cam", 1000, 1000, &cam_cfg);
+        assert_eq!(tracker.active_preset(), None);
+
+        let reg = BoundingBox::new(0, 0, 1000, 1000);
+        let det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.90,
+            bbox: BoundingBox::new(200, 200, 350, 500),
+            region: reg,
+        };
+
+        // 1. Camera moving (active_preset == None): preset-bound zones are suspended, global zone evaluates
+        let (a_moving, _) = tracker.update(10.0, std::slice::from_ref(&det), &[reg], &cam_cfg);
+        assert_eq!(a_moving.len(), 1);
+        assert!(a_moving[0].zones.contains(&"global_perimeter".to_string()));
+        assert!(!a_moving[0].zones.contains(&"driveway_zone".to_string()));
+        assert!(!a_moving[0].zones.contains(&"entry_gate_zone".to_string()));
+
+        // 2. Camera parked at "patio" (non-matching preset): preset-bound zones remain suspended, global zone evaluates
+        tracker.set_active_preset(Some("patio"));
+        assert_eq!(tracker.active_preset(), Some("patio"));
+        let (a_patio, _) = tracker.update(11.0, std::slice::from_ref(&det), &[reg], &cam_cfg);
+        assert!(a_patio[0].zones.contains(&"global_perimeter".to_string()));
+        assert!(!a_patio[0].zones.contains(&"driveway_zone".to_string()));
+        assert!(!a_patio[0].zones.contains(&"entry_gate_zone".to_string()));
+
+        // 3. Camera parked at "driveway": driveway_zone + global_perimeter trigger, entry_gate_zone stays suspended
+        tracker.set_active_preset(Some("driveway"));
+        assert_eq!(tracker.active_preset(), Some("driveway"));
+        let (a_driveway, _) = tracker.update(12.0, std::slice::from_ref(&det), &[reg], &cam_cfg);
+        assert!(
+            a_driveway[0]
+                .zones
+                .contains(&"global_perimeter".to_string())
+        );
+        assert!(a_driveway[0].zones.contains(&"driveway_zone".to_string()));
+        assert!(!a_driveway[0].zones.contains(&"entry_gate_zone".to_string()));
+
+        // 4. Camera moves away via ContinuousMove/RelativeMove -> clear active_preset to None
+        tracker.set_active_preset(None);
+        assert_eq!(tracker.active_preset(), None);
+        let (a_cleared, _) = tracker.update(13.0, std::slice::from_ref(&det), &[reg], &cam_cfg);
+        assert!(a_cleared[0].zones.contains(&"global_perimeter".to_string()));
+        assert!(!a_cleared[0].zones.contains(&"driveway_zone".to_string()));
+
+        // 5. GotoPreset completes to "entry_gate" -> entry_gate_zone + global_perimeter trigger
+        tracker.set_active_preset(Some("entry_gate"));
+        assert_eq!(tracker.active_preset(), Some("entry_gate"));
+        let (a_gate, _) = tracker.update(14.0, std::slice::from_ref(&det), &[reg], &cam_cfg);
+        assert!(a_gate[0].zones.contains(&"global_perimeter".to_string()));
+        assert!(a_gate[0].zones.contains(&"entry_gate_zone".to_string()));
+        assert!(!a_gate[0].zones.contains(&"driveway_zone".to_string()));
     }
 }

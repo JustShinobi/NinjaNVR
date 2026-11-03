@@ -263,6 +263,7 @@ pub struct AppState {
     pub cpu_tracker: ProcCpuTracker,
     pub storage_degraded: Arc<std::sync::atomic::AtomicBool>,
     pub storage_error: Arc<std::sync::Mutex<Option<String>>>,
+    pub ptz_active_presets: Arc<RwLock<HashMap<String, Option<String>>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -532,7 +533,10 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
             "/{camera}/recordings/summary",
             get(api_camera_recordings_summary),
         )
-        .route("/{camera}/ptz/info", get(api_empty_object))
+        .route("/{camera}/ptz/info", get(api_camera_ptz_info))
+        .route("/{camera}/ptz/move", post(api_camera_ptz_move))
+        .route("/{camera}/ptz/stop", post(api_camera_ptz_stop))
+        .route("/{camera}/ptz/preset", post(api_camera_ptz_preset))
         .route(
             "/{camera}/state",
             get(api_camera_state_get).post(api_camera_state_set),
@@ -5161,6 +5165,949 @@ async fn api_empty_object() -> Json<Value> {
     Json(json!({}))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnvifPresetItem {
+    pub token: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OnvifPtzStatus {
+    pub pan: f32,
+    pub tilt: f32,
+    pub zoom: f32,
+    pub move_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Tolerantly parses an ONVIF float string (such as `"+0.5000000"`, `"-0.25"`, `"0,5"`, or malformed text)
+/// into a finite `f32` clamped to `[min, max]`, returning `default` instead of panicking on invalid input.
+pub fn parse_onvif_float(raw: &str, min: f32, max: f32, default: f32) -> f32 {
+    let cleaned = raw.trim().trim_start_matches('+').replace(',', ".");
+    match cleaned.parse::<f32>() {
+        Ok(v) if v.is_finite() => v.clamp(min, max),
+        _ => default,
+    }
+}
+
+fn xml_escape_simple(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+pub fn resolve_onvif_ptz_endpoint(onvif: &ninjanvr_config::OnvifCameraConfig) -> Option<String> {
+    let host_raw = onvif.host.as_deref()?.trim();
+    if host_raw.is_empty() {
+        return None;
+    }
+    if host_raw.starts_with("http://") || host_raw.starts_with("https://") {
+        let trimmed = host_raw.trim_end_matches('/');
+        let after_scheme = trimmed.split_once("://").map(|(_, r)| r).unwrap_or("");
+        if after_scheme.contains('/') {
+            return Some(trimmed.to_string());
+        }
+        return Some(format!("{trimmed}/onvif/ptz_service"));
+    }
+    if host_raw.contains(':') && !host_raw.ends_with(']') {
+        Some(format!("http://{host_raw}/onvif/ptz_service"))
+    } else {
+        Some(format!(
+            "http://{host_raw}:{}/onvif/ptz_service",
+            onvif.port
+        ))
+    }
+}
+
+pub fn build_onvif_soap_envelope(
+    body_xml: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let header_xml = if let Some(u) = user.map(str::trim).filter(|s| !s.is_empty()) {
+        let pw = password.unwrap_or("");
+        format!(
+            "<s:Header><wsse:Security xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\"><wsse:UsernameToken><wsse:Username>{}</wsse:Username><wsse:Password>{}</wsse:Password></wsse:UsernameToken></wsse:Security></s:Header>",
+            xml_escape_simple(u),
+            xml_escape_simple(pw)
+        )
+    } else {
+        "<s:Header/>".to_string()
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:tptz=\"http://www.onvif.org/ver20/ptz/wsdl\" xmlns:tt=\"http://www.onvif.org/ver10/schema\">{header_xml}<s:Body>{body_xml}</s:Body></s:Envelope>"
+    )
+}
+
+pub fn build_onvif_continuous_move_soap(
+    profile_token: &str,
+    pan: f32,
+    tilt: f32,
+    zoom: f32,
+    timeout_sec: u64,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let p = pan.clamp(-1.0, 1.0);
+    let t = tilt.clamp(-1.0, 1.0);
+    let z = zoom.clamp(-1.0, 1.0);
+    let t_sec = timeout_sec.clamp(1, 60);
+    let body = format!(
+        "<tptz:ContinuousMove><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:Velocity><tt:PanTilt x=\"{p:.4}\" y=\"{t:.4}\"/><tt:Zoom x=\"{z:.4}\"/></tptz:Velocity><tptz:Timeout>PT{t_sec}S</tptz:Timeout></tptz:ContinuousMove>",
+        xml_escape_simple(profile_token)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn build_onvif_relative_move_soap(
+    profile_token: &str,
+    pan: f32,
+    tilt: f32,
+    zoom: f32,
+    speed: Option<f32>,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let p = pan.clamp(-1.0, 1.0);
+    let t = tilt.clamp(-1.0, 1.0);
+    let z = zoom.clamp(-1.0, 1.0);
+    let speed_xml = if let Some(spd) = speed {
+        let s = spd.clamp(0.05, 1.0);
+        format!(
+            "<tptz:Speed><tt:PanTilt x=\"{s:.4}\" y=\"{s:.4}\"/><tt:Zoom x=\"{s:.4}\"/></tptz:Speed>"
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<tptz:RelativeMove><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:Translation><tt:PanTilt x=\"{p:.4}\" y=\"{t:.4}\"/><tt:Zoom x=\"{z:.4}\"/></tptz:Translation>{speed_xml}</tptz:RelativeMove>",
+        xml_escape_simple(profile_token)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn build_onvif_stop_soap(
+    profile_token: &str,
+    pan_tilt: bool,
+    zoom: bool,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let body = format!(
+        "<tptz:Stop><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:PanTilt>{pan_tilt}</tptz:PanTilt><tptz:Zoom>{zoom}</tptz:Zoom></tptz:Stop>",
+        xml_escape_simple(profile_token)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn build_onvif_goto_preset_soap(
+    profile_token: &str,
+    preset_token: &str,
+    speed: Option<f32>,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let speed_xml = if let Some(spd) = speed {
+        let s = spd.clamp(0.05, 1.0);
+        format!(
+            "<tptz:Speed><tt:PanTilt x=\"{s:.4}\" y=\"{s:.4}\"/><tt:Zoom x=\"{s:.4}\"/></tptz:Speed>"
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<tptz:GotoPreset><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:PresetToken>{}</tptz:PresetToken>{speed_xml}</tptz:GotoPreset>",
+        xml_escape_simple(profile_token),
+        xml_escape_simple(preset_token)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn build_onvif_get_presets_soap(
+    profile_token: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let body = format!(
+        "<tptz:GetPresets><tptz:ProfileToken>{}</tptz:ProfileToken></tptz:GetPresets>",
+        xml_escape_simple(profile_token)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn build_onvif_get_status_soap(
+    profile_token: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let body = format!(
+        "<tptz:GetStatus><tptz:ProfileToken>{}</tptz:ProfileToken></tptz:GetStatus>",
+        xml_escape_simple(profile_token)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+fn extract_xml_attr<'a>(tag_fragment: &'a str, attr_name: &str) -> Option<&'a str> {
+    for quote in ['"', '\''] {
+        let pattern = format!("{attr_name}={quote}");
+        if let Some(start_idx) = tag_fragment.find(&pattern) {
+            let val_start = start_idx + pattern.len();
+            if let Some(end_rel) = tag_fragment[val_start..].find(quote) {
+                return Some(&tag_fragment[val_start..val_start + end_rel]);
+            }
+        }
+    }
+    None
+}
+
+fn extract_xml_element_text<'a>(xml: &'a str, local_name: &str) -> Option<&'a str> {
+    let mut cursor = 0usize;
+    while let Some(lt_rel) = xml[cursor..].find('<') {
+        let tag_start = cursor + lt_rel;
+        if xml[tag_start..].starts_with("<!--") || xml[tag_start..].starts_with("</") {
+            cursor = tag_start + 2;
+            continue;
+        }
+        let Some(gt_rel) = xml[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + gt_rel;
+        let header = &xml[tag_start + 1..tag_end];
+        let tag_token = header.split_whitespace().next().unwrap_or("");
+        let tag_clean = tag_token.trim_end_matches('/');
+        let candidate_local = tag_clean
+            .rsplit_once(':')
+            .map(|(_, l)| l)
+            .unwrap_or(tag_clean);
+        if candidate_local.eq_ignore_ascii_case(local_name) && !header.ends_with('/') {
+            let content_start = tag_end + 1;
+            let close_pat_colon = format!(":{candidate_local}>");
+            let close_pat_plain = format!("</{candidate_local}>");
+            if let Some(end_rel) = xml[content_start..]
+                .find(&close_pat_colon)
+                .and_then(|pos| xml[content_start..content_start + pos].rfind("</"))
+                .or_else(|| xml[content_start..].find(&close_pat_plain))
+            {
+                return Some(xml[content_start..content_start + end_rel].trim());
+            }
+        }
+        cursor = tag_end + 1;
+    }
+    None
+}
+
+pub fn extract_onvif_soap_fault(xml: &str) -> Option<String> {
+    let has_fault = xml.contains(":Fault") || xml.contains("<Fault");
+    if !has_fault {
+        return None;
+    }
+    if let Some(text) = extract_xml_element_text(xml, "Text")
+        .or_else(|| extract_xml_element_text(xml, "faultstring"))
+        .or_else(|| extract_xml_element_text(xml, "Reason"))
+        .filter(|s| !s.is_empty())
+    {
+        return Some(text.to_string());
+    }
+    Some("ONVIF SOAP Fault".to_string())
+}
+
+pub fn parse_onvif_presets_xml(xml: &str) -> Vec<OnvifPresetItem> {
+    let mut presets = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(lt_rel) = xml[cursor..].find('<') {
+        let tag_start = cursor + lt_rel;
+        let Some(gt_rel) = xml[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + gt_rel;
+        let header = &xml[tag_start + 1..tag_end];
+        let tag_token = header.split_whitespace().next().unwrap_or("");
+        let local_name = tag_token
+            .trim_end_matches('/')
+            .rsplit_once(':')
+            .map(|(_, l)| l)
+            .unwrap_or(tag_token.trim_end_matches('/'));
+        if local_name.eq_ignore_ascii_case("Preset") && !header.starts_with('/') {
+            let token_opt = extract_xml_attr(header, "token").map(str::trim);
+            if header.ends_with('/') {
+                if let Some(tok) = token_opt.filter(|s| !s.is_empty()) {
+                    presets.push(OnvifPresetItem {
+                        token: tok.to_string(),
+                        name: tok.to_string(),
+                    });
+                }
+                cursor = tag_end + 1;
+                continue;
+            }
+            let content_start = tag_end + 1;
+            let close_idx = xml[content_start..]
+                .find(":Preset>")
+                .and_then(|pos| xml[content_start..content_start + pos].rfind("</"))
+                .or_else(|| xml[content_start..].find("</Preset>"))
+                .unwrap_or(xml.len() - content_start);
+            let inner = &xml[content_start..content_start + close_idx];
+            let name_opt = extract_xml_element_text(inner, "Name").map(str::trim);
+            let token_elem = extract_xml_element_text(inner, "token").map(str::trim);
+            let resolved_token = token_opt
+                .or(token_elem)
+                .or(name_opt)
+                .filter(|s| !s.is_empty());
+            if let Some(tok) = resolved_token {
+                let resolved_name = name_opt.filter(|s| !s.is_empty()).unwrap_or(tok);
+                presets.push(OnvifPresetItem {
+                    token: tok.to_string(),
+                    name: resolved_name.to_string(),
+                });
+            }
+            cursor = (content_start + close_idx).min(xml.len());
+        } else {
+            cursor = tag_end + 1;
+        }
+    }
+    presets
+}
+
+pub fn parse_onvif_status_xml(xml: &str) -> OnvifPtzStatus {
+    let mut pan = 0.0f32;
+    let mut tilt = 0.0f32;
+    let mut zoom = 0.0f32;
+
+    let mut cursor = 0usize;
+    while let Some(lt_rel) = xml[cursor..].find('<') {
+        let tag_start = cursor + lt_rel;
+        let Some(gt_rel) = xml[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + gt_rel;
+        let header = &xml[tag_start + 1..tag_end];
+        let tag_token = header.split_whitespace().next().unwrap_or("");
+        let local_name = tag_token
+            .trim_end_matches('/')
+            .rsplit_once(':')
+            .map(|(_, l)| l)
+            .unwrap_or(tag_token.trim_end_matches('/'));
+        if local_name.eq_ignore_ascii_case("PanTilt") {
+            if let Some(x_str) = extract_xml_attr(header, "x") {
+                pan = parse_onvif_float(x_str, -1.0, 1.0, 0.0);
+            }
+            if let Some(y_str) = extract_xml_attr(header, "y") {
+                tilt = parse_onvif_float(y_str, -1.0, 1.0, 0.0);
+            }
+        } else if local_name.eq_ignore_ascii_case("Zoom")
+            && let Some(x_str) = extract_xml_attr(header, "x")
+        {
+            zoom = parse_onvif_float(x_str, 0.0, 1.0, 0.0);
+        }
+        cursor = tag_end + 1;
+    }
+
+    let move_status = extract_xml_element_text(xml, "PanTilt")
+        .or_else(|| extract_xml_element_text(xml, "MoveStatus"))
+        .filter(|s| !s.is_empty() && !s.contains('<'))
+        .unwrap_or("IDLE")
+        .to_ascii_uppercase();
+    let error = extract_xml_element_text(xml, "Error")
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("NoError"))
+        .map(str::to_string);
+
+    OnvifPtzStatus {
+        pan,
+        tilt,
+        zoom,
+        move_status,
+        error,
+    }
+}
+
+async fn send_onvif_soap_request(
+    client: &reqwest::Client,
+    endpoint: &str,
+    action: &str,
+    soap_xml: String,
+    user: Option<&str>,
+    password: Option<&str>,
+    timeout: std::time::Duration,
+) -> std::result::Result<String, (StatusCode, String)> {
+    let mut req = client
+        .post(endpoint)
+        .timeout(timeout)
+        .header(
+            header::CONTENT_TYPE,
+            format!(
+                "application/soap+xml; charset=utf-8; action=\"http://www.onvif.org/ver20/ptz/wsdl/{action}\""
+            ),
+        )
+        .body(soap_xml);
+    if let Some(u) = user.map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.basic_auth(u, password);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(err) if err.is_timeout() => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("ONVIF {action} request timed out"),
+            ));
+        }
+        Err(err) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("ONVIF {action} request failed: {err}"),
+            ));
+        }
+    };
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if let Some(fault_reason) = extract_onvif_soap_fault(&body_text) {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("ONVIF {action} fault: {fault_reason}"),
+        ));
+    }
+    if !status.is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("ONVIF {action} returned HTTP {}", status.as_u16()),
+        ));
+    }
+    Ok(body_text)
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PtzInfoQueryParams {
+    pub timeout_ms: Option<u64>,
+    pub profile_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PtzMoveBody {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub pan: Option<f32>,
+    #[serde(default)]
+    pub tilt: Option<f32>,
+    #[serde(default)]
+    pub zoom: Option<f32>,
+    #[serde(default)]
+    pub speed: Option<f32>,
+    #[serde(default)]
+    pub timeout_sec: Option<u64>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub profile_token: Option<String>,
+}
+
+impl PtzMoveBody {
+    pub fn resolve_vectors(&self) -> (f32, f32, f32) {
+        let spd = self.speed.unwrap_or(0.5).clamp(0.05, 1.0);
+        let dir = self
+            .action
+            .as_deref()
+            .or(self.direction.as_deref())
+            .map(|s| s.trim().to_ascii_lowercase());
+        let (dir_pan, dir_tilt, dir_zoom) = match dir.as_deref() {
+            Some("left" | "pan_left") => (-spd, 0.0, 0.0),
+            Some("right" | "pan_right") => (spd, 0.0, 0.0),
+            Some("up" | "tilt_up") => (0.0, spd, 0.0),
+            Some("down" | "tilt_down") => (0.0, -spd, 0.0),
+            Some("up_left") => (-spd, spd, 0.0),
+            Some("up_right") => (spd, spd, 0.0),
+            Some("down_left") => (-spd, -spd, 0.0),
+            Some("down_right") => (spd, -spd, 0.0),
+            Some("zoom_in" | "in") => (0.0, 0.0, spd),
+            Some("zoom_out" | "out") => (0.0, 0.0, -spd),
+            _ => (0.0, 0.0, 0.0),
+        };
+        let pan = self.pan.unwrap_or(dir_pan).clamp(-1.0, 1.0);
+        let tilt = self.tilt.unwrap_or(dir_tilt).clamp(-1.0, 1.0);
+        let zoom = self.zoom.unwrap_or(dir_zoom).clamp(-1.0, 1.0);
+        (pan, tilt, zoom)
+    }
+
+    pub fn is_relative(&self) -> bool {
+        self.mode
+            .as_deref()
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("relative"))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PtzStopBody {
+    #[serde(default = "default_true")]
+    pub pan_tilt: bool,
+    #[serde(default = "default_true")]
+    pub zoom: bool,
+    #[serde(default)]
+    pub profile_token: Option<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+impl Default for PtzStopBody {
+    fn default() -> Self {
+        Self {
+            pan_tilt: true,
+            zoom: true,
+            profile_token: None,
+            timeout_ms: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PtzPresetBody {
+    #[serde(default, alias = "token", alias = "preset_token", alias = "name")]
+    pub preset: String,
+    #[serde(default)]
+    pub speed: Option<f32>,
+    #[serde(default)]
+    pub profile_token: Option<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+async fn api_camera_ptz_info(
+    State(state): State<AppState>,
+    AxumPath(camera): AxumPath<String>,
+    Query(q): Query<PtzInfoQueryParams>,
+) -> Response {
+    let (cam_opt, active_preset) = {
+        let cfg = state.config.read().await;
+        let cam = cfg.cameras.get(&camera).cloned();
+        let active = state
+            .ptz_active_presets
+            .read()
+            .await
+            .get(&camera)
+            .cloned()
+            .flatten()
+            .or_else(|| {
+                cam.as_ref()
+                    .and_then(|c| c.onvif.return_preset.clone())
+                    .filter(|s| !s.trim().is_empty())
+            });
+        (cam, active)
+    };
+
+    let Some(cam_cfg) = cam_opt else {
+        return Json(json!({
+            "enabled": false,
+            "camera": camera,
+            "features": [],
+            "presets": [],
+            "preset_names": [],
+            "active_preset": Value::Null
+        }))
+        .into_response();
+    };
+
+    let mut fallback_presets: Vec<OnvifPresetItem> = Vec::new();
+    if let Some(ret_p) = cam_cfg
+        .onvif
+        .return_preset
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        fallback_presets.push(OnvifPresetItem {
+            token: ret_p.to_string(),
+            name: ret_p.to_string(),
+        });
+    }
+    for zcfg in cam_cfg.zones.values() {
+        if let Some(zp) = zcfg
+            .preset
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && !fallback_presets
+                .iter()
+                .any(|p| p.token == zp || p.name == zp)
+        {
+            fallback_presets.push(OnvifPresetItem {
+                token: zp.to_string(),
+                name: zp.to_string(),
+            });
+        }
+    }
+
+    let Some(endpoint) = resolve_onvif_ptz_endpoint(&cam_cfg.onvif) else {
+        let preset_names: Vec<String> = fallback_presets.iter().map(|p| p.name.clone()).collect();
+        return Json(json!({
+            "enabled": false,
+            "camera": camera,
+            "features": [],
+            "presets": fallback_presets,
+            "preset_names": preset_names,
+            "active_preset": active_preset,
+            "autotracking": cam_cfg.onvif.autotracking
+        }))
+        .into_response();
+    };
+
+    let timeout = match q.timeout_ms {
+        Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
+        None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 30)),
+    };
+    let profile_token = q.profile_token.as_deref().unwrap_or("Profile_1");
+    let user = cam_cfg.onvif.user.as_deref();
+    let pass = cam_cfg.onvif.password.as_deref();
+
+    let presets_soap = build_onvif_get_presets_soap(profile_token, user, pass);
+    let status_soap = build_onvif_get_status_soap(profile_token, user, pass);
+
+    let presets_res = send_onvif_soap_request(
+        &state.http_client,
+        &endpoint,
+        "GetPresets",
+        presets_soap,
+        user,
+        pass,
+        timeout,
+    )
+    .await;
+    let status_res = send_onvif_soap_request(
+        &state.http_client,
+        &endpoint,
+        "GetStatus",
+        status_soap,
+        user,
+        pass,
+        timeout,
+    )
+    .await;
+
+    let mut merged_presets = match &presets_res {
+        Ok(xml) => parse_onvif_presets_xml(xml),
+        Err(_) => Vec::new(),
+    };
+    for fp in fallback_presets {
+        if !merged_presets
+            .iter()
+            .any(|p| p.token == fp.token || p.name == fp.name)
+        {
+            merged_presets.push(fp);
+        }
+    }
+    let preset_names: Vec<String> = merged_presets.iter().map(|p| p.name.clone()).collect();
+
+    let (status_obj, online, err_opt) = match (presets_res, status_res) {
+        (_, Ok(status_xml)) => (parse_onvif_status_xml(&status_xml), true, None),
+        (Ok(_), Err((_, err_msg))) => (
+            OnvifPtzStatus {
+                pan: 0.0,
+                tilt: 0.0,
+                zoom: 0.0,
+                move_status: "IDLE".to_string(),
+                error: Some(err_msg.clone()),
+            },
+            true,
+            Some(err_msg),
+        ),
+        (Err((_, err_a)), Err((_, _))) => (
+            OnvifPtzStatus {
+                pan: 0.0,
+                tilt: 0.0,
+                zoom: 0.0,
+                move_status: "ERROR".to_string(),
+                error: Some(err_a.clone()),
+            },
+            false,
+            Some(err_a),
+        ),
+    };
+
+    let mut features = vec!["pt", "zoom", "pt-r", "zoom-r", "presets"];
+    if cam_cfg.onvif.autotracking {
+        features.push("autotracking");
+    }
+
+    Json(json!({
+        "enabled": true,
+        "online": online,
+        "camera": camera,
+        "host": cam_cfg.onvif.host,
+        "port": cam_cfg.onvif.port,
+        "autotracking": cam_cfg.onvif.autotracking,
+        "return_preset": cam_cfg.onvif.return_preset,
+        "active_preset": active_preset,
+        "features": features,
+        "presets": merged_presets,
+        "preset_names": preset_names,
+        "status": status_obj,
+        "error": err_opt
+    }))
+    .into_response()
+}
+
+async fn api_camera_ptz_move(
+    State(state): State<AppState>,
+    AxumPath(camera): AxumPath<String>,
+    Json(body): Json<PtzMoveBody>,
+) -> Response {
+    let cam_opt = { state.config.read().await.cameras.get(&camera).cloned() };
+    let Some(cam_cfg) = cam_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
+        )
+            .into_response();
+    };
+    let Some(endpoint) = resolve_onvif_ptz_endpoint(&cam_cfg.onvif) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": format!("ONVIF PTZ is not configured for camera '{camera}'") })),
+        )
+            .into_response();
+    };
+
+    // Moving the camera via ContinuousMove or RelativeMove clears active_preset until GotoPreset completes
+    state
+        .ptz_active_presets
+        .write()
+        .await
+        .insert(camera.clone(), None);
+
+    let (pan, tilt, zoom) = body.resolve_vectors();
+    let is_rel = body.is_relative();
+    let op_name = if is_rel {
+        "RelativeMove"
+    } else {
+        "ContinuousMove"
+    };
+    let profile_token = body.profile_token.as_deref().unwrap_or("Profile_1");
+    let user = cam_cfg.onvif.user.as_deref();
+    let pass = cam_cfg.onvif.password.as_deref();
+    let soap_xml = if is_rel {
+        build_onvif_relative_move_soap(profile_token, pan, tilt, zoom, body.speed, user, pass)
+    } else {
+        let move_timeout = body.timeout_sec.unwrap_or(cam_cfg.onvif.timeout_sec);
+        build_onvif_continuous_move_soap(profile_token, pan, tilt, zoom, move_timeout, user, pass)
+    };
+    let timeout = match body.timeout_ms {
+        Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
+        None => std::time::Duration::from_secs(
+            body.timeout_sec
+                .unwrap_or(cam_cfg.onvif.timeout_sec)
+                .clamp(1, 30),
+        ),
+    };
+
+    match send_onvif_soap_request(
+        &state.http_client,
+        &endpoint,
+        op_name,
+        soap_xml,
+        user,
+        pass,
+        timeout,
+    )
+    .await
+    {
+        Ok(_) => Json(json!({
+            "success": true,
+            "camera": camera,
+            "operation": op_name,
+            "pan": pan,
+            "tilt": tilt,
+            "zoom": zoom,
+            "active_preset": Value::Null
+        }))
+        .into_response(),
+        Err((status, err_msg)) => (
+            status,
+            Json(json!({
+                "success": false,
+                "camera": camera,
+                "operation": op_name,
+                "error": err_msg,
+                "active_preset": Value::Null
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_camera_ptz_stop(
+    State(state): State<AppState>,
+    AxumPath(camera): AxumPath<String>,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let body: PtzStopBody = if body_bytes.is_empty() {
+        PtzStopBody::default()
+    } else {
+        serde_json::from_slice(&body_bytes).unwrap_or_default()
+    };
+
+    let cam_opt = { state.config.read().await.cameras.get(&camera).cloned() };
+    let Some(cam_cfg) = cam_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
+        )
+            .into_response();
+    };
+    let Some(endpoint) = resolve_onvif_ptz_endpoint(&cam_cfg.onvif) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": format!("ONVIF PTZ is not configured for camera '{camera}'") })),
+        )
+            .into_response();
+    };
+
+    let profile_token = body.profile_token.as_deref().unwrap_or("Profile_1");
+    let user = cam_cfg.onvif.user.as_deref();
+    let pass = cam_cfg.onvif.password.as_deref();
+    let soap_xml = build_onvif_stop_soap(profile_token, body.pan_tilt, body.zoom, user, pass);
+    let timeout = match body.timeout_ms {
+        Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
+        None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 30)),
+    };
+    let active_preset = state
+        .ptz_active_presets
+        .read()
+        .await
+        .get(&camera)
+        .cloned()
+        .flatten();
+
+    match send_onvif_soap_request(
+        &state.http_client,
+        &endpoint,
+        "Stop",
+        soap_xml,
+        user,
+        pass,
+        timeout,
+    )
+    .await
+    {
+        Ok(_) => Json(json!({
+            "success": true,
+            "camera": camera,
+            "operation": "Stop",
+            "pan_tilt": body.pan_tilt,
+            "zoom": body.zoom,
+            "active_preset": active_preset
+        }))
+        .into_response(),
+        Err((status, err_msg)) => (
+            status,
+            Json(json!({
+                "success": false,
+                "camera": camera,
+                "operation": "Stop",
+                "error": err_msg,
+                "active_preset": active_preset
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_camera_ptz_preset(
+    State(state): State<AppState>,
+    AxumPath(camera): AxumPath<String>,
+    Json(body): Json<PtzPresetBody>,
+) -> Response {
+    let preset_token = body.preset.trim();
+    if preset_token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Preset token/name is required" })),
+        )
+            .into_response();
+    }
+
+    let cam_opt = { state.config.read().await.cameras.get(&camera).cloned() };
+    let Some(cam_cfg) = cam_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
+        )
+            .into_response();
+    };
+    let Some(endpoint) = resolve_onvif_ptz_endpoint(&cam_cfg.onvif) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": format!("ONVIF PTZ is not configured for camera '{camera}'") })),
+        )
+            .into_response();
+    };
+
+    let profile_token = body.profile_token.as_deref().unwrap_or("Profile_1");
+    let user = cam_cfg.onvif.user.as_deref();
+    let pass = cam_cfg.onvif.password.as_deref();
+    let soap_xml =
+        build_onvif_goto_preset_soap(profile_token, preset_token, body.speed, user, pass);
+    let timeout = match body.timeout_ms {
+        Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
+        None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 30)),
+    };
+
+    match send_onvif_soap_request(
+        &state.http_client,
+        &endpoint,
+        "GotoPreset",
+        soap_xml,
+        user,
+        pass,
+        timeout,
+    )
+    .await
+    {
+        Ok(_) => {
+            state
+                .ptz_active_presets
+                .write()
+                .await
+                .insert(camera.clone(), Some(preset_token.to_string()));
+            Json(json!({
+                "success": true,
+                "camera": camera,
+                "operation": "GotoPreset",
+                "preset": preset_token,
+                "active_preset": preset_token
+            }))
+            .into_response()
+        }
+        Err((status, err_msg)) => {
+            state
+                .ptz_active_presets
+                .write()
+                .await
+                .insert(camera.clone(), None);
+            (
+                status,
+                Json(json!({
+                    "success": false,
+                    "camera": camera,
+                    "operation": "GotoPreset",
+                    "error": err_msg,
+                    "active_preset": Value::Null
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct SetCameraStateBody {
     pub enabled: Option<bool>,
@@ -5803,6 +6750,21 @@ pub async fn new_app_state(
         web_dir
     };
 
+    let mut initial_ptz_presets = HashMap::new();
+    {
+        let cfg_guard = shared_cfg.read().await;
+        for (cam_name, cam_cfg) in &cfg_guard.cameras {
+            let init_preset = cam_cfg
+                .onvif
+                .return_preset
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            initial_ptz_presets.insert(cam_name.clone(), init_preset);
+        }
+    }
+
     let state = AppState {
         config: shared_cfg,
         db,
@@ -5824,6 +6786,7 @@ pub async fn new_app_state(
         cpu_tracker: ProcCpuTracker::default(),
         storage_degraded,
         storage_error,
+        ptz_active_presets: Arc::new(RwLock::new(initial_ptz_presets)),
     };
 
     // Seed 30 initial stats_history points so all 30 bars in /system#general and /system#cameras render with zero 0-padding
@@ -8234,5 +9197,325 @@ version: 0.18-0
                 .unwrap();
         assert_eq!(mse_ws_resp.status(), StatusCode::SWITCHING_PROTOCOLS);
         srv_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn onvif_ptz_soap_endpoints_handle_move_stop_preset_status_floats_faults_and_timeouts() {
+        // 1. Unit-verify tolerant float parser on non-standard ONVIF float strings (#24833)
+        assert!((parse_onvif_float("+0.5000000", -1.0, 1.0, 0.0) - 0.5).abs() < 1e-5);
+        assert!((parse_onvif_float(" -0.2500000 ", -1.0, 1.0, 0.0) - (-0.25)).abs() < 1e-5);
+        assert!((parse_onvif_float("+0.7500", 0.0, 1.0, 0.0) - 0.75).abs() < 1e-5);
+        assert!((parse_onvif_float("0,4000", -1.0, 1.0, 0.0) - 0.4).abs() < 1e-5);
+        assert_eq!(parse_onvif_float("NaN", -1.0, 1.0, 0.0), 0.0);
+        assert_eq!(parse_onvif_float("not_a_float", -1.0, 1.0, 0.0), 0.0);
+        assert_eq!(parse_onvif_float("+9.9999", -1.0, 1.0, 0.0), 1.0);
+
+        // 2. Spin up a local mock ONVIF SOAP HTTP server
+        let mode = Arc::new(std::sync::Mutex::new("ok".to_string()));
+        let recorded_actions: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mode_srv = mode.clone();
+        let actions_srv = recorded_actions.clone();
+        let mock_onvif_router = Router::new().route(
+            "/onvif/ptz_service",
+            post(move |body: String| {
+                let mode_now = mode_srv.lock().unwrap().clone();
+                let actions_log = actions_srv.clone();
+                async move {
+                    let action_tag = if body.contains("GetPresets") {
+                        "GetPresets"
+                    } else if body.contains("GetStatus") {
+                        "GetStatus"
+                    } else if body.contains("ContinuousMove") {
+                        "ContinuousMove"
+                    } else if body.contains("RelativeMove") {
+                        "RelativeMove"
+                    } else if body.contains("GotoPreset") {
+                        "GotoPreset"
+                    } else if body.contains("Stop") {
+                        "Stop"
+                    } else {
+                        "Unknown"
+                    };
+                    actions_log.lock().unwrap().push(action_tag.to_string());
+
+                    if mode_now == "timeout" {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    if mode_now == "fault" {
+                        let fault_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+  <s:Body>
+    <s:Fault>
+      <s:Reason><s:Text xml:lang="en">PTZ Hardware Motor Busy</s:Text></s:Reason>
+    </s:Fault>
+  </s:Body>
+</s:Envelope>"#;
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            [(header::CONTENT_TYPE, "application/soap+xml")],
+                            fault_xml.to_string(),
+                        );
+                    }
+
+                    let resp_xml = match action_tag {
+                        "GetPresets" => r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+  <s:Body>
+    <tptz:GetPresetsResponse>
+      <tptz:Preset token="entry_gate">
+        <tt:Name>entry_gate</tt:Name>
+      </tptz:Preset>
+      <tptz:Preset token="driveway">
+        <tt:Name>driveway</tt:Name>
+      </tptz:Preset>
+    </tptz:GetPresetsResponse>
+  </s:Body>
+</s:Envelope>"#,
+                        "GetStatus" => r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+  <s:Body>
+    <tptz:GetStatusResponse>
+      <tptz:PTZStatus>
+        <tt:Position>
+          <tt:PanTilt x="+0.5000000" y="-0.2500000"/>
+          <tt:Zoom x="+0.1500000"/>
+        </tt:Position>
+        <tt:MoveStatus>
+          <tt:PanTilt>IDLE</tt:PanTilt>
+        </tt:MoveStatus>
+      </tptz:PTZStatus>
+    </tptz:GetStatusResponse>
+  </s:Body>
+</s:Envelope>"#,
+                        "ContinuousMove" => r#"<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tptz:ContinuousMoveResponse/></s:Body></s:Envelope>"#,
+                        "RelativeMove" => r#"<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tptz:RelativeMoveResponse/></s:Body></s:Envelope>"#,
+                        "Stop" => r#"<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tptz:StopResponse/></s:Body></s:Envelope>"#,
+                        "GotoPreset" => r#"<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tptz:GotoPresetResponse/></s:Body></s:Envelope>"#,
+                        _ => r#"<?xml version="1.0" encoding="UTF-8"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body/></s:Envelope>"#,
+                    };
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/soap+xml")],
+                        resp_xml.to_string(),
+                    )
+                }
+            }),
+        );
+
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let mock_handle = tokio::spawn(async move {
+            let _ = axum::serve(mock_listener, mock_onvif_router).await;
+        });
+
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+        let state = &ctx.state;
+
+        // Configure front_door with ONVIF pointing at mock_addr
+        {
+            let mut cfg_guard = state.config.write().await;
+            if let Some(cam) = cfg_guard.cameras.get_mut("front_door") {
+                cam.onvif = ninjanvr_config::OnvifCameraConfig {
+                    host: Some("127.0.0.1".to_string()),
+                    port: mock_addr.port(),
+                    user: Some("admin".to_string()),
+                    password: Some("onvif_pass".to_string()),
+                    autotracking: true,
+                    return_preset: Some("entry_gate".to_string()),
+                    timeout_sec: 2,
+                };
+            }
+        }
+        state
+            .ptz_active_presets
+            .write()
+            .await
+            .insert("front_door".to_string(), Some("entry_gate".to_string()));
+
+        // A. GET /api/front_door/ptz/info parses GetPresets & GetStatus (+0.5000000 floats)
+        let resp_info = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/ptz/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_info.status(), StatusCode::OK);
+        let info_json: Value =
+            serde_json::from_slice(&to_bytes(resp_info.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(info_json["enabled"], true);
+        assert_eq!(info_json["online"], true);
+        assert_eq!(info_json["active_preset"], "entry_gate");
+        assert_eq!(info_json["preset_names"], json!(["entry_gate", "driveway"]));
+        assert!((info_json["status"]["pan"].as_f64().unwrap() - 0.5).abs() < 1e-4);
+        assert!((info_json["status"]["tilt"].as_f64().unwrap() - (-0.25)).abs() < 1e-4);
+        assert!((info_json["status"]["zoom"].as_f64().unwrap() - 0.15).abs() < 1e-4);
+        assert_eq!(info_json["status"]["move_status"], "IDLE");
+
+        // B. POST /api/front_door/ptz/move (ContinuousMove) clears active_preset
+        let resp_move = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/move")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"mode":"continuous","pan":-0.6,"tilt":0.3,"zoom":0.0}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_move.status(), StatusCode::OK);
+        let move_json: Value =
+            serde_json::from_slice(&to_bytes(resp_move.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(move_json["success"], true);
+        assert_eq!(move_json["operation"], "ContinuousMove");
+        assert!(move_json["active_preset"].is_null());
+
+        // C. POST /api/front_door/ptz/move (RelativeMove)
+        let resp_rel = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/move")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"mode":"relative","action":"zoom_in","speed":0.4}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rel.status(), StatusCode::OK);
+        let rel_json: Value =
+            serde_json::from_slice(&to_bytes(resp_rel.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(rel_json["success"], true);
+        assert_eq!(rel_json["operation"], "RelativeMove");
+
+        // D. POST /api/front_door/ptz/stop
+        let resp_stop = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/stop")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_stop.status(), StatusCode::OK);
+        let stop_json: Value =
+            serde_json::from_slice(&to_bytes(resp_stop.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(stop_json["success"], true);
+        assert_eq!(stop_json["operation"], "Stop");
+
+        // E. POST /api/front_door/ptz/preset (GotoPreset) restores active_preset to "driveway"
+        let resp_preset = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/preset")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"preset":"driveway"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_preset.status(), StatusCode::OK);
+        let preset_json: Value =
+            serde_json::from_slice(&to_bytes(resp_preset.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(preset_json["success"], true);
+        assert_eq!(preset_json["operation"], "GotoPreset");
+        assert_eq!(preset_json["active_preset"], "driveway");
+        assert_eq!(
+            state
+                .ptz_active_presets
+                .read()
+                .await
+                .get("front_door")
+                .and_then(|p| p.as_deref()),
+            Some("driveway")
+        );
+
+        // F. SOAP Fault handling: mock server returns 500 SOAP Fault -> 502 Bad Gateway
+        *mode.lock().unwrap() = "fault".to_string();
+        let resp_fault = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/move")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"action":"left"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_fault.status(), StatusCode::BAD_GATEWAY);
+        let fault_json: Value =
+            serde_json::from_slice(&to_bytes(resp_fault.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(fault_json["success"], false);
+        assert!(
+            fault_json["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("PTZ Hardware Motor Busy")
+        );
+
+        // G. Strict Timeout handling: mock server delays 200ms while timeout_ms is 30ms -> 504 Gateway Timeout
+        *mode.lock().unwrap() = "timeout".to_string();
+        let resp_timeout = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/move")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"mode":"relative","pan":0.1,"tilt":0.0,"timeout_ms":30}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_timeout.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        // H. Recovery after dropped/timed-out RelativeMove packet (#24834)
+        *mode.lock().unwrap() = "ok".to_string();
+        let resp_recover = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/move")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"mode":"relative","pan":0.15,"tilt":-0.05}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_recover.status(), StatusCode::OK);
+
+        let actions = recorded_actions.lock().unwrap().clone();
+        assert!(actions.contains(&"GetPresets".to_string()));
+        assert!(actions.contains(&"GetStatus".to_string()));
+        assert!(actions.contains(&"ContinuousMove".to_string()));
+        assert!(actions.contains(&"RelativeMove".to_string()));
+        assert!(actions.contains(&"Stop".to_string()));
+        assert!(actions.contains(&"GotoPreset".to_string()));
+
+        mock_handle.abort();
     }
 }

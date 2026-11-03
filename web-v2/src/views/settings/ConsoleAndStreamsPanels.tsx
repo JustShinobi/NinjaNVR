@@ -966,6 +966,216 @@ export const ChannelsStreamsSection: React.FC<{
                 </div>
               </div>
 
+              {/* ONVIF PTZ & Resilient Auto-Tracking Configuration */}
+              <div
+                style={{
+                  padding: 10,
+                  background: "var(--bg-canvas)",
+                  border: "1px solid var(--border-hairline)",
+                  borderRadius: 3,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 8,
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                  }}
+                >
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: "var(--text-xs)",
+                      fontWeight: 700,
+                      color: "var(--signal-accent-text)",
+                    }}
+                  >
+                    {isPt
+                      ? "ONVIF PTZ & AUTO-TRACKING RESILIENTE"
+                      : "ONVIF PTZ & RESILIENT AUTO-TRACKING"}
+                  </span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span
+                      className="mono"
+                      style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                    >
+                      {isPt ? "Auto-Tracking:" : "Auto-Tracking:"}
+                    </span>
+                    <ToggleSwitch
+                      checked={Boolean(activeCamCfg.onvif?.autotracking)}
+                      label={`Enable ONVIF Auto-Tracking on ${inspectorCam}`}
+                      onChange={(v) =>
+                        updateDraft((next) => {
+                          const cam = next.cameras[inspectorCam];
+                          if (!cam) return;
+                          cam.onvif = {
+                            port: 80,
+                            timeout_sec: 5,
+                            ...(cam.onvif || {}),
+                            autotracking: v,
+                          };
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1.5fr 0.7fr 0.8fr",
+                    gap: 6,
+                  }}
+                >
+                  <input
+                    className="nvr-input mono"
+                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    placeholder="ONVIF Host / IP (e.g. 192.0.2.50)"
+                    aria-label="ONVIF Host"
+                    value={activeCamCfg.onvif?.host || ""}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      updateDraft((next) => {
+                        const cam = next.cameras[inspectorCam];
+                        if (!cam) return;
+                        cam.onvif = {
+                          port: 80,
+                          timeout_sec: 5,
+                          ...(cam.onvif || {}),
+                          host: val,
+                        };
+                      });
+                    }}
+                  />
+                  <input
+                    type="number"
+                    min={1}
+                    max={65535}
+                    className="nvr-input mono"
+                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    placeholder="Port (80)"
+                    aria-label="ONVIF Port"
+                    value={activeCamCfg.onvif?.port ?? 80}
+                    onChange={(e) => {
+                      const port = Math.max(1, Number(e.target.value) || 80);
+                      updateDraft((next) => {
+                        const cam = next.cameras[inspectorCam];
+                        if (!cam) return;
+                        cam.onvif = {
+                          timeout_sec: 5,
+                          ...(cam.onvif || {}),
+                          port,
+                        };
+                      });
+                    }}
+                  />
+                  <input
+                    type="number"
+                    min={1}
+                    max={30}
+                    className="nvr-input mono"
+                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    placeholder="Timeout (s)"
+                    aria-label="ONVIF Timeout Seconds"
+                    value={activeCamCfg.onvif?.timeout_sec ?? 5}
+                    onChange={(e) => {
+                      const timeout_sec = Math.max(1, Number(e.target.value) || 5);
+                      updateDraft((next) => {
+                        const cam = next.cameras[inspectorCam];
+                        if (!cam) return;
+                        cam.onvif = {
+                          port: 80,
+                          ...(cam.onvif || {}),
+                          timeout_sec,
+                        };
+                      });
+                    }}
+                  />
+                </div>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr 1fr 1fr",
+                    gap: 6,
+                  }}
+                >
+                  <input
+                    className="nvr-input mono"
+                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    placeholder="ONVIF Username"
+                    aria-label="ONVIF Username"
+                    value={activeCamCfg.onvif?.user || ""}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      updateDraft((next) => {
+                        const cam = next.cameras[inspectorCam];
+                        if (!cam) return;
+                        cam.onvif = {
+                          port: 80,
+                          timeout_sec: 5,
+                          ...(cam.onvif || {}),
+                          user: val,
+                        };
+                      });
+                    }}
+                  />
+                  <input
+                    type="password"
+                    className="nvr-input mono"
+                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    placeholder={
+                      activeCamCfg.onvif?.has_password
+                        ? "*** (password saved)"
+                        : "ONVIF Password"
+                    }
+                    aria-label="ONVIF Password"
+                    value={
+                      activeCamCfg.onvif?.password === "***"
+                        ? ""
+                        : activeCamCfg.onvif?.password || ""
+                    }
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      updateDraft((next) => {
+                        const cam = next.cameras[inspectorCam];
+                        if (!cam) return;
+                        cam.onvif = {
+                          port: 80,
+                          timeout_sec: 5,
+                          ...(cam.onvif || {}),
+                          password: val || "***",
+                          clear_password: false,
+                        };
+                      });
+                    }}
+                  />
+                  <input
+                    className="nvr-input mono"
+                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    placeholder="Return Preset (e.g. home)"
+                    aria-label="ONVIF Return Preset"
+                    value={activeCamCfg.onvif?.return_preset || ""}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      updateDraft((next) => {
+                        const cam = next.cameras[inspectorCam];
+                        if (!cam) return;
+                        cam.onvif = {
+                          port: 80,
+                          timeout_sec: 5,
+                          ...(cam.onvif || {}),
+                          return_preset: val,
+                        };
+                      });
+                    }}
+                  />
+                </div>
+              </div>
+
               {/* Visual Stream Probe Summary Cards */}
               <div
                 className="mono"

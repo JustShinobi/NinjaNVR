@@ -6,6 +6,7 @@ import {
   CameraConfig,
   CameraGroupConfig,
   CameraMapPlacement,
+  CameraPtzInfoResponse,
   RecordingSegment,
   ReviewItem,
 } from "../types/nvr";
@@ -157,6 +158,258 @@ function buildFovConeSvgPath(
   )} ${y2.toFixed(1)} Z`;
 }
 
+export function isCameraPtzEnabled(
+  camCfg?: CameraConfig,
+  ptzInfo?: CameraPtzInfoResponse | null
+): boolean {
+  if (ptzInfo?.enabled) return true;
+  return Boolean(camCfg?.onvif?.host && camCfg.onvif.host.trim().length > 0);
+}
+
+export function resolveCameraPtzPresets(
+  camCfg?: CameraConfig,
+  ptzInfo?: CameraPtzInfoResponse | null
+): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const pushUnique = (val?: string | null) => {
+    const clean = val ? val.trim() : "";
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  };
+  for (const p of ptzInfo?.presets || []) {
+    pushUnique(p.token || p.name);
+  }
+  for (const name of ptzInfo?.preset_names || []) {
+    pushUnique(name);
+  }
+  pushUnique(camCfg?.onvif?.return_preset);
+  for (const z of Object.values(camCfg?.zones || {})) {
+    pushUnique(z.preset);
+  }
+  return out;
+}
+
+export function buildPtzMovePayload(
+  direction: "left" | "right" | "up" | "down" | "zoom_in" | "zoom_out",
+  speed = 0.5,
+  mode: "continuous" | "relative" = "continuous"
+): {
+  mode: "continuous" | "relative";
+  action: string;
+  pan: number;
+  tilt: number;
+  zoom: number;
+  speed: number;
+} {
+  const spd = Math.max(0.05, Math.min(1.0, speed));
+  let pan = 0;
+  let tilt = 0;
+  let zoom = 0;
+  if (direction === "left") pan = -spd;
+  else if (direction === "right") pan = spd;
+  else if (direction === "up") tilt = spd;
+  else if (direction === "down") tilt = -spd;
+  else if (direction === "zoom_in") zoom = spd;
+  else if (direction === "zoom_out") zoom = -spd;
+  return { mode, action: direction, pan, tilt, zoom, speed: spd };
+}
+
+export const TacticalPtzHudOverlay: React.FC<{
+  camera: string;
+  cameraConfig?: CameraConfig;
+  ptzInfo?: CameraPtzInfoResponse | null;
+  onPtzUpdate?: (camera: string, nextInfo: CameraPtzInfoResponse) => void;
+}> = ({ camera, cameraConfig, ptzInfo, onPtzUpdate }) => {
+  if (!isCameraPtzEnabled(cameraConfig, ptzInfo)) {
+    return null;
+  }
+
+  const presets = resolveCameraPtzPresets(cameraConfig, ptzInfo);
+  const activePreset =
+    ptzInfo?.active_preset !== undefined
+      ? ptzInfo.active_preset
+      : cameraConfig?.onvif?.return_preset || null;
+
+  const sendMove = async (
+    dir: "left" | "right" | "up" | "down" | "zoom_in" | "zoom_out"
+  ) => {
+    const payload = buildPtzMovePayload(dir, 0.5, "continuous");
+    try {
+      await fetch(`/api/${encodeURIComponent(camera)}/ptz/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(payload),
+      });
+      if (onPtzUpdate) {
+        onPtzUpdate(camera, {
+          ...(ptzInfo || { enabled: true }),
+          active_preset: null,
+        });
+      }
+    } catch {
+      // ignore transient network errors
+    }
+  };
+
+  const sendStop = async () => {
+    try {
+      await fetch(`/api/${encodeURIComponent(camera)}/ptz/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ pan_tilt: true, zoom: true }),
+      });
+    } catch {
+      // ignore
+    }
+  };
+
+  const sendPreset = async (preset: string) => {
+    const clean = preset.trim();
+    if (!clean) return;
+    try {
+      const res = await fetch(`/api/${encodeURIComponent(camera)}/ptz/preset`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ preset: clean }),
+      });
+      if (res.ok && onPtzUpdate) {
+        onPtzUpdate(camera, {
+          ...(ptzInfo || { enabled: true }),
+          active_preset: clean,
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  return (
+    <div
+      className="nvr-ptz-hud mono"
+      aria-label={`${camera} PTZ Controls`}
+      onClick={(e) => e.stopPropagation()}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 3,
+        padding: "2px 5px",
+        background: "rgba(7, 10, 15, 0.88)",
+        border: "1px solid var(--border-strong)",
+        borderRadius: 3,
+        pointerEvents: "auto",
+      }}
+    >
+      <span
+        className="nvr-badge mono"
+        style={{
+          height: 20,
+          padding: "0 5px",
+          fontSize: "var(--text-xs)",
+          color: "var(--signal-accent-text)",
+        }}
+      >
+        PTZ{activePreset ? `:${activePreset}` : ""}
+      </span>
+      <button
+        type="button"
+        className="nvr-btn nvr-tile-action mono"
+        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+        aria-label={`PTZ Pan Left ${camera}`}
+        title="Pan Left"
+        onClick={() => sendMove("left")}
+      >
+        ◀
+      </button>
+      <button
+        type="button"
+        className="nvr-btn nvr-tile-action mono"
+        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+        aria-label={`PTZ Tilt Up ${camera}`}
+        title="Tilt Up"
+        onClick={() => sendMove("up")}
+      >
+        ▲
+      </button>
+      <button
+        type="button"
+        className="nvr-btn nvr-tile-action mono"
+        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+        aria-label={`PTZ Tilt Down ${camera}`}
+        title="Tilt Down"
+        onClick={() => sendMove("down")}
+      >
+        ▼
+      </button>
+      <button
+        type="button"
+        className="nvr-btn nvr-tile-action mono"
+        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+        aria-label={`PTZ Pan Right ${camera}`}
+        title="Pan Right"
+        onClick={() => sendMove("right")}
+      >
+        ▶
+      </button>
+      <button
+        type="button"
+        className="nvr-btn nvr-tile-action mono"
+        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+        aria-label={`PTZ Zoom In ${camera}`}
+        title="Zoom In"
+        onClick={() => sendMove("zoom_in")}
+      >
+        Z+
+      </button>
+      <button
+        type="button"
+        className="nvr-btn nvr-tile-action mono"
+        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+        aria-label={`PTZ Zoom Out ${camera}`}
+        title="Zoom Out"
+        onClick={() => sendMove("zoom_out")}
+      >
+        Z-
+      </button>
+      <button
+        type="button"
+        className="nvr-btn danger nvr-tile-action mono"
+        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+        aria-label={`PTZ Stop ${camera}`}
+        title="Stop PTZ Movement"
+        onClick={() => sendStop()}
+      >
+        ■
+      </button>
+      {presets.length > 0 && (
+        <select
+          className="nvr-select mono"
+          aria-label={`PTZ Preset Selector ${camera}`}
+          style={{ height: 20, padding: "0 4px", fontSize: "var(--text-xs)" }}
+          value={activePreset || ""}
+          onChange={(e) => {
+            if (e.target.value) {
+              sendPreset(e.target.value);
+            }
+          }}
+        >
+          <option value="">Preset...</option>
+          {presets.map((p) => (
+            <option key={p} value={p}>
+              {p}
+            </option>
+          ))}
+        </select>
+      )}
+    </div>
+  );
+};
+
 interface LiveWorkspaceProps {
   cameraNames: string[];
   reviews: ReviewItem[];
@@ -231,7 +484,33 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   });
   const [mapPlacements, setMapPlacements] = useState<Record<string, CameraMapPlacement>>({});
   const [mapSaveStatus, setMapSaveStatus] = useState<string | null>(null);
+  const [ptzInfoByCam, setPtzInfoByCam] = useState<Record<string, CameraPtzInfoResponse>>({});
   const mapSvgRef = useRef<SVGSVGElement | null>(null);
+
+  useEffect(() => {
+    const cams = config?.cameras || {};
+    for (const [camName, camCfg] of Object.entries(cams)) {
+      if (isCameraPtzEnabled(camCfg) && !ptzInfoByCam[camName]) {
+        fetch(`/api/${encodeURIComponent(camName)}/ptz/info`, {
+          credentials: "include",
+        })
+          .then((res) => (res.ok ? res.json() : null))
+          .then((data: CameraPtzInfoResponse | null) => {
+            if (data) {
+              setPtzInfoByCam((prev) => ({ ...prev, [camName]: data }));
+            }
+          })
+          .catch(() => {});
+      }
+    }
+  }, [config?.cameras, ptzInfoByCam]);
+
+  const handlePtzUpdate = (camName: string, nextInfo: CameraPtzInfoResponse) => {
+    setPtzInfoByCam((prev) => ({
+      ...prev,
+      [camName]: { ...(prev[camName] || {}), ...nextInfo },
+    }));
+  };
 
   useEffect(() => {
     if (mapEditMode) return;
@@ -993,6 +1272,12 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   >
                     <Camera size={11} />
                   </a>
+                  <TacticalPtzHudOverlay
+                    camera={cam}
+                    cameraConfig={camCfg}
+                    ptzInfo={ptzInfoByCam[cam]}
+                    onPtzUpdate={handlePtzUpdate}
+                  />
                 </div>
               </div>
             );
@@ -1064,6 +1349,12 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         {activeLabels.join(", ")}
                       </span>
                     )}
+                    <TacticalPtzHudOverlay
+                      camera={cam}
+                      cameraConfig={camCfg}
+                      ptzInfo={ptzInfoByCam[cam]}
+                      onPtzUpdate={handlePtzUpdate}
+                    />
                   </div>
                 </div>
               );
@@ -1203,6 +1494,12 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     {t.live.returnToLive}
                   </button>
                 )}
+                <TacticalPtzHudOverlay
+                  camera={selectedCamera}
+                  cameraConfig={config?.cameras?.[selectedCamera]}
+                  ptzInfo={ptzInfoByCam[selectedCamera]}
+                  onPtzUpdate={handlePtzUpdate}
+                />
               </div>
             </div>
           </div>

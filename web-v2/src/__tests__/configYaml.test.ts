@@ -1,3 +1,5 @@
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, test } from "bun:test";
 import { NinjaConfigResponse } from "../types/nvr";
 import { buildCleanYamlFromDraft } from "../utils/configYaml";
@@ -5,6 +7,12 @@ import {
   formatDetectedAttributePill,
   formatEventLabelWithSubLabel,
 } from "../views/ExploreWorkspace";
+import {
+  TacticalPtzHudOverlay,
+  buildPtzMovePayload,
+  isCameraPtzEnabled,
+  resolveCameraPtzPresets,
+} from "../views/LiveWorkspace";
 import {
   DEFAULT_ATTRIBUTE_LABELS,
   STANDARD_LABELS,
@@ -417,5 +425,153 @@ go2rtc:
         area_px: 2400,
       })
     ).toBe("LICENSE_PLATE 94% · 2400px²");
+  });
+
+  test("serializes camera onvif PTZ settings, restores scrubbed ONVIF password, and serializes zone.preset", () => {
+    const rawYaml = `
+cameras:
+  ptz_gate:
+    enabled: true
+    onvif:
+      host: 192.0.2.90
+      port: 8000
+      user: onvif_admin
+      password: original_onvif_secret_pw
+      autotracking: true
+      return_preset: entry_gate
+      timeout_sec: 6
+`;
+
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      cameras: {
+        ptz_gate: {
+          enabled: true,
+          onvif: {
+            host: "192.0.2.90",
+            port: 8000,
+            user: "onvif_admin",
+            password: "***",
+            has_password: true,
+            autotracking: true,
+            return_preset: "entry_gate",
+            timeout_sec: 6,
+          },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {
+            gate_zone: {
+              coordinates: "0.1,0.1,0.8,0.1,0.8,0.9,0.1,0.9",
+              objects: ["person", "car"],
+              inertia: 3,
+              loitering_time: 2,
+              preset: "entry_gate",
+            },
+          },
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+      },
+    };
+
+    const yamlText = buildCleanYamlFromDraft(draft, rawYaml);
+    expect(yamlText).toContain("onvif:");
+    expect(yamlText).toContain("host: 192.0.2.90");
+    expect(yamlText).toContain("port: 8000");
+    expect(yamlText).toContain("user: onvif_admin");
+    expect(yamlText).toContain("password: original_onvif_secret_pw");
+    expect(yamlText).not.toContain('password: "***"');
+    expect(yamlText).toContain("autotracking: true");
+    expect(yamlText).toContain("return_preset: entry_gate");
+    expect(yamlText).toContain("timeout_sec: 6");
+    expect(yamlText).toContain("preset: entry_gate");
+  });
+
+  test("renders TacticalPtzHudOverlay D-Pad and preset selector on PTZ-enabled cameras", () => {
+    const nonPtzCam = {
+      enabled: true,
+      detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+      motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+      zones: {},
+      record: { enabled: true },
+      snapshots: { enabled: true },
+    };
+    expect(isCameraPtzEnabled(nonPtzCam, null)).toBe(false);
+    expect(
+      renderToStaticMarkup(
+        React.createElement(TacticalPtzHudOverlay, {
+          camera: "fixed_cam",
+          cameraConfig: nonPtzCam,
+        })
+      )
+    ).toBe("");
+
+    const ptzCam = {
+      ...nonPtzCam,
+      onvif: {
+        host: "192.0.2.90",
+        port: 80,
+        autotracking: true,
+        return_preset: "home",
+        timeout_sec: 5,
+      },
+      zones: {
+        gate: {
+          coordinates: "0.1,0.1,0.5,0.1,0.5,0.5,0.1,0.5",
+          preset: "entry_gate",
+        },
+      },
+    };
+    const ptzInfo = {
+      enabled: true,
+      active_preset: "entry_gate",
+      presets: [
+        { token: "entry_gate", name: "entry_gate" },
+        { token: "driveway", name: "driveway" },
+      ],
+    };
+
+    expect(isCameraPtzEnabled(ptzCam, ptzInfo)).toBe(true);
+    expect(resolveCameraPtzPresets(ptzCam, ptzInfo)).toEqual([
+      "entry_gate",
+      "driveway",
+      "home",
+    ]);
+
+    expect(buildPtzMovePayload("left", 0.5, "continuous")).toEqual({
+      mode: "continuous",
+      action: "left",
+      pan: -0.5,
+      tilt: 0,
+      zoom: 0,
+      speed: 0.5,
+    });
+    expect(buildPtzMovePayload("zoom_in", 0.4, "relative")).toEqual({
+      mode: "relative",
+      action: "zoom_in",
+      pan: 0,
+      tilt: 0,
+      zoom: 0.4,
+      speed: 0.4,
+    });
+
+    const hudMarkup = renderToStaticMarkup(
+      React.createElement(TacticalPtzHudOverlay, {
+        camera: "ptz_gate",
+        cameraConfig: ptzCam,
+        ptzInfo,
+      })
+    );
+    expect(hudMarkup).toContain("PTZ:entry_gate");
+    expect(hudMarkup).toContain('aria-label="PTZ Pan Left ptz_gate"');
+    expect(hudMarkup).toContain('aria-label="PTZ Tilt Up ptz_gate"');
+    expect(hudMarkup).toContain('aria-label="PTZ Tilt Down ptz_gate"');
+    expect(hudMarkup).toContain('aria-label="PTZ Pan Right ptz_gate"');
+    expect(hudMarkup).toContain('aria-label="PTZ Zoom In ptz_gate"');
+    expect(hudMarkup).toContain('aria-label="PTZ Zoom Out ptz_gate"');
+    expect(hudMarkup).toContain('aria-label="PTZ Stop ptz_gate"');
+    expect(hudMarkup).toContain('aria-label="PTZ Preset Selector ptz_gate"');
+    expect(hudMarkup).toContain(">driveway</option>");
   });
 });

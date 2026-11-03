@@ -9,6 +9,51 @@ function extractOriginalUrls(rawYaml: string): string[] {
   return matches ? Array.from(new Set(matches)) : [];
 }
 
+/**
+ * Extracts original camera ONVIF passwords from raw YAML so scrubbed `"***"`
+ * passwords in `draft.cameras[cam].onvif.password` can be restored losslessly.
+ */
+function extractOriginalOnvifPasswords(rawYaml: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  const lines = rawYaml.split(/\r?\n/);
+  let inCameras = false;
+  let currentCam = "";
+  let inOnvif = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const indent = line.search(/\S/);
+    if (indent === 0) {
+      inCameras = /^cameras\s*:/.test(trimmed);
+      currentCam = "";
+      inOnvif = false;
+      continue;
+    }
+    if (inCameras && indent === 2) {
+      const m = trimmed.match(/^([a-zA-Z0-9_-]+)\s*:/);
+      currentCam = m ? m[1] : "";
+      inOnvif = false;
+      continue;
+    }
+    if (inCameras && currentCam && indent === 4) {
+      inOnvif = /^onvif\s*:/.test(trimmed);
+      continue;
+    }
+    if (inCameras && currentCam && inOnvif && indent >= 6) {
+      const pwMatch = trimmed.match(/^password\s*:\s*(.+)$/);
+      if (pwMatch) {
+        const rawVal = pwMatch[1].replace(/\s+#.*$/, "").trim();
+        const unquoted = rawVal.replace(/^["']|["']$/g, "");
+        if (unquoted && unquoted !== "***" && unquoted !== "null") {
+          result[currentCam] = unquoted;
+        }
+      }
+    }
+  }
+  return result;
+}
+
 function scrubUrl(input: string): string {
   const schemeIdx = input.indexOf("://");
   if (schemeIdx === -1) return input;
@@ -154,6 +199,7 @@ export function buildCleanYamlFromDraft(
   originalRawYaml: string = ""
 ): string {
   const originals = extractOriginalUrls(originalRawYaml);
+  const originalOnvifPasswords = extractOriginalOnvifPasswords(originalRawYaml);
 
   const streamsOut: Record<string, unknown> = {};
   for (const [sName, sVal] of Object.entries(draft.go2rtc?.streams || {})) {
@@ -267,9 +313,60 @@ export function buildCleanYamlFromDraft(
           cutoff_time: 30,
         },
       },
-      zones: cam.zones || {},
+      zones: Object.fromEntries(
+        Object.entries(cam.zones || {}).map(([zName, zCfg]) => {
+          const cleanPreset = zCfg.preset ? zCfg.preset.trim() : "";
+          return [
+            zName,
+            {
+              coordinates: zCfg.coordinates,
+              ...(zCfg.objects ? { objects: zCfg.objects } : {}),
+              ...(zCfg.inertia !== undefined ? { inertia: zCfg.inertia } : {}),
+              ...(zCfg.loitering_time !== undefined
+                ? { loitering_time: zCfg.loitering_time }
+                : {}),
+              ...(zCfg.min_area !== undefined ? { min_area: zCfg.min_area } : {}),
+              ...(zCfg.max_area !== undefined ? { max_area: zCfg.max_area } : {}),
+              ...(zCfg.min_score !== undefined ? { min_score: zCfg.min_score } : {}),
+              ...(cleanPreset ? { preset: cleanPreset } : {}),
+            },
+          ];
+        })
+      ),
       lines: cam.lines || {},
       privacy_mask: cam.privacy_mask || [],
+      ...(cam.onvif &&
+      ((cam.onvif.host && cam.onvif.host.trim().length > 0) ||
+        (cam.onvif.user && cam.onvif.user.trim().length > 0) ||
+        Boolean(cam.onvif.autotracking) ||
+        (cam.onvif.return_preset && cam.onvif.return_preset.trim().length > 0))
+        ? (() => {
+            const rawPass = cam.onvif.clear_password
+              ? undefined
+              : cam.onvif.password &&
+                cam.onvif.password !== "***" &&
+                cam.onvif.password !== "*"
+              ? cam.onvif.password
+              : originalOnvifPasswords[camName];
+            return {
+              onvif: {
+                ...(cam.onvif.host && cam.onvif.host.trim()
+                  ? { host: cam.onvif.host.trim() }
+                  : {}),
+                port: cam.onvif.port ?? 80,
+                ...(cam.onvif.user && cam.onvif.user.trim()
+                  ? { user: cam.onvif.user.trim() }
+                  : {}),
+                ...(rawPass ? { password: rawPass } : {}),
+                autotracking: Boolean(cam.onvif.autotracking),
+                ...(cam.onvif.return_preset && cam.onvif.return_preset.trim()
+                  ? { return_preset: cam.onvif.return_preset.trim() }
+                  : {}),
+                timeout_sec: cam.onvif.timeout_sec ?? 5,
+              },
+            };
+          })()
+        : {}),
       ...(cam.ui &&
       (cam.ui.order !== undefined || cam.ui.dashboard !== undefined)
         ? {
