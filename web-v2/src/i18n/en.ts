@@ -71,6 +71,10 @@ export const en = {
     exportClip: "Export MP4",
     keyboardHint: "[J/K] Nav · [R] Ack · [E] Clip",
     emptyState: "No review segments match the active filter criteria.",
+    shareLinkBtn: "Share Link",
+    shareCopiedBtn: "Copied!",
+    shareError: "Failed to generate share link",
+    shareManualCopyHint: "Copy URL:",
   },
   explore: {
     title: "TRACKED OBJECT EXPLORER",
@@ -100,6 +104,20 @@ export const en = {
     renameBtn: "Rename",
     deleteBtn: "Delete",
     noExports: "No exported MP4 clips on disk. Use the generator or 1-click export from Live/Review.",
+    activeShareLinks: "Active Share Links",
+    noShareLinks: "No active share links.",
+    showInactiveLinks: "Show revoked/expired",
+    maxViewsUnlimited: "Views: Unlimited",
+    maxViews1: "1 view",
+    maxViews5: "5 views",
+    maxViews25: "25 views",
+    copyLinkBtn: "Copy Link",
+    revokeBtn: "Revoke",
+    statusActive: "ACTIVE",
+    statusRevoked: "REVOKED",
+    statusExpired: "EXPIRED",
+    statusExhausted: "EXHAUSTED",
+    generatedUrlLabel: "Share URL",
   },
   zones: {
     title: "TACTICAL SETTINGS & CONFIGURATION STUDIO",
@@ -209,6 +227,10 @@ export interface TranslationDict {
     exportClip: string;
     keyboardHint: string;
     emptyState: string;
+    shareLinkBtn: string;
+    shareCopiedBtn: string;
+    shareError: string;
+    shareManualCopyHint: string;
   };
   explore: {
     title: string;
@@ -238,6 +260,20 @@ export interface TranslationDict {
     renameBtn: string;
     deleteBtn: string;
     noExports: string;
+    activeShareLinks: string;
+    noShareLinks: string;
+    showInactiveLinks: string;
+    maxViewsUnlimited: string;
+    maxViews1: string;
+    maxViews5: string;
+    maxViews25: string;
+    copyLinkBtn: string;
+    revokeBtn: string;
+    statusActive: string;
+    statusRevoked: string;
+    statusExpired: string;
+    statusExhausted: string;
+    generatedUrlLabel: string;
   };
   zones: {
     title: string;
