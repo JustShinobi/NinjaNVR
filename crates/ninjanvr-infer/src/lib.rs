@@ -121,6 +121,56 @@ struct OrtApiBase {
 type OrtGetApiBaseFn = unsafe extern "C" fn() -> *const OrtApiBase;
 type OrtAppendProviderFn = unsafe extern "C" fn(*mut c_void, c_int) -> *mut c_void;
 
+type OrtGetErrorMessageFn = unsafe extern "C" fn(*const c_void) -> *const c_char;
+type OrtReleaseFn = unsafe extern "C" fn(*mut c_void);
+type OrtCreateEnvFn = unsafe extern "C" fn(c_int, *const c_char, *mut *mut c_void) -> *mut c_void;
+type OrtCreateSessionOptionsFn = unsafe extern "C" fn(*mut *mut c_void) -> *mut c_void;
+type OrtSetThreadsFn = unsafe extern "C" fn(*mut c_void, c_int) -> *mut c_void;
+type OrtSetOptLevelFn = unsafe extern "C" fn(*mut c_void, c_int) -> *mut c_void;
+type OrtCreateSessionFn = unsafe extern "C" fn(
+    *const c_void,
+    *const c_char,
+    *const c_void,
+    *mut *mut c_void,
+) -> *mut c_void;
+type OrtSessionGetTypeInfoFn =
+    unsafe extern "C" fn(*const c_void, usize, *mut *mut c_void) -> *mut c_void;
+type OrtSessionGetNameFn =
+    unsafe extern "C" fn(*const c_void, usize, *mut c_void, *mut *mut c_char) -> *mut c_void;
+type OrtCastTypeInfoToTensorInfoFn =
+    unsafe extern "C" fn(*const c_void, *mut *const c_void) -> *mut c_void;
+type OrtGetTensorElementTypeFn = unsafe extern "C" fn(*const c_void, *mut c_int) -> *mut c_void;
+type OrtGetAllocatorFn = unsafe extern "C" fn(*mut *mut c_void) -> *mut c_void;
+type OrtCreateCpuMemoryInfoFn = unsafe extern "C" fn(c_int, c_int, *mut *mut c_void) -> *mut c_void;
+type OrtCreateTensorWithDataFn = unsafe extern "C" fn(
+    *const c_void,
+    *mut c_void,
+    usize,
+    *const i64,
+    usize,
+    c_int,
+    *mut *mut c_void,
+) -> *mut c_void;
+type OrtRunFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_void,
+    *const *const c_char,
+    *const *const c_void,
+    usize,
+    *const *const c_char,
+    usize,
+    *mut *mut c_void,
+) -> *mut c_void;
+type OrtGetTensorMutableDataFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> *mut c_void;
+type OrtGetTensorTypeAndShapeFn =
+    unsafe extern "C" fn(*const c_void, *mut *mut c_void) -> *mut c_void;
+type OrtGetTensorShapeElementCountFn =
+    unsafe extern "C" fn(*const c_void, *mut usize) -> *mut c_void;
+
+const ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT: c_int = 1;
+const ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8: c_int = 2;
+const ORT_GRAPH_OPT_ENABLE_ALL: c_int = 99;
+
 struct OpenVinoCContext {
     _lib_handle: *mut c_void,
     _core: *mut c_void,
@@ -139,11 +189,43 @@ unsafe impl Send for OpenVinoCContext {}
 
 struct OrtCContext {
     _lib_handle: *mut c_void,
+    vtable: *const *const c_void,
+    env: *mut c_void,
+    session_opts: *mut c_void,
+    session: *mut c_void,
+    mem_info: *mut c_void,
+    input_name: CString,
+    output_name: CString,
+    input_is_u8: bool,
+    in_f32_buf: Vec<f32>,
+    in_u8_buf: Vec<u8>,
     in_bytes: usize,
     out_floats: usize,
 }
 
 unsafe impl Send for OrtCContext {}
+
+impl Drop for OrtCContext {
+    fn drop(&mut self) {
+        if self.vtable.is_null() {
+            return;
+        }
+        unsafe {
+            let vt = std::slice::from_raw_parts(self.vtable, 101);
+            let release = |idx: usize, ptr: *mut c_void| {
+                if !ptr.is_null() && !vt[idx].is_null() {
+                    let f: OrtReleaseFn =
+                        std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[idx]);
+                    f(ptr);
+                }
+            };
+            release(94, self.mem_info);
+            release(95, self.session);
+            release(100, self.session_opts);
+            release(92, self.env);
+        }
+    }
+}
 
 enum InferenceRuntimeBackend {
     OpenVino(OpenVinoCContext),
@@ -713,7 +795,7 @@ impl AiDetectorEngine {
     ) -> Result<(OrtCContext, String)> {
         let lib_path = Self::resolve_ort_c_lib()
             .ok_or_else(|| anyhow!("libonnxruntime.so not found in standard paths"))?;
-        let _model_path = Self::resolve_model_path(configured_model)
+        let model_path = Self::resolve_model_path(configured_model)
             .ok_or_else(|| anyhow!("model file {configured_model} not found"))?;
 
         unsafe {
@@ -742,39 +824,235 @@ impl AiDetectorEngine {
             }
             let _ver = ((*base_ptr).get_version_string)();
 
+            let mut api_ptr = std::ptr::null();
+            for ver in [14u32, 10, 1] {
+                let p = ((*base_ptr).get_api)(ver);
+                if !p.is_null() {
+                    api_ptr = p;
+                    break;
+                }
+            }
+            if api_ptr.is_null() {
+                bail!("OrtApiBase::GetApi returned null");
+            }
+
+            Self::init_ort_session_from_vtable(
+                handle,
+                api_ptr as *const *const c_void,
+                &model_path,
+                device,
+                model_w,
+                model_h,
+            )
+        }
+    }
+
+    unsafe fn init_ort_session_from_vtable(
+        handle: *mut c_void,
+        vtable: *const *const c_void,
+        model_path: &Path,
+        device: &str,
+        model_w: u32,
+        model_h: u32,
+    ) -> Result<(OrtCContext, String)> {
+        unsafe {
+            let vt = std::slice::from_raw_parts(vtable, 101);
+            let check_status = |st: *mut c_void, step: &str| -> Result<()> {
+                if st.is_null() {
+                    return Ok(());
+                }
+                let msg = if !vt[2].is_null() {
+                    let get_msg: OrtGetErrorMessageFn =
+                        std::mem::transmute::<*const c_void, OrtGetErrorMessageFn>(vt[2]);
+                    let m_ptr = get_msg(st);
+                    if m_ptr.is_null() {
+                        "unknown ORT error".to_string()
+                    } else {
+                        CStr::from_ptr(m_ptr).to_string_lossy().into_owned()
+                    }
+                } else {
+                    "ORT status error".to_string()
+                };
+                if !vt[93].is_null() {
+                    let rel: OrtReleaseFn =
+                        std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[93]);
+                    rel(st);
+                }
+                bail!("ONNX Runtime {step} failed: {msg}")
+            };
+
+            let create_env: OrtCreateEnvFn =
+                std::mem::transmute::<*const c_void, OrtCreateEnvFn>(vt[3]);
+            let create_opts: OrtCreateSessionOptionsFn =
+                std::mem::transmute::<*const c_void, OrtCreateSessionOptionsFn>(vt[10]);
+            let set_opt_level: OrtSetOptLevelFn =
+                std::mem::transmute::<*const c_void, OrtSetOptLevelFn>(vt[23]);
+            let set_intra_threads: OrtSetThreadsFn =
+                std::mem::transmute::<*const c_void, OrtSetThreadsFn>(vt[24]);
+            let set_inter_threads: OrtSetThreadsFn =
+                std::mem::transmute::<*const c_void, OrtSetThreadsFn>(vt[25]);
+            let create_session: OrtCreateSessionFn =
+                std::mem::transmute::<*const c_void, OrtCreateSessionFn>(vt[7]);
+            let get_in_type: OrtSessionGetTypeInfoFn =
+                std::mem::transmute::<*const c_void, OrtSessionGetTypeInfoFn>(vt[33]);
+            let get_in_name: OrtSessionGetNameFn =
+                std::mem::transmute::<*const c_void, OrtSessionGetNameFn>(vt[36]);
+            let get_out_name: OrtSessionGetNameFn =
+                std::mem::transmute::<*const c_void, OrtSessionGetNameFn>(vt[37]);
+            let cast_tensor_info: OrtCastTypeInfoToTensorInfoFn =
+                std::mem::transmute::<*const c_void, OrtCastTypeInfoToTensorInfoFn>(vt[55]);
+            let get_elem_type: OrtGetTensorElementTypeFn =
+                std::mem::transmute::<*const c_void, OrtGetTensorElementTypeFn>(vt[60]);
+            let create_cpu_mem: OrtCreateCpuMemoryInfoFn =
+                std::mem::transmute::<*const c_void, OrtCreateCpuMemoryInfoFn>(vt[69]);
+            let get_alloc: OrtGetAllocatorFn =
+                std::mem::transmute::<*const c_void, OrtGetAllocatorFn>(vt[78]);
+
+            let mut env: *mut c_void = std::ptr::null_mut();
+            let log_id = CString::new("ninjanvr").unwrap();
+            check_status(create_env(2, log_id.as_ptr(), &mut env), "CreateEnv")?;
+
+            let mut session_opts: *mut c_void = std::ptr::null_mut();
+            check_status(create_opts(&mut session_opts), "CreateSessionOptions")?;
+            check_status(set_intra_threads(session_opts, 1), "SetIntraOpNumThreads")?;
+            check_status(set_inter_threads(session_opts, 1), "SetInterOpNumThreads")?;
+            check_status(
+                set_opt_level(session_opts, ORT_GRAPH_OPT_ENABLE_ALL),
+                "SetSessionGraphOptimizationLevel",
+            )?;
+
             let mut actual_device = device.to_string();
             let req_upper = device.to_ascii_uppercase();
             if req_upper.starts_with("CUDA") || req_upper == "TENSORRT" || req_upper == "ROCM" {
-                let ep_sym = if req_upper == "TENSORRT" {
-                    "OrtSessionOptionsAppendExecutionProvider_TensorRT"
+                let try_ep = |sym: &str, dev_node_ok: bool| -> bool {
+                    if !dev_node_ok || handle.is_null() {
+                        return false;
+                    }
+                    let Ok(c_ep) = CString::new(sym) else {
+                        return false;
+                    };
+                    let ep_ptr = libc::dlsym(handle, c_ep.as_ptr());
+                    if ep_ptr.is_null() {
+                        return false;
+                    }
+                    let append_fn: OrtAppendProviderFn =
+                        std::mem::transmute::<*mut c_void, OrtAppendProviderFn>(ep_ptr);
+                    let st = append_fn(session_opts, 0);
+                    if st.is_null() {
+                        true
+                    } else {
+                        if !vt[93].is_null() {
+                            let rel: OrtReleaseFn =
+                                std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[93]);
+                            rel(st);
+                        }
+                        false
+                    }
+                };
+                let nv_ok =
+                    Path::new("/dev/nvidia0").exists() || Path::new("/dev/nvidiactl").exists();
+                let rocm_ok = Path::new("/dev/kfd").exists();
+                if req_upper == "TENSORRT" {
+                    if try_ep("OrtSessionOptionsAppendExecutionProvider_TensorRT", nv_ok) {
+                        actual_device = "TensorRT".to_string();
+                    } else if try_ep("OrtSessionOptionsAppendExecutionProvider_CUDA", nv_ok) {
+                        warn!("TensorRT provider unavailable; falling back to CUDA");
+                        actual_device = "CUDA".to_string();
+                    } else {
+                        warn!(
+                            "Requested ONNX Runtime provider '{device}' not available; falling back to CPU"
+                        );
+                        actual_device = "CPU".to_string();
+                    }
                 } else if req_upper == "ROCM" {
-                    "OrtSessionOptionsAppendExecutionProvider_ROCM"
-                } else {
-                    "OrtSessionOptionsAppendExecutionProvider_CUDA"
-                };
-                let c_ep = CString::new(ep_sym).unwrap();
-                let ep_ptr = libc::dlsym(handle, c_ep.as_ptr());
-                let dev_node_ok = if req_upper == "ROCM" {
-                    Path::new("/dev/kfd").exists()
-                } else {
-                    Path::new("/dev/nvidia0").exists() || Path::new("/dev/nvidiactl").exists()
-                };
-                if ep_ptr.is_null() || !dev_node_ok {
+                    if !try_ep("OrtSessionOptionsAppendExecutionProvider_ROCM", rocm_ok) {
+                        warn!(
+                            "Requested ONNX Runtime provider '{device}' not available; falling back to CPU"
+                        );
+                        actual_device = "CPU".to_string();
+                    }
+                } else if !try_ep("OrtSessionOptionsAppendExecutionProvider_CUDA", nv_ok) {
                     warn!(
-                        "Requested ONNX Runtime provider '{device}' not available in container; falling back to CPU"
+                        "Requested ONNX Runtime provider '{device}' not available; falling back to CPU"
                     );
                     actual_device = "CPU".to_string();
-                } else {
-                    let _append_fn: OrtAppendProviderFn =
-                        std::mem::transmute::<*mut c_void, OrtAppendProviderFn>(ep_ptr);
                 }
             }
 
-            let in_bytes = (model_w as usize) * (model_h as usize) * 3 * 4;
+            let c_model = CString::new(model_path.to_string_lossy().as_bytes())?;
+            let mut session: *mut c_void = std::ptr::null_mut();
+            check_status(
+                create_session(env, c_model.as_ptr(), session_opts, &mut session),
+                "CreateSession",
+            )?;
+
+            let mut alloc: *mut c_void = std::ptr::null_mut();
+            check_status(get_alloc(&mut alloc), "GetAllocatorWithDefaultOptions")?;
+
+            let mut in_name_ptr: *mut c_char = std::ptr::null_mut();
+            check_status(
+                get_in_name(session, 0, alloc, &mut in_name_ptr),
+                "SessionGetInputName",
+            )?;
+            let input_name = if in_name_ptr.is_null() {
+                CString::new("images").unwrap()
+            } else {
+                CStr::from_ptr(in_name_ptr).to_owned()
+            };
+
+            let mut out_name_ptr: *mut c_char = std::ptr::null_mut();
+            check_status(
+                get_out_name(session, 0, alloc, &mut out_name_ptr),
+                "SessionGetOutputName",
+            )?;
+            let output_name = if out_name_ptr.is_null() {
+                CString::new("output0").unwrap()
+            } else {
+                CStr::from_ptr(out_name_ptr).to_owned()
+            };
+
+            let mut input_is_u8 = false;
+            let mut type_info: *mut c_void = std::ptr::null_mut();
+            if get_in_type(session, 0, &mut type_info).is_null() && !type_info.is_null() {
+                let mut tensor_info: *const c_void = std::ptr::null();
+                if cast_tensor_info(type_info, &mut tensor_info).is_null() && !tensor_info.is_null()
+                {
+                    let mut elem_ty: c_int = ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+                    if get_elem_type(tensor_info, &mut elem_ty).is_null() {
+                        input_is_u8 = elem_ty == ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+                    }
+                }
+                if !vt[98].is_null() {
+                    let rel_ti: OrtReleaseFn =
+                        std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[98]);
+                    rel_ti(type_info);
+                }
+            }
+
+            let mut mem_info: *mut c_void = std::ptr::null_mut();
+            check_status(create_cpu_mem(0, 0, &mut mem_info), "CreateCpuMemoryInfo")?;
+
+            let num_elems = (model_w as usize) * (model_h as usize) * 3;
+            let in_bytes = if input_is_u8 {
+                num_elems
+            } else {
+                num_elems * 4
+            };
             let out_floats = 84 * 8400;
+
             Ok((
                 OrtCContext {
                     _lib_handle: handle,
+                    vtable,
+                    env,
+                    session_opts,
+                    session,
+                    mem_info,
+                    input_name,
+                    output_name,
+                    input_is_u8,
+                    in_f32_buf: vec![0.0f32; num_elems],
+                    in_u8_buf: vec![0u8; num_elems],
                     in_bytes,
                     out_floats,
                 },
@@ -1038,56 +1316,184 @@ impl AiDetectorEngine {
         let mut out_results = Vec::new();
 
         {
-            let guard = self.inner.lock().expect("detector inner mutex poisoned");
-            if let Some(InferenceRuntimeBackend::OpenVino(ref ctx)) = guard.backend {
-                let _ = (ctx.input_tensor, ctx.output_tensor);
-                unsafe {
-                    if ctx.in_bytes == tensor_nhwc.len() * 4 {
-                        let dst_f32 = std::slice::from_raw_parts_mut(
-                            ctx.in_ptr as *mut f32,
-                            tensor_nhwc.len(),
-                        );
-                        prepare_input_tensor_f32(
-                            tensor_nhwc,
-                            guard.model_w,
-                            guard.model_h,
-                            guard.nchw_layout,
-                            dst_f32,
-                        );
-                    } else if guard.nchw_layout && ctx.in_bytes == tensor_nhwc.len() {
-                        let dst_u8 = std::slice::from_raw_parts_mut(ctx.in_ptr, tensor_nhwc.len());
-                        prepare_input_tensor_u8(
-                            tensor_nhwc,
-                            guard.model_w,
-                            guard.model_h,
-                            true,
-                            dst_u8,
-                        );
-                    } else {
-                        let copy_len = tensor_nhwc.len().min(ctx.in_bytes);
-                        let dst_u8 = std::slice::from_raw_parts_mut(ctx.in_ptr, copy_len);
-                        prepare_input_tensor_u8(
-                            tensor_nhwc,
-                            guard.model_w,
-                            guard.model_h,
-                            false,
-                            dst_u8,
-                        );
-                    }
+            let mut guard = self.inner.lock().expect("detector inner mutex poisoned");
+            let model_w = guard.model_w;
+            let model_h = guard.model_h;
+            let nchw_layout = guard.nchw_layout;
 
-                    let rc = (ctx.infer_fn)(ctx.infer_req);
-                    if rc == 0 && ctx.out_floats >= 6 {
-                        let slice = std::slice::from_raw_parts(ctx.out_ptr, ctx.out_floats);
-                        out_results = Self::decode_output_with_state(
-                            &guard,
-                            slice,
-                            region,
-                            frame_w,
-                            frame_h,
-                            score_threshold,
-                        );
+            match guard.backend.as_mut() {
+                Some(InferenceRuntimeBackend::OpenVino(ctx)) => {
+                    let _ = (ctx.input_tensor, ctx.output_tensor);
+                    unsafe {
+                        if ctx.in_bytes == tensor_nhwc.len() * 4 {
+                            let dst_f32 = std::slice::from_raw_parts_mut(
+                                ctx.in_ptr as *mut f32,
+                                tensor_nhwc.len(),
+                            );
+                            prepare_input_tensor_f32(
+                                tensor_nhwc,
+                                model_w,
+                                model_h,
+                                nchw_layout,
+                                dst_f32,
+                            );
+                        } else if nchw_layout && ctx.in_bytes == tensor_nhwc.len() {
+                            let dst_u8 =
+                                std::slice::from_raw_parts_mut(ctx.in_ptr, tensor_nhwc.len());
+                            prepare_input_tensor_u8(tensor_nhwc, model_w, model_h, true, dst_u8);
+                        } else {
+                            let copy_len = tensor_nhwc.len().min(ctx.in_bytes);
+                            let dst_u8 = std::slice::from_raw_parts_mut(ctx.in_ptr, copy_len);
+                            prepare_input_tensor_u8(tensor_nhwc, model_w, model_h, false, dst_u8);
+                        }
+
+                        let rc = (ctx.infer_fn)(ctx.infer_req);
+                        if rc == 0 && ctx.out_floats >= 6 {
+                            let slice = std::slice::from_raw_parts(ctx.out_ptr, ctx.out_floats);
+                            out_results = Self::decode_output_with_state(
+                                &guard,
+                                slice,
+                                region,
+                                frame_w,
+                                frame_h,
+                                score_threshold,
+                            );
+                        }
                     }
                 }
+                Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx)) => unsafe {
+                    let vt = std::slice::from_raw_parts(ort_ctx.vtable, 101);
+                    let create_tensor: OrtCreateTensorWithDataFn =
+                        std::mem::transmute::<*const c_void, OrtCreateTensorWithDataFn>(vt[49]);
+                    let run_fn: OrtRunFn = std::mem::transmute::<*const c_void, OrtRunFn>(vt[9]);
+                    let get_mut_data: OrtGetTensorMutableDataFn =
+                        std::mem::transmute::<*const c_void, OrtGetTensorMutableDataFn>(vt[51]);
+                    let get_type_shape: OrtGetTensorTypeAndShapeFn =
+                        std::mem::transmute::<*const c_void, OrtGetTensorTypeAndShapeFn>(vt[65]);
+                    let get_elem_count: OrtGetTensorShapeElementCountFn =
+                        std::mem::transmute::<*const c_void, OrtGetTensorShapeElementCountFn>(
+                            vt[64],
+                        );
+                    let release_val: OrtReleaseFn =
+                        std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[96]);
+                    let release_shape: OrtReleaseFn =
+                        std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[99]);
+                    let release_status: OrtReleaseFn =
+                        std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[93]);
+
+                    let shape: [i64; 4] = if nchw_layout {
+                        [1, 3, model_h as i64, model_w as i64]
+                    } else {
+                        [1, model_h as i64, model_w as i64, 3]
+                    };
+
+                    let mut in_val: *mut c_void = std::ptr::null_mut();
+                    let create_st = if ort_ctx.input_is_u8 {
+                        prepare_input_tensor_u8(
+                            tensor_nhwc,
+                            model_w,
+                            model_h,
+                            nchw_layout,
+                            &mut ort_ctx.in_u8_buf,
+                        );
+                        create_tensor(
+                            ort_ctx.mem_info,
+                            ort_ctx.in_u8_buf.as_mut_ptr() as *mut c_void,
+                            ort_ctx.in_u8_buf.len(),
+                            shape.as_ptr(),
+                            shape.len(),
+                            ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+                            &mut in_val,
+                        )
+                    } else {
+                        prepare_input_tensor_f32(
+                            tensor_nhwc,
+                            model_w,
+                            model_h,
+                            nchw_layout,
+                            &mut ort_ctx.in_f32_buf,
+                        );
+                        create_tensor(
+                            ort_ctx.mem_info,
+                            ort_ctx.in_f32_buf.as_mut_ptr() as *mut c_void,
+                            ort_ctx.in_f32_buf.len() * 4,
+                            shape.as_ptr(),
+                            shape.len(),
+                            ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                            &mut in_val,
+                        )
+                    };
+
+                    if !create_st.is_null() {
+                        release_status(create_st);
+                    } else if !in_val.is_null() {
+                        let in_names = [ort_ctx.input_name.as_ptr()];
+                        let in_vals = [in_val as *const c_void];
+                        let out_names = [ort_ctx.output_name.as_ptr()];
+                        let mut out_val: *mut c_void = std::ptr::null_mut();
+
+                        let run_st = run_fn(
+                            ort_ctx.session,
+                            std::ptr::null(),
+                            in_names.as_ptr(),
+                            in_vals.as_ptr(),
+                            1,
+                            out_names.as_ptr(),
+                            1,
+                            &mut out_val,
+                        );
+                        if !run_st.is_null() {
+                            release_status(run_st);
+                        } else if !out_val.is_null() {
+                            let mut out_ptr: *mut c_void = std::ptr::null_mut();
+                            let mut shape_info: *mut c_void = std::ptr::null_mut();
+                            let mut elem_count: usize = 0;
+
+                            let st1 = get_mut_data(out_val, &mut out_ptr);
+                            let st2 = get_type_shape(out_val, &mut shape_info);
+                            if st1.is_null() && st2.is_null() && !shape_info.is_null() {
+                                let st3 = get_elem_count(shape_info, &mut elem_count);
+                                if !st3.is_null() {
+                                    release_status(st3);
+                                }
+                            } else {
+                                if !st1.is_null() {
+                                    release_status(st1);
+                                }
+                                if !st2.is_null() {
+                                    release_status(st2);
+                                }
+                            }
+                            if !shape_info.is_null() {
+                                release_shape(shape_info);
+                            }
+
+                            if !out_ptr.is_null() && elem_count >= 6 {
+                                ort_ctx.out_floats = elem_count;
+                                let out_floats = ort_ctx.out_floats;
+                                let slice_vec: Vec<f32> =
+                                    std::slice::from_raw_parts(out_ptr as *const f32, out_floats)
+                                        .to_vec();
+                                release_val(out_val);
+                                release_val(in_val);
+                                out_results = Self::decode_output_with_state(
+                                    &guard,
+                                    &slice_vec,
+                                    region,
+                                    frame_w,
+                                    frame_h,
+                                    score_threshold,
+                                );
+                            } else {
+                                release_val(out_val);
+                                release_val(in_val);
+                            }
+                        } else {
+                            release_val(in_val);
+                        }
+                    }
+                },
+                None => {}
             }
         }
 
@@ -1591,5 +1997,249 @@ version: 0.18-0
         assert_eq!(cat.active_backend, "onnxruntime");
         assert!(cat.devices.iter().any(|d| d.id == "CUDA"));
         assert!(cat.devices.iter().any(|d| d.id == "ROCM"));
+    }
+
+    #[test]
+    fn ort_c_api_session_and_detect_region_executes_full_vtable_pipeline() {
+        static RELEASE_COUNT: AtomicU64 = AtomicU64::new(0);
+        static INTRA_THREADS_SET: AtomicU64 = AtomicU64::new(0);
+        static OPT_LEVEL_SET: AtomicU64 = AtomicU64::new(0);
+        static MOCK_OUT_TENSOR: [f32; 7] = [0.0, 1.0, 0.94, 0.1, 0.1, 0.5, 0.8];
+
+        unsafe extern "C" fn mock_release(ptr: *mut c_void) {
+            if !ptr.is_null() {
+                RELEASE_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        unsafe extern "C" fn mock_create_env(
+            _lvl: c_int,
+            _id: *const c_char,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x1001usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_create_opts(out: *mut *mut c_void) -> *mut c_void {
+            unsafe {
+                *out = 0x1002usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_set_intra(_opts: *mut c_void, threads: c_int) -> *mut c_void {
+            INTRA_THREADS_SET.store(threads as u64, Ordering::SeqCst);
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_set_inter(_opts: *mut c_void, _threads: c_int) -> *mut c_void {
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_set_opt(_opts: *mut c_void, level: c_int) -> *mut c_void {
+            OPT_LEVEL_SET.store(level as u64, Ordering::SeqCst);
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_create_session(
+            _env: *const c_void,
+            _model: *const c_char,
+            _opts: *const c_void,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x1003usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_alloc(out: *mut *mut c_void) -> *mut c_void {
+            unsafe {
+                *out = 0x1004usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_in_name(
+            _sess: *const c_void,
+            _idx: usize,
+            _alloc: *mut c_void,
+            out: *mut *mut c_char,
+        ) -> *mut c_void {
+            unsafe {
+                *out = c"images".as_ptr() as *mut c_char;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_out_name(
+            _sess: *const c_void,
+            _idx: usize,
+            _alloc: *mut c_void,
+            out: *mut *mut c_char,
+        ) -> *mut c_void {
+            unsafe {
+                *out = c"output0".as_ptr() as *mut c_char;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_in_type(
+            _sess: *const c_void,
+            _idx: usize,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x1005usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_cast_tensor_info(
+            _ti: *const c_void,
+            out: *mut *const c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x1006usize as *const c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_elem_type(
+            _info: *const c_void,
+            out: *mut c_int,
+        ) -> *mut c_void {
+            unsafe {
+                *out = ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_create_cpu_mem(
+            _a: c_int,
+            _m: c_int,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x1007usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_create_tensor(
+            _mem: *const c_void,
+            _data: *mut c_void,
+            _byte_len: usize,
+            _shape: *const i64,
+            _shape_len: usize,
+            _ty: c_int,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x2001usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_run(
+            _sess: *mut c_void,
+            _run_opts: *const c_void,
+            _in_names: *const *const c_char,
+            _in_vals: *const *const c_void,
+            _in_len: usize,
+            _out_names: *const *const c_char,
+            _out_len: usize,
+            out_vals: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out_vals = 0x2002usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_mut_data(
+            _val: *mut c_void,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = MOCK_OUT_TENSOR.as_ptr() as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_type_shape(
+            _val: *const c_void,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x2003usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_elem_count(
+            _info: *const c_void,
+            out: *mut usize,
+        ) -> *mut c_void {
+            unsafe {
+                *out = MOCK_OUT_TENSOR.len();
+            }
+            std::ptr::null_mut()
+        }
+
+        let mut vtable: [*const c_void; 101] = [std::ptr::null(); 101];
+        vtable[3] = mock_create_env as *const c_void;
+        vtable[7] = mock_create_session as *const c_void;
+        vtable[9] = mock_run as *const c_void;
+        vtable[10] = mock_create_opts as *const c_void;
+        vtable[23] = mock_set_opt as *const c_void;
+        vtable[24] = mock_set_intra as *const c_void;
+        vtable[25] = mock_set_inter as *const c_void;
+        vtable[33] = mock_get_in_type as *const c_void;
+        vtable[36] = mock_get_in_name as *const c_void;
+        vtable[37] = mock_get_out_name as *const c_void;
+        vtable[49] = mock_create_tensor as *const c_void;
+        vtable[51] = mock_get_mut_data as *const c_void;
+        vtable[55] = mock_cast_tensor_info as *const c_void;
+        vtable[60] = mock_get_elem_type as *const c_void;
+        vtable[64] = mock_get_elem_count as *const c_void;
+        vtable[65] = mock_get_type_shape as *const c_void;
+        vtable[69] = mock_create_cpu_mem as *const c_void;
+        vtable[78] = mock_get_alloc as *const c_void;
+        for idx in [92, 93, 94, 95, 96, 98, 99, 100] {
+            vtable[idx] = mock_release as *const c_void;
+        }
+
+        let (ort_ctx, actual_dev) = unsafe {
+            AiDetectorEngine::init_ort_session_from_vtable(
+                std::ptr::null_mut(),
+                vtable.as_ptr(),
+                Path::new("/tmp/yolo11.onnx"),
+                "TensorRT",
+                64,
+                64,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            actual_dev, "CPU",
+            "TensorRT without GPU handle must fall back to CPU"
+        );
+        assert_eq!(INTRA_THREADS_SET.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            OPT_LEVEL_SET.load(Ordering::SeqCst),
+            ORT_GRAPH_OPT_ENABLE_ALL as u64
+        );
+
+        let cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/c.yml")).unwrap();
+        let engine = AiDetectorEngine::new(&cfg);
+        {
+            let mut g = engine.inner.lock().unwrap();
+            g.model_w = 64;
+            g.model_h = 64;
+            g.nchw_layout = true;
+            g.active_backend = "onnxruntime".to_string();
+            g.active_device = actual_dev;
+            g.backend = Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx));
+        }
+
+        let crop = vec![128u8; 64 * 64 * 3];
+        let region = BoundingBox::new(0, 0, 640, 480);
+        let dets = engine.detect_region(&crop, region, 1280, 720, 0.5);
+        assert_eq!(dets.len(), 1);
+        assert_eq!(dets[0].label, "person");
+        assert!((dets[0].score - 0.94).abs() < 1e-4);
+
+        drop(engine);
+        assert!(
+            RELEASE_COUNT.load(Ordering::SeqCst) >= 7,
+            "all ORT handles (type_info, shape_info, in_val, out_val, mem_info, session, opts, env) must be released"
+        );
     }
 }

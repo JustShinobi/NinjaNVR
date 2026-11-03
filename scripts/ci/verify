@@ -12,4 +12,5 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 bun run --cwd web-v2 typecheck
+bun run --cwd web-v2 test
 bun run --cwd web-v2 build
