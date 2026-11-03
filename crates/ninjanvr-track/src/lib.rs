@@ -22,6 +22,15 @@ pub struct TriggerProvenance {
     pub stationary: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TrackedAttribute {
+    pub label: String,
+    pub score: f32,
+    pub bbox: BoundingBox,
+    pub norm_bbox: [f64; 4],
+    pub area_px: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedObject {
     pub id: String,
@@ -46,6 +55,12 @@ pub struct TrackedObject {
     pub vx: f32,
     pub vy: f32,
     pub provenance: TriggerProvenance,
+    #[serde(default)]
+    pub attributes: Vec<TrackedAttribute>,
+    #[serde(default)]
+    pub best_attribute_score: f32,
+    #[serde(default)]
+    pub inferred_sub_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,6 +180,29 @@ impl ByteTracker {
             })
             .map(|t| t.bbox)
             .collect()
+    }
+
+    fn is_attribute_masked_or_filtered(&self, det: &DetectionResult, cfg: &CameraConfig) -> bool {
+        let (bx, by) = det.bbox.bottom_center();
+        if self.global_object_mask.contains_point(bx, by) {
+            return true;
+        }
+        if let Some(lm) = self.label_masks.get(&det.label)
+            && lm.contains_point(bx, by)
+        {
+            return true;
+        }
+        if let Some(f) = cfg.objects.filters.get(&det.label) {
+            let area = det.bbox.area();
+            let (min_area_px, max_area_px) = f.resolve_area_bounds_px(self.frame_w, self.frame_h);
+            if area < min_area_px || area > max_area_px {
+                return true;
+            }
+            if det.score < f.min_score {
+                return true;
+            }
+        }
+        false
     }
 
     fn is_detection_masked_or_filtered(&self, det: &DetectionResult, cfg: &CameraConfig) -> bool {
@@ -307,10 +345,22 @@ impl ByteTracker {
             }
         }
 
-        // 2. Partition detections into High-Score and Low-Score
+        // 2. Partition detections into Attribute Detections vs Primary High/Low-Score Detections
+        let mut attribute_dets = Vec::new();
         let mut high_dets = Vec::new();
         let mut low_dets = Vec::new();
         for det in deduplicated {
+            if cfg
+                .objects
+                .attribute_labels
+                .iter()
+                .any(|attr_lbl| attr_lbl.eq_ignore_ascii_case(&det.label))
+            {
+                if !self.is_attribute_masked_or_filtered(&det, cfg) {
+                    attribute_dets.push(det);
+                }
+                continue;
+            }
             if self.is_detection_masked_or_filtered(&det, cfg) {
                 continue;
             }
@@ -498,12 +548,84 @@ impl ByteTracker {
                     vx: 0.0,
                     vy: 0.0,
                     provenance,
+                    attributes: Vec::new(),
+                    best_attribute_score: 0.0,
+                    inferred_sub_label: None,
                 },
             );
         }
 
+        // 5. Associate child attribute detections (face, license_plate, delivery logos) to parent tracks
+        self.associate_attributes_to_tracks(&attribute_dets);
+
         let active: Vec<TrackedObject> = self.active_tracks().cloned().collect();
         (active, ended_tracks)
+    }
+
+    fn associate_attributes_to_tracks(&mut self, attribute_dets: &[DetectionResult]) {
+        for trk in self.tracks.values_mut() {
+            if trk.disappeared_frames == 0 {
+                trk.attributes.clear();
+            }
+        }
+        if attribute_dets.is_empty() {
+            return;
+        }
+        let frame_w = self.frame_w;
+        let frame_h = self.frame_h;
+        for attr_det in attribute_dets {
+            let is_face = attr_det.label.eq_ignore_ascii_case("face");
+            let mut best_tid: Option<String> = None;
+            let mut best_containment = 0.60f32;
+            let mut best_parent_score = -1.0f32;
+
+            for (tid, trk) in &self.tracks {
+                if trk.disappeared_frames > 0 {
+                    continue;
+                }
+                let parent_eligible = if is_face {
+                    trk.label == "person"
+                } else {
+                    is_vehicle_label(&trk.label)
+                };
+                if !parent_eligible {
+                    continue;
+                }
+                let containment = trk.bbox.intersection_over_min(&attr_det.bbox);
+                if containment >= 0.60
+                    && (containment > best_containment
+                        || ((containment - best_containment).abs() < 1e-5
+                            && trk.score > best_parent_score))
+                {
+                    best_containment = containment;
+                    best_parent_score = trk.score;
+                    best_tid = Some(tid.clone());
+                }
+            }
+
+            if let Some(tid) = best_tid
+                && let Some(trk) = self.tracks.get_mut(&tid)
+            {
+                let area_px = attr_det.bbox.area();
+                let norm_bbox = attr_det.bbox.to_normalized(frame_w, frame_h);
+                if is_face || attr_det.label.eq_ignore_ascii_case("license_plate") {
+                    let attr_q =
+                        compute_attribute_quality(attr_det.score, area_px, frame_w, frame_h);
+                    if attr_q > trk.best_attribute_score {
+                        trk.best_attribute_score = attr_q;
+                    }
+                } else if is_delivery_logo_label(&attr_det.label) {
+                    trk.inferred_sub_label = Some(attr_det.label.clone());
+                }
+                trk.attributes.push(TrackedAttribute {
+                    label: attr_det.label.clone(),
+                    score: attr_det.score,
+                    bbox: attr_det.bbox,
+                    norm_bbox,
+                    area_px,
+                });
+            }
+        }
     }
 
     fn apply_match(
@@ -687,27 +809,56 @@ fn association_similarity(a: &BoundingBox, b: &BoundingBox) -> f32 {
     iou.max(dist_sim * 0.65)
 }
 
+/// Computes attribute quality score `attr.score * sqrt(attr.area_px / (frame_w * frame_h))`
+/// used to select the frame where a `face` or `license_plate` is largest and sharpest.
+pub fn compute_attribute_quality(score: f32, area_px: u32, frame_w: u32, frame_h: u32) -> f32 {
+    let frame_area = (frame_w.saturating_mul(frame_h)).max(1) as f32;
+    score * ((area_px as f32) / frame_area).sqrt()
+}
+
+pub fn is_vehicle_label(label: &str) -> bool {
+    matches!(
+        label,
+        "car" | "truck" | "bus" | "motorcycle" | "bicycle" | "garbage_truck" | "school_bus"
+    )
+}
+
+pub fn is_delivery_logo_label(label: &str) -> bool {
+    !label.eq_ignore_ascii_case("face") && !label.eq_ignore_ascii_case("license_plate")
+}
+
 /// Evaluates whether a newly observed detection frame should replace the active event's snapshot
-/// according to the camera's configured `SnapshotSelectionPolicy`.
+/// according to the camera's configured `SnapshotSelectionPolicy` and child attribute quality.
+#[allow(clippy::too_many_arguments)]
 pub fn should_replace_snapshot(
     policy: SnapshotSelectionPolicy,
     is_first_snapshot: bool,
     prev_best_score: f32,
     new_score: f32,
+    prev_best_attr_quality: f32,
+    new_attr_quality: f32,
     current_zones: &[String],
     entered_zones: &[String],
 ) -> bool {
     if is_first_snapshot {
         return true;
     }
+    let attr_improved = (prev_best_attr_quality <= 0.0 && new_attr_quality > 0.0)
+        || new_attr_quality > prev_best_attr_quality + 0.02;
+    let score_improved = new_score > prev_best_score + 0.05;
+    let in_zone_ok = entered_zones.is_empty() || !current_zones.is_empty();
+
     match policy {
         SnapshotSelectionPolicy::FirstTrigger => false,
-        SnapshotSelectionPolicy::BestOverall => new_score > prev_best_score + 0.05,
-        SnapshotSelectionPolicy::BestInZone => {
-            if !entered_zones.is_empty() && current_zones.is_empty() {
+        SnapshotSelectionPolicy::BestOverall => attr_improved || score_improved,
+        SnapshotSelectionPolicy::BestInZone => in_zone_ok && (attr_improved || score_improved),
+        SnapshotSelectionPolicy::BestAttribute => {
+            if attr_improved {
+                true
+            } else if prev_best_attr_quality > 0.0 {
                 false
             } else {
-                new_score > prev_best_score + 0.05
+                in_zone_ok && score_improved
             }
         }
     }
@@ -780,6 +931,8 @@ mod tests {
             true,
             0.0,
             0.75,
+            0.0,
+            0.0,
             &z_driveway,
             &z_driveway
         ));
@@ -788,6 +941,8 @@ mod tests {
             false,
             0.75,
             0.95,
+            0.0,
+            0.0,
             &z_driveway,
             &z_driveway
         ));
@@ -798,6 +953,8 @@ mod tests {
             false,
             0.78,
             0.92,
+            0.0,
+            0.0,
             &empty,
             &z_driveway
         ));
@@ -806,6 +963,8 @@ mod tests {
             false,
             0.78,
             0.92,
+            0.0,
+            0.0,
             &z_driveway,
             &z_driveway
         ));
@@ -816,6 +975,8 @@ mod tests {
             false,
             0.78,
             0.92,
+            0.0,
+            0.0,
             &empty,
             &z_driveway
         ));
@@ -1241,5 +1402,198 @@ mod tests {
                 .crossed_lines
                 .contains(&"any_tripwire".to_string())
         );
+    }
+
+    #[test]
+    fn attribute_detections_bind_to_parent_track_without_spawning_standalone_tracks() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 1;
+        cam_cfg.objects.track = vec!["person".to_string(), "car".to_string()];
+
+        let mut tracker = ByteTracker::new("front_door", 1280, 720, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1280, 720);
+
+        let dets = vec![
+            DetectionResult {
+                label: "person".to_string(),
+                score: 0.89,
+                bbox: BoundingBox::new(100, 100, 220, 420),
+                region: reg,
+            },
+            DetectionResult {
+                label: "face".to_string(),
+                score: 0.62, // below primary threshold 0.70, but attribute detections bypass threshold
+                bbox: BoundingBox::new(130, 110, 190, 170),
+                region: reg,
+            },
+            DetectionResult {
+                label: "car".to_string(),
+                score: 0.93,
+                bbox: BoundingBox::new(400, 200, 900, 600),
+                region: reg,
+            },
+            DetectionResult {
+                label: "license_plate".to_string(),
+                score: 0.86,
+                bbox: BoundingBox::new(580, 480, 700, 530),
+                region: reg,
+            },
+            DetectionResult {
+                label: "correios".to_string(),
+                score: 0.81,
+                bbox: BoundingBox::new(500, 280, 660, 380),
+                region: reg,
+            },
+        ];
+
+        let (active, ended) = tracker.update(100.0, &dets, &[reg], &cam_cfg);
+        assert!(ended.is_empty());
+        assert_eq!(
+            active.len(),
+            2,
+            "only person and car tracks may exist; face, license_plate, and correios must not spawn standalone tracks"
+        );
+
+        let person_trk = active.iter().find(|t| t.label == "person").unwrap();
+        assert_eq!(person_trk.attributes.len(), 1);
+        assert_eq!(person_trk.attributes[0].label, "face");
+        assert_eq!(person_trk.attributes[0].area_px, 60 * 60);
+        assert!(person_trk.best_attribute_score > 0.0);
+        assert_eq!(person_trk.inferred_sub_label, None);
+
+        let car_trk = active.iter().find(|t| t.label == "car").unwrap();
+        assert_eq!(car_trk.attributes.len(), 2);
+        assert!(
+            car_trk
+                .attributes
+                .iter()
+                .any(|a| a.label == "license_plate")
+        );
+        assert!(car_trk.attributes.iter().any(|a| a.label == "correios"));
+        assert_eq!(car_trk.inferred_sub_label.as_deref(), Some("correios"));
+        assert!(car_trk.best_attribute_score > 0.0);
+    }
+
+    #[test]
+    fn orphan_attributes_outside_parent_boxes_are_discarded() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 1;
+        cam_cfg.objects.track = vec!["person".to_string(), "car".to_string()];
+
+        let mut tracker = ByteTracker::new("driveway", 1280, 720, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1280, 720);
+
+        // 1. Orphan face and license_plate with no parent tracks at all
+        let orphan_only = vec![
+            DetectionResult {
+                label: "face".to_string(),
+                score: 0.91,
+                bbox: BoundingBox::new(50, 50, 100, 100),
+                region: reg,
+            },
+            DetectionResult {
+                label: "license_plate".to_string(),
+                score: 0.94,
+                bbox: BoundingBox::new(800, 500, 900, 540),
+                region: reg,
+            },
+        ];
+        let (active_empty, _) = tracker.update(10.0, &orphan_only, &[reg], &cam_cfg);
+        assert!(
+            active_empty.is_empty(),
+            "orphan attributes must never create standalone tracks"
+        );
+
+        // 2. Distant face/plate outside the person/car bounding boxes (containment < 0.60)
+        let distant = vec![
+            DetectionResult {
+                label: "person".to_string(),
+                score: 0.88,
+                bbox: BoundingBox::new(100, 100, 200, 350),
+                region: reg,
+            },
+            DetectionResult {
+                label: "face".to_string(),
+                score: 0.92,
+                bbox: BoundingBox::new(600, 100, 650, 150), // far away from person
+                region: reg,
+            },
+            DetectionResult {
+                label: "car".to_string(),
+                score: 0.90,
+                bbox: BoundingBox::new(300, 200, 600, 450),
+                region: reg,
+            },
+            DetectionResult {
+                label: "license_plate".to_string(),
+                score: 0.89,
+                bbox: BoundingBox::new(900, 500, 980, 540), // far away from car
+                region: reg,
+            },
+        ];
+        let (active, _) = tracker.update(11.0, &distant, &[reg], &cam_cfg);
+        assert_eq!(active.len(), 2);
+        for trk in &active {
+            assert!(
+                trk.attributes.is_empty(),
+                "uncontained attributes must not attach to distant tracks"
+            );
+            assert_eq!(trk.best_attribute_score, 0.0);
+        }
+    }
+
+    #[test]
+    fn should_replace_snapshot_upgrades_when_attribute_quality_improves() {
+        let z_porch = vec!["porch".to_string()];
+        let q1 = compute_attribute_quality(0.75, 30 * 30, 1280, 720);
+        let q2 = compute_attribute_quality(0.92, 90 * 90, 1280, 720);
+        assert!(q2 > q1 + 0.02);
+
+        // Gaining first face/license_plate replaces snapshot even when parent score drops (0.82 -> 0.81)
+        assert!(should_replace_snapshot(
+            SnapshotSelectionPolicy::BestAttribute,
+            false,
+            0.82,
+            0.81,
+            0.0,
+            q1,
+            &z_porch,
+            &z_porch,
+        ));
+
+        // Improving face quality (q1 -> q2) replaces snapshot even when parent score is flat (0.82 -> 0.81)
+        assert!(should_replace_snapshot(
+            SnapshotSelectionPolicy::BestAttribute,
+            false,
+            0.82,
+            0.81,
+            q1,
+            q2,
+            &z_porch,
+            &z_porch,
+        ));
+        assert!(should_replace_snapshot(
+            SnapshotSelectionPolicy::BestInZone,
+            false,
+            0.82,
+            0.81,
+            q1,
+            q2,
+            &z_porch,
+            &z_porch,
+        ));
+
+        // Under BestAttribute, once a face snapshot is captured (prev_best_attr_quality = q2 > 0),
+        // a later frame with no face (0.0) does NOT overwrite the snapshot even if parent score rises
+        assert!(!should_replace_snapshot(
+            SnapshotSelectionPolicy::BestAttribute,
+            false,
+            0.82,
+            0.95,
+            q2,
+            0.0,
+            &z_porch,
+            &z_porch,
+        ));
     }
 }

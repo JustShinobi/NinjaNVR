@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { NinjaConfigResponse } from "../types/nvr";
 import { buildCleanYamlFromDraft } from "../utils/configYaml";
+import {
+  formatDetectedAttributePill,
+  formatEventLabelWithSubLabel,
+} from "../views/ExploreWorkspace";
+import {
+  DEFAULT_ATTRIBUTE_LABELS,
+  STANDARD_LABELS,
+  toggleAttributeLabelList,
+} from "../views/settings/VisionAndAiPanels";
 
 describe("buildCleanYamlFromDraft", () => {
   test("restores scrubbed RTSP credentials from originalRawYaml and serializes all config sections", () => {
@@ -319,5 +328,94 @@ go2rtc:
     expect(yamlText).toContain("icon: shield");
     expect(yamlText).toContain("dashboard: false");
     expect(yamlText).toContain("order: 2");
+  });
+
+  test("preserves objects.attribute_labels and snapshots.selection: best_attribute in YAML serialization", () => {
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      objects: {
+        track: ["person", "car", "package"],
+        attribute_labels: ["face", "license_plate", "correios", "mercado_livre"],
+        filters: {},
+      },
+      snapshots: {
+        enabled: true,
+        bounding_box: true,
+        quality: 85,
+        selection: "best_attribute",
+      },
+      cameras: {
+        portao: {
+          name: "portao",
+          enabled: true,
+          ffmpeg: {
+            inputs: [{ path: "rtsp://192.0.2.88:554/sub", roles: ["detect"] }],
+          },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          objects: {
+            track: ["person", "car"],
+            attribute_labels: ["face", "license_plate", "correios"],
+          },
+          zones: {},
+          record: { enabled: true },
+          snapshots: {
+            enabled: true,
+            selection: "best_attribute",
+          },
+        },
+      },
+    };
+
+    const yamlText = buildCleanYamlFromDraft(draft, "");
+    expect(yamlText).toContain("attribute_labels:");
+    expect(yamlText).toContain("- face");
+    expect(yamlText).toContain("- license_plate");
+    expect(yamlText).toContain("- correios");
+    expect(yamlText).toContain("- mercado_livre");
+    expect(yamlText).toContain("selection: best_attribute");
+  });
+
+  test("formats sub_label badges, detected_attributes pills, and attribute label chip lists", () => {
+    expect(STANDARD_LABELS).toContain("package");
+    expect(STANDARD_LABELS).toContain("waste_bin");
+    expect(DEFAULT_ATTRIBUTE_LABELS).toContain("face");
+    expect(DEFAULT_ATTRIBUTE_LABELS).toContain("license_plate");
+    expect(DEFAULT_ATTRIBUTE_LABELS).toContain("correios");
+
+    // Toggle off an existing attribute label and toggle on a new one
+    const withoutFace = toggleAttributeLabelList(
+      ["face", "license_plate", "correios"],
+      "face"
+    );
+    expect(withoutFace).toEqual(["license_plate", "correios"]);
+    const withDhl = toggleAttributeLabelList(withoutFace, "dhl");
+    expect(withDhl).toEqual(["license_plate", "correios", "dhl"]);
+
+    // Format primary label with explicit sub_label or child attribute fallback
+    expect(formatEventLabelWithSubLabel("car", "correios", [])).toBe(
+      "CAR · CORREIOS"
+    );
+    expect(
+      formatEventLabelWithSubLabel("person", null, [
+        {
+          label: "face",
+          score: 0.92,
+          norm_bbox: [0.2, 0.1, 0.3, 0.25],
+          area_px: 1600,
+        },
+      ])
+    ).toBe("PERSON · FACE");
+    expect(formatEventLabelWithSubLabel("person", null, [])).toBe("PERSON");
+
+    expect(
+      formatDetectedAttributePill({
+        label: "license_plate",
+        score: 0.94,
+        norm_bbox: [0.4, 0.6, 0.55, 0.68],
+        area_px: 2400,
+      })
+    ).toBe("LICENSE_PLATE 94% · 2400px²");
   });
 });

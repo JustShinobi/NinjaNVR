@@ -25,16 +25,43 @@ import {
 } from "../../types/nvr";
 import { ToggleSwitch } from "./ConsoleAndStreamsPanels";
 
-const STANDARD_LABELS = [
+export const STANDARD_LABELS = [
   "person",
   "car",
+  "truck",
   "bicycle",
   "motorcycle",
   "bus",
   "dog",
   "cat",
   "bird",
+  "package",
+  "waste_bin",
 ];
+
+export const DEFAULT_ATTRIBUTE_LABELS = [
+  "face",
+  "license_plate",
+  "correios",
+  "mercado_livre",
+  "amazon",
+  "fedex",
+  "dhl",
+  "ups",
+  "usps",
+];
+
+export function toggleAttributeLabelList(
+  current: string[] | undefined,
+  label: string
+): string[] {
+  const base = current ?? DEFAULT_ATTRIBUTE_LABELS;
+  const clean = label.trim().toLowerCase();
+  if (!clean) return [...base];
+  return base.includes(clean)
+    ? base.filter((x) => x !== clean)
+    : [...base, clean];
+}
 
 export const VisionZonesMotionSection: React.FC<{
   draftConfig: NinjaConfigResponse;
@@ -1179,6 +1206,60 @@ export const AiDetectionObjectsSection: React.FC<{
       : draftConfig.cameras?.[inspectorCam]?.objects?.track ||
         draftConfig.objects?.track || ["person"];
 
+  const attributeLabels: string[] =
+    scope === "global"
+      ? draftConfig.objects?.attribute_labels ?? DEFAULT_ATTRIBUTE_LABELS
+      : draftConfig.cameras?.[inspectorCam]?.objects?.attribute_labels ??
+        draftConfig.objects?.attribute_labels ??
+        DEFAULT_ATTRIBUTE_LABELS;
+
+  const activeSnapshotSelection =
+    (scope === "global"
+      ? draftConfig.snapshots?.selection
+      : draftConfig.cameras?.[inspectorCam]?.snapshots?.selection ??
+        draftConfig.snapshots?.selection) || "best_in_zone";
+
+  const toggleAttributeLabel = (lbl: string) => {
+    updateDraft((next) => {
+      if (scope === "global") {
+        if (!next.objects) next.objects = { track: ["person"], filters: {} };
+        next.objects.attribute_labels = toggleAttributeLabelList(
+          next.objects.attribute_labels ?? attributeLabels,
+          lbl
+        );
+      } else if (next.cameras[inspectorCam]) {
+        if (!next.cameras[inspectorCam].objects) {
+          next.cameras[inspectorCam].objects = {
+            track: [...trackedLabels],
+            filters: {},
+          };
+        }
+        next.cameras[inspectorCam].objects!.attribute_labels =
+          toggleAttributeLabelList(
+            next.cameras[inspectorCam].objects!.attribute_labels ??
+              attributeLabels,
+            lbl
+          );
+      }
+    });
+  };
+
+  const updateSnapshotSelection = (
+    selection: "best_overall" | "best_in_zone" | "first_trigger" | "best_attribute"
+  ) => {
+    updateDraft((next) => {
+      if (scope === "global") {
+        if (!next.snapshots) next.snapshots = { enabled: true };
+        next.snapshots.selection = selection;
+      } else if (next.cameras[inspectorCam]) {
+        if (!next.cameras[inspectorCam].snapshots) {
+          next.cameras[inspectorCam].snapshots = { enabled: true };
+        }
+        next.cameras[inspectorCam].snapshots.selection = selection;
+      }
+    });
+  };
+
   // Keep selectedFilterLabel pointed at an active tracked class whenever possible
   useEffect(() => {
     if (trackedLabels.length > 0 && !trackedLabels.includes(selectedFilterLabel)) {
@@ -2176,6 +2257,106 @@ export const AiDetectionObjectsSection: React.FC<{
               <Plus size={11} />
               {isPt ? "Adicionar" : "Add"}
             </button>
+          </div>
+
+          <div
+            style={{
+              padding: "8px 10px",
+              background: "var(--bg-canvas)",
+              border: "1px solid var(--border-hairline)",
+              borderRadius: 3,
+              display: "flex",
+              flexDirection: "column",
+              gap: 8,
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: 8,
+              }}
+            >
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: "var(--text-xs)",
+                    fontWeight: 700,
+                    color: "var(--signal-accent-text)",
+                  }}
+                >
+                  {isPt
+                    ? "ATRIBUTOS FILHOS EM PASSE ÚNICO (FACE, PLACA & LOGOS DE ENTREGA)"
+                    : "ATTRIBUTE LABELS (SINGLE-PASS CHILD BOXES)"}
+                </span>
+                <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt
+                    ? "Vincula face → person e license_plate/logos → veículos sem criar trilhas avulsas."
+                    : "Binds face → person and license_plate/delivery logos → vehicles without spawning standalone tracks."}
+                </span>
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span
+                  className="mono"
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                >
+                  {isPt ? "Política de Snapshot:" : "Snapshot Selection Policy:"}
+                </span>
+                <select
+                  className="nvr-select mono"
+                  aria-label="Snapshot Selection Policy"
+                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  value={activeSnapshotSelection}
+                  onChange={(e) =>
+                    updateSnapshotSelection(
+                      e.target.value as
+                        | "best_overall"
+                        | "best_in_zone"
+                        | "first_trigger"
+                        | "best_attribute"
+                    )
+                  }
+                >
+                  <option value="best_attribute">
+                    {isPt
+                      ? "Melhor Atributo (Face / Placa) (best_attribute)"
+                      : "Best Attribute (Face / License Plate) (best_attribute)"}
+                  </option>
+                  <option value="best_in_zone">
+                    {isPt ? "Melhor na Zona (best_in_zone)" : "Best in Zone (best_in_zone)"}
+                  </option>
+                  <option value="best_overall">
+                    {isPt ? "Melhor Geral (best_overall)" : "Best Overall (best_overall)"}
+                  </option>
+                  <option value="first_trigger">
+                    {isPt ? "Primeiro Gatilho (first_trigger)" : "First Trigger (first_trigger)"}
+                  </option>
+                </select>
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              {Array.from(
+                new Set([...DEFAULT_ATTRIBUTE_LABELS, ...attributeLabels])
+              ).map((attrLbl) => {
+                const isActive = attributeLabels.includes(attrLbl);
+                return (
+                  <button
+                    key={attrLbl}
+                    type="button"
+                    className={`nvr-btn mono ${isActive ? "active" : ""}`}
+                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    onClick={() => toggleAttributeLabel(attrLbl)}
+                  >
+                    {isActive ? `✓ ${attrLbl}` : `+ ${attrLbl}`}
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           <div

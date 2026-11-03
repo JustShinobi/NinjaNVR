@@ -7,6 +7,10 @@ import { WorkspaceTab, findMatchingExport, formatDateTime, formatRelTime } from 
 import { VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
+import {
+  formatDetectedAttributePill,
+  formatEventLabelWithSubLabel,
+} from "./ExploreWorkspace";
 
 interface ReviewWorkspaceProps {
   cameraNames: string[];
@@ -506,7 +510,11 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                           textTransform: "uppercase",
                         }}
                       >
-                        {(item.data?.objects || ["motion"]).join(", ")}
+                        {formatEventLabelWithSubLabel(
+                          (item.data?.objects || ["motion"]).join(", "),
+                          item.data?.sub_labels?.[0] ?? null,
+                          item.data?.detected_attributes
+                        )}
                       </span>
                       <div className="nvr-row-actions">
                         {((item.data?.audio && item.data.audio.length > 0) ||
@@ -609,8 +617,25 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     {formatDateTime(activeReview.start_time)}
                   </span>
                   <span className="nvr-badge">
-                    {(activeReview.data?.objects || ["person"]).join(", ").toUpperCase()}
+                    {formatEventLabelWithSubLabel(
+                      (activeReview.data?.objects || ["person"]).join(", "),
+                      activeReview.data?.sub_labels?.[0] ?? null,
+                      activeReview.data?.detected_attributes
+                    )}
                   </span>
+                  {(activeReview.data?.detected_attributes || []).map((attr, idx) => (
+                    <span
+                      key={`${attr.label}-${idx}`}
+                      className="nvr-badge mono"
+                      style={{
+                        fontFamily: "var(--font-mono)",
+                        fontSize: "var(--text-xs)",
+                        color: "var(--signal-accent-text)",
+                      }}
+                    >
+                      {formatDetectedAttributePill(attr)}
+                    </span>
+                  ))}
                   <span
                     className="mono"
                     style={{
@@ -760,6 +785,32 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                             Matched Zones:{" "}
                             <strong>{zones.length > 0 ? zones.join(", ") : "NONE"}</strong>
                           </span>
+                          {activeReview.data?.detected_attributes &&
+                            activeReview.data.detected_attributes.length > 0 && (
+                              <span
+                                style={{
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: 6,
+                                  flexWrap: "wrap",
+                                  fontFamily: "var(--font-mono)",
+                                }}
+                              >
+                                Child Attributes:{" "}
+                                {activeReview.data.detected_attributes.map((attr, idx) => (
+                                  <span
+                                    key={`${attr.label}-${idx}`}
+                                    className="nvr-badge mono"
+                                    style={{
+                                      fontFamily: "var(--font-mono)",
+                                      fontSize: "var(--text-xs)",
+                                    }}
+                                  >
+                                    {formatDetectedAttributePill(attr)}
+                                  </span>
+                                ))}
+                              </span>
+                            )}
                         </div>
                         <button
                           type="button"

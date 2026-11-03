@@ -50,6 +50,14 @@ pub struct DetectorRuntimeCatalog {
     pub discovered_models: Vec<DiscoveredModelEntry>,
 }
 
+/// Computes the standard multi-scale anchor count for stride-(8, 16, 32) YOLO heads:
+/// `(W/8)*(H/8) + (W/16)*(H/16) + (W/32)*(H/32)` (e.g., `2100` at `320x320`, `8400` at `640x640`, `3549` at `416x416`).
+pub fn expected_yolo_anchors(model_w: u32, model_h: u32) -> usize {
+    let w = model_w as usize;
+    let h = model_h as usize;
+    (w / 8) * (h / 8) + (w / 16) * (h / 16) + (w / 32) * (h / 32)
+}
+
 /// Converts a packed `NHWC` `u8` (`[0..255]`) RGB/BGR frame crop into normalized `[0.0..1.0]` `f32`
 /// elements in either planar `NCHW` (`[1, 3, H, W]`) or interleaved `NHWC` (`[1, H, W, 3]`) layout.
 pub fn prepare_input_tensor_f32(
@@ -441,11 +449,27 @@ impl AiDetectorEngine {
         config: &NinjaConfig,
         entry_override: Option<&DetectorEntryConfig>,
     ) -> DetectorRuntimeState {
-        let raw_labels = config.load_labelmap();
+        let effective_model = entry_override
+            .and_then(|e| e.model.as_ref())
+            .unwrap_or(&config.model);
+
         let mut labelmap = BTreeMap::new();
-        for (k, v) in raw_labels {
-            if let Ok(id) = k.parse::<i32>() {
-                labelmap.insert(id, v);
+        if !effective_model.labelmap_path.is_empty()
+            && let Ok(content) = std::fs::read_to_string(&effective_model.labelmap_path)
+        {
+            for (idx, line) in content.lines().enumerate() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    labelmap.insert(idx as i32, trimmed.to_string());
+                }
+            }
+        }
+        if labelmap.is_empty() {
+            let raw_labels = config.load_labelmap();
+            for (k, v) in raw_labels {
+                if let Ok(id) = k.parse::<i32>() {
+                    labelmap.insert(id, v);
+                }
             }
         }
 
@@ -463,9 +487,6 @@ impl AiDetectorEngine {
             .map(|e| e.device.as_str())
             .or_else(|| config.detectors.values().next().map(|d| d.device.as_str()))
             .unwrap_or("CPU");
-        let effective_model = entry_override
-            .and_then(|e| e.model.as_ref())
-            .unwrap_or(&config.model);
 
         let mut model_w = effective_model.width.max(64);
         let mut model_h = effective_model.height.max(64);
@@ -1519,18 +1540,45 @@ impl AiDetectorEngine {
         Self::decode_output_with_state(&guard, slice, region, frame_w, frame_h, score_threshold)
     }
 
-    fn resolve_yolo_label(state: &DetectorRuntimeState, cls_idx: i32) -> Option<String> {
+    pub fn set_labelmap(&self, labelmap: BTreeMap<i32, String>) {
+        let mut guard = self.inner.lock().expect("detector inner mutex poisoned");
+        guard.labelmap = labelmap;
+    }
+
+    fn custom_labelmap_class_count(state: &DetectorRuntimeState) -> Option<usize> {
+        if state.labelmap.is_empty() {
+            return None;
+        }
         let is_background_zero = state
             .labelmap
             .get(&0)
             .is_some_and(|l| l == "__background__");
-        if !is_background_zero
-            && let Some(lbl) = state.labelmap.get(&cls_idx)
-            && lbl != "__background__"
-        {
-            return Some(lbl.clone());
+        if is_background_zero {
+            return None;
         }
-        if cls_idx >= 0 && (cls_idx as usize) < YOLO_COCO_80.len() {
+        let c_cfg = state.labelmap.keys().filter(|&&k| k >= 0).count();
+        if c_cfg >= 1 { Some(c_cfg) } else { None }
+    }
+
+    fn resolve_yolo_label(state: &DetectorRuntimeState, cls_idx: i32) -> Option<String> {
+        if cls_idx < 0 {
+            return None;
+        }
+        let is_background_zero = state
+            .labelmap
+            .get(&0)
+            .is_some_and(|l| l == "__background__");
+        if !is_background_zero {
+            if let Some(lbl) = state.labelmap.get(&cls_idx)
+                && lbl != "__background__"
+            {
+                return Some(lbl.clone());
+            }
+            if state.labelmap.keys().any(|&k| k >= 0) {
+                return None;
+            }
+        }
+        if (cls_idx as usize) < YOLO_COCO_80.len() {
             return Some(YOLO_COCO_80[cls_idx as usize].to_string());
         }
         state.labelmap.get(&cls_idx).cloned()
@@ -1565,6 +1613,124 @@ impl AiDetectorEngine {
         }
     }
 
+    fn decode_transposed_yolo(
+        state: &DetectorRuntimeState,
+        slice: &[f32],
+        num_classes: usize,
+        num_anchors: usize,
+        region: BoundingBox,
+        frame_dims: (u32, u32),
+        score_threshold: f32,
+    ) -> Vec<DetectionResult> {
+        let rows = 4 + num_classes;
+        if num_classes == 0 || num_anchors == 0 || slice.len() != rows * num_anchors {
+            return Vec::new();
+        }
+        let mw = state.model_w.max(1) as f32;
+        let mh = state.model_h.max(1) as f32;
+        let mut out_results = Vec::new();
+        for a in 0..num_anchors {
+            let mut best_cls = -1i32;
+            let mut best_score = 0.0f32;
+            for c in 0..num_classes {
+                let s = slice[(4 + c) * num_anchors + a];
+                if s > best_score {
+                    best_score = s;
+                    best_cls = c as i32;
+                }
+            }
+            if best_score < score_threshold || best_score > 1.0001 || best_cls < 0 {
+                continue;
+            }
+            let Some(label) = Self::resolve_yolo_label(state, best_cls) else {
+                continue;
+            };
+            let cx = slice[a];
+            let cy = slice[num_anchors + a];
+            let bw = slice[2 * num_anchors + a];
+            let bh = slice[3 * num_anchors + a];
+            if bw <= 0.0 || bh <= 0.0 {
+                continue;
+            }
+            let scale_w = if bw > 1.5 || cx > 1.5 { mw } else { 1.0 };
+            let scale_h = if bh > 1.5 || cy > 1.5 { mh } else { 1.0 };
+            let nx1 = (cx - bw * 0.5) / scale_w;
+            let ny1 = (cy - bh * 0.5) / scale_h;
+            let nx2 = (cx + bw * 0.5) / scale_w;
+            let ny2 = (cy + bh * 0.5) / scale_h;
+            Self::push_box_from_norm(
+                &mut out_results,
+                label,
+                best_score,
+                [nx1, ny1, nx2, ny2],
+                region,
+                frame_dims,
+            );
+        }
+        nms_detections(out_results, 0.50)
+    }
+
+    fn decode_row_major_yolo(
+        state: &DetectorRuntimeState,
+        slice: &[f32],
+        num_classes: usize,
+        region: BoundingBox,
+        frame_dims: (u32, u32),
+        score_threshold: f32,
+    ) -> Vec<DetectionResult> {
+        let stride = 5 + num_classes;
+        if num_classes == 0 || !slice.len().is_multiple_of(stride) {
+            return Vec::new();
+        }
+        let mw = state.model_w.max(1) as f32;
+        let mh = state.model_h.max(1) as f32;
+        let mut out_results = Vec::new();
+        for row in slice.chunks_exact(stride) {
+            let obj_conf = row[4];
+            if obj_conf < score_threshold || obj_conf > 1.0001 {
+                continue;
+            }
+            let mut best_cls = -1i32;
+            let mut best_cls_prob = 0.0f32;
+            for (c, &prob) in row[5..stride].iter().enumerate() {
+                if prob > best_cls_prob {
+                    best_cls_prob = prob;
+                    best_cls = c as i32;
+                }
+            }
+            let score = if best_cls_prob > 0.0 {
+                obj_conf * best_cls_prob
+            } else {
+                obj_conf
+            };
+            if score < score_threshold || score > 1.0001 || best_cls < 0 {
+                continue;
+            }
+            let Some(label) = Self::resolve_yolo_label(state, best_cls) else {
+                continue;
+            };
+            let (cx, cy, bw, bh) = (row[0], row[1], row[2], row[3]);
+            if bw <= 0.0 || bh <= 0.0 {
+                continue;
+            }
+            let scale_w = if bw > 1.5 || cx > 1.5 { mw } else { 1.0 };
+            let scale_h = if bh > 1.5 || cy > 1.5 { mh } else { 1.0 };
+            let nx1 = (cx - bw * 0.5) / scale_w;
+            let ny1 = (cy - bh * 0.5) / scale_h;
+            let nx2 = (cx + bw * 0.5) / scale_w;
+            let ny2 = (cy + bh * 0.5) / scale_h;
+            Self::push_box_from_norm(
+                &mut out_results,
+                label,
+                score,
+                [nx1, ny1, nx2, ny2],
+                region,
+                frame_dims,
+            );
+        }
+        nms_detections(out_results, 0.50)
+    }
+
     fn decode_output_with_state(
         state: &DetectorRuntimeState,
         slice: &[f32],
@@ -1577,14 +1743,22 @@ impl AiDetectorEngine {
         let mw = state.model_w.max(1) as f32;
         let mh = state.model_h.max(1) as f32;
         let frame_dims = (frame_w, frame_h);
+        let expected_anchors = expected_yolo_anchors(state.model_w, state.model_h);
+        let c_cfg = Self::custom_labelmap_class_count(state);
+
+        let is_yolo_tensor_shape = (expected_anchors > 0
+            && slice.len().is_multiple_of(expected_anchors)
+            && (5..=205).contains(&(slice.len() / expected_anchors)))
+            || c_cfg.is_some_and(|c| {
+                slice.len().is_multiple_of(4 + c) || slice.len().is_multiple_of(5 + c)
+            })
+            || slice.len().is_multiple_of(84)
+            || slice.len().is_multiple_of(85);
 
         // 1. SSD DetectionOutput [1, 1, N, 7]: [image_id, label_id, score, xmin, ymin, xmax, ymax]
         // Also auto-detected when a 7-column SSD model is loaded even if `model_type: yolo*` was selected in UI.
         let is_ssd_shape = slice.len().is_multiple_of(7)
-            && (!state.is_yolo
-                || (!slice.len().is_multiple_of(6)
-                    && !slice.len().is_multiple_of(84)
-                    && !slice.len().is_multiple_of(85)));
+            && (!state.is_yolo || (!slice.len().is_multiple_of(6) && !is_yolo_tensor_shape));
 
         if is_ssd_shape {
             for row in slice.as_chunks::<7>().0 {
@@ -1612,94 +1786,103 @@ impl AiDetectorEngine {
             return out_results;
         }
 
-        // 2. YOLOv8 / YOLOv9 / YOLOv11 Transposed [1, 84, N] (where 84 = 4 box coords + 80 classes)
-        // Guarded with `!is_multiple_of(85)` because anchor counts like N=2100 or N=8400 are multiples of 84.
-        if slice.len() >= 84 * 10
+        // 2. Dynamic & 80-class Transposed YOLOv8 / YOLOv9 / YOLOv11 [1, 4 + C, N]
+        if expected_anchors > 0 && slice.len().is_multiple_of(expected_anchors) {
+            let cols = slice.len() / expected_anchors;
+            let prefers_row_major =
+                (c_cfg.is_some_and(|c| cols == 5 + c)) || (c_cfg.is_none() && cols == 85);
+            if (5..=204).contains(&cols) && !prefers_row_major {
+                let num_classes = cols - 4;
+                let dets = Self::decode_transposed_yolo(
+                    state,
+                    slice,
+                    num_classes,
+                    expected_anchors,
+                    region,
+                    frame_dims,
+                    score_threshold,
+                );
+                if !dets.is_empty() || !slice.len().is_multiple_of(cols) {
+                    return dets;
+                }
+            }
+        }
+
+        if let Some(c) = c_cfg
+            && c >= 1
+            && slice.len().is_multiple_of(4 + c)
+        {
+            let num_anchors = slice.len() / (4 + c);
+            let dets = Self::decode_transposed_yolo(
+                state,
+                slice,
+                c,
+                num_anchors,
+                region,
+                frame_dims,
+                score_threshold,
+            );
+            if !dets.is_empty() || !slice.len().is_multiple_of(5 + c) {
+                return dets;
+            }
+        }
+
+        if c_cfg.is_none()
+            && slice.len() >= 84 * 10
             && slice.len().is_multiple_of(84)
             && !slice.len().is_multiple_of(85)
         {
             let num_anchors = slice.len() / 84;
-            for a in 0..num_anchors {
-                let mut best_cls = -1i32;
-                let mut best_score = 0.0f32;
-                for c in 0..80 {
-                    let s = slice[(4 + c) * num_anchors + a];
-                    if s > best_score {
-                        best_score = s;
-                        best_cls = c as i32;
-                    }
-                }
-                if best_score < score_threshold || best_cls < 0 {
-                    continue;
-                }
-                let Some(label) = Self::resolve_yolo_label(state, best_cls) else {
-                    continue;
-                };
-                let cx = slice[a];
-                let cy = slice[num_anchors + a];
-                let bw = slice[2 * num_anchors + a];
-                let bh = slice[3 * num_anchors + a];
-                let scale_w = if bw > 1.5 || cx > 1.5 { mw } else { 1.0 };
-                let scale_h = if bh > 1.5 || cy > 1.5 { mh } else { 1.0 };
-                let nx1 = (cx - bw * 0.5) / scale_w;
-                let ny1 = (cy - bh * 0.5) / scale_h;
-                let nx2 = (cx + bw * 0.5) / scale_w;
-                let ny2 = (cy + bh * 0.5) / scale_h;
-                Self::push_box_from_norm(
-                    &mut out_results,
-                    label,
-                    best_score,
-                    [nx1, ny1, nx2, ny2],
-                    region,
-                    frame_dims,
-                );
-            }
-            return nms_detections(out_results, 0.50);
+            return Self::decode_transposed_yolo(
+                state,
+                slice,
+                80,
+                num_anchors,
+                region,
+                frame_dims,
+                score_threshold,
+            );
         }
 
-        // 3. YOLOv5 / YOLOX 85-column [1, N, 85]: [cx, cy, w, h, obj_conf, cls_0..cls_79]
-        if slice.len().is_multiple_of(85) {
-            for row in slice.as_chunks::<85>().0 {
-                let obj_conf = row[4];
-                if obj_conf < score_threshold {
-                    continue;
-                }
-                let mut best_cls = -1i32;
-                let mut best_cls_prob = 0.0f32;
-                for (c, &prob) in row[5..85].iter().enumerate() {
-                    if prob > best_cls_prob {
-                        best_cls_prob = prob;
-                        best_cls = c as i32;
-                    }
-                }
-                let score = if best_cls_prob > 0.0 {
-                    obj_conf * best_cls_prob
-                } else {
-                    obj_conf
-                };
-                if score < score_threshold || best_cls < 0 {
-                    continue;
-                }
-                let Some(label) = Self::resolve_yolo_label(state, best_cls) else {
-                    continue;
-                };
-                let (cx, cy, bw, bh) = (row[0], row[1], row[2], row[3]);
-                let scale_w = if bw > 1.5 || cx > 1.5 { mw } else { 1.0 };
-                let scale_h = if bh > 1.5 || cy > 1.5 { mh } else { 1.0 };
-                let nx1 = (cx - bw * 0.5) / scale_w;
-                let ny1 = (cy - bh * 0.5) / scale_h;
-                let nx2 = (cx + bw * 0.5) / scale_w;
-                let ny2 = (cy + bh * 0.5) / scale_h;
-                Self::push_box_from_norm(
-                    &mut out_results,
-                    label,
-                    score,
-                    [nx1, ny1, nx2, ny2],
+        // 3. Dynamic & 80-class Row-Major YOLOv5 / YOLOX [1, N, 5 + C]: [cx, cy, w, h, obj_conf, cls_0..cls_{C-1}]
+        if let Some(c) = c_cfg
+            && c >= 1
+            && slice.len().is_multiple_of(5 + c)
+        {
+            return Self::decode_row_major_yolo(
+                state,
+                slice,
+                c,
+                region,
+                frame_dims,
+                score_threshold,
+            );
+        }
+
+        if expected_anchors > 0 && slice.len().is_multiple_of(expected_anchors) {
+            let cols = slice.len() / expected_anchors;
+            if (6..=205).contains(&cols) {
+                let num_classes = cols - 5;
+                return Self::decode_row_major_yolo(
+                    state,
+                    slice,
+                    num_classes,
                     region,
                     frame_dims,
+                    score_threshold,
                 );
             }
-            return nms_detections(out_results, 0.50);
+        }
+
+        if slice.len().is_multiple_of(85) {
+            return Self::decode_row_major_yolo(
+                state,
+                slice,
+                80,
+                region,
+                frame_dims,
+                score_threshold,
+            );
         }
 
         // 4. End-to-End 6-column YOLO / YOLOX / RT-DETR [1, N, 6]: [x1, y1, x2, y2, score, class_id]
@@ -2346,5 +2529,131 @@ version: 0.18-0
         assert!(engine.named_detector(Some("aux_npu")).is_none());
         let reloaded = engine.named_detector(Some("reloaded_ort")).unwrap();
         assert_eq!(reloaded.model_dimensions(), (640, 640, false));
+    }
+
+    #[test]
+    fn decodes_dynamic_15_class_transposed_yolov9_and_row_major_yolov5_tensors() {
+        assert_eq!(expected_yolo_anchors(320, 320), 2100);
+        assert_eq!(expected_yolo_anchors(416, 416), 3549);
+        assert_eq!(expected_yolo_anchors(640, 640), 8400);
+
+        let classes_15 = [
+            "person",
+            "bicycle",
+            "car",
+            "motorcycle",
+            "bus",
+            "truck",
+            "dog",
+            "cat",
+            "face",
+            "license_plate",
+            "package",
+            "waste_bin",
+            "correios",
+            "mercado_livre",
+            "amazon",
+        ];
+        let mut custom_labelmap = BTreeMap::new();
+        for (idx, &lbl) in classes_15.iter().enumerate() {
+            custom_labelmap.insert(idx as i32, lbl.to_string());
+        }
+
+        let mut cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/c15.yml")).unwrap();
+        cfg.model.model_type = "yolo-generic".to_string();
+        cfg.model.width = 320;
+        cfg.model.height = 320;
+        cfg.model.input_tensor = "nchw".to_string();
+        cfg.model.input_pixel_format = "rgb".to_string();
+
+        let engine = AiDetectorEngine::new(&cfg);
+        engine.set_labelmap(custom_labelmap.clone());
+        let region = BoundingBox::new(0, 0, 1280, 720);
+
+        // 1. Transposed [1, 19, 2100] (4 + 15 classes at 320x320) with duplicate overlapping anchor for NMS
+        let n_320 = 2100usize;
+        let mut t_320 = vec![0.0f32; 19 * n_320];
+        // Anchor 0: person at center (160, 160), size (80, 160), score 0.92
+        t_320[0] = 160.0;
+        t_320[n_320] = 160.0;
+        t_320[2 * n_320] = 80.0;
+        t_320[3 * n_320] = 160.0;
+        t_320[4 * n_320] = 0.92; // class 0 = person
+        // Anchor 1: duplicate person box with lower score 0.71 -> suppressed by NMS
+        t_320[1] = 160.0;
+        t_320[n_320 + 1] = 160.0;
+        t_320[2 * n_320 + 1] = 80.0;
+        t_320[3 * n_320 + 1] = 160.0;
+        t_320[4 * n_320 + 1] = 0.71;
+        // Anchor 2: face (class 8) at (160, 100), size (24, 24), score 0.88
+        t_320[2] = 160.0;
+        t_320[n_320 + 2] = 100.0;
+        t_320[2 * n_320 + 2] = 24.0;
+        t_320[3 * n_320 + 2] = 24.0;
+        t_320[(4 + 8) * n_320 + 2] = 0.88;
+        // Anchor 3: package (class 10) at (260, 260), size (40, 40), score 0.84
+        t_320[3] = 260.0;
+        t_320[n_320 + 3] = 260.0;
+        t_320[2 * n_320 + 3] = 40.0;
+        t_320[3 * n_320 + 3] = 40.0;
+        t_320[(4 + 10) * n_320 + 3] = 0.84;
+
+        let dets_320 = engine.parse_raw_output_slice(&t_320, region, 1280, 720, 0.50);
+        assert_eq!(
+            dets_320.len(),
+            3,
+            "duplicate person anchor must be deduplicated by NMS"
+        );
+        assert_eq!(dets_320[0].label, "person");
+        assert!((dets_320[0].score - 0.92).abs() < 1e-4);
+        assert_eq!(dets_320[0].bbox, BoundingBox::new(480, 180, 800, 540));
+        assert_eq!(dets_320[1].label, "face");
+        assert_eq!(dets_320[2].label, "package");
+
+        // 2. Transposed [1, 19, 8400] (4 + 15 classes at 640x640)
+        cfg.model.width = 640;
+        cfg.model.height = 640;
+        engine.reload(&cfg);
+        engine.set_labelmap(custom_labelmap.clone());
+
+        let n_640 = 8400usize;
+        let mut t_640 = vec![0.0f32; 19 * n_640];
+        // Anchor 10: license_plate (class 9) at (320, 480), size (64, 32), score 0.91
+        t_640[10] = 320.0;
+        t_640[n_640 + 10] = 480.0;
+        t_640[2 * n_640 + 10] = 64.0;
+        t_640[3 * n_640 + 10] = 32.0;
+        t_640[(4 + 9) * n_640 + 10] = 0.91;
+
+        let dets_640 = engine.parse_raw_output_slice(&t_640, region, 1280, 720, 0.50);
+        assert_eq!(dets_640.len(), 1);
+        assert_eq!(dets_640[0].label, "license_plate");
+        assert!((dets_640[0].score - 0.91).abs() < 1e-4);
+
+        // 3. Custom anchor count fallback [1, 19, 32] via state.labelmap class count (c_cfg = 15)
+        let n_custom = 32usize;
+        let mut t_custom = vec![0.0f32; 19 * n_custom];
+        t_custom[0] = 320.0;
+        t_custom[n_custom] = 320.0;
+        t_custom[2 * n_custom] = 128.0;
+        t_custom[3 * n_custom] = 128.0;
+        t_custom[(4 + 12) * n_custom] = 0.89; // class 12 = correios
+        let dets_custom = engine.parse_raw_output_slice(&t_custom, region, 1280, 720, 0.50);
+        assert_eq!(dets_custom.len(), 1);
+        assert_eq!(dets_custom[0].label, "correios");
+
+        // 4. Row-major [1, N, 20] (5 + 15 classes: cx, cy, w, h, obj_conf, cls_0..cls_14)
+        let mut rm_20 = vec![0.0f32; 25 * 20];
+        rm_20[0] = 320.0; // cx
+        rm_20[1] = 320.0; // cy
+        rm_20[2] = 160.0; // w
+        rm_20[3] = 160.0; // h
+        rm_20[4] = 0.95; // obj_conf
+        rm_20[5 + 9] = 0.90; // class 9 = license_plate
+        let dets_rm = engine.parse_raw_output_slice(&rm_20, region, 1280, 720, 0.50);
+        assert_eq!(dets_rm.len(), 1);
+        assert_eq!(dets_rm[0].label, "license_plate");
+        assert!((dets_rm[0].score - 0.95 * 0.90).abs() < 1e-4);
     }
 }
