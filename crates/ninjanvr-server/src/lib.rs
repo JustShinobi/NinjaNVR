@@ -2277,9 +2277,21 @@ pub struct UpdateUserCamerasBody {
 
 async fn api_user_role(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(username): AxumPath<String>,
     Json(body): Json<UpdateUserRoleBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if let Some(ref cams) = body.allowed_cameras {
         let _ = state.db.update_user_allowed_cameras(&username, cams);
     } else if !body.role.trim().eq_ignore_ascii_case("admin")
@@ -2317,9 +2329,21 @@ async fn api_user_role(
 
 async fn api_user_cameras(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(username): AxumPath<String>,
     Json(body): Json<UpdateUserCamerasBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     match state
         .db
         .update_user_allowed_cameras(&username, &body.allowed_cameras)
@@ -2348,8 +2372,20 @@ async fn api_user_cameras(
 
 async fn api_user_delete(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(username): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     match state.db.delete_user(&username) {
         Ok(true) => {
             let _ = state.db.revoke_share_links_by_creator(&username);
@@ -2420,8 +2456,20 @@ async fn api_token_create(
 
 async fn api_token_delete(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let token_name = state.db.list_api_tokens().ok().and_then(|tokens| {
         tokens.into_iter().find_map(|item| {
             if item["id"].as_str() == Some(id.trim()) {
@@ -4955,21 +5003,44 @@ pub struct DeleteIdsBody {
 
 async fn api_review_delete(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
-) -> Json<Value> {
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let _ = state.db.delete_reviews(std::slice::from_ref(&id));
     let _ = state.db.revoke_share_links_for_target(None, &id);
     purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
-    Json(json!({ "success": true }))
+    Json(json!({ "success": true })).into_response()
 }
 
 async fn api_reviews_delete(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     Json(body): Json<DeleteIdsBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         for id in &body.ids {
             let permitted = state
@@ -5071,13 +5142,25 @@ async fn api_event_by_id(
 
 async fn api_event_delete(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
-) -> Json<Value> {
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let _ = state.db.delete_event(&id);
     let _ = state.db.revoke_share_links_for_target(None, &id);
     purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
-    Json(json!({ "success": true }))
+    Json(json!({ "success": true })).into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -5090,8 +5173,20 @@ pub struct BulkDeleteEventsBody {
 
 async fn api_events_bulk_delete(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     Json(body): Json<BulkDeleteEventsBody>,
-) -> Json<Value> {
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let ids = if !body.event_ids.is_empty() {
         body.event_ids
     } else {
@@ -5103,7 +5198,7 @@ async fn api_events_bulk_delete(
         cleanup_share_clip_artifacts(&state.media_dir, id);
     }
     purge_revoked_share_credits(&state);
-    Json(json!({ "success": true }))
+    Json(json!({ "success": true })).into_response()
 }
 
 async fn api_event_retain_on(
@@ -7975,9 +8070,21 @@ async fn api_camera_recordings(
 
 async fn api_camera_recordings_delete(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(camera): AxumPath<String>,
     Query(q): Query<RecordingsQueryParams>,
-) -> Json<Value> {
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let now = unix_now() as f64;
     let before = q.before.unwrap_or(now);
     let after = q.after.unwrap_or(0.0);
@@ -8002,6 +8109,7 @@ async fn api_camera_recordings_delete(
         "deleted_segments": deleted.len(),
         "freed_bytes": freed_bytes
     }))
+    .into_response()
 }
 
 async fn api_recordings_sync(State(state): State<AppState>) -> Json<Value> {
@@ -8334,16 +8442,19 @@ fn is_internal_backend_host(host_port: &str) -> bool {
     let host = bare_hostname(host_port);
     if host.eq_ignore_ascii_case("localhost")
         || host.eq_ignore_ascii_case("ninjanvr")
-        || host == "127.0.0.1"
-        || host == "::1"
         || host.ends_with(".svc")
         || host.ends_with(".cluster.local")
         || host.ends_with(".internal")
     {
         return true;
     }
-    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-        return ip.is_loopback() || ip.is_private() || ip.is_link_local();
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        };
     }
     false
 }
@@ -8443,6 +8554,47 @@ fn verify_cookie_csrf_origin(headers: &HeaderMap, uri: &Uri) -> bool {
     true
 }
 
+fn has_active_or_in_flight_share_for_target(
+    state: &AppState,
+    target_id: &str,
+    now_ts: u64,
+) -> bool {
+    if state
+        .db
+        .has_active_share_links_for_target(target_id, now_ts as f64)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let credited_jtis: Vec<String> = state
+        .share_page_video_credits
+        .lock()
+        .ok()
+        .map(|map| {
+            map.iter()
+                .filter(|(_, entry)| {
+                    entry.page_credits > 0
+                        || entry.has_any_active_stream()
+                        || entry.has_active_session(now_ts)
+                })
+                .map(|(jti, _)| jti.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for jti in credited_jtis {
+        if let Ok(Some(link)) = state.db.get_share_link(&jti)
+            && !link["revoked"].as_bool().unwrap_or(false)
+            && link["expires_at"]
+                .as_f64()
+                .is_some_and(|exp| exp > now_ts as f64)
+            && link["target_id"].as_str() == Some(target_id)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 async fn api_share_revoke(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -8487,10 +8639,7 @@ async fn api_share_revoke(
         map.remove(&id);
     }
     if let Some(target_id) = link["target_id"].as_str()
-        && !state
-            .db
-            .has_active_share_links_for_target(target_id, unix_now() as f64)
-            .unwrap_or(false)
+        && !has_active_or_in_flight_share_for_target(&state, target_id, unix_now())
     {
         cleanup_share_clip_artifacts(&state.media_dir, target_id);
     }
@@ -8498,25 +8647,32 @@ async fn api_share_revoke(
 }
 
 fn purge_revoked_share_credits(state: &AppState) {
+    let now_u64 = unix_now();
+    let now_ts = now_u64 as f64;
     let keys: Vec<String> = state
         .share_page_video_credits
         .lock()
         .ok()
         .map(|map| map.keys().cloned().collect())
         .unwrap_or_default();
-    if keys.is_empty() {
-        return;
+    if !keys.is_empty() {
+        let inactive_keys: Vec<String> = keys
+            .into_iter()
+            .filter(|jti| !state.db.is_share_link_active(jti, now_ts).unwrap_or(false))
+            .collect();
+        if !inactive_keys.is_empty()
+            && let Ok(mut map) = state.share_page_video_credits.lock()
+        {
+            for jti in inactive_keys {
+                map.remove(&jti);
+            }
+        }
     }
-    let now_ts = unix_now() as f64;
-    let inactive_keys: Vec<String> = keys
-        .into_iter()
-        .filter(|jti| !state.db.is_share_link_active(jti, now_ts).unwrap_or(false))
-        .collect();
-    if !inactive_keys.is_empty()
-        && let Ok(mut map) = state.share_page_video_credits.lock()
-    {
-        for jti in inactive_keys {
-            map.remove(&jti);
+    if let Ok(targets) = state.db.list_expired_or_revoked_share_link_targets(now_ts) {
+        for target_id in targets {
+            if !has_active_or_in_flight_share_for_target(state, &target_id, now_u64) {
+                cleanup_share_clip_artifacts(&state.media_dir, &target_id);
+            }
         }
     }
 }
@@ -8703,28 +8859,46 @@ fn verify_share_jti_with_view_mode(
     if link["revoked"].as_bool().unwrap_or(false) {
         if let Some(created_by) = link["created_by"].as_str()
             && !created_by.is_empty()
-            && !created_by.starts_with("token:")
         {
-            let lookup_user = created_by.strip_prefix("ext:").unwrap_or(created_by).trim();
-            if let Ok(Some(db_u)) = state.db.get_user(lookup_user)
-                && !db_u.role.trim().eq_ignore_ascii_case("viewer")
-                && !db_u.role.trim().eq_ignore_ascii_case("admin")
-            {
-                let raw_cams = db_u.allowed_cameras.trim();
-                if !raw_cams.is_empty() && raw_cams != "*" {
-                    let allowed: Vec<&str> = raw_cams
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    let cam_ok = link["camera"]
-                        .as_str()
-                        .is_some_and(|c| allowed.contains(&c));
-                    if !cam_ok {
-                        return Err((
-                            StatusCode::FORBIDDEN,
-                            "Share link creator camera access revoked",
-                        ));
+            if let Some(token_name) = created_by.strip_prefix("token:") {
+                let token_exists = state.db.list_api_tokens().ok().is_some_and(|tokens| {
+                    tokens
+                        .iter()
+                        .any(|item| item["name"].as_str() == Some(token_name.trim()))
+                });
+                if token_exists
+                    && !state
+                        .db
+                        .is_api_token_active_by_name(token_name, now_ts as f64)
+                        .unwrap_or(false)
+                {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        "Share link creator API token revoked or expired",
+                    ));
+                }
+            } else {
+                let lookup_user = created_by.strip_prefix("ext:").unwrap_or(created_by).trim();
+                if let Ok(Some(db_u)) = state.db.get_user(lookup_user)
+                    && !db_u.role.trim().eq_ignore_ascii_case("viewer")
+                    && !db_u.role.trim().eq_ignore_ascii_case("admin")
+                {
+                    let raw_cams = db_u.allowed_cameras.trim();
+                    if !raw_cams.is_empty() && raw_cams != "*" {
+                        let allowed: Vec<&str> = raw_cams
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        let cam_ok = link["camera"]
+                            .as_str()
+                            .is_some_and(|c| allowed.contains(&c));
+                        if !cam_ok {
+                            return Err((
+                                StatusCode::FORBIDDEN,
+                                "Share link creator camera access revoked",
+                            ));
+                        }
                     }
                 }
             }
@@ -8783,12 +8957,21 @@ fn verify_share_jti_with_view_mode(
     if let Some(created_by) = link["created_by"].as_str()
         && !created_by.is_empty()
     {
+        let revoke_invalid_creator_jti = |revoke_db: bool| {
+            if revoke_db && !created_by.eq_ignore_ascii_case("admin") {
+                let _ = state.db.revoke_share_link(jti);
+            }
+            if let Ok(mut map) = state.share_page_video_credits.lock() {
+                map.remove(jti);
+            }
+        };
         if let Some(token_name) = created_by.strip_prefix("token:") {
             let token_valid = state
                 .db
                 .is_api_token_active_by_name(token_name, now_ts as f64)
                 .unwrap_or(false);
             if !token_valid {
+                revoke_invalid_creator_jti(true);
                 return Err((
                     StatusCode::FORBIDDEN,
                     "Share link creator API token revoked or expired",
@@ -8797,6 +8980,7 @@ fn verify_share_jti_with_view_mode(
         } else if let Some(ext_user) = created_by.strip_prefix("ext:") {
             let trimmed_ext = ext_user.trim();
             if trimmed_ext.is_empty() {
+                revoke_invalid_creator_jti(!is_player_page);
                 return Err((
                     StatusCode::FORBIDDEN,
                     "Share link creator user no longer exists",
@@ -8804,6 +8988,7 @@ fn verify_share_jti_with_view_mode(
             }
             if let Ok(Some(db_u)) = state.db.get_user(trimmed_ext) {
                 if db_u.role.trim().eq_ignore_ascii_case("viewer") {
+                    revoke_invalid_creator_jti(!is_player_page);
                     return Err((
                         StatusCode::FORBIDDEN,
                         "Share link creator role is not permitted to share",
@@ -8821,6 +9006,7 @@ fn verify_share_jti_with_view_mode(
                             .as_str()
                             .is_some_and(|c| allowed.contains(&c));
                         if !cam_ok {
+                            revoke_invalid_creator_jti(true);
                             return Err((
                                 StatusCode::FORBIDDEN,
                                 "Share link creator camera access revoked",
@@ -8833,6 +9019,7 @@ fn verify_share_jti_with_view_mode(
             match state.db.get_user(created_by) {
                 Ok(Some(db_u)) => {
                     if db_u.role.trim().eq_ignore_ascii_case("viewer") {
+                        revoke_invalid_creator_jti(!is_player_page);
                         return Err((
                             StatusCode::FORBIDDEN,
                             "Share link creator role is not permitted to share",
@@ -8850,6 +9037,7 @@ fn verify_share_jti_with_view_mode(
                                 .as_str()
                                 .is_some_and(|c| allowed.contains(&c));
                             if !cam_ok {
+                                revoke_invalid_creator_jti(true);
                                 return Err((
                                     StatusCode::FORBIDDEN,
                                     "Share link creator camera access revoked",
@@ -8860,6 +9048,7 @@ fn verify_share_jti_with_view_mode(
                 }
                 Ok(None) if created_by.eq_ignore_ascii_case("admin") => {}
                 Ok(None) | Err(_) => {
+                    revoke_invalid_creator_jti(!is_player_page);
                     return Err((
                         StatusCode::FORBIDDEN,
                         "Share link creator user no longer exists",
@@ -8952,9 +9141,23 @@ fn record_share_access_or_gone(
     new_session_id: Option<String>,
     has_valid_sid: bool,
     valid_continuation: bool,
+    prev_stream_cursor: Option<(usize, u64)>,
     resp: Response,
 ) -> Response {
     if resp.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        if let Some((idx, prev_cursor)) = prev_stream_cursor
+            && let Some(jti) = payload
+                .jti
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            && let Ok(mut map) = state.share_page_video_credits.lock()
+            && let Some(entry) = map.get_mut(jti)
+            && idx < entry.active_streams.len()
+        {
+            entry.active_streams[idx] = prev_cursor;
+            entry.sync_stream_summary();
+        }
         return resp;
     }
     let is_initial_video = !is_player_page && matches!(request_range, None | Some((0, _)));
@@ -9062,6 +9265,9 @@ fn record_share_access_or_gone(
             Ok(false) => {
                 if let Ok(mut map) = state.share_page_video_credits.lock() {
                     map.remove(jti);
+                }
+                if !has_active_or_in_flight_share_for_target(state, &payload.id, now_ts) {
+                    cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
                 }
                 (
                     StatusCode::GONE,
@@ -9268,6 +9474,7 @@ async fn share_player_page(
         Some(sid),
         false,
         false,
+        None,
         resp,
     )
 }
@@ -9705,47 +9912,37 @@ pub struct ShareVideoQuery {
 fn verify_post_build_share_target_and_jti(
     state: &AppState,
     payload: &ShareTokenPayload,
+    is_initial: bool,
+    provided_sid: Option<&str>,
+    valid_continuation: bool,
 ) -> Option<Response> {
     if !resolve_share_target_metadata(state, &payload.k, &payload.id).3 {
         cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
         return Some(StatusCode::NOT_FOUND.into_response());
     }
     let now_ts = unix_now();
-    if payload
-        .jti
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_some_and(|jti| {
-            !state
-                .db
-                .is_share_link_active(jti, now_ts as f64)
-                .unwrap_or(false)
-        })
-    {
-        if !state
-            .db
-            .has_active_share_links_for_target(&payload.id, now_ts as f64)
-            .unwrap_or(false)
+    if let Err((status, msg)) = verify_share_jti_with_view_mode(
+        state,
+        payload,
+        now_ts,
+        is_initial,
+        false,
+        provided_sid,
+        valid_continuation,
+    ) {
+        if msg.starts_with("Share link creator ")
+            && let Some(jti) = payload
+                .jti
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
         {
-            cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
+            let _ = state.db.revoke_share_link(jti);
+            if let Ok(mut map) = state.share_page_video_credits.lock() {
+                map.remove(jti);
+            }
         }
-        return Some(
-            (
-                StatusCode::GONE,
-                Json(json!({ "error": "Share link has been revoked" })),
-            )
-                .into_response(),
-        );
-    }
-    if let Err((status, msg)) =
-        verify_share_jti_with_view_mode(state, payload, now_ts, false, false, None, true)
-    {
-        if !state
-            .db
-            .has_active_share_links_for_target(&payload.id, now_ts as f64)
-            .unwrap_or(false)
-        {
+        if !has_active_or_in_flight_share_for_target(state, &payload.id, now_ts) {
             cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
         }
         return Some((status, Json(json!({ "error": msg }))).into_response());
@@ -9778,6 +9975,7 @@ async fn share_video_mp4(
     let provided_sid = q.sid.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let mut has_valid_sid = false;
     let mut valid_continuation = false;
+    let mut prev_stream_cursor: Option<(usize, u64)> = None;
     if let Some(jti) = payload
         .jti
         .as_deref()
@@ -9798,7 +9996,7 @@ async fn share_video_mp4(
             if entry.active_streams.is_empty() && entry.active_stream_started {
                 entry.active_streams.push(entry.min_next_range_start);
             }
-            if let Some((idx, _)) = entry
+            if let Some((idx, prev_cursor)) = entry
                 .active_streams
                 .iter()
                 .copied()
@@ -9807,6 +10005,7 @@ async fn share_video_mp4(
                 .max_by_key(|&(_, c)| c)
             {
                 valid_continuation = true;
+                prev_stream_cursor = Some((idx, prev_cursor));
                 let next_min = match end_opt {
                     Some(end) => end.saturating_add(1).max(2),
                     None => start.saturating_add(1).max(2),
@@ -9955,7 +10154,13 @@ async fn share_video_mp4(
                     }
                 }
                 drop(_clip_guard);
-                if let Some(err_resp) = verify_post_build_share_target_and_jti(&state, &payload) {
+                if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                    &state,
+                    &payload,
+                    is_initial,
+                    provided_sid,
+                    valid_continuation,
+                ) {
                     return err_resp;
                 }
 
@@ -9973,6 +10178,7 @@ async fn share_video_mp4(
                         provided_sid.map(str::to_string),
                         has_valid_sid,
                         valid_continuation,
+                        prev_stream_cursor,
                         resp,
                     );
                 }
@@ -10005,7 +10211,13 @@ async fn share_video_mp4(
                     }
                 }
                 drop(_clip_guard);
-                if let Some(err_resp) = verify_post_build_share_target_and_jti(&state, &payload) {
+                if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                    &state,
+                    &payload,
+                    is_initial,
+                    provided_sid,
+                    valid_continuation,
+                ) {
                     return err_resp;
                 }
                 if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &clip_path)
@@ -10021,6 +10233,7 @@ async fn share_video_mp4(
                         provided_sid.map(str::to_string),
                         has_valid_sid,
                         valid_continuation,
+                        prev_stream_cursor,
                         resp,
                     );
                 }
@@ -10038,6 +10251,7 @@ async fn share_video_mp4(
                     provided_sid.map(str::to_string),
                     has_valid_sid,
                     valid_continuation,
+                    prev_stream_cursor,
                     resp,
                 );
             }
@@ -10223,7 +10437,13 @@ async fn share_video_mp4(
                     }
                 }
                 drop(_clip_guard);
-                if let Some(err_resp) = verify_post_build_share_target_and_jti(&state, &payload) {
+                if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                    &state,
+                    &payload,
+                    is_initial,
+                    provided_sid,
+                    valid_continuation,
+                ) {
                     return err_resp;
                 }
 
@@ -10241,6 +10461,7 @@ async fn share_video_mp4(
                         provided_sid.map(str::to_string),
                         has_valid_sid,
                         valid_continuation,
+                        prev_stream_cursor,
                         resp,
                     );
                 }
@@ -10287,7 +10508,13 @@ async fn share_video_mp4(
                 }
             }
             drop(_clip_guard);
-            if let Some(err_resp) = verify_post_build_share_target_and_jti(&state, &payload) {
+            if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                &state,
+                &payload,
+                is_initial,
+                provided_sid,
+                valid_continuation,
+            ) {
                 return err_resp;
             }
             if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &clip_path)
@@ -10303,6 +10530,7 @@ async fn share_video_mp4(
                     provided_sid.map(str::to_string),
                     has_valid_sid,
                     valid_continuation,
+                    prev_stream_cursor,
                     resp,
                 );
             }
@@ -10547,8 +10775,20 @@ async fn api_export_rename(
 
 async fn api_export_delete(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let _ = state.db.revoke_share_links_for_target(Some("export"), &id);
     purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
@@ -10572,9 +10812,20 @@ async fn api_export_delete(
 async fn api_exports_bulk_delete(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     Json(body): Json<DeleteIdsBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         for id in &body.ids {
             let permitted = state
@@ -23932,6 +24183,7 @@ cameras:
             Some(prune_sid),
             true,
             false,
+            None,
             StatusCode::PARTIAL_CONTENT.into_response(),
         );
         assert_eq!(gone_resp.status(), StatusCode::GONE);
@@ -23944,8 +24196,11 @@ cameras:
         );
 
         // Also verify verify_post_build_share_target_and_jti fails closed with 410 GONE on missing row
-        let post_build_gone = verify_post_build_share_target_and_jti(&state, &prune_payload)
-            .expect("missing JTI row must fail closed in verify_post_build_share_target_and_jti");
+        let post_build_gone =
+            verify_post_build_share_target_and_jti(&state, &prune_payload, true, None, false)
+                .expect(
+                    "missing JTI row must fail closed in verify_post_build_share_target_and_jti",
+                );
         assert_eq!(post_build_gone.status(), StatusCode::GONE);
 
         // =========================================================================
@@ -24191,6 +24446,646 @@ cameras:
             .unwrap();
         assert_eq!(&served_stripped[..], &silent_mp4[..]);
         assert_ne!(&served_stripped[..], &audio_mp4_bytes[..]);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn security_share_link_round6_audit_findings_regression_work() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_sec_share_r6_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let cfg_path = tmp_dir.join("config.yml");
+        let web_dir = tmp_dir.join("web-v2");
+        let media_dir = tmp_dir.join("media");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
+
+        let yaml = format!(
+            r#"
+version: 0.18-0
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/front_door
+          roles: [record, detect]
+  backyard:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/backyard
+          roles: [record, detect]
+"#,
+            db_path.display()
+        );
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+            .await
+            .unwrap();
+        let auth_app = build_router_with_auth(state.clone(), true);
+
+        let now = unix_now();
+        let make_jwt = |sub: &str, role: &str, allowed_cameras: Option<&str>| -> String {
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &JwtClaims {
+                    sub: sub.to_string(),
+                    role: role.to_string(),
+                    allowed_cameras: allowed_cameras.map(str::to_string),
+                    iat: now,
+                    exp: now + 3600,
+                },
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            )
+            .unwrap()
+        };
+
+        let admin_jwt = make_jwt("admin", "admin", Some("*"));
+        let admin_bearer = format!("Bearer {admin_jwt}");
+        let admin_cookie = format!("ninjanvr_token={admin_jwt}");
+
+        let exports_dir = media_dir.join("exports");
+        let clips_dir = media_dir.join("clips");
+        let rec_dir = media_dir.join("recordings/2026-11-04/12/front_door");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        let mp4_payload: Vec<u8> = (0u8..128u8).collect();
+        for exp_id in [
+            "exp_r6_tok",
+            "exp_r6_cam",
+            "exp_r6_inflight",
+            "exp_r6_u_del",
+            "exp_r6_u_role",
+            "exp_r6_u_cam",
+            "exp_r6_tok_del",
+            "exp_r6_416",
+            "exp_r6_csrf",
+        ] {
+            std::fs::write(exports_dir.join(format!("{exp_id}.mp4")), &mp4_payload).unwrap();
+            state
+                .db
+                .insert_export(&ExportRow {
+                    id: exp_id.to_string(),
+                    camera: "front_door".to_string(),
+                    name: format!("R6 {exp_id}"),
+                    date: 1700000100.0,
+                    video_path: format!("/media/ninjanvr/exports/{exp_id}.mp4"),
+                    thumb_path: format!("/media/ninjanvr/clips/{exp_id}.webp"),
+                    in_progress: false,
+                })
+                .unwrap();
+        }
+
+        let seed_artifacts = |target_id: &str| {
+            let r_mp4 = exports_dir.join(format!("share_redacted_{target_id}.mp4"));
+            let r_hash = exports_dir.join(format!(".share_redacted_{target_id}.mask_hash"));
+            let c_mp4 = exports_dir.join(format!("share_clip_{target_id}.mp4"));
+            std::fs::write(&r_mp4, b"REDACTED_ARTIFACT").unwrap();
+            std::fs::write(&r_hash, b"MASK_HASH").unwrap();
+            std::fs::write(&c_mp4, b"CLIP_ARTIFACT").unwrap();
+            (r_mp4, r_hash, c_mp4)
+        };
+
+        // =========================================================================
+        // 1. [R6-FINDING-01 & R6-FINDING-02] Post-Build Creator Token Expiry & Camera
+        //    Revocation Auto-Revoke JTI in DB, Return 403 FORBIDDEN (Not 410 GONE),
+        //    Clean Up Newly Built Artifacts, & Preserve In-Flight Playback Sessions
+        // =========================================================================
+        // 1a. Post-build creator API token expiry: auto-revokes JTI in DB, returns 403 FORBIDDEN,
+        //     and removes newly built share_redacted_* / share_clip_* artifacts from disk!
+        state
+            .db
+            .create_api_token("r6_expiring_bot", "full", Some((now - 5) as f64))
+            .unwrap();
+        state
+            .db
+            .insert_share_link(
+                "shr_r6_post_tok",
+                "export",
+                "exp_r6_tok",
+                Some("front_door"),
+                "token:r6_expiring_bot",
+                now as f64,
+                (now + 3600) as f64,
+            )
+            .unwrap();
+        assert!(!state.db.is_share_link_revoked("shr_r6_post_tok").unwrap());
+        let (r_mp4_tok, r_hash_tok, c_mp4_tok) = seed_artifacts("exp_r6_tok");
+        let tok_payload = ShareTokenPayload {
+            k: "export".to_string(),
+            id: "exp_r6_tok".to_string(),
+            exp: now + 3600,
+            cam: Some("front_door".to_string()),
+            jti: Some("shr_r6_post_tok".to_string()),
+        };
+        let post_tok_resp =
+            verify_post_build_share_target_and_jti(&state, &tok_payload, true, None, false)
+                .expect("expired creator API token must fail post-build check");
+        assert_eq!(
+            post_tok_resp.status(),
+            StatusCode::FORBIDDEN,
+            "expired creator API token must return 403 FORBIDDEN, not 410 GONE"
+        );
+        assert!(
+            state.db.is_share_link_revoked("shr_r6_post_tok").unwrap(),
+            "post-build creator token expiry must auto-revoke JTI in SQLite"
+        );
+        assert!(
+            !r_mp4_tok.exists() && !r_hash_tok.exists() && !c_mp4_tok.exists(),
+            "post-build creator token expiry must clean up share_redacted_* and share_clip_* artifacts"
+        );
+
+        // 1b. Post-build creator camera access revocation (via update_user_allowed_cameras, which sets revoked=1):
+        //     returns 403 FORBIDDEN (NOT masked as 410 GONE!) and cleans up artifacts on disk!
+        state
+            .db
+            .create_user_with_cameras(
+                "r6_cam_op",
+                "pass1234",
+                "operator",
+                "front_door,backyard",
+                1000,
+            )
+            .unwrap();
+        state
+            .db
+            .insert_share_link(
+                "shr_r6_post_cam",
+                "export",
+                "exp_r6_cam",
+                Some("front_door"),
+                "r6_cam_op",
+                now as f64,
+                (now + 3600) as f64,
+            )
+            .unwrap();
+        state
+            .db
+            .update_user_allowed_cameras("r6_cam_op", "backyard")
+            .unwrap();
+        assert!(state.db.is_share_link_revoked("shr_r6_post_cam").unwrap());
+        let (r_mp4_cam, r_hash_cam, c_mp4_cam) = seed_artifacts("exp_r6_cam");
+        let cam_payload = ShareTokenPayload {
+            k: "export".to_string(),
+            id: "exp_r6_cam".to_string(),
+            exp: now + 3600,
+            cam: Some("front_door".to_string()),
+            jti: Some("shr_r6_post_cam".to_string()),
+        };
+        let post_cam_resp =
+            verify_post_build_share_target_and_jti(&state, &cam_payload, true, None, false)
+                .expect("revoked camera permission must fail post-build check");
+        assert_eq!(
+            post_cam_resp.status(),
+            StatusCode::FORBIDDEN,
+            "creator camera revocation in verify_post_build_share_target_and_jti must return 403 FORBIDDEN (not 410 GONE)"
+        );
+        assert!(
+            !r_mp4_cam.exists() && !r_hash_cam.exists() && !c_mp4_cam.exists(),
+            "post-build camera revocation must clean up share_redacted_* and share_clip_* artifacts"
+        );
+
+        // 1c. Preserve in-flight max_views=1 playback session artifacts when sibling link is revoked,
+        //     then clean up artifacts once the in-flight session finishes!
+        let resp_mv1 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r6_inflight","expires_in_sec":3600,"max_views":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mv1_json: Value =
+            serde_json::from_slice(&to_bytes(resp_mv1.into_body(), 4096).await.unwrap()).unwrap();
+        let mv1_jti = mv1_json["id"].as_str().unwrap().to_string();
+        let mv1_tok = mv1_json["token"].as_str().unwrap().to_string();
+
+        let resp_sib = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r6_inflight","expires_in_sec":3600,"max_views":5}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sib_json: Value =
+            serde_json::from_slice(&to_bytes(resp_sib.into_body(), 4096).await.unwrap()).unwrap();
+        let sib_jti = sib_json["id"].as_str().unwrap().to_string();
+
+        // Viewer opens player page on mv1_tok -> access_count reaches 1 == max_views, session credit is active
+        let page_mv1 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{mv1_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_mv1.status(), StatusCode::OK);
+        assert!(
+            state
+                .share_page_video_credits
+                .lock()
+                .unwrap()
+                .contains_key(&mv1_jti)
+        );
+        let (r_mp4_inf, r_hash_inf, c_mp4_inf) = seed_artifacts("exp_r6_inflight");
+
+        // Revoking sibling link `sib_jti` while `mv1_jti` has an active in-flight session preserves the artifacts!
+        let rev_sib = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/share/{sib_jti}"))
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rev_sib.status(), StatusCode::OK);
+        assert!(
+            r_mp4_inf.exists() && r_hash_inf.exists() && c_mp4_inf.exists(),
+            "in-flight max_views=1 viewer session must preserve shared clip artifacts when sibling link is revoked"
+        );
+
+        // Once the in-flight session expires/clears, purge_revoked_share_credits cleans up the exhausted target's artifacts!
+        state.share_page_video_credits.lock().unwrap().clear();
+        assert!(!has_active_or_in_flight_share_for_target(
+            &state,
+            "exp_r6_inflight",
+            unix_now()
+        ));
+        purge_revoked_share_credits(&state);
+        assert!(
+            !r_mp4_inf.exists() && !r_hash_inf.exists() && !c_mp4_inf.exists(),
+            "exhausted max_views=1 target without in-flight session must have artifacts cleaned up"
+        );
+
+        // =========================================================================
+        // 2. [R6-FINDING-06a] Creator Deletion, Role Demotion, Camera Narrowing, &
+        //    Token Deletion Clean Up Orphaned Share Artifacts on Disk
+        // =========================================================================
+        for (u_name, exp_id) in [
+            ("r6_u_del", "exp_r6_u_del"),
+            ("r6_u_role", "exp_r6_u_role"),
+            ("r6_u_cam", "exp_r6_u_cam"),
+        ] {
+            state
+                .db
+                .create_user_with_cameras(
+                    u_name,
+                    "pass1234",
+                    "operator",
+                    "front_door,backyard",
+                    1000,
+                )
+                .unwrap();
+            state
+                .db
+                .insert_share_link(
+                    &format!("shr_{u_name}"),
+                    "export",
+                    exp_id,
+                    Some("front_door"),
+                    u_name,
+                    now as f64,
+                    (now + 3600) as f64,
+                )
+                .unwrap();
+        }
+        let (tok_meta, _) = state
+            .db
+            .create_api_token("r6_tok_del", "full", Some((now + 3600) as f64))
+            .unwrap();
+        let tok_del_id = tok_meta["id"].as_str().unwrap().to_string();
+        state
+            .db
+            .insert_share_link(
+                "shr_r6_tok_del",
+                "export",
+                "exp_r6_tok_del",
+                Some("front_door"),
+                "token:r6_tok_del",
+                now as f64,
+                (now + 3600) as f64,
+            )
+            .unwrap();
+
+        // 2a. DELETE /api/users/r6_u_del cleans up exp_r6_u_del artifacts
+        let (r_del_mp4, r_del_hash, c_del_mp4) = seed_artifacts("exp_r6_u_del");
+        let resp_u_del = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/users/r6_u_del")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_u_del.status(), StatusCode::OK);
+        assert!(!r_del_mp4.exists() && !r_del_hash.exists() && !c_del_mp4.exists());
+
+        // 2b. PUT /api/users/r6_u_role/role (viewer) cleans up exp_r6_u_role artifacts
+        let (r_role_mp4, r_role_hash, c_role_mp4) = seed_artifacts("exp_r6_u_role");
+        let resp_u_role = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/users/r6_u_role/role")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"role":"viewer"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_u_role.status(), StatusCode::OK);
+        assert!(!r_role_mp4.exists() && !r_role_hash.exists() && !c_role_mp4.exists());
+
+        // 2c. PUT /api/users/r6_u_cam/cameras (backyard) cleans up exp_r6_u_cam artifacts
+        let (r_cam_mp4, r_cam_hash, c_cam_mp4) = seed_artifacts("exp_r6_u_cam");
+        let resp_u_cam = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/users/r6_u_cam/cameras")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"allowed_cameras":"backyard"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_u_cam.status(), StatusCode::OK);
+        assert!(!r_cam_mp4.exists() && !r_cam_hash.exists() && !c_cam_mp4.exists());
+
+        // 2d. DELETE /api/tokens/{id} cleans up exp_r6_tok_del artifacts
+        let (r_td_mp4, r_td_hash, c_td_mp4) = seed_artifacts("exp_r6_tok_del");
+        let resp_tok_del = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/tokens/{tok_del_id}"))
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_tok_del.status(), StatusCode::OK);
+        assert!(!r_td_mp4.exists() && !r_td_hash.exists() && !c_td_mp4.exists());
+
+        // =========================================================================
+        // 3. [R6-FINDING-06b] Out-of-Bounds Range Request (416 RANGE_NOT_SATISFIABLE)
+        //    Rolls Back `active_streams[idx]` So Subsequent Valid Range Chunk Succeeds
+        // =========================================================================
+        let resp_416_share = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r6_416","expires_in_sec":3600,"max_views":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let share_416_json: Value =
+            serde_json::from_slice(&to_bytes(resp_416_share.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let share_416_tok = share_416_json["token"].as_str().unwrap().to_string();
+
+        // Initial chunk Range: bytes=0-15 sets stream cursor to 16
+        let r_chunk1 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_416_tok}/video.mp4"))
+                    .header(header::RANGE, "bytes=0-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_chunk1.status(), StatusCode::PARTIAL_CONTENT);
+
+        // Out-of-bounds Range: bytes=999999- returns 416 RANGE_NOT_SATISFIABLE and rolls back cursor to 16
+        let r_oob_416 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_416_tok}/video.mp4"))
+                    .header(header::RANGE, "bytes=999999-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_oob_416.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+        // Next valid chunk Range: bytes=16-63 still succeeds with 206 PARTIAL_CONTENT!
+        let r_chunk2 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_416_tok}/video.mp4"))
+                    .header(header::RANGE, "bytes=16-63")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_chunk2.status(),
+            StatusCode::PARTIAL_CONTENT,
+            "valid continuation range after 416 out-of-bounds range probe must still succeed"
+        );
+
+        // =========================================================================
+        // 4. [R6-FINDING-03a] `is_internal_backend_host` Rejects RFC1918 LAN IPs While
+        //    Accepting Loopback & Internal Service-Mesh DNS Names
+        // =========================================================================
+        for loopback_or_mesh in [
+            "127.0.0.1",
+            "127.0.0.1:5000",
+            "127.0.0.2:8971",
+            "[::1]",
+            "[::1]:5000",
+            "[0:0:0:0:0:0:0:1]:5000",
+            "[::ffff:127.0.0.1]:5000",
+            "localhost:5000",
+            "ninjanvr:5000",
+            "ninjanvr.default.svc",
+            "ninjanvr.default.svc.cluster.local:5000",
+            "gateway.internal:8443",
+        ] {
+            assert!(
+                is_internal_backend_host(loopback_or_mesh),
+                "{loopback_or_mesh} must be accepted as internal backend host"
+            );
+        }
+        for lan_or_external in [
+            "192.168.1.50",
+            "192.168.1.50:5000",
+            "10.0.0.50:5000",
+            "172.16.0.10:5000",
+            "169.254.1.10:5000",
+            "[::ffff:192.168.1.50]:5000",
+            "nvr.corp.example:5000",
+        ] {
+            assert!(
+                !is_internal_backend_host(lan_or_external),
+                "{lan_or_external} must NOT be trusted as internal backend host for X-Forwarded-Host"
+            );
+        }
+
+        // Forged X-Forwarded-Host against LAN IP Host (`192.168.1.50:5000`) is rejected with 403 FORBIDDEN
+        let r_lan_xfh_spoof = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, "https://evil.example")
+                    .header("x-forwarded-host", "evil.example")
+                    .header(header::HOST, "192.168.1.50:5000")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r6_csrf","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_lan_xfh_spoof.status(),
+            StatusCode::FORBIDDEN,
+            "forged X-Forwarded-Host against RFC1918 LAN Host 192.168.1.50:5000 must return 403 FORBIDDEN"
+        );
+
+        // =========================================================================
+        // 5. [R6-FINDING-03b] Cookie CSRF Rejection (403 FORBIDDEN) on All
+        //    Target-Deleting & Share-Revoking Endpoints When Origin Mismatches Host
+        // =========================================================================
+        state
+            .db
+            .create_user_with_cameras("r6_csrf_target_u", "pass1234", "operator", "*", 1000)
+            .unwrap();
+        let (csrf_tok_meta, _) = state
+            .db
+            .create_api_token("r6_csrf_tok", "read_only", None)
+            .unwrap();
+        let csrf_tok_id = csrf_tok_meta["id"].as_str().unwrap().to_string();
+
+        for (method, uri, body_opt) in [
+            (
+                "POST",
+                "/api/reviews/delete".to_string(),
+                Some(r#"{"ids":["rev_1"]}"#),
+            ),
+            (
+                "DELETE",
+                "/api/reviews".to_string(),
+                Some(r#"{"ids":["rev_1"]}"#),
+            ),
+            ("DELETE", "/api/review/rev_1".to_string(), None),
+            (
+                "POST",
+                "/api/exports/delete".to_string(),
+                Some(r#"{"ids":["exp_r6_csrf"]}"#),
+            ),
+            ("DELETE", "/api/export/exp_r6_csrf".to_string(), None),
+            ("DELETE", "/api/events/ev_1".to_string(), None),
+            (
+                "DELETE",
+                "/api/events".to_string(),
+                Some(r#"{"event_ids":["ev_1"]}"#),
+            ),
+            (
+                "PUT",
+                "/api/users/r6_csrf_target_u/role".to_string(),
+                Some(r#"{"role":"viewer"}"#),
+            ),
+            (
+                "PUT",
+                "/api/users/r6_csrf_target_u/cameras".to_string(),
+                Some(r#"{"allowed_cameras":"front_door"}"#),
+            ),
+            ("DELETE", "/api/users/r6_csrf_target_u".to_string(), None),
+            ("DELETE", format!("/api/tokens/{csrf_tok_id}"), None),
+            (
+                "DELETE",
+                "/api/front_door/recordings?after=0&before=9999".to_string(),
+                None,
+            ),
+        ] {
+            let mut req_b = Request::builder()
+                .method(method)
+                .uri(&uri)
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::ORIGIN, "https://evil.example")
+                .header(header::HOST, "192.168.1.50:5000");
+            let body = if let Some(json_str) = body_opt {
+                req_b = req_b.header(header::CONTENT_TYPE, "application/json");
+                Body::from(json_str)
+            } else {
+                Body::empty()
+            };
+            let resp = auth_app
+                .clone()
+                .oneshot(req_b.body(body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "cookie CSRF request {method} {uri} with mismatched Origin must return 403 FORBIDDEN"
+            );
+        }
+
+        // Verify none of the protected resources were modified/deleted by the rejected CSRF requests
+        assert!(state.db.get_export_by_id("exp_r6_csrf").unwrap().is_some());
+        assert!(state.db.get_user("r6_csrf_target_u").unwrap().is_some());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
