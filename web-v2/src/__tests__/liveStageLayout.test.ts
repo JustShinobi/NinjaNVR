@@ -6,6 +6,7 @@ import {
   resolvePersistentStageContainerStyle,
   resolvePersistentTileStyle,
   resolveTileClickAction,
+  shouldRenderLiveAlertRibbon,
   shouldRenderSpotlightTimeline,
 } from "../utils/liveStageLayout";
 
@@ -437,5 +438,24 @@ describe("liveStageLayout (#92 [UX-17])", () => {
         lockedHeroCam: "garagem",
       })
     ).toBe("varanda");
+  });
+
+  test("shouldRenderLiveAlertRibbon_hides_ribbon_in_spotlight_and_map_and_shows_in_grid_focus_single", () => {
+    // Returns false for 'spotlight' and 'map' even when showAlertRibbon is true and unreviewedCount is 186
+    expect(shouldRenderLiveAlertRibbon("spotlight", true, 186)).toBe(false);
+    expect(shouldRenderLiveAlertRibbon("map", true, 186)).toBe(false);
+
+    // Returns true for '2x2', 'focus', and 'single' when showAlertRibbon is true and unreviewedCount > 0
+    for (const layout of ["2x2", "focus", "single"] as const) {
+      expect(shouldRenderLiveAlertRibbon(layout, true, 186)).toBe(true);
+      expect(shouldRenderLiveAlertRibbon(layout, true, 1)).toBe(true);
+    }
+
+    // Returns false when showAlertRibbon is false or unreviewedCount is 0
+    for (const layout of ["2x2", "focus", "single", "spotlight", "map"] as const) {
+      expect(shouldRenderLiveAlertRibbon(layout, false, 186)).toBe(false);
+      expect(shouldRenderLiveAlertRibbon(layout, true, 0)).toBe(false);
+      expect(shouldRenderLiveAlertRibbon(layout, false, 0)).toBe(false);
+    }
   });
 });

@@ -45,6 +45,7 @@ import {
   resolvePersistentStageContainerStyle,
   resolvePersistentTileStyle,
   resolveTileClickAction,
+  shouldRenderLiveAlertRibbon,
   shouldRenderSpotlightTimeline,
   triggerMainStreamPrewarmIfNeeded,
 } from "../utils/liveStageLayout";
@@ -1843,25 +1844,31 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             <Eye size={13} />
             {t.live.zonesOverlay}
           </button>
-          {unreviewedAlerts.length > 0 && (
-            <button
-              className="nvr-btn success"
-              onClick={() =>
-                handleMarkReviews(
-                  unreviewedAlerts.map((r) => r.id),
-                  true
-                )
-              }
-            >
-              <Check size={13} />
-              {t.live.markAllReviewed} ({unreviewedAlerts.length})
-            </button>
-          )}
+          {liveLayout !== "spotlight" &&
+            liveLayout !== "map" &&
+            unreviewedAlerts.length > 0 && (
+              <button
+                className="nvr-btn success"
+                onClick={() =>
+                  handleMarkReviews(
+                    unreviewedAlerts.map((r) => r.id),
+                    true
+                  )
+                }
+              >
+                <Check size={13} />
+                {t.live.markAllReviewed} ({unreviewedAlerts.length})
+              </button>
+            )}
         </div>
       </div>
 
       {/* Zero-Decoder-Bloat Unreviewed Alert Ribbon (Video mounts ONLY on pointer hover!) */}
-      {showAlertRibbon && unreviewedAlerts.length > 0 && (
+      {shouldRenderLiveAlertRibbon(
+        liveLayout,
+        showAlertRibbon,
+        unreviewedAlerts.length
+      ) && (
         <div className="nvr-alert-ribbon" aria-label={t.live.unreviewedAlerts}>
           <div
             style={{

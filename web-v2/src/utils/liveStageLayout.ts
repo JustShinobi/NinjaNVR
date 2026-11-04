@@ -355,6 +355,15 @@ export function shouldRenderSpotlightTimeline(
   return timeShiftTs !== null;
 }
 
+export function shouldRenderLiveAlertRibbon(
+  liveLayout: LiveLayout,
+  showAlertRibbon: boolean,
+  unreviewedCount: number
+): boolean {
+  if (liveLayout === "spotlight" || liveLayout === "map") return false;
+  return Boolean(showAlertRibbon && unreviewedCount > 0);
+}
+
 export interface ResolveEffectiveSpotlightHeroCamParams {
   promotedCams: string[];
   trailCams: Array<{ cam: string; ts: number }>;
