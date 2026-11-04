@@ -9389,6 +9389,58 @@ fn prune_share_page_video_credits(map: &mut HashMap<String, SharePlaybackCredit>
     }
 }
 
+fn rollback_share_stream_cursor(
+    state: &AppState,
+    payload: &ShareTokenPayload,
+    prev_stream_cursor: Option<(usize, u64, u64)>,
+) {
+    if let Some((idx, prev_cursor, prev_exp)) = prev_stream_cursor
+        && let Some(jti) = payload
+            .jti
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        && let Ok(mut map) = state.share_page_video_credits.lock()
+        && let Some(entry) = map.get_mut(jti)
+        && idx < entry.active_streams.len()
+    {
+        entry.active_streams[idx] = prev_cursor;
+        if idx < entry.active_stream_expires.len() {
+            entry.active_stream_expires[idx] = prev_exp;
+        }
+        entry.sync_stream_summary();
+    }
+}
+
+fn build_share_video_head_placeholder_response(headers: &HeaderMap) -> Response {
+    let status = if parse_video_range_bounds(headers).is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "video/mp4"),
+            (header::ACCEPT_RANGES, "bytes"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'",
+            ),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CACHE_CONTROL, "private, no-store"),
+            (
+                header::HeaderName::from_static("cross-origin-resource-policy"),
+                "same-origin",
+            ),
+        ],
+        Body::empty(),
+    )
+        .into_response()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_share_access_or_gone(
     state: &AppState,
@@ -9400,23 +9452,11 @@ fn record_share_access_or_gone(
     new_session_id: Option<String>,
     has_valid_sid: bool,
     valid_continuation: bool,
-    prev_stream_cursor: Option<(usize, u64)>,
+    prev_stream_cursor: Option<(usize, u64, u64)>,
     resp: Response,
 ) -> Response {
-    if resp.status() == StatusCode::RANGE_NOT_SATISFIABLE {
-        if let Some((idx, prev_cursor)) = prev_stream_cursor
-            && let Some(jti) = payload
-                .jti
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            && let Ok(mut map) = state.share_page_video_credits.lock()
-            && let Some(entry) = map.get_mut(jti)
-            && idx < entry.active_streams.len()
-        {
-            entry.active_streams[idx] = prev_cursor;
-            entry.sync_stream_summary();
-        }
+    if !resp.status().is_success() {
+        rollback_share_stream_cursor(state, payload, prev_stream_cursor);
         return resp;
     }
     let is_initial_video = !is_player_page && matches!(request_range, None | Some((0, _)));
@@ -9448,11 +9488,14 @@ fn record_share_access_or_gone(
             && let Some(sid_str) = new_session_id.as_deref()
             && let Some((exp, credit_claimed)) = entry.sessions.get_mut(sid_str)
             && *exp > now_ts
-            && !*credit_claimed
         {
-            *credit_claimed = true;
-            entry.page_credits = entry.page_credits.saturating_sub(1);
+            *exp = now_ts + 900;
+            if !*credit_claimed {
+                *credit_claimed = true;
+                entry.page_credits = entry.page_credits.saturating_sub(1);
+            }
         }
+        let _ = state.db.touch_share_link_last_accessed(jti, now_ts as f64);
         return resp;
     }
     let (stream_active, min_next_start) = if is_player_page {
@@ -9496,6 +9539,7 @@ fn record_share_access_or_gone(
             })
             .unwrap_or(false);
         if consumed_credit {
+            let _ = state.db.touch_share_link_last_accessed(jti, now_ts as f64);
             return resp;
         }
     }
@@ -9557,10 +9601,25 @@ fn record_share_access_or_gone(
                 Some(end) => end.saturating_add(1).max(2),
                 None => start.saturating_add(1).max(2),
             });
+            let matched_slot = tentative_next
+                .and_then(|t_next| {
+                    prev_stream_cursor
+                        .and_then(|(idx, _, _)| {
+                            (idx < entry.active_streams.len()
+                                && entry.active_streams[idx] == t_next)
+                                .then_some(idx)
+                        })
+                        .or_else(|| entry.active_streams.iter().position(|&c| c == t_next))
+                })
+                .or_else(|| {
+                    prev_stream_cursor.and_then(|(idx, prev_cursor, _)| {
+                        (idx < entry.active_streams.len()
+                            && entry.active_streams[idx] == prev_cursor)
+                            .then_some(idx)
+                    })
+                });
             if stream_active {
-                if let Some(t_next) = tentative_next
-                    && let Some(pos) = entry.active_streams.iter().position(|&c| c == t_next)
-                {
+                if let Some(pos) = matched_slot {
                     entry.active_streams[pos] = min_next_start;
                     while entry.active_stream_expires.len() <= pos {
                         entry.active_stream_expires.push(now_ts + 900);
@@ -9569,16 +9628,11 @@ fn record_share_access_or_gone(
                 } else if entry.active_streams.is_empty() {
                     entry.record_initial_stream_at(min_next_start, now_ts + 900);
                 }
-            } else if let Some(t_next) = tentative_next
-                && let Some(pos) = entry.active_streams.iter().position(|&c| c == t_next)
-            {
+            } else if let Some(pos) = matched_slot {
                 entry.active_streams.remove(pos);
                 if pos < entry.active_stream_expires.len() {
                     entry.active_stream_expires.remove(pos);
                 }
-            } else {
-                entry.active_streams.pop();
-                entry.active_stream_expires.pop();
             }
             entry.sync_stream_summary();
             entry.prune_expired_sessions(now_ts);
@@ -9589,6 +9643,7 @@ fn record_share_access_or_gone(
                 map.remove(jti);
             }
         }
+        let _ = state.db.touch_share_link_last_accessed(jti, now_ts as f64);
         resp
     }
 }
@@ -10296,7 +10351,7 @@ async fn share_video_mp4(
     let provided_sid = q.sid.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let mut has_valid_sid = false;
     let mut valid_continuation = false;
-    let mut prev_stream_cursor: Option<(usize, u64)> = None;
+    let mut prev_stream_cursor: Option<(usize, u64, u64)> = None;
     if let Some(jti) = payload
         .jti
         .as_deref()
@@ -10331,7 +10386,12 @@ async fn share_video_mp4(
             {
                 valid_continuation = true;
                 if method != axum::http::Method::HEAD {
-                    prev_stream_cursor = Some((idx, prev_cursor));
+                    let prev_exp = entry
+                        .active_stream_expires
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(now_ts + 900);
+                    prev_stream_cursor = Some((idx, prev_cursor, prev_exp));
                     let next_min = match end_opt {
                         Some(end) => end.saturating_add(1).max(2),
                         None => start.saturating_add(1).max(2),
@@ -10345,106 +10405,308 @@ async fn share_video_mp4(
             }
         }
     }
-    let count_view = match verify_share_jti_with_view_mode(
-        &state,
-        &payload,
-        now_ts,
-        is_initial,
-        false,
-        provided_sid,
-        valid_continuation,
-    ) {
-        Ok(cv) => cv,
-        Err((status, msg)) => {
-            return (status, Json(json!({ "error": msg }))).into_response();
-        }
-    };
 
-    let finalize_video_resp = |resp: Response| -> Response {
-        if method == axum::http::Method::HEAD {
-            if resp.status() != StatusCode::RANGE_NOT_SATISFIABLE
-                && let Some(jti) = payload
-                    .jti
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                && !state
-                    .db
-                    .is_share_link_active(jti, now_ts as f64)
-                    .unwrap_or(false)
-            {
-                if let Ok(mut map) = state.share_page_video_credits.lock() {
-                    map.remove(jti);
-                }
-                return (
-                    StatusCode::GONE,
-                    Json(json!({ "error": "Share link has been revoked" })),
-                )
-                    .into_response();
-            }
-            return resp;
-        }
-        record_share_access_or_gone(
+    let resp: Response = async {
+        let count_view = match verify_share_jti_with_view_mode(
             &state,
             &payload,
-            count_view,
-            false,
-            request_range,
             now_ts,
-            provided_sid.map(str::to_string),
-            has_valid_sid,
+            is_initial,
+            false,
+            provided_sid,
             valid_continuation,
-            prev_stream_cursor,
-            resp,
-        )
-    };
-
-    let safe_id: String = payload
-        .id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
-        .collect();
-
-    if payload.k == "export" {
-        let mut resolved_export: Option<(PathBuf, Option<String>)> = None;
-        if let Ok(Some(exp)) = state.db.get_export_by_id(&payload.id) {
-            if let Some(ref token_cam) = payload.cam
-                && let Some(exp_cam) = exp["camera"].as_str()
-                && token_cam != exp_cam
-            {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "Share link camera mismatch" })),
-                )
-                    .into_response();
+        ) {
+            Ok(cv) => cv,
+            Err((status, msg)) => {
+                return (status, Json(json!({ "error": msg }))).into_response();
             }
-            if exp["in_progress"].as_bool().unwrap_or(false) {
-                cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            if let Some(vp) = exp["video_path"].as_str() {
-                let disk_path = resolve_recording_disk_path(&state.media_dir, vp);
-                if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &disk_path)
-                    && safe_path.is_file()
-                {
-                    let cam = exp["camera"]
-                        .as_str()
+        };
+
+        let finalize_video_resp = |resp: Response| -> Response {
+            if method == axum::http::Method::HEAD {
+                if resp.status() != StatusCode::RANGE_NOT_SATISFIABLE
+                    && let Some(jti) = payload
+                        .jti
+                        .as_deref()
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .or_else(|| payload.cam.clone());
+                    && !state
+                        .db
+                        .is_share_link_active(jti, now_ts as f64)
+                        .unwrap_or(false)
+                {
+                    if let Ok(mut map) = state.share_page_video_credits.lock() {
+                        map.remove(jti);
+                    }
+                    return (
+                        StatusCode::GONE,
+                        Json(json!({ "error": "Share link has been revoked" })),
+                    )
+                        .into_response();
+                }
+                return resp;
+            }
+            record_share_access_or_gone(
+                &state,
+                &payload,
+                count_view,
+                false,
+                request_range,
+                now_ts,
+                provided_sid.map(str::to_string),
+                has_valid_sid,
+                valid_continuation,
+                prev_stream_cursor,
+                resp,
+            )
+        };
+
+        let safe_id: String = payload
+            .id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+            .collect();
+
+        if payload.k == "export" {
+            let mut resolved_export: Option<(PathBuf, Option<String>)> = None;
+            if let Ok(Some(exp)) = state.db.get_export_by_id(&payload.id) {
+                if let Some(ref token_cam) = payload.cam
+                    && let Some(exp_cam) = exp["camera"].as_str()
+                    && token_cam != exp_cam
+                {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": "Share link camera mismatch" })),
+                    )
+                        .into_response();
+                }
+                if exp["in_progress"].as_bool().unwrap_or(false) {
+                    cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                if let Some(vp) = exp["video_path"].as_str() {
+                    let disk_path = resolve_recording_disk_path(&state.media_dir, vp);
+                    if let Some(safe_path) =
+                        ensure_path_within_media_dir(&state.media_dir, &disk_path)
+                        && safe_path.is_file()
+                    {
+                        let cam = exp["camera"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .or_else(|| payload.cam.clone());
+                        resolved_export = Some((safe_path, cam));
+                    }
+                }
+                if resolved_export.is_none() {
+                    cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+            } else if !is_disallowed_export_fallback_id(&payload.id) && payload.id == safe_id {
+                if let Some(ref token_cam) = payload.cam
+                    && let Some(cam_prefix) =
+                        payload.id.rsplitn(3, '_').nth(2).filter(|s| !s.is_empty())
+                    && token_cam != cam_prefix
+                {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": "Share link camera mismatch" })),
+                    )
+                        .into_response();
+                }
+                let file_path = state
+                    .media_dir
+                    .join("exports")
+                    .join(format!("{safe_id}.mp4"));
+                if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &file_path)
+                    && safe_path.is_file()
+                {
+                    let cam = payload.cam.clone().or_else(|| {
+                        payload
+                            .id
+                            .rsplitn(3, '_')
+                            .nth(2)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    });
                     resolved_export = Some((safe_path, cam));
                 }
             }
-            if resolved_export.is_none() {
+
+            if let Some((source_path, export_cam)) = resolved_export {
+                let privacy_mask = if let Some(ref cam) = export_cam {
+                    let cfg = state.config.read().await;
+                    cfg.cameras.get(cam).map(|c| c.privacy_mask.clone())
+                } else {
+                    None
+                };
+                if has_active_privacy_mask(privacy_mask.as_ref()) {
+                    if safe_id.is_empty() || payload.id != safe_id || payload.id.contains("..") {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    if ninjanvr_media::build_privacy_drawbox_filter(privacy_mask.as_ref()).is_none()
+                    {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    let redacted_id = format!("share_redacted_{safe_id}");
+                    let exports_dir = state.media_dir.join("exports");
+                    let redacted_path = exports_dir.join(format!("{redacted_id}.mp4"));
+                    let mask_hash_path = exports_dir.join(format!(".{redacted_id}.mask_hash"));
+                    let current_mask_hash = compute_privacy_mask_hash(privacy_mask.as_ref());
+
+                    let clip_lock = acquire_share_clip_lock(&state, &redacted_id).await;
+                    let _clip_guard = clip_lock.lock().await;
+
+                    if redacted_path.is_file() {
+                        let hash_matches = std::fs::read_to_string(&mask_hash_path)
+                            .map(|existing_hash| existing_hash.trim() == current_mask_hash)
+                            .unwrap_or(false);
+                        if !hash_matches
+                            || is_cached_share_artifact_stale(
+                                &redacted_path,
+                                std::slice::from_ref(&source_path),
+                            )
+                            || ninjanvr_media::mp4_file_has_audio_track(&redacted_path)
+                        {
+                            let _ = std::fs::remove_file(&redacted_path);
+                            let _ = std::fs::remove_file(&mask_hash_path);
+                        }
+                    }
+
+                    if !redacted_path.is_file() {
+                        if method == axum::http::Method::HEAD {
+                            drop(_clip_guard);
+                            if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                                &state,
+                                &payload,
+                                is_initial,
+                                provided_sid,
+                                valid_continuation,
+                            ) {
+                                return err_resp;
+                            }
+                            return finalize_video_resp(
+                                build_share_video_head_placeholder_response(&headers),
+                            );
+                        }
+                        let _sem_permit = state.share_ffmpeg_semaphore.acquire().await.ok();
+                        let build_ok = redact_mp4_file_with_privacy(
+                            &source_path,
+                            &exports_dir,
+                            &redacted_id,
+                            &redacted_path,
+                            privacy_mask.as_ref(),
+                        )
+                        .await;
+                        if build_ok && !ninjanvr_media::mp4_file_has_audio_track(&redacted_path) {
+                            let _ = std::fs::write(&mask_hash_path, &current_mask_hash);
+                        } else {
+                            let _ = std::fs::remove_file(&redacted_path);
+                            let _ = std::fs::remove_file(&mask_hash_path);
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                    }
+                    drop(_clip_guard);
+                    if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                        &state,
+                        &payload,
+                        is_initial,
+                        provided_sid,
+                        valid_continuation,
+                    ) {
+                        return err_resp;
+                    }
+
+                    if let Some(safe_path) =
+                        ensure_path_within_media_dir(&state.media_dir, &redacted_path)
+                        && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
+                    {
+                        return finalize_video_resp(resp);
+                    }
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+
+                if ninjanvr_media::mp4_file_has_audio_track(&source_path) {
+                    if safe_id.is_empty() || payload.id != safe_id || payload.id.contains("..") {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    let clip_id = format!("share_clip_{safe_id}");
+                    let exports_dir = state.media_dir.join("exports");
+                    let clip_path = exports_dir.join(format!("{clip_id}.mp4"));
+
+                    let clip_lock = acquire_share_clip_lock(&state, &clip_id).await;
+                    let _clip_guard = clip_lock.lock().await;
+
+                    if clip_path.is_file()
+                        && (ninjanvr_media::mp4_file_has_audio_track(&clip_path)
+                            || is_cached_share_artifact_stale(
+                                &clip_path,
+                                std::slice::from_ref(&source_path),
+                            ))
+                    {
+                        let _ = std::fs::remove_file(&clip_path);
+                    }
+
+                    if !clip_path.is_file() {
+                        if method == axum::http::Method::HEAD {
+                            drop(_clip_guard);
+                            if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                                &state,
+                                &payload,
+                                is_initial,
+                                provided_sid,
+                                valid_continuation,
+                            ) {
+                                return err_resp;
+                            }
+                            return finalize_video_resp(
+                                build_share_video_head_placeholder_response(&headers),
+                            );
+                        }
+                        let _sem_permit = state.share_ffmpeg_semaphore.acquire().await.ok();
+                        let build_ok = strip_mp4_audio_to_file(
+                            &source_path,
+                            &exports_dir,
+                            &clip_id,
+                            &clip_path,
+                        )
+                        .await;
+                        if !build_ok || ninjanvr_media::mp4_file_has_audio_track(&clip_path) {
+                            let _ = std::fs::remove_file(&clip_path);
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                    }
+                    drop(_clip_guard);
+                    if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                        &state,
+                        &payload,
+                        is_initial,
+                        provided_sid,
+                        valid_continuation,
+                    ) {
+                        return err_resp;
+                    }
+                    if let Some(safe_path) =
+                        ensure_path_within_media_dir(&state.media_dir, &clip_path)
+                        && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
+                    {
+                        return finalize_video_resp(resp);
+                    }
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+
+                if let Some(resp) = serve_mp4_file_with_range(&source_path, &headers).await {
+                    return finalize_video_resp(resp);
+                }
+            } else {
                 cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
-                return StatusCode::NOT_FOUND.into_response();
             }
-        } else if !is_disallowed_export_fallback_id(&payload.id) && payload.id == safe_id {
-            if let Some(ref token_cam) = payload.cam
-                && let Some(cam_prefix) =
-                    payload.id.rsplitn(3, '_').nth(2).filter(|s| !s.is_empty())
-                && token_cam != cam_prefix
+        } else if payload.k == "review" || payload.k == "event" {
+            if let (Ok(Some(rev)), Ok(Some(ev))) = (
+                state.db.get_review_by_id(&payload.id),
+                state.db.get_event(&payload.id),
+            ) && ev["camera"].as_str().is_some_and(|ec| ec != rev.camera)
             {
                 return (
                     StatusCode::FORBIDDEN,
@@ -10452,126 +10714,276 @@ async fn share_video_mp4(
                 )
                     .into_response();
             }
-            let file_path = state
-                .media_dir
-                .join("exports")
-                .join(format!("{safe_id}.mp4"));
-            if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &file_path)
-                && safe_path.is_file()
-            {
-                let cam = payload.cam.clone().or_else(|| {
-                    payload
-                        .id
-                        .rsplitn(3, '_')
-                        .nth(2)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                });
-                resolved_export = Some((safe_path, cam));
-            }
-        }
-
-        if let Some((source_path, export_cam)) = resolved_export {
-            let privacy_mask = if let Some(ref cam) = export_cam {
-                let cfg = state.config.read().await;
-                cfg.cameras.get(cam).map(|c| c.privacy_mask.clone())
-            } else {
-                None
-            };
-            if has_active_privacy_mask(privacy_mask.as_ref()) {
-                if safe_id.is_empty() || payload.id != safe_id || payload.id.contains("..") {
-                    return StatusCode::BAD_REQUEST.into_response();
-                }
-                let redacted_id = format!("share_redacted_{safe_id}");
-                let exports_dir = state.media_dir.join("exports");
-                let redacted_path = exports_dir.join(format!("{redacted_id}.mp4"));
-                let mask_hash_path = exports_dir.join(format!(".{redacted_id}.mask_hash"));
-                let current_mask_hash = compute_privacy_mask_hash(privacy_mask.as_ref());
-
-                let clip_lock = acquire_share_clip_lock(&state, &redacted_id).await;
-                let _clip_guard = clip_lock.lock().await;
-
-                if redacted_path.is_file() {
-                    let hash_matches = std::fs::read_to_string(&mask_hash_path)
-                        .map(|existing_hash| existing_hash.trim() == current_mask_hash)
-                        .unwrap_or(false);
-                    if !hash_matches
-                        || is_cached_share_artifact_stale(
-                            &redacted_path,
-                            std::slice::from_ref(&source_path),
-                        )
-                        || ninjanvr_media::mp4_file_has_audio_track(&redacted_path)
-                    {
-                        let _ = std::fs::remove_file(&redacted_path);
-                        let _ = std::fs::remove_file(&mask_hash_path);
+            let mut resolved_target: Option<(String, f64, f64)> = None;
+            if payload.k == "review" {
+                if let Ok(Some(rev)) = state.db.get_review_by_id(&payload.id) {
+                    if !rev.camera.trim().is_empty() {
+                        if let Some(ref token_cam) = payload.cam
+                            && token_cam != &rev.camera
+                        {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(json!({ "error": "Share link camera mismatch" })),
+                            )
+                                .into_response();
+                        }
+                        let end = rev.end_time.unwrap_or(rev.start_time + 15.0);
+                        resolved_target = Some((rev.camera, rev.start_time, end));
                     }
+                } else if let Ok(Some(ev)) = state.db.get_event(&payload.id)
+                    && let Some(cam) = ev["camera"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    if let Some(ref token_cam) = payload.cam
+                        && token_cam != cam
+                    {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "error": "Share link camera mismatch" })),
+                        )
+                            .into_response();
+                    }
+                    let start = ev["start_time"].as_f64().unwrap_or(0.0);
+                    let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
+                    resolved_target = Some((cam.to_string(), start, end));
+                }
+            } else if let Ok(Some(ev)) = state.db.get_event(&payload.id) {
+                if let Some(cam) = ev["camera"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Some(ref token_cam) = payload.cam
+                        && token_cam != cam
+                    {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "error": "Share link camera mismatch" })),
+                        )
+                            .into_response();
+                    }
+                    let start = ev["start_time"].as_f64().unwrap_or(0.0);
+                    let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
+                    resolved_target = Some((cam.to_string(), start, end));
+                }
+            } else if let Ok(Some(rev)) = state.db.get_review_by_id(&payload.id)
+                && !rev.camera.trim().is_empty()
+            {
+                if let Some(ref token_cam) = payload.cam
+                    && token_cam != &rev.camera
+                {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": "Share link camera mismatch" })),
+                    )
+                        .into_response();
+                }
+                let end = rev.end_time.unwrap_or(rev.start_time + 15.0);
+                resolved_target = Some((rev.camera, rev.start_time, end));
+            }
+
+            if let Some((cam, start, raw_end)) = resolved_target {
+                let end = raw_end.max(start).min(start + 300.0);
+
+                let filter_valid_recs = |rows: Vec<ninjanvr_db::RecordingRow>| -> Vec<PathBuf> {
+                    rows.into_iter()
+                        .filter_map(|rec| {
+                            let disk_path =
+                                resolve_recording_disk_path(&state.media_dir, &rec.path);
+                            let safe_path =
+                                ensure_path_within_media_dir(&state.media_dir, &disk_path)?;
+                            if safe_path.is_file() {
+                                Some(safe_path)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                };
+
+                let mut recs = state
+                    .db
+                    .query_recordings(&cam, start - 5.0, end + 5.0)
+                    .map(filter_valid_recs)
+                    .unwrap_or_default();
+                if recs.is_empty() {
+                    recs = state
+                        .db
+                        .query_recordings(&cam, start - 10.0, end + 10.0)
+                        .map(filter_valid_recs)
+                        .unwrap_or_default();
+                }
+                if recs.is_empty() {
+                    cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
+                    return StatusCode::NOT_FOUND.into_response();
                 }
 
-                if !redacted_path.is_file() {
-                    let _sem_permit = state.share_ffmpeg_semaphore.acquire().await.ok();
-                    let build_ok = redact_mp4_file_with_privacy(
-                        &source_path,
-                        &exports_dir,
-                        &redacted_id,
-                        &redacted_path,
-                        privacy_mask.as_ref(),
-                    )
-                    .await;
-                    if build_ok && !ninjanvr_media::mp4_file_has_audio_track(&redacted_path) {
-                        let _ = std::fs::write(&mask_hash_path, &current_mask_hash);
-                    } else {
-                        let _ = std::fs::remove_file(&redacted_path);
-                        let _ = std::fs::remove_file(&mask_hash_path);
+                let privacy_mask = {
+                    let cfg = state.config.read().await;
+                    cfg.cameras.get(&cam).map(|c| c.privacy_mask.clone())
+                };
+                if has_active_privacy_mask(privacy_mask.as_ref()) {
+                    if safe_id.is_empty() || payload.id != safe_id || payload.id.contains("..") {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    if ninjanvr_media::build_privacy_drawbox_filter(privacy_mask.as_ref()).is_none()
+                    {
                         return StatusCode::NOT_FOUND.into_response();
                     }
-                }
-                drop(_clip_guard);
-                if let Some(err_resp) = verify_post_build_share_target_and_jti(
-                    &state,
-                    &payload,
-                    is_initial,
-                    provided_sid,
-                    valid_continuation,
-                ) {
-                    return err_resp;
+                    let redacted_id = format!("share_redacted_{safe_id}");
+                    let exports_dir = state.media_dir.join("exports");
+                    let redacted_path = exports_dir.join(format!("{redacted_id}.mp4"));
+                    let mask_hash_path = exports_dir.join(format!(".{redacted_id}.mask_hash"));
+                    let current_mask_hash = compute_privacy_mask_hash(privacy_mask.as_ref());
+
+                    let clip_lock = acquire_share_clip_lock(&state, &redacted_id).await;
+                    let _clip_guard = clip_lock.lock().await;
+
+                    if redacted_path.is_file() {
+                        let hash_matches = std::fs::read_to_string(&mask_hash_path)
+                            .map(|existing_hash| existing_hash.trim() == current_mask_hash)
+                            .unwrap_or(false);
+                        if !hash_matches
+                            || is_cached_share_artifact_stale(&redacted_path, &recs)
+                            || ninjanvr_media::mp4_file_has_audio_track(&redacted_path)
+                        {
+                            let _ = std::fs::remove_file(&redacted_path);
+                            let _ = std::fs::remove_file(&mask_hash_path);
+                        }
+                    }
+
+                    if !redacted_path.is_file() {
+                        if method == axum::http::Method::HEAD {
+                            drop(_clip_guard);
+                            if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                                &state,
+                                &payload,
+                                is_initial,
+                                provided_sid,
+                                valid_continuation,
+                            ) {
+                                return err_resp;
+                            }
+                            return finalize_video_resp(
+                                build_share_video_head_placeholder_response(&headers),
+                            );
+                        }
+                        let _sem_permit = state.share_ffmpeg_semaphore.acquire().await.ok();
+                        let build_res = tokio::time::timeout(
+                            Duration::from_secs(120),
+                            build_mp4_export_with_privacy(
+                                &state.db,
+                                &state.media_dir,
+                                &redacted_id,
+                                &cam,
+                                "shared_redacted",
+                                start - 5.0,
+                                end + 5.0,
+                                false,
+                                privacy_mask.as_ref(),
+                            ),
+                        )
+                        .await;
+                        let _ = state.db.delete_export(&redacted_id);
+                        let _ = std::fs::remove_file(
+                            state
+                                .media_dir
+                                .join("clips")
+                                .join(format!("{redacted_id}.webp")),
+                        );
+                        match build_res {
+                            Ok(Ok(()))
+                                if !ninjanvr_media::mp4_file_has_audio_track(&redacted_path) =>
+                            {
+                                let _ = std::fs::write(&mask_hash_path, &current_mask_hash);
+                            }
+                            _ => {
+                                let _ = std::fs::remove_file(&redacted_path);
+                                let _ = std::fs::remove_file(&mask_hash_path);
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
+                        }
+                    }
+                    drop(_clip_guard);
+                    if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                        &state,
+                        &payload,
+                        is_initial,
+                        provided_sid,
+                        valid_continuation,
+                    ) {
+                        return err_resp;
+                    }
+
+                    if let Some(safe_path) =
+                        ensure_path_within_media_dir(&state.media_dir, &redacted_path)
+                        && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
+                    {
+                        return finalize_video_resp(resp);
+                    }
+                    return StatusCode::NOT_FOUND.into_response();
                 }
 
-                if let Some(safe_path) =
-                    ensure_path_within_media_dir(&state.media_dir, &redacted_path)
-                    && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
-                {
-                    return finalize_video_resp(resp);
-                }
-                return StatusCode::NOT_FOUND.into_response();
-            }
-
-            if ninjanvr_media::mp4_file_has_audio_track(&source_path) {
                 if safe_id.is_empty() || payload.id != safe_id || payload.id.contains("..") {
                     return StatusCode::BAD_REQUEST.into_response();
                 }
                 let clip_id = format!("share_clip_{safe_id}");
-                let exports_dir = state.media_dir.join("exports");
-                let clip_path = exports_dir.join(format!("{clip_id}.mp4"));
-
+                let clip_path = state
+                    .media_dir
+                    .join("exports")
+                    .join(format!("{clip_id}.mp4"));
                 let clip_lock = acquire_share_clip_lock(&state, &clip_id).await;
                 let _clip_guard = clip_lock.lock().await;
-
                 if clip_path.is_file()
-                    && (ninjanvr_media::mp4_file_has_audio_track(&clip_path)
-                        || is_cached_share_artifact_stale(
-                            &clip_path,
-                            std::slice::from_ref(&source_path),
-                        ))
+                    && (is_cached_share_artifact_stale(&clip_path, &recs)
+                        || ninjanvr_media::mp4_file_has_audio_track(&clip_path))
                 {
                     let _ = std::fs::remove_file(&clip_path);
                 }
-
                 if !clip_path.is_file() {
+                    if method == axum::http::Method::HEAD {
+                        drop(_clip_guard);
+                        if let Some(err_resp) = verify_post_build_share_target_and_jti(
+                            &state,
+                            &payload,
+                            is_initial,
+                            provided_sid,
+                            valid_continuation,
+                        ) {
+                            return err_resp;
+                        }
+                        return finalize_video_resp(build_share_video_head_placeholder_response(
+                            &headers,
+                        ));
+                    }
                     let _sem_permit = state.share_ffmpeg_semaphore.acquire().await.ok();
-                    let build_ok =
-                        strip_mp4_audio_to_file(&source_path, &exports_dir, &clip_id, &clip_path)
-                            .await;
-                    if !build_ok || ninjanvr_media::mp4_file_has_audio_track(&clip_path) {
+                    let build_res = tokio::time::timeout(
+                        Duration::from_secs(120),
+                        build_mp4_export_with_privacy(
+                            &state.db,
+                            &state.media_dir,
+                            &clip_id,
+                            &cam,
+                            "shared_clip",
+                            start - 5.0,
+                            end + 5.0,
+                            false,
+                            None,
+                        ),
+                    )
+                    .await;
+                    let _ = state.db.delete_export(&clip_id);
+                    let _ = std::fs::remove_file(
+                        state
+                            .media_dir
+                            .join("clips")
+                            .join(format!("{clip_id}.webp")),
+                    );
+                    if !matches!(build_res, Ok(Ok(())))
+                        || ninjanvr_media::mp4_file_has_audio_track(&clip_path)
+                    {
                         let _ = std::fs::remove_file(&clip_path);
                         return StatusCode::NOT_FOUND.into_response();
                     }
@@ -10593,281 +11005,16 @@ async fn share_video_mp4(
                 }
                 return StatusCode::NOT_FOUND.into_response();
             }
-
-            if let Some(resp) = serve_mp4_file_with_range(&source_path, &headers).await {
-                return finalize_video_resp(resp);
-            }
-        } else {
-            cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
-        }
-    } else if payload.k == "review" || payload.k == "event" {
-        if let (Ok(Some(rev)), Ok(Some(ev))) = (
-            state.db.get_review_by_id(&payload.id),
-            state.db.get_event(&payload.id),
-        ) && ev["camera"].as_str().is_some_and(|ec| ec != rev.camera)
-        {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "Share link camera mismatch" })),
-            )
-                .into_response();
-        }
-        let mut resolved_target: Option<(String, f64, f64)> = None;
-        if payload.k == "review" {
-            if let Ok(Some(rev)) = state.db.get_review_by_id(&payload.id) {
-                if !rev.camera.trim().is_empty() {
-                    if let Some(ref token_cam) = payload.cam
-                        && token_cam != &rev.camera
-                    {
-                        return (
-                            StatusCode::FORBIDDEN,
-                            Json(json!({ "error": "Share link camera mismatch" })),
-                        )
-                            .into_response();
-                    }
-                    let end = rev.end_time.unwrap_or(rev.start_time + 15.0);
-                    resolved_target = Some((rev.camera, rev.start_time, end));
-                }
-            } else if let Ok(Some(ev)) = state.db.get_event(&payload.id)
-                && let Some(cam) = ev["camera"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-            {
-                if let Some(ref token_cam) = payload.cam
-                    && token_cam != cam
-                {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({ "error": "Share link camera mismatch" })),
-                    )
-                        .into_response();
-                }
-                let start = ev["start_time"].as_f64().unwrap_or(0.0);
-                let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
-                resolved_target = Some((cam.to_string(), start, end));
-            }
-        } else if let Ok(Some(ev)) = state.db.get_event(&payload.id) {
-            if let Some(cam) = ev["camera"]
-                .as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                if let Some(ref token_cam) = payload.cam
-                    && token_cam != cam
-                {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({ "error": "Share link camera mismatch" })),
-                    )
-                        .into_response();
-                }
-                let start = ev["start_time"].as_f64().unwrap_or(0.0);
-                let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
-                resolved_target = Some((cam.to_string(), start, end));
-            }
-        } else if let Ok(Some(rev)) = state.db.get_review_by_id(&payload.id)
-            && !rev.camera.trim().is_empty()
-        {
-            if let Some(ref token_cam) = payload.cam
-                && token_cam != &rev.camera
-            {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "Share link camera mismatch" })),
-                )
-                    .into_response();
-            }
-            let end = rev.end_time.unwrap_or(rev.start_time + 15.0);
-            resolved_target = Some((rev.camera, rev.start_time, end));
         }
 
-        if let Some((cam, start, raw_end)) = resolved_target {
-            let end = raw_end.max(start).min(start + 300.0);
-
-            let filter_valid_recs = |rows: Vec<ninjanvr_db::RecordingRow>| -> Vec<PathBuf> {
-                rows.into_iter()
-                    .filter_map(|rec| {
-                        let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
-                        let safe_path = ensure_path_within_media_dir(&state.media_dir, &disk_path)?;
-                        if safe_path.is_file() {
-                            Some(safe_path)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            };
-
-            let mut recs = state
-                .db
-                .query_recordings(&cam, start - 5.0, end + 5.0)
-                .map(filter_valid_recs)
-                .unwrap_or_default();
-            if recs.is_empty() {
-                recs = state
-                    .db
-                    .query_recordings(&cam, start - 10.0, end + 10.0)
-                    .map(filter_valid_recs)
-                    .unwrap_or_default();
-            }
-            if recs.is_empty() {
-                cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
-                return StatusCode::NOT_FOUND.into_response();
-            }
-
-            let privacy_mask = {
-                let cfg = state.config.read().await;
-                cfg.cameras.get(&cam).map(|c| c.privacy_mask.clone())
-            };
-            if has_active_privacy_mask(privacy_mask.as_ref()) {
-                if safe_id.is_empty() || payload.id != safe_id || payload.id.contains("..") {
-                    return StatusCode::BAD_REQUEST.into_response();
-                }
-                let redacted_id = format!("share_redacted_{safe_id}");
-                let exports_dir = state.media_dir.join("exports");
-                let redacted_path = exports_dir.join(format!("{redacted_id}.mp4"));
-                let mask_hash_path = exports_dir.join(format!(".{redacted_id}.mask_hash"));
-                let current_mask_hash = compute_privacy_mask_hash(privacy_mask.as_ref());
-
-                let clip_lock = acquire_share_clip_lock(&state, &redacted_id).await;
-                let _clip_guard = clip_lock.lock().await;
-
-                if redacted_path.is_file() {
-                    let hash_matches = std::fs::read_to_string(&mask_hash_path)
-                        .map(|existing_hash| existing_hash.trim() == current_mask_hash)
-                        .unwrap_or(false);
-                    if !hash_matches
-                        || is_cached_share_artifact_stale(&redacted_path, &recs)
-                        || ninjanvr_media::mp4_file_has_audio_track(&redacted_path)
-                    {
-                        let _ = std::fs::remove_file(&redacted_path);
-                        let _ = std::fs::remove_file(&mask_hash_path);
-                    }
-                }
-
-                if !redacted_path.is_file() {
-                    let _sem_permit = state.share_ffmpeg_semaphore.acquire().await.ok();
-                    let build_res = tokio::time::timeout(
-                        Duration::from_secs(120),
-                        build_mp4_export_with_privacy(
-                            &state.db,
-                            &state.media_dir,
-                            &redacted_id,
-                            &cam,
-                            "shared_redacted",
-                            start - 5.0,
-                            end + 5.0,
-                            false,
-                            privacy_mask.as_ref(),
-                        ),
-                    )
-                    .await;
-                    let _ = state.db.delete_export(&redacted_id);
-                    let _ = std::fs::remove_file(
-                        state
-                            .media_dir
-                            .join("clips")
-                            .join(format!("{redacted_id}.webp")),
-                    );
-                    match build_res {
-                        Ok(Ok(())) if !ninjanvr_media::mp4_file_has_audio_track(&redacted_path) => {
-                            let _ = std::fs::write(&mask_hash_path, &current_mask_hash);
-                        }
-                        _ => {
-                            let _ = std::fs::remove_file(&redacted_path);
-                            let _ = std::fs::remove_file(&mask_hash_path);
-                            return StatusCode::NOT_FOUND.into_response();
-                        }
-                    }
-                }
-                drop(_clip_guard);
-                if let Some(err_resp) = verify_post_build_share_target_and_jti(
-                    &state,
-                    &payload,
-                    is_initial,
-                    provided_sid,
-                    valid_continuation,
-                ) {
-                    return err_resp;
-                }
-
-                if let Some(safe_path) =
-                    ensure_path_within_media_dir(&state.media_dir, &redacted_path)
-                    && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
-                {
-                    return finalize_video_resp(resp);
-                }
-                return StatusCode::NOT_FOUND.into_response();
-            }
-
-            if safe_id.is_empty() || payload.id != safe_id || payload.id.contains("..") {
-                return StatusCode::BAD_REQUEST.into_response();
-            }
-            let clip_id = format!("share_clip_{safe_id}");
-            let clip_path = state
-                .media_dir
-                .join("exports")
-                .join(format!("{clip_id}.mp4"));
-            let clip_lock = acquire_share_clip_lock(&state, &clip_id).await;
-            let _clip_guard = clip_lock.lock().await;
-            if clip_path.is_file()
-                && (is_cached_share_artifact_stale(&clip_path, &recs)
-                    || ninjanvr_media::mp4_file_has_audio_track(&clip_path))
-            {
-                let _ = std::fs::remove_file(&clip_path);
-            }
-            if !clip_path.is_file() {
-                let _sem_permit = state.share_ffmpeg_semaphore.acquire().await.ok();
-                let build_res = tokio::time::timeout(
-                    Duration::from_secs(120),
-                    build_mp4_export_with_privacy(
-                        &state.db,
-                        &state.media_dir,
-                        &clip_id,
-                        &cam,
-                        "shared_clip",
-                        start - 5.0,
-                        end + 5.0,
-                        false,
-                        None,
-                    ),
-                )
-                .await;
-                let _ = state.db.delete_export(&clip_id);
-                let _ = std::fs::remove_file(
-                    state
-                        .media_dir
-                        .join("clips")
-                        .join(format!("{clip_id}.webp")),
-                );
-                if !matches!(build_res, Ok(Ok(())))
-                    || ninjanvr_media::mp4_file_has_audio_track(&clip_path)
-                {
-                    let _ = std::fs::remove_file(&clip_path);
-                    return StatusCode::NOT_FOUND.into_response();
-                }
-            }
-            drop(_clip_guard);
-            if let Some(err_resp) = verify_post_build_share_target_and_jti(
-                &state,
-                &payload,
-                is_initial,
-                provided_sid,
-                valid_continuation,
-            ) {
-                return err_resp;
-            }
-            if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &clip_path)
-                && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
-            {
-                return finalize_video_resp(resp);
-            }
-            return StatusCode::NOT_FOUND.into_response();
-        }
+        StatusCode::NOT_FOUND.into_response()
     }
+    .await;
 
-    StatusCode::NOT_FOUND.into_response()
+    if !resp.status().is_success() {
+        rollback_share_stream_cursor(&state, &payload, prev_stream_cursor);
+    }
+    resp
 }
 
 async fn api_exports(
@@ -11008,6 +11155,53 @@ async fn api_export_create(
             Json(json!({
                 "success": false,
                 "message": "Camera is not permitted for this user"
+            })),
+        )
+            .into_response();
+    }
+    let is_safe_camera = !camera.is_empty()
+        && !camera.starts_with('.')
+        && !camera.contains("..")
+        && !camera.starts_with("share_redacted_")
+        && !camera.starts_with("share_clip_")
+        && camera
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !is_safe_camera {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Invalid camera identifier"
+            })),
+        )
+            .into_response();
+    }
+    let camera_configured = {
+        let cfg = state.config.read().await;
+        cfg.cameras.contains_key(&camera)
+    };
+    if !camera_configured {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": format!("Unknown camera '{camera}'")
+            })),
+        )
+            .into_response();
+    }
+    if !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end <= start
+        || (end - start) > 86400.0
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Export start and end timestamps must be finite, non-negative, and satisfy 0 < end - start <= 86400"
             })),
         )
             .into_response();
@@ -27457,6 +27651,835 @@ cameras:
             r_enc_cam.status(),
             StatusCode::FORBIDDEN,
             "api_export_create must enforce caller_allowed_cameras on percent-encoded camera parameter"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn security_share_link_round12_audit_findings_regression_work() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_sec_share_r12_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let cfg_path = tmp_dir.join("config.yml");
+        let web_dir = tmp_dir.join("web-v2");
+        let media_dir = tmp_dir.join("media");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
+
+        let yaml = format!(
+            r#"
+version: 0.18-0
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/front_door
+          roles: [record, detect]
+  backyard:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/backyard
+          roles: [record, detect]
+"#,
+            db_path.display()
+        );
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+            .await
+            .unwrap();
+        let auth_app = build_router_with_auth(state.clone(), true);
+
+        let now = unix_now();
+        let admin_jwt = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &JwtClaims {
+                sub: "admin".to_string(),
+                role: "admin".to_string(),
+                allowed_cameras: Some("*".to_string()),
+                iat: now,
+                exp: now + 3600,
+            },
+            &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+        )
+        .unwrap();
+        let admin_bearer = format!("Bearer {admin_jwt}");
+
+        let exports_dir = media_dir.join("exports");
+        let clips_dir = media_dir.join("clips");
+        let rec_dir = media_dir.join("recordings/2026-11-04/12/front_door");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        let mp4_payload: Vec<u8> = (0u8..128u8).collect();
+        let make_mp4_box = |box_type: &[u8; 4], payload: &[u8]| -> Vec<u8> {
+            let total = (8 + payload.len()) as u32;
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&total.to_be_bytes());
+            out.extend_from_slice(box_type);
+            out.extend_from_slice(payload);
+            out
+        };
+        let make_mp4_full_box =
+            |box_type: &[u8; 4], version: u8, flags: u32, body: &[u8]| -> Vec<u8> {
+                let total = (12 + body.len()) as u32;
+                let mut out = Vec::with_capacity(12 + body.len());
+                out.extend_from_slice(&total.to_be_bytes());
+                out.extend_from_slice(box_type);
+                let vf = ((version as u32) << 24) | (flags & 0x00FF_FFFF);
+                out.extend_from_slice(&vf.to_be_bytes());
+                out.extend_from_slice(body);
+                out
+            };
+        let audio_mp4 = {
+            let ftyp = make_mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+            let mdat = make_mp4_box(b"mdat", &[0x11u8; 32]);
+            let mut hdlr_body = vec![0u8; 20];
+            hdlr_body[4..8].copy_from_slice(b"soun");
+            let hdlr = make_mp4_full_box(b"hdlr", 0, 0, &hdlr_body);
+            let mdia = make_mp4_box(b"mdia", &hdlr);
+            let soun_trak = make_mp4_box(b"trak", &mdia);
+            let moov = make_mp4_box(b"moov", &soun_trak);
+            let mut out = Vec::new();
+            out.extend_from_slice(&ftyp);
+            out.extend_from_slice(&mdat);
+            out.extend_from_slice(&moov);
+            out
+        };
+
+        for exp_id in [
+            "exp_r12_head_red",
+            "exp_r12_head_aud",
+            "exp_r12_rollback",
+            "exp_r12_touch1",
+            "exp_r12_touch2",
+        ] {
+            let bytes = if exp_id == "exp_r12_head_aud" {
+                &audio_mp4
+            } else {
+                &mp4_payload
+            };
+            std::fs::write(exports_dir.join(format!("{exp_id}.mp4")), bytes).unwrap();
+            state
+                .db
+                .insert_export(&ExportRow {
+                    id: exp_id.to_string(),
+                    camera: "front_door".to_string(),
+                    name: format!("R12 {exp_id}"),
+                    date: 1700000200.0,
+                    video_path: format!("/media/ninjanvr/exports/{exp_id}.mp4"),
+                    thumb_path: format!("/media/ninjanvr/clips/{exp_id}.webp"),
+                    in_progress: false,
+                })
+                .unwrap();
+        }
+
+        let rec_r12_seg = rec_dir.join("55.00.mp4");
+        std::fs::write(&rec_r12_seg, &mp4_payload).unwrap();
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "rec_r12_6000".to_string(),
+                camera: "front_door".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-04/12/front_door/55.00.mp4".to_string(),
+                start_time: 6000.0,
+                end_time: 6010.0,
+                duration: 10.0,
+                motion: 5,
+                objects: 1,
+                dbfs: -20,
+                segment_size: 0.1,
+                regions: 1,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_r12_head".to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: 6001.0,
+                end_time: Some(6008.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.9),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({}),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.9),
+                stationary: false,
+            })
+            .unwrap();
+
+        let mint_share = |kind: &str, target_id: &str, max_views: Option<u32>| {
+            let auth_app = auth_app.clone();
+            let admin_bearer = admin_bearer.clone();
+            let body = json!({
+                "kind": kind,
+                "target_id": target_id,
+                "expires_in_sec": 3600,
+                "max_views": max_views,
+            })
+            .to_string();
+            async move {
+                let r = auth_app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/share")
+                            .header(header::AUTHORIZATION, &admin_bearer)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::OK);
+                let v: Value =
+                    serde_json::from_slice(&to_bytes(r.into_body(), 4096).await.unwrap()).unwrap();
+                (
+                    v["id"].as_str().unwrap().to_string(),
+                    v["token"].as_str().unwrap().to_string(),
+                )
+            }
+        };
+
+        // =========================================================================
+        // 1. [R12-FINDING-01] Prevent Uncounted FFmpeg Transcode DoS on HTTP HEAD
+        // =========================================================================
+        // 1a. Unit check `build_share_video_head_placeholder_response`
+        let unranged_placeholder = build_share_video_head_placeholder_response(&HeaderMap::new());
+        assert_eq!(unranged_placeholder.status(), StatusCode::OK);
+        assert_eq!(
+            unranged_placeholder
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap(),
+            "video/mp4"
+        );
+        assert_eq!(
+            unranged_placeholder
+                .headers()
+                .get(header::ACCEPT_RANGES)
+                .unwrap(),
+            "bytes"
+        );
+        assert_eq!(
+            unranged_placeholder
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        let mut ranged_hdrs = HeaderMap::new();
+        ranged_hdrs.insert(header::RANGE, "bytes=0-15".parse().unwrap());
+        let ranged_placeholder = build_share_video_head_placeholder_response(&ranged_hdrs);
+        assert_eq!(ranged_placeholder.status(), StatusCode::PARTIAL_CONTENT);
+
+        // Hold ALL 2 global `share_ffmpeg_semaphore` permits so any attempt to acquire the semaphore
+        // in `HEAD /share/{token}/video.mp4` would immediately deadlock!
+        let held_ffmpeg_permits = state
+            .share_ffmpeg_semaphore
+            .acquire_many(2)
+            .await
+            .expect("must acquire both FFmpeg semaphore permits");
+
+        let (jti_exp_red, tok_exp_red) = mint_share("export", "exp_r12_head_red", Some(1)).await;
+        let (jti_exp_aud, tok_exp_aud) = mint_share("export", "exp_r12_head_aud", Some(1)).await;
+        let (jti_ev_head, tok_ev_head) = mint_share("event", "ev_r12_head", Some(1)).await;
+
+        let valid_mask = json!([[[0.1, 0.1], [0.4, 0.1], [0.4, 0.4], [0.1, 0.4]]]);
+        let invalid_mask = json!([{"not_a_polygon": true}]);
+
+        // Branch 1 (export redacted) & Branch 3 (event redacted) with uncompilable privacy mask -> 404 NOT_FOUND on HEAD
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("front_door").unwrap().privacy_mask = invalid_mask;
+        }
+        for tok in [&tok_exp_red, &tok_ev_head] {
+            let r_bad_mask = tokio::time::timeout(
+                Duration::from_secs(2),
+                auth_app.clone().oneshot(
+                    Request::builder()
+                        .method("HEAD")
+                        .uri(format!("/share/{tok}/video.mp4"))
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("HEAD must not block on share_ffmpeg_semaphore")
+            .unwrap();
+            assert_eq!(
+                r_bad_mask.status(),
+                StatusCode::NOT_FOUND,
+                "HEAD on link with uncompilable privacy mask must return 404 NOT_FOUND"
+            );
+        }
+
+        // Branch 1 (export redacted) & Branch 3 (event redacted) with valid privacy mask, uncached on disk:
+        // HEAD returns 200 OK / 206 PARTIAL_CONTENT placeholder WITHOUT acquiring semaphore or spawning FFmpeg!
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("front_door").unwrap().privacy_mask = valid_mask.clone();
+        }
+        for (jti, tok, tid) in [
+            (&jti_exp_red, &tok_exp_red, "exp_r12_head_red"),
+            (&jti_ev_head, &tok_ev_head, "ev_r12_head"),
+        ] {
+            let r_head_ok = tokio::time::timeout(
+                Duration::from_secs(2),
+                auth_app.clone().oneshot(
+                    Request::builder()
+                        .method("HEAD")
+                        .uri(format!("/share/{tok}/video.mp4"))
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("HEAD must not acquire share_ffmpeg_semaphore")
+            .unwrap();
+            assert_eq!(r_head_ok.status(), StatusCode::OK);
+            assert_eq!(
+                r_head_ok.headers().get(header::CONTENT_TYPE).unwrap(),
+                "video/mp4"
+            );
+            assert_eq!(
+                r_head_ok.headers().get(header::ACCEPT_RANGES).unwrap(),
+                "bytes"
+            );
+
+            let r_head_206 = tokio::time::timeout(
+                Duration::from_secs(2),
+                auth_app.clone().oneshot(
+                    Request::builder()
+                        .method("HEAD")
+                        .uri(format!("/share/{tok}/video.mp4"))
+                        .header(header::RANGE, "bytes=0-15")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("ranged HEAD must not acquire share_ffmpeg_semaphore")
+            .unwrap();
+            assert_eq!(r_head_206.status(), StatusCode::PARTIAL_CONTENT);
+            assert!(
+                !exports_dir
+                    .join(format!("share_redacted_{tid}.mp4"))
+                    .exists(),
+                "HEAD must not spawn FFmpeg to build share_redacted_{tid}.mp4"
+            );
+            assert_eq!(
+                state.db.get_share_link(jti).unwrap().unwrap()["access_count"],
+                0
+            );
+
+            // When valid cached redacted file exists on disk, HEAD serves its exact headers (`Content-Length: 128`)
+            let red_path = exports_dir.join(format!("share_redacted_{tid}.mp4"));
+            let hash_path = exports_dir.join(format!(".share_redacted_{tid}.mask_hash"));
+            std::fs::write(&red_path, &mp4_payload).unwrap();
+            std::fs::write(&hash_path, compute_privacy_mask_hash(Some(&valid_mask))).unwrap();
+            let r_head_cached = tokio::time::timeout(
+                Duration::from_secs(2),
+                auth_app.clone().oneshot(
+                    Request::builder()
+                        .method("HEAD")
+                        .uri(format!("/share/{tok}/video.mp4"))
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(r_head_cached.status(), StatusCode::OK);
+            assert_eq!(
+                r_head_cached.headers().get(header::CONTENT_LENGTH).unwrap(),
+                "128"
+            );
+            let _ = std::fs::remove_file(&red_path);
+            let _ = std::fs::remove_file(&hash_path);
+        }
+
+        // Clear privacy mask to test Branch 2 (export audio-stripped) & Branch 4 (event unmasked clip)
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("front_door").unwrap().privacy_mask = Value::Null;
+        }
+        for (jti, tok, tid) in [
+            (&jti_exp_aud, &tok_exp_aud, "exp_r12_head_aud"),
+            (&jti_ev_head, &tok_ev_head, "ev_r12_head"),
+        ] {
+            let r_head_ok = tokio::time::timeout(
+                Duration::from_secs(2),
+                auth_app.clone().oneshot(
+                    Request::builder()
+                        .method("HEAD")
+                        .uri(format!("/share/{tok}/video.mp4"))
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("HEAD on uncached clip branch must not acquire share_ffmpeg_semaphore")
+            .unwrap();
+            assert_eq!(r_head_ok.status(), StatusCode::OK);
+
+            let r_head_206 = tokio::time::timeout(
+                Duration::from_secs(2),
+                auth_app.clone().oneshot(
+                    Request::builder()
+                        .method("HEAD")
+                        .uri(format!("/share/{tok}/video.mp4"))
+                        .header(header::RANGE, "bytes=0-15")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("ranged HEAD on uncached clip branch must not acquire share_ffmpeg_semaphore")
+            .unwrap();
+            assert_eq!(r_head_206.status(), StatusCode::PARTIAL_CONTENT);
+            assert!(
+                !exports_dir.join(format!("share_clip_{tid}.mp4")).exists(),
+                "HEAD must not spawn FFmpeg to build share_clip_{tid}.mp4"
+            );
+            assert_eq!(
+                state.db.get_share_link(jti).unwrap().unwrap()["access_count"],
+                0
+            );
+        }
+
+        drop(held_ffmpeg_permits);
+
+        // =========================================================================
+        // 2. [R12-FINDING-02] Roll Back `prev_stream_cursor` & `active_stream_expires`
+        //    on All Non-2xx Early-Return Errors in `share_video_mp4`
+        // =========================================================================
+        let (jti_rb, tok_rb) = mint_share("export", "exp_r12_rollback", Some(1)).await;
+        // Start initial ranged stream `bytes=0-15` -> `active_streams == [16]`, `access_count == 1`
+        let r_rb_init = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_rb}/video.mp4"))
+                    .header(header::RANGE, "bytes=0-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_rb_init.status(), StatusCode::PARTIAL_CONTENT);
+
+        // Pin `active_stream_expires[0]` to a distinct value `now + 300` so we can verify expiry rollback
+        let custom_exp = now + 300;
+        {
+            let mut map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get_mut(&jti_rb).unwrap();
+            assert_eq!(entry.active_streams, vec![16]);
+            entry.active_stream_expires = vec![custom_exp];
+        }
+
+        // 2a. `416 RANGE_NOT_SATISFIABLE` (`bytes=999999-`) rolls back BOTH `active_streams` AND `active_stream_expires`
+        let r_rb_416 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_rb}/video.mp4"))
+                    .header(header::RANGE, "bytes=999999-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_rb_416.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        {
+            let map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get(&jti_rb).unwrap();
+            assert_eq!(entry.active_streams, vec![16]);
+            assert_eq!(
+                entry.active_stream_expires,
+                vec![custom_exp],
+                "416 response must roll back active_stream_expires to prevent expiry extension DoS"
+            );
+        }
+
+        // 2b. `404 NOT_FOUND` during continuation (source file temporarily missing) rolls back `active_streams` & `active_stream_expires`
+        let rb_file = exports_dir.join("exp_r12_rollback.mp4");
+        let rb_file_bak = exports_dir.join("exp_r12_rollback.mp4.bak");
+        std::fs::rename(&rb_file, &rb_file_bak).unwrap();
+        let r_rb_404 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_rb}/video.mp4"))
+                    .header(header::RANGE, "bytes=16-63")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_rb_404.status(), StatusCode::NOT_FOUND);
+        {
+            let map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get(&jti_rb).unwrap();
+            assert_eq!(
+                entry.active_streams,
+                vec![16],
+                "404 error in share_video_mp4 must roll back active_streams[0] to 16"
+            );
+            assert_eq!(
+                entry.active_stream_expires,
+                vec![custom_exp],
+                "404 error in share_video_mp4 must roll back active_stream_expires[0]"
+            );
+        }
+        std::fs::rename(&rb_file_bak, &rb_file).unwrap();
+
+        // Retry the exact same `Range: bytes=16-63` continuation -> now succeeds with `206 PARTIAL_CONTENT`!
+        let r_rb_retry = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_rb}/video.mp4"))
+                    .header(header::RANGE, "bytes=16-63")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_rb_retry.status(),
+            StatusCode::PARTIAL_CONTENT,
+            "legitimate Range: bytes=16-63 retry after transient 404 must succeed"
+        );
+        {
+            let map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get(&jti_rb).unwrap();
+            assert_eq!(entry.active_streams, vec![64]);
+        }
+
+        // 2c. When `!stream_active` in `record_share_access_or_gone`, only the matched cursor slot is removed
+        //     (never blindly popping a concurrent viewer's cursor)
+        {
+            let mut map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get_mut(&jti_rb).unwrap();
+            entry.active_streams = vec![64, 96];
+            entry.active_stream_expires = vec![now + 900, now + 900];
+            entry.sync_stream_summary();
+        }
+        let rb_payload = ShareTokenPayload {
+            k: "export".to_string(),
+            id: "exp_r12_rollback".to_string(),
+            exp: now + 3600,
+            cam: Some("front_door".to_string()),
+            jti: Some(jti_rb.clone()),
+        };
+        // Unmatched final range (`tentative_next = 40`, `prev_stream_cursor = None`) does not pop `96` or `64`
+        let _ = record_share_access_or_gone(
+            &state,
+            &rb_payload,
+            false,
+            false,
+            Some((32, Some(39))),
+            now,
+            None,
+            false,
+            true,
+            None,
+            StatusCode::OK.into_response(),
+        );
+        {
+            let map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get(&jti_rb).unwrap();
+            assert_eq!(
+                entry.active_streams,
+                vec![64, 96],
+                "unmatched !stream_active completion must not blindly pop a concurrent viewer's stream cursor"
+            );
+        }
+        // Completing stream 0 (`Range: bytes=64-127` -> reaches EOF `127/128`, `!stream_active`) removes slot 0 (`64`), keeping `96`!
+        let r_rb_eof = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_rb}/video.mp4"))
+                    .header(header::RANGE, "bytes=64-127")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_rb_eof.status(), StatusCode::PARTIAL_CONTENT);
+        {
+            let map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get(&jti_rb).unwrap();
+            assert_eq!(
+                entry.active_streams,
+                vec![96],
+                "completing stream slot 0 must remove only slot 0 and preserve concurrent stream slot 96"
+            );
+        }
+
+        // =========================================================================
+        // 3. [R12-FINDING-03] Camera Identifier Sanitation, Reserved-Prefix Guard,
+        //    & Finite `[start, end]` Bounds Check in `api_export_create`
+        // =========================================================================
+        for bad_uri in [
+            "/api/export/share_clip_front_door/start/6000/end/6010",
+            "/api/export/share_redacted_front_door/start/6000/end/6010",
+            "/api/export/.hidden_cam/start/6000/end/6010",
+            "/api/export/front..door/start/6000/end/6010",
+            "/api/export/front$door/start/6000/end/6010",
+            "/api/export/unknown_camera/start/6000/end/6010",
+            "/api/export/front_door/start/NaN/end/6010",
+            "/api/export/front_door/start/6000/end/inf",
+            "/api/export/front_door/start/-5/end/6010",
+            "/api/export/front_door/start/6010/end/6010",
+            "/api/export/front_door/start/6010/end/6000",
+            "/api/export/front_door/start/1000/end/90000",
+        ] {
+            let r_bad_exp = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(bad_uri)
+                        .header(header::AUTHORIZATION, &admin_bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_bad_exp.status(),
+                StatusCode::BAD_REQUEST,
+                "POST {bad_uri} must be rejected with 400 BAD_REQUEST"
+            );
+        }
+        assert!(
+            state
+                .db
+                .get_export_by_id("share_clip_front_door_6000_6010")
+                .unwrap()
+                .is_none(),
+            "reserved prefix share_clip_* must never be inserted into export table"
+        );
+        assert!(
+            state
+                .db
+                .get_export_by_id("front_door_0_6010")
+                .unwrap()
+                .is_none(),
+            "NaN/negative start timestamp must never be cast to 0 and inserted into export table"
+        );
+
+        // =========================================================================
+        // 4. [R12-FINDING-04] Refresh SQLite `last_accessed_at` via
+        //    `touch_share_link_last_accessed` During Active `?sid=` / Continuation Playback
+        // =========================================================================
+        let (jti_t1, tok_t1) = mint_share("export", "exp_r12_touch1", Some(1)).await;
+        let r_t1_page = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_t1}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_t1_page.status(), StatusCode::OK);
+        let t1_html = String::from_utf8(
+            to_bytes(r_t1_page.into_body(), 16384)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let sid_t1 = {
+            let marker = format!("/share/{tok_t1}/video.mp4?sid=");
+            let start_idx = t1_html.find(&marker).unwrap() + marker.len();
+            t1_html[start_idx..start_idx + 32].to_string()
+        };
+
+        // Backdate SQLite `last_accessed_at` to `now - 1000` (outside 900s grace window)
+        // and set in-memory session expiry to `now + 50`
+        state
+            .db
+            .execute_batch(&format!(
+                "UPDATE share_link SET last_accessed_at = {} WHERE id = '{jti_t1}';",
+                (now - 1000) as f64
+            ))
+            .unwrap();
+        {
+            let mut map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get_mut(&jti_t1).unwrap();
+            entry.sessions.get_mut(&sid_t1).unwrap().0 = now + 50;
+        }
+        assert!(
+            !state
+                .db
+                .has_recently_accessed_share_links_for_target("exp_r12_touch1", now as f64, 900.0)
+                .unwrap()
+        );
+
+        // 4a. Initial `?sid=` video claim refreshes BOTH in-memory session `*exp` AND SQLite `last_accessed_at`
+        let r_t1_vid1 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_t1}/video.mp4?sid={sid_t1}"))
+                    .header(header::RANGE, "bytes=0-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_t1_vid1.status(), StatusCode::PARTIAL_CONTENT);
+        {
+            let map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get(&jti_t1).unwrap();
+            let (sess_exp, claimed) = entry.sessions.get(&sid_t1).copied().unwrap();
+            assert!(claimed);
+            assert!(
+                sess_exp >= now + 895,
+                "?sid= claim must refresh session expiry to now_ts + 900"
+            );
+        }
+        assert!(
+            state
+                .db
+                .has_recently_accessed_share_links_for_target("exp_r12_touch1", now as f64, 900.0)
+                .unwrap(),
+            "?sid= video playback must refresh SQLite last_accessed_at via touch_share_link_last_accessed"
+        );
+
+        // 4b. Subsequent ranged `?sid=` chunk on already-claimed session also refreshes `*exp` & SQLite `last_accessed_at`
+        state
+            .db
+            .execute_batch(&format!(
+                "UPDATE share_link SET last_accessed_at = {} WHERE id = '{jti_t1}';",
+                (now - 1000) as f64
+            ))
+            .unwrap();
+        {
+            let mut map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get_mut(&jti_t1).unwrap();
+            entry.sessions.get_mut(&sid_t1).unwrap().0 = now + 50;
+        }
+        let r_t1_vid2 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_t1}/video.mp4?sid={sid_t1}"))
+                    .header(header::RANGE, "bytes=16-63")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_t1_vid2.status(), StatusCode::PARTIAL_CONTENT);
+        {
+            let map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get(&jti_t1).unwrap();
+            let (sess_exp, _) = entry.sessions.get(&sid_t1).copied().unwrap();
+            assert!(sess_exp >= now + 895);
+        }
+        assert!(
+            state
+                .db
+                .has_recently_accessed_share_links_for_target("exp_r12_touch1", now as f64, 900.0)
+                .unwrap()
+        );
+
+        // 4c & 4d. `consumed_credit` (un-sid initial video after page load) & `valid_continuation` (un-sid range continuation)
+        //          both refresh SQLite `last_accessed_at`
+        let (jti_t2, tok_t2) = mint_share("export", "exp_r12_touch2", Some(1)).await;
+        let r_t2_page = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_t2}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_t2_page.status(), StatusCode::OK);
+
+        state
+            .db
+            .execute_batch(&format!(
+                "UPDATE share_link SET last_accessed_at = {} WHERE id = '{jti_t2}';",
+                (now - 1000) as f64
+            ))
+            .unwrap();
+        let r_t2_init = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_t2}/video.mp4"))
+                    .header(header::RANGE, "bytes=0-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_t2_init.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(
+            state
+                .db
+                .has_recently_accessed_share_links_for_target("exp_r12_touch2", now as f64, 900.0)
+                .unwrap(),
+            "consumed_credit branch must refresh SQLite last_accessed_at"
+        );
+
+        state
+            .db
+            .execute_batch(&format!(
+                "UPDATE share_link SET last_accessed_at = {} WHERE id = '{jti_t2}';",
+                (now - 1000) as f64
+            ))
+            .unwrap();
+        let r_t2_cont = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{tok_t2}/video.mp4"))
+                    .header(header::RANGE, "bytes=16-63")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_t2_cont.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(
+            state
+                .db
+                .has_recently_accessed_share_links_for_target("exp_r12_touch2", now as f64, 900.0)
+                .unwrap(),
+            "valid_continuation branch must refresh SQLite last_accessed_at"
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
