@@ -1873,6 +1873,39 @@ impl RecordingEngine {
                 }
             }
 
+            // Prune expired share links and remove orphaned share clip/redacted artifacts
+            let expired_or_revoked_targets = self
+                .db
+                .list_expired_or_revoked_share_link_targets(now)
+                .unwrap_or_default();
+            let _ = self.db.prune_expired_share_links(now);
+            let exports_dir = self.media_dir.join("exports");
+            let clips_dir = self.media_dir.join("clips");
+            for target_id in expired_or_revoked_targets {
+                let safe_id: String = target_id
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+                    .collect();
+                if safe_id.is_empty() || safe_id != target_id || target_id.contains("..") {
+                    continue;
+                }
+                if !self
+                    .db
+                    .has_active_share_links_for_target(&target_id, now)
+                    .unwrap_or(true)
+                {
+                    for path in [
+                        exports_dir.join(format!("share_redacted_{safe_id}.mp4")),
+                        exports_dir.join(format!(".share_redacted_{safe_id}.mask_hash")),
+                        exports_dir.join(format!("share_clip_{safe_id}.mp4")),
+                        clips_dir.join(format!("share_redacted_{safe_id}.webp")),
+                        clips_dir.join(format!("share_clip_{safe_id}.webp")),
+                    ] {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+
             // Periodic SQLite query-planner optimization & WAL checkpointing
             let db_maint = self.db.clone();
             let _ = tokio::task::spawn_blocking(move || db_maint.run_maintenance()).await;
@@ -2605,6 +2638,10 @@ async fn build_mp4_export_inner(
 
     // Atomically publish completed MP4 only after +faststart rewrite has finished
     std::fs::rename(&tmp_out_file, &out_file)?;
+
+    if export_id.starts_with("share_redacted_") || export_id.starts_with("share_clip_") {
+        return Ok(());
+    }
 
     // Extract a real video frame thumbnail as WebP (with RgbImage fallback and privacy mask filter)
     let thumb_vf = if let Some(db_f) = build_privacy_drawbox_filter(privacy_mask) {
@@ -3649,5 +3686,74 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn build_mp4_export_with_privacy_skips_db_and_thumbnails_for_transient_share_exports() {
+        let root = std::env::temp_dir().join(format!(
+            "ninjanvr-transient-share-export-{}",
+            random_suffix()
+        ));
+        let rec_dir = root.join("recordings/2026-11-01/12/front_door");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        let db_path = root.join("ninjanvr.db");
+        let db = NinjaDatabase::open(&db_path).unwrap();
+
+        let seg_disk = rec_dir.join("00.00.mp4");
+        let mut fake_mp4 = vec![0u8; 2048];
+        fake_mp4[0..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p']);
+        std::fs::write(&seg_disk, &fake_mp4).unwrap();
+
+        db.insert_recording(&RecordingRow {
+            id: "seg_share_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-01/12/front_door/00.00.mp4".to_string(),
+            start_time: 1000.0,
+            end_time: 1010.0,
+            duration: 10.0,
+            motion: 5,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 0.002,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        for transient_id in ["share_redacted_ev_1", "share_clip_ev_2"] {
+            build_mp4_export_with_privacy(
+                &db,
+                &root,
+                transient_id,
+                "front_door",
+                "Transient Share Clip",
+                1000.0,
+                1010.0,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let final_mp4 = root.join("exports").join(format!("{transient_id}.mp4"));
+            let thumb_webp = root.join("clips").join(format!("{transient_id}.webp"));
+            assert!(
+                final_mp4.exists(),
+                "transient share MP4 must exist for {transient_id}"
+            );
+            assert!(
+                !thumb_webp.exists(),
+                "transient share export must not create .webp thumbnail for {transient_id}"
+            );
+            assert!(
+                db.get_export_by_id(transient_id).unwrap().is_none(),
+                "transient share export must not insert row into export table for {transient_id}"
+            );
+        }
+
+        assert!(db.query_exports().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

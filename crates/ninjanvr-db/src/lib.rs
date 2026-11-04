@@ -943,6 +943,12 @@ impl NinjaDatabase {
             "UPDATE user SET role = ?1 WHERE username = ?2",
             params![norm_role, target],
         )?;
+        if norm_role == "viewer" {
+            conn.execute(
+                "UPDATE share_link SET revoked = 1 WHERE created_by = ?1",
+                params![target],
+            )?;
+        }
         Ok(updated > 0)
     }
 
@@ -1044,9 +1050,46 @@ impl NinjaDatabase {
     }
 
     pub fn delete_api_token(&self, id: &str) -> Result<bool> {
+        let target_id = id.trim();
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let deleted = conn.execute("DELETE FROM api_token WHERE id = ?1", params![id.trim()])?;
+        let token_name: Option<String> = conn
+            .query_row(
+                "SELECT name FROM api_token WHERE id = ?1",
+                params![target_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let deleted = conn.execute("DELETE FROM api_token WHERE id = ?1", params![target_id])?;
+        if deleted > 0
+            && let Some(name) = token_name
+        {
+            let creator = format!("token:{name}");
+            conn.execute(
+                "UPDATE share_link SET revoked = 1 WHERE created_by = ?1",
+                params![creator],
+            )?;
+        }
         Ok(deleted > 0)
+    }
+
+    pub fn is_api_token_active_by_name(&self, name: &str, now_ts: f64) -> Result<bool> {
+        let target = name.trim();
+        if target.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM api_token
+            WHERE name = ?1
+              AND scope = 'full'
+              AND (expires_at IS NULL OR expires_at > ?2)
+            "#,
+            params![target, now_ts],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Validates an incoming `nnvr_...` bearer token by its SHA-256 hash, checks expiration,
@@ -3735,6 +3778,42 @@ impl NinjaDatabase {
         Ok(deleted)
     }
 
+    pub fn list_expired_or_revoked_share_link_targets(
+        &self,
+        before_ts: f64,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT DISTINCT target_id
+            FROM share_link
+            WHERE expires_at <= ?1 OR revoked != 0
+            "#,
+        )?;
+        let rows = stmt.query_map(params![before_ts], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn has_active_share_links_for_target(&self, target_id: &str, now_ts: f64) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM share_link
+            WHERE target_id = ?1
+              AND revoked = 0
+              AND expires_at > ?2
+            "#,
+            params![target_id, now_ts],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn revoke_share_link(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let updated = conn.execute(
@@ -4042,6 +4121,17 @@ impl NinjaDatabase {
                     params![id],
                 );
                 let _ = conn.execute("DELETE FROM reviewsegment WHERE id = ?1", params![id]);
+                let _ = conn.execute(
+                    "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
+                    params![id],
+                );
+                files_to_remove.push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
+                files_to_remove.push(format!(
+                    "/media/ninjanvr/exports/.share_redacted_{id}.mask_hash"
+                ));
+                files_to_remove.push(format!("/media/ninjanvr/exports/share_clip_{id}.mp4"));
+                files_to_remove.push(format!("/media/ninjanvr/clips/share_redacted_{id}.webp"));
+                files_to_remove.push(format!("/media/ninjanvr/clips/share_clip_{id}.webp"));
             }
         }
 
@@ -4072,6 +4162,17 @@ impl NinjaDatabase {
             for id in ids {
                 files_to_remove.push(format!("/media/ninjanvr/clips/{id}.jpg"));
                 files_to_remove.push(format!("/media/ninjanvr/clips/{camera}-{id}.webp"));
+                files_to_remove.push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
+                files_to_remove.push(format!(
+                    "/media/ninjanvr/exports/.share_redacted_{id}.mask_hash"
+                ));
+                files_to_remove.push(format!("/media/ninjanvr/exports/share_clip_{id}.mp4"));
+                files_to_remove.push(format!("/media/ninjanvr/clips/share_redacted_{id}.webp"));
+                files_to_remove.push(format!("/media/ninjanvr/clips/share_clip_{id}.webp"));
+                let _ = conn.execute(
+                    "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
+                    params![id],
+                );
                 let _ = conn.execute("DELETE FROM event WHERE id = ?1", params![id]);
             }
         }
@@ -6634,6 +6735,248 @@ mod tests {
         let capped_list = db.list_share_links().unwrap();
         assert_eq!(capped_list.len(), 500);
         assert_eq!(capped_list[0]["id"], "sl_bulk_0509");
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn share_link_lifecycle_coupling_with_api_tokens_user_roles_and_retention_cleanup_works() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_share_lifecycle_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. API token scope/expiry check and delete_api_token share link revocation
+        assert!(!db.is_api_token_active_by_name("", 1000.0).unwrap());
+        assert!(!db.is_api_token_active_by_name("missing", 1000.0).unwrap());
+
+        let (_ro_meta, _) = db.create_api_token("ro_bot", "read_only", None).unwrap();
+        assert!(!db.is_api_token_active_by_name("ro_bot", 1000.0).unwrap());
+
+        let (exp_meta, _) = db
+            .create_api_token("temp_bot", "full", Some(2000.0))
+            .unwrap();
+        assert!(db.is_api_token_active_by_name("temp_bot", 1500.0).unwrap());
+        assert!(!db.is_api_token_active_by_name("temp_bot", 2000.0).unwrap());
+        assert!(!db.is_api_token_active_by_name("temp_bot", 2500.0).unwrap());
+        let exp_tok_id = exp_meta["id"].as_str().unwrap();
+        assert!(db.delete_api_token(exp_tok_id).unwrap());
+
+        let (full_meta, _) = db.create_api_token("ci_bot", "full", None).unwrap();
+        let full_tok_id = full_meta["id"].as_str().unwrap();
+        assert!(db.is_api_token_active_by_name("ci_bot", 5000.0).unwrap());
+
+        db.insert_share_link(
+            "sl_tok_ci",
+            "export",
+            "exp_1",
+            Some("front_door"),
+            "token:ci_bot",
+            1000.0,
+            4000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_tok_other",
+            "export",
+            "exp_1",
+            Some("front_door"),
+            "token:other_bot",
+            1000.0,
+            4000.0,
+        )
+        .unwrap();
+
+        assert!(db.delete_api_token(full_tok_id).unwrap());
+        assert!(!db.is_api_token_active_by_name("ci_bot", 5000.0).unwrap());
+        assert!(db.is_share_link_revoked("sl_tok_ci").unwrap());
+        assert!(!db.is_share_link_revoked("sl_tok_other").unwrap());
+
+        // 2. update_user_role to viewer revokes share links created by that user
+        db.create_user_with_cameras("admin_root", "StrongPass123!", "admin", "*", 1000)
+            .unwrap();
+        db.create_user_with_cameras("op_user", "StrongPass123!", "operator", "*", 1000)
+            .unwrap();
+
+        db.insert_share_link(
+            "sl_op_1",
+            "event",
+            "ev_1",
+            Some("front_door"),
+            "op_user",
+            1000.0,
+            4000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_admin_1",
+            "event",
+            "ev_1",
+            Some("front_door"),
+            "admin_root",
+            1000.0,
+            4000.0,
+        )
+        .unwrap();
+
+        assert!(db.update_user_role("op_user", "admin").unwrap());
+        assert!(!db.is_share_link_revoked("sl_op_1").unwrap());
+
+        assert!(db.update_user_role("op_user", "viewer").unwrap());
+        assert!(db.is_share_link_revoked("sl_op_1").unwrap());
+        assert!(!db.is_share_link_revoked("sl_admin_1").unwrap());
+
+        // 3. cleanup_expired_events_and_reviews revokes share links and returns share_redacted_* / share_clip_* paths
+        db.upsert_event(&EventDto {
+            id: "ev_exp_share".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.9),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"max_severity": "alert"}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.9),
+            stationary: false,
+        })
+        .unwrap();
+
+        db.upsert_event(&EventDto {
+            id: "ev_keep_share".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: true,
+            sub_label: None,
+            top_score: Some(0.95),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"max_severity": "alert"}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.95),
+            stationary: false,
+        })
+        .unwrap();
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_exp_share".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 1000.0,
+            end_time: Some(1015.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-rev_exp_share.webp".to_string(),
+            data: json!({}),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        db.insert_share_link(
+            "sl_ev_exp",
+            "event",
+            "ev_exp_share",
+            Some("front_door"),
+            "admin_root",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_ev_keep",
+            "event",
+            "ev_keep_share",
+            Some("front_door"),
+            "admin_root",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_rev_exp",
+            "review",
+            "rev_exp_share",
+            Some("front_door"),
+            "admin_root",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+
+        let removed = db
+            .cleanup_expired_events_and_reviews("front_door", 2000.0, 2000.0)
+            .unwrap();
+
+        assert!(db.is_share_link_revoked("sl_ev_exp").unwrap());
+        assert!(db.is_share_link_revoked("sl_rev_exp").unwrap());
+        assert!(!db.is_share_link_revoked("sl_ev_keep").unwrap());
+
+        for id in ["ev_exp_share", "rev_exp_share"] {
+            assert!(
+                removed.contains(&format!("/media/ninjanvr/exports/share_redacted_{id}.mp4")),
+                "missing share_redacted mp4 for {id}"
+            );
+            assert!(
+                removed.contains(&format!(
+                    "/media/ninjanvr/exports/.share_redacted_{id}.mask_hash"
+                )),
+                "missing mask_hash for {id}"
+            );
+            assert!(
+                removed.contains(&format!("/media/ninjanvr/exports/share_clip_{id}.mp4")),
+                "missing share_clip mp4 for {id}"
+            );
+            assert!(
+                removed.contains(&format!("/media/ninjanvr/clips/share_redacted_{id}.webp")),
+                "missing share_redacted webp for {id}"
+            );
+            assert!(
+                removed.contains(&format!("/media/ninjanvr/clips/share_clip_{id}.webp")),
+                "missing share_clip webp for {id}"
+            );
+        }
+
+        // 4. list_expired_or_revoked_share_link_targets & has_active_share_links_for_target
+        let targets = db
+            .list_expired_or_revoked_share_link_targets(2500.0)
+            .unwrap();
+        assert!(targets.contains(&"ev_exp_share".to_string()));
+        assert!(targets.contains(&"rev_exp_share".to_string()));
+        assert!(!targets.contains(&"ev_keep_share".to_string()));
+
+        assert!(
+            !db.has_active_share_links_for_target("ev_exp_share", 2500.0)
+                .unwrap()
+        );
+        assert!(
+            !db.has_active_share_links_for_target("rev_exp_share", 2500.0)
+                .unwrap()
+        );
+        assert!(
+            db.has_active_share_links_for_target("ev_keep_share", 2500.0)
+                .unwrap()
+        );
+        assert!(
+            !db.has_active_share_links_for_target("ev_keep_share", 5000.0)
+                .unwrap()
+        );
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);
