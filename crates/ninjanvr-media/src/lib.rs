@@ -514,6 +514,107 @@ pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
     0
 }
 
+/// Fast pure-Rust ISO-BMFF `moov` inspection helper that returns `true` when the MP4 container
+/// carries an audio (`soun`) track with non-empty samples (or a `soun` `trak` box).
+pub fn mp4_file_has_audio_track(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let file_len = meta.len();
+    let mut pos = 0u64;
+    let mut hdr = [0u8; 8];
+    while pos + 8 <= file_len {
+        if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut hdr).is_err() {
+            break;
+        }
+        let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+        let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        let (box_size, hdr_len) = if size32 == 1 {
+            let mut ext = [0u8; 8];
+            if file.read_exact(&mut ext).is_err() {
+                break;
+            }
+            (u64::from_be_bytes(ext), 16u64)
+        } else if size32 == 0 {
+            (file_len - pos, 8u64)
+        } else {
+            (size32, 8u64)
+        };
+        if box_size < hdr_len || pos + box_size > file_len {
+            break;
+        }
+        if &btype == b"moov" {
+            let mut moov = vec![0u8; (box_size - hdr_len).min(262_144) as usize];
+            if file.read_exact(&mut moov).is_err() {
+                break;
+            }
+            if let Some((_, total_audio_bytes, sample_count, _)) = extract_soun_sample_stats(&moov)
+            {
+                return sample_count > 0 && total_audio_bytes > 0;
+            }
+            return moov_has_soun_trak(&moov);
+        }
+        pos += box_size;
+    }
+    false
+}
+
+fn moov_has_soun_trak(moov: &[u8]) -> bool {
+    let mut mpos = 0usize;
+    while mpos + 8 <= moov.len() {
+        let msize = u32::from_be_bytes([moov[mpos], moov[mpos + 1], moov[mpos + 2], moov[mpos + 3]])
+            as usize;
+        let mtype = &moov[mpos + 4..mpos + 8];
+        if msize < 8 || mpos + msize > moov.len() {
+            break;
+        }
+        if mtype == b"trak" {
+            let trak = &moov[mpos + 8..mpos + msize];
+            let mut tpos = 0usize;
+            while tpos + 8 <= trak.len() {
+                let tsize = u32::from_be_bytes([
+                    trak[tpos],
+                    trak[tpos + 1],
+                    trak[tpos + 2],
+                    trak[tpos + 3],
+                ]) as usize;
+                let ttype = &trak[tpos + 4..tpos + 8];
+                if tsize < 8 || tpos + tsize > trak.len() {
+                    break;
+                }
+                if ttype == b"mdia" {
+                    let mdia = &trak[tpos + 8..tpos + tsize];
+                    let mut dpos = 0usize;
+                    while dpos + 8 <= mdia.len() {
+                        let dsize = u32::from_be_bytes([
+                            mdia[dpos],
+                            mdia[dpos + 1],
+                            mdia[dpos + 2],
+                            mdia[dpos + 3],
+                        ]) as usize;
+                        let dtype = &mdia[dpos + 4..dpos + 8];
+                        if dsize < 8 || dpos + dsize > mdia.len() {
+                            break;
+                        }
+                        let dbody = &mdia[dpos + 8..dpos + dsize];
+                        if dtype == b"hdlr" && dbody.len() >= 12 && &dbody[8..12] == b"soun" {
+                            return true;
+                        }
+                        dpos += dsize;
+                    }
+                }
+                tpos += tsize;
+            }
+        }
+        mpos += msize;
+    }
+    false
+}
+
 fn extract_soun_sample_stats(moov: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
     let mut mpos = 0usize;
     while mpos + 8 <= moov.len() {
@@ -2633,6 +2734,10 @@ async fn build_mp4_export_inner(
                 "failed to redact export {export_id} with privacy mask for camera {camera}"
             );
         }
+        if !include_audio && existing_paths.iter().any(|p| mp4_file_has_audio_track(p)) {
+            let _ = std::fs::remove_file(&tmp_out_file);
+            anyhow::bail!("failed to strip audio track for export {export_id} on camera {camera}");
+        }
         std::fs::copy(&existing_paths[0], &tmp_out_file)?;
     }
 
@@ -3753,6 +3858,141 @@ mod tests {
         }
 
         assert!(db.query_exports().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn mp4_file_has_audio_track_and_export_audio_strip_fail_closed_prevent_audio_leak() {
+        fn make_box(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let sz = (8 + body.len()) as u32;
+            let mut out = Vec::with_capacity(sz as usize);
+            out.extend_from_slice(&sz.to_be_bytes());
+            out.extend_from_slice(btype);
+            out.extend_from_slice(body);
+            out
+        }
+
+        let build_soun_mp4 = |sample_count: u32, sample_size: u32| -> Vec<u8> {
+            let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2mp41");
+            let mdat_payload = vec![0x2Au8; (sample_count * sample_size).max(64) as usize];
+            let mdat_offset = (ftyp.len() + 8) as u32;
+            let mdat = make_box(b"mdat", &mdat_payload);
+
+            let mut hdlr_body = vec![0u8; 24];
+            hdlr_body[8..12].copy_from_slice(b"soun");
+            let hdlr = make_box(b"hdlr", &hdlr_body);
+
+            let mut stsz_body = Vec::new();
+            stsz_body.extend_from_slice(&0u32.to_be_bytes());
+            stsz_body.extend_from_slice(&sample_size.to_be_bytes());
+            stsz_body.extend_from_slice(&sample_count.to_be_bytes());
+            let stsz = make_box(b"stsz", &stsz_body);
+
+            let mut stco_body = Vec::new();
+            stco_body.extend_from_slice(&0u32.to_be_bytes());
+            stco_body.extend_from_slice(&1u32.to_be_bytes());
+            stco_body.extend_from_slice(&mdat_offset.to_be_bytes());
+            let stco = make_box(b"stco", &stco_body);
+
+            let mut stbl_body = Vec::new();
+            stbl_body.extend_from_slice(&stsz);
+            stbl_body.extend_from_slice(&stco);
+            let stbl = make_box(b"stbl", &stbl_body);
+            let minf = make_box(b"minf", &stbl);
+
+            let mut mdia_body = Vec::new();
+            mdia_body.extend_from_slice(&hdlr);
+            mdia_body.extend_from_slice(&minf);
+            let mdia = make_box(b"mdia", &mdia_body);
+            let trak = make_box(b"trak", &mdia);
+            let moov = make_box(b"moov", &trak);
+
+            let mut file_bytes = Vec::new();
+            file_bytes.extend_from_slice(&ftyp);
+            file_bytes.extend_from_slice(&mdat);
+            file_bytes.extend_from_slice(&moov);
+            file_bytes
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "ninjanvr-audio-strip-fail-closed-{}",
+            random_suffix()
+        ));
+        let rec_dir = root.join("recordings/2026-11-04/12/front_door");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        let video_only_path = root.join("video_only.mp4");
+        let mut fake_video_mp4 = vec![0u8; 2048];
+        fake_video_mp4[0..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p']);
+        std::fs::write(&video_only_path, &fake_video_mp4).unwrap();
+
+        let empty_soun_path = root.join("empty_soun.mp4");
+        std::fs::write(&empty_soun_path, build_soun_mp4(0, 0)).unwrap();
+
+        let minimal_soun_trak_path = root.join("minimal_soun_trak.mp4");
+        let mut hdlr_body = vec![0u8; 24];
+        hdlr_body[8..12].copy_from_slice(b"soun");
+        let min_moov = make_box(
+            b"moov",
+            &make_box(b"trak", &make_box(b"mdia", &make_box(b"hdlr", &hdlr_body))),
+        );
+        std::fs::write(&minimal_soun_trak_path, &min_moov).unwrap();
+
+        let seg_with_audio = rec_dir.join("00.00.mp4");
+        std::fs::write(&seg_with_audio, build_soun_mp4(256, 2)).unwrap();
+
+        assert!(!mp4_file_has_audio_track(&root.join("missing.mp4")));
+        assert!(!mp4_file_has_audio_track(&video_only_path));
+        assert!(!mp4_file_has_audio_track(&empty_soun_path));
+        assert!(mp4_file_has_audio_track(&minimal_soun_trak_path));
+        assert!(mp4_file_has_audio_track(&seg_with_audio));
+
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+        db.insert_recording(&ninjanvr_db::RecordingRow {
+            id: "rec_audio_strip_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-04/12/front_door/00.00.mp4".to_string(),
+            start_time: 1000.0,
+            end_time: 1010.0,
+            duration: 10.0,
+            motion: 5,
+            objects: 1,
+            dbfs: -18,
+            segment_size: 0.1,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        let err_strip = build_mp4_export_with_privacy(
+            &db,
+            &root,
+            "share_clip_ev_audio_leak",
+            "front_door",
+            "Audio Stripped Share",
+            1000.0,
+            1010.0,
+            false,
+            None,
+        )
+        .await
+        .expect_err("failed ffmpeg audio strip on segment with soun track must fail closed");
+        assert!(
+            err_strip.to_string().contains(
+                "failed to strip audio track for export share_clip_ev_audio_leak on camera front_door"
+            ),
+            "unexpected error: {err_strip}"
+        );
+        assert!(
+            !root.join("exports/share_clip_ev_audio_leak.mp4").exists(),
+            "unstripped audio segment must never be copied to output file"
+        );
+        assert!(
+            db.get_export_by_id("share_clip_ev_audio_leak")
+                .unwrap()
+                .is_none()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

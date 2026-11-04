@@ -1004,6 +1004,14 @@ impl NinjaDatabase {
         let created_at = Utc::now().timestamp() as f64;
 
         let conn = self.conn.lock().expect("db mutex poisoned");
+        let existing_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM api_token WHERE name = ?1",
+            params![trimmed_name],
+            |r| r.get(0),
+        )?;
+        if existing_count > 0 {
+            anyhow::bail!("An API token with name '{trimmed_name}' already exists");
+        }
         conn.execute(
             r#"
             INSERT INTO api_token (id, name, token_hash, prefix, scope, created_at, last_used_at, expires_at)
@@ -1050,30 +1058,35 @@ impl NinjaDatabase {
     }
 
     pub fn delete_api_token(&self, id: &str) -> Result<bool> {
-        let target_id = id.trim();
+        let id_trimmed = id.trim();
         let conn = self.conn.lock().expect("db mutex poisoned");
         let token_name: Option<String> = conn
             .query_row(
                 "SELECT name FROM api_token WHERE id = ?1",
-                params![target_id],
+                params![id_trimmed],
                 |r| r.get(0),
             )
             .optional()?;
-        let deleted = conn.execute("DELETE FROM api_token WHERE id = ?1", params![target_id])?;
-        if deleted > 0
-            && let Some(name) = token_name
-        {
-            let creator = format!("token:{name}");
+        let deleted = conn.execute("DELETE FROM api_token WHERE id = ?1", params![id_trimmed])?;
+        if deleted > 0 {
+            let creator_id = format!("token:{id_trimmed}");
             conn.execute(
                 "UPDATE share_link SET revoked = 1 WHERE created_by = ?1",
-                params![creator],
+                params![creator_id],
             )?;
+            if let Some(name) = token_name {
+                let creator_name = format!("token:{name}");
+                conn.execute(
+                    "UPDATE share_link SET revoked = 1 WHERE created_by = ?1",
+                    params![creator_name],
+                )?;
+            }
         }
         Ok(deleted > 0)
     }
 
-    pub fn is_api_token_active_by_name(&self, name: &str, now_ts: f64) -> Result<bool> {
-        let target = name.trim();
+    pub fn is_api_token_active_by_name(&self, name_or_id: &str, now_ts: f64) -> Result<bool> {
+        let target = name_or_id.trim();
         if target.is_empty() {
             return Ok(false);
         }
@@ -1082,7 +1095,7 @@ impl NinjaDatabase {
             r#"
             SELECT COUNT(*)
             FROM api_token
-            WHERE name = ?1
+            WHERE (id = ?1 OR name = ?1)
               AND scope = 'full'
               AND (expires_at IS NULL OR expires_at > ?2)
             "#,
@@ -6767,6 +6780,18 @@ mod tests {
         let (full_meta, _) = db.create_api_token("ci_bot", "full", None).unwrap();
         let full_tok_id = full_meta["id"].as_str().unwrap();
         assert!(db.is_api_token_active_by_name("ci_bot", 5000.0).unwrap());
+        assert!(db.is_api_token_active_by_name(full_tok_id, 5000.0).unwrap());
+
+        // Duplicate token name must be rejected
+        let dup_err = db
+            .create_api_token("  ci_bot  ", "read_only", None)
+            .expect_err("duplicate API token name must be rejected");
+        assert!(
+            dup_err
+                .to_string()
+                .contains("An API token with name 'ci_bot' already exists"),
+            "unexpected error: {dup_err}"
+        );
 
         db.insert_share_link(
             "sl_tok_ci",
@@ -6774,6 +6799,16 @@ mod tests {
             "exp_1",
             Some("front_door"),
             "token:ci_bot",
+            1000.0,
+            4000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_tok_ci_by_id",
+            "export",
+            "exp_1",
+            Some("front_door"),
+            &format!("token:{full_tok_id}"),
             1000.0,
             4000.0,
         )
@@ -6791,7 +6826,9 @@ mod tests {
 
         assert!(db.delete_api_token(full_tok_id).unwrap());
         assert!(!db.is_api_token_active_by_name("ci_bot", 5000.0).unwrap());
+        assert!(!db.is_api_token_active_by_name(full_tok_id, 5000.0).unwrap());
         assert!(db.is_share_link_revoked("sl_tok_ci").unwrap());
+        assert!(db.is_share_link_revoked("sl_tok_ci_by_id").unwrap());
         assert!(!db.is_share_link_revoked("sl_tok_other").unwrap());
 
         // 2. update_user_role to viewer revokes share links created by that user
