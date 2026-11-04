@@ -143,8 +143,13 @@ async fn main() -> Result<()> {
                 return;
             };
             let io = TokioIo::new(tls_stream);
+            let peer_ip_str = remote_addr.ip().to_string();
             let hyper_service =
                 hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+                    req.headers_mut().remove("x-peer-ip");
+                    if let Ok(val) = hyper::header::HeaderValue::from_str(&peer_ip_str) {
+                        req.headers_mut().insert("x-peer-ip", val);
+                    }
                     if !req.headers().contains_key(hyper::header::HOST)
                         && let Some(auth) = req.uri().authority()
                         && let Ok(val) = hyper::header::HeaderValue::from_str(auth.as_str())
@@ -157,7 +162,6 @@ async fn main() -> Result<()> {
             let _ = AutoConnBuilder::new(TokioExecutor::new())
                 .serve_connection_with_upgrades(io, hyper_service)
                 .await;
-            let _ = remote_addr;
         });
     }
 }
