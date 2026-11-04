@@ -1999,7 +1999,11 @@ impl RecordingEngine {
                 if !self
                     .db
                     .has_active_share_links_for_target(&target_id, now)
-                    .unwrap_or(true)
+                    .unwrap_or(false)
+                    && !self
+                        .db
+                        .has_recently_accessed_share_links_for_target(&target_id, now, 900.0)
+                        .unwrap_or(false)
                 {
                     for path in [
                         exports_dir.join(format!("share_redacted_{safe_id}.mp4")),

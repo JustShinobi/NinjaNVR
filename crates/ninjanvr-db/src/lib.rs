@@ -3864,6 +3864,29 @@ impl NinjaDatabase {
         Ok(count > 0)
     }
 
+    pub fn has_recently_accessed_share_links_for_target(
+        &self,
+        target_id: &str,
+        now_ts: f64,
+        grace_sec: f64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let count: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM share_link
+            WHERE target_id = ?1
+              AND revoked = 0
+              AND expires_at > ?2
+              AND last_accessed_at IS NOT NULL
+              AND last_accessed_at + ?3 > ?2
+            "#,
+            params![target_id, now_ts, grace_sec],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     pub fn revoke_share_link(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let updated = conn.execute(
@@ -7371,6 +7394,122 @@ mod tests {
         );
         assert!(
             !db.has_active_share_links_for_target("rev_single_target", 1840.0)
+                .unwrap()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn has_recently_accessed_share_links_for_target_respects_grace_window_revocation_and_expiry() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_share_recent_grace_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        db.insert_share_link_with_options(
+            "sl_grace_1",
+            "review",
+            "rev_grace_target",
+            Some("front_door"),
+            "admin",
+            1000.0,
+            9000.0,
+            Some(1),
+        )
+        .unwrap();
+
+        // Before access (last_accessed_at IS NULL): returns false even though link is active
+        assert!(
+            !db.has_recently_accessed_share_links_for_target("rev_grace_target", 1500.0, 900.0)
+                .unwrap()
+        );
+
+        // Exhaust the max_views = 1 link at t = 1600.0
+        assert!(db.record_share_link_access("sl_grace_1", 1600.0).unwrap());
+        assert!(
+            !db.has_active_share_links_for_target("rev_single_target", 1610.0)
+                .unwrap()
+        );
+        assert!(
+            !db.has_active_share_links_for_target("rev_grace_target", 1610.0)
+                .unwrap()
+        );
+
+        // Within the 900s grace window (1600.0 + 900.0 = 2500.0 > now_ts): returns true
+        assert!(
+            db.has_recently_accessed_share_links_for_target("rev_grace_target", 1600.0, 900.0)
+                .unwrap()
+        );
+        assert!(
+            db.has_recently_accessed_share_links_for_target("rev_grace_target", 1700.0, 900.0)
+                .unwrap()
+        );
+        assert!(
+            db.has_recently_accessed_share_links_for_target("rev_grace_target", 2499.9, 900.0)
+                .unwrap()
+        );
+
+        // At or after the 900s grace window elapses (1600.0 + 900.0 <= now_ts): returns false
+        assert!(
+            !db.has_recently_accessed_share_links_for_target("rev_grace_target", 2500.0, 900.0)
+                .unwrap()
+        );
+        assert!(
+            !db.has_recently_accessed_share_links_for_target("rev_grace_target", 3000.0, 900.0)
+                .unwrap()
+        );
+
+        // Expired link within 900s of last_accessed_at returns false
+        db.insert_share_link_with_options(
+            "sl_grace_exp",
+            "review",
+            "rev_grace_exp_target",
+            Some("front_door"),
+            "admin",
+            1000.0,
+            2000.0,
+            Some(1),
+        )
+        .unwrap();
+        assert!(db.record_share_link_access("sl_grace_exp", 1950.0).unwrap());
+        // Before expiry (1990.0 < 2000.0) and within 900s: true
+        assert!(
+            db.has_recently_accessed_share_links_for_target("rev_grace_exp_target", 1990.0, 900.0)
+                .unwrap()
+        );
+        // At or after expiry (2000.0 and 2100.0) despite 1950.0 + 900.0 > now_ts: false
+        assert!(
+            !db.has_recently_accessed_share_links_for_target("rev_grace_exp_target", 2000.0, 900.0)
+                .unwrap()
+        );
+        assert!(
+            !db.has_recently_accessed_share_links_for_target("rev_grace_exp_target", 2100.0, 900.0)
+                .unwrap()
+        );
+
+        // Revoked link within 900s of last_accessed_at returns false
+        db.insert_share_link_with_options(
+            "sl_grace_rev",
+            "review",
+            "rev_grace_rev_target",
+            Some("front_door"),
+            "admin",
+            1000.0,
+            9000.0,
+            Some(1),
+        )
+        .unwrap();
+        assert!(db.record_share_link_access("sl_grace_rev", 1600.0).unwrap());
+        assert!(
+            db.has_recently_accessed_share_links_for_target("rev_grace_rev_target", 1700.0, 900.0)
+                .unwrap()
+        );
+        assert!(db.revoke_share_link("sl_grace_rev").unwrap());
+        assert!(
+            !db.has_recently_accessed_share_links_for_target("rev_grace_rev_target", 1700.0, 900.0)
                 .unwrap()
         );
 
