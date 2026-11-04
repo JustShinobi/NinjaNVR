@@ -2305,7 +2305,7 @@ impl NinjaConfig {
                         "enabled_in_config": false
                     },
                     "onvif": {
-                        "host": cam.onvif.host,
+                        "host": cam.onvif.host.as_deref().map(scrub_rtsp_credentials),
                         "port": cam.onvif.port,
                         "user": cam.onvif.user,
                         "password": if cam.onvif.password.as_ref().is_some_and(|p| !p.is_empty() && p != "***") {
@@ -2323,7 +2323,7 @@ impl NinjaConfig {
                         "dashboard": cam.ui.dashboard,
                         "review": true
                     },
-                    "webui_url": cam.webui_url,
+                    "webui_url": cam.webui_url.as_deref().map(scrub_rtsp_credentials),
                     "notes": cam.notes,
                     "privacy_mask": cam.privacy_mask,
                     "map": cam.map,
@@ -2687,12 +2687,14 @@ impl NinjaConfig {
 
     /// Resolves the SSRF-safe base HTTP/HTTPS URL for a camera's native Web UI, using either
     /// `camera.webui_url` or the host/IP extracted from its configured RTSP input or go2rtc stream.
-    /// Loopback addresses (`127.0.0.1`, `localhost`, `::1`) are never returned as a camera host.
+    /// Loopback, unspecified, link-local, metadata, and internal service addresses are never returned.
     pub fn resolve_camera_webui_base_url(&self, camera: &str) -> Option<String> {
         let cam = self.cameras.get(camera)?;
         if let Some(ref custom) = cam.webui_url {
             let trimmed = custom.trim().trim_end_matches('/');
             if (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+                && !trimmed.contains(['@', '?', '#', '\\'])
+                && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
                 && let Some(h) = extract_non_loopback_host(trimmed)
                 && !h.is_empty()
             {
@@ -2714,7 +2716,8 @@ impl NinjaConfig {
         None
     }
 
-    /// Collects all raw URL strings currently stored in `cameras.*.ffmpeg.inputs` and `go2rtc.streams`.
+    /// Collects all raw URL strings currently stored in `cameras.*.ffmpeg.inputs`,
+    /// `cameras.*.onvif.host`, `cameras.*.webui_url`, and `go2rtc.streams`.
     pub fn collect_original_urls(&self) -> Vec<String> {
         let mut out = Vec::new();
         for cam in self.cameras.values() {
@@ -2722,6 +2725,16 @@ impl NinjaConfig {
                 if !inp.path.is_empty() {
                     out.push(inp.path.clone());
                 }
+            }
+            if let Some(ref s) = cam.onvif.host
+                && s.contains("://")
+            {
+                out.push(s.clone());
+            }
+            if let Some(ref s) = cam.webui_url
+                && s.contains("://")
+            {
+                out.push(s.clone());
             }
         }
         fn collect_from_val(v: &Value, out: &mut Vec<String>) {
@@ -2744,6 +2757,80 @@ impl NinjaConfig {
             collect_from_val(val, &mut out);
         }
         out
+    }
+
+    /// Restores scrubbed URLs (`*:*@`, `*@`) and masked secret fields (`***`, `*`) in `self`
+    /// from a previously loaded `NinjaConfig` and refreshes `self.raw_yaml` when any secret is restored.
+    pub fn restore_scrubbed_from_previous(&mut self, prev: &NinjaConfig) {
+        let originals = prev.collect_original_urls();
+        let mut restored_any = false;
+
+        for (cam_name, cam) in &mut self.cameras {
+            for inp in &mut cam.ffmpeg.inputs {
+                if inp.path.contains("://*:*@") || inp.path.contains("://*@") {
+                    inp.path = restore_scrubbed_url(&inp.path, &originals);
+                    restored_any = true;
+                }
+            }
+            if let Some(ref h) = cam.onvif.host
+                && (h.contains("://*:*@") || h.contains("://*@"))
+            {
+                let restored = restore_scrubbed_url(h, &originals);
+                cam.onvif.host = Some(restored);
+                restored_any = true;
+            }
+            if let Some(ref u) = cam.webui_url
+                && (u.contains("://*:*@") || u.contains("://*@"))
+            {
+                let restored = restore_scrubbed_url(u, &originals);
+                cam.webui_url = Some(restored);
+                restored_any = true;
+            }
+            if cam
+                .onvif
+                .password
+                .as_deref()
+                .is_some_and(|p| p.trim() == "***" || p.trim() == "*")
+            {
+                cam.onvif.password = prev
+                    .cameras
+                    .get(cam_name)
+                    .and_then(|c| c.onvif.password.clone());
+                restored_any = true;
+            }
+        }
+
+        for v in self.go2rtc.streams.values_mut() {
+            let next_v = restore_scrubbed_json(v, &originals);
+            if next_v != *v {
+                *v = next_v;
+                restored_any = true;
+            }
+        }
+
+        if self
+            .mqtt
+            .password
+            .as_deref()
+            .is_some_and(|p| p.trim() == "***" || p.trim() == "*")
+        {
+            self.mqtt.password = prev.mqtt.password.clone();
+            restored_any = true;
+        }
+
+        if self
+            .genai
+            .api_key
+            .as_deref()
+            .is_some_and(|k| k.trim() == "***" || k.trim() == "*")
+        {
+            self.genai.api_key = prev.genai.api_key.clone();
+            restored_any = true;
+        }
+
+        if restored_any && let Ok(clean) = self.to_clean_yaml() {
+            self.raw_yaml = clean;
+        }
     }
 
     /// Serializes this `NinjaConfig` to a clean YAML string and validates it can be re-parsed.
@@ -3086,7 +3173,7 @@ fn extract_non_loopback_host(url: &str) -> Option<String> {
     let idx = url.find("://")?;
     let after_scheme = &url[idx + 3..];
     let authority_end = after_scheme
-        .find(['/', '?', '#'])
+        .find(['/', '?', '#', '\\'])
         .unwrap_or(after_scheme.len());
     let authority = &after_scheme[..authority_end];
     let host_port = if let Some(at_idx) = authority.rfind('@') {
@@ -3103,11 +3190,45 @@ fn extract_non_loopback_host(url: &str) -> Option<String> {
         host_port.split(':').next().unwrap_or(host_port)
     }
     .trim();
-    if host.is_empty()
-        || host.eq_ignore_ascii_case("localhost")
-        || host == "127.0.0.1"
-        || host == "::1"
-        || host == "[::1]"
+    if host.is_empty() {
+        return None;
+    }
+    let host_clean = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    let ip_candidate = host_clean.split('%').next().unwrap_or(host_clean);
+    if let Ok(ip) = ip_candidate.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if v4.is_loopback() || v4.is_unspecified() || v4.is_link_local() {
+                    return None;
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || v6.to_ipv4_mapped().is_some_and(|v4| {
+                        v4.is_loopback() || v4.is_unspecified() || v4.is_link_local()
+                    })
+                {
+                    return None;
+                }
+            }
+        }
+        return Some(host.to_string());
+    }
+    let host_lc = host_clean.trim_end_matches('.').to_ascii_lowercase();
+    if host_lc.is_empty()
+        || host_lc == "localhost"
+        || host_lc.ends_with(".localhost")
+        || host_lc == "ninjanvr"
+        || host_lc == "metadata"
+        || host_lc == "metadata.google.internal"
+        || host_lc.ends_with(".internal")
+        || host_lc.ends_with(".svc")
+        || host_lc.ends_with(".cluster.local")
     {
         return None;
     }
@@ -5270,5 +5391,236 @@ cameras:
             ..Default::default()
         };
         assert_eq!(unset_genai.resolve_api_key(), "");
+    }
+
+    #[test]
+    fn to_api_config_scrubs_onvif_host_and_webui_url_and_restores_from_previous() {
+        let yaml = r#"
+mqtt:
+  enabled: true
+  host: 127.0.0.1
+  port: 1883
+  user: mqtt_admin
+  password: secret_mqtt_password
+genai:
+  enabled: true
+  provider: gemini
+  api_key: secret_genai_api_key
+  model: gemini-2.5-flash
+cameras:
+  gate:
+    enabled: true
+    webui_url: "https://webui_user:webui_pass@192.0.2.91:8443/ui"
+    onvif:
+      host: "http://onvif_user:onvif_pass@192.0.2.92:8000"
+      port: 8000
+      user: onvif_user
+      password: secret_onvif_password
+    ffmpeg:
+      inputs:
+        - path: rtsp://rtsp_user:rtsp_pass@192.0.2.93:554/main
+          roles: [record, detect]
+go2rtc:
+  streams:
+    gate:
+      - rtsp://stream_token@192.0.2.94:554/live
+"#;
+        let orig_cfg =
+            NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/r16_config.yml")).unwrap();
+
+        // 1. to_api_config scrubs onvif.host and webui_url credentials
+        let api_val = orig_cfg.to_api_config();
+        assert_eq!(
+            api_val["cameras"]["gate"]["onvif"]["host"],
+            "http://*:*@192.0.2.92:8000"
+        );
+        assert_eq!(
+            api_val["cameras"]["gate"]["webui_url"],
+            "https://*:*@192.0.2.91:8443/ui"
+        );
+        let api_str = serde_json::to_string(&api_val).unwrap();
+        assert!(!api_str.contains("webui_pass"));
+        assert!(!api_str.contains("onvif_pass"));
+        assert!(!api_str.contains("rtsp_pass"));
+        assert!(!api_str.contains("stream_token"));
+        assert!(!api_str.contains("secret_onvif_password"));
+        assert!(!api_str.contains("secret_mqtt_password"));
+        assert!(!api_str.contains("secret_genai_api_key"));
+
+        // 2. collect_original_urls includes onvif.host and webui_url so structured updates restore them
+        let originals = orig_cfg.collect_original_urls();
+        assert!(
+            originals
+                .iter()
+                .any(|u| u == "http://onvif_user:onvif_pass@192.0.2.92:8000")
+        );
+        assert!(
+            originals
+                .iter()
+                .any(|u| u == "https://webui_user:webui_pass@192.0.2.91:8443/ui")
+        );
+
+        let mut structured_cfg = orig_cfg.clone();
+        structured_cfg.apply_structured_json(&api_val).unwrap();
+        assert_eq!(
+            structured_cfg.cameras["gate"].onvif.host.as_deref(),
+            Some("http://onvif_user:onvif_pass@192.0.2.92:8000")
+        );
+        assert_eq!(
+            structured_cfg.cameras["gate"].webui_url.as_deref(),
+            Some("https://webui_user:webui_pass@192.0.2.91:8443/ui")
+        );
+
+        // 3. restore_scrubbed_from_previous restores all scrubbed URLs and masked passwords/keys in raw YAML edits
+        let scrubbed_yaml = scrub_yaml_credentials(&orig_cfg.raw_yaml);
+        assert!(!scrubbed_yaml.contains("secret_mqtt_password"));
+        assert!(!scrubbed_yaml.contains("secret_genai_api_key"));
+        assert!(!scrubbed_yaml.contains("secret_onvif_password"));
+        assert!(!scrubbed_yaml.contains("webui_pass"));
+        assert!(!scrubbed_yaml.contains("onvif_pass"));
+        assert!(!scrubbed_yaml.contains("rtsp_pass"));
+        assert!(!scrubbed_yaml.contains("stream_token"));
+
+        let mut edited_cfg =
+            NinjaConfig::from_yaml_str(&scrubbed_yaml, PathBuf::from("/tmp/r16_config.yml"))
+                .unwrap();
+        edited_cfg.restore_scrubbed_from_previous(&orig_cfg);
+
+        assert_eq!(
+            edited_cfg.mqtt.password.as_deref(),
+            Some("secret_mqtt_password")
+        );
+        assert_eq!(
+            edited_cfg.genai.api_key.as_deref(),
+            Some("secret_genai_api_key")
+        );
+        let gate = &edited_cfg.cameras["gate"];
+        assert_eq!(
+            gate.onvif.password.as_deref(),
+            Some("secret_onvif_password")
+        );
+        assert_eq!(
+            gate.onvif.host.as_deref(),
+            Some("http://onvif_user:onvif_pass@192.0.2.92:8000")
+        );
+        assert_eq!(
+            gate.webui_url.as_deref(),
+            Some("https://webui_user:webui_pass@192.0.2.91:8443/ui")
+        );
+        assert_eq!(
+            gate.ffmpeg.inputs[0].path,
+            "rtsp://rtsp_user:rtsp_pass@192.0.2.93:554/main"
+        );
+        assert_eq!(
+            edited_cfg.go2rtc.streams["gate"],
+            json!(["rtsp://stream_token@192.0.2.94:554/live"])
+        );
+        assert!(edited_cfg.raw_yaml.contains("secret_mqtt_password"));
+        assert!(edited_cfg.raw_yaml.contains("secret_genai_api_key"));
+        assert!(edited_cfg.raw_yaml.contains("secret_onvif_password"));
+        assert!(
+            edited_cfg
+                .raw_yaml
+                .contains("rtsp://rtsp_user:rtsp_pass@192.0.2.93:554/main")
+        );
+    }
+
+    #[test]
+    fn extract_non_loopback_host_and_resolve_camera_webui_base_url_block_ssrf_targets() {
+        for forbidden_host in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.255.255.254",
+            "[::1]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:127.0.0.2]",
+            "0.0.0.0",
+            "[::]",
+            "[::ffff:0.0.0.0]",
+            "169.254.169.254",
+            "169.254.0.1",
+            "[::ffff:169.254.169.254]",
+            "[fe80::1]",
+            "[febf::1234]",
+            "localhost",
+            "LOCALHOST",
+            "sub.localhost",
+            "metadata",
+            "metadata.google.internal",
+            "service.internal",
+            "ninjanvr",
+            "NINJANVR",
+            "ninjanvr.default.svc",
+            "cam.svc.cluster.local",
+        ] {
+            let rtsp_url = format!("rtsp://{forbidden_host}:554/stream");
+            assert!(
+                extract_non_loopback_host(&rtsp_url).is_none(),
+                "SSRF target '{forbidden_host}' must be rejected by extract_non_loopback_host"
+            );
+        }
+
+        assert_eq!(
+            extract_non_loopback_host("rtsp://192.0.2.100:554/live").as_deref(),
+            Some("192.0.2.100")
+        );
+        assert_eq!(
+            extract_non_loopback_host("rtsp://[2001:db8::42]:554/live").as_deref(),
+            Some("[2001:db8::42]")
+        );
+
+        let yaml = r#"
+cameras:
+  ssrf_loopback:
+    webui_url: "http://127.0.0.2:8080"
+  ssrf_v6_mapped:
+    webui_url: "http://[::ffff:127.0.0.1]:8080"
+  ssrf_unspec:
+    webui_url: "http://0.0.0.0:8080"
+  ssrf_imds:
+    webui_url: "http://169.254.169.254"
+  ssrf_v6_link_local:
+    webui_url: "http://[fe80::1]"
+  ssrf_gcp_meta:
+    webui_url: "http://metadata.google.internal"
+  ssrf_self:
+    webui_url: "http://ninjanvr:5000"
+  ssrf_k8s_svc:
+    webui_url: "http://cam.svc.cluster.local:8080"
+  bad_userinfo:
+    webui_url: "http://admin:pass@192.0.2.100:8080"
+  bad_query:
+    webui_url: "http://192.0.2.100:8080?foo=bar"
+  bad_fragment:
+    webui_url: "http://192.0.2.100:8080#frag"
+  bad_backslash:
+    webui_url: "http://192.0.2.100:8080\\admin"
+  valid_cam:
+    webui_url: "https://192.0.2.100:8443/"
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/ssrf.yml")).unwrap();
+        for blocked_cam in [
+            "ssrf_loopback",
+            "ssrf_v6_mapped",
+            "ssrf_unspec",
+            "ssrf_imds",
+            "ssrf_v6_link_local",
+            "ssrf_gcp_meta",
+            "ssrf_self",
+            "ssrf_k8s_svc",
+            "bad_userinfo",
+            "bad_query",
+            "bad_fragment",
+            "bad_backslash",
+        ] {
+            assert!(
+                cfg.resolve_camera_webui_base_url(blocked_cam).is_none(),
+                "camera '{blocked_cam}' webui_url must be rejected"
+            );
+        }
+        assert_eq!(
+            cfg.resolve_camera_webui_base_url("valid_cam").as_deref(),
+            Some("https://192.0.2.100:8443")
+        );
     }
 }
