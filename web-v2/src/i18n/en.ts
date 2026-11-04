@@ -46,6 +46,11 @@ export const en = {
     subStream: "720p Sub",
     motionActive: "MOTION",
     idleState: "NOMINAL",
+    spotlightTimelineReactive: "Timeline: Auto-Pause",
+    spotlightTimelineWall: "Clean Wall",
+    spotlightPausedBadge: "SPOTLIGHT PAUSED // TIME-SHIFT",
+    resumeSpotlight: "Resume Spotlight",
+    focusCameraBtn: "Focus",
   },
   sync: {
     title: "MULTI-CAMERA SYNCHRONIZED TIME MACHINE",
@@ -202,6 +207,11 @@ export interface TranslationDict {
     subStream: string;
     motionActive: string;
     idleState: string;
+    spotlightTimelineReactive: string;
+    spotlightTimelineWall: string;
+    spotlightPausedBadge: string;
+    resumeSpotlight: string;
+    focusCameraBtn: string;
   };
   sync: {
     title: string;

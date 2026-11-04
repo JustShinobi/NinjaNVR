@@ -1,5 +1,9 @@
 import type React from "react";
-import { LiveLayoutMode, MatrixDensity } from "./format";
+import {
+  LiveLayoutMode,
+  MatrixDensity,
+  SpotlightTimelineMode,
+} from "./format";
 import { prewarmStream } from "./msePlayerEngine";
 
 export type LiveLayout = LiveLayoutMode;
@@ -129,11 +133,11 @@ export function computeLiveStageDescriptors(
         return {
           camera: cam,
           role: "hero",
-          renderMode: "mse",
+          renderMode: timeShiftTs !== null ? "vod" : "mse",
           useMainStream: true,
           dockIndex: -1,
           dockTotal,
-          isTimelineSelected: cam === selectedCamera,
+          isTimelineSelected: true,
           isSpotlightHeld: heldSet.has(cam),
         };
       }
@@ -147,7 +151,7 @@ export function computeLiveStageDescriptors(
         useMainStream: false,
         dockIndex,
         dockTotal,
-        isTimelineSelected: cam === selectedCamera,
+        isTimelineSelected: false,
         isSpotlightHeld: heldSet.has(cam),
       };
     });
@@ -242,6 +246,15 @@ export function resolveTileClickAction(
     };
   }
 
+  if (liveLayout === "spotlight" && role === "hero" && isDoubleClick) {
+    return {
+      nextLayout: "focus",
+      nextSelectedCamera: camera,
+      promotedToFocus: true,
+      shouldPrewarmMainStream: true,
+    };
+  }
+
   return {
     nextLayout: liveLayout,
     nextSelectedCamera: camera,
@@ -330,4 +343,42 @@ export function triggerMainStreamPrewarmIfNeeded(
   if (shouldPrewarm && realCamera) {
     prewarmStream(realCamera);
   }
+}
+
+export function shouldRenderSpotlightTimeline(
+  liveLayout: LiveLayout,
+  spotlightTimelineMode: SpotlightTimelineMode,
+  timeShiftTs: number | null
+): boolean {
+  if (liveLayout !== "spotlight") return true;
+  if (spotlightTimelineMode === "reactive") return true;
+  return timeShiftTs !== null;
+}
+
+export interface ResolveEffectiveSpotlightHeroCamParams {
+  promotedCams: string[];
+  trailCams: Array<{ cam: string; ts: number }>;
+  selectedCamera: string;
+  fallbackCam?: string;
+  timeShiftTs: number | null;
+  lockedHeroCam: string | null;
+}
+
+export function resolveEffectiveSpotlightHeroCam(
+  params: ResolveEffectiveSpotlightHeroCamParams
+): string {
+  const {
+    promotedCams,
+    trailCams,
+    selectedCamera,
+    fallbackCam = "",
+    timeShiftTs,
+    lockedHeroCam,
+  } = params;
+  if (timeShiftTs !== null && lockedHeroCam && lockedHeroCam.trim().length > 0) {
+    return lockedHeroCam;
+  }
+  const latestTrailCam =
+    trailCams.length > 0 ? trailCams[trailCams.length - 1].cam : "";
+  return promotedCams[0] || latestTrailCam || selectedCamera || fallbackCam || "";
 }

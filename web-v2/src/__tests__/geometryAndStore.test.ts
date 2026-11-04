@@ -89,6 +89,7 @@ describe("useNvrStore state transitions and i18n parity", () => {
     s.setSyncQuadCameras(["cam1", "cam2", "cam3", "cam4", "cam5"]);
     s.setSpotlightFilter("person");
     s.setSpotlightHoldSec(30);
+    s.setSpotlightTimelineMode("wall");
     s.setSecurityProfile("home");
     s.setSelectedCamera("front_door");
     s.setHudPosition("top-right");
@@ -139,6 +140,14 @@ describe("useNvrStore state transitions and i18n parity", () => {
     expect(updated.syncQuadCameras).toEqual(["cam1", "cam2", "cam3", "cam4"]);
     expect(updated.spotlightFilter).toBe("person");
     expect(updated.spotlightHoldSec).toBe(30);
+    expect(updated.spotlightTimelineMode).toBe("wall");
+    expect(
+      (
+        globalThis as unknown as {
+          window: { localStorage: { getItem: (k: string) => string | null } };
+        }
+      ).window.localStorage.getItem("ninjanvr_spotlight_timeline_mode")
+    ).toBe("wall");
     expect(updated.securityProfile).toBe("home");
     expect(updated.selectedCamera).toBe("front_door");
     expect(updated.hudPosition).toBe("top-right");
@@ -159,6 +168,14 @@ describe("useNvrStore state transitions and i18n parity", () => {
     updated.resetUiPreferences();
     const reset = useNvrStore.getState();
     expect(reset.liveLayout).toBe("2x2");
+    expect(reset.spotlightTimelineMode).toBe("reactive");
+    expect(
+      (
+        globalThis as unknown as {
+          window: { localStorage: { getItem: (k: string) => string | null } };
+        }
+      ).window.localStorage.getItem("ninjanvr_spotlight_timeline_mode")
+    ).toBeNull();
     expect(reset.hudPosition).toBe("bottom-right");
     expect(reset.useMainStream).toBe(false);
     expect(reset.showVectors).toBe(false);

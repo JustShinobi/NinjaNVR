@@ -15,6 +15,7 @@ import {
   resolveInitialHudPosition,
   resolveInitialLiveLayout,
   resolveInitialPlaybackSpeed,
+  resolveInitialSpotlightTimelineMode,
   resolveInitialTab,
 } from "../utils/format";
 
@@ -137,6 +138,16 @@ describe("format utilities", () => {
     expect(resolveInitialFirstWeekday()).toBe("sunday");
     win.localStorage.setItem("ninjanvr_first_weekday", "monday");
     expect(resolveInitialFirstWeekday()).toBe("monday");
+
+    expect(resolveInitialSpotlightTimelineMode()).toBe("reactive");
+    expect(resolveInitialSpotlightTimelineMode("wall")).toBe("wall");
+    win.localStorage.setItem("ninjanvr_spotlight_timeline_mode", "wall");
+    expect(resolveInitialSpotlightTimelineMode()).toBe("wall");
+    win.localStorage.setItem("ninjanvr_spotlight_timeline_mode", "reactive");
+    expect(resolveInitialSpotlightTimelineMode("wall")).toBe("reactive");
+    win.localStorage.setItem("ninjanvr_spotlight_timeline_mode", "invalid_mode");
+    expect(resolveInitialSpotlightTimelineMode()).toBe("reactive");
+    expect(resolveInitialSpotlightTimelineMode("wall")).toBe("wall");
   });
 
   test("formatDisplayVersion and resolveHeaderTelemetryMeta format brand version and header telemetry status", () => {

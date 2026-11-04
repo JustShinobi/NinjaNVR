@@ -19,6 +19,7 @@ export type WorkspaceTab =
 export type LiveLayoutMode = "2x2" | "focus" | "single" | "spotlight" | "map";
 export type MatrixDensity = "2x2" | "3x3" | "4x4";
 export type SpotlightFilter = "all_activity" | "objects" | "person" | "vehicle";
+export type SpotlightTimelineMode = "reactive" | "wall";
 export type FirstWeekday = "sunday" | "monday";
 export type ThemeMode = "dark" | "light" | "system";
 export type EffectiveTheme = "dark" | "light";
@@ -133,6 +134,23 @@ export function resolveInitialMatrixDensity(): MatrixDensity {
     return saved;
   }
   return "2x2";
+}
+
+export function resolveInitialSpotlightTimelineMode(
+  fallback: SpotlightTimelineMode = "reactive"
+): SpotlightTimelineMode {
+  try {
+    if (typeof window === "undefined") return fallback;
+    const saved = window.localStorage?.getItem(
+      "ninjanvr_spotlight_timeline_mode"
+    );
+    if (saved === "reactive" || saved === "wall") {
+      return saved;
+    }
+  } catch {
+    // ignore storage access errors
+  }
+  return fallback;
 }
 
 export function resolveInitialBool(key: string, fallback: boolean): boolean {

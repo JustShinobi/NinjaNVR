@@ -2,9 +2,11 @@ import { describe, expect, test } from "bun:test";
 import {
   computeLiveStageDescriptors,
   DEFAULT_MAX_DOCK_LIVE_DECODERS,
+  resolveEffectiveSpotlightHeroCam,
   resolvePersistentStageContainerStyle,
   resolvePersistentTileStyle,
   resolveTileClickAction,
+  shouldRenderSpotlightTimeline,
 } from "../utils/liveStageLayout";
 
 describe("liveStageLayout (#92 [UX-17])", () => {
@@ -229,6 +231,81 @@ describe("liveStageLayout (#92 [UX-17])", () => {
       promotedToFocus: true,
       shouldPrewarmMainStream: true,
     });
+
+    // 5. Spotlight hero tile: single-click stays on spotlight, double-click promotes to Focus Stage
+    const singleClickSpotlightHero = resolveTileClickAction({
+      liveLayout: "spotlight",
+      role: "hero",
+      camera: "garagem",
+      selectedCamera: "escritorio",
+      isDoubleClick: false,
+    });
+    expect(singleClickSpotlightHero).toEqual({
+      nextLayout: "spotlight",
+      nextSelectedCamera: "garagem",
+      promotedToFocus: false,
+      shouldPrewarmMainStream: false,
+    });
+
+    const dblClickSpotlightHero = resolveTileClickAction({
+      liveLayout: "spotlight",
+      role: "hero",
+      camera: "garagem",
+      selectedCamera: "escritorio",
+      isDoubleClick: true,
+    });
+    expect(dblClickSpotlightHero).toEqual({
+      nextLayout: "focus",
+      nextSelectedCamera: "garagem",
+      promotedToFocus: true,
+      shouldPrewarmMainStream: true,
+    });
+  });
+
+  test("spotlight_hero_switches_to_vod_when_timeShiftTs_is_set_while_dock_tiles_remain_live_or_snapshot", () => {
+    const fleet10 = Array.from({ length: 10 }, (_, i) => `cam_${i + 1}`);
+
+    const liveSpot = computeLiveStageDescriptors({
+      liveLayout: "spotlight",
+      visibleMatrixCams: fleet10.slice(0, 4),
+      groupCams: fleet10,
+      selectedCamera: "cam_1",
+      spotlightHeroCam: "cam_3",
+      spotlightPromotedCams: ["cam_3"],
+      hoveredDockCam: null,
+      useMainStream: false,
+      timeShiftTs: null,
+      maxDockLiveDecoders: DEFAULT_MAX_DOCK_LIVE_DECODERS,
+    });
+    const liveHero = liveSpot.find((d) => d.camera === "cam_3")!;
+    expect(liveHero.role).toBe("hero");
+    expect(liveHero.renderMode).toBe("mse");
+    expect(liveHero.isTimelineSelected).toBe(true);
+    const liveDocks = liveSpot.filter((d) => d.camera !== "cam_3");
+    expect(liveDocks.every((d) => d.isTimelineSelected === false)).toBe(true);
+
+    const vodSpot = computeLiveStageDescriptors({
+      liveLayout: "spotlight",
+      visibleMatrixCams: fleet10.slice(0, 4),
+      groupCams: fleet10,
+      selectedCamera: "cam_1",
+      spotlightHeroCam: "cam_3",
+      spotlightPromotedCams: ["cam_3"],
+      hoveredDockCam: null,
+      useMainStream: false,
+      timeShiftTs: 1700000000,
+      maxDockLiveDecoders: DEFAULT_MAX_DOCK_LIVE_DECODERS,
+    });
+    expect(vodSpot.map((d) => d.camera)).toEqual(liveSpot.map((d) => d.camera));
+    const vodHero = vodSpot.find((d) => d.camera === "cam_3")!;
+    expect(vodHero.role).toBe("hero");
+    expect(vodHero.renderMode).toBe("vod");
+    expect(vodHero.isTimelineSelected).toBe(true);
+
+    const vodDocks = vodSpot.filter((d) => d.camera !== "cam_3");
+    expect(vodDocks.every((d) => d.isTimelineSelected === false)).toBe(true);
+    expect(vodDocks.slice(0, 6).every((d) => d.renderMode === "mse")).toBe(true);
+    expect(vodDocks.slice(6).every((d) => d.renderMode === "snapshot")).toBe(true);
   });
 
   test("simulated_100_camera_fleet_caps_focus_hero_span_and_4x4_grid_decoders", () => {
@@ -267,5 +344,98 @@ describe("liveStageLayout (#92 [UX-17])", () => {
     expect(grid16.slice(0, 8).every((d) => d.renderMode === "mse")).toBe(true);
     expect(grid16[12].renderMode).toBe("mse");
     expect(grid16[10].renderMode).toBe("snapshot");
+  });
+
+  test("shouldRenderSpotlightTimeline_handles_reactive_and_wall_modes_across_layouts", () => {
+    // Non-spotlight layouts always render timeline regardless of spotlightTimelineMode or timeShiftTs
+    for (const layout of ["2x2", "focus", "single", "map"] as const) {
+      expect(shouldRenderSpotlightTimeline(layout, "reactive", null)).toBe(true);
+      expect(shouldRenderSpotlightTimeline(layout, "wall", null)).toBe(true);
+      expect(shouldRenderSpotlightTimeline(layout, "wall", 1700000000)).toBe(true);
+    }
+
+    // Spotlight + reactive mode always renders timeline
+    expect(shouldRenderSpotlightTimeline("spotlight", "reactive", null)).toBe(true);
+    expect(shouldRenderSpotlightTimeline("spotlight", "reactive", 1700000000)).toBe(
+      true
+    );
+
+    // Spotlight + wall mode hides timeline when live (timeShiftTs === null), shows when time-shifted
+    expect(shouldRenderSpotlightTimeline("spotlight", "wall", null)).toBe(false);
+    expect(shouldRenderSpotlightTimeline("spotlight", "wall", 1700000000)).toBe(true);
+  });
+
+  test("resolveEffectiveSpotlightHeroCam_enforces_auto_pause_lock_during_time_shift_and_releases_on_live", () => {
+    // 1. Live mode (timeShiftTs === null) uses promotedCams[0] first, then latest trailCam, then selectedCamera, then fallbackCam
+    expect(
+      resolveEffectiveSpotlightHeroCam({
+        promotedCams: ["garagem", "sala"],
+        trailCams: [{ cam: "varanda", ts: 100 }],
+        selectedCamera: "escritorio",
+        fallbackCam: "hall",
+        timeShiftTs: null,
+        lockedHeroCam: "escritorio",
+      })
+    ).toBe("garagem");
+
+    expect(
+      resolveEffectiveSpotlightHeroCam({
+        promotedCams: [],
+        trailCams: [
+          { cam: "sala", ts: 90 },
+          { cam: "varanda", ts: 100 },
+        ],
+        selectedCamera: "escritorio",
+        fallbackCam: "hall",
+        timeShiftTs: null,
+        lockedHeroCam: null,
+      })
+    ).toBe("varanda");
+
+    expect(
+      resolveEffectiveSpotlightHeroCam({
+        promotedCams: [],
+        trailCams: [],
+        selectedCamera: "escritorio",
+        fallbackCam: "hall",
+        timeShiftTs: null,
+        lockedHeroCam: null,
+      })
+    ).toBe("escritorio");
+
+    expect(
+      resolveEffectiveSpotlightHeroCam({
+        promotedCams: [],
+        trailCams: [],
+        selectedCamera: "",
+        fallbackCam: "hall",
+        timeShiftTs: null,
+        lockedHeroCam: null,
+      })
+    ).toBe("hall");
+
+    // 2. Auto-Pause lock: while timeShiftTs !== null, background motion on "varanda" cannot hijack lockedHeroCam ("garagem")
+    expect(
+      resolveEffectiveSpotlightHeroCam({
+        promotedCams: ["varanda", "garagem"],
+        trailCams: [{ cam: "varanda", ts: 200 }],
+        selectedCamera: "garagem",
+        fallbackCam: "escritorio",
+        timeShiftTs: 1700000000,
+        lockedHeroCam: "garagem",
+      })
+    ).toBe("garagem");
+
+    // 3. Returning to Live (timeShiftTs === null) immediately releases lock and promotes latest active camera ("varanda")
+    expect(
+      resolveEffectiveSpotlightHeroCam({
+        promotedCams: ["varanda", "garagem"],
+        trailCams: [{ cam: "varanda", ts: 200 }],
+        selectedCamera: "garagem",
+        fallbackCam: "escritorio",
+        timeShiftTs: null,
+        lockedHeroCam: "garagem",
+      })
+    ).toBe("varanda");
   });
 });

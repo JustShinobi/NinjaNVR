@@ -41,9 +41,11 @@ import { TimelineScrubber } from "../components/TimelineScrubber";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 import {
   computeLiveStageDescriptors,
+  resolveEffectiveSpotlightHeroCam,
   resolvePersistentStageContainerStyle,
   resolvePersistentTileStyle,
   resolveTileClickAction,
+  shouldRenderSpotlightTimeline,
   triggerMainStreamPrewarmIfNeeded,
 } from "../utils/liveStageLayout";
 
@@ -952,6 +954,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const setSpotlightFilter = useNvrStore((s) => s.setSpotlightFilter);
   const spotlightHoldSec = useNvrStore((s) => s.spotlightHoldSec);
   const setSpotlightHoldSec = useNvrStore((s) => s.setSpotlightHoldSec);
+  const spotlightTimelineMode = useNvrStore((s) => s.spotlightTimelineMode);
+  const setSpotlightTimelineMode = useNvrStore(
+    (s) => s.setSpotlightTimelineMode
+  );
   const selectedCamera = useNvrStore((s) => s.selectedCamera);
   const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
   const hudPosition = useNvrStore((s) => s.hudPosition);
@@ -996,6 +1002,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const lastSurgeRef = useRef<Record<string, number>>({});
   const prevMatchRef = useRef<Record<string, boolean>>({});
   const [spotlightTrail, setSpotlightTrail] = useState<Array<{ cam: string; ts: number }>>([]);
+  const [lockedSpotlightCam, setLockedSpotlightCam] = useState<string | null>(null);
   const [nowTick, setNowTick] = useState<number>(() => Math.floor(Date.now() / 1000));
   const [mapEditMode, setMapEditMode] = useState(false);
   const [mapTool, setMapTool] = useState<FloorplanStudioTool>("select");
@@ -1379,6 +1386,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const selectCameraAndRevealOnStage = (cam: string) => {
     pendingStageCameraRef.current = cam;
     setSelectedCamera(cam);
+    if (liveLayout === "spotlight") {
+      const ts = Math.floor(Date.now() / 1000);
+      lastActiveRef.current[cam] = ts;
+      lastSurgeRef.current[cam] = ts;
+      setNowTick(ts);
+      setLockedSpotlightCam(cam);
+      return;
+    }
     if (liveLayout === "2x2") {
       const idxInGroup = groupCams.indexOf(cam);
       if (idxInGroup >= 0) {
@@ -1433,11 +1448,48 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         (lastSurgeRef.current[b] || lastActiveRef.current[b] || 0) -
         (lastSurgeRef.current[a] || lastActiveRef.current[a] || 0)
     );
-  const spotlightHeroCam =
-    spotlightPromotedCams[0] ||
-    (spotlightTrail.length > 0
-      ? spotlightTrail[spotlightTrail.length - 1].cam
-      : selectedCamera);
+  const liveSpotlightHeroCam = resolveEffectiveSpotlightHeroCam({
+    promotedCams: spotlightPromotedCams,
+    trailCams: spotlightTrail,
+    selectedCamera,
+    fallbackCam: groupCams[0],
+    timeShiftTs: null,
+    lockedHeroCam: null,
+  });
+  const spotlightHeroCam = resolveEffectiveSpotlightHeroCam({
+    promotedCams: spotlightPromotedCams,
+    trailCams: spotlightTrail,
+    selectedCamera,
+    fallbackCam: groupCams[0],
+    timeShiftTs,
+    lockedHeroCam: lockedSpotlightCam || liveSpotlightHeroCam,
+  });
+
+  useEffect(() => {
+    if (liveLayout !== "spotlight") return;
+    if (timeShiftTs === null) {
+      setLockedSpotlightCam(liveSpotlightHeroCam || null);
+    } else if (!lockedSpotlightCam && liveSpotlightHeroCam) {
+      setLockedSpotlightCam(liveSpotlightHeroCam);
+    }
+  }, [liveLayout, timeShiftTs, liveSpotlightHeroCam, lockedSpotlightCam]);
+
+  useEffect(() => {
+    if (
+      liveLayout === "spotlight" &&
+      timeShiftTs === null &&
+      spotlightHeroCam &&
+      selectedCamera !== spotlightHeroCam
+    ) {
+      setSelectedCamera(spotlightHeroCam);
+    }
+  }, [
+    liveLayout,
+    timeShiftTs,
+    spotlightHeroCam,
+    selectedCamera,
+    setSelectedCamera,
+  ]);
 
   const lastLayoutSwitchMsRef = useRef<number>(0);
 
@@ -1648,6 +1700,52 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 <option value={30}>Hold: 30s</option>
                 <option value={60}>Hold: 60s</option>
               </select>
+              <span className="nvr-divider" aria-hidden="true" />
+              <button
+                type="button"
+                data-testid="spotlight-timeline-mode-reactive"
+                className={`nvr-btn mono ${
+                  spotlightTimelineMode === "reactive" ? "active" : ""
+                }`}
+                style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                onClick={() => setSpotlightTimelineMode("reactive")}
+                title="Show Timeline scrubber in Spotlight and auto-pause Spotlight camera rotation while scrubbing or playing time-shift"
+              >
+                {t.live.spotlightTimelineReactive}
+              </button>
+              <button
+                type="button"
+                data-testid="spotlight-timeline-mode-wall"
+                className={`nvr-btn mono ${
+                  spotlightTimelineMode === "wall" ? "active" : ""
+                }`}
+                style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                onClick={() => setSpotlightTimelineMode("wall")}
+                title="Hide bottom Timeline scrubber during live Spotlight wall monitoring (automatically appears during time-shift)"
+              >
+                {t.live.spotlightTimelineWall}
+              </button>
+              {timeShiftTs !== null && (
+                <>
+                  <span
+                    data-testid="spotlight-paused-badge"
+                    className="nvr-badge rewind mono"
+                    style={{ height: 24, padding: "0 8px" }}
+                  >
+                    {t.live.spotlightPausedBadge}
+                  </span>
+                  <button
+                    type="button"
+                    data-testid="spotlight-resume-btn"
+                    className="nvr-btn success mono"
+                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    onClick={() => setTimeShiftTs(null)}
+                  >
+                    <Play size={11} />
+                    {t.live.resumeSpotlight}
+                  </button>
+                </>
+              )}
               {spotlightTrail.length > 0 && (
                 <span
                   className="mono"
@@ -1673,7 +1771,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         onClick={() => {
                           lastActiveRef.current[item.cam] = nowTick;
                           lastSurgeRef.current[item.cam] = nowTick;
+                          setNowTick(nowTick);
                           setSelectedCamera(item.cam);
+                          setLockedSpotlightCam(item.cam);
                         }}
                       >
                         {item.cam.toUpperCase()} ({ago}s)
@@ -1973,6 +2073,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 lastActiveRef.current[cam] = ts;
                 lastSurgeRef.current[cam] = ts;
                 setNowTick(ts);
+                setLockedSpotlightCam(cam);
               }
               if (action.nextSelectedCamera !== selectedCamera) {
                 setSelectedCamera(action.nextSelectedCamera);
@@ -2092,7 +2193,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         }`}
                       />
                       {liveLayout === "spotlight"
-                        ? `SPOTLIGHT // ${cam.toUpperCase()}`
+                        ? isTimeShifted && timeShiftTs !== null
+                          ? `SPOTLIGHT // ${cam.toUpperCase()} // ${
+                              t.live.timeShiftBadge
+                            } @ ${formatTs(timeShiftTs)}`
+                          : `SPOTLIGHT // ${cam.toUpperCase()}`
                         : isHero
                         ? `${cam.toUpperCase()} // ${
                             isTimeShifted && timeShiftTs !== null
@@ -2285,6 +2390,46 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           }}
                         >
                           Expand
+                        </button>
+                      </>
+                    )}
+                    {isHero && liveLayout === "spotlight" && !isTimeShifted && (
+                      <>
+                        <button
+                          type="button"
+                          data-testid="spotlight-hero-rewind30s"
+                          className="nvr-btn nvr-tile-action mono"
+                          style={{
+                            height: 22,
+                            padding: "0 6px",
+                            fontSize: "var(--text-xs)",
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setLockedSpotlightCam(cam);
+                            setSelectedCamera(cam);
+                            setTimeShiftTs(Math.floor(Date.now() / 1000) - 30);
+                          }}
+                        >
+                          {t.live.rewind30s}
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="spotlight-hero-focus"
+                          className="nvr-btn nvr-tile-action mono"
+                          style={{
+                            height: 22,
+                            padding: "0 6px",
+                            fontSize: "var(--text-xs)",
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            triggerMainStreamPrewarmIfNeeded(realCam, true);
+                            setSelectedCamera(cam);
+                            setLiveLayout("focus");
+                          }}
+                        >
+                          {t.live.focusCameraBtn}
                         </button>
                       </>
                     )}
@@ -4958,27 +5103,33 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         </div>
       )}
 
-      <TimelineScrubber
-        camera={selectedCamera}
-        cameras={groupCams}
-        stageCameras={liveLayout === "2x2" ? visibleMatrixCams : undefined}
-        cameraGroups={effectiveCameraGroups}
-        onSelectCamera={selectCameraAndRevealOnStage}
-        onFocusCamera={
-          liveLayout !== "focus"
-            ? (cam) => {
-                setSelectedCamera(cam);
-                setLiveLayout("focus");
-              }
-            : undefined
-        }
-        segments={focusSegments}
-        reviews={reviews}
-        currentTs={timeShiftTs}
-        onSeek={(ts) => setTimeShiftTs(ts)}
-        onExportRange={handleQuickExport}
-        titlePrefix="TIMELINE"
-      />
+      {shouldRenderSpotlightTimeline(
+        liveLayout,
+        spotlightTimelineMode,
+        timeShiftTs
+      ) && (
+        <TimelineScrubber
+          camera={liveLayout === "spotlight" ? spotlightHeroCam : selectedCamera}
+          cameras={groupCams}
+          stageCameras={liveLayout === "2x2" ? visibleMatrixCams : undefined}
+          cameraGroups={effectiveCameraGroups}
+          onSelectCamera={selectCameraAndRevealOnStage}
+          onFocusCamera={
+            liveLayout !== "focus"
+              ? (cam) => {
+                  setSelectedCamera(cam);
+                  setLiveLayout("focus");
+                }
+              : undefined
+          }
+          segments={focusSegments}
+          reviews={reviews}
+          currentTs={timeShiftTs}
+          onSeek={(ts) => setTimeShiftTs(ts)}
+          onExportRange={handleQuickExport}
+          titlePrefix="TIMELINE"
+        />
+      )}
     </>
   );
 };

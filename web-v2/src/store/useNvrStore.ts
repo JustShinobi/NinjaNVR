@@ -12,6 +12,7 @@ import {
   LiveLayoutMode,
   MatrixDensity,
   SpotlightFilter,
+  SpotlightTimelineMode,
   ThemeMode,
   WorkspaceTab,
   applyThemeToDocument,
@@ -21,6 +22,7 @@ import {
   resolveInitialLiveLayout,
   resolveInitialMatrixDensity,
   resolveInitialPlaybackSpeed,
+  resolveInitialSpotlightTimelineMode,
   resolveInitialTab,
   resolveInitialThemeMode,
 } from "../utils/format";
@@ -183,6 +185,7 @@ interface NvrRealtimeState {
   syncQuadCameras: string[];
   spotlightFilter: SpotlightFilter;
   spotlightHoldSec: number;
+  spotlightTimelineMode: SpotlightTimelineMode;
   securityProfile: "armed" | "home" | "disarmed";
   selectedCamera: string;
   hudPosition: HudPosition;
@@ -217,6 +220,7 @@ interface NvrRealtimeState {
   ) => void;
   setSpotlightFilter: (filter: SpotlightFilter) => void;
   setSpotlightHoldSec: (sec: number) => void;
+  setSpotlightTimelineMode: (mode: SpotlightTimelineMode) => void;
   setSecurityProfile: (profile: "armed" | "home" | "disarmed") => void;
   setSelectedCamera: (camera: string) => void;
   setHudPosition: (pos: HudPosition) => void;
@@ -252,6 +256,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   syncQuadCameras: [],
   spotlightFilter: "all_activity",
   spotlightHoldSec: 15,
+  spotlightTimelineMode: resolveInitialSpotlightTimelineMode(),
   securityProfile: "armed",
   selectedCamera: "escritorio",
   hudPosition: resolveInitialHudPosition(),
@@ -310,6 +315,15 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
     }),
   setSpotlightFilter: (spotlightFilter) => set({ spotlightFilter }),
   setSpotlightHoldSec: (spotlightHoldSec) => set({ spotlightHoldSec }),
+  setSpotlightTimelineMode: (spotlightTimelineMode) => {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem(
+        "ninjanvr_spotlight_timeline_mode",
+        spotlightTimelineMode
+      );
+    }
+    set({ spotlightTimelineMode });
+  },
   setSecurityProfile: (securityProfile) => set({ securityProfile }),
   setSelectedCamera: (selectedCamera) => set({ selectedCamera }),
   setHudPosition: (hudPosition) => {
@@ -437,6 +451,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       [
         "ninjanvr_live_layout",
         "ninjanvr_matrix_density",
+        "ninjanvr_spotlight_timeline_mode",
         "ninjanvr_hud_position",
         "ninjanvr_use_main_stream",
         "ninjanvr_show_vectors",
@@ -459,6 +474,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       matrixTourEnabled: false,
       matrixTourIntervalSec: 15,
       syncQuadCameras: [],
+      spotlightTimelineMode: "reactive",
       hudPosition: "bottom-right",
       useMainStream: false,
       showVectors: false,

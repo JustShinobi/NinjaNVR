@@ -48,6 +48,11 @@ export const pt: TranslationDict = {
     subStream: "720p Sub",
     motionActive: "MOVIMENTO",
     idleState: "NOMINAL",
+    spotlightTimelineReactive: "Timeline: Auto-Pausa",
+    spotlightTimelineWall: "Modo Parede",
+    spotlightPausedBadge: "SPOTLIGHT PAUSADO // TIME-SHIFT",
+    resumeSpotlight: "Retomar Spotlight",
+    focusCameraBtn: "Focar",
   },
   sync: {
     title: "MÁQUINA DO TEMPO MULTI-CÂMERA SINCRONIZADA",
