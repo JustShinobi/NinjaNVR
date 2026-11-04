@@ -365,6 +365,7 @@ async fn run_upstream_worker(
             let (mut sink, mut stream_rx) = ws_stream.split();
             let handshake = r#"{"type":"mse","value":"avc1.640029,avc1.64002A,avc1.640028,avc1.4D401F,avc1.4D0029,avc1.42E01E,hev1.1.6.L153.B0,mp4a.40.2,mp4a.40.5,flac,opus"}"#;
             if sink.send(TungMsg::Text(handshake.into())).await.is_ok() {
+                let mut consecutive_timeouts = 0u8;
                 loop {
                     let keep_alive = {
                         let mut sessions = hub.sessions.write().await;
@@ -385,29 +386,48 @@ async fn run_upstream_worker(
 
                     match tokio::time::timeout(Duration::from_secs(3), stream_rx.next()).await {
                         Ok(Some(Ok(TungMsg::Text(t)))) => {
+                            consecutive_timeouts = 0;
                             hub.ingest_upstream_text(&stream, t.as_str()).await;
                         }
                         Ok(Some(Ok(TungMsg::Binary(b)))) => {
+                            consecutive_timeouts = 0;
                             hub.ingest_upstream_binary(&stream, b).await;
                         }
                         Ok(Some(Ok(TungMsg::Ping(p)))) => {
+                            consecutive_timeouts = 0;
                             let _ = sink.send(TungMsg::Pong(p)).await;
                         }
+                        Ok(Some(Ok(TungMsg::Pong(_)))) => {
+                            consecutive_timeouts = 0;
+                        }
                         Ok(Some(Ok(TungMsg::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
+                        Err(_) => {
+                            consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+                            if consecutive_timeouts >= 3 {
+                                break;
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
         }
 
-        let is_persistent = {
+        let should_retry = {
             let sessions = hub.sessions.read().await;
-            sessions.get(&stream).map(|s| s.persistent).unwrap_or(false)
+            sessions
+                .get(&stream)
+                .map(|s| {
+                    s.persistent
+                        || s.active_clients.load(Ordering::SeqCst) > 0
+                        || Instant::now() < s.expires_at
+                })
+                .unwrap_or(false)
         };
-        if !is_persistent {
+        if !should_retry {
             break;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     hub.sessions.write().await.remove(&stream);
@@ -526,5 +546,61 @@ mod tests {
         cache.ingest_binary(huge_delta);
         assert_eq!(cache.gop_fragments.len(), 2);
         assert!(cache.gop_bytes <= MAX_GOP_BYTES);
+    }
+
+    #[tokio::test]
+    async fn mse_stream_hub_retries_upstream_when_go2rtc_disconnects_or_starts_late() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ws_base = format!("ws://{addr}");
+        let hub = MseStreamHub::new();
+
+        // Spawn upstream mock go2rtc server that drops the first connection and streams on the second
+        tokio::spawn(async move {
+            // 1st connection: accept and close immediately (simulating go2rtc restart / pod boot race)
+            if let Ok((tcp1, _)) = listener.accept().await
+                && let Ok(mut ws1) = tokio_tungstenite::accept_async(tcp1).await
+            {
+                let _ = ws1.close(None).await;
+            }
+            // 2nd connection: accept and send MSE codec + init + IDR sync fragment
+            if let Ok((tcp2, _)) = listener.accept().await
+                && let Ok(mut ws2) = tokio_tungstenite::accept_async(tcp2).await
+            {
+                let _ = ws2.next().await;
+                let _ = ws2
+                    .send(TungMsg::Text(
+                        r#"{"type":"mse","value":"video/mp4; codecs=\"avc1.640029\""}"#.into(),
+                    ))
+                    .await;
+                let _ = ws2.send(TungMsg::Binary(build_test_init_segment())).await;
+                let _ = ws2
+                    .send(TungMsg::Binary(build_test_fragment(true, &[0x42; 64])))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+
+        let mut sub = hub
+            .subscribe_client(&ws_base, "cozinha_sub")
+            .await
+            .expect("client subscription must succeed");
+
+        // Wait up to 2s for the retry worker to reconnect and broadcast the keyframe fragment
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut received_fragment = false;
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(MseLivePacket::Fragment { .. })) =
+                tokio::time::timeout(Duration::from_millis(800), sub.rx.recv()).await
+            {
+                received_fragment = true;
+                break;
+            }
+        }
+        assert!(
+            received_fragment,
+            "MseStreamHub must retry upstream go2rtc while active client is subscribed"
+        );
+        assert!(hub.get_fresh_burst("cozinha_sub").await.is_some());
     }
 }

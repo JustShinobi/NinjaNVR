@@ -190,6 +190,64 @@ export class DualSlotMachine {
     }
     return this.getState();
   }
+
+  /**
+   * Returns `true` when neither the active slot nor the standby slot is currently
+   * `"ready"` or `"connecting"` for `desiredStreamSrc`. Used by `LiveMsePlayer` to
+   * determine whether an automatic reconnect or stream-upgrade retry is required.
+   */
+  public needsReconnect(desiredStreamSrc: string): boolean {
+    const trimmed = desiredStreamSrc.trim();
+    if (!trimmed) return false;
+    const activeState = this.slots[this.activeSlot];
+    if (
+      (activeState.status === "ready" || activeState.status === "connecting") &&
+      activeState.streamSrc === trimmed
+    ) {
+      return false;
+    }
+    if (this.standbySlot !== null) {
+      const standbyState = this.slots[this.standbySlot];
+      if (
+        (standbyState.status === "ready" || standbyState.status === "connecting") &&
+        standbyState.streamSrc === trimmed
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+}
+
+export const MSE_RECONNECT_BASE_DELAYS_MS = [1_000, 2_000, 3_500, 5_000] as const;
+export const MSE_HANDSHAKE_TIMEOUT_MS = 8_000;
+export const MSE_STALL_TIMEOUT_MS = 8_000;
+
+/**
+ * Deterministic camera-name hash in `[0, 300]` ms used to stagger reconnect attempts
+ * across multi-camera video-wall tiles so they do not thunder-herd simultaneously.
+ */
+export function computeCameraJitterSeed(camera: string): number {
+  const trimmed = camera.trim();
+  let hash = 0;
+  for (let i = 0; i < trimmed.length; i++) {
+    hash = (hash * 31 + trimmed.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash) % 301;
+}
+
+/**
+ * Computes capped exponential backoff (`1s -> 2s -> 3.5s -> 5s max`) plus a bounded
+ * camera-staggered jitter (`0..300ms`) for automatic MSE WebSocket recovery.
+ */
+export function computeMseReconnectDelayMs(attempt: number, jitterSeed = 0): number {
+  const safeAttempt = Number.isFinite(attempt) ? Math.max(0, Math.floor(attempt)) : 0;
+  const idx = Math.min(MSE_RECONNECT_BASE_DELAYS_MS.length - 1, safeAttempt);
+  const base = MSE_RECONNECT_BASE_DELAYS_MS[idx];
+  const safeJitter = Number.isFinite(jitterSeed)
+    ? Math.abs(Math.floor(jitterSeed)) % 301
+    : 0;
+  return base + safeJitter;
 }
 
 export interface CapturedFrameEntry {
@@ -410,12 +468,16 @@ export function computeLiveEdgeSeekTarget(
     return null;
   }
   if (isInitialBurst) {
-    if (bufferedEnd > 0.25) {
+    if (bufferedEnd > 0.25 || currentTime < bufferedStart) {
       return Math.max(bufferedStart, Number((bufferedEnd - 0.08).toFixed(3)));
     }
     return null;
   }
-  if (bufferedEnd - currentTime > 1.8) {
+  if (
+    bufferedEnd - currentTime > 1.8 ||
+    currentTime < bufferedStart - 0.5 ||
+    currentTime > bufferedEnd + 0.5
+  ) {
     return Math.max(bufferedStart, Number((bufferedEnd - 0.15).toFixed(3)));
   }
   return null;

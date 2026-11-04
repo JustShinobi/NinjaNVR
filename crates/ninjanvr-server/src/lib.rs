@@ -14082,6 +14082,11 @@ async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) 
                                 }
                                 last_sent_seq = burst.last_seq;
                                 sent_init = true;
+                            } else if sent_init {
+                                // Upstream go2rtc session reconnected and emitted a new codec/init header
+                                // (which resets fMP4 tfdt timestamps). Close client WS so the player
+                                // reconnects with a clean MediaSource and the fresh GOP burst.
+                                break;
                             }
                         }
                         Ok(mse_hub::MseLivePacket::Fragment { seq, bytes }) => {
@@ -14563,6 +14568,20 @@ pub async fn new_app_state(
     }
 
     if spawn_go2rtc {
+        let enabled_cams: Vec<String> = {
+            let cfg_guard = state.config.read().await;
+            cfg_guard
+                .cameras
+                .iter()
+                .filter(|(_, c)| c.enabled)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        state
+            .mse_hub
+            .start_persistent_camera_streams(&state.go2rtc_ws_base, enabled_cams)
+            .await;
+
         let stats_state = state.clone();
         tokio::spawn(async move {
             loop {

@@ -314,6 +314,9 @@ export const App: React.FC = () => {
     setSecurityProfile,
   ]);
 
+  const fetchCoreDataRef = useRef(fetchCoreData);
+  fetchCoreDataRef.current = fetchCoreData;
+
   useEffect(() => {
     if (!authNeeded) return;
     fetch("/api/auth/providers", { credentials: "include" })
@@ -353,15 +356,27 @@ export const App: React.FC = () => {
 
     const connect = () => {
       if (closed) return;
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       ws = new WebSocket(`${proto}//${window.location.host}/ws`);
 
       ws.onopen = () => {
-        if (!closed) setWsOnline(true);
+        if (!closed) {
+          setWsOnline(true);
+          void fetchCoreDataRef.current();
+        }
       };
       ws.onclose = () => {
         if (!closed) {
           setWsOnline(false);
-          reconnectTimer = window.setTimeout(connect, 2000);
+          if (reconnectTimer === null) {
+            reconnectTimer = window.setTimeout(() => {
+              reconnectTimer = null;
+              connect();
+            }, 2000);
+          }
         }
       };
       ws.onmessage = (ev) => {
@@ -432,8 +447,25 @@ export const App: React.FC = () => {
 
     connect();
 
+    const onBrowserOnline = () => {
+      if (closed) return;
+      void fetchCoreDataRef.current();
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        connect();
+      }
+    };
+    const onBrowserOffline = () => {
+      if (!closed) {
+        setWsOnline(false);
+      }
+    };
+    window.addEventListener("online", onBrowserOnline);
+    window.addEventListener("offline", onBrowserOffline);
+
     return () => {
       closed = true;
+      window.removeEventListener("online", onBrowserOnline);
+      window.removeEventListener("offline", onBrowserOffline);
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
       }

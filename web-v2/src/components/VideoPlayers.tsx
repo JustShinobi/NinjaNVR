@@ -11,8 +11,12 @@ import { resolveCanvasThemePalette } from "../utils/themeTokens";
 import {
   captureVideoElementFrame,
   coalesceArrayBuffers,
+  computeCameraJitterSeed,
   computeLiveEdgeSeekTarget,
+  computeMseReconnectDelayMs,
   DualSlotMachine,
+  MSE_HANDSHAKE_TIMEOUT_MS,
+  MSE_STALL_TIMEOUT_MS,
   prewarmStream,
   resolveLivePosterUrl,
   VideoSlotIndex,
@@ -805,11 +809,65 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const [overlayBox, setOverlayBox] = useState<ContainedBox | null>(null);
   const [pttState, setPttState] = useState<PushToTalkState>("idle");
   const configuredCameras = useNvrStore((s) => s.config?.cameras);
+  const wsOnline = useNvrStore((s) => s.wsOnline);
   const realCamera = resolveRealCameraSource(camera, configuredCameras);
   const realCameraRef = useRef<string>(realCamera);
   realCameraRef.current = realCamera;
+  const desiredStreamSrc = useMainStream ? realCamera : `${realCamera}_sub`;
+  const desiredStreamSrcRef = useRef<string>(desiredStreamSrc);
+  desiredStreamSrcRef.current = desiredStreamSrc;
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef<number>(0);
+  const unmountedRef = useRef<boolean>(false);
+  const connectDesiredStreamRef = useRef<
+    (streamSrc: string, isCameraOrModeSwitch?: boolean) => void
+  >(() => {});
   const camStats = useNvrStore(
     (s) => s.stats?.cameras?.[camera] ?? s.stats?.cameras?.[realCamera]
+  );
+
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimerRef.current !== null && typeof window !== "undefined") {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleReconnect = useCallback(
+    (immediate = false) => {
+      if (unmountedRef.current || typeof window === "undefined") return;
+      const jitterMs = computeCameraJitterSeed(realCameraRef.current);
+      if (immediate) {
+        clearReconnectTimer();
+        reconnectAttemptRef.current = 0;
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null;
+          if (unmountedRef.current) return;
+          const target = desiredStreamSrcRef.current;
+          if (slotMachineRef.current.needsReconnect(target)) {
+            connectDesiredStreamRef.current(target, false);
+          }
+        }, jitterMs);
+        return;
+      }
+      if (reconnectTimerRef.current !== null) {
+        return;
+      }
+      const delayMs = computeMseReconnectDelayMs(
+        reconnectAttemptRef.current,
+        jitterMs
+      );
+      reconnectAttemptRef.current += 1;
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        if (unmountedRef.current) return;
+        const target = desiredStreamSrcRef.current;
+        if (slotMachineRef.current.needsReconnect(target)) {
+          connectDesiredStreamRef.current(target, false);
+        }
+      }, delayMs);
+    },
+    [clearReconnectTimer]
   );
 
   const getSlotVideoEl = useCallback((slot: VideoSlotIndex): HTMLVideoElement | null => {
@@ -863,23 +921,29 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   // Periodic fallback snapshot refresh when MSE is still handshaking or camera is offline
   useEffect(() => {
     if (mseReady) return;
-    fetch(`/api/${encodeURIComponent(realCamera)}/latest.jpg`, {
-      method: "HEAD",
-      credentials: "include",
-    })
-      .then((res) => {
-        const hdr = res.headers.get("x-last-frame-timestamp");
-        if (hdr) {
-          const parsed = Number(hdr);
-          if (Number.isFinite(parsed) && parsed > 0) {
-            setHeaderLastSeenTs(parsed);
-          }
-        }
+    const probeLatestFrame = () => {
+      if (typeof navigator !== "undefined" && navigator.onLine === false) {
+        return;
+      }
+      fetch(`/api/${encodeURIComponent(realCamera)}/latest.jpg`, {
+        method: "HEAD",
+        credentials: "include",
       })
-      .catch(() => {});
-    const timer = window.setInterval(() => {
-      setPosterTick(Date.now());
-    }, 2000);
+        .then((res) => {
+          if (!res.ok) return;
+          const hdr = res.headers.get("x-last-frame-timestamp");
+          if (hdr) {
+            const parsed = Number(hdr);
+            if (Number.isFinite(parsed) && parsed > 0) {
+              setHeaderLastSeenTs(parsed);
+            }
+          }
+          setPosterTick(Date.now());
+        })
+        .catch(() => {});
+    };
+    probeLatestFrame();
+    const timer = window.setInterval(probeLatestFrame, 2000);
     return () => window.clearInterval(timer);
   }, [realCamera, mseReady]);
 
@@ -890,13 +954,19 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         return;
       }
 
+      if (slot === slotMachineRef.current.getState().activeSlot) {
+        captureVideoElementFrame(realCameraRef.current, videoEl);
+      }
+
       slotCleanupsRef.current[slot]?.();
       slotCleanupsRef.current[slot] = null;
 
       let closed = false;
+      let failedOnce = false;
       let ws: WebSocket | null = null;
       let mediaSource: MediaSource | null = null;
       let sourceBuffer: SourceBuffer | null = null;
+      let watchdogTimer: number | null = null;
       const queue: ArrayBuffer[] = [];
 
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -912,6 +982,43 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       let promotedOnce = false;
       let teardownTimer: number | null = null;
 
+      const clearWatchdog = () => {
+        if (watchdogTimer !== null) {
+          window.clearTimeout(watchdogTimer);
+          watchdogTimer = null;
+        }
+      };
+
+      const handleSlotFailure = () => {
+        if (closed || failedOnce) return;
+        failedOnce = true;
+        clearWatchdog();
+        if (slot === slotMachineRef.current.getState().activeSlot) {
+          captureVideoElementFrame(realCameraRef.current, videoEl);
+        }
+        const snap = slotMachineRef.current.markSlotError(slot, sessionId);
+        if (!snap.isAnyReady) {
+          setMseReady(false);
+          setStreamDisconnected(true);
+        }
+        slotCleanupsRef.current[slot]?.();
+        slotCleanupsRef.current[slot] = null;
+        if (slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)) {
+          scheduleReconnect(false);
+        }
+      };
+
+      const resetWatchdog = (timeoutMs: number) => {
+        clearWatchdog();
+        if (closed) return;
+        watchdogTimer = window.setTimeout(() => {
+          watchdogTimer = null;
+          handleSlotFailure();
+        }, timeoutMs);
+      };
+
+      resetWatchdog(MSE_HANDSHAKE_TIMEOUT_MS);
+
       const flushQueue = () => {
         if (closed || !sourceBuffer || sourceBuffer.updating || queue.length === 0) {
           return;
@@ -922,7 +1029,9 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         try {
           sourceBuffer.appendBuffer(merged);
         } catch {
-          // ignore transient append error
+          if (videoEl.error || (mediaSource && mediaSource.readyState !== "open")) {
+            handleSlotFailure();
+          }
         }
       };
 
@@ -941,6 +1050,12 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             if (seekTarget !== null) {
               videoEl.currentTime = seekTarget;
               initialBurstSeekDone = true;
+            }
+            if (videoEl.paused) {
+              videoEl.play().catch(() => {});
+            }
+            if (videoEl.readyState >= 2) {
+              tryPromoteSlot();
             }
             if (end - start > 18 && !sourceBuffer.updating && queue.length === 0) {
               try {
@@ -963,9 +1078,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         ws.binaryType = "arraybuffer";
 
         ws.onopen = () => {
-          if (!closed) {
-            setStreamDisconnected(false);
-          }
+          if (closed) return;
+          resetWatchdog(MSE_HANDSHAKE_TIMEOUT_MS);
           const codecs = [
             'video/mp4; codecs="avc1.640029,mp4a.40.2"',
             'video/mp4; codecs="avc1.64002A,mp4a.40.2"',
@@ -990,23 +1104,11 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         };
 
         ws.onerror = () => {
-          if (!closed) {
-            const snap = slotMachineRef.current.markSlotError(slot, sessionId);
-            if (!snap.isAnyReady) {
-              setMseReady(false);
-              setStreamDisconnected(true);
-            }
-          }
+          handleSlotFailure();
         };
 
         ws.onclose = () => {
-          if (!closed) {
-            const snap = slotMachineRef.current.markSlotError(slot, sessionId);
-            if (!snap.isAnyReady) {
-              setMseReady(false);
-              setStreamDisconnected(true);
-            }
-          }
+          handleSlotFailure();
         };
 
         ws.onmessage = (ev) => {
@@ -1019,12 +1121,17 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
                   sourceBuffer = mediaSource.addSourceBuffer(msg.value);
                   sourceBuffer.mode = "segments";
                   sourceBuffer.addEventListener("updateend", onUpdateEnd);
+                  sourceBuffer.addEventListener("error", handleSlotFailure);
+                  flushQueue();
                 }
               }
             } catch {
               // ignore malformed JSON
             }
           } else if (ev.data instanceof ArrayBuffer) {
+            if (promotedOnce) {
+              resetWatchdog(MSE_STALL_TIMEOUT_MS);
+            }
             if (queue.length < 256) {
               queue.push(ev.data);
             }
@@ -1046,6 +1153,11 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         promotedOnce = true;
         const res = slotMachineRef.current.markSlotReady(slot, sessionId);
         if (res.promoted) {
+          reconnectAttemptRef.current = 0;
+          if (!slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)) {
+            clearReconnectTimer();
+          }
+          resetWatchdog(MSE_STALL_TIMEOUT_MS);
           setActiveSlot(res.activeSlot);
           setMseReady(true);
           setStreamDisconnected(false);
@@ -1088,14 +1200,20 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         tryPromoteSlot();
       };
 
+      const onVideoError = () => {
+        handleSlotFailure();
+      };
+
       videoEl.addEventListener("loadeddata", onLoadedData);
       videoEl.addEventListener("canplay", onCanPlayOrSeeked);
       videoEl.addEventListener("seeked", onCanPlayOrSeeked);
       videoEl.addEventListener("playing", onCanPlayOrSeeked);
+      videoEl.addEventListener("error", onVideoError);
       videoEl.addEventListener("resize", updateOverlayGeometry);
 
       slotCleanupsRef.current[slot] = () => {
         closed = true;
+        clearWatchdog();
         if (teardownTimer !== null) {
           window.clearTimeout(teardownTimer);
           teardownTimer = null;
@@ -1104,7 +1222,14 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         videoEl.removeEventListener("canplay", onCanPlayOrSeeked);
         videoEl.removeEventListener("seeked", onCanPlayOrSeeked);
         videoEl.removeEventListener("playing", onCanPlayOrSeeked);
+        videoEl.removeEventListener("error", onVideoError);
         videoEl.removeEventListener("resize", updateOverlayGeometry);
+        try {
+          sourceBuffer?.removeEventListener("updateend", onUpdateEnd);
+          sourceBuffer?.removeEventListener("error", handleSlotFailure);
+        } catch {
+          // ignore
+        }
         try {
           ws?.close();
         } catch {
@@ -1120,36 +1245,107 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         URL.revokeObjectURL(objUrl);
       };
     },
-    [getSlotVideoEl, updateOverlayGeometry]
+    [clearReconnectTimer, getSlotVideoEl, scheduleReconnect, updateOverlayGeometry]
   );
+
+  const connectDesiredStream = useCallback(
+    (streamSrc: string, isCameraOrModeSwitch = false) => {
+      const transition = slotMachineRef.current.requestStream(streamSrc);
+      if (transition.abortSlot !== null) {
+        slotCleanupsRef.current[transition.abortSlot]?.();
+        slotCleanupsRef.current[transition.abortSlot] = null;
+      }
+      if (transition.action === "noop") {
+        return;
+      }
+      if (transition.action === "start_active" && isCameraOrModeSwitch) {
+        setMseReady(false);
+        setStreamDisconnected(false);
+      }
+      startSlotSession(transition.targetSlot, streamSrc, transition.sessionId);
+    },
+    [startSlotSession]
+  );
+  connectDesiredStreamRef.current = connectDesiredStream;
 
   // Double-buffered ping-pong transition when realCamera or useMainStream changes
   useEffect(() => {
     const streamSrc = useMainStream ? realCamera : `${realCamera}_sub`;
-    const transition = slotMachineRef.current.requestStream(streamSrc);
-    if (transition.abortSlot !== null) {
-      slotCleanupsRef.current[transition.abortSlot]?.();
-      slotCleanupsRef.current[transition.abortSlot] = null;
+    reconnectAttemptRef.current = 0;
+    clearReconnectTimer();
+    connectDesiredStream(streamSrc, true);
+  }, [realCamera, useMainStream, clearReconnectTimer, connectDesiredStream]);
+
+  // Fast-path MSE recovery when global telemetry WebSocket (/ws) or camera FPS comes back online after pod rollout
+  useEffect(() => {
+    if (!wsOnline && !(camStats && camStats.camera_fps > 0)) return;
+    if (slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)) {
+      scheduleReconnect(true);
     }
-    if (transition.action === "noop") {
-      return;
+  }, [wsOnline, camStats?.camera_fps, camStats?.last_frame_ts, scheduleReconnect]);
+
+  // Fast-path MSE recovery on browser network restore ("online") or tab wake ("visibilitychange")
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onNetworkOnline = () => {
+      if (slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)) {
+        scheduleReconnect(true);
+      }
+    };
+    const onVisibilityChange = () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        return;
+      }
+      if (slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)) {
+        scheduleReconnect(true);
+        return;
+      }
+      const v = getActiveVideoEl();
+      if (v) {
+        try {
+          if (v.buffered.length > 0) {
+            const end = v.buffered.end(v.buffered.length - 1);
+            const start = v.buffered.start(0);
+            const seekTarget = computeLiveEdgeSeekTarget(
+              start,
+              end,
+              v.currentTime,
+              false
+            );
+            if (seekTarget !== null) {
+              v.currentTime = seekTarget;
+            }
+          }
+        } catch {
+          // ignore
+        }
+        v.play().catch(() => {});
+      }
+    };
+    window.addEventListener("online", onNetworkOnline);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
     }
-    if (transition.action === "start_active") {
-      setMseReady(false);
-      setStreamDisconnected(false);
-    }
-    startSlotSession(transition.targetSlot, streamSrc, transition.sessionId);
-  }, [realCamera, useMainStream, startSlotSession]);
+    return () => {
+      window.removeEventListener("online", onNetworkOnline);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+    };
+  }, [getActiveVideoEl, scheduleReconnect]);
 
   // Capture live GPU-decoded frame into LiveFrameBridge and release decoders on unmount
   useEffect(() => {
+    unmountedRef.current = false;
     return () => {
+      unmountedRef.current = true;
+      clearReconnectTimer();
       captureVideoElementFrame(realCameraRef.current, getActiveVideoEl());
       slotCleanupsRef.current[0]?.();
       slotCleanupsRef.current[1]?.();
       slotCleanupsRef.current = [null, null];
     };
-  }, [getActiveVideoEl]);
+  }, [clearReconnectTimer, getActiveVideoEl]);
 
   const masks = extractMaskPolygons(cameraConfig?.motion?.mask);
   const objectMasks = extractMaskPolygons(cameraConfig?.objects?.mask);

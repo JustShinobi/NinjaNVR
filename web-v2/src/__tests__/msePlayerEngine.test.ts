@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   coalesceArrayBuffers,
+  computeCameraJitterSeed,
   computeLiveEdgeSeekTarget,
+  computeMseReconnectDelayMs,
   DualSlotMachine,
   LiveFrameBridge,
   resolveLivePosterUrl,
@@ -185,6 +187,77 @@ describe("msePlayerEngine (#91 [UX-16])", () => {
     expect(computeLiveEdgeSeekTarget(0, 5.0, 4.4, false)).toBeNull();
     // Steady-state playback with drift > 1.8s snaps to bufferedEnd - 0.15 = 4.85
     expect(computeLiveEdgeSeekTarget(0, 5.0, 2.5, false)).toBeCloseTo(4.85, 3);
+    // Out-of-bounds currentTime ahead of bufferedEnd (e.g., upstream tfdt reset) snaps back into range
+    expect(computeLiveEdgeSeekTarget(0, 2.0, 45.0, false)).toBeCloseTo(1.85, 3);
+  });
+
+  test("dual_slot_machine_recovers_from_pod_rollout_disconnect_and_standby_upgrade_failure", () => {
+    const machine = new DualSlotMachine();
+    expect(machine.needsReconnect("cozinha_sub")).toBe(true);
+
+    // 1. Initial connection on slot 0
+    const t1 = machine.requestStream("cozinha_sub");
+    expect(t1.action).toBe("start_active");
+    expect(machine.needsReconnect("cozinha_sub")).toBe(false);
+
+    machine.markSlotReady(0, t1.sessionId);
+    expect(machine.getState().isAnyReady).toBe(true);
+    expect(machine.needsReconnect("cozinha_sub")).toBe(false);
+
+    // 2. Pod rollout or internet drop closes active slot 0 WebSocket
+    const afterDrop = machine.markSlotError(0, t1.sessionId);
+    expect(afterDrop.isAnyReady).toBe(false);
+    expect(afterDrop.slots[0].status).toBe("error");
+    expect(machine.needsReconnect("cozinha_sub")).toBe(true);
+
+    // 3. Auto-reconnect requests cozinha_sub again on slot 0 with a fresh sessionId
+    const t2 = machine.requestStream("cozinha_sub");
+    expect(t2.action).toBe("start_active");
+    expect(t2.targetSlot).toBe(0);
+    expect(t2.sessionId).toBeGreaterThan(t1.sessionId);
+    expect(machine.needsReconnect("cozinha_sub")).toBe(false);
+
+    machine.markSlotReady(0, t2.sessionId);
+    expect(machine.getState().isAnyReady).toBe(true);
+    expect(machine.needsReconnect("cozinha_sub")).toBe(false);
+
+    // 4. Operator upgrades to main stream ("cozinha") in standby slot 1, which fails transiently
+    const t3 = machine.requestStream("cozinha");
+    expect(t3.action).toBe("start_standby");
+    expect(t3.targetSlot).toBe(1);
+    expect(machine.needsReconnect("cozinha")).toBe(false);
+
+    const afterStandbyErr = machine.markSlotError(1, t3.sessionId);
+    // Slot 0 remains visible with cozinha_sub, but desired stream "cozinha" still needs reconnect
+    expect(afterStandbyErr.isAnyReady).toBe(true);
+    expect(afterStandbyErr.standbySlot).toBeNull();
+    expect(machine.needsReconnect("cozinha")).toBe(true);
+
+    // 5. Auto-reconnect retries "cozinha" in standby slot 1 and promotes cleanly
+    const t4 = machine.requestStream("cozinha");
+    expect(t4.action).toBe("start_standby");
+    expect(t4.targetSlot).toBe(1);
+    const promoted = machine.markSlotReady(1, t4.sessionId);
+    expect(promoted.promoted).toBe(true);
+    expect(promoted.activeSlot).toBe(1);
+    expect(machine.needsReconnect("cozinha")).toBe(false);
+  });
+
+  test("compute_mse_reconnect_delay_ms_applies_capped_exponential_backoff_and_camera_jitter", () => {
+    expect(computeMseReconnectDelayMs(0, 0)).toBe(1000);
+    expect(computeMseReconnectDelayMs(1, 0)).toBe(2000);
+    expect(computeMseReconnectDelayMs(2, 0)).toBe(3500);
+    expect(computeMseReconnectDelayMs(3, 0)).toBe(5000);
+    expect(computeMseReconnectDelayMs(10, 0)).toBe(5000);
+
+    const seedA = computeCameraJitterSeed("escritorio");
+    const seedB = computeCameraJitterSeed("cozinha");
+    expect(seedA).toBeGreaterThanOrEqual(0);
+    expect(seedA).toBeLessThanOrEqual(300);
+    expect(seedB).toBeGreaterThanOrEqual(0);
+    expect(seedB).toBeLessThanOrEqual(300);
+    expect(seedA).not.toBe(seedB);
+    expect(computeMseReconnectDelayMs(0, seedA)).toBe(1000 + seedA);
   });
 
   test("coalesce_array_buffers_merges_gop_burst_chunks_in_order", () => {
