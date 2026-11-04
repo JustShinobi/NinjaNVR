@@ -343,6 +343,57 @@ describe("shareLinks utilities", () => {
         "https://nvr.local/share/tok\\@evil"
       )
     ).toBe("");
+
+    // Malformed, non-http(s), credentialed, subpath, query, or hash origins are rejected across relative, bare, and full URL inputs
+    expect(buildSharePublicUrl("javascript:alert(1)", "/share/tok.sig")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("javascript:alert(1)", "tok.sig")).toBe("");
+    expect(
+      buildSharePublicUrl("https://user:pass@nvr.local", "/share/tok.sig")
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("https://user:pass@nvr.local", "tok.sig")
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("https://user@nvr.local", "/share/tok.sig")
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("https://:pass@nvr.local", "/share/tok.sig")
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("https://nvr.local/subpath", "/share/tok.sig")
+    ).toBe("");
+    expect(buildSharePublicUrl("https://nvr.local/subpath", "tok.sig")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("https://nvr.local?q=1", "/share/tok.sig")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("https://nvr.local?q=1", "tok.sig")).toBe("");
+    expect(
+      buildSharePublicUrl("https://nvr.local#frag", "/share/tok.sig")
+    ).toBe("");
+    expect(buildSharePublicUrl("not a valid origin", "/share/tok.sig")).toBe(
+      ""
+    );
+
+    // Credentialed full URLs are rejected whether origin is provided or empty
+    expect(
+      buildSharePublicUrl(
+        "https://nvr.local",
+        "https://user:pass@nvr.local/share/tok"
+      )
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("", "https://user:pass@nvr.local/share/tok")
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("", "https://user@nvr.local/share/tok")
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("", "https://:pass@nvr.local/share/tok")
+    ).toBe("");
   });
 
   test("formatShareLinkViews formats bounded and unlimited view counts", () => {
@@ -621,6 +672,38 @@ describe("shareLinks utilities", () => {
     expect(activeCopied).toEqual([cachedUrl]);
     expect(activeUrlMap).toEqual({ shr_cached_1: cachedUrl });
     expect(activeNotes).toEqual([]);
+
+    // 3. Corrupted or cross-origin entry in shareUrlMap is rejected by buildSharePublicUrl and not copied directly
+    let corruptedUrlMap: Record<string, string> = {
+      shr_cached_1: "https://evil.example.test/share/tok_cached_1.sig",
+    };
+    const corruptedCopied: string[] = [];
+    await executeCopyExistingShareLink(
+      { ...staleLocalLink, token: "tok_fallback_valid.sig" },
+      {
+        creatingShareId: null,
+        fetchShareLinks: async () => [
+          { ...staleLocalLink, token: "tok_fallback_valid.sig" },
+        ],
+        shareUrlMap: corruptedUrlMap,
+        setShareUrlMap: (updater) => {
+          corruptedUrlMap =
+            typeof updater === "function" ? updater(corruptedUrlMap) : updater;
+        },
+        setGeneratedShareUrl: () => {},
+        copyUrlToClipboard: async (url) => {
+          corruptedCopied.push(url);
+        },
+        notify: () => {},
+        origin: "https://nvr.example.test",
+        fetchImpl: (async () => {
+          throw new Error("fetchImpl must not be called when fallback token is valid");
+        }) as unknown as typeof fetch,
+      }
+    );
+    expect(corruptedCopied).toEqual([
+      "https://nvr.example.test/share/tok_fallback_valid.sig",
+    ]);
   });
 
   test("executeCopyExistingShareLink does not fall back to stale link when pruned from /api/share response", async () => {

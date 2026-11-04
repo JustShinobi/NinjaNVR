@@ -123,7 +123,9 @@ export async function executeCopyExistingShareLink(
       return;
     }
     const knownUrl =
-      shareUrlMap[currentLink.id] ||
+      (shareUrlMap[currentLink.id]
+        ? buildSharePublicUrl(origin, shareUrlMap[currentLink.id])
+        : "") ||
       (currentLink.url
         ? buildSharePublicUrl(origin, currentLink.url)
         : currentLink.token
@@ -361,6 +363,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           data.url || data.token
         );
         if (!fullUrl) {
+          await fetchShareLinks();
           notify("Failed to generate share link");
           return;
         }

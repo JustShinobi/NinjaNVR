@@ -136,11 +136,37 @@ export function buildSharePublicUrl(
   }
 
   const cleanOrigin = (origin || "").trim().replace(/\/+$/, "");
+  let normalizedOrigin = "";
+  if (cleanOrigin) {
+    if (/[\u0000-\u0020\u007f]/.test(cleanOrigin)) {
+      return "";
+    }
+    try {
+      const parsedOrigin = new URL(cleanOrigin);
+      if (
+        (parsedOrigin.protocol !== "http:" &&
+          parsedOrigin.protocol !== "https:") ||
+        parsedOrigin.username !== "" ||
+        parsedOrigin.password !== "" ||
+        parsedOrigin.pathname !== "/" ||
+        parsedOrigin.search !== "" ||
+        parsedOrigin.hash !== ""
+      ) {
+        return "";
+      }
+      normalizedOrigin = parsedOrigin.origin;
+    } catch {
+      return "";
+    }
+  }
 
   if (/^https?:\/\//i.test(rawTarget)) {
     try {
       const parsed = new URL(rawTarget);
       if (
+        (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+        parsed.username !== "" ||
+        parsed.password !== "" ||
         parsed.search !== "" ||
         parsed.hash !== "" ||
         !parsed.pathname.startsWith("/share/")
@@ -151,11 +177,11 @@ export function buildSharePublicUrl(
       if (!isValidShareTokenSegment(tokenSeg)) {
         return "";
       }
-      if (cleanOrigin) {
-        const expectedOrigin = new URL(cleanOrigin).origin.toLowerCase();
-        if (parsed.origin.toLowerCase() !== expectedOrigin) {
-          return "";
-        }
+      if (
+        normalizedOrigin &&
+        parsed.origin.toLowerCase() !== normalizedOrigin.toLowerCase()
+      ) {
+        return "";
       }
       return `${parsed.origin}/share/${tokenSeg}`;
     } catch {
@@ -185,7 +211,7 @@ export function buildSharePublicUrl(
     path = `/share/${rawTarget}`;
   }
 
-  return cleanOrigin ? `${cleanOrigin}${path}` : path;
+  return normalizedOrigin ? `${normalizedOrigin}${path}` : path;
 }
 
 export function formatShareLinkViews(
