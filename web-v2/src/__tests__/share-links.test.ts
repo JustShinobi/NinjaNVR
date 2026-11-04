@@ -8,6 +8,7 @@ import {
   formatShareLinkRemainingTtl,
   formatShareLinkViews,
 } from "../utils/shareLinks";
+import { executeCopyExistingShareLink } from "../views/ExportsWorkspace";
 
 function makeShareLink(overrides: Partial<ShareLinkItem> = {}): ShareLinkItem {
   return {
@@ -391,5 +392,362 @@ describe("shareLinks utilities", () => {
         nowSec
       )
     ).toBeNull();
+  });
+
+  test("executeCopyExistingShareLink always refreshes server state before copying cached knownUrl and evicts exhausted or revoked links", async () => {
+    const futureExpires = Math.floor(Date.now() / 1000) + 3600;
+    const staleLocalLink = makeShareLink({
+      id: "shr_cached_1",
+      target_id: "exp_1",
+      expires_at: futureExpires,
+      max_views: 1,
+      access_count: 0,
+      revoked: false,
+    });
+    const cachedUrl = "https://nvr.example.test/share/tok_cached_1.sig";
+
+    // 1. Server refresh reveals max_views=1 was already exhausted (access_count=1):
+    // must NOT copy cachedUrl, must evict link.id from shareUrlMap, clear generatedShareUrl, and notify inactive
+    let shareUrlMap: Record<string, string> = {
+      shr_cached_1: cachedUrl,
+      shr_other: "https://nvr.example.test/share/tok_other.sig",
+    };
+    let generatedShareUrl = cachedUrl;
+    const copiedUrls: string[] = [];
+    const notifications: string[] = [];
+    const creatingTransitions: Array<string | null> = [];
+    let fetchCalls = 0;
+    let fetchShareLinksCalls = 0;
+
+    await executeCopyExistingShareLink(staleLocalLink, {
+      creatingShareId: null,
+      setCreatingShareId: (id) => creatingTransitions.push(id),
+      fetchShareLinks: async () => {
+        fetchShareLinksCalls += 1;
+        return [
+          {
+            ...staleLocalLink,
+            access_count: 1,
+            max_views: 1,
+          },
+        ];
+      },
+      shareUrlMap,
+      setShareUrlMap: (updater) => {
+        shareUrlMap =
+          typeof updater === "function" ? updater(shareUrlMap) : updater;
+      },
+      setGeneratedShareUrl: (updater) => {
+        generatedShareUrl =
+          typeof updater === "function" ? updater(generatedShareUrl) : updater;
+      },
+      copyUrlToClipboard: async (url) => {
+        copiedUrls.push(url);
+      },
+      notify: (msg) => notifications.push(msg),
+      origin: "https://nvr.example.test",
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        throw new Error("fetchImpl must not be called");
+      }) as unknown as typeof fetch,
+    });
+
+    expect(fetchShareLinksCalls).toBe(1);
+    expect(fetchCalls).toBe(0);
+    expect(copiedUrls).toEqual([]);
+    expect(shareUrlMap).toEqual({
+      shr_other: "https://nvr.example.test/share/tok_other.sig",
+    });
+    expect(generatedShareUrl).toBe("");
+    expect(notifications).toEqual(["Share link is no longer active"]);
+    expect(creatingTransitions).toEqual(["exp_1", null]);
+
+    // 2. Server refresh confirms link is still active: copies cached knownUrl without rotating
+    let activeUrlMap: Record<string, string> = {
+      shr_cached_1: cachedUrl,
+    };
+    let activeGenUrl = "";
+    const activeCopied: string[] = [];
+    const activeNotes: string[] = [];
+    let activeRefreshCalls = 0;
+
+    await executeCopyExistingShareLink(staleLocalLink, {
+      creatingShareId: null,
+      fetchShareLinks: async () => {
+        activeRefreshCalls += 1;
+        return [staleLocalLink];
+      },
+      shareUrlMap: activeUrlMap,
+      setShareUrlMap: (updater) => {
+        activeUrlMap =
+          typeof updater === "function" ? updater(activeUrlMap) : updater;
+      },
+      setGeneratedShareUrl: (updater) => {
+        activeGenUrl =
+          typeof updater === "function" ? updater(activeGenUrl) : updater;
+      },
+      copyUrlToClipboard: async (url) => {
+        activeCopied.push(url);
+      },
+      notify: (msg) => activeNotes.push(msg),
+      origin: "https://nvr.example.test",
+      fetchImpl: (async () => {
+        throw new Error("fetchImpl must not be called when knownUrl is active");
+      }) as unknown as typeof fetch,
+    });
+
+    expect(activeRefreshCalls).toBe(1);
+    expect(activeCopied).toEqual([cachedUrl]);
+    expect(activeUrlMap).toEqual({ shr_cached_1: cachedUrl });
+    expect(activeNotes).toEqual([]);
+  });
+
+  test("executeCopyExistingShareLink does not fall back to stale link when pruned from /api/share response", async () => {
+    const futureExpires = Math.floor(Date.now() / 1000) + 3600;
+    const prunedLink = makeShareLink({
+      id: "shr_pruned_99",
+      target_id: "exp_pruned",
+      expires_at: futureExpires,
+      revoked: false,
+    });
+    const prunedUrl = "https://nvr.example.test/share/tok_pruned.sig";
+
+    let shareUrlMap: Record<string, string> = {
+      shr_pruned_99: prunedUrl,
+    };
+    let generatedShareUrl = prunedUrl;
+    const notifications: string[] = [];
+    const copiedUrls: string[] = [];
+    let apiCalls = 0;
+
+    // Server returns a valid array that no longer contains shr_pruned_99
+    await executeCopyExistingShareLink(prunedLink, {
+      creatingShareId: null,
+      fetchShareLinks: async () => [
+        makeShareLink({ id: "shr_different_1", expires_at: futureExpires }),
+      ],
+      shareUrlMap,
+      setShareUrlMap: (updater) => {
+        shareUrlMap =
+          typeof updater === "function" ? updater(shareUrlMap) : updater;
+      },
+      setGeneratedShareUrl: (updater) => {
+        generatedShareUrl =
+          typeof updater === "function" ? updater(generatedShareUrl) : updater;
+      },
+      copyUrlToClipboard: async (url) => {
+        copiedUrls.push(url);
+      },
+      notify: (msg) => notifications.push(msg),
+      origin: "https://nvr.example.test",
+      fetchImpl: (async () => {
+        apiCalls += 1;
+        throw new Error("must not rotate pruned link");
+      }) as unknown as typeof fetch,
+    });
+
+    expect(apiCalls).toBe(0);
+    expect(copiedUrls).toEqual([]);
+    expect(shareUrlMap).toEqual({});
+    expect(generatedShareUrl).toBe("");
+    expect(notifications).toEqual(["Share link is no longer active"]);
+
+    // Transient network error (fetchShareLinks returns null) falls back to link
+    const fallbackCopied: string[] = [];
+    await executeCopyExistingShareLink(prunedLink, {
+      creatingShareId: null,
+      fetchShareLinks: async () => null,
+      shareUrlMap: { shr_pruned_99: prunedUrl },
+      setShareUrlMap: () => {},
+      setGeneratedShareUrl: () => {},
+      copyUrlToClipboard: async (url) => {
+        fallbackCopied.push(url);
+      },
+      notify: () => {},
+      origin: "https://nvr.example.test",
+    });
+    expect(fallbackCopied).toEqual([prunedUrl]);
+  });
+
+  test("executeCopyExistingShareLink cleans up old link state immediately after DELETE and refreshes list if POST /api/share fails or throws", async () => {
+    const futureExpires = Math.floor(Date.now() / 1000) + 7200;
+    const rotLink = makeShareLink({
+      id: "shr_rot_old",
+      target_id: "exp_rot",
+      expires_at: futureExpires,
+      max_views: 5,
+      access_count: 2,
+      revoked: false,
+    });
+    const staleOldUrl = "https://nvr.example.test/share/old_rot.sig";
+
+    // Case A: DELETE succeeds (200), then POST /api/share returns 500 (!res.ok)
+    // State cleanup of shr_rot_old must happen BEFORE POST /api/share is called,
+    // and fetchShareLinks() must be called after POST fails.
+    let shareUrlMapA: Record<string, string> = {};
+    let generatedShareUrlA = staleOldUrl;
+    let mapSnapshotDuringPostA: Record<string, string> = {};
+    let genUrlSnapshotDuringPostA = "__unset__";
+    let refreshCountA = 0;
+    const notificationsA: string[] = [];
+    const requestsA: Array<{ url: string; method: string }> = [];
+
+    await executeCopyExistingShareLink(rotLink, {
+      creatingShareId: null,
+      fetchShareLinks: async () => {
+        refreshCountA += 1;
+        return [rotLink];
+      },
+      shareUrlMap: shareUrlMapA,
+      setShareUrlMap: (updater) => {
+        shareUrlMapA =
+          typeof updater === "function" ? updater(shareUrlMapA) : updater;
+      },
+      setGeneratedShareUrl: (updater) => {
+        generatedShareUrlA =
+          typeof updater === "function"
+            ? updater(generatedShareUrlA)
+            : updater;
+      },
+      copyUrlToClipboard: async () => {},
+      notify: (msg) => notificationsA.push(msg),
+      origin: "https://nvr.example.test",
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method || "GET";
+        requestsA.push({ url, method });
+        if (method === "DELETE") {
+          // Simulate concurrent map entry populated prior to DELETE completion
+          shareUrlMapA = {
+            shr_rot_old: staleOldUrl,
+            shr_keep: "https://nvr.example.test/share/keep.sig",
+          };
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        if (method === "POST") {
+          mapSnapshotDuringPostA = { ...shareUrlMapA };
+          genUrlSnapshotDuringPostA = generatedShareUrlA;
+          return new Response(
+            JSON.stringify({ message: "Minting rate limit exceeded" }),
+            { status: 429 }
+          );
+        }
+        throw new Error(`Unexpected request: ${method} ${url}`);
+      }) as unknown as typeof fetch,
+    });
+
+    expect(requestsA).toEqual([
+      { url: "/api/share/shr_rot_old", method: "DELETE" },
+      { url: "/api/share", method: "POST" },
+    ]);
+    // Verified BEFORE POST resolved: shr_rot_old was already removed and generatedShareUrl was cleared
+    expect(mapSnapshotDuringPostA).toEqual({
+      shr_keep: "https://nvr.example.test/share/keep.sig",
+    });
+    expect(genUrlSnapshotDuringPostA).toBe("");
+    expect(refreshCountA).toBe(2);
+    expect(notificationsA).toEqual(["Minting rate limit exceeded"]);
+
+    // Case B: DELETE succeeds (404 already gone), then POST /api/share throws network error
+    // catch block must call fetchShareLinks() so UI reflects revoked old link
+    let shareUrlMapB: Record<string, string> = {};
+    let generatedShareUrlB = staleOldUrl;
+    let refreshCountB = 0;
+    const notificationsB: string[] = [];
+    const creatingTransitionsB: Array<string | null> = [];
+
+    await executeCopyExistingShareLink(rotLink, {
+      creatingShareId: null,
+      setCreatingShareId: (id) => creatingTransitionsB.push(id),
+      fetchShareLinks: async () => {
+        refreshCountB += 1;
+        return [rotLink];
+      },
+      shareUrlMap: shareUrlMapB,
+      setShareUrlMap: (updater) => {
+        shareUrlMapB =
+          typeof updater === "function" ? updater(shareUrlMapB) : updater;
+      },
+      setGeneratedShareUrl: (updater) => {
+        generatedShareUrlB =
+          typeof updater === "function"
+            ? updater(generatedShareUrlB)
+            : updater;
+      },
+      copyUrlToClipboard: async () => {},
+      notify: (msg) => notificationsB.push(msg),
+      origin: "https://nvr.example.test",
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method || "GET";
+        if (method === "DELETE") {
+          shareUrlMapB = { shr_rot_old: staleOldUrl };
+          return new Response(null, { status: 404 });
+        }
+        throw new Error("Simulated POST network disconnect");
+      }) as unknown as typeof fetch,
+    });
+
+    expect(shareUrlMapB).toEqual({});
+    expect(generatedShareUrlB).toBe("");
+    expect(refreshCountB).toBe(2);
+    expect(notificationsB).toEqual(["Failed to generate share link"]);
+    expect(creatingTransitionsB).toEqual(["exp_rot", null]);
+
+    // Case C: Full rotation success (DELETE 200 + POST 200)
+    let shareUrlMapC: Record<string, string> = {};
+    let generatedShareUrlC = "";
+    let refreshCountC = 0;
+    const copiedC: Array<{ url: string; ttl?: string }> = [];
+    let postBodyC: Record<string, unknown> = {};
+
+    await executeCopyExistingShareLink(rotLink, {
+      creatingShareId: null,
+      fetchShareLinks: async () => {
+        refreshCountC += 1;
+        return [rotLink];
+      },
+      shareUrlMap: shareUrlMapC,
+      setShareUrlMap: (updater) => {
+        shareUrlMapC =
+          typeof updater === "function" ? updater(shareUrlMapC) : updater;
+      },
+      setGeneratedShareUrl: (updater) => {
+        generatedShareUrlC =
+          typeof updater === "function"
+            ? updater(generatedShareUrlC)
+            : updater;
+      },
+      copyUrlToClipboard: async (url, ttl) => {
+        generatedShareUrlC = url;
+        copiedC.push({ url, ttl });
+      },
+      notify: () => {},
+      origin: "https://nvr.example.test",
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method || "GET";
+        if (method === "DELETE") {
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        postBodyC = JSON.parse(String(init?.body || "{}"));
+        return new Response(
+          JSON.stringify({
+            id: "shr_rot_new",
+            url: "/share/new_rot.sig",
+          }),
+          { status: 200 }
+        );
+      }) as unknown as typeof fetch,
+    });
+
+    expect(postBodyC?.max_views).toBe(3);
+    expect(shareUrlMapC).toEqual({
+      shr_rot_new: "https://nvr.example.test/share/new_rot.sig",
+    });
+    expect(generatedShareUrlC).toBe(
+      "https://nvr.example.test/share/new_rot.sig"
+    );
+    expect(refreshCountC).toBe(2);
+    expect(copiedC.length).toBe(1);
+    expect(copiedC[0].url).toBe("https://nvr.example.test/share/new_rot.sig");
   });
 });

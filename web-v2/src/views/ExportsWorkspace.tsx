@@ -48,6 +48,185 @@ interface ExportsWorkspaceProps {
   notify: (msg: string) => void;
 }
 
+export interface CopyExistingShareLinkDeps {
+  creatingShareId?: string | null;
+  setCreatingShareId?: (id: string | null) => void;
+  fetchShareLinks: () => Promise<ShareLinkItem[] | null>;
+  shareUrlMap: Record<string, string>;
+  setShareUrlMap: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  setGeneratedShareUrl: React.Dispatch<React.SetStateAction<string>>;
+  copyUrlToClipboard: (fullUrl: string, ttlHoursLabel?: string) => Promise<void>;
+  notify: (msg: string) => void;
+  origin?: string;
+  fetchImpl?: typeof fetch;
+}
+
+export async function executeCopyExistingShareLink(
+  link: ShareLinkItem,
+  deps: CopyExistingShareLinkDeps
+): Promise<void> {
+  const {
+    creatingShareId,
+    setCreatingShareId,
+    fetchShareLinks,
+    shareUrlMap,
+    setShareUrlMap,
+    setGeneratedShareUrl,
+    copyUrlToClipboard,
+    notify,
+    origin = typeof window !== "undefined" && window.location
+      ? window.location.origin
+      : "",
+    fetchImpl = fetch,
+  } = deps;
+  if (creatingShareId !== null && creatingShareId !== undefined) return;
+  setCreatingShareId?.(link.target_id);
+  try {
+    const latestLinks = await fetchShareLinks();
+    const currentLink =
+      latestLinks !== null
+        ? latestLinks.find((l) => l.id === link.id)
+        : link;
+    const oldUrl =
+      shareUrlMap[link.id] ||
+      (currentLink?.url
+        ? buildSharePublicUrl(origin, currentLink.url)
+        : currentLink?.token
+          ? buildSharePublicUrl(origin, currentLink.token)
+          : link.url
+            ? buildSharePublicUrl(origin, link.url)
+            : link.token
+              ? buildSharePublicUrl(origin, link.token)
+              : "");
+    if (!currentLink || computeShareLinkStatus(currentLink) !== "active") {
+      let evictedUrl = oldUrl;
+      setShareUrlMap((prev) => {
+        if (prev[link.id]) {
+          evictedUrl = prev[link.id];
+        }
+        if (!(link.id in prev)) return prev;
+        const next = { ...prev };
+        delete next[link.id];
+        return next;
+      });
+      if (evictedUrl) {
+        setGeneratedShareUrl((prev) => (prev === evictedUrl ? "" : prev));
+      }
+      notify("Share link is no longer active");
+      return;
+    }
+    const knownUrl =
+      shareUrlMap[currentLink.id] ||
+      (currentLink.url
+        ? buildSharePublicUrl(origin, currentLink.url)
+        : currentLink.token
+          ? buildSharePublicUrl(origin, currentLink.token)
+          : link.url
+            ? buildSharePublicUrl(origin, link.url)
+            : link.token
+              ? buildSharePublicUrl(origin, link.token)
+              : "");
+    if (knownUrl) {
+      await copyUrlToClipboard(knownUrl);
+      return;
+    }
+    const rotation = computeShareLinkRotationParams(currentLink);
+    if (!rotation) {
+      let evictedUrl = oldUrl;
+      setShareUrlMap((prev) => {
+        if (prev[link.id]) {
+          evictedUrl = prev[link.id];
+        }
+        if (!(link.id in prev)) return prev;
+        const next = { ...prev };
+        delete next[link.id];
+        return next;
+      });
+      if (evictedUrl) {
+        setGeneratedShareUrl((prev) => (prev === evictedUrl ? "" : prev));
+      }
+      notify("Share link is no longer active");
+      return;
+    }
+    let delRes: Response;
+    try {
+      delRes = await fetchImpl(
+        `/api/share/${encodeURIComponent(rotation.revokeOldId)}`,
+        {
+          method: "DELETE",
+          credentials: "include",
+        }
+      );
+    } catch {
+      notify("Failed to revoke previous share link");
+      return;
+    }
+    if (!delRes.ok && delRes.status !== 404) {
+      notify("Failed to revoke previous share link");
+      return;
+    }
+    let revokedOldUrl = shareUrlMap[rotation.revokeOldId] || oldUrl;
+    setShareUrlMap((prev) => {
+      if (prev[rotation.revokeOldId]) {
+        revokedOldUrl = prev[rotation.revokeOldId];
+      }
+      if (!(rotation.revokeOldId in prev)) return prev;
+      const next = { ...prev };
+      delete next[rotation.revokeOldId];
+      return next;
+    });
+    if (revokedOldUrl) {
+      setGeneratedShareUrl((prev) => (prev === revokedOldUrl ? "" : prev));
+    }
+    const payload: Record<string, unknown> = {
+      kind: currentLink.kind || "export",
+      target_id: currentLink.target_id,
+      expires_in_sec: rotation.expiresInSec,
+    };
+    if (
+      typeof rotation.remainingMaxViews === "number" &&
+      Number.isFinite(rotation.remainingMaxViews) &&
+      rotation.remainingMaxViews > 0
+    ) {
+      payload.max_views = rotation.remainingMaxViews;
+    }
+    const res = await fetchImpl("/api/share", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && (data.url || data.token)) {
+      const fullUrl = buildSharePublicUrl(origin, data.url || data.token);
+      setShareUrlMap((prev) => {
+        const next = { ...prev };
+        delete next[rotation.revokeOldId];
+        if (data.id) {
+          next[String(data.id)] = fullUrl;
+        }
+        return next;
+      });
+      await fetchShareLinks();
+      await copyUrlToClipboard(
+        fullUrl,
+        `${Math.round(rotation.expiresInSec / 3600)}h`
+      );
+    } else {
+      await fetchShareLinks();
+      notify(
+        (typeof data?.message === "string" && data.message) ||
+          "Failed to generate share link"
+      );
+    }
+  } catch {
+    await fetchShareLinks();
+    notify("Failed to generate share link");
+  } finally {
+    setCreatingShareId?.(null);
+  }
+}
+
 export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   cameraNames,
   config,
@@ -189,97 +368,16 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   };
 
   const handleCopyExistingShareLink = async (link: ShareLinkItem) => {
-    const knownUrl =
-      shareUrlMap[link.id] ||
-      (link.url
-        ? buildSharePublicUrl(window.location.origin, link.url)
-        : link.token
-          ? buildSharePublicUrl(window.location.origin, link.token)
-          : "");
-    if (knownUrl) {
-      if (computeShareLinkStatus(link) !== "active") {
-        notify("Share link is no longer active");
-        return;
-      }
-      await copyUrlToClipboard(knownUrl);
-      return;
-    }
-    if (creatingShareId !== null) return;
-    setCreatingShareId(link.target_id);
-    try {
-      const latestLinks = await fetchShareLinks();
-      const currentLink = latestLinks?.find((l) => l.id === link.id) ?? link;
-      const rotation = computeShareLinkRotationParams(currentLink);
-      if (!rotation) {
-        notify("Share link is no longer active");
-        return;
-      }
-      let delRes: Response;
-      try {
-        delRes = await fetch(
-          `/api/share/${encodeURIComponent(rotation.revokeOldId)}`,
-          {
-            method: "DELETE",
-            credentials: "include",
-          }
-        );
-      } catch {
-        notify("Failed to revoke previous share link");
-        return;
-      }
-      if (!delRes.ok && delRes.status !== 404) {
-        notify("Failed to revoke previous share link");
-        return;
-      }
-      const payload: Record<string, unknown> = {
-        kind: currentLink.kind || "export",
-        target_id: currentLink.target_id,
-        expires_in_sec: rotation.expiresInSec,
-      };
-      if (
-        typeof rotation.remainingMaxViews === "number" &&
-        Number.isFinite(rotation.remainingMaxViews) &&
-        rotation.remainingMaxViews > 0
-      ) {
-        payload.max_views = rotation.remainingMaxViews;
-      }
-      const res = await fetch("/api/share", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && (data.url || data.token)) {
-        const fullUrl = buildSharePublicUrl(
-          window.location.origin,
-          data.url || data.token
-        );
-        setShareUrlMap((prev) => {
-          const next = { ...prev };
-          delete next[rotation.revokeOldId];
-          if (data.id) {
-            next[String(data.id)] = fullUrl;
-          }
-          return next;
-        });
-        await fetchShareLinks();
-        await copyUrlToClipboard(
-          fullUrl,
-          `${Math.round(rotation.expiresInSec / 3600)}h`
-        );
-      } else {
-        await fetchShareLinks();
-        notify(
-          (typeof data?.message === "string" && data.message) ||
-            "Failed to generate share link"
-        );
-      }
-    } catch {
-      notify("Failed to generate share link");
-    } finally {
-      setCreatingShareId(null);
-    }
+    await executeCopyExistingShareLink(link, {
+      creatingShareId,
+      setCreatingShareId,
+      fetchShareLinks,
+      shareUrlMap,
+      setShareUrlMap,
+      setGeneratedShareUrl,
+      copyUrlToClipboard,
+      notify,
+    });
   };
 
   const handleRevokeShareLink = async (id: string) => {
