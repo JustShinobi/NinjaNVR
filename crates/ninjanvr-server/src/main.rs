@@ -144,7 +144,13 @@ async fn main() -> Result<()> {
             };
             let io = TokioIo::new(tls_stream);
             let hyper_service =
-                hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+                    if !req.headers().contains_key(hyper::header::HOST)
+                        && let Some(auth) = req.uri().authority()
+                        && let Ok(val) = hyper::header::HeaderValue::from_str(auth.as_str())
+                    {
+                        req.headers_mut().insert(hyper::header::HOST, val);
+                    }
                     let mut svc = app_clone.clone();
                     async move { svc.call(req).await }
                 });

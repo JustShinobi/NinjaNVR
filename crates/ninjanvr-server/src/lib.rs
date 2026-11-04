@@ -8145,13 +8145,14 @@ async fn api_share_list(
     Json(Value::Array(links))
 }
 
-fn extract_url_host(raw: &str) -> Option<&str> {
+fn extract_url_scheme_and_host(raw: &str) -> Option<(&str, &str)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
         return None;
     }
-    let (scheme, after_scheme) = trimmed.split_once("://")?;
-    if scheme.trim().is_empty() {
+    let (scheme_raw, after_scheme) = trimmed.split_once("://")?;
+    let scheme = scheme_raw.trim();
+    if scheme.is_empty() {
         return None;
     }
     let host = after_scheme
@@ -8162,10 +8163,97 @@ fn extract_url_host(raw: &str) -> Option<&str> {
     if host.is_empty() {
         return None;
     }
-    Some(host)
+    Some((scheme, host))
 }
 
-fn verify_cookie_csrf_origin(headers: &HeaderMap) -> bool {
+fn strip_default_port_for_scheme<'a>(scheme: &str, host: &'a str) -> &'a str {
+    if scheme.eq_ignore_ascii_case("https") {
+        host.strip_suffix(":443").unwrap_or(host)
+    } else if scheme.eq_ignore_ascii_case("http") {
+        host.strip_suffix(":80").unwrap_or(host)
+    } else {
+        host
+    }
+}
+
+fn bare_hostname(host_port: &str) -> &str {
+    let trimmed = host_port.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some((ipv6, _)) = rest.split_once(']')
+    {
+        return ipv6;
+    }
+    if let Some((h, p)) = trimmed.rsplit_once(':')
+        && !h.contains(':')
+        && p.chars().all(|c| c.is_ascii_digit())
+    {
+        return h;
+    }
+    trimmed
+}
+
+fn is_internal_backend_host(host_port: &str) -> bool {
+    let host = bare_hostname(host_port);
+    if host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("ninjanvr")
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.ends_with(".svc")
+        || host.ends_with(".cluster.local")
+        || host.ends_with(".internal")
+    {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return ip.is_loopback() || ip.is_private() || ip.is_link_local();
+    }
+    false
+}
+
+fn request_host_matches(headers: &HeaderMap, uri: &Uri, scheme: &str, source_host: &str) -> bool {
+    let normalized_source = strip_default_port_for_scheme(scheme, source_host);
+    let x_forwarded_host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim())
+        .filter(|s| !s.is_empty());
+    let host_header = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim())
+        .filter(|s| !s.is_empty());
+    let uri_authority = uri
+        .authority()
+        .map(|a| a.as_str().trim())
+        .filter(|s| !s.is_empty());
+    let is_same_origin_fetch = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("same-origin"));
+
+    let primary_host = host_header.or(uri_authority);
+    let allow_xfh = match (x_forwarded_host, primary_host) {
+        (Some(_), None) => true,
+        (Some(_), Some(_)) if is_same_origin_fetch => true,
+        (Some(xfh), Some(pri)) => {
+            is_internal_backend_host(pri)
+                || bare_hostname(xfh).eq_ignore_ascii_case(bare_hostname(pri))
+        }
+        (None, _) => false,
+    };
+
+    let trusted_xfh = if allow_xfh { x_forwarded_host } else { None };
+
+    [trusted_xfh, host_header, uri_authority]
+        .into_iter()
+        .flatten()
+        .any(|candidate| {
+            let normalized_candidate = strip_default_port_for_scheme(scheme, candidate);
+            normalized_source.eq_ignore_ascii_case(normalized_candidate)
+        })
+}
+
+fn verify_cookie_csrf_origin(headers: &HeaderMap, uri: &Uri) -> bool {
     let has_bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -8183,32 +8271,24 @@ fn verify_cookie_csrf_origin(headers: &HeaderMap) -> bool {
         }
     }
     if let Some(origin_val) = headers.get(header::ORIGIN) {
-        let Some(origin_host) = origin_val.to_str().ok().and_then(extract_url_host) else {
-            return false;
-        };
-        let Some(req_host) = headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+        let Some((scheme, origin_host)) = origin_val
+            .to_str()
+            .ok()
+            .and_then(extract_url_scheme_and_host)
         else {
             return false;
         };
-        return origin_host.eq_ignore_ascii_case(req_host);
+        return request_host_matches(headers, uri, scheme, origin_host);
     }
     if let Some(referer_val) = headers.get(header::REFERER) {
-        let Some(referer_host) = referer_val.to_str().ok().and_then(extract_url_host) else {
-            return false;
-        };
-        let Some(req_host) = headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+        let Some((scheme, referer_host)) = referer_val
+            .to_str()
+            .ok()
+            .and_then(extract_url_scheme_and_host)
         else {
             return false;
         };
-        return referer_host.eq_ignore_ascii_case(req_host);
+        return request_host_matches(headers, uri, scheme, referer_host);
     }
     true
 }
@@ -8216,10 +8296,11 @@ fn verify_cookie_csrf_origin(headers: &HeaderMap) -> bool {
 async fn api_share_revoke(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers) {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -8292,10 +8373,11 @@ fn purge_revoked_share_credits(state: &AppState) {
 async fn api_share_create(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     Json(body): Json<CreateShareBody>,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers) {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -20670,6 +20752,85 @@ cameras:
             .unwrap();
         assert_eq!(resp_del_cookie_ok.status(), StatusCode::OK);
         assert!(state.db.is_share_link_revoked(&cookie_share_id).unwrap());
+
+        // 2e. HTTP/2 `:authority` (no `Host` header) and reverse-proxy `X-Forwarded-Host`
+        //     must succeed for same-origin requests and reject cross-origin requests.
+        let resp_h2_create = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("https://nvr.example.test/api/share")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, "https://nvr.example.test")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_p3_1","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_h2_create.status(), StatusCode::OK);
+        let h2_share_json: Value =
+            serde_json::from_slice(&to_bytes(resp_h2_create.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let h2_share_id = h2_share_json["id"].as_str().unwrap().to_string();
+
+        // Cross-origin against HTTP/2 `:authority` -> 403 FORBIDDEN
+        let resp_h2_csrf = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("https://nvr.example.test/api/share/{h2_share_id}"))
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, "https://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_h2_csrf.status(), StatusCode::FORBIDDEN);
+        assert!(!state.db.is_share_link_revoked(&h2_share_id).unwrap());
+
+        // Forged `X-Forwarded-Host: evil.example` against an external `Host` is rejected -> 403 FORBIDDEN
+        let resp_forged_xfh = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/share/{h2_share_id}"))
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, "https://evil.example")
+                    .header("x-forwarded-host", "evil.example")
+                    .header(header::HOST, "nvr.example.test:5000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_forged_xfh.status(), StatusCode::FORBIDDEN);
+        assert!(!state.db.is_share_link_revoked(&h2_share_id).unwrap());
+
+        // Reverse-proxy `X-Forwarded-Host` with internal `Host` and default `:443` port -> 200 OK
+        let resp_xfh_revoke = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/share/{h2_share_id}"))
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, "https://nvr.example.test")
+                    .header("x-forwarded-host", "nvr.example.test:443, proxy.internal")
+                    .header(header::HOST, "127.0.0.1:8971")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_xfh_revoke.status(), StatusCode::OK);
+        assert!(state.db.is_share_link_revoked(&h2_share_id).unwrap());
 
         // =========================================================================
         // 3. Max-Views Enforcement, Access Counter, and Last-Accessed Timestamp
