@@ -2361,7 +2361,7 @@ async fn api_user_role(
             if body.role.trim().eq_ignore_ascii_case("viewer") {
                 let _ = state.db.revoke_share_links_by_creator(&username);
                 if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
-                    auto_map.clear();
+                    remove_creator_from_auto_revoked(&state, &mut auto_map, Some(&username), None);
                 }
             }
             purge_revoked_share_credits(&state);
@@ -2448,7 +2448,7 @@ async fn api_user_delete(
         Ok(true) => {
             let _ = state.db.revoke_share_links_by_creator(&username);
             if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
-                auto_map.clear();
+                remove_creator_from_auto_revoked(&state, &mut auto_map, Some(&username), None);
             }
             purge_revoked_share_credits(&state);
             Json(json!({
@@ -2542,13 +2542,18 @@ async fn api_token_delete(
     });
     match state.db.delete_api_token(&id) {
         Ok(true) => {
-            if let Some(name) = token_name {
+            if let Some(ref name) = token_name {
                 let _ = state
                     .db
                     .revoke_share_links_by_creator(&format!("token:{name}"));
             }
             if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
-                auto_map.clear();
+                remove_creator_from_auto_revoked(
+                    &state,
+                    &mut auto_map,
+                    None,
+                    token_name.as_deref(),
+                );
             }
             purge_revoked_share_credits(&state);
             Json(json!({
@@ -2716,7 +2721,22 @@ async fn api_config_raw(State(state): State<AppState>) -> Json<Value> {
     Json(Value::String(cfg.raw_yaml.clone()))
 }
 
-async fn api_config_save(State(state): State<AppState>, body: String) -> Response {
+async fn api_config_save(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let path = { state.config.read().await.config_path.clone() };
     match NinjaConfig::from_yaml_str(&body, path.clone()) {
         Ok(new_cfg) => {
@@ -2746,7 +2766,22 @@ async fn api_config_save(State(state): State<AppState>, body: String) -> Respons
     }
 }
 
-async fn api_config_structured(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+async fn api_config_structured(
+    State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let mut next_cfg = { state.config.read().await.clone() };
     if let Err(err) = next_cfg.apply_structured_json(&body) {
         return (
@@ -8761,9 +8796,60 @@ async fn api_share_revoke(
     Json(json!({ "success": true, "id": id })).into_response()
 }
 
+fn prune_share_creator_auto_revoked(
+    state: &AppState,
+    auto_map: &mut HashMap<String, &'static str>,
+    now_ts: u64,
+) {
+    let now_f64 = now_ts as f64;
+    auto_map.retain(|k, _| {
+        state.db.get_share_link(k).ok().flatten().is_some_and(|l| {
+            l["expires_at"]
+                .as_f64()
+                .is_some_and(|exp| exp > now_f64 && (exp as u64) > now_ts)
+        })
+    });
+}
+
+fn remove_creator_from_auto_revoked(
+    state: &AppState,
+    auto_map: &mut HashMap<String, &'static str>,
+    creator_username: Option<&str>,
+    creator_token_name: Option<&str>,
+) {
+    let target_user = creator_username.map(str::trim).filter(|s| !s.is_empty());
+    let target_token = creator_token_name.map(str::trim).filter(|s| !s.is_empty());
+    auto_map.retain(|k, _| {
+        let Some(link) = state.db.get_share_link(k).ok().flatten() else {
+            return false;
+        };
+        let Some(cb) = link["created_by"].as_str().map(str::trim) else {
+            return true;
+        };
+        if let Some(u) = target_user {
+            let link_u = cb.strip_prefix("ext:").unwrap_or(cb).trim();
+            if !cb.starts_with("token:") && link_u == u {
+                return false;
+            }
+        }
+        if let Some(t) = target_token
+            && let Some(link_t) = cb.strip_prefix("token:")
+            && link_t.trim() == t
+        {
+            return false;
+        }
+        true
+    });
+}
+
 fn purge_revoked_share_credits(state: &AppState) {
     let now_u64 = unix_now();
     let now_ts = now_u64 as f64;
+    if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock()
+        && !auto_map.is_empty()
+    {
+        prune_share_creator_auto_revoked(state, &mut auto_map, now_u64);
+    }
     let keys: Vec<String> = state
         .share_page_video_credits
         .lock()
@@ -9134,7 +9220,14 @@ fn verify_share_jti_with_view_mode(
             }
             if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
                 if !auto_map.contains_key(jti) && auto_map.len() >= 512 {
-                    auto_map.clear();
+                    prune_share_creator_auto_revoked(state, &mut auto_map, now_ts);
+                    while auto_map.len() >= 512 {
+                        if let Some(evict_key) = auto_map.keys().next().cloned() {
+                            auto_map.remove(&evict_key);
+                        } else {
+                            break;
+                        }
+                    }
                 }
                 auto_map.insert(jti.to_string(), reason);
             }
@@ -9250,7 +9343,7 @@ fn next_stream_state_from_video_response(
         if start == 0 && end + 1 < total {
             return (true, (end + 1).max(2));
         }
-        if matches!(request_range, Some((0, None))) && total > 2 {
+        if start == 0 && total > 2 {
             return (true, 2);
         }
         if start > 0 && end + 1 < total {
@@ -9468,7 +9561,7 @@ fn record_share_access_or_gone(
                 if let Some(t_next) = tentative_next
                     && let Some(pos) = entry.active_streams.iter().position(|&c| c == t_next)
                 {
-                    entry.active_streams[pos] = t_next.max(min_next_start);
+                    entry.active_streams[pos] = min_next_start;
                     while entry.active_stream_expires.len() <= pos {
                         entry.active_stream_expires.push(now_ts + 900);
                     }
@@ -9905,6 +9998,23 @@ async fn acquire_share_clip_lock(state: &AppState, clip_key: &str) -> Arc<tokio:
     map.entry(clip_key.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+fn is_cached_share_artifact_stale(artifact_path: &Path, source_paths: &[PathBuf]) -> bool {
+    let Ok(art_meta) = std::fs::metadata(artifact_path) else {
+        return true;
+    };
+    if !art_meta.is_file() || art_meta.len() == 0 {
+        return true;
+    }
+    let Ok(art_mtime) = art_meta.modified() else {
+        return false;
+    };
+    source_paths.iter().any(|src| {
+        std::fs::metadata(src)
+            .and_then(|m| m.modified())
+            .is_ok_and(|src_mtime| src_mtime > art_mtime)
+    })
 }
 
 fn cleanup_share_clip_artifacts(media_dir: &Path, target_id: &str) {
@@ -10385,7 +10495,13 @@ async fn share_video_mp4(
                     let hash_matches = std::fs::read_to_string(&mask_hash_path)
                         .map(|existing_hash| existing_hash.trim() == current_mask_hash)
                         .unwrap_or(false);
-                    if !hash_matches {
+                    if !hash_matches
+                        || is_cached_share_artifact_stale(
+                            &redacted_path,
+                            std::slice::from_ref(&source_path),
+                        )
+                        || ninjanvr_media::mp4_file_has_audio_track(&redacted_path)
+                    {
                         let _ = std::fs::remove_file(&redacted_path);
                         let _ = std::fs::remove_file(&mask_hash_path);
                     }
@@ -10401,7 +10517,7 @@ async fn share_video_mp4(
                         privacy_mask.as_ref(),
                     )
                     .await;
-                    if build_ok {
+                    if build_ok && !ninjanvr_media::mp4_file_has_audio_track(&redacted_path) {
                         let _ = std::fs::write(&mask_hash_path, &current_mask_hash);
                     } else {
                         let _ = std::fs::remove_file(&redacted_path);
@@ -10440,7 +10556,13 @@ async fn share_video_mp4(
                 let clip_lock = acquire_share_clip_lock(&state, &clip_id).await;
                 let _clip_guard = clip_lock.lock().await;
 
-                if clip_path.is_file() && ninjanvr_media::mp4_file_has_audio_track(&clip_path) {
+                if clip_path.is_file()
+                    && (ninjanvr_media::mp4_file_has_audio_track(&clip_path)
+                        || is_cached_share_artifact_stale(
+                            &clip_path,
+                            std::slice::from_ref(&source_path),
+                        ))
+                {
                     let _ = std::fs::remove_file(&clip_path);
                 }
 
@@ -10615,7 +10737,10 @@ async fn share_video_mp4(
                     let hash_matches = std::fs::read_to_string(&mask_hash_path)
                         .map(|existing_hash| existing_hash.trim() == current_mask_hash)
                         .unwrap_or(false);
-                    if !hash_matches {
+                    if !hash_matches
+                        || is_cached_share_artifact_stale(&redacted_path, &recs)
+                        || ninjanvr_media::mp4_file_has_audio_track(&redacted_path)
+                    {
                         let _ = std::fs::remove_file(&redacted_path);
                         let _ = std::fs::remove_file(&mask_hash_path);
                     }
@@ -10646,7 +10771,7 @@ async fn share_video_mp4(
                             .join(format!("{redacted_id}.webp")),
                     );
                     match build_res {
-                        Ok(Ok(())) => {
+                        Ok(Ok(())) if !ninjanvr_media::mp4_file_has_audio_track(&redacted_path) => {
                             let _ = std::fs::write(&mask_hash_path, &current_mask_hash);
                         }
                         _ => {
@@ -10686,6 +10811,12 @@ async fn share_video_mp4(
                 .join(format!("{clip_id}.mp4"));
             let clip_lock = acquire_share_clip_lock(&state, &clip_id).await;
             let _clip_guard = clip_lock.lock().await;
+            if clip_path.is_file()
+                && (is_cached_share_artifact_stale(&clip_path, &recs)
+                    || ninjanvr_media::mp4_file_has_audio_track(&clip_path))
+            {
+                let _ = std::fs::remove_file(&clip_path);
+            }
             if !clip_path.is_file() {
                 let _sem_permit = state.share_ffmpeg_semaphore.acquire().await.ok();
                 let build_res = tokio::time::timeout(
@@ -10710,7 +10841,9 @@ async fn share_video_mp4(
                         .join("clips")
                         .join(format!("{clip_id}.webp")),
                 );
-                if !matches!(build_res, Ok(Ok(()))) {
+                if !matches!(build_res, Ok(Ok(())))
+                    || ninjanvr_media::mp4_file_has_audio_track(&clip_path)
+                {
                     let _ = std::fs::remove_file(&clip_path);
                     return StatusCode::NOT_FOUND.into_response();
                 }
@@ -10851,10 +10984,36 @@ impl Default for CreateExportBody {
 
 async fn api_export_create(
     State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath((camera, start, end)): AxumPath<(String, f64, f64)>,
     body: Option<Json<CreateExportBody>>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Camera is not permitted for this user"
+            })),
+        )
+            .into_response();
+    }
     let id = format!("{camera}_{}_{}", start as u64, end as u64);
+    cleanup_share_clip_artifacts(&state.media_dir, &id);
     let parsed_body = body.map(|b| b.0).unwrap_or_default();
     let include_audio = parsed_body.include_audio && !parsed_body.strip_audio;
     let name = parsed_body
@@ -10895,6 +11054,8 @@ async fn api_export_create(
         ),
     )
     .await;
+
+    cleanup_share_clip_artifacts(&state.media_dir, &id);
 
     match export_res {
         Ok(Ok(())) => Json(json!({
@@ -10938,10 +11099,21 @@ pub struct RenameExportBody {
 async fn api_export_rename(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<RenameExportBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         let permitted = state
             .db
@@ -26391,6 +26563,900 @@ cameras:
         assert!(
             !r_ex_mp4.exists() && !r_ex_hash.exists() && !c_ex_mp4.exists(),
             "expired JTI rejection must clean up orphaned target artifacts"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn security_share_link_round10_audit_findings_regression_work() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_sec_share_r10_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let cfg_path = tmp_dir.join("config.yml");
+        let web_dir = tmp_dir.join("web-v2");
+        let media_dir = tmp_dir.join("media");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
+
+        let yaml = format!(
+            r#"
+version: 0.18-0
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/front_door
+          roles: [record, detect]
+  backyard:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/backyard
+          roles: [record, detect]
+"#,
+            db_path.display()
+        );
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+            .await
+            .unwrap();
+        let auth_app = build_router_with_auth(state.clone(), true);
+
+        let now = unix_now();
+        let make_jwt = |sub: &str, role: &str, allowed_cameras: Option<&str>| -> String {
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &JwtClaims {
+                    sub: sub.to_string(),
+                    role: role.to_string(),
+                    allowed_cameras: allowed_cameras.map(str::to_string),
+                    iat: now,
+                    exp: now + 3600,
+                },
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            )
+            .unwrap()
+        };
+
+        let admin_jwt = make_jwt("admin", "admin", Some("*"));
+        let admin_bearer = format!("Bearer {admin_jwt}");
+        let admin_cookie = format!("ninjanvr_token={admin_jwt}");
+        state
+            .db
+            .create_user_with_cameras("scoped_r10_fd", "pass1234", "operator", "front_door", 1000)
+            .unwrap();
+        let scoped_fd_jwt = make_jwt("scoped_r10_fd", "operator", Some("front_door"));
+        let scoped_fd_bearer = format!("Bearer {scoped_fd_jwt}");
+
+        let exports_dir = media_dir.join("exports");
+        let clips_dir = media_dir.join("clips");
+        let rec_dir = media_dir.join("recordings/2026-11-04/12/front_door");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        let mp4_payload: Vec<u8> = (0u8..128u8).collect();
+        for exp_id in [
+            "exp_r10_clamped1",
+            "exp_r10_clamped2",
+            "exp_r10_auto_keep",
+            "exp_r10_auto_u",
+            "exp_r10_auto_del",
+            "exp_r10_auto_tok",
+            "exp_r10_stale_red",
+            "exp_r10_stale_clip",
+            "exp_r10_rename",
+        ] {
+            std::fs::write(exports_dir.join(format!("{exp_id}.mp4")), &mp4_payload).unwrap();
+            state
+                .db
+                .insert_export(&ExportRow {
+                    id: exp_id.to_string(),
+                    camera: "front_door".to_string(),
+                    name: format!("R10 {exp_id}"),
+                    date: 1700000100.0,
+                    video_path: format!("/media/ninjanvr/exports/{exp_id}.mp4"),
+                    thumb_path: format!("/media/ninjanvr/clips/{exp_id}.webp"),
+                    in_progress: false,
+                })
+                .unwrap();
+        }
+
+        // =========================================================================
+        // 1. [R10-FINDING-01] Over-Clamped Initial Range Requests & Clamped Cursor Update
+        // =========================================================================
+        // 1a. Bounded initial `Range: bytes=0-65535` on a 128-byte MP4 (`Content-Range: bytes 0-127/128`)
+        //     returns `(true, 2)` in `next_stream_state_from_video_response` and seeds `active_streams = [2]`
+        //     on a `max_views = 1` link so subsequent range requests succeed!
+        let mut init_clamp_hdrs = HeaderMap::new();
+        init_clamp_hdrs.insert(header::RANGE, "bytes=0-65535".parse().unwrap());
+        let resp_unit_clamp = serve_mp4_bytes_with_range(mp4_payload.clone(), &init_clamp_hdrs);
+        assert_eq!(resp_unit_clamp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            next_stream_state_from_video_response(&resp_unit_clamp, Some((0, Some(65535)))),
+            (true, 2)
+        );
+
+        let resp_share_c1 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r10_clamped1","expires_in_sec":3600,"max_views":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let c1_json: Value =
+            serde_json::from_slice(&to_bytes(resp_share_c1.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let c1_jti = c1_json["id"].as_str().unwrap().to_string();
+        let c1_tok = c1_json["token"].as_str().unwrap().to_string();
+
+        for rng in ["bytes=0-65535", "bytes=16-63", "bytes=64-127"] {
+            let r = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{c1_tok}/video.mp4"))
+                        .header(header::RANGE, rng)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::PARTIAL_CONTENT,
+                "Range {rng} after clamped initial Range: bytes=0-65535 must succeed on max_views=1"
+            );
+        }
+        assert_eq!(
+            state.db.get_share_link(&c1_jti).unwrap().unwrap()["access_count"],
+            1
+        );
+
+        // 1b. 2-byte initial probe `Range: bytes=0-1` followed by over-clamped `Range: bytes=0-65535`
+        //     updates `active_streams[pos]` to response-clamped `min_next_start` (2) rather than unclamped 65536,
+        //     so subsequent `Range: bytes=16-63` succeeds!
+        let resp_share_c2 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r10_clamped2","expires_in_sec":3600,"max_views":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let c2_json: Value =
+            serde_json::from_slice(&to_bytes(resp_share_c2.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let c2_jti = c2_json["id"].as_str().unwrap().to_string();
+        let c2_tok = c2_json["token"].as_str().unwrap().to_string();
+
+        for rng in ["bytes=0-1", "bytes=0-65535", "bytes=16-63"] {
+            let r = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{c2_tok}/video.mp4"))
+                        .header(header::RANGE, rng)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::PARTIAL_CONTENT,
+                "Range {rng} in 2-byte probe -> over-clamped 0-65535 -> 16-63 sequence must succeed"
+            );
+        }
+        assert_eq!(
+            state
+                .share_page_video_credits
+                .lock()
+                .unwrap()
+                .get(&c2_jti)
+                .unwrap()
+                .active_streams,
+            vec![64]
+        );
+
+        // =========================================================================
+        // 2. [R10-FINDING-02] Bounded Selective Eviction & Pruning of `share_creator_auto_revoked`
+        // =========================================================================
+        // 2a. `prune_share_creator_auto_revoked` and `purge_revoked_share_credits` prune expired/deleted JTIs
+        //     while retaining active-TTL auto-revoked JTIs
+        state
+            .db
+            .insert_share_link(
+                "shr_r10_auto_keep",
+                "export",
+                "exp_r10_auto_keep",
+                Some("front_door"),
+                "ghost_deleted_creator",
+                now as f64,
+                (now + 3600) as f64,
+            )
+            .unwrap();
+        let keep_tok = sign_share_token(
+            &state.jwt_secret,
+            &ShareTokenPayload {
+                k: "export".to_string(),
+                id: "exp_r10_auto_keep".to_string(),
+                exp: now + 3600,
+                cam: Some("front_door".to_string()),
+                jti: Some("shr_r10_auto_keep".to_string()),
+            },
+        );
+        // Trigger auto-revocation on `shr_r10_auto_keep` -> 403 FORBIDDEN & stored in `share_creator_auto_revoked`
+        let r_keep_init = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{keep_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_keep_init.status(), StatusCode::FORBIDDEN);
+        assert!(
+            state
+                .share_creator_auto_revoked
+                .lock()
+                .unwrap()
+                .contains_key("shr_r10_auto_keep")
+        );
+
+        // Seed 511 synthetic expired/missing JTIs in `share_creator_auto_revoked` (bringing len to 512)
+        {
+            let mut auto_map = state.share_creator_auto_revoked.lock().unwrap();
+            for i in 0..511 {
+                auto_map.insert(
+                    format!("shr_r10_stale_{i}"),
+                    "Share link creator user no longer exists",
+                );
+            }
+            assert_eq!(auto_map.len(), 512);
+        }
+        // `purge_revoked_share_credits` prunes the 511 missing/expired JTIs while keeping `shr_r10_auto_keep`
+        purge_revoked_share_credits(&state);
+        {
+            let auto_map = state.share_creator_auto_revoked.lock().unwrap();
+            assert_eq!(auto_map.len(), 1);
+            assert!(auto_map.contains_key("shr_r10_auto_keep"));
+        }
+
+        // 2b. When 512 active-TTL entries exist in `share_creator_auto_revoked`, inserting a 513th
+        //     auto-revoked JTI evicts only a single entry (NOT `auto_map.clear()`), keeping map len at 512!
+        {
+            let mut auto_map = state.share_creator_auto_revoked.lock().unwrap();
+            for i in 0..511 {
+                let jti_k = format!("shr_r10_cap_{i}");
+                state
+                    .db
+                    .insert_share_link(
+                        &jti_k,
+                        "export",
+                        "exp_r10_auto_keep",
+                        Some("front_door"),
+                        "ghost_deleted_creator",
+                        now as f64,
+                        (now + 3600) as f64,
+                    )
+                    .unwrap();
+                let _ = state.db.revoke_share_link(&jti_k);
+                auto_map.insert(jti_k, "Share link creator user no longer exists");
+            }
+            assert_eq!(auto_map.len(), 512);
+        }
+        state
+            .db
+            .insert_share_link(
+                "shr_r10_cap_512",
+                "export",
+                "exp_r10_auto_keep",
+                Some("front_door"),
+                "ghost_deleted_creator",
+                now as f64,
+                (now + 3600) as f64,
+            )
+            .unwrap();
+        let cap512_tok = sign_share_token(
+            &state.jwt_secret,
+            &ShareTokenPayload {
+                k: "export".to_string(),
+                id: "exp_r10_auto_keep".to_string(),
+                exp: now + 3600,
+                cam: Some("front_door".to_string()),
+                jti: Some("shr_r10_cap_512".to_string()),
+            },
+        );
+        let r_cap512 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{cap512_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_cap512.status(), StatusCode::FORBIDDEN);
+        {
+            let mut auto_map = state.share_creator_auto_revoked.lock().unwrap();
+            assert_eq!(
+                auto_map.len(),
+                512,
+                "512-cap eviction must evict a single entry instead of clearing all 512 entries"
+            );
+            assert!(auto_map.contains_key("shr_r10_cap_512"));
+            auto_map.retain(|k, _| k == "shr_r10_auto_keep");
+            auto_map.insert(
+                "shr_r10_auto_keep".to_string(),
+                "Share link creator user no longer exists",
+            );
+        }
+
+        // 2c. `api_user_role`, `api_user_delete`, and `api_token_delete` selectively remove only the
+        //     mutated/deleted creator's entries from `share_creator_auto_revoked`, preserving `shr_r10_auto_keep`!
+        state
+            .db
+            .create_user_with_cameras("r10_u_role", "pass1234", "operator", "*", 1000)
+            .unwrap();
+        state
+            .db
+            .create_user_with_cameras("r10_u_del", "pass1234", "operator", "*", 1000)
+            .unwrap();
+        let (tok_r10_meta, _) = state
+            .db
+            .create_api_token("r10_tok_del", "full", Some((now + 3600) as f64))
+            .unwrap();
+        let tok_r10_id = tok_r10_meta["id"].as_str().unwrap().to_string();
+
+        for (jti, exp_id, creator) in [
+            ("shr_r10_u_role", "exp_r10_auto_u", "r10_u_role"),
+            ("shr_r10_u_del", "exp_r10_auto_del", "ext:r10_u_del"),
+            ("shr_r10_tok_del", "exp_r10_auto_tok", "token:r10_tok_del"),
+        ] {
+            state
+                .db
+                .insert_share_link(
+                    jti,
+                    "export",
+                    exp_id,
+                    Some("front_door"),
+                    creator,
+                    now as f64,
+                    (now + 3600) as f64,
+                )
+                .unwrap();
+            state
+                .share_creator_auto_revoked
+                .lock()
+                .unwrap()
+                .insert(jti.to_string(), "Share link creator camera access revoked");
+        }
+
+        let r_role = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/users/r10_u_role/role")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"role":"viewer"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_role.status(), StatusCode::OK);
+        {
+            let auto_map = state.share_creator_auto_revoked.lock().unwrap();
+            assert!(!auto_map.contains_key("shr_r10_u_role"));
+            assert!(auto_map.contains_key("shr_r10_u_del"));
+            assert!(auto_map.contains_key("shr_r10_tok_del"));
+            assert!(auto_map.contains_key("shr_r10_auto_keep"));
+        }
+
+        let r_udel = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/users/r10_u_del")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_udel.status(), StatusCode::OK);
+        {
+            let auto_map = state.share_creator_auto_revoked.lock().unwrap();
+            assert!(!auto_map.contains_key("shr_r10_u_del"));
+            assert!(auto_map.contains_key("shr_r10_tok_del"));
+            assert!(auto_map.contains_key("shr_r10_auto_keep"));
+        }
+
+        let r_tdel = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/tokens/{tok_r10_id}"))
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_tdel.status(), StatusCode::OK);
+        {
+            let auto_map = state.share_creator_auto_revoked.lock().unwrap();
+            assert!(!auto_map.contains_key("shr_r10_tok_del"));
+            assert!(auto_map.contains_key("shr_r10_auto_keep"));
+        }
+
+        // `shr_r10_auto_keep` still returns 403 FORBIDDEN after all unrelated user/token mutations!
+        let r_keep_after = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{keep_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_keep_after.status(), StatusCode::FORBIDDEN);
+
+        // =========================================================================
+        // 3. [R10-FINDING-03] Invalidate Stale Cached Share Clips on Source mtime Update
+        //    & Verify Audio-Free Redacted/Clip Cache
+        // =========================================================================
+        let make_mp4_box = |box_type: &[u8; 4], payload: &[u8]| -> Vec<u8> {
+            let total = (8 + payload.len()) as u32;
+            let mut out = Vec::with_capacity(8 + payload.len());
+            out.extend_from_slice(&total.to_be_bytes());
+            out.extend_from_slice(box_type);
+            out.extend_from_slice(payload);
+            out
+        };
+        let make_mp4_full_box =
+            |box_type: &[u8; 4], version: u8, flags: u32, body: &[u8]| -> Vec<u8> {
+                let total = (12 + body.len()) as u32;
+                let mut out = Vec::with_capacity(12 + body.len());
+                out.extend_from_slice(&total.to_be_bytes());
+                out.extend_from_slice(box_type);
+                let vf = ((version as u32) << 24) | (flags & 0x00FF_FFFF);
+                out.extend_from_slice(&vf.to_be_bytes());
+                out.extend_from_slice(body);
+                out
+            };
+        let build_mp4_with_audio = || -> Vec<u8> {
+            let ftyp = make_mp4_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+            let mdat = make_mp4_box(b"mdat", &[0x11u8; 32]);
+            let mut hdlr_body = vec![0u8; 20];
+            hdlr_body[4..8].copy_from_slice(b"soun");
+            let hdlr = make_mp4_full_box(b"hdlr", 0, 0, &hdlr_body);
+            let mdia = make_mp4_box(b"mdia", &hdlr);
+            let soun_trak = make_mp4_box(b"trak", &mdia);
+            let moov = make_mp4_box(b"moov", &soun_trak);
+            let mut out = Vec::new();
+            out.extend_from_slice(&ftyp);
+            out.extend_from_slice(&mdat);
+            out.extend_from_slice(&moov);
+            out
+        };
+        let audio_mp4 = build_mp4_with_audio();
+
+        // 3a. Export redacted cache (`share_redacted_exp_r10_stale_red.mp4`):
+        //     invalidated when contains audio track OR when `source_path` mtime is newer than `redacted_path`!
+        let mask_val = json!([[[0.1, 0.1], [0.4, 0.1], [0.4, 0.4], [0.1, 0.4]]]);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("front_door").unwrap().privacy_mask = mask_val.clone();
+        }
+        let resp_sh_red = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r10_stale_red","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sh_red_tok = serde_json::from_slice::<Value>(
+            &to_bytes(resp_sh_red.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let red_art_path = exports_dir.join("share_redacted_exp_r10_stale_red.mp4");
+        let red_hash_path = exports_dir.join(".share_redacted_exp_r10_stale_red.mask_hash");
+        let src_red_path = exports_dir.join("exp_r10_stale_red.mp4");
+
+        // Pre-seed cached redacted file containing an audio track -> invalidated and removed!
+        std::fs::write(&red_art_path, &audio_mp4).unwrap();
+        std::fs::write(&red_hash_path, compute_privacy_mask_hash(Some(&mask_val))).unwrap();
+        let r_red_audio = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{sh_red_tok}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_red_audio.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !red_art_path.exists(),
+            "cached redacted MP4 containing audio track must be invalidated and removed"
+        );
+
+        // Pre-seed valid silent redacted file, then touch/update source export with newer mtime -> invalidated!
+        std::fs::write(&red_art_path, b"SILENT_REDACTED_V1").unwrap();
+        std::fs::write(&red_hash_path, compute_privacy_mask_hash(Some(&mask_val))).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        std::fs::write(&src_red_path, &mp4_payload).unwrap();
+        assert!(is_cached_share_artifact_stale(
+            &red_art_path,
+            std::slice::from_ref(&src_red_path)
+        ));
+        let r_red_stale = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{sh_red_tok}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_red_stale.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !red_art_path.exists(),
+            "stale cached redacted MP4 older than source_path must be invalidated and removed"
+        );
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("front_door").unwrap().privacy_mask = Value::Null;
+        }
+
+        // 3b. Export audio-stripped cache (`share_clip_exp_r10_stale_clip.mp4`):
+        //     invalidated when `source_path` mtime is newer than `clip_path`!
+        let src_clip_path = exports_dir.join("exp_r10_stale_clip.mp4");
+        std::fs::write(&src_clip_path, &audio_mp4).unwrap();
+        let resp_sh_clip = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r10_stale_clip","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sh_clip_tok = serde_json::from_slice::<Value>(
+            &to_bytes(resp_sh_clip.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let clip_art_path = exports_dir.join("share_clip_exp_r10_stale_clip.mp4");
+        std::fs::write(&clip_art_path, b"SILENT_STRIPPED_V1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        std::fs::write(&src_clip_path, &audio_mp4).unwrap();
+        assert!(is_cached_share_artifact_stale(
+            &clip_art_path,
+            std::slice::from_ref(&src_clip_path)
+        ));
+        let r_clip_stale = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{sh_clip_tok}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_clip_stale.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !clip_art_path.exists(),
+            "stale share_clip_<id>.mp4 older than source export must be invalidated and removed"
+        );
+
+        // 3c. Event/review unmasked (`share_clip_ev_r10_1.mp4`) & redacted (`share_redacted_ev_r10_1.mp4`):
+        //     invalidated when contains audio track OR when recording segment mtime is newer!
+        let rec_r10_seg = rec_dir.join("50.00.mp4");
+        std::fs::write(&rec_r10_seg, &mp4_payload).unwrap();
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "rec_r10_5000".to_string(),
+                camera: "front_door".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-04/12/front_door/50.00.mp4".to_string(),
+                start_time: 5000.0,
+                end_time: 5010.0,
+                duration: 10.0,
+                motion: 5,
+                objects: 1,
+                dbfs: -20,
+                segment_size: 0.1,
+                regions: 1,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_r10_1".to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: 5001.0,
+                end_time: Some(5008.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.9),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({}),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.9),
+                stationary: false,
+            })
+            .unwrap();
+        let resp_sh_ev = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"event","target_id":"ev_r10_1","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sh_ev_tok =
+            serde_json::from_slice::<Value>(&to_bytes(resp_sh_ev.into_body(), 4096).await.unwrap())
+                .unwrap()["token"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+        let ev_clip_path = exports_dir.join("share_clip_ev_r10_1.mp4");
+        // Cached `share_clip_ev_r10_1.mp4` with audio track -> invalidated and rebuilt from `rec_r10_seg`!
+        std::fs::write(&ev_clip_path, &audio_mp4).unwrap();
+        let r_ev_clip_audio = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{sh_ev_tok}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_ev_clip_audio.status(), StatusCode::OK);
+        let ev_audio_rebuilt = to_bytes(r_ev_clip_audio.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            &ev_audio_rebuilt[..],
+            &mp4_payload[..],
+            "event share_clip_<id>.mp4 containing audio track must be invalidated and rebuilt from source segment"
+        );
+
+        // Cached `share_clip_ev_r10_1.mp4` older than recording segment `rec_r10_seg` -> invalidated and rebuilt!
+        std::fs::write(&ev_clip_path, b"SILENT_EV_CLIP_V1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let updated_seg_bytes = b"UPDATED_REC_SEG_V2_PAYLOAD_BYTES".to_vec();
+        std::fs::write(&rec_r10_seg, &updated_seg_bytes).unwrap();
+        let r_ev_clip_stale = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{sh_ev_tok}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_ev_clip_stale.status(), StatusCode::OK);
+        let ev_stale_rebuilt = to_bytes(r_ev_clip_stale.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            &ev_stale_rebuilt[..],
+            &updated_seg_bytes[..],
+            "stale event share_clip_<id>.mp4 older than recording segment must be invalidated and rebuilt"
+        );
+
+        // Also verify event redacted (`share_redacted_ev_r10_1.mp4`) invalidates on audio track & stale mtime
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("front_door").unwrap().privacy_mask = mask_val.clone();
+        }
+        let ev_red_path = exports_dir.join("share_redacted_ev_r10_1.mp4");
+        let ev_red_hash = exports_dir.join(".share_redacted_ev_r10_1.mask_hash");
+        std::fs::write(&ev_red_path, &audio_mp4).unwrap();
+        std::fs::write(&ev_red_hash, compute_privacy_mask_hash(Some(&mask_val))).unwrap();
+        let r_ev_red_audio = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{sh_ev_tok}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_ev_red_audio.status(), StatusCode::NOT_FOUND);
+        assert!(!ev_red_path.exists());
+
+        std::fs::write(&ev_red_path, b"SILENT_EV_REDACTED_V1").unwrap();
+        std::fs::write(&ev_red_hash, compute_privacy_mask_hash(Some(&mask_val))).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        std::fs::write(&rec_r10_seg, &updated_seg_bytes).unwrap();
+        let r_ev_red_stale = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{sh_ev_tok}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_ev_red_stale.status(), StatusCode::NOT_FOUND);
+        assert!(!ev_red_path.exists());
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("front_door").unwrap().privacy_mask = Value::Null;
+        }
+
+        // 3d. `api_export_create` (`POST /api/export/front_door/start/5000/end/5010`) purges cached share artifacts!
+        let reexport_id = "front_door_5000_5010";
+        let reexport_red = exports_dir.join(format!("share_redacted_{reexport_id}.mp4"));
+        let reexport_hash = exports_dir.join(format!(".share_redacted_{reexport_id}.mask_hash"));
+        let reexport_clip = exports_dir.join(format!("share_clip_{reexport_id}.mp4"));
+        std::fs::write(&reexport_red, b"STALE_RED").unwrap();
+        std::fs::write(&reexport_hash, b"STALE_HASH").unwrap();
+        std::fs::write(&reexport_clip, b"STALE_CLIP").unwrap();
+
+        let _ = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export/front_door/start/5000/end/5010")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !reexport_red.exists() && !reexport_hash.exists() && !reexport_clip.exists(),
+            "api_export_create must purge any stale share_redacted_* and share_clip_* artifacts for the export ID"
+        );
+
+        // =========================================================================
+        // 4. [R10-FINDING-04] Cookie CSRF Guard & Handler Camera Scoping on
+        //    `api_export_create`, `api_export_rename`, `api_config_save`, and `api_config_structured`
+        // =========================================================================
+        for (method, uri, content_type, body) in [
+            (
+                "POST",
+                "/api/export/front_door/start/5000/end/5010",
+                "application/json",
+                r#"{"name":"csrf"}"#,
+            ),
+            (
+                "PATCH",
+                "/api/export/exp_r10_rename/rename",
+                "application/json",
+                r#"{"name":"csrf_renamed"}"#,
+            ),
+            (
+                "POST",
+                "/api/config/save",
+                "text/plain",
+                "version: 0.18-0\n",
+            ),
+            (
+                "PUT",
+                "/api/config/structured",
+                "application/json",
+                r#"{"cameras":{}}"#,
+            ),
+        ] {
+            let r_csrf = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::COOKIE, &admin_cookie)
+                        .header(header::ORIGIN, "https://evil.example")
+                        .header(header::HOST, "nvr.local:5000")
+                        .header(header::CONTENT_TYPE, content_type)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_csrf.status(),
+                StatusCode::FORBIDDEN,
+                "Cross-origin cookie request to {method} {uri} must be rejected with 403 FORBIDDEN"
+            );
+        }
+
+        // Handler-level camera scoping in `api_export_create` blocks percent-encoded unauthorized camera
+        let r_enc_cam = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/export/%62ackyard/start/5000/end/5010")
+                    .header(header::AUTHORIZATION, &scoped_fd_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_enc_cam.status(),
+            StatusCode::FORBIDDEN,
+            "api_export_create must enforce caller_allowed_cameras on percent-encoded camera parameter"
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
