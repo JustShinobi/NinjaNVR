@@ -1832,12 +1832,7 @@ impl RecordingEngine {
                 .await
                 {
                     for cp in clip_paths {
-                        let disk_path = if let Some(rel) = strip_media_root(&cp) {
-                            self.media_dir.join(rel)
-                        } else {
-                            PathBuf::from(cp)
-                        };
-                        let _ = std::fs::remove_file(disk_path);
+                        let _ = self.remove_contained_media_file(&cp);
                     }
                 }
 
@@ -1981,47 +1976,68 @@ impl RecordingEngine {
             }
 
             // Prune expired share links and remove orphaned share clip/redacted artifacts
-            let expired_or_revoked_targets = self
-                .db
-                .list_expired_or_revoked_share_link_targets(now)
-                .unwrap_or_default();
-            let _ = self.db.prune_expired_share_links(now);
-            let exports_dir = self.media_dir.join("exports");
-            let clips_dir = self.media_dir.join("clips");
-            for target_id in expired_or_revoked_targets {
-                let safe_id: String = target_id
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
-                    .collect();
-                if safe_id.is_empty() || safe_id != target_id || target_id.contains("..") {
-                    continue;
-                }
-                if !self
-                    .db
-                    .has_active_share_links_for_target(&target_id, now)
-                    .unwrap_or(false)
-                    && !self
-                        .db
-                        .has_recently_accessed_share_links_for_target(&target_id, now, 900.0)
-                        .unwrap_or(false)
-                {
-                    for path in [
-                        exports_dir.join(format!("share_redacted_{safe_id}.mp4")),
-                        exports_dir.join(format!(".share_redacted_{safe_id}.mask_hash")),
-                        exports_dir.join(format!("share_clip_{safe_id}.mp4")),
-                        clips_dir.join(format!("share_redacted_{safe_id}.webp")),
-                        clips_dir.join(format!("share_clip_{safe_id}.webp")),
-                    ] {
-                        let _ = std::fs::remove_file(path);
-                    }
-                }
-            }
+            self.prune_expired_share_link_artifacts(now);
 
             // Periodic SQLite query-planner optimization & WAL checkpointing
             let db_maint = self.db.clone();
             let _ = tokio::task::spawn_blocking(move || db_maint.run_maintenance()).await;
 
             tokio::time::sleep(std::time::Duration::from_secs(expire_interval)).await;
+        }
+    }
+
+    fn remove_contained_media_file(&self, cp: &str) -> bool {
+        let disk_path = if let Some(rel) = strip_media_root(cp) {
+            self.media_dir.join(rel)
+        } else {
+            PathBuf::from(cp)
+        };
+        if let Ok(canon_media_dir) = std::fs::canonicalize(&self.media_dir)
+            && let Ok(canon_file) = std::fs::canonicalize(&disk_path)
+            && canon_file.starts_with(&canon_media_dir)
+            && canon_file.is_file()
+        {
+            std::fs::remove_file(disk_path).is_ok()
+        } else {
+            false
+        }
+    }
+
+    fn prune_expired_share_link_artifacts(&self, now: f64) {
+        let expired_or_revoked_targets = self
+            .db
+            .list_expired_or_revoked_share_link_targets(now)
+            .unwrap_or_default();
+        let _ = self.db.prune_expired_share_links(now);
+        let exports_dir = self.media_dir.join("exports");
+        let clips_dir = self.media_dir.join("clips");
+        for target_id in expired_or_revoked_targets {
+            let safe_id: String = target_id
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+                .collect();
+            if safe_id.is_empty() || safe_id != target_id || target_id.contains("..") {
+                continue;
+            }
+            if !self
+                .db
+                .has_active_share_links_for_target(&target_id, now)
+                .unwrap_or(false)
+                && !self
+                    .db
+                    .has_recently_accessed_share_links_for_target(&target_id, now, 900.0)
+                    .unwrap_or(false)
+            {
+                for path in [
+                    exports_dir.join(format!("share_redacted_{safe_id}.mp4")),
+                    exports_dir.join(format!(".share_redacted_{safe_id}.mask_hash")),
+                    exports_dir.join(format!("share_clip_{safe_id}.mp4")),
+                    clips_dir.join(format!("share_redacted_{safe_id}.webp")),
+                    clips_dir.join(format!("share_clip_{safe_id}.webp")),
+                ] {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
         }
     }
 
@@ -4051,6 +4067,203 @@ mod tests {
             db.get_export_by_id("share_clip_ev_audio_leak")
                 .unwrap()
                 .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn retention_cleanup_enforces_canonical_media_dir_containment_and_honors_touched_share_links()
+     {
+        let root = std::env::temp_dir().join(format!(
+            "ninjanvr-retention-containment-{}",
+            random_suffix()
+        ));
+        let media_dir = root.join("media");
+        let outside_dir = root.join("outside");
+        std::fs::create_dir_all(media_dir.join("recordings")).unwrap();
+        std::fs::create_dir_all(media_dir.join("exports")).unwrap();
+        std::fs::create_dir_all(media_dir.join("clips")).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+        let cfg = Arc::new(RwLock::new(
+            NinjaConfig::from_yaml_str(
+                r#"
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/front_door
+          roles: [record]
+    record:
+      enabled: true
+      alerts:
+        retain:
+          days: 1
+      detections:
+        retain:
+          days: 1
+"#,
+                root.join("config.yml"),
+            )
+            .unwrap(),
+        ));
+        let engine = Arc::new(RecordingEngine::new(
+            cfg,
+            db.clone(),
+            media_dir.clone(),
+            new_activity_ledger(),
+        ));
+
+        let now = unix_now_f64();
+
+        // 1. Valid expired event inside media_dir -> its artifacts inside media_dir must be removed
+        let valid_clip_jpg = media_dir.join("clips/ev_exp_valid.jpg");
+        let valid_share_mp4 = media_dir.join("exports/share_redacted_ev_exp_valid.mp4");
+        std::fs::write(&valid_clip_jpg, b"jpg").unwrap();
+        std::fs::write(&valid_share_mp4, b"mp4").unwrap();
+        db.upsert_event(&EventDto {
+            id: "ev_exp_valid".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: serde_json::json!([]),
+            start_time: 100.0,
+            end_time: Some(110.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.9),
+            false_positive: Some(false),
+            box_coords: None,
+            data: serde_json::json!({"max_severity": "alert"}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.9),
+            stationary: false,
+        })
+        .unwrap();
+
+        // 2. Expired review segment whose thumb_path points outside media_dir (and a preview with .. traversal)
+        let outside_thumb = outside_dir.join("outside_thumb.webp");
+        let outside_preview = outside_dir.join("outside_preview.mp4");
+        let outside_symlink_target = outside_dir.join("symlink_target.webp");
+        std::fs::write(&outside_thumb, b"keep_outside_thumb").unwrap();
+        std::fs::write(&outside_preview, b"keep_outside_preview").unwrap();
+        std::fs::write(&outside_symlink_target, b"keep_symlink_target").unwrap();
+
+        let symlink_in_media = media_dir.join("clips/escape_link.webp");
+        std::os::unix::fs::symlink(&outside_symlink_target, &symlink_in_media).unwrap();
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_outside_thumb".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 100.0,
+            end_time: Some(110.0),
+            severity: "alert".to_string(),
+            thumb_path: outside_thumb.to_string_lossy().to_string(),
+            data: serde_json::json!({}),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_symlink_thumb".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 100.0,
+            end_time: Some(110.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/escape_link.webp".to_string(),
+            data: serde_json::json!({}),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+        db.insert_preview(
+            "prev_traversal",
+            "front_door",
+            "/media/ninjanvr/clips/../../outside/outside_preview.mp4",
+            100.0,
+            110.0,
+            10.0,
+        )
+        .unwrap();
+
+        // 3. Exhausted max_views = 1 share links:
+        //    - target_touched: initial access > 900s ago, but touched via touch_share_link_last_accessed 60s ago -> protected
+        //    - target_stale: initial access > 900s ago, never touched -> artifacts removed
+        let touched_artifact = media_dir.join("exports/share_clip_target_touched.mp4");
+        let stale_artifact = media_dir.join("exports/share_clip_target_stale.mp4");
+        std::fs::write(&touched_artifact, b"touched_stream").unwrap();
+        std::fs::write(&stale_artifact, b"stale_stream").unwrap();
+
+        db.insert_share_link_with_options(
+            "sl_touched",
+            "review",
+            "target_touched",
+            Some("front_door"),
+            "admin",
+            now - 3600.0,
+            now + 3600.0,
+            Some(1),
+        )
+        .unwrap();
+        assert!(
+            db.record_share_link_access("sl_touched", now - 1200.0)
+                .unwrap()
+        );
+        assert!(
+            db.touch_share_link_last_accessed("sl_touched", now - 60.0)
+                .unwrap()
+        );
+
+        db.insert_share_link_with_options(
+            "sl_stale",
+            "review",
+            "target_stale",
+            Some("front_door"),
+            "admin",
+            now - 3600.0,
+            now + 3600.0,
+            Some(1),
+        )
+        .unwrap();
+        assert!(
+            db.record_share_link_access("sl_stale", now - 1200.0)
+                .unwrap()
+        );
+
+        // Run retention cleanup artifact removal and share link pruning
+        let clip_paths = db
+            .cleanup_expired_events_and_reviews("front_door", 2000.0, 2000.0)
+            .unwrap();
+        for cp in &clip_paths {
+            let _ = engine.remove_contained_media_file(cp);
+        }
+        // Directory paths inside media_dir are also rejected by is_file()
+        assert!(!engine.remove_contained_media_file("/media/ninjanvr/clips"));
+
+        engine.prune_expired_share_link_artifacts(now);
+
+        // Contained expired artifacts were removed
+        assert!(!valid_clip_jpg.exists());
+        assert!(!valid_share_mp4.exists());
+
+        // Outside files and symlink targets outside media_dir were never unlinked
+        assert!(outside_thumb.exists());
+        assert!(outside_preview.exists());
+        assert!(outside_symlink_target.exists());
+
+        // Exhausted share link touched recently is preserved, while stale exhausted link is cleaned up
+        assert!(
+            touched_artifact.exists(),
+            "recently touched exhausted share link artifact must be preserved"
+        );
+        assert!(
+            !stale_artifact.exists(),
+            "stale exhausted share link artifact must be removed"
         );
 
         let _ = std::fs::remove_dir_all(&root);

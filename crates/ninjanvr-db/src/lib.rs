@@ -3816,6 +3816,22 @@ impl NinjaDatabase {
         Ok(updated > 0)
     }
 
+    pub fn touch_share_link_last_accessed(&self, id: &str, accessed_at: f64) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let updated = conn.execute(
+            r#"
+            UPDATE share_link
+            SET last_accessed_at = CASE
+                WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
+                ELSE last_accessed_at
+            END
+            WHERE id = ?1 AND revoked = 0
+            "#,
+            params![id, accessed_at],
+        )?;
+        Ok(updated > 0)
+    }
+
     pub fn prune_expired_share_links(&self, before_ts: f64) -> Result<usize> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let deleted = conn.execute(
@@ -4173,6 +4189,13 @@ impl NinjaDatabase {
     ) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let mut files_to_remove = Vec::new();
+        let is_safe_id = |id: &str| -> bool {
+            !id.is_empty()
+                && !id.contains("..")
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        };
 
         // 1. Expired review segments
         {
@@ -4212,13 +4235,16 @@ impl NinjaDatabase {
                     "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
                     params![id],
                 );
-                files_to_remove.push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
-                files_to_remove.push(format!(
-                    "/media/ninjanvr/exports/.share_redacted_{id}.mask_hash"
-                ));
-                files_to_remove.push(format!("/media/ninjanvr/exports/share_clip_{id}.mp4"));
-                files_to_remove.push(format!("/media/ninjanvr/clips/share_redacted_{id}.webp"));
-                files_to_remove.push(format!("/media/ninjanvr/clips/share_clip_{id}.webp"));
+                if is_safe_id(&id) {
+                    files_to_remove
+                        .push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
+                    files_to_remove.push(format!(
+                        "/media/ninjanvr/exports/.share_redacted_{id}.mask_hash"
+                    ));
+                    files_to_remove.push(format!("/media/ninjanvr/exports/share_clip_{id}.mp4"));
+                    files_to_remove.push(format!("/media/ninjanvr/clips/share_redacted_{id}.webp"));
+                    files_to_remove.push(format!("/media/ninjanvr/clips/share_clip_{id}.webp"));
+                }
             }
         }
 
@@ -4247,15 +4273,18 @@ impl NinjaDatabase {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             drop(stmt);
             for id in ids {
-                files_to_remove.push(format!("/media/ninjanvr/clips/{id}.jpg"));
-                files_to_remove.push(format!("/media/ninjanvr/clips/{camera}-{id}.webp"));
-                files_to_remove.push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
-                files_to_remove.push(format!(
-                    "/media/ninjanvr/exports/.share_redacted_{id}.mask_hash"
-                ));
-                files_to_remove.push(format!("/media/ninjanvr/exports/share_clip_{id}.mp4"));
-                files_to_remove.push(format!("/media/ninjanvr/clips/share_redacted_{id}.webp"));
-                files_to_remove.push(format!("/media/ninjanvr/clips/share_clip_{id}.webp"));
+                if is_safe_id(&id) {
+                    files_to_remove.push(format!("/media/ninjanvr/clips/{id}.jpg"));
+                    files_to_remove.push(format!("/media/ninjanvr/clips/{camera}-{id}.webp"));
+                    files_to_remove
+                        .push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
+                    files_to_remove.push(format!(
+                        "/media/ninjanvr/exports/.share_redacted_{id}.mask_hash"
+                    ));
+                    files_to_remove.push(format!("/media/ninjanvr/exports/share_clip_{id}.mp4"));
+                    files_to_remove.push(format!("/media/ninjanvr/clips/share_redacted_{id}.webp"));
+                    files_to_remove.push(format!("/media/ninjanvr/clips/share_clip_{id}.webp"));
+                }
                 let _ = conn.execute(
                     "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
                     params![id],
@@ -7512,6 +7541,205 @@ mod tests {
             !db.has_recently_accessed_share_links_for_target("rev_grace_rev_target", 1700.0, 900.0)
                 .unwrap()
         );
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn touch_share_link_last_accessed_extends_grace_window_and_cleanup_filters_unsafe_ids() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_share_touch_cleanup_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. touch_share_link_last_accessed on missing link returns false
+        assert!(
+            !db.touch_share_link_last_accessed("sl_missing", 1500.0)
+                .unwrap()
+        );
+
+        db.insert_share_link_with_options(
+            "sl_touch_1",
+            "review",
+            "rev_touch_target",
+            Some("front_door"),
+            "admin",
+            1000.0,
+            9000.0,
+            Some(1),
+        )
+        .unwrap();
+
+        // Touching when last_accessed_at IS NULL sets timestamp without incrementing access_count
+        assert!(
+            db.touch_share_link_last_accessed("sl_touch_1", 1500.0)
+                .unwrap()
+        );
+        let after_initial_touch = db.get_share_link("sl_touch_1").unwrap().unwrap();
+        assert_eq!(after_initial_touch["access_count"], 0);
+        assert_eq!(after_initial_touch["last_accessed_at"], 1500.0);
+
+        // Consume the single view at t = 1600.0 (access_count == 1 == max_views)
+        assert!(db.record_share_link_access("sl_touch_1", 1600.0).unwrap());
+        assert!(!db.record_share_link_access("sl_touch_1", 1605.0).unwrap());
+
+        // Without extending last_accessed_at, at t = 2505.0 (> 1600.0 + 900.0), grace window would be expired
+        assert!(
+            !db.has_recently_accessed_share_links_for_target("rev_touch_target", 2505.0, 900.0)
+                .unwrap()
+        );
+
+        // Active continuation playback touches last_accessed_at at t = 2300.0 on the exhausted link
+        assert!(
+            db.touch_share_link_last_accessed("sl_touch_1", 2300.0)
+                .unwrap()
+        );
+        let after_stream_touch = db.get_share_link("sl_touch_1").unwrap().unwrap();
+        assert_eq!(after_stream_touch["access_count"], 1);
+        assert_eq!(after_stream_touch["last_accessed_at"], 2300.0);
+
+        // Older timestamp does not regress last_accessed_at
+        assert!(
+            db.touch_share_link_last_accessed("sl_touch_1", 2000.0)
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_share_link("sl_touch_1").unwrap().unwrap()["last_accessed_at"],
+            2300.0
+        );
+
+        // Now at t = 2505.0 (< 2300.0 + 900.0 = 3200.0), target remains protected by grace window
+        assert!(
+            db.has_recently_accessed_share_links_for_target("rev_touch_target", 2505.0, 900.0)
+                .unwrap()
+        );
+        assert!(
+            !db.has_recently_accessed_share_links_for_target("rev_touch_target", 3200.0, 900.0)
+                .unwrap()
+        );
+
+        // Revoking the share link causes touch_share_link_last_accessed to reject updates
+        assert!(db.revoke_share_link("sl_touch_1").unwrap());
+        assert!(
+            !db.touch_share_link_last_accessed("sl_touch_1", 4000.0)
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_share_link("sl_touch_1").unwrap().unwrap()["last_accessed_at"],
+            2300.0
+        );
+
+        // 2. cleanup_expired_events_and_reviews only pushes derived paths for safe IDs
+        for id in [
+            "ev_safe_ok.1",
+            "../ev_traversal",
+            "ev/slash",
+            "ev..dots",
+            "ev$bad",
+        ] {
+            db.upsert_event(&EventDto {
+                id: id.to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: 1000.0,
+                end_time: Some(1010.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.9),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({"max_severity": "alert"}),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.9),
+                stationary: false,
+            })
+            .unwrap();
+            db.insert_share_link(
+                &format!("sl_ev_{id}"),
+                "event",
+                id,
+                Some("front_door"),
+                "admin",
+                1000.0,
+                9000.0,
+            )
+            .unwrap();
+        }
+
+        for id in [
+            "rev_safe-ok_1",
+            "../rev_traversal",
+            "rev/slash",
+            "rev..dots",
+        ] {
+            db.insert_review_segment(&ReviewItemDto {
+                id: id.to_string(),
+                camera: "front_door".to_string(),
+                start_time: 1000.0,
+                end_time: Some(1010.0),
+                severity: "alert".to_string(),
+                thumb_path: String::new(),
+                data: json!({}),
+                has_been_reviewed: false,
+            })
+            .unwrap();
+            db.insert_share_link(
+                &format!("sl_rev_{id}"),
+                "review",
+                id,
+                Some("front_door"),
+                "admin",
+                1000.0,
+                9000.0,
+            )
+            .unwrap();
+        }
+
+        let removed = db
+            .cleanup_expired_events_and_reviews("front_door", 2000.0, 2000.0)
+            .unwrap();
+
+        // Safe IDs have their clip and share paths included
+        assert!(removed.contains(&"/media/ninjanvr/clips/ev_safe_ok.1.jpg".to_string()));
+        assert!(
+            removed.contains(&"/media/ninjanvr/clips/front_door-ev_safe_ok.1.webp".to_string())
+        );
+        assert!(
+            removed
+                .contains(&"/media/ninjanvr/exports/share_redacted_ev_safe_ok.1.mp4".to_string())
+        );
+        assert!(
+            removed
+                .contains(&"/media/ninjanvr/exports/share_redacted_rev_safe-ok_1.mp4".to_string())
+        );
+
+        // Unsafe IDs never produce derived paths in files_to_remove, though their DB rows and share links are cleaned up
+        for unsafe_id in [
+            "../ev_traversal",
+            "ev/slash",
+            "ev..dots",
+            "ev$bad",
+            "../rev_traversal",
+            "rev/slash",
+            "rev..dots",
+        ] {
+            assert!(
+                !removed.iter().any(|p| p.contains(unsafe_id)),
+                "unsafe id {unsafe_id} must not be interpolated into files_to_remove: {removed:?}"
+            );
+        }
+        assert!(db.get_event("../ev_traversal").unwrap().is_none());
+        assert!(db.get_review_by_id("../rev_traversal").unwrap().is_none());
+        assert!(db.is_share_link_revoked("sl_ev_../ev_traversal").unwrap());
+        assert!(db.is_share_link_revoked("sl_rev_../rev_traversal").unwrap());
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);
