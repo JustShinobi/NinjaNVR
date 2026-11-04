@@ -3808,6 +3808,7 @@ impl NinjaDatabase {
                 last_accessed_at = ?2
             WHERE id = ?1
               AND revoked = 0
+              AND expires_at > ?2
               AND (max_views IS NULL OR access_count < max_views)
             "#,
             params![id, accessed_at],
@@ -3833,7 +3834,9 @@ impl NinjaDatabase {
             r#"
             SELECT DISTINCT target_id
             FROM share_link
-            WHERE expires_at <= ?1 OR revoked != 0
+            WHERE expires_at <= ?1
+               OR revoked != 0
+               OR (max_views IS NOT NULL AND access_count >= max_views)
             "#,
         )?;
         let rows = stmt.query_map(params![before_ts], |r| r.get::<_, String>(0))?;
@@ -3853,6 +3856,7 @@ impl NinjaDatabase {
             WHERE target_id = ?1
               AND revoked = 0
               AND expires_at > ?2
+              AND (max_views IS NULL OR access_count < max_views)
             "#,
             params![target_id, now_ts],
             |r| r.get(0),
@@ -7250,6 +7254,125 @@ mod tests {
         db.prune_expired_share_links(6000.0).unwrap();
         assert!(db.get_share_link("sl_cam_fd_direct").unwrap().is_none());
         assert!(!db.is_share_link_active("sl_cam_fd_direct", 2000.0).unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn share_link_expiry_access_guard_and_exhausted_max_views_target_lifecycle_work() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_share_quota_expiry_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. record_share_link_access rejects accesses at or after expires_at without mutating counters
+        db.insert_share_link_with_options(
+            "sl_exp_bound",
+            "export",
+            "exp_target_bound",
+            Some("front_door"),
+            "admin",
+            1000.0,
+            2000.0,
+            Some(5),
+        )
+        .unwrap();
+
+        // Access strictly before expires_at succeeds
+        assert!(db.record_share_link_access("sl_exp_bound", 1999.5).unwrap());
+        let before_exp = db.get_share_link("sl_exp_bound").unwrap().unwrap();
+        assert_eq!(before_exp["access_count"], 1);
+        assert_eq!(before_exp["last_accessed_at"], 1999.5);
+
+        // Access at exact expires_at boundary (accessed_at == expires_at) and after expires_at returns Ok(false)
+        assert!(!db.record_share_link_access("sl_exp_bound", 2000.0).unwrap());
+        assert!(!db.record_share_link_access("sl_exp_bound", 2500.0).unwrap());
+        let after_exp_attempt = db.get_share_link("sl_exp_bound").unwrap().unwrap();
+        assert_eq!(after_exp_attempt["access_count"], 1);
+        assert_eq!(after_exp_attempt["last_accessed_at"], 1999.5);
+
+        // 2. Exhausted max_views link is included in list_expired_or_revoked_share_link_targets
+        //    and excluded from has_active_share_links_for_target even before expires_at
+        db.insert_share_link_with_options(
+            "sl_single_use",
+            "review",
+            "rev_single_target",
+            Some("front_door"),
+            "admin",
+            1000.0,
+            9000.0,
+            Some(1),
+        )
+        .unwrap();
+
+        // Before first view: target is active and not in expired/revoked/exhausted candidate list
+        assert!(
+            db.has_active_share_links_for_target("rev_single_target", 1500.0)
+                .unwrap()
+        );
+        let initial_candidates = db
+            .list_expired_or_revoked_share_link_targets(1500.0)
+            .unwrap();
+        assert!(!initial_candidates.contains(&"rev_single_target".to_string()));
+
+        // Consume the single allowed view well before expires_at (1600.0 < 9000.0)
+        assert!(
+            db.record_share_link_access("sl_single_use", 1600.0)
+                .unwrap()
+        );
+        assert!(
+            !db.record_share_link_access("sl_single_use", 1601.0)
+                .unwrap()
+        );
+
+        // Once access_count reaches max_views, has_active_share_links_for_target returns Ok(false)
+        assert!(
+            !db.has_active_share_links_for_target("rev_single_target", 1700.0)
+                .unwrap()
+        );
+
+        // And list_expired_or_revoked_share_link_targets includes the exhausted link's target before expires_at
+        let exhausted_candidates = db
+            .list_expired_or_revoked_share_link_targets(1700.0)
+            .unwrap();
+        assert!(exhausted_candidates.contains(&"rev_single_target".to_string()));
+
+        // If a sibling non-exhausted link is created for the same target, has_active_share_links_for_target becomes true again
+        db.insert_share_link_with_options(
+            "sl_sibling_active",
+            "review",
+            "rev_single_target",
+            Some("front_door"),
+            "admin",
+            1750.0,
+            9000.0,
+            Some(2),
+        )
+        .unwrap();
+        assert!(
+            db.has_active_share_links_for_target("rev_single_target", 1800.0)
+                .unwrap()
+        );
+
+        // Exhausting the sibling link transitions has_active_share_links_for_target back to false
+        assert!(
+            db.record_share_link_access("sl_sibling_active", 1810.0)
+                .unwrap()
+        );
+        assert!(
+            db.has_active_share_links_for_target("rev_single_target", 1820.0)
+                .unwrap()
+        );
+        assert!(
+            db.record_share_link_access("sl_sibling_active", 1830.0)
+                .unwrap()
+        );
+        assert!(
+            !db.has_active_share_links_for_target("rev_single_target", 1840.0)
+                .unwrap()
+        );
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);
