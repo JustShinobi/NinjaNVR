@@ -7,6 +7,7 @@ import {
   filterActiveAndRecentShareLinks,
   formatShareLinkRemainingTtl,
   formatShareLinkViews,
+  isValidShareTokenSegment,
 } from "../utils/shareLinks";
 import { executeCopyExistingShareLink } from "../views/ExportsWorkspace";
 
@@ -272,6 +273,76 @@ describe("shareLinks utilities", () => {
     expect(buildSharePublicUrl("https://nvr.example.test", "share/")).toBe("");
     expect(buildSharePublicUrl("https://nvr.example.test", "share//tok")).toBe("");
     expect(buildSharePublicUrl("http://localhost:5000", "   ")).toBe("");
+
+    // Single-segment token validation rejects path traversal, backslashes, extra segments, query strings, and hashes across all branches
+    expect(isValidShareTokenSegment("tok.sig")).toBe(true);
+    expect(isValidShareTokenSegment("")).toBe(false);
+    expect(isValidShareTokenSegment("..")).toBe(false);
+    expect(isValidShareTokenSegment("tok..sig")).toBe(false);
+    expect(isValidShareTokenSegment("tok/extra")).toBe(false);
+    expect(isValidShareTokenSegment("tok\\@evil")).toBe(false);
+    expect(isValidShareTokenSegment("tok?foo=bar")).toBe(false);
+    expect(isValidShareTokenSegment("tok#hash")).toBe(false);
+    expect(isValidShareTokenSegment("tok:colon")).toBe(false);
+
+    expect(
+      buildSharePublicUrl("https://nvr.local", "/share/../../admin")
+    ).toBe("");
+    expect(buildSharePublicUrl("https://nvr.local", "/share/tok\\@evil")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("https://nvr.local", "/share/tok/extra")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("https://nvr.local", "/share/tok?foo=bar")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("https://nvr.local", "/share/tok#frag")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("https://nvr.local", "share/../../admin")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("https://nvr.local", "share/tok\\@evil")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("https://nvr.local", "share/tok/extra")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("https://nvr.local", "share/tok?foo=bar")).toBe(
+      ""
+    );
+    expect(buildSharePublicUrl("https://nvr.local", "tok..sig")).toBe("");
+    expect(
+      buildSharePublicUrl(
+        "https://nvr.local",
+        "https://nvr.local/share/tok/extra"
+      )
+    ).toBe("");
+    expect(
+      buildSharePublicUrl(
+        "https://nvr.local",
+        "https://nvr.local/share/tok?foo=bar"
+      )
+    ).toBe("");
+    expect(
+      buildSharePublicUrl(
+        "https://nvr.local",
+        "https://nvr.local/share/tok#frag"
+      )
+    ).toBe("");
+    expect(
+      buildSharePublicUrl(
+        "https://nvr.local",
+        "https://nvr.local/share/../../admin"
+      )
+    ).toBe("");
+    expect(
+      buildSharePublicUrl(
+        "https://nvr.local",
+        "https://nvr.local/share/tok\\@evil"
+      )
+    ).toBe("");
   });
 
   test("formatShareLinkViews formats bounded and unlimited view counts", () => {
@@ -842,5 +913,44 @@ describe("shareLinks utilities", () => {
     expect(copiedD).toEqual([]);
     expect(refreshCountD).toBe(2);
     expect(notificationsD).toEqual(["Failed to generate share link"]);
+
+    // Case E: Rotating a link with < 30 minutes remaining formats TTL with formatShareLinkRemainingTtl (never "0h")
+    const shortTtlLink = makeShareLink({
+      id: "shr_rot_short",
+      target_id: "exp_short",
+      expires_at: Math.floor(Date.now() / 1000) + 900,
+      revoked: false,
+    });
+    const copiedShort: Array<{ url: string; ttl?: string }> = [];
+
+    await executeCopyExistingShareLink(shortTtlLink, {
+      creatingShareId: null,
+      fetchShareLinks: async () => [shortTtlLink],
+      shareUrlMap: {},
+      setShareUrlMap: () => {},
+      setGeneratedShareUrl: () => {},
+      copyUrlToClipboard: async (url, ttl) => {
+        copiedShort.push({ url, ttl });
+      },
+      notify: () => {},
+      origin: "https://nvr.example.test",
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method || "GET";
+        if (method === "DELETE") {
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return new Response(
+          JSON.stringify({
+            id: "shr_rot_short_new",
+            url: "/share/short_rot.sig",
+          }),
+          { status: 200 }
+        );
+      }) as unknown as typeof fetch,
+    });
+
+    expect(copiedShort.length).toBe(1);
+    expect(copiedShort[0].ttl).not.toBe("0h");
+    expect(copiedShort[0].ttl).toMatch(/^(14m \d+s|15m)$/);
   });
 });

@@ -215,7 +215,9 @@ export async function executeCopyExistingShareLink(
       await fetchShareLinks();
       await copyUrlToClipboard(
         fullUrl,
-        `${Math.round(rotation.expiresInSec / 3600)}h`
+        formatShareLinkRemainingTtl(
+          Math.floor(Date.now() / 1000) + rotation.expiresInSec
+        )
       );
     } else {
       await fetchShareLinks();
@@ -362,7 +364,10 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           }));
         }
         await fetchShareLinks();
-        await copyUrlToClipboard(fullUrl, `${Math.round(ttlToUse / 3600)}h`);
+        await copyUrlToClipboard(
+          fullUrl,
+          formatShareLinkRemainingTtl(Math.floor(Date.now() / 1000) + ttlToUse)
+        );
       } else {
         notify(
           (typeof data?.message === "string" && data.message) ||

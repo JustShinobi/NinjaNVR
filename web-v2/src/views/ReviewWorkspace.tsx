@@ -90,20 +90,21 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [reviewPlateDraft, setReviewPlateDraft] = React.useState("");
   const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
   const bumpSubLabelsRefresh = useNvrStore((s) => s.bumpSubLabelsRefresh);
+  const [shareTtlSec, setShareTtlSec] = React.useState<number>(86400);
+  const [shareMaxViews, setShareMaxViews] = React.useState<number>(0);
+  const [shareCopied, setShareCopied] = React.useState(false);
+  const [shareError, setShareError] = React.useState<string | null>(null);
+  const [shareFallbackUrl, setShareFallbackUrl] = React.useState<string | null>(null);
+  const [shareCreating, setShareCreating] = React.useState(false);
+  const shareCopiedTimerRef = React.useRef<number | null>(null);
+  const activeReviewIdRef = React.useRef<string | null>(activeReview?.id ?? null);
+  activeReviewIdRef.current = activeReview?.id ?? null;
 
   React.useEffect(() => {
     setReviewNoteDraft(activeReview?.data?.notes || "");
     const firstSub = activeReview?.data?.sub_labels?.[0] || "";
     setReviewFaceDraft(firstSub && firstSub !== "unknown" ? firstSub : "");
     setReviewPlateDraft(activeReview?.data?.recognized_license_plates?.[0] || "");
-    if (shareCopiedTimerRef.current !== null) {
-      window.clearTimeout(shareCopiedTimerRef.current);
-      shareCopiedTimerRef.current = null;
-    }
-    setShareError(null);
-    setShareFallbackUrl(null);
-    setShareCopied(false);
-    setShareCreating(false);
   }, [
     activeReview?.id,
     activeReview?.data?.notes,
@@ -112,7 +113,20 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   ]);
 
   React.useEffect(() => {
+    activeReviewIdRef.current = activeReview?.id ?? null;
+    if (shareCopiedTimerRef.current !== null) {
+      window.clearTimeout(shareCopiedTimerRef.current);
+      shareCopiedTimerRef.current = null;
+    }
+    setShareError(null);
+    setShareFallbackUrl(null);
+    setShareCopied(false);
+    setShareCreating(false);
+  }, [activeReview?.id]);
+
+  React.useEffect(() => {
     if (!activeReview || !reviews.some((r) => r.id === activeReview.id)) {
+      activeReviewIdRef.current = null;
       if (shareCopiedTimerRef.current !== null) {
         window.clearTimeout(shareCopiedTimerRef.current);
         shareCopiedTimerRef.current = null;
@@ -228,13 +242,6 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
       });
     }
   };
-  const [shareTtlSec, setShareTtlSec] = React.useState<number>(86400);
-  const [shareMaxViews, setShareMaxViews] = React.useState<number>(0);
-  const [shareCopied, setShareCopied] = React.useState(false);
-  const [shareError, setShareError] = React.useState<string | null>(null);
-  const [shareFallbackUrl, setShareFallbackUrl] = React.useState<string | null>(null);
-  const [shareCreating, setShareCreating] = React.useState(false);
-  const shareCopiedTimerRef = React.useRef<number | null>(null);
   const [briefingActive, setBriefingActive] = React.useState(false);
   const [briefingSpeed, setBriefingSpeed] = React.useState<1 | 2 | 4>(2);
   const [briefingAutoMark, setBriefingAutoMark] = React.useState(true);
@@ -918,6 +925,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     disabled={shareCreating}
                     onClick={async () => {
                       if (shareCreating) return;
+                      const requestReviewId = activeReview.id;
+                      activeReviewIdRef.current = requestReviewId;
                       if (shareCopiedTimerRef.current !== null) {
                         window.clearTimeout(shareCopiedTimerRef.current);
                         shareCopiedTimerRef.current = null;
@@ -933,12 +942,15 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                           credentials: "include",
                           body: JSON.stringify({
                             kind: "review",
-                            target_id: activeReview.id,
+                            target_id: requestReviewId,
                             expires_in_sec: shareTtlSec,
                             ...(shareMaxViews > 0 ? { max_views: shareMaxViews } : {}),
                           }),
                         });
                         const data = await res.json().catch(() => ({}));
+                        if (activeReviewIdRef.current !== requestReviewId) {
+                          return;
+                        }
                         if (!res.ok || !(data?.url || data?.token)) {
                           const errMsg =
                             (typeof data?.message === "string" && data.message) ||
@@ -971,20 +983,30 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                             copiedOk = false;
                           }
                         }
+                        if (activeReviewIdRef.current !== requestReviewId) {
+                          return;
+                        }
                         if (copiedOk) {
                           setShareCopied(true);
                           shareCopiedTimerRef.current = window.setTimeout(() => {
-                            setShareCopied(false);
+                            if (activeReviewIdRef.current === requestReviewId) {
+                              setShareCopied(false);
+                            }
                             shareCopiedTimerRef.current = null;
                           }, 2000);
                         } else {
                           setShareCopied(false);
                         }
                       } catch {
+                        if (activeReviewIdRef.current !== requestReviewId) {
+                          return;
+                        }
                         setShareError(t.review.shareError);
                         setShareCopied(false);
                       } finally {
-                        setShareCreating(false);
+                        if (activeReviewIdRef.current === requestReviewId) {
+                          setShareCreating(false);
+                        }
                       }
                     }}
                     title="Copy HMAC-signed shareable link for this review event"

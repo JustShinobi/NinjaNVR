@@ -119,6 +119,10 @@ export function filterActiveAndRecentShareLinks(
   });
 }
 
+export function isValidShareTokenSegment(seg: string): boolean {
+  return seg.length > 0 && !seg.includes("..") && !/[:/?#\\]/.test(seg);
+}
+
 export function buildSharePublicUrl(
   origin: string,
   tokenOrUrl: string
@@ -127,7 +131,7 @@ export function buildSharePublicUrl(
   if (!rawTarget || /[\u0000-\u0020\u007f]/.test(rawTarget)) {
     return "";
   }
-  if (rawTarget.startsWith("//")) {
+  if (rawTarget.startsWith("//") || rawTarget.includes("..")) {
     return "";
   }
 
@@ -137,10 +141,14 @@ export function buildSharePublicUrl(
     try {
       const parsed = new URL(rawTarget);
       if (
-        !parsed.pathname.startsWith("/share/") ||
-        parsed.pathname.startsWith("/share//") ||
-        parsed.pathname.slice("/share/".length).trim().length === 0
+        parsed.search !== "" ||
+        parsed.hash !== "" ||
+        !parsed.pathname.startsWith("/share/")
       ) {
+        return "";
+      }
+      const tokenSeg = parsed.pathname.slice("/share/".length).trim();
+      if (!isValidShareTokenSegment(tokenSeg)) {
         return "";
       }
       if (cleanOrigin) {
@@ -149,7 +157,7 @@ export function buildSharePublicUrl(
           return "";
         }
       }
-      return `${parsed.origin}${parsed.pathname}${parsed.search}${parsed.hash}`;
+      return `${parsed.origin}/share/${tokenSeg}`;
     } catch {
       return "";
     }
@@ -157,23 +165,21 @@ export function buildSharePublicUrl(
 
   let path: string;
   if (rawTarget.startsWith("/share/")) {
-    if (
-      rawTarget.startsWith("/share//") ||
-      rawTarget.slice("/share/".length).trim().length === 0
-    ) {
+    const tokenSeg = rawTarget.slice("/share/".length).trim();
+    if (!isValidShareTokenSegment(tokenSeg)) {
       return "";
     }
-    path = rawTarget;
+    path = `/share/${tokenSeg}`;
   } else if (rawTarget.startsWith("share/")) {
-    const rest = rawTarget.slice("share/".length).trim();
-    if (!rest || rest.startsWith("/")) {
+    const tokenSeg = rawTarget.slice("share/".length).trim();
+    if (!isValidShareTokenSegment(tokenSeg)) {
       return "";
     }
-    path = `/${rawTarget}`;
+    path = `/share/${tokenSeg}`;
   } else if (rawTarget.startsWith("/")) {
     return "";
   } else {
-    if (/[:/?#\\]/.test(rawTarget)) {
+    if (!isValidShareTokenSegment(rawTarget)) {
       return "";
     }
     path = `/share/${rawTarget}`;
