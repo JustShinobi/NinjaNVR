@@ -45,7 +45,10 @@ export function computeShareLinkRotationParams(
     return null;
   }
   const now = resolveNowSec(nowSec);
-  const expiresInSec = Math.max(60, Math.floor(link.expires_at - now));
+  const expiresInSec = Math.floor(link.expires_at - now);
+  if (expiresInSec <= 0) {
+    return null;
+  }
   let remainingMaxViews: number | null = null;
   if (
     typeof link.max_views === "number" &&

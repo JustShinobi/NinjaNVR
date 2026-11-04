@@ -253,16 +253,40 @@ describe("shareLinks utilities", () => {
       revokeOldId: "shr_unlim",
     });
 
-    // Clamps expiresInSec >= 60 when link is active but < 60s from expiration
+    // Preserves exact expiresInSec without artificial 60s floor extension when < 60s remaining
     const nearExpiryLink = makeShareLink({
       id: "shr_near",
-      expires_at: nowSec + 15,
+      expires_at: nowSec + 25,
     });
     expect(computeShareLinkRotationParams(nearExpiryLink, nowSec)).toEqual({
-      expiresInSec: 60,
+      expiresInSec: 25,
       remainingMaxViews: null,
       revokeOldId: "shr_near",
     });
+
+    const oneSecLeftLink = makeShareLink({
+      id: "shr_one_sec",
+      expires_at: nowSec + 1.8,
+    });
+    expect(computeShareLinkRotationParams(oneSecLeftLink, nowSec)).toEqual({
+      expiresInSec: 1,
+      remainingMaxViews: null,
+      revokeOldId: "shr_one_sec",
+    });
+
+    // Sub-second remaining TTL (floor 0) returns null instead of extending TTL
+    expect(
+      computeShareLinkRotationParams(
+        makeShareLink({ id: "shr_subsec_9", expires_at: nowSec + 0.9 }),
+        nowSec
+      )
+    ).toBeNull();
+    expect(
+      computeShareLinkRotationParams(
+        makeShareLink({ id: "shr_subsec_1", expires_at: nowSec + 0.1 }),
+        nowSec
+      )
+    ).toBeNull();
 
     // Active link with max_views: 5 and access_count: 3 -> remainingMaxViews: 2
     const partialQuotaLink = makeShareLink({

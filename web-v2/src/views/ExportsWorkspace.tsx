@@ -79,20 +79,27 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   const [creatingShareId, setCreatingShareId] = React.useState<string | null>(null);
   const [revokingShareId, setRevokingShareId] = React.useState<string | null>(null);
 
-  const fetchShareLinks = React.useCallback(async () => {
-    try {
-      const res = await fetch("/api/share", {
-        credentials: "include",
-      });
-      if (!res.ok) return;
-      const data = await res.json().catch(() => null);
-      if (Array.isArray(data)) {
-        setShareLinks(data as ShareLinkItem[]);
+  const fetchShareLinks = React.useCallback(
+    async (): Promise<ShareLinkItem[] | null> => {
+      try {
+        const res = await fetch("/api/share", {
+          credentials: "include",
+        });
+        if (!res.ok) return null;
+        const data = await res.json().catch(() => null);
+        if (Array.isArray(data)) {
+          const parsed = data as ShareLinkItem[];
+          setShareLinks(parsed);
+          return parsed;
+        }
+        return null;
+      } catch {
+        // Preserve last known share links state on transient network error
+        return null;
       }
-    } catch {
-      // Preserve last known share links state on transient network error
-    }
-  }, []);
+    },
+    []
+  );
 
   React.useEffect(() => {
     void fetchShareLinks();
@@ -182,7 +189,6 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   };
 
   const handleCopyExistingShareLink = async (link: ShareLinkItem) => {
-    if (computeShareLinkStatus(link) !== "active") return;
     const knownUrl =
       shareUrlMap[link.id] ||
       (link.url
@@ -191,17 +197,43 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           ? buildSharePublicUrl(window.location.origin, link.token)
           : "");
     if (knownUrl) {
+      if (computeShareLinkStatus(link) !== "active") {
+        notify("Share link is no longer active");
+        return;
+      }
       await copyUrlToClipboard(knownUrl);
       return;
     }
-    const rotation = computeShareLinkRotationParams(link);
-    if (!rotation) return;
     if (creatingShareId !== null) return;
     setCreatingShareId(link.target_id);
     try {
+      const latestLinks = await fetchShareLinks();
+      const currentLink = latestLinks?.find((l) => l.id === link.id) ?? link;
+      const rotation = computeShareLinkRotationParams(currentLink);
+      if (!rotation) {
+        notify("Share link is no longer active");
+        return;
+      }
+      let delRes: Response;
+      try {
+        delRes = await fetch(
+          `/api/share/${encodeURIComponent(rotation.revokeOldId)}`,
+          {
+            method: "DELETE",
+            credentials: "include",
+          }
+        );
+      } catch {
+        notify("Failed to revoke previous share link");
+        return;
+      }
+      if (!delRes.ok && delRes.status !== 404) {
+        notify("Failed to revoke previous share link");
+        return;
+      }
       const payload: Record<string, unknown> = {
-        kind: link.kind || "export",
-        target_id: link.target_id,
+        kind: currentLink.kind || "export",
+        target_id: currentLink.target_id,
         expires_in_sec: rotation.expiresInSec,
       };
       if (
@@ -223,14 +255,6 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           window.location.origin,
           data.url || data.token
         );
-        try {
-          await fetch(`/api/share/${encodeURIComponent(rotation.revokeOldId)}`, {
-            method: "DELETE",
-            credentials: "include",
-          });
-        } catch {
-          // Best-effort revocation if network hiccups after minting replacement
-        }
         setShareUrlMap((prev) => {
           const next = { ...prev };
           delete next[rotation.revokeOldId];
@@ -245,6 +269,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           `${Math.round(rotation.expiresInSec / 3600)}h`
         );
       } else {
+        await fetchShareLinks();
         notify(
           (typeof data?.message === "string" && data.message) ||
             "Failed to generate share link"
@@ -572,15 +597,85 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                     title={t.exports.deleteBtn}
                     onClick={async (e) => {
                       e.stopPropagation();
-                      await fetch(`/api/export/${encodeURIComponent(ex.id)}`, {
-                        method: "DELETE",
-                        credentials: "include",
-                      });
-                      setExportsList((prev) => prev.filter((i) => i.id !== ex.id));
-                      if (activeExportPreview?.id === ex.id) {
-                        setActiveExportPreview(null);
+                      try {
+                        const res = await fetch(
+                          `/api/export/${encodeURIComponent(ex.id)}`,
+                          {
+                            method: "DELETE",
+                            credentials: "include",
+                          }
+                        );
+                        if (res.ok) {
+                          setExportsList((prev) =>
+                            prev.filter((i) => i.id !== ex.id)
+                          );
+                          if (activeExportPreview?.id === ex.id) {
+                            setActiveExportPreview(null);
+                          }
+                          const matchingLinks = shareLinks.filter(
+                            (l) => l.target_id === ex.id
+                          );
+                          const matchingIds = new Set(
+                            matchingLinks.map((l) => l.id)
+                          );
+                          const matchingUrls = new Set<string>();
+                          for (const l of matchingLinks) {
+                            if (shareUrlMap[l.id]) {
+                              matchingUrls.add(shareUrlMap[l.id]);
+                            }
+                            if (l.url) {
+                              matchingUrls.add(
+                                buildSharePublicUrl(
+                                  window.location.origin,
+                                  l.url
+                                )
+                              );
+                            }
+                            if (l.token) {
+                              matchingUrls.add(
+                                buildSharePublicUrl(
+                                  window.location.origin,
+                                  l.token
+                                )
+                              );
+                            }
+                          }
+                          if (shareUrlMap[ex.id]) {
+                            matchingUrls.add(shareUrlMap[ex.id]);
+                          }
+                          setShareUrlMap((prev) => {
+                            let changed = false;
+                            const next = { ...prev };
+                            for (const id of matchingIds) {
+                              if (id in next) {
+                                delete next[id];
+                                changed = true;
+                              }
+                            }
+                            if (ex.id in next) {
+                              delete next[ex.id];
+                              changed = true;
+                            }
+                            return changed ? next : prev;
+                          });
+                          if (matchingUrls.size > 0) {
+                            setGeneratedShareUrl((prev) =>
+                              matchingUrls.has(prev) ? "" : prev
+                            );
+                          }
+                          void fetchShareLinks();
+                          notify("Export deleted");
+                        } else {
+                          const data = await res.json().catch(() => ({}));
+                          notify(
+                            (typeof data?.message === "string" &&
+                              data.message) ||
+                              "Failed to delete export"
+                          );
+                        }
+                      } catch {
+                        notify("Failed to delete export");
                       }
-                      notify("Export deleted");
                     }}
                   >
                     <Trash2 size={12} />
