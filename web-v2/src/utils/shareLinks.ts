@@ -9,6 +9,12 @@ function resolveNowSec(nowSec?: number): number {
   return Math.floor(Date.now() / 1000);
 }
 
+export interface ShareLinkRotationPlan {
+  expiresInSec: number;
+  remainingMaxViews: number | null;
+  revokeOldId: string;
+}
+
 export function computeShareLinkStatus(
   link: ShareLinkItem,
   nowSec?: number
@@ -29,6 +35,32 @@ export function computeShareLinkStatus(
     return "exhausted";
   }
   return "active";
+}
+
+export function computeShareLinkRotationParams(
+  link: ShareLinkItem,
+  nowSec?: number
+): ShareLinkRotationPlan | null {
+  if (computeShareLinkStatus(link, nowSec) !== "active") {
+    return null;
+  }
+  const now = resolveNowSec(nowSec);
+  const expiresInSec = Math.max(60, Math.floor(link.expires_at - now));
+  let remainingMaxViews: number | null = null;
+  if (
+    typeof link.max_views === "number" &&
+    Number.isFinite(link.max_views) &&
+    link.max_views > 0
+  ) {
+    const used = Math.max(0, Math.floor(link.access_count ?? 0));
+    const rem = Math.max(1, Math.floor(link.max_views) - used);
+    remainingMaxViews = rem;
+  }
+  return {
+    expiresInSec,
+    remainingMaxViews,
+    revokeOldId: link.id,
+  };
 }
 
 export function formatShareLinkRemainingTtl(

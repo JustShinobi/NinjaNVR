@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { ShareLinkItem } from "../types/nvr";
 import {
   buildSharePublicUrl,
+  computeShareLinkRotationParams,
   computeShareLinkStatus,
   filterActiveAndRecentShareLinks,
   formatShareLinkRemainingTtl,
@@ -236,5 +237,135 @@ describe("shareLinks utilities", () => {
     );
     expect(formatShareLinkViews({ access_count: 2, max_views: 5 })).toBe("2/5");
     expect(formatShareLinkViews({ access_count: 1, max_views: 1 })).toBe("1/1");
+  });
+
+  test("computeShareLinkRotationParams preserves remaining TTL, view quota, and old link revocation target", () => {
+    // Active link without max_views (unlimited)
+    const unlimitedLink = makeShareLink({
+      id: "shr_unlim",
+      expires_at: nowSec + 3600,
+      max_views: null,
+      access_count: 12,
+    });
+    expect(computeShareLinkRotationParams(unlimitedLink, nowSec)).toEqual({
+      expiresInSec: 3600,
+      remainingMaxViews: null,
+      revokeOldId: "shr_unlim",
+    });
+
+    // Clamps expiresInSec >= 60 when link is active but < 60s from expiration
+    const nearExpiryLink = makeShareLink({
+      id: "shr_near",
+      expires_at: nowSec + 15,
+    });
+    expect(computeShareLinkRotationParams(nearExpiryLink, nowSec)).toEqual({
+      expiresInSec: 60,
+      remainingMaxViews: null,
+      revokeOldId: "shr_near",
+    });
+
+    // Active link with max_views: 5 and access_count: 3 -> remainingMaxViews: 2
+    const partialQuotaLink = makeShareLink({
+      id: "shr_quota_partial",
+      expires_at: nowSec + 7200,
+      max_views: 5,
+      access_count: 3,
+    });
+    expect(computeShareLinkRotationParams(partialQuotaLink, nowSec)).toEqual({
+      expiresInSec: 7200,
+      remainingMaxViews: 2,
+      revokeOldId: "shr_quota_partial",
+    });
+
+    // Active link with max_views: 5 and access_count: 4 -> remainingMaxViews: 1
+    expect(
+      computeShareLinkRotationParams(
+        makeShareLink({
+          id: "shr_quota_last",
+          expires_at: nowSec + 1800,
+          max_views: 5,
+          access_count: 4,
+        }),
+        nowSec
+      )
+    ).toEqual({
+      expiresInSec: 1800,
+      remainingMaxViews: 1,
+      revokeOldId: "shr_quota_last",
+    });
+
+    // Active link with max_views: 5 and access_count: 0 or undefined -> remainingMaxViews: 5
+    expect(
+      computeShareLinkRotationParams(
+        makeShareLink({
+          id: "shr_quota_zero",
+          expires_at: nowSec + 1200,
+          max_views: 5,
+          access_count: 0,
+        }),
+        nowSec
+      )
+    ).toEqual({
+      expiresInSec: 1200,
+      remainingMaxViews: 5,
+      revokeOldId: "shr_quota_zero",
+    });
+    expect(
+      computeShareLinkRotationParams(
+        makeShareLink({
+          id: "shr_quota_undef",
+          expires_at: nowSec + 1200,
+          max_views: 5,
+          access_count: undefined,
+        }),
+        nowSec
+      )
+    ).toEqual({
+      expiresInSec: 1200,
+      remainingMaxViews: 5,
+      revokeOldId: "shr_quota_undef",
+    });
+
+    // Inactive links (revoked, expired, exhausted) return null
+    expect(
+      computeShareLinkRotationParams(
+        makeShareLink({ id: "shr_revoked", revoked: true, expires_at: nowSec + 3600 }),
+        nowSec
+      )
+    ).toBeNull();
+    expect(
+      computeShareLinkRotationParams(
+        makeShareLink({ id: "shr_expired", expires_at: nowSec }),
+        nowSec
+      )
+    ).toBeNull();
+    expect(
+      computeShareLinkRotationParams(
+        makeShareLink({ id: "shr_expired_past", expires_at: nowSec - 100 }),
+        nowSec
+      )
+    ).toBeNull();
+    expect(
+      computeShareLinkRotationParams(
+        makeShareLink({
+          id: "shr_exhausted_eq",
+          expires_at: nowSec + 3600,
+          max_views: 5,
+          access_count: 5,
+        }),
+        nowSec
+      )
+    ).toBeNull();
+    expect(
+      computeShareLinkRotationParams(
+        makeShareLink({
+          id: "shr_exhausted_gt",
+          expires_at: nowSec + 3600,
+          max_views: 5,
+          access_count: 7,
+        }),
+        nowSec
+      )
+    ).toBeNull();
   });
 });

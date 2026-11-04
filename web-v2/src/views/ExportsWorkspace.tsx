@@ -12,6 +12,7 @@ import { formatDateTime } from "../utils/format";
 import {
   ShareLinkStatus,
   buildSharePublicUrl,
+  computeShareLinkRotationParams,
   computeShareLinkStatus,
   filterActiveAndRecentShareLinks,
   formatShareLinkRemainingTtl,
@@ -193,16 +194,67 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
       await copyUrlToClipboard(knownUrl);
       return;
     }
-    const remSec = Math.max(
-      60,
-      Math.floor(link.expires_at - Math.floor(Date.now() / 1000))
-    );
-    await handleCopyShareLink(
-      link.target_id,
-      link.kind || "export",
-      remSec,
-      link.max_views ?? null
-    );
+    const rotation = computeShareLinkRotationParams(link);
+    if (!rotation) return;
+    if (creatingShareId !== null) return;
+    setCreatingShareId(link.target_id);
+    try {
+      const payload: Record<string, unknown> = {
+        kind: link.kind || "export",
+        target_id: link.target_id,
+        expires_in_sec: rotation.expiresInSec,
+      };
+      if (
+        typeof rotation.remainingMaxViews === "number" &&
+        Number.isFinite(rotation.remainingMaxViews) &&
+        rotation.remainingMaxViews > 0
+      ) {
+        payload.max_views = rotation.remainingMaxViews;
+      }
+      const res = await fetch("/api/share", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && (data.url || data.token)) {
+        const fullUrl = buildSharePublicUrl(
+          window.location.origin,
+          data.url || data.token
+        );
+        try {
+          await fetch(`/api/share/${encodeURIComponent(rotation.revokeOldId)}`, {
+            method: "DELETE",
+            credentials: "include",
+          });
+        } catch {
+          // Best-effort revocation if network hiccups after minting replacement
+        }
+        setShareUrlMap((prev) => {
+          const next = { ...prev };
+          delete next[rotation.revokeOldId];
+          if (data.id) {
+            next[String(data.id)] = fullUrl;
+          }
+          return next;
+        });
+        await fetchShareLinks();
+        await copyUrlToClipboard(
+          fullUrl,
+          `${Math.round(rotation.expiresInSec / 3600)}h`
+        );
+      } else {
+        notify(
+          (typeof data?.message === "string" && data.message) ||
+            "Failed to generate share link"
+        );
+      }
+    } catch {
+      notify("Failed to generate share link");
+    } finally {
+      setCreatingShareId(null);
+    }
   };
 
   const handleRevokeShareLink = async (id: string) => {
