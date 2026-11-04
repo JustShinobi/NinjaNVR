@@ -944,9 +944,10 @@ impl NinjaDatabase {
             params![norm_role, target],
         )?;
         if norm_role == "viewer" {
+            let ext_target = format!("ext:{target}");
             conn.execute(
-                "UPDATE share_link SET revoked = 1 WHERE created_by = ?1",
-                params![target],
+                "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 OR created_by = ?2",
+                params![target, ext_target],
             )?;
         }
         Ok(updated > 0)
@@ -962,11 +963,43 @@ impl NinjaDatabase {
         } else {
             allowed_cameras.trim()
         };
+        let target = username.trim();
         let conn = self.conn.lock().expect("db mutex poisoned");
         let updated = conn.execute(
             "UPDATE user SET allowed_cameras = ?1 WHERE username = ?2",
-            params![norm, username.trim()],
+            params![norm, target],
         )?;
+        if updated > 0 && norm != "*" {
+            let allowed: Vec<&str> = norm
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let ext_target = format!("ext:{target}");
+            let mut stmt = conn.prepare(
+                "SELECT id, camera FROM share_link WHERE revoked = 0 AND (created_by = ?1 OR created_by = ?2)",
+            )?;
+            let rows = stmt.query_map(params![target, ext_target], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1).ok().flatten(),
+                ))
+            })?;
+            let mut revoke_ids = Vec::new();
+            for row in rows {
+                let (id, cam) = row?;
+                if !cam.as_deref().is_some_and(|c| allowed.contains(&c.trim())) {
+                    revoke_ids.push(id);
+                }
+            }
+            drop(stmt);
+            for id in revoke_ids {
+                conn.execute(
+                    "UPDATE share_link SET revoked = 1 WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+        }
         Ok(updated > 0)
     }
 
@@ -3856,10 +3889,12 @@ impl NinjaDatabase {
     }
 
     pub fn revoke_share_links_by_creator(&self, created_by: &str) -> Result<usize> {
+        let trimmed = created_by.trim();
+        let ext_creator = format!("ext:{trimmed}");
         let conn = self.conn.lock().expect("db mutex poisoned");
         let updated = conn.execute(
-            "UPDATE share_link SET revoked = 1 WHERE created_by = ?1",
-            params![created_by.trim()],
+            "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 OR created_by = ?2",
+            params![trimmed, ext_creator],
         )?;
         Ok(updated)
     }
@@ -3874,6 +3909,18 @@ impl NinjaDatabase {
             )
             .optional()?;
         Ok(revoked.unwrap_or(0) != 0)
+    }
+
+    pub fn is_share_link_active(&self, id: &str, now_ts: f64) -> Result<bool> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let row: Option<(i64, f64)> = conn
+            .query_row(
+                "SELECT revoked, expires_at FROM share_link WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.is_some_and(|(revoked, expires_at)| revoked == 0 && expires_at > now_ts))
     }
 
     pub fn insert_export(&self, exp: &ExportRow) -> Result<()> {
@@ -7014,6 +7061,195 @@ mod tests {
             !db.has_active_share_links_for_target("ev_keep_share", 5000.0)
                 .unwrap()
         );
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn share_link_ext_creator_camera_scoping_revocation_and_is_share_link_active_work() {
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_share_r4_db_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        db.create_user_with_cameras("admin_root", "StrongPass123!", "admin", "*", 1000)
+            .unwrap();
+        db.create_user_with_cameras(
+            "scoped_op",
+            "StrongPass123!",
+            "operator",
+            "front_door,backyard,garage",
+            1000,
+        )
+        .unwrap();
+        db.create_user_with_cameras("role_op", "StrongPass123!", "operator", "*", 1000)
+            .unwrap();
+
+        // 1. revoke_share_links_by_creator revokes both `<user>` and `ext:<user>` (trimmed)
+        db.insert_share_link(
+            "sl_creator_direct",
+            "event",
+            "ev_1",
+            Some("front_door"),
+            "del_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_creator_ext",
+            "event",
+            "ev_2",
+            Some("front_door"),
+            "ext:del_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_creator_other",
+            "event",
+            "ev_3",
+            Some("front_door"),
+            "ext:other_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+
+        let revoked_count = db.revoke_share_links_by_creator("  del_op  ").unwrap();
+        assert_eq!(revoked_count, 2);
+        assert!(db.is_share_link_revoked("sl_creator_direct").unwrap());
+        assert!(db.is_share_link_revoked("sl_creator_ext").unwrap());
+        assert!(!db.is_share_link_revoked("sl_creator_other").unwrap());
+
+        // 2. update_user_role to viewer revokes both `<user>` and `ext:<user>` links
+        db.insert_share_link(
+            "sl_role_direct",
+            "event",
+            "ev_4",
+            Some("front_door"),
+            "role_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_role_ext",
+            "event",
+            "ev_5",
+            Some("front_door"),
+            "ext:role_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        assert!(db.update_user_role("  role_op  ", "viewer").unwrap());
+        assert!(db.is_share_link_revoked("sl_role_direct").unwrap());
+        assert!(db.is_share_link_revoked("sl_role_ext").unwrap());
+        assert!(!db.is_share_link_revoked("sl_creator_other").unwrap());
+
+        // 3. update_user_allowed_cameras revokes disallowed or NULL camera links for `<user>` and `ext:<user>`
+        db.insert_share_link(
+            "sl_cam_fd_direct",
+            "event",
+            "ev_fd",
+            Some("front_door"),
+            "scoped_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_cam_by_ext",
+            "event",
+            "ev_by",
+            Some("backyard"),
+            "ext:scoped_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_cam_gar_direct",
+            "event",
+            "ev_gar",
+            Some("garage"),
+            "scoped_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_cam_gar_ext",
+            "event",
+            "ev_gar_ext",
+            Some("garage"),
+            "ext:scoped_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_cam_null_direct",
+            "export",
+            "exp_null",
+            None,
+            "scoped_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_cam_null_ext",
+            "export",
+            "exp_null_ext",
+            None,
+            "ext:scoped_op",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_cam_admin_gar",
+            "event",
+            "ev_admin_gar",
+            Some("garage"),
+            "admin_root",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+
+        assert!(
+            db.update_user_allowed_cameras("  scoped_op  ", " front_door , backyard ")
+                .unwrap()
+        );
+        assert!(!db.is_share_link_revoked("sl_cam_fd_direct").unwrap());
+        assert!(!db.is_share_link_revoked("sl_cam_by_ext").unwrap());
+        assert!(db.is_share_link_revoked("sl_cam_gar_direct").unwrap());
+        assert!(db.is_share_link_revoked("sl_cam_gar_ext").unwrap());
+        assert!(db.is_share_link_revoked("sl_cam_null_direct").unwrap());
+        assert!(db.is_share_link_revoked("sl_cam_null_ext").unwrap());
+        assert!(!db.is_share_link_revoked("sl_cam_admin_gar").unwrap());
+
+        // 4. is_share_link_active fail-closed semantics (missing, pruned, revoked, expired vs active)
+        assert!(!db.is_share_link_active("sl_nonexistent", 2000.0).unwrap());
+        // Active link (revoked == 0, expires_at == 5000.0 > now_ts)
+        assert!(db.is_share_link_active("sl_cam_fd_direct", 2000.0).unwrap());
+        assert!(db.is_share_link_active("sl_cam_fd_direct", 4999.9).unwrap());
+        // Expired boundary and past expiry (expires_at <= now_ts)
+        assert!(!db.is_share_link_active("sl_cam_fd_direct", 5000.0).unwrap());
+        assert!(!db.is_share_link_active("sl_cam_fd_direct", 6000.0).unwrap());
+        // Revoked link (revoked != 0 even when expires_at > now_ts)
+        assert!(
+            !db.is_share_link_active("sl_cam_gar_direct", 2000.0)
+                .unwrap()
+        );
+        // Pruned link returns false
+        db.prune_expired_share_links(6000.0).unwrap();
+        assert!(db.get_share_link("sl_cam_fd_direct").unwrap().is_none());
+        assert!(!db.is_share_link_active("sl_cam_fd_direct", 2000.0).unwrap());
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);

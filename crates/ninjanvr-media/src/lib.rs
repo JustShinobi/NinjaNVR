@@ -544,19 +544,25 @@ pub fn mp4_file_has_audio_track(path: &Path) -> bool {
         } else {
             (size32, 8u64)
         };
-        if box_size < hdr_len || pos + box_size > file_len {
+        if box_size < hdr_len {
             break;
         }
         if &btype == b"moov" {
-            let mut moov = vec![0u8; (box_size - hdr_len).min(262_144) as usize];
+            if box_size - hdr_len > 16 * 1024 * 1024 {
+                return true;
+            }
+            let mut moov = vec![0u8; (box_size - hdr_len) as usize];
             if file.read_exact(&mut moov).is_err() {
-                break;
+                return true;
             }
             if let Some((_, total_audio_bytes, sample_count, _)) = extract_soun_sample_stats(&moov)
             {
                 return sample_count > 0 && total_audio_bytes > 0;
             }
             return moov_has_soun_trak(&moov);
+        }
+        if pos + box_size > file_len {
+            break;
         }
         pos += box_size;
     }
@@ -3947,6 +3953,55 @@ mod tests {
         assert!(!mp4_file_has_audio_track(&empty_soun_path));
         assert!(mp4_file_has_audio_track(&minimal_soun_trak_path));
         assert!(mp4_file_has_audio_track(&seg_with_audio));
+
+        // moov > 256 KB (e.g. 300 KB free padding before trak):
+        // - video-only moov > 256 KB returns false
+        // - audio-bearing moov > 256 KB (where soun trak sits past 256 KB offset) returns true
+        let padding_300kb = make_box(b"free", &vec![0u8; 300 * 1024]);
+        let mut vide_hdlr_body = vec![0u8; 24];
+        vide_hdlr_body[8..12].copy_from_slice(b"vide");
+        let vide_trak = make_box(
+            b"trak",
+            &make_box(b"mdia", &make_box(b"hdlr", &vide_hdlr_body)),
+        );
+        let soun_trak = make_box(b"trak", &make_box(b"mdia", &make_box(b"hdlr", &hdlr_body)));
+
+        let mut large_video_moov_body = Vec::with_capacity(padding_300kb.len() + vide_trak.len());
+        large_video_moov_body.extend_from_slice(&padding_300kb);
+        large_video_moov_body.extend_from_slice(&vide_trak);
+        let large_video_only_path = root.join("large_moov_video_only.mp4");
+        std::fs::write(
+            &large_video_only_path,
+            make_box(b"moov", &large_video_moov_body),
+        )
+        .unwrap();
+        assert!(!mp4_file_has_audio_track(&large_video_only_path));
+
+        let mut large_audio_moov_body = Vec::with_capacity(padding_300kb.len() + soun_trak.len());
+        large_audio_moov_body.extend_from_slice(&padding_300kb);
+        large_audio_moov_body.extend_from_slice(&soun_trak);
+        let large_audio_path = root.join("large_moov_with_audio.mp4");
+        std::fs::write(&large_audio_path, make_box(b"moov", &large_audio_moov_body)).unwrap();
+        assert!(mp4_file_has_audio_track(&large_audio_path));
+
+        // moov > 16 MB fails closed (returns true)
+        let oversized_moov_path = root.join("oversized_moov_gt_16mb.mp4");
+        let oversized_box_size: u32 = (16 * 1024 * 1024 + 8 + 1) as u32;
+        let mut oversized_hdr = Vec::with_capacity(16);
+        oversized_hdr.extend_from_slice(&oversized_box_size.to_be_bytes());
+        oversized_hdr.extend_from_slice(b"moov");
+        oversized_hdr.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&oversized_moov_path, &oversized_hdr).unwrap();
+        assert!(mp4_file_has_audio_track(&oversized_moov_path));
+
+        // Truncated/unreadable moov body fails closed (returns true)
+        let truncated_moov_path = root.join("truncated_moov.mp4");
+        let mut truncated_moov = Vec::with_capacity(16);
+        truncated_moov.extend_from_slice(&1024u32.to_be_bytes());
+        truncated_moov.extend_from_slice(b"moov");
+        truncated_moov.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&truncated_moov_path, &truncated_moov).unwrap();
+        assert!(mp4_file_has_audio_track(&truncated_moov_path));
 
         let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
         db.insert_recording(&ninjanvr_db::RecordingRow {
