@@ -199,6 +199,11 @@ export async function executeCopyExistingShareLink(
     const data = await res.json().catch(() => ({}));
     if (res.ok && (data.url || data.token)) {
       const fullUrl = buildSharePublicUrl(origin, data.url || data.token);
+      if (!fullUrl) {
+        await fetchShareLinks();
+        notify("Failed to generate share link");
+        return;
+      }
       setShareUrlMap((prev) => {
         const next = { ...prev };
         delete next[rotation.revokeOldId];
@@ -346,6 +351,10 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           window.location.origin,
           data.url || data.token
         );
+        if (!fullUrl) {
+          notify("Failed to generate share link");
+          return;
+        }
         if (data.id) {
           setShareUrlMap((prev) => ({
             ...prev,

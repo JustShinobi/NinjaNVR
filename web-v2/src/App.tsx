@@ -634,6 +634,7 @@ export const App: React.FC = () => {
         body: JSON.stringify({ ids }),
       });
       setReviews((prev) => prev.filter((r) => !ids.includes(r.id)));
+      setActiveReview((curr) => (curr && ids.includes(curr.id) ? null : curr));
       notify(`Deleted ${ids.length} review segment(s)`);
     },
     [notify]

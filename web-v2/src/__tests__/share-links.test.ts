@@ -196,7 +196,7 @@ describe("shareLinks utilities", () => {
     expect(input).toEqual(snapshot);
   });
 
-  test("buildSharePublicUrl normalizes origins, relative paths, bare tokens, and full URLs", () => {
+  test("buildSharePublicUrl normalizes origins, relative paths, bare tokens, and full URLs while rejecting cross-origin and unsafe targets", () => {
     expect(
       buildSharePublicUrl("http://192.168.1.50:5000", "/share/tok.sig")
     ).toBe("http://192.168.1.50:5000/share/tok.sig");
@@ -209,18 +209,68 @@ describe("shareLinks utilities", () => {
     expect(buildSharePublicUrl("https://nvr.example.test", "tok.sig")).toBe(
       "https://nvr.example.test/share/tok.sig"
     );
-    expect(
-      buildSharePublicUrl("https://nvr.example.test", "/custom/path")
-    ).toBe("https://nvr.example.test/custom/path");
-    expect(buildSharePublicUrl("", "/custom/path")).toBe("/custom/path");
     expect(buildSharePublicUrl("", "/share/tok.sig")).toBe("/share/tok.sig");
     expect(buildSharePublicUrl("", "tok.sig")).toBe("/share/tok.sig");
+
+    // Same-origin full URLs are accepted
+    expect(
+      buildSharePublicUrl(
+        "https://nvr.example.test",
+        "https://nvr.example.test/share/tok.sig"
+      )
+    ).toBe("https://nvr.example.test/share/tok.sig");
+    expect(
+      buildSharePublicUrl("", "https://nvr.example.test/share/tok.sig")
+    ).toBe("https://nvr.example.test/share/tok.sig");
+
+    // Cross-origin full URLs are rejected
     expect(
       buildSharePublicUrl(
         "http://localhost:5000",
-        "https://cdn.example.test/share/tok.sig"
+        "https://evil.example/share/tok.sig"
       )
-    ).toBe("https://cdn.example.test/share/tok.sig");
+    ).toBe("");
+    expect(
+      buildSharePublicUrl(
+        "https://nvr.example.test",
+        "https://evil.example/share/tok.sig"
+      )
+    ).toBe("");
+
+    // Protocol-relative URLs, non-/share/ paths, javascript: URIs, whitespace/control chars, and empty /share/ are rejected
+    expect(
+      buildSharePublicUrl("https://nvr.example.test", "//evil.example/share/tok.sig")
+    ).toBe("");
+    expect(buildSharePublicUrl("", "//evil.example/share/tok.sig")).toBe("");
+    expect(
+      buildSharePublicUrl("https://nvr.example.test", "/api/logout")
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("https://nvr.example.test", "/custom/path")
+    ).toBe("");
+    expect(buildSharePublicUrl("", "/custom/path")).toBe("");
+    expect(
+      buildSharePublicUrl(
+        "https://nvr.example.test",
+        "https://nvr.example.test/api/logout"
+      )
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("https://nvr.example.test", "javascript:alert(1)")
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("https://nvr.example.test", "tok.sig\nwith-newline")
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("https://nvr.example.test", "/share/tok with space")
+    ).toBe("");
+    expect(
+      buildSharePublicUrl("https://nvr.example.test", "/share/\u0000tok")
+    ).toBe("");
+    expect(buildSharePublicUrl("https://nvr.example.test", "/share/")).toBe("");
+    expect(buildSharePublicUrl("https://nvr.example.test", "/share//tok")).toBe("");
+    expect(buildSharePublicUrl("https://nvr.example.test", "share/")).toBe("");
+    expect(buildSharePublicUrl("https://nvr.example.test", "share//tok")).toBe("");
     expect(buildSharePublicUrl("http://localhost:5000", "   ")).toBe("");
   });
 
@@ -749,5 +799,48 @@ describe("shareLinks utilities", () => {
     expect(refreshCountC).toBe(2);
     expect(copiedC.length).toBe(1);
     expect(copiedC[0].url).toBe("https://nvr.example.test/share/new_rot.sig");
+
+    // Case D: POST 200 returns an unsafe / cross-origin URL rejected by buildSharePublicUrl
+    let shareUrlMapD: Record<string, string> = {};
+    let refreshCountD = 0;
+    const copiedD: string[] = [];
+    const notificationsD: string[] = [];
+
+    await executeCopyExistingShareLink(rotLink, {
+      creatingShareId: null,
+      fetchShareLinks: async () => {
+        refreshCountD += 1;
+        return [rotLink];
+      },
+      shareUrlMap: shareUrlMapD,
+      setShareUrlMap: (updater) => {
+        shareUrlMapD =
+          typeof updater === "function" ? updater(shareUrlMapD) : updater;
+      },
+      setGeneratedShareUrl: () => {},
+      copyUrlToClipboard: async (url) => {
+        copiedD.push(url);
+      },
+      notify: (msg) => notificationsD.push(msg),
+      origin: "https://nvr.example.test",
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method || "GET";
+        if (method === "DELETE") {
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return new Response(
+          JSON.stringify({
+            id: "shr_rot_evil",
+            url: "https://evil.example/share/phish.sig",
+          }),
+          { status: 200 }
+        );
+      }) as unknown as typeof fetch,
+    });
+
+    expect(shareUrlMapD).toEqual({});
+    expect(copiedD).toEqual([]);
+    expect(refreshCountD).toBe(2);
+    expect(notificationsD).toEqual(["Failed to generate share link"]);
   });
 });

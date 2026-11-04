@@ -124,22 +124,58 @@ export function buildSharePublicUrl(
   tokenOrUrl: string
 ): string {
   const rawTarget = (tokenOrUrl || "").trim();
-  if (!rawTarget) {
+  if (!rawTarget || /[\u0000-\u0020\u007f]/.test(rawTarget)) {
     return "";
   }
-  if (/^https?:\/\//i.test(rawTarget)) {
-    return rawTarget;
+  if (rawTarget.startsWith("//")) {
+    return "";
   }
 
   const cleanOrigin = (origin || "").trim().replace(/\/+$/, "");
+
+  if (/^https?:\/\//i.test(rawTarget)) {
+    try {
+      const parsed = new URL(rawTarget);
+      if (
+        !parsed.pathname.startsWith("/share/") ||
+        parsed.pathname.startsWith("/share//") ||
+        parsed.pathname.slice("/share/".length).trim().length === 0
+      ) {
+        return "";
+      }
+      if (cleanOrigin) {
+        const expectedOrigin = new URL(cleanOrigin).origin.toLowerCase();
+        if (parsed.origin.toLowerCase() !== expectedOrigin) {
+          return "";
+        }
+      }
+      return `${parsed.origin}${parsed.pathname}${parsed.search}${parsed.hash}`;
+    } catch {
+      return "";
+    }
+  }
+
   let path: string;
   if (rawTarget.startsWith("/share/")) {
+    if (
+      rawTarget.startsWith("/share//") ||
+      rawTarget.slice("/share/".length).trim().length === 0
+    ) {
+      return "";
+    }
     path = rawTarget;
   } else if (rawTarget.startsWith("share/")) {
+    const rest = rawTarget.slice("share/".length).trim();
+    if (!rest || rest.startsWith("/")) {
+      return "";
+    }
     path = `/${rawTarget}`;
   } else if (rawTarget.startsWith("/")) {
-    path = rawTarget;
+    return "";
   } else {
+    if (/[:/?#\\]/.test(rawTarget)) {
+      return "";
+    }
     path = `/share/${rawTarget}`;
   }
 

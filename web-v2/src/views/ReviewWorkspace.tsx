@@ -112,6 +112,19 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   ]);
 
   React.useEffect(() => {
+    if (!activeReview || !reviews.some((r) => r.id === activeReview.id)) {
+      if (shareCopiedTimerRef.current !== null) {
+        window.clearTimeout(shareCopiedTimerRef.current);
+        shareCopiedTimerRef.current = null;
+      }
+      setShareError(null);
+      setShareFallbackUrl(null);
+      setShareCopied(false);
+      setShareCreating(false);
+    }
+  }, [reviews, activeReview]);
+
+  React.useEffect(() => {
     return () => {
       if (shareCopiedTimerRef.current !== null) {
         window.clearTimeout(shareCopiedTimerRef.current);
@@ -216,6 +229,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     }
   };
   const [shareTtlSec, setShareTtlSec] = React.useState<number>(86400);
+  const [shareMaxViews, setShareMaxViews] = React.useState<number>(0);
   const [shareCopied, setShareCopied] = React.useState(false);
   const [shareError, setShareError] = React.useState<string | null>(null);
   const [shareFallbackUrl, setShareFallbackUrl] = React.useState<string | null>(null);
@@ -887,6 +901,18 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     <option value={86400}>TTL: 24h</option>
                     <option value={604800}>TTL: 7d</option>
                   </select>
+                  <select
+                    className="nvr-select mono"
+                    aria-label="Share link maximum views"
+                    style={{ height: 28, fontSize: "var(--text-xs)" }}
+                    value={shareMaxViews}
+                    onChange={(e) => setShareMaxViews(Number(e.target.value))}
+                  >
+                    <option value={0}>Views: Unlimited</option>
+                    <option value={1}>Views: 1</option>
+                    <option value={5}>Views: 5</option>
+                    <option value={25}>Views: 25</option>
+                  </select>
                   <button
                     className={`nvr-btn mono ${shareError ? "danger" : shareCopied ? "success" : ""}`}
                     disabled={shareCreating}
@@ -909,6 +935,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                             kind: "review",
                             target_id: activeReview.id,
                             expires_in_sec: shareTtlSec,
+                            ...(shareMaxViews > 0 ? { max_views: shareMaxViews } : {}),
                           }),
                         });
                         const data = await res.json().catch(() => ({}));
@@ -925,6 +952,11 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                           window.location.origin,
                           data.url || data.token
                         );
+                        if (!fullUrl) {
+                          setShareError(t.review.shareError);
+                          setShareCopied(false);
+                          return;
+                        }
                         setShareFallbackUrl(fullUrl);
                         let copiedOk = false;
                         if (
