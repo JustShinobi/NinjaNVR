@@ -50,6 +50,7 @@ interface ExportsWorkspaceProps {
 
 export interface CopyExistingShareLinkDeps {
   creatingShareId?: string | null;
+  revokingShareId?: string | null;
   setCreatingShareId?: (id: string | null) => void;
   fetchShareLinks: () => Promise<ShareLinkItem[] | null>;
   shareUrlMap: Record<string, string>;
@@ -67,6 +68,7 @@ export async function executeCopyExistingShareLink(
 ): Promise<void> {
   const {
     creatingShareId,
+    revokingShareId,
     setCreatingShareId,
     fetchShareLinks,
     shareUrlMap,
@@ -79,7 +81,12 @@ export async function executeCopyExistingShareLink(
       : "",
     fetchImpl = fetch,
   } = deps;
-  if (creatingShareId !== null && creatingShareId !== undefined) return;
+  if (
+    (creatingShareId !== null && creatingShareId !== undefined) ||
+    (revokingShareId !== null && revokingShareId !== undefined)
+  ) {
+    return;
+  }
   setCreatingShareId?.(link.target_id);
   try {
     const latestLinks = await fetchShareLinks();
@@ -323,7 +330,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
     overrideTtlSec?: number,
     overrideMaxViews?: number | null
   ) => {
-    if (creatingShareId !== null) return;
+    if (creatingShareId !== null || revokingShareId !== null) return;
     setCreatingShareId(targetId);
     try {
       const ttlToUse = overrideTtlSec ?? shareTtlSec;
@@ -384,6 +391,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   const handleCopyExistingShareLink = async (link: ShareLinkItem) => {
     await executeCopyExistingShareLink(link, {
       creatingShareId,
+      revokingShareId,
       setCreatingShareId,
       fetchShareLinks,
       shareUrlMap,
@@ -395,7 +403,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   };
 
   const handleRevokeShareLink = async (id: string) => {
-    if (revokingShareId !== null) return;
+    if (creatingShareId !== null || revokingShareId !== null) return;
     setRevokingShareId(id);
     try {
       const res = await fetch(`/api/share/${encodeURIComponent(id)}`, {
@@ -684,7 +692,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                     className="nvr-btn mono"
                     style={{ height: 26, padding: "0 7px", fontSize: "var(--text-xs)" }}
                     title="Copy expiring HMAC-signed shareable link"
-                    disabled={creatingShareId !== null}
+                    disabled={creatingShareId !== null || revokingShareId !== null}
                     onClick={(e) => {
                       e.stopPropagation();
                       void handleCopyShareLink(ex.id);
@@ -922,7 +930,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                                 padding: "0 7px",
                                 fontSize: "var(--text-xs)",
                               }}
-                              disabled={creatingShareId !== null}
+                              disabled={creatingShareId !== null || revokingShareId !== null}
                               onClick={() => void handleCopyExistingShareLink(link)}
                               title={t.exports.copyLinkBtn}
                             >
@@ -937,7 +945,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                                 padding: "0 7px",
                                 fontSize: "var(--text-xs)",
                               }}
-                              disabled={revokingShareId !== null}
+                              disabled={creatingShareId !== null || revokingShareId !== null}
                               onClick={() => void handleRevokeShareLink(link.id)}
                               title={t.exports.revokeBtn}
                             >

@@ -953,4 +953,78 @@ describe("shareLinks utilities", () => {
     expect(copiedShort[0].ttl).not.toBe("0h");
     expect(copiedShort[0].ttl).toMatch(/^(14m \d+s|15m)$/);
   });
+
+  test("executeCopyExistingShareLink returns immediately without calling fetchShareLinks, DELETE, or POST when revokingShareId or creatingShareId is non-null", async () => {
+    const futureExpires = Math.floor(Date.now() / 1000) + 3600;
+    const link = makeShareLink({
+      id: "shr_concurrent_1",
+      target_id: "exp_concurrent_1",
+      expires_at: futureExpires,
+      revoked: false,
+    });
+
+    let fetchShareLinksCalls = 0;
+    let fetchCalls = 0;
+    const creatingTransitions: Array<string | null> = [];
+    const copiedUrls: string[] = [];
+    const notifications: string[] = [];
+
+    // 1. Concurrent revocation in flight (revokingShareId is non-null)
+    await executeCopyExistingShareLink(link, {
+      creatingShareId: null,
+      revokingShareId: "shr_concurrent_1",
+      setCreatingShareId: (id) => creatingTransitions.push(id),
+      fetchShareLinks: async () => {
+        fetchShareLinksCalls += 1;
+        return [link];
+      },
+      shareUrlMap: {},
+      setShareUrlMap: () => {},
+      setGeneratedShareUrl: () => {},
+      copyUrlToClipboard: async (url) => {
+        copiedUrls.push(url);
+      },
+      notify: (msg) => notifications.push(msg),
+      origin: "https://nvr.example.test",
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        throw new Error("fetchImpl must not be called when revokingShareId is non-null");
+      }) as unknown as typeof fetch,
+    });
+
+    expect(fetchShareLinksCalls).toBe(0);
+    expect(fetchCalls).toBe(0);
+    expect(creatingTransitions).toEqual([]);
+    expect(copiedUrls).toEqual([]);
+    expect(notifications).toEqual([]);
+
+    // 2. Concurrent creation/rotation in flight (creatingShareId is non-null)
+    await executeCopyExistingShareLink(link, {
+      creatingShareId: "exp_concurrent_1",
+      revokingShareId: null,
+      setCreatingShareId: (id) => creatingTransitions.push(id),
+      fetchShareLinks: async () => {
+        fetchShareLinksCalls += 1;
+        return [link];
+      },
+      shareUrlMap: {},
+      setShareUrlMap: () => {},
+      setGeneratedShareUrl: () => {},
+      copyUrlToClipboard: async (url) => {
+        copiedUrls.push(url);
+      },
+      notify: (msg) => notifications.push(msg),
+      origin: "https://nvr.example.test",
+      fetchImpl: (async () => {
+        fetchCalls += 1;
+        throw new Error("fetchImpl must not be called when creatingShareId is non-null");
+      }) as unknown as typeof fetch,
+    });
+
+    expect(fetchShareLinksCalls).toBe(0);
+    expect(fetchCalls).toBe(0);
+    expect(creatingTransitions).toEqual([]);
+    expect(copiedUrls).toEqual([]);
+    expect(notifications).toEqual([]);
+  });
 });
