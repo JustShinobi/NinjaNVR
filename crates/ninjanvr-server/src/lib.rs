@@ -289,11 +289,13 @@ pub struct AppState {
     pub share_ffmpeg_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SharePlaybackCredit {
     pub page_credits: usize,
     pub active_stream_started: bool,
     pub min_next_range_start: u64,
+    pub session_id: Option<String>,
+    pub session_expires_at: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -852,25 +854,87 @@ fn is_protected_path(path: &str) -> bool {
     ) {
         return false;
     }
-    path.starts_with("/api/")
-        || path == "/api"
-        || path.starts_with("/vod/")
-        || path.starts_with("/live/")
-        || path == "/ws"
-        || path.starts_with("/clips/")
-        || path.starts_with("/recordings/")
-        || path.starts_with("/exports/")
+    let check_protected = |p: &str| {
+        p.starts_with("/api/")
+            || p == "/api"
+            || p.starts_with("/vod/")
+            || p.starts_with("/live/")
+            || p == "/ws"
+            || p.starts_with("/clips/")
+            || p.starts_with("/recordings/")
+            || p.starts_with("/exports/")
+    };
+    if check_protected(path) {
+        return true;
+    }
+    percent_decode_path(path).is_some_and(|decoded| check_protected(&decoded))
+}
+
+fn percent_decode_segment(seg: &str) -> Option<String> {
+    let bytes = seg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return None;
+                }
+                let hi = (bytes[i + 1] as char).to_digit(16)?;
+                let lo = (bytes[i + 2] as char).to_digit(16)?;
+                let decoded = ((hi << 4) | lo) as u8;
+                if decoded == 0 || decoded == b'/' || decoded == b'\\' {
+                    return None;
+                }
+                out.push(decoded);
+                i += 3;
+            }
+            0 | b'/' | b'\\' => return None,
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+pub fn percent_decode_path(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return Some(String::new());
+    }
+    let mut decoded_segments = Vec::new();
+    for seg in raw.split('/') {
+        decoded_segments.push(percent_decode_segment(seg)?);
+    }
+    Some(decoded_segments.join("/"))
+}
+
+fn strip_static_media_prefix(p: &str) -> Option<&str> {
+    p.strip_prefix("/exports/")
+        .or_else(|| p.strip_prefix("/clips/"))
+        .or_else(|| p.strip_prefix("/recordings/"))
 }
 
 fn is_hidden_static_media_path(path: &str) -> bool {
-    if let Some(rest) = path
-        .strip_prefix("/exports/")
-        .or_else(|| path.strip_prefix("/clips/"))
+    let Some(decoded) = percent_decode_path(path) else {
+        return true;
+    };
+    if let Some(rest) = strip_static_media_prefix(path)
+        && rest.split('/').filter(|s| !s.is_empty()).any(|seg| {
+            seg.starts_with('.')
+                || seg.contains("..")
+                || seg.starts_with("%2e")
+                || seg.starts_with("%2E")
+        })
     {
+        return true;
+    }
+    if let Some(rest) = strip_static_media_prefix(&decoded) {
         return rest
             .split('/')
             .filter(|s| !s.is_empty())
-            .any(|seg| seg.starts_with('.') || seg.starts_with("%2e") || seg.starts_with("%2E"));
+            .any(|seg| seg.starts_with('.') || seg.contains(".."));
     }
     false
 }
@@ -879,6 +943,8 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
     if is_hidden_static_media_path(path) {
         return None;
     }
+    let decoded = percent_decode_path(path)?;
+    let path = decoded.as_str();
     if let Some(rest) = path.strip_prefix("/exports/") {
         let fname = rest.split('/').next().unwrap_or("");
         let raw_id = fname.strip_suffix(".mp4").unwrap_or(fname);
@@ -912,9 +978,6 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
     }
     if let Some(rest) = path.strip_prefix("/recordings/") {
         let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.first() == Some(&".staging") && parts.len() >= 2 {
-            return Some(parts[1].to_string());
-        }
         if parts.len() >= 3 && parts[0].len() == 10 && parts[0].chars().nth(4) == Some('-') {
             return Some(parts[2].to_string());
         }
@@ -1086,9 +1149,10 @@ async fn auth_gate_middleware(
                     &role,
                 )
             {
-                let is_static_media = path.starts_with("/exports/")
-                    || path.starts_with("/recordings/")
-                    || path.starts_with("/clips/");
+                let decoded_path = percent_decode_path(&path).unwrap_or_else(|| path.clone());
+                let is_static_media = decoded_path.starts_with("/exports/")
+                    || decoded_path.starts_with("/recordings/")
+                    || decoded_path.starts_with("/clips/");
                 let static_media_cam = if is_static_media {
                     resolve_static_media_camera(&state, &path)
                 } else {
@@ -2133,6 +2197,7 @@ async fn api_user_role(
         Ok(true) => {
             if body.role.trim().eq_ignore_ascii_case("viewer") {
                 let _ = state.db.revoke_share_links_by_creator(&username);
+                purge_revoked_share_credits(&state);
             }
             Json(json!({
                 "success": true,
@@ -2189,6 +2254,7 @@ async fn api_user_delete(
     match state.db.delete_user(&username) {
         Ok(true) => {
             let _ = state.db.revoke_share_links_by_creator(&username);
+            purge_revoked_share_credits(&state);
             Json(json!({
                 "success": true,
                 "message": format!("User '{username}' deleted"),
@@ -2273,6 +2339,7 @@ async fn api_token_delete(
                     .db
                     .revoke_share_links_by_creator(&format!("token:{name}"));
             }
+            purge_revoked_share_credits(&state);
             Json(json!({
                 "success": true,
                 "tokens": state.db.list_api_tokens().unwrap_or_default()
@@ -2385,8 +2452,7 @@ async fn caller_allowed_cameras(
     headers: &HeaderMap,
 ) -> Option<Vec<String>> {
     let cfg = state.config.read().await;
-    let (user, role) =
-        extract_authenticated_user(state, jar, headers, &cfg.auth.cookie_name, cfg.auth.enabled)?;
+    let (user, role) = extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)?;
     resolve_user_allowed_cameras(state, jar, headers, &cfg.auth, &user, &role)
 }
 
@@ -4792,6 +4858,7 @@ async fn api_review_delete(
 ) -> Json<Value> {
     let _ = state.db.delete_reviews(std::slice::from_ref(&id));
     let _ = state.db.revoke_share_links_for_target(None, &id);
+    purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
     Json(json!({ "success": true }))
 }
@@ -4805,6 +4872,7 @@ async fn api_reviews_delete(
         let _ = state.db.revoke_share_links_for_target(None, id);
         cleanup_share_clip_artifacts(&state.media_dir, id);
     }
+    purge_revoked_share_credits(&state);
     Json(json!({ "success": true }))
 }
 
@@ -4884,6 +4952,7 @@ async fn api_event_delete(
 ) -> Json<Value> {
     let _ = state.db.delete_event(&id);
     let _ = state.db.revoke_share_links_for_target(None, &id);
+    purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
     Json(json!({ "success": true }))
 }
@@ -4910,6 +4979,7 @@ async fn api_events_bulk_delete(
         let _ = state.db.revoke_share_links_for_target(None, id);
         cleanup_share_clip_artifacts(&state.media_dir, id);
     }
+    purge_revoked_share_credits(&state);
     Json(json!({ "success": true }))
 }
 
@@ -8185,10 +8255,38 @@ async fn api_share_revoke(
     if let Ok(mut map) = state.share_page_video_credits.lock() {
         map.remove(&id);
     }
-    if let Some(target_id) = link["target_id"].as_str() {
+    if let Some(target_id) = link["target_id"].as_str()
+        && !state
+            .db
+            .has_active_share_links_for_target(target_id, unix_now() as f64)
+            .unwrap_or(false)
+    {
         cleanup_share_clip_artifacts(&state.media_dir, target_id);
     }
     Json(json!({ "success": true, "id": id })).into_response()
+}
+
+fn purge_revoked_share_credits(state: &AppState) {
+    let keys: Vec<String> = state
+        .share_page_video_credits
+        .lock()
+        .ok()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+    if keys.is_empty() {
+        return;
+    }
+    let revoked_keys: Vec<String> = keys
+        .into_iter()
+        .filter(|jti| state.db.is_share_link_revoked(jti).unwrap_or(false))
+        .collect();
+    if !revoked_keys.is_empty()
+        && let Ok(mut map) = state.share_page_video_credits.lock()
+    {
+        for jti in revoked_keys {
+            map.remove(&jti);
+        }
+    }
 }
 
 async fn api_share_create(
@@ -8242,20 +8340,25 @@ async fn api_share_create(
     }
 
     let now = unix_now();
-    let exp = now + body.expires_in_sec.clamp(60, 86400 * 30);
+    let exp = now + body.expires_in_sec.clamp(1, 86400 * 30);
     let clamped_max_views = body.max_views.map(|v| v.max(1));
     let jti = format!("shr_{}_{:032x}", now, rand::random::<u128>());
     let created_by = {
         let cfg = state.config.read().await;
-        extract_authenticated_user(
-            &state,
-            &jar,
-            &headers,
-            &cfg.auth.cookie_name,
-            cfg.auth.enabled,
-        )
-        .map(|(u, _)| u)
-        .unwrap_or_else(|| "admin".to_string())
+        extract_authenticated_user_with_cfg(&state, &jar, &headers, &cfg.auth)
+            .map(|(u, _)| {
+                if u.starts_with("token:")
+                    || u.starts_with("ext:")
+                    || matches!(state.db.get_user(&u), Ok(Some(_)))
+                    || (u.eq_ignore_ascii_case("admin")
+                        && matches!(state.db.get_user(&u), Ok(None)))
+                {
+                    u
+                } else {
+                    format!("ext:{u}")
+                }
+            })
+            .unwrap_or_else(|| "admin".to_string())
     };
     if let Err(err) = state.db.insert_share_link_with_options(
         &jti,
@@ -8318,11 +8421,10 @@ fn parse_video_range_bounds(headers: &HeaderMap) -> Option<(u64, Option<u64>)> {
 }
 
 fn is_initial_or_unranged_video_request(headers: &HeaderMap) -> bool {
-    match parse_video_range_bounds(headers) {
-        None => true,
-        Some((0, _)) => true,
-        Some(_) => false,
+    if !headers.contains_key(header::RANGE) {
+        return true;
     }
+    matches!(parse_video_range_bounds(headers), Some((0, _)))
 }
 
 fn verify_share_jti(
@@ -8330,7 +8432,7 @@ fn verify_share_jti(
     payload: &ShareTokenPayload,
     now_ts: u64,
 ) -> std::result::Result<(), (StatusCode, &'static str)> {
-    verify_share_jti_with_view_mode(state, payload, now_ts, true, true).map(|_| ())
+    verify_share_jti_with_view_mode(state, payload, now_ts, true, true, None, false).map(|_| ())
 }
 
 fn verify_share_jti_with_view_mode(
@@ -8339,6 +8441,8 @@ fn verify_share_jti_with_view_mode(
     now_ts: u64,
     is_initial_request: bool,
     is_player_page: bool,
+    provided_sid: Option<&str>,
+    valid_continuation: bool,
 ) -> std::result::Result<bool, (StatusCode, &'static str)> {
     let Some(jti) = payload
         .jti
@@ -8377,15 +8481,27 @@ fn verify_share_jti_with_view_mode(
         .share_page_video_credits
         .lock()
         .ok()
-        .and_then(|map| map.get(jti).copied())
+        .and_then(|map| map.get(jti).cloned())
         .unwrap_or_default();
-    let has_page_credit =
-        !is_player_page && is_initial_request && access_count > 0 && credit_state.page_credits > 0;
+    let has_valid_sid = !is_player_page
+        && access_count > 0
+        && provided_sid.is_some_and(|sid| {
+            !sid.is_empty()
+                && credit_state.session_id.as_deref() == Some(sid)
+                && credit_state.session_expires_at > now_ts
+        });
+    let has_page_credit = !is_player_page
+        && provided_sid.is_none()
+        && is_initial_request
+        && !valid_continuation
+        && access_count > 0
+        && credit_state.page_credits > 0;
     let has_active_stream = !is_player_page
-        && !is_initial_request
+        && provided_sid.is_none()
+        && valid_continuation
         && access_count > 0
         && credit_state.active_stream_started;
-    let count_view = is_player_page || (!has_page_credit && !has_active_stream);
+    let count_view = is_player_page || (!has_valid_sid && !has_page_credit && !has_active_stream);
     if let Some(max_v) = link["max_views"].as_i64()
         && ((count_view && access_count >= max_v) || (!count_view && access_count > max_v))
     {
@@ -8394,7 +8510,9 @@ fn verify_share_jti_with_view_mode(
         {
             entry.active_stream_started = false;
             entry.min_next_range_start = u64::MAX;
-            if entry.page_credits == 0 {
+            if entry.page_credits == 0
+                && (entry.session_id.is_none() || entry.session_expires_at <= now_ts)
+            {
                 map.remove(jti);
             }
         }
@@ -8408,22 +8526,23 @@ fn verify_share_jti_with_view_mode(
     }
     if let Some(created_by) = link["created_by"].as_str()
         && !created_by.is_empty()
-        && !created_by.eq_ignore_ascii_case("admin")
     {
         if let Some(token_name) = created_by.strip_prefix("token:") {
-            let token_valid = state.db.list_api_tokens().ok().is_some_and(|tokens| {
-                tokens.iter().any(|item| {
-                    item["name"].as_str() == Some(token_name)
-                        && item["scope"].as_str() == Some("full")
-                        && item["expires_at"]
-                            .as_f64()
-                            .is_none_or(|exp| exp > now_ts as f64)
-                })
-            });
+            let token_valid = state
+                .db
+                .is_api_token_active_by_name(token_name, now_ts as f64)
+                .unwrap_or(false);
             if !token_valid {
                 return Err((
                     StatusCode::FORBIDDEN,
                     "Share link creator API token revoked or expired",
+                ));
+            }
+        } else if let Some(ext_user) = created_by.strip_prefix("ext:") {
+            if ext_user.trim().is_empty() {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Share link creator user no longer exists",
                 ));
             }
         } else {
@@ -8455,6 +8574,7 @@ fn verify_share_jti_with_view_mode(
                         }
                     }
                 }
+                Ok(None) if created_by.eq_ignore_ascii_case("admin") => {}
                 Ok(None) | Err(_) => {
                     return Err((
                         StatusCode::FORBIDDEN,
@@ -8485,6 +8605,9 @@ fn next_stream_state_from_video_response(
             total_s.trim().parse::<u64>(),
         )
     {
+        if matches!(request_range, Some((0, Some(1)))) && total > 2 {
+            return (true, 0);
+        }
         if start == 0 && end + 1 < total {
             return (true, (end + 1).max(2));
         }
@@ -8494,20 +8617,40 @@ fn next_stream_state_from_video_response(
         if start > 0 && end + 1 < total {
             return (true, end + 1);
         }
+        if let Some((req_start, None)) = request_range
+            && req_start > 0
+            && req_start + 1 < total
+        {
+            return (true, req_start + 1);
+        }
     }
     (false, u64::MAX)
 }
 
-fn prune_share_page_video_credits(map: &mut HashMap<String, SharePlaybackCredit>) {
+fn prune_share_page_video_credits(map: &mut HashMap<String, SharePlaybackCredit>, now_ts: u64) {
     if map.len() < 512 {
         return;
     }
-    map.retain(|_, v| v.page_credits > 0 || v.active_stream_started);
+    map.retain(|_, v| {
+        v.page_credits > 0
+            || v.active_stream_started
+            || (v.session_id.is_some() && v.session_expires_at > now_ts)
+    });
+    if map.len() >= 512 {
+        map.retain(|_, v| {
+            v.page_credits > 0 || (v.session_id.is_some() && v.session_expires_at > now_ts)
+        });
+    }
     if map.len() >= 512 {
         map.retain(|_, v| v.page_credits > 0);
     }
     while map.len() >= 512 {
-        if let Some(victim_key) = map.keys().next().cloned() {
+        if let Some(victim_key) = map
+            .iter()
+            .find(|(_, v)| v.session_expires_at <= now_ts || v.page_credits == 0)
+            .map(|(k, _)| k.clone())
+            .or_else(|| map.keys().next().cloned())
+        {
             map.remove(&victim_key);
         } else {
             break;
@@ -8515,6 +8658,7 @@ fn prune_share_page_video_credits(map: &mut HashMap<String, SharePlaybackCredit>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_share_access_or_gone(
     state: &AppState,
     payload: &ShareTokenPayload,
@@ -8522,8 +8666,14 @@ fn record_share_access_or_gone(
     is_player_page: bool,
     request_range: Option<(u64, Option<u64>)>,
     now_ts: u64,
+    new_session_id: Option<String>,
+    has_valid_sid: bool,
+    valid_continuation: bool,
     resp: Response,
 ) -> Response {
+    if resp.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        return resp;
+    }
     let is_initial_video = !is_player_page && matches!(request_range, None | Some((0, _)));
     let Some(jti) = payload
         .jti
@@ -8533,12 +8683,30 @@ fn record_share_access_or_gone(
     else {
         return resp;
     };
+    if state.db.is_share_link_revoked(jti).unwrap_or(true) {
+        if let Ok(mut map) = state.share_page_video_credits.lock() {
+            map.remove(jti);
+        }
+        return (
+            StatusCode::GONE,
+            Json(json!({ "error": "Share link has been revoked" })),
+        )
+            .into_response();
+    }
+    if !is_player_page && has_valid_sid {
+        if let Ok(mut map) = state.share_page_video_credits.lock()
+            && let Some(entry) = map.get_mut(jti)
+        {
+            entry.page_credits = entry.page_credits.saturating_sub(1);
+        }
+        return resp;
+    }
     let (stream_active, min_next_start) = if is_player_page {
         (false, u64::MAX)
     } else {
         next_stream_state_from_video_response(&resp, request_range)
     };
-    if !is_player_page && is_initial_video {
+    if !is_player_page && is_initial_video && !valid_continuation && !count_view {
         let consumed_credit = state
             .share_page_video_credits
             .lock()
@@ -8550,7 +8718,10 @@ fn record_share_access_or_gone(
                     entry.page_credits -= 1;
                     entry.active_stream_started = stream_active;
                     entry.min_next_range_start = min_next_start;
-                    if entry.page_credits == 0 && !entry.active_stream_started {
+                    if entry.page_credits == 0
+                        && !entry.active_stream_started
+                        && (entry.session_id.is_none() || entry.session_expires_at <= now_ts)
+                    {
                         map.remove(jti);
                     }
                     Some(true)
@@ -8563,19 +8734,23 @@ fn record_share_access_or_gone(
             return resp;
         }
     }
-    if count_view || (!is_player_page && is_initial_video) {
+    if count_view || (!is_player_page && is_initial_video && !valid_continuation) {
         match state.db.record_share_link_access(jti, now_ts as f64) {
             Ok(true) => {
                 if let Ok(mut map) = state.share_page_video_credits.lock() {
                     if is_player_page {
                         if !map.contains_key(jti) && map.len() >= 512 {
-                            prune_share_page_video_credits(&mut map);
+                            prune_share_page_video_credits(&mut map, now_ts);
                         }
                         let entry = map.entry(jti.to_string()).or_default();
                         entry.page_credits += 1;
+                        if let Some(sid) = new_session_id {
+                            entry.session_id = Some(sid);
+                            entry.session_expires_at = now_ts + 900;
+                        }
                     } else if is_initial_video && stream_active {
                         if !map.contains_key(jti) && map.len() >= 512 {
-                            prune_share_page_video_credits(&mut map);
+                            prune_share_page_video_credits(&mut map, now_ts);
                         }
                         let entry = map.entry(jti.to_string()).or_default();
                         entry.active_stream_started = true;
@@ -8583,7 +8758,9 @@ fn record_share_access_or_gone(
                     } else if let Some(entry) = map.get_mut(jti) {
                         entry.active_stream_started = false;
                         entry.min_next_range_start = u64::MAX;
-                        if entry.page_credits == 0 {
+                        if entry.page_credits == 0
+                            && (entry.session_id.is_none() || entry.session_expires_at <= now_ts)
+                        {
                             map.remove(jti);
                         }
                     }
@@ -8611,8 +8788,15 @@ fn record_share_access_or_gone(
             && let Some(entry) = map.get_mut(jti)
         {
             entry.active_stream_started = stream_active;
-            entry.min_next_range_start = min_next_start;
-            if entry.page_credits == 0 && !entry.active_stream_started {
+            entry.min_next_range_start = if stream_active {
+                entry.min_next_range_start.max(min_next_start)
+            } else {
+                u64::MAX
+            };
+            if entry.page_credits == 0
+                && !entry.active_stream_started
+                && (entry.session_id.is_none() || entry.session_expires_at <= now_ts)
+            {
                 map.remove(jti);
             }
         }
@@ -8723,6 +8907,7 @@ async fn share_player_page(
     }
     let safe_id = xml_escape_simple(&payload.id);
     let safe_token = xml_escape_simple(&token);
+    let sid = format!("{:032x}", rand::random::<u128>());
     let ts_label = clip_ts
         .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
@@ -8741,9 +8926,9 @@ async fn share_player_page(
         <div><strong>NINJANVR SHARED CLIP // {safe_title}</strong></div>
         <div style="color:#94a3b8;font-size:11px;margin-top:2px">CLIP TIME: {ts_label} · EXPIRES: {exp_label}</div>
       </div>
-      <a href="/share/{safe_token}/video.mp4" download="{safe_id}.mp4" style="color:#38bdf8;text-decoration:none;border:1px solid #0284c7;padding:4px 10px;border-radius:3px">Download MP4</a>
+      <a href="/share/{safe_token}/video.mp4?sid={sid}" download="{safe_id}.mp4" style="color:#38bdf8;text-decoration:none;border:1px solid #0284c7;padding:4px 10px;border-radius:3px">Download MP4</a>
     </div>
-    <video src="/share/{safe_token}/video.mp4" controls autoplay playsinline style="width:100%;max-height:72vh;object-fit:contain;background:#000"></video>
+    <video src="/share/{safe_token}/video.mp4?sid={sid}" controls autoplay playsinline style="width:100%;max-height:72vh;object-fit:contain;background:#000"></video>
   </div>
 </body>
 </html>"#
@@ -8773,51 +8958,66 @@ async fn share_player_page(
         true,
         None,
         now_ts,
+        Some(sid),
+        false,
+        false,
         resp,
     )
 }
 
 pub fn serve_mp4_bytes_with_range(bytes: Vec<u8>, headers: &HeaderMap) -> Response {
     let total = bytes.len();
-    if total > 0
-        && let Some(range_val) = headers.get(header::RANGE).and_then(|v| v.to_str().ok())
-        && let Some(spec) = range_val.strip_prefix("bytes=")
-        && let Some((start_s, end_s)) = spec.split_once('-')
-        && let Ok(start) = start_s.trim().parse::<usize>()
-        && start < total
-    {
-        let end = end_s
-            .trim()
-            .parse::<usize>()
-            .map(|e| e.min(total - 1))
-            .unwrap_or(total - 1);
-        if start <= end {
-            let slice = bytes[start..=end].to_vec();
-            let content_range = format!("bytes {start}-{end}/{total}");
+    if headers.contains_key(header::RANGE) {
+        let Some((start_u64, end_opt)) = parse_video_range_bounds(headers) else {
             return (
-                StatusCode::PARTIAL_CONTENT,
-                [
-                    (header::CONTENT_TYPE, "video/mp4".to_string()),
-                    (header::ACCEPT_RANGES, "bytes".to_string()),
-                    (header::CONTENT_RANGE, content_range),
-                    (header::CONTENT_LENGTH, slice.len().to_string()),
-                    (
-                        header::CONTENT_SECURITY_POLICY,
-                        "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'".to_string(),
-                    ),
-                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-                    (header::REFERRER_POLICY, "no-referrer".to_string()),
-                    (header::X_FRAME_OPTIONS, "DENY".to_string()),
-                    (header::CACHE_CONTROL, "private, no-store".to_string()),
-                    (
-                        header::HeaderName::from_static("cross-origin-resource-policy"),
-                        "same-origin".to_string(),
-                    ),
-                ],
-                slice,
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{total}"))],
+            )
+                .into_response();
+        };
+        let Ok(start) = usize::try_from(start_u64) else {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{total}"))],
+            )
+                .into_response();
+        };
+        if total == 0 || start >= total {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{total}"))],
             )
                 .into_response();
         }
+        let end = end_opt
+            .and_then(|e| usize::try_from(e).ok())
+            .map(|e| e.min(total - 1))
+            .unwrap_or(total - 1);
+        let slice = bytes[start..=end].to_vec();
+        let content_range = format!("bytes {start}-{end}/{total}");
+        return (
+            StatusCode::PARTIAL_CONTENT,
+            [
+                (header::CONTENT_TYPE, "video/mp4".to_string()),
+                (header::ACCEPT_RANGES, "bytes".to_string()),
+                (header::CONTENT_RANGE, content_range),
+                (header::CONTENT_LENGTH, slice.len().to_string()),
+                (
+                    header::CONTENT_SECURITY_POLICY,
+                    "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'".to_string(),
+                ),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                (header::REFERRER_POLICY, "no-referrer".to_string()),
+                (header::X_FRAME_OPTIONS, "DENY".to_string()),
+                (header::CACHE_CONTROL, "private, no-store".to_string()),
+                (
+                    header::HeaderName::from_static("cross-origin-resource-policy"),
+                    "same-origin".to_string(),
+                ),
+            ],
+            slice,
+        )
+            .into_response();
     }
 
     (
@@ -8852,60 +9052,66 @@ async fn serve_mp4_file_with_range(disk_path: &Path, headers: &HeaderMap) -> Opt
         return None;
     }
     let total = meta.len();
-    if total > 0
-        && let Some(range_val) = headers.get(header::RANGE).and_then(|v| v.to_str().ok())
-        && let Some(spec) = range_val.strip_prefix("bytes=")
-        && let Some((start_s, end_s)) = spec.split_once('-')
-        && let Ok(start) = start_s.trim().parse::<u64>()
-        && start < total
-    {
-        let end = end_s
-            .trim()
-            .parse::<u64>()
-            .map(|e| e.min(total - 1))
-            .unwrap_or(total - 1);
-        if start <= end {
-            file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
-            let slice_len = end - start + 1;
-            let reader = file.take(slice_len);
-            let stream = futures_util::stream::unfold(reader, |mut r| async move {
-                let mut buf = vec![0u8; 65536];
-                match r.read(&mut buf).await {
-                    Ok(0) => None,
-                    Ok(n) => {
-                        buf.truncate(n);
-                        Some((Ok::<Bytes, std::io::Error>(Bytes::from(buf)), r))
-                    }
-                    Err(e) => Some((Err(e), r)),
-                }
-            });
-            let content_range = format!("bytes {start}-{end}/{total}");
+    if headers.contains_key(header::RANGE) {
+        let Some((start, end_opt)) = parse_video_range_bounds(headers) else {
             return Some(
                 (
-                    StatusCode::PARTIAL_CONTENT,
-                    [
-                        (header::CONTENT_TYPE, "video/mp4".to_string()),
-                        (header::ACCEPT_RANGES, "bytes".to_string()),
-                        (header::CONTENT_RANGE, content_range),
-                        (header::CONTENT_LENGTH, slice_len.to_string()),
-                        (
-                            header::CONTENT_SECURITY_POLICY,
-                            "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'".to_string(),
-                        ),
-                        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-                        (header::REFERRER_POLICY, "no-referrer".to_string()),
-                        (header::X_FRAME_OPTIONS, "DENY".to_string()),
-                        (header::CACHE_CONTROL, "private, no-store".to_string()),
-                        (
-                            header::HeaderName::from_static("cross-origin-resource-policy"),
-                            "same-origin".to_string(),
-                        ),
-                    ],
-                    Body::from_stream(stream),
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    [(header::CONTENT_RANGE, format!("bytes */{total}"))],
+                )
+                    .into_response(),
+            );
+        };
+        if total == 0 || start >= total {
+            return Some(
+                (
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    [(header::CONTENT_RANGE, format!("bytes */{total}"))],
                 )
                     .into_response(),
             );
         }
+        let end = end_opt.map(|e| e.min(total - 1)).unwrap_or(total - 1);
+        file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
+        let slice_len = end - start + 1;
+        let reader = file.take(slice_len);
+        let stream = futures_util::stream::unfold(reader, |mut r| async move {
+            let mut buf = vec![0u8; 65536];
+            match r.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok::<Bytes, std::io::Error>(Bytes::from(buf)), r))
+                }
+                Err(e) => Some((Err(e), r)),
+            }
+        });
+        let content_range = format!("bytes {start}-{end}/{total}");
+        return Some(
+            (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, "video/mp4".to_string()),
+                    (header::ACCEPT_RANGES, "bytes".to_string()),
+                    (header::CONTENT_RANGE, content_range),
+                    (header::CONTENT_LENGTH, slice_len.to_string()),
+                    (
+                        header::CONTENT_SECURITY_POLICY,
+                        "default-src 'none'; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'".to_string(),
+                    ),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    (header::REFERRER_POLICY, "no-referrer".to_string()),
+                    (header::X_FRAME_OPTIONS, "DENY".to_string()),
+                    (header::CACHE_CONTROL, "private, no-store".to_string()),
+                    (
+                        header::HeaderName::from_static("cross-origin-resource-policy"),
+                        "same-origin".to_string(),
+                    ),
+                ],
+                Body::from_stream(stream),
+            )
+                .into_response(),
+        );
     }
 
     let reader = file.take(total);
@@ -9143,10 +9349,49 @@ async fn redact_mp4_file_with_privacy(
     std::fs::rename(&tmp_out_file, out_file).is_ok()
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct ShareVideoQuery {
+    pub sid: Option<String>,
+}
+
+fn verify_post_build_share_target_and_jti(
+    state: &AppState,
+    payload: &ShareTokenPayload,
+) -> Option<Response> {
+    if !resolve_share_target_metadata(state, &payload.k, &payload.id).3 {
+        cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
+        return Some(StatusCode::NOT_FOUND.into_response());
+    }
+    if payload
+        .jti
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|jti| state.db.is_share_link_revoked(jti).unwrap_or(true))
+    {
+        if !state
+            .db
+            .has_active_share_links_for_target(&payload.id, unix_now() as f64)
+            .unwrap_or(false)
+        {
+            cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
+        }
+        return Some(
+            (
+                StatusCode::GONE,
+                Json(json!({ "error": "Share link has been revoked" })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
 async fn share_video_mp4(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(token): AxumPath<String>,
+    Query(q): Query<ShareVideoQuery>,
 ) -> Response {
     let now_ts = unix_now();
     let payload = match verify_share_token(&state.jwt_secret, &token, now_ts) {
@@ -9160,33 +9405,61 @@ async fn share_video_mp4(
         }
     };
     let request_range = parse_video_range_bounds(&headers);
+    if headers.contains_key(header::RANGE) && request_range.is_none() {
+        return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+    }
     let is_initial = is_initial_or_unranged_video_request(&headers);
-    if !is_initial && let Some(jti) = payload.jti.as_deref().map(str::trim) {
-        let valid_continuation = request_range
-            .and_then(|(start, _)| {
-                state
-                    .share_page_video_credits
-                    .lock()
-                    .ok()
-                    .and_then(|map| map.get(jti).copied())
-                    .map(|c| c.active_stream_started && start >= c.min_next_range_start)
-            })
-            .unwrap_or(false);
-        if !valid_continuation
+    let provided_sid = q.sid.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let mut has_valid_sid = false;
+    let mut valid_continuation = false;
+    if let Some(jti) = payload
+        .jti
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(sid_str) = provided_sid {
+            if let Ok(map) = state.share_page_video_credits.lock()
+                && let Some(entry) = map.get(jti)
+                && entry.session_id.as_deref() == Some(sid_str)
+                && entry.session_expires_at > now_ts
+            {
+                has_valid_sid = true;
+            }
+        } else if let Some((start, end_opt)) = request_range
             && let Ok(mut map) = state.share_page_video_credits.lock()
             && let Some(entry) = map.get_mut(jti)
         {
-            entry.active_stream_started = false;
-            entry.min_next_range_start = u64::MAX;
+            let can_continue = entry.active_stream_started
+                && start >= entry.min_next_range_start
+                && (start > 0 || (entry.min_next_range_start == 0 && end_opt != Some(1)));
+            if can_continue {
+                valid_continuation = true;
+                let next_min = match end_opt {
+                    Some(end) => end.saturating_add(1).max(2),
+                    None => start.saturating_add(1).max(2),
+                };
+                entry.min_next_range_start = next_min;
+            } else if start > 0 {
+                entry.active_stream_started = false;
+                entry.min_next_range_start = u64::MAX;
+            }
         }
     }
-    let count_view =
-        match verify_share_jti_with_view_mode(&state, &payload, now_ts, is_initial, false) {
-            Ok(cv) => cv,
-            Err((status, msg)) => {
-                return (status, Json(json!({ "error": msg }))).into_response();
-            }
-        };
+    let count_view = match verify_share_jti_with_view_mode(
+        &state,
+        &payload,
+        now_ts,
+        is_initial,
+        false,
+        provided_sid,
+        valid_continuation,
+    ) {
+        Ok(cv) => cv,
+        Err((status, msg)) => {
+            return (status, Json(json!({ "error": msg }))).into_response();
+        }
+    };
 
     let safe_id: String = payload
         .id
@@ -9277,16 +9550,12 @@ async fn share_video_mp4(
                 let _clip_guard = clip_lock.lock().await;
 
                 if redacted_path.is_file() {
-                    match std::fs::read_to_string(&mask_hash_path) {
-                        Ok(existing_hash) => {
-                            if existing_hash.trim() != current_mask_hash {
-                                let _ = std::fs::remove_file(&redacted_path);
-                                let _ = std::fs::remove_file(&mask_hash_path);
-                            }
-                        }
-                        Err(_) => {
-                            let _ = std::fs::write(&mask_hash_path, &current_mask_hash);
-                        }
+                    let hash_matches = std::fs::read_to_string(&mask_hash_path)
+                        .map(|existing_hash| existing_hash.trim() == current_mask_hash)
+                        .unwrap_or(false);
+                    if !hash_matches {
+                        let _ = std::fs::remove_file(&redacted_path);
+                        let _ = std::fs::remove_file(&mask_hash_path);
                     }
                 }
 
@@ -9309,6 +9578,9 @@ async fn share_video_mp4(
                     }
                 }
                 drop(_clip_guard);
+                if let Some(err_resp) = verify_post_build_share_target_and_jti(&state, &payload) {
+                    return err_resp;
+                }
 
                 if let Some(safe_path) =
                     ensure_path_within_media_dir(&state.media_dir, &redacted_path)
@@ -9321,6 +9593,9 @@ async fn share_video_mp4(
                         false,
                         request_range,
                         now_ts,
+                        None,
+                        has_valid_sid,
+                        valid_continuation,
                         resp,
                     );
                 }
@@ -9335,6 +9610,9 @@ async fn share_video_mp4(
                     false,
                     request_range,
                     now_ts,
+                    None,
+                    has_valid_sid,
+                    valid_continuation,
                     resp,
                 );
             }
@@ -9475,16 +9753,12 @@ async fn share_video_mp4(
                 let _clip_guard = clip_lock.lock().await;
 
                 if redacted_path.is_file() {
-                    match std::fs::read_to_string(&mask_hash_path) {
-                        Ok(existing_hash) => {
-                            if existing_hash.trim() != current_mask_hash {
-                                let _ = std::fs::remove_file(&redacted_path);
-                                let _ = std::fs::remove_file(&mask_hash_path);
-                            }
-                        }
-                        Err(_) => {
-                            let _ = std::fs::write(&mask_hash_path, &current_mask_hash);
-                        }
+                    let hash_matches = std::fs::read_to_string(&mask_hash_path)
+                        .map(|existing_hash| existing_hash.trim() == current_mask_hash)
+                        .unwrap_or(false);
+                    if !hash_matches {
+                        let _ = std::fs::remove_file(&redacted_path);
+                        let _ = std::fs::remove_file(&mask_hash_path);
                     }
                 }
 
@@ -9524,6 +9798,9 @@ async fn share_video_mp4(
                     }
                 }
                 drop(_clip_guard);
+                if let Some(err_resp) = verify_post_build_share_target_and_jti(&state, &payload) {
+                    return err_resp;
+                }
 
                 if let Some(safe_path) =
                     ensure_path_within_media_dir(&state.media_dir, &redacted_path)
@@ -9536,6 +9813,9 @@ async fn share_video_mp4(
                         false,
                         request_range,
                         now_ts,
+                        None,
+                        has_valid_sid,
+                        valid_continuation,
                         resp,
                     );
                 }
@@ -9582,6 +9862,9 @@ async fn share_video_mp4(
                 }
             }
             drop(_clip_guard);
+            if let Some(err_resp) = verify_post_build_share_target_and_jti(&state, &payload) {
+                return err_resp;
+            }
             if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &clip_path)
                 && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
             {
@@ -9592,6 +9875,9 @@ async fn share_video_mp4(
                     false,
                     request_range,
                     now_ts,
+                    None,
+                    has_valid_sid,
+                    valid_continuation,
                     resp,
                 );
             }
@@ -9839,6 +10125,7 @@ async fn api_export_delete(
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     let _ = state.db.revoke_share_links_for_target(Some("export"), &id);
+    purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
     if let Ok(Some((vpath, tpath))) = state.db.delete_export(&id) {
         let _ = tokio::fs::remove_file(resolve_recording_disk_path(&state.media_dir, &vpath)).await;
@@ -9888,6 +10175,7 @@ async fn api_exports_bulk_delete(
                 tokio::fs::remove_file(resolve_recording_disk_path(&state.media_dir, &tpath)).await;
         }
     }
+    purge_revoked_share_credits(&state);
     Json(json!({ "success": true })).into_response()
 }
 
@@ -16555,7 +16843,7 @@ cameras:
 
         range_hdrs.insert(header::RANGE, "bytes=10-4".parse().unwrap());
         let resp_invalid = serve_mp4_bytes_with_range(sample_mp4.clone(), &range_hdrs);
-        assert_eq!(resp_invalid.status(), StatusCode::OK);
+        assert_eq!(resp_invalid.status(), StatusCode::RANGE_NOT_SATISFIABLE);
 
         // 5. parse_onvif_status_xml, continuous/relative move SOAP builders, and resolve_recording_disk_path
         let status_xml = r#"
@@ -17423,16 +17711,21 @@ cameras:
         );
 
         // Case C: Pre-generated redacted export (exports/share_redacted_ev_by_1.mp4) is served when privacy_mask is active
-        // (string format too) instead of serving the raw unredacted segment from recordings/
+        // (string format too) and matching .mask_hash sidecar exists instead of serving the raw unredacted segment from recordings/
+        let mask_str_val = json!("0.1,0.1,0.5,0.1,0.5,0.5");
         {
             let mut cfg = state.config.write().await;
-            cfg.cameras.get_mut("backyard").unwrap().privacy_mask =
-                json!("0.1,0.1,0.5,0.1,0.5,0.5");
+            cfg.cameras.get_mut("backyard").unwrap().privacy_mask = mask_str_val.clone();
         }
         let redacted_bytes = b"REDACTED_MP4_STREAM_PAYLOAD".to_vec();
         std::fs::write(
             exports_dir.join("share_redacted_ev_by_1.mp4"),
             &redacted_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            exports_dir.join(".share_redacted_ev_by_1.mask_hash"),
+            compute_privacy_mask_hash(Some(&mask_str_val)),
         )
         .unwrap();
         let resp_masked_redacted = auth_app
@@ -18231,18 +18524,14 @@ cameras:
         let inverted_resp = serve_mp4_file_with_range(&file_disk_path, &inverted_hdrs)
             .await
             .unwrap();
-        assert_eq!(inverted_resp.status(), StatusCode::OK);
-        let inverted_bytes = to_bytes(inverted_resp.into_body(), 4096).await.unwrap();
-        assert_eq!(&inverted_bytes[..], &mp4_payload[..]);
+        assert_eq!(inverted_resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
 
         let mut oob_hdrs = HeaderMap::new();
         oob_hdrs.insert(header::RANGE, "bytes=9999-10000".parse().unwrap());
         let oob_resp = serve_mp4_file_with_range(&file_disk_path, &oob_hdrs)
             .await
             .unwrap();
-        assert_eq!(oob_resp.status(), StatusCode::OK);
-        let oob_bytes = to_bytes(oob_resp.into_body(), 4096).await.unwrap();
-        assert_eq!(&oob_bytes[..], &mp4_payload[..]);
+        assert_eq!(oob_resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
 
         // =========================================================================
         // Finding 6 & Finding 8: Share Link Persistence, Listing, Revocation & Security Headers
@@ -19814,7 +20103,7 @@ cameras:
         let redacted_file = exports_dir.join("share_redacted_ev_p2_mask.mp4");
         let sidecar_file = exports_dir.join(".share_redacted_ev_p2_mask.mask_hash");
         std::fs::write(&redacted_file, b"REDACTED_V1_BYTES").unwrap();
-        assert!(!sidecar_file.exists());
+        std::fs::write(&sidecar_file, compute_privacy_mask_hash(Some(&mask_v1))).unwrap();
 
         state
             .db
@@ -19839,7 +20128,7 @@ cameras:
             },
         );
 
-        // First request seeds the missing sidecar with mask_v1 hash and serves REDACTED_V1_BYTES
+        // First request with matching sidecar serves REDACTED_V1_BYTES
         let r_mask_v1 = auth_app
             .clone()
             .oneshot(
@@ -20055,7 +20344,8 @@ cameras:
             (r_mp4, r_hash, c_mp4)
         };
 
-        // 4a. Revoking a share link removes its target's share_redacted_*, .mask_hash, and share_clip_* artifacts
+        // 4a. Revoking one share link while a sibling link (`shr_ev_fd_multi`) is still active preserves shared artifacts;
+        //     revoking the last active share link removes its target's share_redacted_*, .mask_hash, and share_clip_* artifacts
         state
             .db
             .insert_share_link(
@@ -20082,6 +20372,23 @@ cameras:
             .await
             .unwrap();
         assert_eq!(resp_rev.status(), StatusCode::OK);
+        assert!(
+            r_mp4.exists() && r_hash.exists() && c_mp4.exists(),
+            "shared artifacts must be preserved while sibling link shr_ev_fd_multi is still active"
+        );
+        let resp_rev_last = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/share/shr_ev_fd_multi")
+                    .header(header::AUTHORIZATION, &admin_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rev_last.status(), StatusCode::OK);
         assert!(!r_mp4.exists() && !r_hash.exists() && !c_mp4.exists());
 
         // 4b. Deleting an event removes its share_redacted_*, .mask_hash, and share_clip_* artifacts
@@ -21514,11 +21821,16 @@ cameras:
             .unwrap();
         assert_eq!(r_exp_fail_closed.status(), StatusCode::NOT_FOUND);
 
-        // 1b. With redacted export present, share_video_mp4 seeds .share_redacted_exp_by_masked.mask_hash
-        //     and serves share_redacted_exp_by_masked.mp4 instead of raw exp_by_masked.mp4
+        // 1b. With redacted export + matching .mask_hash sidecar present, share_video_mp4
+        //     serves share_redacted_exp_by_masked.mp4 instead of raw exp_by_masked.mp4
         let redacted_exp_file = exports_dir.join("share_redacted_exp_by_masked.mp4");
         let redacted_exp_sidecar = exports_dir.join(".share_redacted_exp_by_masked.mask_hash");
         std::fs::write(&redacted_exp_file, b"REDACTED_EXPORT_V1_BYTES").unwrap();
+        std::fs::write(
+            &redacted_exp_sidecar,
+            compute_privacy_mask_hash(Some(&mask_v1)),
+        )
+        .unwrap();
         let r_exp_redacted_ok = auth_app
             .clone()
             .oneshot(
@@ -21994,6 +22306,7 @@ cameras:
                         page_credits: if i % 2 == 0 { 0 } else { 1 },
                         active_stream_started: false,
                         min_next_range_start: u64::MAX,
+                        ..Default::default()
                     },
                 );
             }
@@ -22019,6 +22332,474 @@ cameras:
             );
             assert!(map.contains_key("shr_ev_fd_sem"));
         }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn security_share_link_round2_audit_findings_regression_work() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_sec_share_r2_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let cfg_path = tmp_dir.join("config.yml");
+        let web_dir = tmp_dir.join("web-v2");
+        let media_dir = tmp_dir.join("media");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
+
+        let yaml = format!(
+            r#"
+version: 0.18-0
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/front_door
+          roles: [record, detect]
+  backyard:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/backyard
+          roles: [record, detect]
+"#,
+            db_path.display()
+        );
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+            .await
+            .unwrap();
+        let auth_app = build_router_with_auth(state.clone(), true);
+
+        let now = unix_now();
+        let make_jwt = |sub: &str, role: &str, allowed_cameras: Option<&str>| -> String {
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &JwtClaims {
+                    sub: sub.to_string(),
+                    role: role.to_string(),
+                    allowed_cameras: allowed_cameras.map(str::to_string),
+                    iat: now,
+                    exp: now + 3600,
+                },
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            )
+            .unwrap()
+        };
+
+        let admin_jwt = make_jwt("admin", "admin", Some("*"));
+        let admin_bearer = format!("Bearer {admin_jwt}");
+
+        let exports_dir = media_dir.join("exports");
+        let clips_dir = media_dir.join("clips");
+        let rec_dir = media_dir.join("recordings/2026-11-04/12/front_door");
+        let rec_staging_dir = media_dir.join("recordings/.staging/front_door");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        std::fs::create_dir_all(&rec_dir).unwrap();
+        std::fs::create_dir_all(&rec_staging_dir).unwrap();
+
+        let mp4_payload: Vec<u8> = (0u8..128u8).collect();
+        std::fs::write(exports_dir.join("exp_r2_fd.mp4"), &mp4_payload).unwrap();
+        std::fs::write(exports_dir.join("exp_r2_by.mp4"), &mp4_payload).unwrap();
+        state
+            .db
+            .insert_export(&ExportRow {
+                id: "exp_r2_fd".to_string(),
+                camera: "front_door".to_string(),
+                name: "R2 Front Door".to_string(),
+                date: 1700000100.0,
+                video_path: "/media/ninjanvr/exports/exp_r2_fd.mp4".to_string(),
+                thumb_path: "/media/ninjanvr/clips/exp_r2_fd.webp".to_string(),
+                in_progress: false,
+            })
+            .unwrap();
+        state
+            .db
+            .insert_export(&ExportRow {
+                id: "exp_r2_by".to_string(),
+                camera: "backyard".to_string(),
+                name: "R2 Backyard".to_string(),
+                date: 1700000100.0,
+                video_path: "/media/ninjanvr/exports/exp_r2_by.mp4".to_string(),
+                thumb_path: "/media/ninjanvr/clips/exp_r2_by.webp".to_string(),
+                in_progress: false,
+            })
+            .unwrap();
+
+        // =========================================================================
+        // 1. [FINDING-01 & FINDING-02] Playback Session Grant (`sid`) + Range Unification (416)
+        // =========================================================================
+        let resp_create = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r2_fd","expires_in_sec":15,"max_views":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_create.status(), StatusCode::OK);
+        let create_json: Value =
+            serde_json::from_slice(&to_bytes(resp_create.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let share_id = create_json["id"].as_str().unwrap().to_string();
+        let share_tok = create_json["token"].as_str().unwrap().to_string();
+        let exp_ts = create_json["expires_at"].as_u64().unwrap();
+        // [FINDING-03 / FINDING-08] TTL < 60s (15s) is preserved without clamping up to 60s
+        assert!(
+            exp_ts <= unix_now() + 20,
+            "expires_in_sec=15 must not be clamped to 60s (got delta {})",
+            exp_ts.saturating_sub(unix_now())
+        );
+
+        // Load player page (consumes the 1 view and embeds ?sid=<32-hex> in <video> and <a download>)
+        let page_resp = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_tok}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page_resp.status(), StatusCode::OK);
+        let page_html = String::from_utf8(
+            to_bytes(page_resp.into_body(), 16384)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let sid_marker = format!("/share/{share_tok}/video.mp4?sid=");
+        let sid_pos = page_html
+            .find(&sid_marker)
+            .expect("player HTML must embed ?sid= on video/download URLs");
+        let sid_slice = &page_html[sid_pos + sid_marker.len()..];
+        let sid: String = sid_slice
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        assert_eq!(sid.len(), 32);
+        assert_eq!(
+            state.db.get_share_link(&share_id).unwrap().unwrap()["access_count"],
+            1
+        );
+
+        // Malformed Range: bytes=2-invalid returns 416 RANGE_NOT_SATISFIABLE without consuming session or views
+        let bad_range_resp = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{share_tok}/video.mp4?sid={sid}"))
+                    .header(header::RANGE, "bytes=2-invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_range_resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+        // Within the authenticated player session (`?sid={sid}`), Safari 0-1 probe, 0-63 read,
+        // open-ended mid-stream Range: bytes=64-, backward seek Range: bytes=0-31, and Download MP4
+        // (no Range header) ALL succeed on max_views=1 without incrementing access_count!
+        for range_opt in [
+            Some("bytes=0-1"),
+            Some("bytes=0-63"),
+            Some("bytes=64-"),
+            Some("bytes=0-31"),
+            None,
+        ] {
+            let mut req = Request::builder().uri(format!("/share/{share_tok}/video.mp4?sid={sid}"));
+            if let Some(r_val) = range_opt {
+                req = req.header(header::RANGE, r_val);
+            }
+            let r = auth_app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let expected_status = if range_opt.is_some() {
+                StatusCode::PARTIAL_CONTENT
+            } else {
+                StatusCode::OK
+            };
+            assert_eq!(
+                r.status(),
+                expected_status,
+                "valid sid session request with Range={range_opt:?} must succeed on max_views=1"
+            );
+            assert_eq!(
+                state.db.get_share_link(&share_id).unwrap().unwrap()["access_count"],
+                1
+            );
+        }
+
+        // Second client without `sid` or with wrong `sid` gets 410 GONE on max_views=1
+        for bad_uri in [
+            format!("/share/{share_tok}/video.mp4"),
+            format!("/share/{share_tok}/video.mp4?sid=00000000000000000000000000000000"),
+            format!("/share/{share_tok}"),
+        ] {
+            let r_unauth = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&bad_uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_unauth.status(),
+                StatusCode::GONE,
+                "uncredited viewer on {bad_uri} must get 410 GONE when max_views=1 is exhausted"
+            );
+        }
+
+        // Direct API/video playback without `sid`: Safari 0-1 probe -> 0-31 -> open-ended 32- works on max_views=1
+        let resp_direct = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r2_fd","expires_in_sec":3600,"max_views":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let direct_json: Value =
+            serde_json::from_slice(&to_bytes(resp_direct.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let direct_tok = direct_json["token"].as_str().unwrap().to_string();
+        for range_hdr in ["bytes=0-1", "bytes=0-31", "bytes=32-", "bytes=64-"] {
+            let r = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{direct_tok}/video.mp4"))
+                        .header(header::RANGE, range_hdr)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::PARTIAL_CONTENT,
+                "direct Range={range_hdr} sequence must succeed on max_views=1"
+            );
+        }
+        // Concurrent/duplicate Range: bytes=64- at the already-consumed offset is rejected with 410 GONE
+        let r_dup_offset = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{direct_tok}/video.mp4"))
+                    .header(header::RANGE, "bytes=64-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_dup_offset.status(), StatusCode::GONE);
+
+        // =========================================================================
+        // 2. [FINDING-04] OIDC / External Creator (`ext:`) & Demoted Local `admin` DB User
+        // =========================================================================
+        let oidc_jwt = make_jwt("alice.sso@corp.example", "admin", Some("*"));
+        let resp_oidc_create = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, format!("Bearer {oidc_jwt}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r2_fd","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_oidc_create.status(), StatusCode::OK);
+        let oidc_share_json: Value =
+            serde_json::from_slice(&to_bytes(resp_oidc_create.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let oidc_share_id = oidc_share_json["id"].as_str().unwrap().to_string();
+        let oidc_share_tok = oidc_share_json["token"].as_str().unwrap().to_string();
+        assert_eq!(
+            state.db.get_share_link(&oidc_share_id).unwrap().unwrap()["created_by"],
+            "ext:alice.sso@corp.example"
+        );
+        let r_oidc_play = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{oidc_share_tok}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_oidc_play.status(), StatusCode::OK);
+
+        // Demoting local `admin` user in SQLite to `operator` with `allowed_cameras = "front_door"`
+        // blocks `admin`'s share link for `"backyard"` with 403 FORBIDDEN!
+        let resp_admin_by = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_r2_by","expires_in_sec":3600}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_admin_by.status(), StatusCode::OK);
+        let admin_by_json: Value =
+            serde_json::from_slice(&to_bytes(resp_admin_by.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let admin_by_tok = admin_by_json["token"].as_str().unwrap().to_string();
+
+        state
+            .db
+            .execute_batch(
+                "UPDATE user SET role = 'operator', allowed_cameras = 'front_door' WHERE username = 'admin';",
+            )
+            .unwrap();
+        let r_demoted_admin = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{admin_by_tok}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_demoted_admin.status(),
+            StatusCode::FORBIDDEN,
+            "demoted local admin DB user must be blocked from sharing unauthorized camera"
+        );
+        state
+            .db
+            .execute_batch(
+                "UPDATE user SET role = 'admin', allowed_cameras = '*' WHERE username = 'admin';",
+            )
+            .unwrap();
+
+        // =========================================================================
+        // 3. [FINDING-05] Percent-Encoded Static Media Paths & `/recordings/` Dot-Files Blocked
+        // =========================================================================
+        state
+            .db
+            .create_user_with_cameras("scoped_r2", "pass1234", "operator", "front_door", 1000)
+            .unwrap();
+        let scoped_r2_bearer = format!(
+            "Bearer {}",
+            make_jwt("scoped_r2", "operator", Some("front_door"))
+        );
+        std::fs::write(
+            exports_dir.join("share_clip_front_door_ghost_r2.mp4"),
+            b"GHOST",
+        )
+        .unwrap();
+        std::fs::write(rec_staging_dir.join("seg.mp4"), b"STAGING").unwrap();
+        std::fs::write(rec_dir.join(".compact.mp4"), b"COMPACT").unwrap();
+
+        for encoded_or_hidden in [
+            "/exports/%73hare_clip_front_door_ghost_r2.mp4",
+            "/exports/%73hare_redacted_front_door_ghost_r2.mp4",
+            "/exports/share_clip_front_door_ghost_r2.mp%34",
+            "/clips/%73hare_clip_front_door-ghost.webp",
+            "/recordings/.staging/front_door/seg.mp4",
+            "/recordings/%2estaging/front_door/seg.mp4",
+            "/recordings/2026-11-04/12/front_door/.compact.mp4",
+        ] {
+            assert_eq!(
+                resolve_static_media_camera(&state, encoded_or_hidden),
+                None,
+                "resolve_static_media_camera must return None on {encoded_or_hidden}"
+            );
+            let r = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(encoded_or_hidden)
+                        .header(header::AUTHORIZATION, &scoped_r2_bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::FORBIDDEN,
+                "percent-encoded or dot-segment static path {encoded_or_hidden} must return 403 FORBIDDEN"
+            );
+        }
+
+        // =========================================================================
+        // 4. [FINDING-06] Pre-existing `share_redacted_<id>.mp4` WITHOUT `.mask_hash` Sidecar Is Invalidated
+        // =========================================================================
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("backyard").unwrap().privacy_mask =
+                json!([[[0.1, 0.1], [0.5, 0.1], [0.5, 0.5], [0.1, 0.5]]]);
+        }
+        let unverified_redacted = exports_dir.join("share_redacted_exp_r2_by.mp4");
+        let unverified_sidecar = exports_dir.join(".share_redacted_exp_r2_by.mask_hash");
+        std::fs::write(&unverified_redacted, b"STALE_UNVERIFIED_REDACTED_MP4").unwrap();
+        let _ = std::fs::remove_file(&unverified_sidecar);
+
+        let r_missing_sidecar = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/share/{admin_by_tok}/video.mp4"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_missing_sidecar.status(),
+            StatusCode::NOT_FOUND,
+            "missing .mask_hash sidecar must invalidate pre-existing redacted MP4 and fail closed when rebuild fails"
+        );
+        assert!(
+            !unverified_redacted.exists(),
+            "unverified share_redacted_<id>.mp4 without .mask_hash must be removed"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
