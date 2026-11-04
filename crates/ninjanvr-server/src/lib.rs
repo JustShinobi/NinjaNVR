@@ -1811,8 +1811,12 @@ fn extract_authenticated_user(
 
 fn parse_authorization_bearer(raw: &str) -> Option<&str> {
     let trimmed = raw.trim_start();
-    if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
-        let tok = trimmed[7..].trim();
+    if trimmed
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("bearer "))
+        && let Some(rest) = trimmed.get(7..)
+    {
+        let tok = rest.trim();
         if !tok.is_empty() {
             return Some(tok);
         }
@@ -8351,8 +8355,14 @@ fn verify_share_jti_with_view_mode(
     if let Some(max_v) = link["max_views"].as_i64()
         && ((count_view && access_count >= max_v) || (!count_view && access_count > max_v))
     {
-        if let Ok(mut map) = state.share_page_video_credits.lock() {
-            map.remove(jti);
+        if let Ok(mut map) = state.share_page_video_credits.lock()
+            && let Some(entry) = map.get_mut(jti)
+        {
+            entry.active_stream_started = false;
+            entry.min_next_range_start = u64::MAX;
+            if entry.page_credits == 0 {
+                map.remove(jti);
+            }
         }
         return Err((StatusCode::GONE, "Share link view limit reached"));
     }
@@ -8423,7 +8433,10 @@ fn verify_share_jti_with_view_mode(
     Ok(count_view)
 }
 
-fn next_stream_state_from_video_response(resp: &Response) -> (bool, u64) {
+fn next_stream_state_from_video_response(
+    resp: &Response,
+    request_range: Option<(u64, Option<u64>)>,
+) -> (bool, u64) {
     if resp.status() == StatusCode::PARTIAL_CONTENT
         && let Some(cr) = resp
             .headers()
@@ -8431,11 +8444,22 @@ fn next_stream_state_from_video_response(resp: &Response) -> (bool, u64) {
             .and_then(|v| v.to_str().ok())
         && let Some(spec) = cr.trim().strip_prefix("bytes ")
         && let Some((range_part, total_s)) = spec.split_once('/')
-        && let Some((_start_s, end_s)) = range_part.split_once('-')
-        && let (Ok(end), Ok(total)) = (end_s.trim().parse::<u64>(), total_s.trim().parse::<u64>())
-        && end + 1 < total
+        && let Some((start_s, end_s)) = range_part.split_once('-')
+        && let (Ok(start), Ok(end), Ok(total)) = (
+            start_s.trim().parse::<u64>(),
+            end_s.trim().parse::<u64>(),
+            total_s.trim().parse::<u64>(),
+        )
     {
-        return (true, (end + 1).max(2));
+        if start == 0 && end + 1 < total {
+            return (true, (end + 1).max(2));
+        }
+        if matches!(request_range, Some((0, None))) && total > 2 {
+            return (true, 2);
+        }
+        if start > 0 && end + 1 < total {
+            return (true, end + 1);
+        }
     }
     (false, u64::MAX)
 }
@@ -8444,11 +8468,12 @@ fn record_share_access_or_gone(
     state: &AppState,
     payload: &ShareTokenPayload,
     count_view: bool,
-    is_initial_video: bool,
     is_player_page: bool,
+    request_range: Option<(u64, Option<u64>)>,
     now_ts: u64,
     resp: Response,
 ) -> Response {
+    let is_initial_video = !is_player_page && matches!(request_range, None | Some((0, _)));
     let Some(jti) = payload
         .jti
         .as_deref()
@@ -8458,9 +8483,9 @@ fn record_share_access_or_gone(
         return resp;
     };
     let (stream_active, min_next_start) = if is_player_page {
-        (true, 2)
+        (false, u64::MAX)
     } else {
-        next_stream_state_from_video_response(&resp)
+        next_stream_state_from_video_response(&resp, request_range)
     };
     if !is_player_page && is_initial_video {
         let consumed_credit = state
@@ -8494,14 +8519,16 @@ fn record_share_access_or_gone(
                     if is_player_page {
                         let entry = map.entry(jti.to_string()).or_default();
                         entry.page_credits += 1;
-                        entry.active_stream_started = true;
-                        entry.min_next_range_start = 2;
-                    } else if stream_active {
+                    } else if is_initial_video && stream_active {
                         let entry = map.entry(jti.to_string()).or_default();
                         entry.active_stream_started = true;
                         entry.min_next_range_start = min_next_start;
-                    } else {
-                        map.remove(jti);
+                    } else if let Some(entry) = map.get_mut(jti) {
+                        entry.active_stream_started = false;
+                        entry.min_next_range_start = u64::MAX;
+                        if entry.page_credits == 0 {
+                            map.remove(jti);
+                        }
                     }
                 }
                 resp
@@ -8686,8 +8713,8 @@ async fn share_player_page(
         &state,
         &payload,
         payload.jti.is_some(),
-        false,
         true,
+        None,
         now_ts,
         resp,
     )
@@ -8933,9 +8960,10 @@ async fn share_video_mp4(
                 .into_response();
         }
     };
+    let request_range = parse_video_range_bounds(&headers);
     let is_initial = is_initial_or_unranged_video_request(&headers);
     if !is_initial && let Some(jti) = payload.jti.as_deref().map(str::trim) {
-        let valid_continuation = parse_video_range_bounds(&headers)
+        let valid_continuation = request_range
             .and_then(|(start, _)| {
                 state
                     .share_page_video_credits
@@ -8950,6 +8978,7 @@ async fn share_video_mp4(
             && let Some(entry) = map.get_mut(jti)
         {
             entry.active_stream_started = false;
+            entry.min_next_range_start = u64::MAX;
         }
     }
     let count_view =
@@ -8984,7 +9013,13 @@ async fn share_video_mp4(
                     && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
                 {
                     return record_share_access_or_gone(
-                        &state, &payload, count_view, is_initial, false, now_ts, resp,
+                        &state,
+                        &payload,
+                        count_view,
+                        false,
+                        request_range,
+                        now_ts,
+                        resp,
                     );
                 }
             }
@@ -9009,7 +9044,13 @@ async fn share_video_mp4(
                 && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
             {
                 return record_share_access_or_gone(
-                    &state, &payload, count_view, is_initial, false, now_ts, resp,
+                    &state,
+                    &payload,
+                    count_view,
+                    false,
+                    request_range,
+                    now_ts,
+                    resp,
                 );
             }
         }
@@ -9168,7 +9209,13 @@ async fn share_video_mp4(
                     && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
                 {
                     return record_share_access_or_gone(
-                        &state, &payload, count_view, is_initial, false, now_ts, resp,
+                        &state,
+                        &payload,
+                        count_view,
+                        false,
+                        request_range,
+                        now_ts,
+                        resp,
                     );
                 }
                 return StatusCode::NOT_FOUND.into_response();
@@ -9245,7 +9292,13 @@ async fn share_video_mp4(
                     && let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await
                 {
                     return record_share_access_or_gone(
-                        &state, &payload, count_view, is_initial, false, now_ts, resp,
+                        &state,
+                        &payload,
+                        count_view,
+                        false,
+                        request_range,
+                        now_ts,
+                        resp,
                     );
                 }
                 return StatusCode::NOT_FOUND.into_response();
@@ -9254,7 +9307,13 @@ async fn share_video_mp4(
             for safe_path in recs {
                 if let Some(resp) = serve_mp4_file_with_range(&safe_path, &headers).await {
                     return record_share_access_or_gone(
-                        &state, &payload, count_view, is_initial, false, now_ts, resp,
+                        &state,
+                        &payload,
+                        count_view,
+                        false,
+                        request_range,
+                        now_ts,
+                        resp,
                     );
                 }
             }
@@ -20408,7 +20467,9 @@ cameras:
         assert_eq!(second_range1.status(), StatusCode::GONE);
 
         // 1b. Consuming max_views=1 via player page (GET /share/{tok}) and then immediately sending
-        //     Range: bytes=1- (without Range: bytes=0-) is rejected with 410 GONE!
+        //     Range: bytes=1-, Range: bytes=2-, or Range: bytes=16-63 (without an initial Range: bytes=0-...)
+        //     is rejected with 410 GONE, and the legitimate Range: bytes=0-15 still works afterwards using
+        //     the unconsumed page credit!
         let resp_create_r2 = auth_app
             .clone()
             .oneshot(
@@ -20427,6 +20488,7 @@ cameras:
         let r2_json: Value =
             serde_json::from_slice(&to_bytes(resp_create_r2.into_body(), 4096).await.unwrap())
                 .unwrap();
+        let r2_id = r2_json["id"].as_str().unwrap().to_string();
         let r2_tok = r2_json["token"].as_str().unwrap().to_string();
 
         let r2_page = auth_app
@@ -20441,22 +20503,111 @@ cameras:
             .unwrap();
         assert_eq!(r2_page.status(), StatusCode::OK);
 
-        let r2_range1 = auth_app
+        for premature_range in ["bytes=1-", "bytes=2-", "bytes=16-63"] {
+            let r2_premature = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{r2_tok}/video.mp4"))
+                        .header(header::RANGE, premature_range)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r2_premature.status(),
+                StatusCode::GONE,
+                "Range: {premature_range} directly after player page when max_views=1 must return 410 GONE"
+            );
+        }
+
+        let r2_legit_initial = auth_app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/share/{r2_tok}/video.mp4"))
-                    .header(header::RANGE, "bytes=1-")
+                    .header(header::RANGE, "bytes=0-15")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(
-            r2_range1.status(),
-            StatusCode::GONE,
-            "Range: bytes=1- directly after player page when max_views=1 must return 410 GONE"
+            r2_legit_initial.status(),
+            StatusCode::PARTIAL_CONTENT,
+            "legitimate Range: bytes=0-15 after rejected premature non-zero ranges must succeed using unconsumed page credit"
         );
+        assert_eq!(
+            state.db.get_share_link(&r2_id).unwrap().unwrap()["access_count"],
+            1
+        );
+
+        // 1c. An initial open-ended Range: bytes=0- on a max_views=1 link followed by Range: bytes=16-63
+        //     succeeds (206 PARTIAL_CONTENT, access_count == 1), while a subsequent second viewer attempting
+        //     Range: bytes=0- and then Range: bytes=1- or Range: bytes=16-63 gets 410 GONE on all of them!
+        let resp_create_r3 = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/share")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"export","target_id":"exp_p0p1","expires_in_sec":3600,"max_views":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let r3_json: Value =
+            serde_json::from_slice(&to_bytes(resp_create_r3.into_body(), 4096).await.unwrap())
+                .unwrap();
+        let r3_id = r3_json["id"].as_str().unwrap().to_string();
+        let r3_tok = r3_json["token"].as_str().unwrap().to_string();
+
+        for viewer1_range in ["bytes=0-", "bytes=16-63"] {
+            let r3_v1 = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{r3_tok}/video.mp4"))
+                        .header(header::RANGE, viewer1_range)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r3_v1.status(),
+                StatusCode::PARTIAL_CONTENT,
+                "viewer 1 request with Range: {viewer1_range} must return 206 PARTIAL_CONTENT"
+            );
+            assert_eq!(
+                state.db.get_share_link(&r3_id).unwrap().unwrap()["access_count"],
+                1
+            );
+        }
+
+        for viewer2_range in ["bytes=0-", "bytes=1-", "bytes=16-63"] {
+            let r3_v2 = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/share/{r3_tok}/video.mp4"))
+                        .header(header::RANGE, viewer2_range)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r3_v2.status(),
+                StatusCode::GONE,
+                "viewer 2 request with Range: {viewer2_range} on exhausted max_views=1 link must return 410 GONE"
+            );
+        }
 
         // =========================================================================
         // 2. [ALTO-02] CSRF Parser Differential, Sec-Fetch-Site: cross-site, and Referer
@@ -20582,6 +20733,11 @@ cameras:
             .await
             .unwrap();
         assert_eq!(resp_lower_bearer.status(), StatusCode::OK);
+
+        // Multi-byte UTF-8 input in parse_authorization_bearer never panics on char boundaries
+        for utf8_input in ["🔥earer tok", "bear🔥r tok", "🔥🔥 tok", "  🔥bearer tok"] {
+            assert_eq!(parse_authorization_bearer(utf8_input), None);
+        }
 
         // =========================================================================
         // 3. [ALTO-03] Mandatory JTI Enforcement (jti: None or empty -> 403 FORBIDDEN)
