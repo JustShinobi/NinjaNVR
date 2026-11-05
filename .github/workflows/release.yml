@@ -117,6 +117,8 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          provenance: false
+          sbom: false
           build-args: |
             NINJANVR_RELEASE_VERSION=${{ steps.resolve.outputs.tag }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -125,7 +127,7 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: linux/amd64
 
-      - name: Prune old GHCR RC and untagged versions (keep latest 10 RC tags)
+      - name: Prune old GHCR RC versions (keep latest 10 RC tags)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PACKAGE_OWNER: ${{ github.repository_owner }}
@@ -139,6 +141,8 @@ jobs:
           MAX_RC_TO_KEEP = 10
           STABLE_RE = re.compile(r"^v\d+\.\d+\.\d+$")
           RC_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-rc\.(\d+)$")
+          LEGACY_SHA_RE = re.compile(r"^sha-[0-9a-f]+$")
+          BROKEN_RC_TAGS = {"v2.3.9-rc.1"}
           owner = os.environ.get("PACKAGE_OWNER", "JustShinobi")
 
           res = subprocess.run(
@@ -169,7 +173,7 @@ jobs:
               raise SystemExit(0)
 
           rc_entries = []
-          orphan_ids = []
+          legacy_sha_ids = []
 
           for v in versions:
               vid = v.get("id")
@@ -178,7 +182,15 @@ jobs:
                   .get("container", {})
                   .get("tags", [])
               )
+              # Never delete untagged package versions: in GHCR, child platform
+              # and attestation manifests referenced by OCI Image Indexes have
+              # no tags of their own, and deleting them corrupts parent tags.
+              if not tags:
+                  continue
               if any(t in ("latest", "dev") or STABLE_RE.match(t) for t in tags):
+                  continue
+              if any(t in BROKEN_RC_TAGS for t in tags):
+                  legacy_sha_ids.append((vid, tags))
                   continue
 
               rc_matches = [m for t in tags if (m := RC_RE.match(t))]
@@ -188,18 +200,17 @@ jobs:
                       for m in rc_matches
                   )
                   rc_entries.append((best_rc, v.get("created_at", ""), vid, tags))
-              else:
-                  # Untagged or legacy sha-* only image version
-                  orphan_ids.append((vid, tags))
+              elif all(LEGACY_SHA_RE.match(t) for t in tags):
+                  legacy_sha_ids.append((vid, tags))
 
           rc_entries.sort(reverse=True)
           to_delete = [
               (vid, tags) for _, _, vid, tags in rc_entries[MAX_RC_TO_KEEP:]
-          ] + orphan_ids
+          ] + legacy_sha_ids
 
           print(
               f"GHCR retention check: {len(rc_entries)} RC version(s) found (keeping up to {MAX_RC_TO_KEEP}), "
-              f"{len(to_delete)} old/orphan version(s) queued for deletion."
+              f"{len(to_delete)} old RC/legacy-sha version(s) queued for deletion."
           )
           for vid, tags in to_delete:
               del_res = subprocess.run(
