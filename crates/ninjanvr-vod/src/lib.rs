@@ -1,7 +1,32 @@
-use std::path::Path;
+use std::path::{Component, Path};
 
 use anyhow::{Context, Result, anyhow, bail};
 use ninjanvr_db::RecordingRow;
+
+const MAX_MOOV_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SEGMENT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SAMPLES_PER_TRACK: usize = 65_536;
+const MAX_TABLE_ENTRIES: usize = 65_536;
+
+fn validate_segment_path(path: &Path) -> Result<u64> {
+    if path.as_os_str().is_empty() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        bail!("unsafe segment path {}", path.display());
+    }
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat MP4 segment {}", path.display()))?;
+    if !meta.file_type().is_file() {
+        bail!("MP4 segment {} is not a regular file", path.display());
+    }
+    let len = meta.len();
+    if len > MAX_SEGMENT_FILE_BYTES {
+        bail!(
+            "MP4 segment {} exceeds maximum allowed size ({} bytes)",
+            path.display(),
+            len
+        );
+    }
+    Ok(len)
+}
 
 /// Probes the `(width, height)` video dimensions from an MP4 file's `vide` `tkhd` box in pure Rust.
 pub fn probe_mp4_resolution(mp4_path: &Path) -> Option<(u32, u32)> {
@@ -20,17 +45,24 @@ pub fn probe_mp4_resolution(mp4_path: &Path) -> Option<(u32, u32)> {
             let Some(hdlr) = find_box(&mdia_boxes, b"hdlr") else {
                 continue;
             };
-            let min_tkhd_len = if tkhd.first().copied() == Some(1) {
-                96
-            } else {
-                84
+            let min_tkhd_len = match tkhd.first().copied() {
+                Some(0) => 84usize,
+                Some(1) => 96usize,
+                _ => continue,
             };
             if hdlr.len() >= 12 && &hdlr[8..12] == b"vide" && tkhd.len() >= min_tkhd_len {
-                let n = tkhd.len();
-                let w =
-                    u32::from_be_bytes([tkhd[n - 8], tkhd[n - 7], tkhd[n - 6], tkhd[n - 5]]) >> 16;
-                let h =
-                    u32::from_be_bytes([tkhd[n - 4], tkhd[n - 3], tkhd[n - 2], tkhd[n - 1]]) >> 16;
+                let w = u32::from_be_bytes([
+                    tkhd[min_tkhd_len - 8],
+                    tkhd[min_tkhd_len - 7],
+                    tkhd[min_tkhd_len - 6],
+                    tkhd[min_tkhd_len - 5],
+                ]) >> 16;
+                let h = u32::from_be_bytes([
+                    tkhd[min_tkhd_len - 4],
+                    tkhd[min_tkhd_len - 3],
+                    tkhd[min_tkhd_len - 2],
+                    tkhd[min_tkhd_len - 1],
+                ]) >> 16;
                 if w > 0 && h > 0 {
                     return Some((w, h));
                 }
@@ -67,7 +99,12 @@ pub fn build_media_m3u8(segments: &[RecordingRow]) -> Result<String> {
 }
 
 fn format_program_date_time_utc(epoch_sec: f64) -> String {
-    let total_ms = (epoch_sec.max(0.0) * 1000.0).round() as i64;
+    let safe_sec = if epoch_sec.is_finite() {
+        epoch_sec.clamp(0.0, 253_402_300_799.0)
+    } else {
+        0.0
+    };
+    let total_ms = (safe_sec * 1000.0).round() as i64;
     let secs = total_ms.div_euclid(1000);
     let ms = total_ms.rem_euclid(1000);
     let days = secs.div_euclid(86400);
@@ -98,7 +135,14 @@ pub fn build_media_playlist_with_resolutions(
 ) -> Result<String> {
     let max_dur = segments
         .iter()
-        .map(|s| s.duration.ceil() as u64)
+        .map(|s| {
+            let d = if s.duration.is_finite() && s.duration > 0.0 {
+                s.duration.clamp(0.1, 3600.0)
+            } else {
+                10.0
+            };
+            d.ceil() as u64
+        })
         .max()
         .unwrap_or(10)
         .max(1);
@@ -118,8 +162,17 @@ pub fn build_media_playlist_with_resolutions(
     let mut prev_rate: Option<f64> = None;
     for (idx, seg) in segments.iter().enumerate() {
         let cur_res = resolutions.and_then(|r| r.get(idx).copied());
-        let dur = seg.duration.max(0.1);
-        let cur_rate = seg.segment_size / dur;
+        let dur = if seg.duration.is_finite() && seg.duration > 0.0 {
+            seg.duration.clamp(0.1, 3600.0)
+        } else {
+            10.0
+        };
+        let safe_size = if seg.segment_size.is_finite() && seg.segment_size >= 0.0 {
+            seg.segment_size
+        } else {
+            0.0
+        };
+        let cur_rate = safe_size / dur;
 
         let time_gap = prev_end
             .map(|pe| (seg.start_time - pe).abs() > 1.5)
@@ -169,22 +222,24 @@ struct Mp4BoxSlice<'a> {
 fn iter_boxes(mut buf: &[u8]) -> Vec<Mp4BoxSlice<'_>> {
     let mut out = Vec::new();
     while buf.len() >= 8 {
-        let size32 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let size32 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
         let box_type = [buf[4], buf[5], buf[6], buf[7]];
-        let (box_len, hdr_len) = if size32 == 1 {
+        let (box_len_u64, hdr_len) = if size32 == 1 {
             if buf.len() < 16 {
                 break;
             }
             let size64 = u64::from_be_bytes([
                 buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-            ]) as usize;
-            (size64, 16)
+            ]);
+            (size64, 16usize)
         } else if size32 == 0 {
-            (buf.len(), 8)
+            (buf.len() as u64, 8usize)
         } else {
-            (size32, 8)
+            (size32, 8usize)
         };
-
+        let Ok(box_len) = usize::try_from(box_len_u64) else {
+            break;
+        };
         if box_len < hdr_len || box_len > buf.len() {
             break;
         }
@@ -249,17 +304,20 @@ struct ParsedTrack {
 
 fn read_moov_from_file(path: &Path) -> Result<(Vec<u8>, usize)> {
     use std::io::{Read, Seek, SeekFrom};
+    let file_len = validate_segment_path(path)?;
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("failed to open MP4 segment {}", path.display()))?;
-    let file_len = file.metadata()?.len();
     let mut pos = 0u64;
     let mut hdr = [0u8; 8];
-    while pos + 8 <= file_len {
+    while pos.checked_add(8).is_some_and(|end| end <= file_len) {
         file.seek(SeekFrom::Start(pos))?;
         file.read_exact(&mut hdr)?;
         let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
         let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
         let (box_size, hdr_len) = if size32 == 1 {
+            if pos.checked_add(16).is_none_or(|end| end > file_len) {
+                break;
+            }
             let mut ext = [0u8; 8];
             file.read_exact(&mut ext)?;
             (u64::from_be_bytes(ext), 16u64)
@@ -268,16 +326,26 @@ fn read_moov_from_file(path: &Path) -> Result<(Vec<u8>, usize)> {
         } else {
             (size32, 8u64)
         };
-        if box_size < hdr_len || pos + box_size > file_len {
+        let Some(next_pos) = pos.checked_add(box_size) else {
+            break;
+        };
+        if box_size < hdr_len || next_pos > file_len {
             break;
         }
         if &btype == b"moov" {
-            let payload_len = (box_size - hdr_len) as usize;
+            let payload_u64 = box_size - hdr_len;
+            if payload_u64 > MAX_MOOV_BYTES {
+                bail!(
+                    "moov box exceeds maximum allowed size in {}",
+                    path.display()
+                );
+            }
+            let payload_len = payload_u64 as usize;
             let mut buf = vec![0u8; payload_len];
             file.read_exact(&mut buf)?;
             return Ok((buf, file_len as usize));
         }
-        pos += box_size;
+        pos = next_pos;
     }
     bail!("no moov box found in {}", path.display())
 }
@@ -290,6 +358,14 @@ fn parse_tracks_from_moov(
     let mvhd_payload = find_box(&moov_boxes, b"mvhd")
         .ok_or_else(|| anyhow!("missing mvhd inside moov"))?
         .to_vec();
+    let min_mvhd_len = match mvhd_payload.first().copied() {
+        Some(0) => 20usize,
+        Some(1) => 32usize,
+        _ => bail!("unsupported or empty mvhd version"),
+    };
+    if mvhd_payload.len() < min_mvhd_len {
+        bail!("mvhd payload too short for version");
+    }
 
     let mut tracks = Vec::new();
     for b in &moov_boxes {
@@ -336,17 +412,19 @@ fn parse_tracks_from_moov(
 fn parse_single_trak(trak_payload: &[u8]) -> Result<ParsedTrack> {
     let trak_boxes = iter_boxes(trak_payload);
     let tkhd = find_box(&trak_boxes, b"tkhd").ok_or_else(|| anyhow!("missing tkhd"))?;
-    if tkhd.len() < 20 {
+    if tkhd.len() < 24 {
         bail!("tkhd too short");
     }
     let tkhd_ver = tkhd[0];
     let track_id = if tkhd_ver == 1 {
-        if tkhd.len() < 24 {
+        if tkhd.len() < 36 {
             bail!("tkhd v1 too short");
         }
         u32::from_be_bytes([tkhd[20], tkhd[21], tkhd[22], tkhd[23]])
-    } else {
+    } else if tkhd_ver == 0 {
         u32::from_be_bytes([tkhd[12], tkhd[13], tkhd[14], tkhd[15]])
+    } else {
+        bail!("unsupported tkhd version {tkhd_ver}");
     };
 
     let mdia = find_box(&trak_boxes, b"mdia").ok_or_else(|| anyhow!("missing mdia"))?;
@@ -357,12 +435,14 @@ fn parse_single_trak(trak_payload: &[u8]) -> Result<ParsedTrack> {
     }
     let mdhd_ver = mdhd[0];
     let timescale = if mdhd_ver == 1 {
-        if mdhd.len() < 24 {
+        if mdhd.len() < 32 {
             bail!("mdhd v1 too short");
         }
         u32::from_be_bytes([mdhd[20], mdhd[21], mdhd[22], mdhd[23]])
-    } else {
+    } else if mdhd_ver == 0 {
         u32::from_be_bytes([mdhd[12], mdhd[13], mdhd[14], mdhd[15]])
+    } else {
+        bail!("unsupported mdhd version {mdhd_ver}");
     }
     .max(1);
 
@@ -429,11 +509,23 @@ fn parse_sample_table(
     }
     let fixed_size = u32::from_be_bytes([stsz[4], stsz[5], stsz[6], stsz[7]]);
     let sample_count = u32::from_be_bytes([stsz[8], stsz[9], stsz[10], stsz[11]]) as usize;
+    if sample_count > MAX_SAMPLES_PER_TRACK {
+        bail!(
+            "stsz sample_count ({sample_count}) exceeds maximum allowed ({MAX_SAMPLES_PER_TRACK})"
+        );
+    }
     let mut sizes = Vec::with_capacity(sample_count);
     if fixed_size != 0 {
         sizes.resize(sample_count, fixed_size);
     } else {
-        if stsz.len() < 12 + sample_count * 4 {
+        let needed = 12usize
+            .checked_add(
+                sample_count
+                    .checked_mul(4)
+                    .ok_or_else(|| anyhow!("stsz size overflow"))?,
+            )
+            .ok_or_else(|| anyhow!("stsz size overflow"))?;
+        if stsz.len() < needed {
             bail!("stsz table truncated");
         }
         for i in 0..sample_count {
@@ -452,22 +544,23 @@ fn parse_sample_table(
     let mut durations = Vec::with_capacity(sample_count);
     if stts.len() >= 8 {
         let entry_count = u32::from_be_bytes([stts[4], stts[5], stts[6], stts[7]]) as usize;
-        for i in 0..entry_count {
-            let p = 8 + i * 8;
-            if p + 8 > stts.len() {
+        for i in 0..entry_count.min(MAX_TABLE_ENTRIES) {
+            let Some(p) = i.checked_mul(8).and_then(|o| o.checked_add(8)) else {
+                break;
+            };
+            if p + 8 > stts.len() || durations.len() >= sample_count {
                 break;
             }
-            let count = u32::from_be_bytes([stts[p], stts[p + 1], stts[p + 2], stts[p + 3]]);
+            let count =
+                u32::from_be_bytes([stts[p], stts[p + 1], stts[p + 2], stts[p + 3]]) as usize;
             let delta = u32::from_be_bytes([stts[p + 4], stts[p + 5], stts[p + 6], stts[p + 7]]);
-            for _ in 0..count {
-                if durations.len() < sample_count {
-                    durations.push(delta);
-                }
-            }
+            let take = count.min(sample_count.saturating_sub(durations.len()));
+            durations.extend(std::iter::repeat_n(delta, take));
         }
     }
-    while durations.len() < sample_count {
-        durations.push(durations.last().copied().unwrap_or(1024));
+    if durations.len() < sample_count {
+        let pad_val = durations.last().copied().unwrap_or(1024);
+        durations.resize(sample_count, pad_val);
     }
 
     // 3. Parse ctts (optional composition time offsets)
@@ -477,20 +570,19 @@ fn parse_sample_table(
     {
         let entry_count = u32::from_be_bytes([ctts[4], ctts[5], ctts[6], ctts[7]]) as usize;
         let mut idx = 0usize;
-        for i in 0..entry_count {
-            let p = 8 + i * 8;
-            if p + 8 > ctts.len() {
+        for i in 0..entry_count.min(MAX_TABLE_ENTRIES) {
+            let Some(p) = i.checked_mul(8).and_then(|o| o.checked_add(8)) else {
+                break;
+            };
+            if p + 8 > ctts.len() || idx >= sample_count {
                 break;
             }
             let count =
                 u32::from_be_bytes([ctts[p], ctts[p + 1], ctts[p + 2], ctts[p + 3]]) as usize;
             let offset = i32::from_be_bytes([ctts[p + 4], ctts[p + 5], ctts[p + 6], ctts[p + 7]]);
-            for _ in 0..count {
-                if idx < sample_count {
-                    cts_offsets[idx] = offset;
-                    idx += 1;
-                }
-            }
+            let take = count.min(sample_count.saturating_sub(idx));
+            cts_offsets[idx..idx + take].fill(offset);
+            idx += take;
         }
     }
 
@@ -500,8 +592,10 @@ fn parse_sample_table(
         && stss.len() >= 8
     {
         let entry_count = u32::from_be_bytes([stss[4], stss[5], stss[6], stss[7]]) as usize;
-        for i in 0..entry_count {
-            let p = 8 + i * 4;
+        for i in 0..entry_count.min(MAX_TABLE_ENTRIES) {
+            let Some(p) = i.checked_mul(4).and_then(|o| o.checked_add(8)) else {
+                break;
+            };
             if p + 4 > stss.len() {
                 break;
             }
@@ -521,35 +615,40 @@ fn parse_sample_table(
         && stco.len() >= 8
     {
         let entry_count = u32::from_be_bytes([stco[4], stco[5], stco[6], stco[7]]) as usize;
-        for i in 0..entry_count {
-            let p = 8 + i * 4;
-            if p + 4 <= stco.len() {
-                chunk_offsets.push(u32::from_be_bytes([
-                    stco[p],
-                    stco[p + 1],
-                    stco[p + 2],
-                    stco[p + 3],
-                ]) as usize);
+        for i in 0..entry_count.min(MAX_TABLE_ENTRIES) {
+            let Some(p) = i.checked_mul(4).and_then(|o| o.checked_add(8)) else {
+                break;
+            };
+            if p + 4 > stco.len() {
+                break;
             }
+            chunk_offsets.push(
+                u32::from_be_bytes([stco[p], stco[p + 1], stco[p + 2], stco[p + 3]]) as usize,
+            );
         }
     } else if let Some(co64) = find_box(stbl_boxes, b"co64")
         && co64.len() >= 8
     {
         let entry_count = u32::from_be_bytes([co64[4], co64[5], co64[6], co64[7]]) as usize;
-        for i in 0..entry_count {
-            let p = 8 + i * 8;
-            if p + 8 <= co64.len() {
-                chunk_offsets.push(u64::from_be_bytes([
-                    co64[p],
-                    co64[p + 1],
-                    co64[p + 2],
-                    co64[p + 3],
-                    co64[p + 4],
-                    co64[p + 5],
-                    co64[p + 6],
-                    co64[p + 7],
-                ]) as usize);
+        for i in 0..entry_count.min(MAX_TABLE_ENTRIES) {
+            let Some(p) = i.checked_mul(8).and_then(|o| o.checked_add(8)) else {
+                break;
+            };
+            if p + 8 > co64.len() {
+                break;
             }
+            let raw_off = u64::from_be_bytes([
+                co64[p],
+                co64[p + 1],
+                co64[p + 2],
+                co64[p + 3],
+                co64[p + 4],
+                co64[p + 5],
+                co64[p + 6],
+                co64[p + 7],
+            ]);
+            let off = usize::try_from(raw_off).map_err(|_| anyhow!("co64 offset overflow"))?;
+            chunk_offsets.push(off);
         }
     }
 
@@ -557,16 +656,18 @@ fn parse_sample_table(
     let mut stsc_entries = Vec::new();
     if stsc.len() >= 8 {
         let entry_count = u32::from_be_bytes([stsc[4], stsc[5], stsc[6], stsc[7]]) as usize;
-        for i in 0..entry_count {
-            let p = 8 + i * 12;
-            if p + 12 <= stsc.len() {
-                let first_chunk =
-                    u32::from_be_bytes([stsc[p], stsc[p + 1], stsc[p + 2], stsc[p + 3]]) as usize;
-                let samples_per_chunk =
-                    u32::from_be_bytes([stsc[p + 4], stsc[p + 5], stsc[p + 6], stsc[p + 7]])
-                        as usize;
-                stsc_entries.push((first_chunk.max(1), samples_per_chunk));
+        for i in 0..entry_count.min(MAX_TABLE_ENTRIES) {
+            let Some(p) = i.checked_mul(12).and_then(|o| o.checked_add(8)) else {
+                break;
+            };
+            if p + 12 > stsc.len() {
+                break;
             }
+            let first_chunk =
+                u32::from_be_bytes([stsc[p], stsc[p + 1], stsc[p + 2], stsc[p + 3]]) as usize;
+            let samples_per_chunk =
+                u32::from_be_bytes([stsc[p + 4], stsc[p + 5], stsc[p + 6], stsc[p + 7]]) as usize;
+            stsc_entries.push((first_chunk.max(1), samples_per_chunk));
         }
     }
 
@@ -583,10 +684,8 @@ fn parse_sample_table(
             }
         }
         let mut cur_offset = chunk_offset;
-        for _ in 0..spc {
-            if sample_idx >= sample_count {
-                break;
-            }
+        let take = spc.min(sample_count.saturating_sub(sample_idx));
+        for _ in 0..take {
             let sz = sizes[sample_idx];
             samples.push(ParsedSample {
                 offset: cur_offset,
@@ -595,7 +694,9 @@ fn parse_sample_table(
                 cts_offset: cts_offsets[sample_idx],
                 is_sync: sync_flags[sample_idx],
             });
-            cur_offset += sz as usize;
+            cur_offset = cur_offset
+                .checked_add(sz as usize)
+                .ok_or_else(|| anyhow!("sample offset overflow"))?;
             sample_idx += 1;
         }
         if sample_idx >= sample_count {
@@ -613,12 +714,10 @@ pub fn build_init_mp4(first_segment_path: &Path) -> Result<Vec<u8>> {
     let (mut mvhd, tracks) = parse_tracks_from_moov(&moov_payload, file_len)?;
 
     // Zero out duration in mvhd so players treat this as a fragmented stream
-    if mvhd.len() >= 20 {
-        if mvhd[0] == 1 && mvhd.len() >= 32 {
-            mvhd[24..32].fill(0);
-        } else {
-            mvhd[16..20].fill(0);
-        }
+    if mvhd[0] == 1 && mvhd.len() >= 32 {
+        mvhd[24..32].fill(0);
+    } else if mvhd[0] == 0 && mvhd.len() >= 20 {
+        mvhd[16..20].fill(0);
     }
 
     let mut moov_children = Vec::new();
@@ -628,20 +727,16 @@ pub fn build_init_mp4(first_segment_path: &Path) -> Result<Vec<u8>> {
 
     for t in &tracks {
         let mut tkhd = t.tkhd_payload.clone();
-        if tkhd.len() >= 24 {
-            if tkhd[0] == 1 && tkhd.len() >= 36 {
-                tkhd[28..36].fill(0);
-            } else {
-                tkhd[20..24].fill(0);
-            }
+        if tkhd[0] == 1 && tkhd.len() >= 36 {
+            tkhd[28..36].fill(0);
+        } else if tkhd[0] == 0 && tkhd.len() >= 24 {
+            tkhd[20..24].fill(0);
         }
         let mut mdhd = t.mdhd_payload.clone();
-        if mdhd.len() >= 20 {
-            if mdhd[0] == 1 && mdhd.len() >= 32 {
-                mdhd[24..32].fill(0);
-            } else {
-                mdhd[16..20].fill(0);
-            }
+        if mdhd[0] == 1 && mdhd.len() >= 32 {
+            mdhd[24..32].fill(0);
+        } else if mdhd[0] == 0 && mdhd.len() >= 20 {
+            mdhd[16..20].fill(0);
         }
 
         // Empty sample table boxes required by ISO-BMFF for fragmented MP4 init segments
@@ -695,6 +790,7 @@ pub fn build_media_segment_m4s(
     sequence_number: u32,
     base_time_seconds: f64,
 ) -> Result<Vec<u8>> {
+    validate_segment_path(segment_path)?;
     let file_bytes = std::fs::read(segment_path)
         .with_context(|| format!("failed to read MP4 file {}", segment_path.display()))?;
     let top_boxes = iter_boxes(&file_bytes);
@@ -723,7 +819,12 @@ pub fn build_media_segment_m4s(
             ));
 
             // tfdt v1: 64-bit baseMediaDecodeTime in track timescale units
-            let base_dts = (base_time_seconds.max(0.0) * (t.timescale as f64)).round() as u64;
+            let safe_base_sec = if base_time_seconds.is_finite() {
+                base_time_seconds.clamp(0.0, 315_360_000.0)
+            } else {
+                0.0
+            };
+            let base_dts = (safe_base_sec * (t.timescale as f64)).round() as u64;
             traf_children.extend_from_slice(&make_full_box(b"tfdt", 1, 0, &base_dts.to_be_bytes()));
 
             let has_cts = t.samples.iter().any(|s| s.cts_offset != 0);
@@ -768,27 +869,55 @@ pub fn build_media_segment_m4s(
 
     let dummy_offsets = vec![0i32; tracks.len()];
     let initial_moof = build_moof(&dummy_offsets);
-    let moof_len = initial_moof.len() as i32;
+    let moof_len = initial_moof.len();
 
     let mut real_offsets = Vec::with_capacity(tracks.len());
     let mut total_mdat_payload = 0usize;
     for t in &tracks {
         // +8 for the mdat box header (size + 'mdat')
-        real_offsets.push(moof_len + 8 + (total_mdat_payload as i32));
+        let data_off_usize = moof_len
+            .checked_add(8)
+            .and_then(|v| v.checked_add(total_mdat_payload))
+            .ok_or_else(|| anyhow!("trun data_offset overflow"))?;
+        let data_off_i32 =
+            i32::try_from(data_off_usize).map_err(|_| anyhow!("trun data_offset exceeds i32"))?;
+        real_offsets.push(data_off_i32);
         for s in &t.samples {
-            total_mdat_payload += s.size as usize;
+            total_mdat_payload = total_mdat_payload
+                .checked_add(s.size as usize)
+                .ok_or_else(|| anyhow!("mdat payload size overflow"))?;
         }
+    }
+    if total_mdat_payload > file_bytes.len() {
+        bail!(
+            "mdat sample table payload ({total_mdat_payload} bytes) exceeds source segment file size ({} bytes)",
+            file_bytes.len()
+        );
     }
 
     let final_moof = build_moof(&real_offsets);
-    let mut out = Vec::with_capacity(final_moof.len() + 8 + total_mdat_payload);
+    let mdat_box_size = u32::try_from(
+        8usize
+            .checked_add(total_mdat_payload)
+            .ok_or_else(|| anyhow!("mdat box size overflow"))?,
+    )
+    .map_err(|_| anyhow!("mdat box size exceeds u32"))?;
+    let total_out_cap = final_moof
+        .len()
+        .checked_add(8)
+        .and_then(|v| v.checked_add(total_mdat_payload))
+        .ok_or_else(|| anyhow!("output buffer size overflow"))?;
+    let mut out = Vec::with_capacity(total_out_cap);
     out.extend_from_slice(&final_moof);
-    out.extend_from_slice(&((8 + total_mdat_payload) as u32).to_be_bytes());
+    out.extend_from_slice(&mdat_box_size.to_be_bytes());
     out.extend_from_slice(b"mdat");
 
     for t in &tracks {
         for s in &t.samples {
-            let end = s.offset + (s.size as usize);
+            let end = s
+                .offset
+                .checked_add(s.size as usize)
+                .ok_or_else(|| anyhow!("sample offset overflow"))?;
             if end <= file_bytes.len() {
                 out.extend_from_slice(&file_bytes[s.offset..end]);
             } else {
@@ -839,6 +968,9 @@ pub fn parse_trun_first_sample_is_sync(
     if (tr_flags & 0x000001) != 0 {
         pos += 4;
     }
+    if pos > trun.len() {
+        return None;
+    }
     if (tr_flags & 0x000004) != 0 {
         if pos + 4 > trun.len() {
             return None;
@@ -884,7 +1016,13 @@ fn parse_tfhd_track_and_default_flags(tfhd: &[u8]) -> (Option<u32>, Option<u32>)
     if (tf_flags & 0x000010) != 0 {
         pos += 4;
     }
-    let default_flags = if (tf_flags & 0x000020) != 0 && pos + 4 <= tfhd.len() {
+    if pos > tfhd.len() {
+        return (None, None);
+    }
+    let default_flags = if (tf_flags & 0x000020) != 0 {
+        if pos + 4 > tfhd.len() {
+            return (None, None);
+        }
         Some(u32::from_be_bytes([
             tfhd[pos],
             tfhd[pos + 1],
@@ -1663,6 +1801,171 @@ mod tests {
         assert_eq!(
             parse_trun_first_sample_is_sync(&trun_default_only[8..], Some(0x0000_0000)),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn rejects_oom_stsz_billion_spin_tables_chunk_aliasing_overflow_and_traversal() {
+        // 1. VOD-01: stsz with fixed_size = 1 and sample_count = u32::MAX must fail immediately without 148 GB OOM
+        let mut oom_stsz_body = Vec::new();
+        oom_stsz_body.extend_from_slice(&1u32.to_be_bytes()); // fixed_size = 1
+        oom_stsz_body.extend_from_slice(&u32::MAX.to_be_bytes()); // sample_count = 4,294,967,295
+        let oom_stsz = make_full_box(b"stsz", 0, 0, &oom_stsz_body);
+        let oom_stbl = make_box(b"stbl", &oom_stsz);
+        let oom_stbl_boxes = iter_boxes(&oom_stbl[8..]);
+        let err_oom = parse_sample_table(&oom_stbl_boxes, b"vide")
+            .expect_err("oversized stsz sample_count must fail fast");
+        assert!(err_oom.to_string().contains("exceeds maximum allowed"));
+
+        // 2. VOD-02 & VOD-03: stts, ctts, stco, co64, and stsc with entry_count = u32::MAX or run count = u32::MAX
+        //    must terminate in O(1) without 4.29B iteration spin loops, and co64 offset near u64::MAX must not overflow
+        let mut stsz_2_body = Vec::new();
+        stsz_2_body.extend_from_slice(&64u32.to_be_bytes()); // fixed_size = 64
+        stsz_2_body.extend_from_slice(&2u32.to_be_bytes()); // sample_count = 2
+        let stsz_2 = make_full_box(b"stsz", 0, 0, &stsz_2_body);
+
+        let mut stts_spin_body = Vec::new();
+        stts_spin_body.extend_from_slice(&u32::MAX.to_be_bytes()); // entry_count = u32::MAX
+        stts_spin_body.extend_from_slice(&u32::MAX.to_be_bytes()); // run count = u32::MAX
+        stts_spin_body.extend_from_slice(&3000u32.to_be_bytes()); // delta = 3000
+        let stts_spin = make_full_box(b"stts", 0, 0, &stts_spin_body);
+
+        let mut ctts_spin_body = Vec::new();
+        ctts_spin_body.extend_from_slice(&u32::MAX.to_be_bytes()); // entry_count = u32::MAX
+        ctts_spin_body.extend_from_slice(&u32::MAX.to_be_bytes()); // run count = u32::MAX
+        ctts_spin_body.extend_from_slice(&1500i32.to_be_bytes()); // offset = 1500
+        let ctts_spin = make_full_box(b"ctts", 0, 0, &ctts_spin_body);
+
+        let mut stsc_spin_body = Vec::new();
+        stsc_spin_body.extend_from_slice(&u32::MAX.to_be_bytes()); // entry_count = u32::MAX
+        stsc_spin_body.extend_from_slice(&1u32.to_be_bytes()); // first_chunk = 1
+        stsc_spin_body.extend_from_slice(&u32::MAX.to_be_bytes()); // samples_per_chunk = u32::MAX
+        stsc_spin_body.extend_from_slice(&1u32.to_be_bytes());
+        let stsc_spin = make_full_box(b"stsc", 0, 0, &stsc_spin_body);
+
+        let mut co64_overflow_body = Vec::new();
+        co64_overflow_body.extend_from_slice(&u32::MAX.to_be_bytes()); // entry_count = u32::MAX
+        co64_overflow_body.extend_from_slice(&(u64::MAX - 10).to_be_bytes()); // offset near u64::MAX -> cur_offset + 64 overflows!
+        let co64_overflow = make_full_box(b"co64", 0, 0, &co64_overflow_body);
+
+        let mut spin_stbl_children = Vec::new();
+        spin_stbl_children.extend_from_slice(&stsz_2);
+        spin_stbl_children.extend_from_slice(&stts_spin);
+        spin_stbl_children.extend_from_slice(&ctts_spin);
+        spin_stbl_children.extend_from_slice(&stsc_spin);
+        spin_stbl_children.extend_from_slice(&co64_overflow);
+        let spin_stbl = make_box(b"stbl", &spin_stbl_children);
+        let spin_stbl_boxes = iter_boxes(&spin_stbl[8..]);
+        let err_overflow = parse_sample_table(&spin_stbl_boxes, b"vide")
+            .expect_err("co64 offset overflow across multi-sample chunk must be rejected");
+        assert!(err_overflow.to_string().contains("overflow"));
+
+        // 3. VOD-01b: Chunk-aliasing amplification bomb (100 chunks all pointing to the same 64-byte mdat payload)
+        //    must be rejected in build_media_segment_m4s because total_mdat_payload (6400) > file_bytes.len()
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+        let video_sample = vec![0x65u8; 64];
+        let mdat_offset = (ftyp.len() + 8) as u32;
+        let mdat = make_box(b"mdat", &video_sample);
+
+        let mut tkhd_body = vec![0u8; 80];
+        tkhd_body[8..12].copy_from_slice(&1u32.to_be_bytes());
+        let tkhd = make_full_box(b"tkhd", 0, 3, &tkhd_body);
+        let mut mdhd_body = vec![0u8; 20];
+        mdhd_body[8..12].copy_from_slice(&90000u32.to_be_bytes());
+        mdhd_body[12..16].copy_from_slice(&90000u32.to_be_bytes());
+        let mdhd = make_full_box(b"mdhd", 0, 0, &mdhd_body);
+        let mut hdlr_body = vec![0u8; 20];
+        hdlr_body[4..8].copy_from_slice(b"vide");
+        let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+        let stsd = make_full_box(b"stsd", 0, 0, &[0, 0, 0, 1]);
+
+        let mut alias_stsz_body = Vec::new();
+        alias_stsz_body.extend_from_slice(&64u32.to_be_bytes());
+        alias_stsz_body.extend_from_slice(&100u32.to_be_bytes()); // 100 samples of 64 bytes = 6400 bytes
+        let alias_stsz = make_full_box(b"stsz", 0, 0, &alias_stsz_body);
+
+        let mut alias_stts_body = Vec::new();
+        alias_stts_body.extend_from_slice(&1u32.to_be_bytes());
+        alias_stts_body.extend_from_slice(&100u32.to_be_bytes());
+        alias_stts_body.extend_from_slice(&3000u32.to_be_bytes());
+        let alias_stts = make_full_box(b"stts", 0, 0, &alias_stts_body);
+
+        let mut alias_stsc_body = Vec::new();
+        alias_stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        alias_stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        alias_stsc_body.extend_from_slice(&1u32.to_be_bytes()); // 1 sample per chunk
+        alias_stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        let alias_stsc = make_full_box(b"stsc", 0, 0, &alias_stsc_body);
+
+        let mut alias_stco_body = Vec::new();
+        alias_stco_body.extend_from_slice(&100u32.to_be_bytes());
+        for _ in 0..100 {
+            alias_stco_body.extend_from_slice(&mdat_offset.to_be_bytes());
+        }
+        let alias_stco = make_full_box(b"stco", 0, 0, &alias_stco_body);
+
+        let mut alias_stbl_children = Vec::new();
+        alias_stbl_children.extend_from_slice(&stsd);
+        alias_stbl_children.extend_from_slice(&alias_stsz);
+        alias_stbl_children.extend_from_slice(&alias_stts);
+        alias_stbl_children.extend_from_slice(&alias_stsc);
+        alias_stbl_children.extend_from_slice(&alias_stco);
+        let alias_stbl = make_box(b"stbl", &alias_stbl_children);
+        let alias_minf = make_box(b"minf", &alias_stbl);
+        let mut alias_mdia_children = Vec::new();
+        alias_mdia_children.extend_from_slice(&mdhd);
+        alias_mdia_children.extend_from_slice(&hdlr);
+        alias_mdia_children.extend_from_slice(&alias_minf);
+        let alias_mdia = make_box(b"mdia", &alias_mdia_children);
+        let mut alias_trak_children = Vec::new();
+        alias_trak_children.extend_from_slice(&tkhd);
+        alias_trak_children.extend_from_slice(&alias_mdia);
+        let alias_trak = make_box(b"trak", &alias_trak_children);
+        let mvhd = make_full_box(b"mvhd", 0, 0, &[0u8; 96]);
+        let mut alias_moov_children = Vec::new();
+        alias_moov_children.extend_from_slice(&mvhd);
+        alias_moov_children.extend_from_slice(&alias_trak);
+        let alias_moov = make_box(b"moov", &alias_moov_children);
+
+        let mut alias_mp4 = Vec::new();
+        alias_mp4.extend_from_slice(&ftyp);
+        alias_mp4.extend_from_slice(&mdat);
+        alias_mp4.extend_from_slice(&alias_moov);
+
+        let alias_path = std::env::temp_dir().join("ninjanvr-vod-alias-bomb.mp4");
+        std::fs::write(&alias_path, &alias_mp4).unwrap();
+        let err_alias = build_media_segment_m4s(&alias_path, 1, 0.0)
+            .expect_err("chunk-aliasing amplification exceeding file size must be rejected");
+        assert!(
+            err_alias
+                .to_string()
+                .contains("exceeds source segment file size")
+        );
+        let _ = std::fs::remove_file(&alias_path);
+
+        // 4. VOD-03 & VOD-04: 64-bit largesize overflow in read_moov_from_file, truncated v1 tkhd/mdhd, and '..' path traversal
+        let mut wrap_mp4 = ftyp;
+        wrap_mp4.extend_from_slice(&1u32.to_be_bytes());
+        wrap_mp4.extend_from_slice(b"free");
+        wrap_mp4.extend_from_slice(&(u64::MAX - 10).to_be_bytes());
+        wrap_mp4.extend_from_slice(&[0u8; 16]);
+        let wrap_path = std::env::temp_dir().join("ninjanvr-vod-wrap-largesize.mp4");
+        std::fs::write(&wrap_path, &wrap_mp4).unwrap();
+        assert!(build_init_mp4(&wrap_path).is_err());
+        assert_eq!(probe_mp4_resolution(&wrap_path), None);
+        let _ = std::fs::remove_file(&wrap_path);
+
+        // Path traversal with '..' must be rejected before opening
+        let trav_path = Path::new("/tmp/ninjanvr/../etc/passwd");
+        assert!(build_init_mp4(trav_path).is_err());
+        assert!(build_media_segment_m4s(trav_path, 1, 0.0).is_err());
+        assert_eq!(probe_mp4_resolution(trav_path), None);
+
+        // Truncated trun with data-offset-present flag (0x000001) but only 8 bytes must return None
+        let truncated_trun = [0, 0, 0, 1, 0, 0, 0, 1];
+        assert_eq!(
+            parse_trun_first_sample_is_sync(&truncated_trun, Some(0x0200_0000)),
+            None
         );
     }
 }
