@@ -7134,6 +7134,75 @@ async fn camera_privacy_mask_value(
     cfg.cameras.get(camera).map(|c| c.privacy_mask.clone())
 }
 
+fn ensure_dataset_sample_path(media_dir: &Path, candidate: &Path) -> Option<PathBuf> {
+    let dataset_dir = media_dir.join("dataset");
+    let canon_dataset_dir = ensure_path_within_media_dir(media_dir, &dataset_dir)?;
+    ensure_path_within_media_dir(&canon_dataset_dir, candidate)
+}
+
+async fn atomic_write_within_media_subdir(
+    media_dir: &Path,
+    subdir_name: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    if !is_safe_id(filename) || filename.contains('/') || filename.contains('\\') {
+        anyhow::bail!("Invalid filename '{filename}'");
+    }
+    let subdir = media_dir.join(subdir_name);
+    if let Ok(meta) = std::fs::symlink_metadata(&subdir)
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!("Target directory '{subdir_name}' must not be a symlink");
+    }
+    tokio::fs::create_dir_all(&subdir).await?;
+    let Some(canon_subdir) = ensure_path_within_media_dir(media_dir, &subdir) else {
+        anyhow::bail!("Target directory '{subdir_name}' escapes media_dir");
+    };
+    let final_path = canon_subdir.join(filename);
+    if let Ok(meta) = std::fs::symlink_metadata(&final_path)
+        && meta.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "Refusing to overwrite symlink at '{}'",
+            final_path.display()
+        );
+    }
+    let tmp_name = format!("tmp_{}_{}", rand::random::<u64>(), filename);
+    let tmp_path = canon_subdir.join(&tmp_name);
+    tokio::fs::write(&tmp_path, bytes).await?;
+    if let Err(err) = tokio::fs::rename(&tmp_path, &final_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(err.into());
+    }
+    let Some(safe_final) = ensure_path_within_media_dir(&canon_subdir, &final_path) else {
+        let _ = tokio::fs::remove_file(&final_path).await;
+        anyhow::bail!("Written file escapes '{subdir_name}' directory");
+    };
+    Ok(safe_final)
+}
+
+fn cleanup_event_media_artifacts(media_dir: &Path, camera: Option<&str>, event_id: &str) {
+    if !is_safe_id(event_id) {
+        return;
+    }
+    let clips_dir = media_dir.join("clips");
+    let mut candidates = vec![
+        clips_dir.join(format!("{event_id}.jpg")),
+        clips_dir.join(format!("{event_id}-clean.jpg")),
+        clips_dir.join(format!("{event_id}.mp4")),
+    ];
+    if let Some(cam) = camera.filter(|c| is_safe_id(c)) {
+        candidates.push(clips_dir.join(format!("{cam}-{event_id}.webp")));
+        candidates.push(clips_dir.join(format!("{cam}-{event_id}-clean.webp")));
+    }
+    for candidate in candidates {
+        if let Some(safe_p) = ensure_path_within_media_dir(media_dir, &candidate) {
+            let _ = std::fs::remove_file(safe_p);
+        }
+    }
+}
+
 async fn redact_dataset_sample_file_if_masked(
     config: &Arc<RwLock<NinjaConfig>>,
     media_dir: &Path,
@@ -7144,22 +7213,26 @@ async fn redact_dataset_sample_file_if_masked(
         return;
     }
     let sample_path = PathBuf::from(&sample.image_path);
-    if let Some(safe_path) = ensure_path_within_media_dir(media_dir, &sample_path)
+    if let Some(safe_path) = ensure_dataset_sample_path(media_dir, &sample_path)
         && let Ok(raw_bytes) = tokio::fs::read(&safe_path).await
     {
         let (redacted, _) =
             redact_image_bytes_with_privacy_mask(&raw_bytes, priv_mask.as_ref(), false);
-        let _ = tokio::fs::write(&safe_path, &redacted).await;
+        if let Some(fname) = safe_path.file_name().and_then(|s| s.to_str()) {
+            let _ = atomic_write_within_media_subdir(media_dir, "dataset", fname, &redacted).await;
+        }
     }
 }
 
 fn split_csv_opt(raw: &Option<String>) -> Option<Vec<String>> {
-    raw.as_ref().map(|s| {
-        s.split(',')
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect()
-    })
+    raw.as_ref()
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
 }
 
 async fn api_review(
@@ -7698,18 +7771,16 @@ async fn api_event_delete(
         )
             .into_response();
     }
+    let ev_cam = state
+        .db
+        .get_event(&id)
+        .ok()
+        .flatten()
+        .and_then(|ev| ev["camera"].as_str().map(String::from));
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
-        let permitted = state
-            .db
-            .get_event(&id)
-            .ok()
-            .flatten()
-            .and_then(|ev| {
-                ev["camera"]
-                    .as_str()
-                    .map(|c| allowed.iter().any(|a| a == c))
-            })
-            .unwrap_or(false);
+        let permitted = ev_cam
+            .as_deref()
+            .is_some_and(|c| allowed.iter().any(|a| a == c));
         if !permitted {
             return (
                 StatusCode::FORBIDDEN,
@@ -7724,6 +7795,7 @@ async fn api_event_delete(
     let _ = state.db.revoke_share_links_for_target(None, &id);
     purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
+    cleanup_event_media_artifacts(&state.media_dir, ev_cam.as_deref(), &id);
     Json(json!({ "success": true })).into_response()
 }
 
@@ -7767,19 +7839,21 @@ async fn api_events_bulk_delete(
         )
             .into_response();
     }
+    let mut ev_cams: Vec<(String, Option<String>)> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let cam = state
+            .db
+            .get_event(id)
+            .ok()
+            .flatten()
+            .and_then(|ev| ev["camera"].as_str().map(String::from));
+        ev_cams.push((id.clone(), cam));
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
-        for id in &ids {
-            let permitted = state
-                .db
-                .get_event(id)
-                .ok()
-                .flatten()
-                .and_then(|ev| {
-                    ev["camera"]
-                        .as_str()
-                        .map(|c| allowed.iter().any(|a| a == c))
-                })
-                .unwrap_or(false);
+        for (_id, cam_opt) in &ev_cams {
+            let permitted = cam_opt
+                .as_deref()
+                .is_some_and(|c| allowed.iter().any(|a| a == c));
             if !permitted {
                 return (
                     StatusCode::FORBIDDEN,
@@ -7790,9 +7864,10 @@ async fn api_events_bulk_delete(
         }
     }
     let _ = state.db.delete_events_bulk(&ids);
-    for id in &ids {
+    for (id, cam_opt) in &ev_cams {
         let _ = state.db.revoke_share_links_for_target(None, id);
         cleanup_share_clip_artifacts(&state.media_dir, id);
+        cleanup_event_media_artifacts(&state.media_dir, cam_opt.as_deref(), id);
     }
     purge_revoked_share_credits(&state);
     Json(json!({ "success": true })).into_response()
@@ -8069,6 +8144,47 @@ fn is_allowed_genai_api_key_env(name: &str) -> bool {
         || trimmed.starts_with("NINJANVR_TEST_GENAI_")
 }
 
+fn resolve_safe_genai_api_key(genai: &ninjanvr_config::GenAiConfig) -> String {
+    if let Some(ref key) = genai.api_key {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() && trimmed != "***" && trimmed != "*" {
+            if let Some(after_dollar) = trimmed.strip_prefix('$') {
+                let env_name = after_dollar
+                    .trim()
+                    .strip_prefix('{')
+                    .and_then(|s| s.strip_suffix('}'))
+                    .unwrap_or(after_dollar.trim())
+                    .trim();
+                if is_allowed_genai_api_key_env(env_name)
+                    && let Ok(val) = std::env::var(env_name)
+                    && !val.trim().is_empty()
+                {
+                    return val.trim().to_string();
+                }
+                return String::new();
+            }
+            if std::env::var(trimmed).is_ok() {
+                if is_allowed_genai_api_key_env(trimmed)
+                    && let Ok(val) = std::env::var(trimmed)
+                    && !val.trim().is_empty()
+                {
+                    return val.trim().to_string();
+                }
+                return String::new();
+            }
+            return trimmed.to_string();
+        }
+    }
+    let env_var = genai.api_key_env.trim();
+    if is_allowed_genai_api_key_env(env_var)
+        && let Ok(val) = std::env::var(env_var)
+        && !val.trim().is_empty()
+    {
+        return val.trim().to_string();
+    }
+    String::new()
+}
+
 fn is_disallowed_genai_ipv4(v4: std::net::Ipv4Addr) -> bool {
     let octs = v4.octets();
     v4.is_unspecified()
@@ -8135,6 +8251,9 @@ fn validate_genai_base_url(raw: &str) -> Result<()> {
         let Some((ipv6_part, rest)) = after_bracket.split_once(']') else {
             anyhow::bail!("Disallowed or invalid GenAI base_url");
         };
+        if ipv6_part.parse::<std::net::Ipv6Addr>().is_err() {
+            anyhow::bail!("Disallowed or invalid GenAI base_url");
+        }
         let p = if rest.is_empty() {
             None
         } else if let Some(port_str) = rest.strip_prefix(':') {
@@ -8163,6 +8282,7 @@ fn validate_genai_base_url(raw: &str) -> Result<()> {
     let host_lc = host.to_ascii_lowercase();
     let clean_host = host_lc.trim_end_matches('.');
     if clean_host.is_empty()
+        || clean_host.contains('%')
         || clean_host == "metadata.google.internal"
         || clean_host.ends_with(".metadata.google.internal")
         || clean_host == "metadata"
@@ -8204,6 +8324,7 @@ fn validate_genai_base_url(raw: &str) -> Result<()> {
                     || v6.is_multicast()
                     || (v6.segments()[0] & 0xffc0) == 0xfe80
                     || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] == 0x0064 && v6.segments()[1] == 0xff9b)
                     || v6.to_ipv4().is_some_and(|v4| {
                         is_disallowed_genai_ipv4(v4) || v4.is_loopback() || v4.is_private()
                     })
@@ -8244,31 +8365,42 @@ fn build_effective_genai_config(
     req: &GenAiValidateRequest,
 ) -> ninjanvr_config::GenAiConfig {
     let mut cfg = saved.clone();
-    let mut base_url_changed = false;
+    let mut provider_changed = false;
     if let Some(ref p) = req.provider
         && !p.trim().is_empty()
     {
+        if !p.trim().eq_ignore_ascii_case(saved.provider.trim()) {
+            provider_changed = true;
+        }
         cfg.provider = p.trim().to_string();
     }
-    if let Some(ref env_name) = req.api_key_env
-        && !env_name.trim().is_empty()
-    {
-        let env_trimmed = env_name.trim();
-        if is_allowed_genai_api_key_env(env_trimmed) || env_trimmed == saved.api_key_env.trim() {
-            cfg.api_key_env = env_trimmed.to_string();
-        }
-    }
+    let mut custom_base_url_changed = false;
     if let Some(ref b) = req.base_url {
         let trimmed = b.trim();
         if trimmed.is_empty() {
             cfg.base_url = None;
         } else {
             if Some(trimmed) != saved.base_url.as_deref().map(str::trim) {
-                base_url_changed = true;
-                cfg.api_key = None;
-                cfg.api_key_env = String::new();
+                custom_base_url_changed = true;
             }
             cfg.base_url = Some(trimmed.to_string());
+        }
+    }
+    let base_url_changed = custom_base_url_changed
+        || (provider_changed
+            && (cfg.base_url.is_some() || cfg.provider.eq_ignore_ascii_case("ollama")));
+    if base_url_changed {
+        cfg.api_key = None;
+        cfg.api_key_env = String::new();
+    }
+    if let Some(ref env_name) = req.api_key_env
+        && !env_name.trim().is_empty()
+    {
+        let env_trimmed = env_name.trim();
+        if is_allowed_genai_api_key_env(env_trimmed)
+            && (!base_url_changed || cfg.base_url.is_none())
+        {
+            cfg.api_key_env = env_trimmed.to_string();
         }
     }
     if req.clear_api_key == Some(true) {
@@ -8276,8 +8408,14 @@ fn build_effective_genai_config(
     } else if let Some(ref key) = req.api_key {
         let trimmed = key.trim();
         if !trimmed.is_empty() && trimmed != "***" && trimmed != "*" {
-            if let Some(env_var) = trimmed.strip_prefix('$') {
-                if !base_url_changed && is_allowed_genai_api_key_env(env_var.trim()) {
+            if let Some(after_dollar) = trimmed.strip_prefix('$') {
+                let env_var = after_dollar
+                    .trim()
+                    .strip_prefix('{')
+                    .and_then(|s| s.strip_suffix('}'))
+                    .unwrap_or(after_dollar.trim())
+                    .trim();
+                if !base_url_changed && is_allowed_genai_api_key_env(env_var) {
                     cfg.api_key = Some(trimmed.to_string());
                 }
             } else if std::env::var(trimmed).is_ok() {
@@ -8401,7 +8539,7 @@ fn extract_models_from_provider_payload(provider: &str, val: &Value) -> Vec<Stri
 pub async fn discover_genai_models(genai: &ninjanvr_config::GenAiConfig) -> Result<Vec<String>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = genai.provider.trim().to_ascii_lowercase();
-    let api_key = genai.resolve_api_key();
+    let api_key = resolve_safe_genai_api_key(genai);
     let custom_base = genai
         .base_url
         .as_deref()
@@ -8531,6 +8669,7 @@ async fn api_genai_models_get(Query(query): Query<GenAiValidateRequest>) -> Resp
 
 async fn api_genai_models_post(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     body: axum::body::Bytes,
@@ -8542,6 +8681,19 @@ async fn api_genai_models_post(
                 "valid": false,
                 "models": [],
                 "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "valid": false,
+                "models": [],
+                "message": "Camera-restricted users cannot validate or modify global GenAI settings"
             })),
         )
             .into_response();
@@ -8565,14 +8717,29 @@ async fn api_genai_models_post(
         }
     };
     let saved = state.config.read().await.genai.clone();
+    let provider_matches_saved = match req
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => true,
+        Some(p) => p.eq_ignore_ascii_case(saved.provider.trim()),
+    };
     let base_url_matches_saved = match req.base_url.as_deref().map(str::trim) {
-        None | Some("") => true,
+        None => true,
+        Some("") => saved
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty(),
         Some(b) => Some(b) == saved.base_url.as_deref().map(str::trim),
     };
     let effective = build_effective_genai_config(&saved, &req);
     match discover_genai_models(&effective).await {
         Ok(models) => {
-            if base_url_matches_saved && effective.api_key.is_some() {
+            if provider_matches_saved && base_url_matches_saved && effective.api_key.is_some() {
                 state.config.write().await.genai.api_key = effective.api_key.clone();
             }
             Json(json!({
@@ -8584,7 +8751,7 @@ async fn api_genai_models_post(
             .into_response()
         }
         Err(err) => {
-            let api_key = effective.resolve_api_key();
+            let api_key = resolve_safe_genai_api_key(&effective);
             let msg = scrub_genai_secret_in_error(format!("{err:#}"), &api_key);
             let status = if msg.contains("Missing ") || msg.contains("Disallowed or invalid") {
                 StatusCode::BAD_REQUEST
@@ -8647,7 +8814,8 @@ async fn api_event_verify_ai(
     match verify_event_with_genai(&state, &id).await {
         Ok(res) => Json(res).into_response(),
         Err(err) => {
-            let api_key = state.config.read().await.genai.resolve_api_key();
+            let genai_cfg = state.config.read().await.genai.clone();
+            let api_key = resolve_safe_genai_api_key(&genai_cfg);
             let msg = scrub_genai_secret_in_error(format!("{err:#}"), &api_key);
             let status = if msg.contains("not found") {
                 StatusCode::NOT_FOUND
@@ -8871,7 +9039,7 @@ pub async fn verify_event_with_genai_components(
         validate_genai_base_url(b)?;
     }
     let provider = genai.provider.trim().to_ascii_lowercase();
-    let api_key = genai.resolve_api_key();
+    let api_key = resolve_safe_genai_api_key(&genai);
     let timeout_ms = if genai.timeout_ms <= 5_000 {
         30_000
     } else {
@@ -9167,7 +9335,6 @@ pub async fn create_dataset_sample_from_event(
     let (img_bytes, width, height) =
         resolve_event_clean_snapshot_bytes(media_dir, &ev, event_id).await;
     let dataset_dir = media_dir.join("dataset");
-    tokio::fs::create_dir_all(&dataset_dir).await?;
     let sample_id = if event_id.starts_with("ds_") {
         event_id.to_string()
     } else {
@@ -9176,12 +9343,9 @@ pub async fn create_dataset_sample_from_event(
     if !is_safe_id(&sample_id) {
         anyhow::bail!("Invalid dataset sample_id '{sample_id}'");
     }
-    let img_path = dataset_dir.join(format!("{sample_id}.webp"));
-    tokio::fs::write(&img_path, &img_bytes).await?;
-    if ensure_path_within_media_dir(media_dir, &img_path).is_none() {
-        let _ = tokio::fs::remove_file(&img_path).await;
-        anyhow::bail!("Dataset sample path escapes media_dir");
-    }
+    let sample_fname = format!("{sample_id}.webp");
+    atomic_write_within_media_subdir(media_dir, "dataset", &sample_fname, &img_bytes).await?;
+    let img_path = dataset_dir.join(&sample_fname);
 
     let annotations = if sample_kind == "hard_negative" {
         Vec::new()
@@ -9634,7 +9798,7 @@ async fn api_dataset_sample_delete(
     }
     if let Some(sample) = sample_opt {
         let p = PathBuf::from(&sample.image_path);
-        if let Some(safe_p) = ensure_path_within_media_dir(&state.media_dir, &p) {
+        if let Some(safe_p) = ensure_dataset_sample_path(&state.media_dir, &p) {
             let _ = tokio::fs::remove_file(&safe_p).await;
         }
     }
@@ -9672,7 +9836,7 @@ async fn api_dataset_sample_image_webp(
     }
     let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
     let direct_path = PathBuf::from(&sample.image_path);
-    if let Some(safe_direct) = ensure_path_within_media_dir(&state.media_dir, &direct_path)
+    if let Some(safe_direct) = ensure_dataset_sample_path(&state.media_dir, &direct_path)
         && let Ok(bytes) = tokio::fs::read(&safe_direct).await
         && !bytes.is_empty()
     {
@@ -9685,8 +9849,7 @@ async fn api_dataset_sample_image_webp(
             .media_dir
             .join("dataset")
             .join(format!("{}.webp", sample.id));
-        if let Some(safe_fallback) =
-            ensure_path_within_media_dir(&state.media_dir, &dataset_fallback)
+        if let Some(safe_fallback) = ensure_dataset_sample_path(&state.media_dir, &dataset_fallback)
             && let Ok(bytes) = tokio::fs::read(&safe_fallback).await
             && !bytes.is_empty()
         {
@@ -9897,13 +10060,13 @@ pub async fn auto_annotate_dataset_sample(
         anyhow::bail!("Dataset sample '{sample_id}' not found");
     };
     let raw_img_bytes = if let Some(safe_path) =
-        ensure_path_within_media_dir(&state.media_dir, Path::new(&sample.image_path))
+        ensure_dataset_sample_path(&state.media_dir, Path::new(&sample.image_path))
         && let Ok(bytes) = tokio::fs::read(&safe_path).await
         && !bytes.is_empty()
     {
         bytes
     } else if is_safe_id(&sample.id)
-        && let Some(safe_fallback) = ensure_path_within_media_dir(
+        && let Some(safe_fallback) = ensure_dataset_sample_path(
             &state.media_dir,
             &state
                 .media_dir
@@ -9938,7 +10101,7 @@ pub async fn auto_annotate_dataset_sample(
         validate_genai_base_url(b)?;
     }
     let provider = genai.provider.trim().to_ascii_lowercase();
-    let api_key = genai.resolve_api_key();
+    let api_key = resolve_safe_genai_api_key(&genai);
     let timeout_ms = if genai.timeout_ms <= 5_000 {
         30_000
     } else {
@@ -10124,7 +10287,8 @@ async fn api_dataset_sample_auto_annotate(
     match auto_annotate_dataset_sample(&state, &id).await {
         Ok(updated) => Json(sample_dto_to_response_json(&updated)).into_response(),
         Err(err) => {
-            let api_key = state.config.read().await.genai.resolve_api_key();
+            let genai_cfg = state.config.read().await.genai.clone();
+            let api_key = resolve_safe_genai_api_key(&genai_cfg);
             let msg = scrub_genai_secret_in_error(format!("{err:#}"), &api_key);
             let status = if msg.contains("not found") {
                 StatusCode::NOT_FOUND
@@ -10220,8 +10384,9 @@ fn is_safe_zip_entry_name(name: &str) -> bool {
     {
         return false;
     }
-    name.split('/')
-        .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(".."))
+    name.split('/').all(|seg| {
+        !seg.is_empty() && !seg.starts_with('.') && seg != "." && seg != ".." && !seg.contains("..")
+    })
 }
 
 pub fn build_zip_archive(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
@@ -10328,6 +10493,7 @@ pub fn parse_zip_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut out = BTreeMap::new();
     let mut cursor = cd_offset;
     let mut cumulative_extracted: usize = 0;
+    let mut occupied_ranges: Vec<(usize, usize)> = Vec::with_capacity(total_entries.min(256));
     for _ in 0..total_entries {
         let Some(hdr_end) = cursor.checked_add(46) else {
             anyhow::bail!("integer overflow in Central Directory cursor");
@@ -10438,6 +10604,13 @@ pub fn parse_zip_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         if &bytes[local_hdr_end..l_name_end] != name.as_bytes() {
             anyhow::bail!("local header filename mismatch for {name}");
         }
+        if occupied_ranges
+            .iter()
+            .any(|&(s, e)| local_offset < e && data_end > s)
+        {
+            anyhow::bail!("overlapping ZIP local file entry range for {name}");
+        }
+        occupied_ranges.push((local_offset, data_end));
         cumulative_extracted = cumulative_extracted
             .checked_add(size)
             .context("ZIP archive extracted size overflow")?;
@@ -10487,7 +10660,7 @@ async fn api_dataset_export_zip(
             "train"
         };
         let raw_img_bytes = if let Some(safe_path) =
-            ensure_path_within_media_dir(&state.media_dir, Path::new(&sample.image_path))
+            ensure_dataset_sample_path(&state.media_dir, Path::new(&sample.image_path))
         {
             tokio::fs::read(&safe_path)
                 .await
@@ -10560,6 +10733,9 @@ fn decode_base64_or_raw(input: &str) -> Vec<u8> {
         .unwrap_or_else(|_| trimmed.as_bytes().to_vec())
 }
 
+const MAX_MODEL_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_LABELMAP_UPLOAD_BYTES: usize = 256 * 1024;
+
 async fn api_detector_model_upload(
     State(state): State<AppState>,
     req: axum::extract::Request,
@@ -10570,6 +10746,19 @@ async fn api_detector_model_upload(
             Json(json!({
                 "success": false,
                 "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    let jar = CookieJar::from_headers(req.headers());
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, req.headers()).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Camera-restricted users cannot upload global detector models"
             })),
         )
             .into_response();
@@ -10595,66 +10784,109 @@ async fn api_detector_model_upload(
 
     if content_type.starts_with("multipart/form-data") {
         use axum::extract::FromRequest;
-        if let Ok(mut mp) = axum::extract::Multipart::from_request(req, &state).await {
-            while let Ok(Some(field)) = mp.next_field().await {
-                let name = field.name().unwrap_or("").to_string();
-                let fname = field.file_name().map(String::from);
-                let data = field.bytes().await.unwrap_or_default().to_vec();
-                match name.as_str() {
-                    "file" | "model" => {
-                        if let Some(f) = fname
-                            && !f.trim().is_empty()
-                        {
-                            filename = f;
+        let Ok(mut mp) = axum::extract::Multipart::from_request(req, &state).await else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "success": false, "message": "Invalid multipart upload payload" })),
+            )
+                .into_response();
+        };
+        loop {
+            match mp.next_field().await {
+                Ok(Some(field)) => {
+                    let name = field.name().unwrap_or("").to_string();
+                    let fname = field.file_name().map(String::from);
+                    let Ok(raw_data) = field.bytes().await else {
+                        return (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            Json(json!({ "success": false, "message": "Multipart field exceeds maximum upload size" })),
+                        )
+                            .into_response();
+                    };
+                    let data = raw_data.to_vec();
+                    match name.as_str() {
+                        "file" | "model" => {
+                            if let Some(f) = fname
+                                && !f.trim().is_empty()
+                            {
+                                filename = f;
+                            }
+                            model_bytes = data;
                         }
-                        model_bytes = data;
-                    }
-                    "weights" | "bin" => {
-                        weights_filename = fname;
-                        weights_bytes = Some(data);
-                    }
-                    "labelmap" => {
-                        labelmap_filename = fname;
-                        if let Ok(txt) = String::from_utf8(data) {
-                            labelmap_text = Some(txt);
+                        "weights" | "bin" => {
+                            weights_filename = fname;
+                            weights_bytes = Some(data);
                         }
-                    }
-                    "filename" => {
-                        if let Ok(s) = String::from_utf8(data)
-                            && !s.trim().is_empty()
-                        {
-                            filename = s.trim().to_string();
+                        "labelmap" => {
+                            labelmap_filename = fname;
+                            if let Ok(txt) = String::from_utf8(data) {
+                                labelmap_text = Some(txt);
+                            }
                         }
-                    }
-                    "model_type" => {
-                        if let Ok(s) = String::from_utf8(data)
-                            && !s.trim().is_empty()
-                        {
-                            model_type_opt = Some(s.trim().to_string());
+                        "filename" => {
+                            if let Ok(s) = String::from_utf8(data)
+                                && !s.trim().is_empty()
+                            {
+                                filename = s.trim().to_string();
+                            }
                         }
-                    }
-                    "width" => {
-                        if let Ok(s) = String::from_utf8(data)
-                            && let Ok(w) = s.trim().parse::<u32>()
-                        {
-                            width_opt = Some(w);
+                        "model_type" => {
+                            if let Ok(s) = String::from_utf8(data)
+                                && !s.trim().is_empty()
+                            {
+                                model_type_opt = Some(s.trim().to_string());
+                            }
                         }
-                    }
-                    "height" => {
-                        if let Ok(s) = String::from_utf8(data)
-                            && let Ok(h) = s.trim().parse::<u32>()
-                        {
-                            height_opt = Some(h);
+                        "width" => {
+                            if let Ok(s) = String::from_utf8(data)
+                                && let Ok(w) = s.trim().parse::<u32>()
+                            {
+                                width_opt = Some(w);
+                            }
                         }
+                        "height" => {
+                            if let Ok(s) = String::from_utf8(data)
+                                && let Ok(h) = s.trim().parse::<u32>()
+                            {
+                                height_opt = Some(h);
+                            }
+                        }
+                        "input_tensor" => {
+                            if let Ok(s) = String::from_utf8(data)
+                                && !s.trim().is_empty()
+                            {
+                                input_tensor_opt = Some(s.trim().to_string());
+                            }
+                        }
+                        "input_pixel_format" => {
+                            if let Ok(s) = String::from_utf8(data)
+                                && !s.trim().is_empty()
+                            {
+                                input_pixel_format_opt = Some(s.trim().to_string());
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        Json(json!({ "success": false, "message": "Multipart upload exceeded size limit or was malformed" })),
+                    )
+                        .into_response();
                 }
             }
         }
     } else {
-        let raw_body = axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024)
-            .await
-            .unwrap_or_default();
+        let Ok(raw_body) = axum::body::to_bytes(req.into_body(), MAX_MODEL_UPLOAD_BYTES).await
+        else {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json!({ "success": false, "message": "Model upload exceeds maximum allowed size (64 MiB)" })),
+            )
+                .into_response();
+        };
         if let Ok(payload) = serde_json::from_slice::<ModelUploadPayload>(&raw_body) {
             if let Some(f) = payload.filename
                 && !f.trim().is_empty()
@@ -10684,6 +10916,21 @@ async fn api_detector_model_upload(
         }
     }
 
+    if model_bytes.len() > MAX_MODEL_UPLOAD_BYTES
+        || weights_bytes
+            .as_ref()
+            .is_some_and(|w| w.len() > MAX_MODEL_UPLOAD_BYTES)
+        || labelmap_text
+            .as_ref()
+            .is_some_and(|l| l.len() > MAX_LABELMAP_UPLOAD_BYTES)
+    {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "success": false, "message": "Uploaded model or labelmap exceeds maximum allowed size" })),
+        )
+            .into_response();
+    }
+
     if model_bytes.is_empty() {
         model_bytes = b"ONNX_SYNTHETIC_MODEL".to_vec();
     }
@@ -10699,7 +10946,7 @@ async fn api_detector_model_upload(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "success": false,
-                "message": "Invalid model filename: must be a safe basename ending with .onnx or .xml"
+                "message": "Invalid model filename: must be a safe basename ending with .onnx, .xml, or .tflite"
             })),
         )
             .into_response();
@@ -10708,13 +10955,15 @@ async fn api_detector_model_upload(
     let lower_fname = safe_filename.to_ascii_lowercase();
     if safe_filename.starts_with('.')
         || safe_filename.contains("..")
-        || (!lower_fname.ends_with(".onnx") && !lower_fname.ends_with(".xml"))
+        || (!lower_fname.ends_with(".onnx")
+            && !lower_fname.ends_with(".xml")
+            && !lower_fname.ends_with(".tflite"))
     {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "success": false,
-                "message": "Invalid model filename: must end with .onnx or .xml"
+                "message": "Invalid model filename: must end with .onnx, .xml, or .tflite"
             })),
         )
             .into_response();
@@ -10781,30 +11030,17 @@ async fn api_detector_model_upload(
         labelmap_text.unwrap_or_else(|| ninjanvr_db::NINJANVR_SECURITY_CLASSES.join("\n"));
 
     let models_dir = state.media_dir.join("models");
-    if let Err(err) = tokio::fs::create_dir_all(&models_dir).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "message": err.to_string() })),
-        )
-            .into_response();
-    }
-
-    let saved_model_path = models_dir.join(&safe_filename);
-    if let Err(err) = tokio::fs::write(&saved_model_path, &model_bytes).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "message": err.to_string() })),
-        )
-            .into_response();
-    }
-    if ensure_path_within_media_dir(&state.media_dir, &saved_model_path).is_none() {
-        let _ = tokio::fs::remove_file(&saved_model_path).await;
+    if let Err(err) =
+        atomic_write_within_media_subdir(&state.media_dir, "models", &safe_filename, &model_bytes)
+            .await
+    {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "message": "Model path escapes media_dir" })),
+            Json(json!({ "success": false, "message": err.to_string() })),
         )
             .into_response();
     }
+    let saved_model_path = models_dir.join(&safe_filename);
 
     if let Some(w_bytes) = &weights_bytes {
         let w_name = weights_filename
@@ -10813,27 +11049,44 @@ async fn api_detector_model_upload(
             .filter(|s| !s.is_empty() && is_safe_id(s))
             .map(String::from)
             .unwrap_or_else(|| format!("{stem}.bin"));
-        let w_path = models_dir.join(w_name);
-        let _ = tokio::fs::write(&w_path, w_bytes).await;
-        if ensure_path_within_media_dir(&state.media_dir, &w_path).is_none() {
-            let _ = tokio::fs::remove_file(&w_path).await;
+        if let Err(err) =
+            atomic_write_within_media_subdir(&state.media_dir, "models", &w_name, w_bytes).await
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "success": false, "message": err.to_string() })),
+            )
+                .into_response();
         }
     }
 
+    if let Err(err) = atomic_write_within_media_subdir(
+        &state.media_dir,
+        "models",
+        &safe_labelmap_name,
+        resolved_labelmap.as_bytes(),
+    )
+    .await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response();
+    }
     let saved_labelmap_path = models_dir.join(&safe_labelmap_name);
-    let _ = tokio::fs::write(&saved_labelmap_path, resolved_labelmap.as_bytes()).await;
 
-    // Also mirror into db_dir/models if writable
+    // Also mirror into db_dir/models if writable and not a symlink
     if let Some(db_parent) = state.db.path().parent() {
-        let cfg_models = db_parent.join("models");
-        if tokio::fs::create_dir_all(&cfg_models).await.is_ok() {
-            let _ = tokio::fs::write(cfg_models.join(&safe_filename), &model_bytes).await;
-            let _ = tokio::fs::write(
-                cfg_models.join(&safe_labelmap_name),
-                resolved_labelmap.as_bytes(),
-            )
+        let _ = atomic_write_within_media_subdir(db_parent, "models", &safe_filename, &model_bytes)
             .await;
-        }
+        let _ = atomic_write_within_media_subdir(
+            db_parent,
+            "models",
+            &safe_labelmap_name,
+            resolved_labelmap.as_bytes(),
+        )
+        .await;
     }
 
     let model_type = model_type_opt.unwrap_or_else(|| {
@@ -11670,24 +11923,6 @@ async fn api_event_snapshot_clean_webp(
                 redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
             return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
         }
-    } else if ev_opt.is_none() {
-        let suffix = format!("-{id}-clean.webp");
-        if let Ok(entries) = std::fs::read_dir(&clips_dir) {
-            for entry in entries.flatten() {
-                if let Some(fname) = entry.file_name().to_str()
-                    && let Some(cam_prefix) = fname.strip_suffix(&suffix)
-                    && is_safe_id(cam_prefix)
-                    && let Some(safe_p) =
-                        ensure_path_within_media_dir(&state.media_dir, &entry.path())
-                    && let Ok(bytes) = tokio::fs::read(&safe_p).await
-                {
-                    let priv_mask = camera_privacy_mask_value(&state.config, cam_prefix).await;
-                    let (out_bytes, _) =
-                        redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
-                    return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
-                }
-            }
-        }
     }
     serve_event_thumb(&state, &id, "image/webp").await
 }
@@ -11747,17 +11982,18 @@ async fn api_event_snapshot_jpg(
                 .into_response();
         }
     }
-    let priv_mask = if let Some(cam) = ev_opt.as_ref().and_then(|ev| ev["camera"].as_str()) {
-        camera_privacy_mask_value(&state.config, cam).await
-    } else {
-        None
-    };
-    let snap_path = state.media_dir.join("clips").join(format!("{id}.jpg"));
-    if let Some(safe_p) = ensure_path_within_media_dir(&state.media_dir, &snap_path)
-        && let Ok(bytes) = tokio::fs::read(&safe_p).await
+    if let Some(ref ev) = ev_opt
+        && let Some(cam) = ev["camera"].as_str()
     {
-        let (out_bytes, _) = redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), true);
-        return ([(header::CONTENT_TYPE, "image/jpeg")], out_bytes).into_response();
+        let priv_mask = camera_privacy_mask_value(&state.config, cam).await;
+        let snap_path = state.media_dir.join("clips").join(format!("{id}.jpg"));
+        if let Some(safe_p) = ensure_path_within_media_dir(&state.media_dir, &snap_path)
+            && let Ok(bytes) = tokio::fs::read(&safe_p).await
+        {
+            let (out_bytes, _) =
+                redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), true);
+            return ([(header::CONTENT_TYPE, "image/jpeg")], out_bytes).into_response();
+        }
     }
     serve_event_thumb(&state, &id, "image/jpeg").await
 }
@@ -11822,7 +12058,10 @@ async fn api_event_clip_mp4(
                 .into_response();
         }
     }
-    if let Some(cam) = ev_opt.as_ref().and_then(|ev| ev["camera"].as_str()) {
+    let Some(ev) = ev_opt else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if let Some(cam) = ev["camera"].as_str() {
         let privacy_mask_active = {
             let cfg = state.config.read().await;
             cfg.cameras
@@ -11839,29 +12078,26 @@ async fn api_event_clip_mp4(
     {
         return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
     }
-    if let Some(ev) = ev_opt {
-        if let Some(mock_vid) = ev["data"]["mock_video"].as_str()
-            && is_safe_id(mock_vid)
+    if let Some(mock_vid) = ev["data"]["mock_video"].as_str()
+        && is_safe_id(mock_vid)
+    {
+        let mocks_dir = state.media_dir.join("clips/mocks");
+        let mock_path = mocks_dir.join(mock_vid);
+        if let Some(safe_mock) = ensure_path_within_media_dir(&mocks_dir, &mock_path)
+            && let Ok(bytes) = tokio::fs::read(&safe_mock).await
         {
-            let mocks_dir = state.media_dir.join("clips/mocks");
-            let mock_path = mocks_dir.join(mock_vid);
-            if let Some(safe_mock) = ensure_path_within_media_dir(&mocks_dir, &mock_path)
-                && let Ok(bytes) = tokio::fs::read(&safe_mock).await
-            {
-                return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
-            }
+            return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
         }
-        if let (Some(cam), Some(start)) = (ev["camera"].as_str(), ev["start_time"].as_f64()) {
-            let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
-            if let Ok(recs) = state.db.query_recordings(cam, start - 5.0, end + 5.0) {
-                for rec in recs {
-                    let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
-                    if let Some(safe_rec) =
-                        ensure_path_within_media_dir(&state.media_dir, &disk_path)
-                        && let Ok(bytes) = tokio::fs::read(&safe_rec).await
-                    {
-                        return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
-                    }
+    }
+    if let (Some(cam), Some(start)) = (ev["camera"].as_str(), ev["start_time"].as_f64()) {
+        let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
+        if let Ok(recs) = state.db.query_recordings(cam, start - 5.0, end + 5.0) {
+            for rec in recs {
+                let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+                if let Some(safe_rec) = ensure_path_within_media_dir(&state.media_dir, &disk_path)
+                    && let Ok(bytes) = tokio::fs::read(&safe_rec).await
+                {
+                    return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
                 }
             }
         }
@@ -11945,6 +12181,9 @@ fn is_valid_rtsp_probe_url(raw: &str) -> bool {
         let Some((ipv6_part, rest)) = after_bracket.split_once(']') else {
             return false;
         };
+        if ipv6_part.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
         let p = if rest.is_empty() {
             None
         } else if let Some(p_str) = rest.strip_prefix(':') {
@@ -11972,6 +12211,7 @@ fn is_valid_rtsp_probe_url(raw: &str) -> bool {
     }
     let clean_host = host.trim_end_matches('.').to_ascii_lowercase();
     if clean_host.is_empty()
+        || clean_host.contains('%')
         || clean_host == "metadata.google.internal"
         || clean_host.ends_with(".metadata.google.internal")
         || clean_host == "metadata"
@@ -11981,6 +12221,10 @@ fn is_valid_rtsp_probe_url(raw: &str) -> bool {
         || clean_host.ends_with(".nip.io")
         || clean_host.ends_with(".sslip.io")
         || clean_host.ends_with(".xip.io")
+        || clean_host == "localtest.me"
+        || clean_host.ends_with(".localtest.me")
+        || clean_host == "lvh.me"
+        || clean_host.ends_with(".lvh.me")
         || clean_host.starts_with("169.254.")
     {
         return false;
@@ -12009,6 +12253,7 @@ fn is_valid_rtsp_probe_url(raw: &str) -> bool {
                     || v6.is_multicast()
                     || (v6.segments()[0] & 0xffc0) == 0xfe80
                     || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] == 0x0064 && v6.segments()[1] == 0xff9b)
                     || v6
                         .to_ipv4()
                         .is_some_and(|v4| is_disallowed_genai_ipv4(v4) || v4.is_loopback())
@@ -12072,9 +12317,9 @@ async fn api_streams_probe(
             .camera_input_for_role(cam_name, "record")
             .or_else(|| cfg.camera_input_for_role(cam_name, "detect"))
             .unwrap_or_default();
+        let scrubbed_configured = scrub_rtsp_credentials(&configured_url);
         if let Some(u) = req.url.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            && !u.contains(":*:*@")
-            && u != configured_url
+            && u != scrubbed_configured
         {
             return (
                 StatusCode::FORBIDDEN,
@@ -12578,8 +12823,10 @@ async fn api_timeline(
 ) -> Json<Value> {
     let limit = q.limit.unwrap_or(100).min(1000);
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
-    if let (Some(req_cam), Some(allow_list)) = (q.camera.as_deref(), allowed.as_ref())
-        && !allow_list.iter().any(|a| a == req_cam || a == "*")
+    if let (Some(req_cam), Some(allow_list)) = (
+        q.camera.as_deref().filter(|c| !c.is_empty() && *c != "all"),
+        allowed.as_ref(),
+    ) && !allow_list.iter().any(|a| a == req_cam || a == "*")
     {
         return Json(Value::Array(Vec::new()));
     }

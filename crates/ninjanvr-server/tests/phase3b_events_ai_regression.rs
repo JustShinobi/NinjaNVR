@@ -1106,3 +1106,464 @@ async fn p3b_08_09_10_faces_sub_labels_plates_recordings_delete_ffprobe_and_snap
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[tokio::test]
+async fn r2_p3b_cycle2_snapshot_privacy_genai_env_ssrf_symlink_zip_and_timeline_regression() {
+    let (tmp_dir, state, app, admin_bearer, scoped_admin_bearer, scoped_op_bearer) =
+        setup_phase3b_test_env().await;
+    let direct_app = build_router(state.clone());
+
+    // =========================================================================
+    // 1. [R2-P3B-01] Deleted/non-existent event snapshot & clip privacy-mask bypass
+    // =========================================================================
+    let mut white_img = image::RgbImage::new(64, 64);
+    for p in white_img.pixels_mut() {
+        *p = image::Rgb([250, 250, 250]);
+    }
+    let white_webp = ninjanvr_vision::encode_image_webp(&white_img).unwrap();
+    let white_jpg = ninjanvr_vision::encode_image_jpeg(&white_img).unwrap();
+
+    // Activate privacy mask on backyard
+    {
+        let mut cfg = state.config.write().await;
+        cfg.cameras.get_mut("backyard").unwrap().privacy_mask =
+            json!(["0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0"]);
+    }
+
+    // Write backyard-secret-ev_orphan_suffix-clean.webp (where ev_orphan_suffix is NOT in DB)
+    std::fs::write(
+        state
+            .media_dir
+            .join("clips/backyard-secret-ev_orphan_suffix-clean.webp"),
+        &white_webp,
+    )
+    .unwrap();
+    let r_orphan_clean = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/events/ev_orphan_suffix/snapshot-clean.webp")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_orphan_clean.status(), StatusCode::OK);
+    let orphan_bytes = to_bytes(r_orphan_clean.into_body(), 65536).await.unwrap();
+    assert_ne!(
+        orphan_bytes.as_ref(),
+        white_webp.as_slice(),
+        "GET /api/events/ev_orphan_suffix/snapshot-clean.webp must never leak unmasked suffix file when event is not in DB"
+    );
+
+    // Create an event on backyard with snapshot.jpg, clean.webp, and clip.mp4, then delete the event
+    state
+        .db
+        .upsert_event(&EventDto {
+            id: "ev_del_masked".to_string(),
+            camera: "backyard".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 8000.0,
+            end_time: Some(8005.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.92),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.92),
+            stationary: false,
+        })
+        .unwrap();
+    let del_jpg = state.media_dir.join("clips/ev_del_masked.jpg");
+    let del_webp = state
+        .media_dir
+        .join("clips/backyard-ev_del_masked-clean.webp");
+    let del_mp4 = state.media_dir.join("clips/ev_del_masked.mp4");
+    std::fs::write(&del_jpg, &white_jpg).unwrap();
+    std::fs::write(&del_webp, &white_webp).unwrap();
+    std::fs::write(&del_mp4, b"FAKE_MP4_CLIP_BYTES").unwrap();
+
+    let r_del_ev = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/events/ev_del_masked")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_del_ev.status(), StatusCode::OK);
+    assert!(
+        !del_jpg.exists() && !del_webp.exists() && !del_mp4.exists(),
+        "DELETE /api/events/{{id}} must remove event clip and snapshot files from clips/"
+    );
+
+    // Even if an orphan clip file exists on disk without a DB event row, clip.mp4 returns 404
+    std::fs::write(&del_mp4, b"ORPHAN_MP4_BYTES").unwrap();
+    let r_orphan_clip = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/events/ev_del_masked/clip.mp4")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_orphan_clip.status(), StatusCode::NOT_FOUND);
+
+    // =========================================================================
+    // 2. [R2-P3B-02] GenAI non-allowlisted env-var exfiltration & provider switch key leak
+    // =========================================================================
+    let captured_auth: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let auth_clone = captured_auth.clone();
+    let mock_router = Router::new()
+        .route(
+            "/v1/models",
+            get(move |headers: axum::http::HeaderMap| {
+                let auth_hdr = headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                *auth_clone.lock().unwrap() = auth_hdr;
+                async move { Json(json!({ "data": [{ "id": "gpt-4o-mini" }] })).into_response() }
+            }),
+        )
+        .route(
+            "/api/tags",
+            get({
+                let auth_clone2 = captured_auth.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let auth_hdr = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    *auth_clone2.lock().unwrap() = auth_hdr;
+                    async move {
+                        Json(json!({ "models": [{ "name": "qwen2.5vl:7b" }] })).into_response()
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_base = format!("http://{addr}/v1");
+    let srv_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_router).await;
+    });
+
+    unsafe {
+        std::env::set_var("NINJANVR_FORBIDDEN_INTERNAL_SECRET", "top-secret-jwt-key");
+    }
+    {
+        let mut cfg = state.config.write().await;
+        cfg.genai.provider = "openai".to_string();
+        cfg.genai.base_url = Some(mock_base.clone());
+        cfg.genai.api_key = Some("$NINJANVR_FORBIDDEN_INTERNAL_SECRET".to_string());
+        cfg.genai.api_key_env = "NINJANVR_FORBIDDEN_INTERNAL_SECRET".to_string();
+    }
+    let _ = ninjanvr_server::discover_genai_models(&state.config.read().await.genai).await;
+    assert!(
+        captured_auth.lock().unwrap().is_none(),
+        "discover_genai_models must never resolve non-allowlisted environment variables"
+    );
+
+    // Switching provider in /api/genai/validate without supplying a new key must not leak saved key
+    {
+        let mut cfg = state.config.write().await;
+        cfg.genai.provider = "openai".to_string();
+        cfg.genai.base_url = Some(format!("http://{addr}"));
+        cfg.genai.api_key = Some("sk-saved-openai-secret".to_string());
+    }
+    *captured_auth.lock().unwrap() = None;
+    let r_switch_prov = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/genai/validate")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "provider": "ollama" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_switch_prov.status(), StatusCode::OK);
+    assert!(
+        captured_auth.lock().unwrap().is_none(),
+        "Switching GenAI provider must not leak saved API key from previous provider"
+    );
+
+    // Camera-restricted caller on direct_app cannot call POST /api/genai/validate or /api/detectors/models/upload
+    for (uri, payload) in [
+        ("/api/genai/validate", json!({ "provider": "ollama" })),
+        (
+            "/api/detectors/models/upload",
+            json!({ "filename": "scoped_attempt.onnx" }),
+        ),
+    ] {
+        let r_scoped_forbid = direct_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, &scoped_admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_scoped_forbid.status(),
+            StatusCode::FORBIDDEN,
+            "Camera-restricted caller must receive 403 FORBIDDEN on {uri}"
+        );
+    }
+
+    // =========================================================================
+    // 3. [R2-P3B-03] IPv6 Zone-ID SSRF bypass & RTSP password oracle prevention
+    // =========================================================================
+    for bad_zone_genai in [
+        "http://[fe80::1%25eth0]:8080/v1",
+        "http://[fe80::1%eth0]:8080/v1",
+        "http://[64:ff9b::a9fe:a9fe]/v1",
+    ] {
+        let r_zone = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/genai/validate")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "provider": "openai",
+                            "api_key": "sk-test",
+                            "base_url": bad_zone_genai
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_zone.status(), StatusCode::BAD_REQUEST);
+    }
+
+    for bad_zone_rtsp in [
+        "rtsp://[fe80::1%25eth0]:554/live",
+        "rtsp://[fe80::1%eth0]:554/live",
+        "rtsp://127.0.0.1.localtest.me:554/live",
+        "rtsp://127.0.0.1.lvh.me:554/live",
+    ] {
+        let r_rtsp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/streams/probe")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "url": bad_zone_rtsp }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_rtsp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // Configure front_door with RTSP credentials and verify scoped caller cannot use url equality as a password oracle
+    {
+        let mut cfg = state.config.write().await;
+        cfg.cameras.get_mut("front_door").unwrap().ffmpeg.inputs[0].path =
+            "rtsp://camadmin:SuperSecretCamPass@127.0.0.1:8554/front_door".to_string();
+    }
+    let r_oracle = direct_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/streams/probe")
+                .header(header::AUTHORIZATION, &scoped_admin_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "camera": "front_door",
+                        "url": "rtsp://camadmin:SuperSecretCamPass@127.0.0.1:8554/front_door"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r_oracle.status(),
+        StatusCode::FORBIDDEN,
+        "Scoped caller must not be able to test unredacted RTSP password matches via /api/streams/probe"
+    );
+
+    // =========================================================================
+    // 4. [R2-P3B-04] Symlink overwrite protection on model upload & dataset subdir confinement
+    // =========================================================================
+    let external_target = tmp_dir.join("external_do_not_overwrite.onnx");
+    std::fs::write(&external_target, b"ORIGINAL_EXTERNAL_FILE").unwrap();
+    let models_dir = state.media_dir.join("models");
+    std::fs::create_dir_all(&models_dir).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&external_target, models_dir.join("symlinked.onnx")).unwrap();
+        let r_sym_up = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/detectors/models/upload")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "filename": "symlinked.onnx",
+                            "model_base64": base64::engine::general_purpose::STANDARD.encode(b"PWNED_BYTES")
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_sym_up.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read(&external_target).unwrap(),
+            b"ORIGINAL_EXTERNAL_FILE",
+            "Model upload must refuse to overwrite symlink targets before writing"
+        );
+    }
+
+    // Dataset sample pointing to media_dir/recordings/ must not unlink the recording on DELETE
+    let rec_keep = state.media_dir.join("recordings/keep_segment.mp4");
+    std::fs::write(&rec_keep, b"IMPORTANT_RECORDING_SEGMENT").unwrap();
+    state
+        .db
+        .upsert_dataset_sample(&ninjanvr_db::DatasetSampleDto {
+            id: "ds_cross_subdir".to_string(),
+            event_id: None,
+            camera: "front_door".to_string(),
+            split: "train".to_string(),
+            sample_kind: "true_positive".to_string(),
+            image_path: rec_keep.to_string_lossy().to_string(),
+            width: 64,
+            height: 64,
+            annotations: vec![],
+            verified: false,
+            night_mode: false,
+            created_at: 8500.0,
+        })
+        .unwrap();
+    let r_del_cross = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/dataset/samples/ds_cross_subdir")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_del_cross.status(), StatusCode::OK);
+    assert!(
+        rec_keep.is_file(),
+        "DELETE /api/dataset/samples/{{id}} must only unlink files inside media_dir/dataset/"
+    );
+
+    // =========================================================================
+    // 5. [R2-P3B-05] Scoped GET /api/timeline?camera=all & GET /api/events?cameras=
+    // =========================================================================
+    state
+        .db
+        .insert_timeline_entry(
+            9000.0,
+            "front_door",
+            "tracked_object",
+            Some("ev_fd_sub"),
+            "entered_zone",
+            &json!({"label": "person"}),
+        )
+        .unwrap();
+    state
+        .db
+        .insert_timeline_entry(
+            9001.0,
+            "backyard",
+            "tracked_object",
+            Some("ev_by_sub"),
+            "entered_zone",
+            &json!({"label": "person"}),
+        )
+        .unwrap();
+
+    for uri in ["/api/timeline?camera=all", "/api/timeline?camera="] {
+        let r_tl = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, &scoped_op_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_tl.status(), StatusCode::OK);
+        let tl_arr: Vec<Value> =
+            serde_json::from_slice(&to_bytes(r_tl.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(
+            tl_arr.len(),
+            1,
+            "Scoped caller on {uri} must receive their permitted camera's timeline entries"
+        );
+        assert_eq!(tl_arr[0]["camera"], "front_door");
+    }
+
+    let r_ev_empty_cams = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/events?cameras=")
+                .header(header::AUTHORIZATION, &scoped_op_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_ev_empty_cams.status(), StatusCode::OK);
+    let ev_arr: Vec<Value> =
+        serde_json::from_slice(&to_bytes(r_ev_empty_cams.into_body(), 16384).await.unwrap())
+            .unwrap();
+    assert!(
+        ev_arr.iter().all(|e| e["camera"] == "front_door"),
+        "Scoped caller on /api/events?cameras= must receive only permitted front_door events"
+    );
+
+    srv_handle.abort();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
