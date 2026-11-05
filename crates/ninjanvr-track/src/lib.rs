@@ -214,6 +214,13 @@ impl ByteTracker {
             .collect()
     }
 
+    fn clamped_bottom_center(&self, bbox: &BoundingBox) -> (f32, f32) {
+        let (bx, by) = bbox.bottom_center();
+        let max_x = (self.frame_w as f32 - 1e-3).max(0.0);
+        let max_y = (self.frame_h as f32 - 1e-3).max(0.0);
+        (bx.clamp(0.0, max_x), by.clamp(0.0, max_y))
+    }
+
     fn is_attribute_masked_or_filtered(&self, det: &DetectionResult, cfg: &CameraConfig) -> bool {
         if !det.score.is_finite()
             || det.score < 0.0
@@ -222,7 +229,7 @@ impl ByteTracker {
         {
             return true;
         }
-        let (bx, by) = det.bbox.bottom_center();
+        let (bx, by) = self.clamped_bottom_center(&det.bbox);
         if self.global_object_mask.contains_point(bx, by) {
             return true;
         }
@@ -255,7 +262,7 @@ impl ByteTracker {
         if !cfg.objects.track.iter().any(|l| l == &det.label) {
             return true;
         }
-        let (bx, by) = det.bbox.bottom_center();
+        let (bx, by) = self.clamped_bottom_center(&det.bbox);
         if self.global_object_mask.contains_point(bx, by) {
             return true;
         }
@@ -293,7 +300,7 @@ impl ByteTracker {
         if !score.is_finite() {
             return Vec::new();
         }
-        let (bx, by) = bbox.bottom_center();
+        let (bx, by) = self.clamped_bottom_center(bbox);
         let area = bbox.area();
         let frame_area = (self.frame_w as f64) * (self.frame_h as f64);
         let mut matched = Vec::new();
@@ -415,13 +422,21 @@ impl ByteTracker {
 
         let sanitized_raw: Vec<DetectionResult> = raw_detections
             .iter()
-            .filter(|d| {
-                d.score.is_finite()
-                    && d.score >= 0.0
-                    && d.bbox.x_max > d.bbox.x_min
-                    && d.bbox.y_max > d.bbox.y_min
+            .filter_map(|d| {
+                if !d.score.is_finite() || d.score < 0.0 {
+                    return None;
+                }
+                let x_min = d.bbox.x_min.min(d.bbox.x_max);
+                let y_min = d.bbox.y_min.min(d.bbox.y_max);
+                let x_max = d.bbox.x_max.max(d.bbox.x_min).min(self.frame_w);
+                let y_max = d.bbox.y_max.max(d.bbox.y_min).min(self.frame_h);
+                if x_max <= x_min || y_max <= y_min {
+                    return None;
+                }
+                let mut clean = d.clone();
+                clean.bbox = BoundingBox::new(x_min, y_min, x_max, y_max);
+                Some(clean)
             })
-            .cloned()
             .collect();
         let deduplicated = nms_detections(sanitized_raw, 0.55);
 
@@ -1045,9 +1060,20 @@ pub fn should_replace_snapshot(
     if is_first_snapshot {
         return true;
     }
-    let attr_improved = (prev_best_attr_quality <= 0.0 && new_attr_quality > 0.0)
-        || new_attr_quality > prev_best_attr_quality + 0.02;
-    let score_improved = new_score > prev_best_score + 0.05;
+    let safe_prev_score = if prev_best_score.is_finite() {
+        prev_best_score
+    } else {
+        0.0
+    };
+    let safe_prev_attr = if prev_best_attr_quality.is_finite() {
+        prev_best_attr_quality
+    } else {
+        0.0
+    };
+    let attr_improved = new_attr_quality.is_finite()
+        && ((safe_prev_attr <= 0.0 && new_attr_quality > 0.0)
+            || new_attr_quality > safe_prev_attr + 0.02);
+    let score_improved = new_score.is_finite() && new_score > safe_prev_score + 0.05;
     let in_zone_ok = entered_zones.is_empty() || !current_zones.is_empty();
 
     match policy {
@@ -1057,7 +1083,7 @@ pub fn should_replace_snapshot(
         SnapshotSelectionPolicy::BestAttribute => {
             if attr_improved {
                 true
-            } else if prev_best_attr_quality > 0.0 {
+            } else if safe_prev_attr > 0.0 {
                 false
             } else {
                 in_zone_ok && score_improved
@@ -2242,5 +2268,98 @@ mod tests {
             "unscanned stationary track must expire after bounded interval"
         );
         assert_eq!(tracker.active_tracks().count(), 0);
+    }
+
+    #[test]
+    fn regression_bottom_edge_detections_respect_masks_zones_and_snapshot_nan_guards() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 1;
+        cam_cfg.objects.track = vec!["person".to_string(), "car".to_string()];
+        // Per-label mask for "car" covering the bottom half [0, 0.5]..[1.0, 1.0]
+        let car_filter = ninjanvr_config::ObjectFilterConfig {
+            mask: "0.0,0.5,1.0,0.5,1.0,1.0,0.0,1.0".into(),
+            ..Default::default()
+        };
+        cam_cfg
+            .objects
+            .filters
+            .insert("car".to_string(), car_filter);
+        cam_cfg.zones.insert(
+            "bottom_zone".to_string(),
+            ninjanvr_config::ZoneConfig {
+                coordinates: "0.0,0.5,1.0,0.5,1.0,1.0,0.0,1.0".into(),
+                objects: vec!["person".to_string()],
+                inertia: 1,
+                loitering_time: 0,
+                min_area: None,
+                max_area: None,
+                min_score: None,
+                preset: None,
+            },
+        );
+
+        let mut tracker = ByteTracker::new("cam", 1000, 1000, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1000, 1000);
+
+        // 1. Car touching or slightly protruding past bottom edge (y_max = 1005 -> clamped to 1000)
+        // must still be suppressed by the bottom-half object mask instead of bypassing it
+        let edge_car = DetectionResult {
+            label: "car".to_string(),
+            score: 0.92,
+            bbox: BoundingBox::new(300, 750, 600, 1005),
+            region: reg,
+        };
+        // 2. Person touching bottom edge (y_max = 1000) must still enter bottom_zone and keep norm_bbox <= 1.0
+        let edge_person = DetectionResult {
+            label: "person".to_string(),
+            score: 0.91,
+            bbox: BoundingBox::new(100, 700, 220, 1005),
+            region: reg,
+        };
+        // 3. Completely out-of-frame detection (x_min >= frame_w) is rejected
+        let oob_person = DetectionResult {
+            label: "person".to_string(),
+            score: 0.95,
+            bbox: BoundingBox::new(1200, 1200, 1400, 1500),
+            region: reg,
+        };
+
+        let (active, _) =
+            tracker.update(1.0, &[edge_car, edge_person, oob_person], &[reg], &cam_cfg);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].label, "person");
+        assert_eq!(active[0].bbox, BoundingBox::new(100, 700, 220, 1000));
+        assert!(active[0].zones.contains(&"bottom_zone".to_string()));
+        assert!(
+            active[0]
+                .provenance
+                .norm_bbox
+                .iter()
+                .all(|&v| (0.0..=1.0).contains(&v))
+        );
+        assert!(active[0].provenance.area_pct <= 100.0);
+
+        // Snapshot replacement rejects non-finite new scores and recovers from NaN previous scores
+        let z = vec!["bottom_zone".to_string()];
+        assert!(!should_replace_snapshot(
+            SnapshotSelectionPolicy::BestOverall,
+            false,
+            0.80,
+            f32::INFINITY,
+            0.0,
+            f32::INFINITY,
+            &z,
+            &z,
+        ));
+        assert!(should_replace_snapshot(
+            SnapshotSelectionPolicy::BestOverall,
+            false,
+            f32::NAN,
+            0.85,
+            f32::NAN,
+            0.0,
+            &z,
+            &z,
+        ));
     }
 }

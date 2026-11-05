@@ -379,9 +379,9 @@ impl SimdMotionDetector {
         }
         let mw = self.motion_w as usize;
         let mh = self.motion_h as usize;
-        let fw = self.frame_w as usize;
-        let fh = self.frame_h as usize;
-        let Some(expected_y_len) = fw.checked_mul(fh) else {
+        let src_w = frame.width as usize;
+        let src_h = frame.height as usize;
+        let Some(expected_y_len) = src_w.checked_mul(src_h) else {
             return Vec::new();
         };
         let y_plane = frame.y_plane();
@@ -392,18 +392,18 @@ impl SimdMotionDetector {
         // 1. Box-averaging downscale of Y-plane into `work_gray` (suppresses sensor & H.264 pixel noise)
 
         for my in 0..mh {
-            let sy0 = (my * fh) / mh;
-            let sy1 = (((my + 1) * fh) / mh).max(sy0 + 1).min(fh);
+            let sy0 = (my * src_h) / mh;
+            let sy1 = (((my + 1) * src_h) / mh).max(sy0 + 1).min(src_h);
             let sy_mid = (sy0 + sy1) / 2;
-            let row_a = &y_plane[sy0 * fw..(sy0 + 1) * fw];
-            let row_b = &y_plane[sy_mid * fw..(sy_mid + 1) * fw];
+            let row_a = &y_plane[sy0 * src_w..(sy0 + 1) * src_w];
+            let row_b = &y_plane[sy_mid * src_w..(sy_mid + 1) * src_w];
             let row_dst = &mut self.work_gray[my * mw..(my + 1) * mw];
             for (mx, dst) in row_dst.iter_mut().enumerate() {
-                let sx0 = (mx * fw) / mw;
-                let sx1 = (((mx + 1) * fw) / mw)
+                let sx0 = (mx * src_w) / mw;
+                let sx1 = (((mx + 1) * src_w) / mw)
                     .saturating_sub(1)
                     .max(sx0)
-                    .min(fw - 1);
+                    .min(src_w - 1);
                 let sum = (row_a[sx0] as u32)
                     + (row_a[sx1] as u32)
                     + (row_b[sx0] as u32)
@@ -469,10 +469,10 @@ impl SimdMotionDetector {
                     (1.0 - c_alpha) * self.smooth_max_v + c_alpha * (raw_max as f32);
             }
 
-            let min_v = self.smooth_min_v.round().clamp(0.0, 254.0) as u8;
-            // Enforce a minimum span of 85 (~3x max gain) so dark/uniform rooms never amplify compression noise
+            let min_v = self.smooth_min_v.round().clamp(0.0, 170.0) as u8;
+            // Enforce a minimum span of 85 (~3x max gain) so dark/bright/uniform rooms never amplify compression noise
             let max_v =
-                (self.smooth_max_v.round().clamp(1.0, 255.0) as u8).max(min_v.saturating_add(85));
+                (self.smooth_max_v.round().clamp(85.0, 255.0) as u8).max(min_v.saturating_add(85));
             if min_v < max_v {
                 let span = (max_v - min_v) as u32;
                 for px in &mut self.work_blurred {
@@ -503,7 +503,7 @@ impl SimdMotionDetector {
             0.2
         };
         let delta_alpha = raw_da.clamp(0.01, 1.0);
-        let thresh_val = self.config.threshold;
+        let thresh_val = self.config.threshold.max(1);
         let mut active_pixels = 0usize;
 
         for i in 0..self.work_blurred.len() {
@@ -881,16 +881,27 @@ pub fn crop_yuv420p_to_tensor_nhwc(
         return;
     }
 
+    let mw = model_w as usize;
+    let mh = model_h as usize;
+    let Some(req_out_len) = mw.checked_mul(mh).and_then(|px| px.checked_mul(3)) else {
+        out_tensor.fill(0);
+        return;
+    };
+    if out_tensor.len() < req_out_len {
+        out_tensor.fill(0);
+        return;
+    }
+
     let y_plane = &frame.data[..y_size];
     let u_plane = &frame.data[y_size..y_size + uv_size];
     let v_plane = &frame.data[y_size + uv_size..y_size + uv_size * 2];
 
-    let rw = region.width().max(1) as usize;
-    let rh = region.height().max(1) as usize;
-    let rx0 = (region.x_min as usize).min(fw - 1);
-    let ry0 = (region.y_min as usize).min(fh - 1);
-    let mw = model_w as usize;
-    let mh = model_h as usize;
+    let rx0 = (region.x_min.min(region.x_max) as usize).min(fw - 1);
+    let ry0 = (region.y_min.min(region.y_max) as usize).min(fh - 1);
+    let rx1 = (region.x_max.max(region.x_min) as usize).clamp(rx0 + 1, fw);
+    let ry1 = (region.y_max.max(region.y_min) as usize).clamp(ry0 + 1, fh);
+    let rw = (rx1 - rx0).max(1);
+    let rh = (ry1 - ry0).max(1);
 
     for ty in 0..mh {
         let sy = ry0.saturating_add((ty.saturating_mul(rh)) / mh).min(fh - 1);
@@ -903,16 +914,14 @@ pub fn crop_yuv420p_to_tensor_nhwc(
             let v_val = v_plane[uv_y * uv_stride + uv_x];
             let (r, g, b) = yuv_to_rgb_pixel(y_val, u_val, v_val);
             let dst_idx = (ty * mw + tx) * 3;
-            if dst_idx + 2 < out_tensor.len() {
-                if bgr_order {
-                    out_tensor[dst_idx] = b;
-                    out_tensor[dst_idx + 1] = g;
-                    out_tensor[dst_idx + 2] = r;
-                } else {
-                    out_tensor[dst_idx] = r;
-                    out_tensor[dst_idx + 1] = g;
-                    out_tensor[dst_idx + 2] = b;
-                }
+            if bgr_order {
+                out_tensor[dst_idx] = b;
+                out_tensor[dst_idx + 1] = g;
+                out_tensor[dst_idx + 2] = r;
+            } else {
+                out_tensor[dst_idx] = r;
+                out_tensor[dst_idx + 1] = g;
+                out_tensor[dst_idx + 2] = b;
             }
         }
     }
@@ -954,7 +963,16 @@ pub fn yuv420p_to_rgb_image_scaled(
         return RgbImage::new(320, 180);
     }
 
-    let region = crop.unwrap_or_else(|| BoundingBox::new(0, 0, frame.width, frame.height));
+    let region = match crop {
+        Some(c) => {
+            let x1 = c.x_min.min(c.x_max).min(frame.width - 1);
+            let y1 = c.y_min.min(c.y_max).min(frame.height - 1);
+            let x2 = c.x_max.max(c.x_min).clamp(x1 + 1, frame.width);
+            let y2 = c.y_max.max(c.y_min).clamp(y1 + 1, frame.height);
+            BoundingBox::new(x1, y1, x2, y2)
+        }
+        None => BoundingBox::new(0, 0, frame.width, frame.height),
+    };
     let rw = region.width().max(1);
     let rh = region.height().max(1);
     let (out_w, out_h) = match max_height {
@@ -1006,13 +1024,13 @@ pub fn yuv420p_to_rgb_image_scaled(
         let rgb = Rgb(*color);
         for x in x1..=x2 {
             for t in 0..2 {
-                img.put_pixel(x, (y1 + t).min(out_h - 1), rgb);
+                img.put_pixel(x, y1.saturating_add(t).min(out_h - 1), rgb);
                 img.put_pixel(x, y2.saturating_sub(t), rgb);
             }
         }
         for y in y1..=y2 {
             for t in 0..2 {
-                img.put_pixel((x1 + t).min(out_w - 1), y, rgb);
+                img.put_pixel(x1.saturating_add(t).min(out_w - 1), y, rgb);
                 img.put_pixel(x2.saturating_sub(t), y, rgb);
             }
         }
@@ -1417,20 +1435,20 @@ pub fn annotate_rgb_image_with_boxes(img: &mut RgbImage, boxes: &[(BoundingBox, 
         return;
     }
     for (bbox, color) in boxes {
-        let x1 = bbox.x_min.min(w - 1);
-        let y1 = bbox.y_min.min(h - 1);
-        let x2 = bbox.x_max.min(w - 1);
-        let y2 = bbox.y_max.min(h - 1);
+        let x1 = bbox.x_min.min(bbox.x_max).min(w - 1);
+        let y1 = bbox.y_min.min(bbox.y_max).min(h - 1);
+        let x2 = bbox.x_max.max(bbox.x_min).min(w - 1);
+        let y2 = bbox.y_max.max(bbox.y_min).min(h - 1);
         let rgb = Rgb(*color);
         for x in x1..=x2 {
             for t in 0..2 {
-                img.put_pixel(x, (y1 + t).min(h - 1), rgb);
+                img.put_pixel(x, y1.saturating_add(t).min(h - 1), rgb);
                 img.put_pixel(x, y2.saturating_sub(t), rgb);
             }
         }
         for y in y1..=y2 {
             for t in 0..2 {
-                img.put_pixel((x1 + t).min(w - 1), y, rgb);
+                img.put_pixel(x1.saturating_add(t).min(w - 1), y, rgb);
                 img.put_pixel(x2.saturating_sub(t), y, rgb);
             }
         }
@@ -1445,30 +1463,38 @@ pub fn resolve_roi_crop_bbox(crop: [f32; 4], frame_w: u32, frame_h: u32) -> Boun
     if crop.iter().any(|v| !v.is_finite()) {
         return BoundingBox::new(0, 0, safe_w, safe_h);
     }
-    let fw = safe_w as f32;
-    let fh = safe_h as f32;
+    let fw = safe_w as f64;
+    let fh = safe_h as f64;
     let is_normalized = crop.iter().all(|&v| (0.0..=1.0).contains(&v));
-    let raw_x1 = if is_normalized { crop[0] * fw } else { crop[0] };
-    let raw_y1 = if is_normalized { crop[1] * fh } else { crop[1] };
-    let raw_x2 = if is_normalized { crop[2] * fw } else { crop[2] };
-    let raw_y2 = if is_normalized { crop[3] * fh } else { crop[3] };
+    let raw_x1 = if is_normalized {
+        (crop[0] as f64) * fw
+    } else {
+        crop[0] as f64
+    };
+    let raw_y1 = if is_normalized {
+        (crop[1] as f64) * fh
+    } else {
+        crop[1] as f64
+    };
+    let raw_x2 = if is_normalized {
+        (crop[2] as f64) * fw
+    } else {
+        crop[2] as f64
+    };
+    let raw_y2 = if is_normalized {
+        (crop[3] as f64) * fh
+    } else {
+        crop[3] as f64
+    };
 
-    let x_min = raw_x1
-        .min(raw_x2)
-        .round()
-        .clamp(0.0, (safe_w.saturating_sub(1)) as f32) as u32;
-    let y_min = raw_y1
-        .min(raw_y2)
-        .round()
-        .clamp(0.0, (safe_h.saturating_sub(1)) as f32) as u32;
-    let x_max = raw_x1
-        .max(raw_x2)
-        .round()
-        .clamp((x_min + 1) as f32, safe_w as f32) as u32;
-    let y_max = raw_y1
-        .max(raw_y2)
-        .round()
-        .clamp((y_min + 1) as f32, safe_h as f32) as u32;
+    let max_x_min = safe_w.saturating_sub(1);
+    let max_y_min = safe_h.saturating_sub(1);
+    let x_min = (raw_x1.min(raw_x2).round().clamp(0.0, max_x_min as f64) as u32).min(max_x_min);
+    let y_min = (raw_y1.min(raw_y2).round().clamp(0.0, max_y_min as f64) as u32).min(max_y_min);
+    let x_max =
+        (raw_x1.max(raw_x2).round().clamp((x_min + 1) as f64, fw) as u32).clamp(x_min + 1, safe_w);
+    let y_max =
+        (raw_y1.max(raw_y2).round().clamp((y_min + 1) as f64, fh) as u32).clamp(y_min + 1, safe_h);
     BoundingBox::new(x_min, y_min, x_max, y_max)
 }
 
@@ -2783,5 +2809,81 @@ mod tests {
         assert!(tr.confidence.is_finite());
         let tr_timeout = tracker.observe_state("open", 0.9, 531.0);
         assert!(tr_timeout.anomaly_triggered);
+    }
+
+    #[test]
+    fn regression_extreme_dimensions_oversized_crops_and_bright_contrast_caps_stay_safe() {
+        // 1. resolve_roi_crop_bbox at u32::MAX and >2^24 dimensions never overflows x_min + 1 or returns 0-width box
+        let max_bbox = resolve_roi_crop_bbox([1.0, 1.0, 1.0, 1.0], u32::MAX, u32::MAX);
+        assert_eq!(max_bbox.x_min, u32::MAX - 1);
+        assert_eq!(max_bbox.x_max, u32::MAX);
+        assert_eq!(max_bbox.width(), 1);
+        assert_eq!(max_bbox.height(), 1);
+
+        let f32_gap_bbox = resolve_roi_crop_bbox([1.0, 1.0, 1.0, 1.0], 16_777_220, 33_554_439);
+        assert!(f32_gap_bbox.width() >= 1);
+        assert!(f32_gap_bbox.height() >= 1);
+        assert!(f32_gap_bbox.x_max <= 16_777_220);
+        assert!(f32_gap_bbox.y_max <= 33_554_439);
+
+        // 2. yuv420p_to_rgb_image_scaled clamps oversized crop (e.g. u32::MAX) to frame dimensions instead of OOM/panic
+        let w = 64u32;
+        let h = 48u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        let frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 1.0,
+            width: w,
+            height: h,
+            data: Arc::new(vec![128u8; y_len + uv_len * 2]),
+        };
+        let huge_crop = BoundingBox::new(0, 0, u32::MAX, u32::MAX);
+        let img = yuv420p_to_rgb_image_scaled(&frame, Some(huge_crop), &[], None);
+        assert_eq!(img.width(), w);
+        assert_eq!(img.height(), h);
+
+        // 3. crop_yuv420p_to_tensor_nhwc safely handles overflowing model dimensions without panicking
+        let mut small_tensor = [255u8; 12];
+        crop_yuv420p_to_tensor_nhwc(
+            &frame,
+            &huge_crop,
+            u32::MAX,
+            u32::MAX,
+            false,
+            &mut small_tensor,
+        );
+        assert_eq!(small_tensor, [0u8; 12]);
+
+        // 4. SimdMotionDetector enforces 3x max contrast gain cap in bright scenes (luma 250..252) and threshold=0 floor
+        let cfg = MotionConfig {
+            threshold: 0,
+            improve_contrast: true,
+            ..MotionConfig::default()
+        };
+        let mut det = SimdMotionDetector::new(64, 48, cfg);
+        let mut bright_buf = vec![250u8; y_len + uv_len * 2];
+        bright_buf[y_len..].fill(128);
+        let bright_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 1.0,
+            width: w,
+            height: h,
+            data: Arc::new(bright_buf.clone()),
+        };
+        for _ in 0..32 {
+            assert!(det.detect(&bright_frame).is_empty());
+        }
+        // 1-unit compression ripple (250 -> 251) in bright scene must not trigger false motion
+        bright_buf[10 * 64 + 10] = 251;
+        let ripple_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 2.0,
+            width: w,
+            height: h,
+            data: Arc::new(bright_buf),
+        };
+        let _ = det.detect(&ripple_frame);
+        assert!(det.detect(&ripple_frame).is_empty());
     }
 }
