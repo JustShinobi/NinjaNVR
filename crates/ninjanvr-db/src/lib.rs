@@ -229,12 +229,16 @@ pub fn strip_media_root(path: &str) -> Option<&str> {
     if rel.is_empty() { None } else { Some(rel) }
 }
 
+const MIN_PBKDF2_ITERATIONS: u32 = 1_000;
+const MAX_PBKDF2_ITERATIONS: u32 = 10_000_000;
+
 /// Hashes a password using the `pbkdf2_sha256$<iterations>$<salt>$<b64>` format.
 pub fn hash_password(password: &str, salt: Option<&str>, iterations: u32) -> String {
+    let effective_iterations = iterations.clamp(MIN_PBKDF2_ITERATIONS, MAX_PBKDF2_ITERATIONS);
     let owned_salt: String;
     let salt_str = match salt {
-        Some(s) => s,
-        None => {
+        Some(s) if !s.is_empty() && !s.contains('$') => s,
+        _ => {
             let mut bytes = [0u8; 16];
             rand::fill(&mut bytes);
             owned_salt = bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -246,11 +250,11 @@ pub fn hash_password(password: &str, salt: Option<&str>, iterations: u32) -> Str
     let _ = pbkdf2::<Hmac<Sha256>>(
         password.as_bytes(),
         salt_str.as_bytes(),
-        iterations,
+        effective_iterations,
         &mut dk,
     );
     let b64 = base64::engine::general_purpose::STANDARD.encode(dk);
-    format!("{PASSWORD_HASH_ALGORITHM}${iterations}${salt_str}${b64}")
+    format!("{PASSWORD_HASH_ALGORITHM}${effective_iterations}${salt_str}${b64}")
 }
 
 /// Verifies a plaintext password against a `pbkdf2_sha256$<iterations>$<salt>$<b64>` hash.
@@ -265,19 +269,45 @@ pub fn verify_password(password: &str, password_hash: &str) -> bool {
     let Ok(iterations) = parts[1].parse::<u32>() else {
         return false;
     };
-    let expected = hash_password(password, Some(parts[2]), iterations);
-    constant_time_eq(expected.as_bytes(), password_hash.as_bytes())
+    if !(MIN_PBKDF2_ITERATIONS..=MAX_PBKDF2_ITERATIONS).contains(&iterations) {
+        return false;
+    }
+    let salt_str = parts[2];
+    let digest_b64 = parts[3];
+    if salt_str.is_empty() || digest_b64.is_empty() || digest_b64.contains('$') {
+        return false;
+    }
+    let mut dk = [0u8; 32];
+    let _ = pbkdf2::<Hmac<Sha256>>(
+        password.as_bytes(),
+        salt_str.as_bytes(),
+        iterations,
+        &mut dk,
+    );
+    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(dk);
+    constant_time_eq(expected_b64.as_bytes(), digest_b64.as_bytes())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
+    let max_len = a.len().max(b.len());
+    let mut diff = if a.len() == b.len() { 0u8 } else { 1u8 };
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
         diff |= x ^ y;
     }
-    diff == 0
+    diff == 0 && a.len() == b.len()
+}
+
+fn escape_sql_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn parse_json_or(raw: Option<String>, fallback: Value) -> Value {
@@ -289,12 +319,12 @@ fn parse_json_or(raw: Option<String>, fallback: Value) -> Value {
 
 fn value_to_f64(val: &rusqlite::types::ValueRef<'_>) -> Option<f64> {
     match val {
-        rusqlite::types::ValueRef::Real(f) => Some(*f),
+        rusqlite::types::ValueRef::Real(f) => (*f).is_finite().then_some(*f),
         rusqlite::types::ValueRef::Integer(i) => Some(*i as f64),
         rusqlite::types::ValueRef::Text(bytes) => {
             let s = std::str::from_utf8(bytes).ok()?;
             if let Ok(f) = s.parse::<f64>() {
-                return Some(f);
+                return f.is_finite().then_some(f);
             }
             if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
                 return Some(dt.timestamp_micros() as f64 / 1_000_000.0);
@@ -333,12 +363,13 @@ fn parse_four_f64(val: &Value) -> Option<[f64; 4]> {
     if arr.len() < 4 {
         return None;
     }
-    Some([
+    let coords = [
         arr[0].as_f64()?,
         arr[1].as_f64()?,
         arr[2].as_f64()?,
         arr[3].as_f64()?,
-    ])
+    ];
+    coords.iter().all(|v| v.is_finite()).then_some(coords)
 }
 
 fn extract_norm_box_from_event(ev: &Value) -> [f64; 4] {
@@ -369,11 +400,22 @@ fn extract_dhash64_from_value(val: &Value) -> Option<u64> {
 }
 
 fn iou_corners(a: [f64; 4], b: [f64; 4]) -> f64 {
+    if !a.iter().all(|v| v.is_finite()) || !b.iter().all(|v| v.is_finite()) {
+        return 0.0;
+    }
     let aw = a[2] - a[0];
     let ah = a[3] - a[1];
     let bw = b[2] - b[0];
     let bh = b[3] - b[1];
-    if aw <= 0.0 || ah <= 0.0 || bw <= 0.0 || bh <= 0.0 {
+    if !aw.is_finite()
+        || !ah.is_finite()
+        || !bw.is_finite()
+        || !bh.is_finite()
+        || aw <= 0.0
+        || ah <= 0.0
+        || bw <= 0.0
+        || bh <= 0.0
+    {
         return 0.0;
     }
     let ix1 = a[0].max(b[0]);
@@ -385,12 +427,19 @@ fn iou_corners(a: [f64; 4], b: [f64; 4]) -> f64 {
     }
     let inter = (ix2 - ix1) * (iy2 - iy1);
     let union = aw * ah + bw * bh - inter;
-    if union <= 0.0 { 0.0 } else { inter / union }
+    if !inter.is_finite() || !union.is_finite() || union <= 0.0 {
+        0.0
+    } else {
+        (inter / union).clamp(0.0, 1.0)
+    }
 }
 
 /// Computes normalized bounding-box IoU supporting both `[x1, y1, x2, y2]` and `[x, y, w, h]`
 /// (as returned by `BoundingBox::to_normalized`).
 pub fn compute_norm_box_iou(a: [f64; 4], b: [f64; 4]) -> f64 {
+    if !a.iter().all(|v| v.is_finite()) || !b.iter().all(|v| v.is_finite()) {
+        return 0.0;
+    }
     let xyxy = iou_corners(a, b);
     let can_be_xywh = a[2] > 0.0
         && a[3] > 0.0
@@ -412,6 +461,12 @@ pub fn compute_norm_box_iou(a: [f64; 4], b: [f64; 4]) -> f64 {
 }
 
 impl NinjaDatabase {
+    fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -447,13 +502,13 @@ impl NinjaDatabase {
 
     #[doc(hidden)]
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         conn.execute_batch(sql)?;
         Ok(())
     }
 
     pub fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS "recordings" (
@@ -673,7 +728,7 @@ impl NinjaDatabase {
     }
 
     pub fn set_recording_stream_tier(&self, id: &str, tier: &str) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         Ok(conn.execute(
             "UPDATE recordings SET stream_tier = ?2 WHERE id = ?1",
             params![id, tier],
@@ -685,11 +740,15 @@ impl NinjaDatabase {
         target_dbfs: i64,
         limit: usize,
     ) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let capped_limit = limit.min(10_000) as i64;
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT id, path FROM recordings WHERE dbfs = ?1 ORDER BY start_time DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![target_dbfs, limit as i64], |r| {
+        let rows = stmt.query_map(params![target_dbfs, capped_limit], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         let mut out = Vec::new();
@@ -700,7 +759,7 @@ impl NinjaDatabase {
     }
 
     pub fn update_recording_dbfs(&self, id: &str, dbfs: i64) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         Ok(conn.execute(
             "UPDATE recordings SET dbfs = ?2 WHERE id = ?1",
             params![id, dbfs],
@@ -712,7 +771,10 @@ impl NinjaDatabase {
         camera: &str,
         idle_main_cutoff: f64,
     ) -> Result<Vec<String>> {
-        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        if !idle_main_cutoff.is_finite() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         let mut to_delete = Vec::new();
         {
@@ -755,49 +817,71 @@ impl NinjaDatabase {
     }
 
     pub fn delete_recording_by_id(&self, id: &str) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         Ok(conn.execute("DELETE FROM recordings WHERE id = ?1", params![id])?)
     }
 
     pub fn ensure_default_admin(&self, iterations: u32) -> Result<Option<String>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let existing: Option<(String, String)> = conn
+        {
+            let conn = self.lock_conn();
+            let existing: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT username, password_hash FROM user WHERE username = 'admin'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+
+            if let Some((_, ref hash)) = existing
+                && !hash.is_empty()
+            {
+                return Ok(None);
+            }
+        }
+
+        let mut bytes = [0u8; 16];
+        rand::fill(&mut bytes);
+        let password: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let pw_hash = hash_password(&password, None, iterations.max(MIN_PBKDF2_ITERATIONS));
+
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let existing: Option<(String, String)> = tx
             .query_row(
                 "SELECT username, password_hash FROM user WHERE username = 'admin'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-
         if let Some((_, ref hash)) = existing
             && !hash.is_empty()
         {
             return Ok(None);
         }
 
-        let mut bytes = [0u8; 16];
-        rand::fill(&mut bytes);
-        let password: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let pw_hash = hash_password(&password, None, iterations);
-
-        conn.execute(
+        tx.execute(
             r#"
-            INSERT INTO user (username, role, password_hash, notification_tokens)
-            VALUES ('admin', 'admin', ?1, '[]')
-            ON CONFLICT(username) DO UPDATE SET password_hash = excluded.password_hash
+            INSERT INTO user (username, role, allowed_cameras, password_hash, notification_tokens)
+            VALUES ('admin', 'admin', '*', ?1, '[]')
+            ON CONFLICT(username) DO UPDATE SET
+                role = 'admin',
+                allowed_cameras = '*',
+                password_hash = excluded.password_hash
             "#,
             params![pw_hash],
         )?;
+        tx.commit()?;
         info!("Created default admin user in SQLite database");
         Ok(Some(password))
     }
 
     pub fn get_user(&self, username: &str) -> Result<Option<DbUser>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let target = username.trim();
+        let conn = self.lock_conn();
         let row = conn
             .query_row(
                 "SELECT username, password_hash, role, notification_tokens, COALESCE(allowed_cameras, '*') FROM user WHERE username = ?1",
-                params![username],
+                params![target],
                 |r| {
                     let tokens_raw: Option<String> = r.get(3).ok();
                     let allowed_cameras: String = r.get::<_, Option<String>>(4)?.unwrap_or_else(|| "*".to_string());
@@ -815,7 +899,7 @@ impl NinjaDatabase {
     }
 
     pub fn list_users(&self) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT username, role, password_changed_at, COALESCE(allowed_cameras, '*') FROM user ORDER BY username",
         )?;
@@ -877,8 +961,25 @@ impl NinjaDatabase {
             allowed_cameras.trim()
         };
 
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let exists: Option<String> = conn
+        {
+            let conn = self.lock_conn();
+            let exists: Option<String> = conn
+                .query_row(
+                    "SELECT username FROM user WHERE username = ?1",
+                    params![trimmed],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_some() {
+                anyhow::bail!("User '{trimmed}' already exists");
+            }
+        }
+
+        let pw_hash = hash_password(password, None, iterations.max(MIN_PBKDF2_ITERATIONS));
+        let now_str = Utc::now().to_rfc3339();
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let exists: Option<String> = tx
             .query_row(
                 "SELECT username FROM user WHERE username = ?1",
                 params![trimmed],
@@ -888,16 +989,14 @@ impl NinjaDatabase {
         if exists.is_some() {
             anyhow::bail!("User '{trimmed}' already exists");
         }
-
-        let pw_hash = hash_password(password, None, iterations.max(1000));
-        let now_str = Utc::now().to_rfc3339();
-        conn.execute(
+        tx.execute(
             r#"
             INSERT INTO user (username, role, allowed_cameras, password_hash, notification_tokens, password_changed_at)
             VALUES (?1, ?2, ?3, ?4, '[]', ?5)
             "#,
             params![trimmed, norm_role, norm_cams, pw_hash, now_str],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -910,14 +1009,54 @@ impl NinjaDatabase {
         if password.is_empty() {
             anyhow::bail!("Password cannot be empty");
         }
-        let pw_hash = hash_password(password, None, iterations.max(1000));
+        let pw_hash = hash_password(password, None, iterations.max(MIN_PBKDF2_ITERATIONS));
         let now_str = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let updated = conn.execute(
             "UPDATE user SET password_hash = ?1, password_changed_at = ?2 WHERE username = ?3",
             params![pw_hash, now_str, username.trim()],
         )?;
         Ok(updated > 0)
+    }
+
+    fn revoke_disallowed_camera_share_links_in_tx(
+        tx: &Connection,
+        target: &str,
+        norm_allowed_cameras: &str,
+    ) -> Result<()> {
+        if norm_allowed_cameras == "*" {
+            return Ok(());
+        }
+        let allowed: Vec<&str> = norm_allowed_cameras
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let ext_target = format!("ext:{target}");
+        let mut stmt = tx.prepare(
+            "SELECT id, camera FROM share_link WHERE revoked = 0 AND (created_by = ?1 OR created_by = ?2)",
+        )?;
+        let rows = stmt.query_map(params![target, ext_target], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1).ok().flatten(),
+            ))
+        })?;
+        let mut revoke_ids = Vec::new();
+        for row in rows {
+            let (id, cam) = row?;
+            if !cam.as_deref().is_some_and(|c| allowed.contains(&c.trim())) {
+                revoke_ids.push(id);
+            }
+        }
+        drop(stmt);
+        for id in revoke_ids {
+            tx.execute(
+                "UPDATE share_link SET revoked = 1 WHERE id = ?1",
+                params![id],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn update_user_role(&self, username: &str, role: &str) -> Result<bool> {
@@ -928,10 +1067,11 @@ impl NinjaDatabase {
             _ => anyhow::bail!("Role must be 'admin', 'operator', or 'viewer'"),
         };
         let target = username.trim();
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
         if norm_role != "admin" {
-            let other_admins: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM user WHERE COALESCE(role, 'admin') = 'admin' AND username != ?1",
+            let other_admins: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM user WHERE LOWER(TRIM(COALESCE(role, 'admin'))) = 'admin' AND username != ?1",
                 params![target],
                 |r| r.get(0),
             )?;
@@ -939,17 +1079,35 @@ impl NinjaDatabase {
                 anyhow::bail!("Cannot demote the last admin account");
             }
         }
-        let updated = conn.execute(
+        let updated = tx.execute(
             "UPDATE user SET role = ?1 WHERE username = ?2",
             params![norm_role, target],
         )?;
-        if norm_role == "viewer" {
-            let ext_target = format!("ext:{target}");
-            conn.execute(
-                "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 OR created_by = ?2",
-                params![target, ext_target],
-            )?;
+        if updated > 0 {
+            if norm_role == "viewer" {
+                let ext_target = format!("ext:{target}");
+                tx.execute(
+                    "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 OR created_by = ?2",
+                    params![target, ext_target],
+                )?;
+            } else if norm_role == "operator" {
+                let allowed_cams: String = tx
+                    .query_row(
+                        "SELECT COALESCE(allowed_cameras, '*') FROM user WHERE username = ?1",
+                        params![target],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or_else(|| "*".to_string());
+                let norm_cams = if allowed_cams.trim().is_empty() {
+                    "*"
+                } else {
+                    allowed_cams.trim()
+                };
+                Self::revoke_disallowed_camera_share_links_in_tx(&tx, target, norm_cams)?;
+            }
         }
+        tx.commit()?;
         Ok(updated > 0)
     }
 
@@ -964,42 +1122,16 @@ impl NinjaDatabase {
             allowed_cameras.trim()
         };
         let target = username.trim();
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let updated = conn.execute(
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let updated = tx.execute(
             "UPDATE user SET allowed_cameras = ?1 WHERE username = ?2",
             params![norm, target],
         )?;
         if updated > 0 && norm != "*" {
-            let allowed: Vec<&str> = norm
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
-            let ext_target = format!("ext:{target}");
-            let mut stmt = conn.prepare(
-                "SELECT id, camera FROM share_link WHERE revoked = 0 AND (created_by = ?1 OR created_by = ?2)",
-            )?;
-            let rows = stmt.query_map(params![target, ext_target], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1).ok().flatten(),
-                ))
-            })?;
-            let mut revoke_ids = Vec::new();
-            for row in rows {
-                let (id, cam) = row?;
-                if !cam.as_deref().is_some_and(|c| allowed.contains(&c.trim())) {
-                    revoke_ids.push(id);
-                }
-            }
-            drop(stmt);
-            for id in revoke_ids {
-                conn.execute(
-                    "UPDATE share_link SET revoked = 1 WHERE id = ?1",
-                    params![id],
-                )?;
-            }
+            Self::revoke_disallowed_camera_share_links_in_tx(&tx, target, norm)?;
         }
+        tx.commit()?;
         Ok(updated > 0)
     }
 
@@ -1014,6 +1146,11 @@ impl NinjaDatabase {
         let trimmed_name = name.trim();
         if trimmed_name.is_empty() {
             anyhow::bail!("Token name cannot be empty");
+        }
+        if let Some(exp) = expires_at
+            && (!exp.is_finite() || exp <= 0.0)
+        {
+            anyhow::bail!("Token expiration timestamp must be a finite positive number");
         }
         let norm_scope = match scope.trim().to_ascii_lowercase().as_str() {
             "read_only" => "read_only",
@@ -1036,22 +1173,24 @@ impl NinjaDatabase {
         let id: String = id_bytes.iter().map(|b| format!("{b:02x}")).collect();
         let created_at = Utc::now().timestamp() as f64;
 
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let existing_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM api_token WHERE name = ?1",
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let existing_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM api_token WHERE name = ?1 OR id = ?1",
             params![trimmed_name],
             |r| r.get(0),
         )?;
         if existing_count > 0 {
             anyhow::bail!("An API token with name '{trimmed_name}' already exists");
         }
-        conn.execute(
+        tx.execute(
             r#"
             INSERT INTO api_token (id, name, token_hash, prefix, scope, created_at, last_used_at, expires_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
             "#,
             params![id, trimmed_name, token_hash, prefix, norm_scope, created_at, expires_at],
         )?;
+        tx.commit()?;
 
         Ok((
             json!({
@@ -1068,19 +1207,22 @@ impl NinjaDatabase {
     }
 
     pub fn list_api_tokens(&self) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT id, name, prefix, scope, created_at, last_used_at, expires_at FROM api_token ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
+            let created_at = value_to_f64(&r.get_ref(4)?).unwrap_or(0.0);
+            let last_used_at = value_to_f64(&r.get_ref(5)?);
+            let expires_at = value_to_f64(&r.get_ref(6)?);
             Ok(json!({
                 "id": r.get::<_, String>(0)?,
                 "name": r.get::<_, String>(1)?,
                 "prefix": r.get::<_, String>(2)?,
                 "scope": r.get::<_, String>(3)?,
-                "created_at": r.get::<_, f64>(4).unwrap_or(0.0),
-                "last_used_at": r.get::<_, Option<f64>>(5).ok().flatten(),
-                "expires_at": r.get::<_, Option<f64>>(6).ok().flatten(),
+                "created_at": created_at,
+                "last_used_at": last_used_at,
+                "expires_at": expires_at,
             }))
         })?;
         let mut out = Vec::new();
@@ -1092,38 +1234,40 @@ impl NinjaDatabase {
 
     pub fn delete_api_token(&self, id: &str) -> Result<bool> {
         let id_trimmed = id.trim();
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let token_name: Option<String> = conn
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let token_name: Option<String> = tx
             .query_row(
                 "SELECT name FROM api_token WHERE id = ?1",
                 params![id_trimmed],
                 |r| r.get(0),
             )
             .optional()?;
-        let deleted = conn.execute("DELETE FROM api_token WHERE id = ?1", params![id_trimmed])?;
+        let deleted = tx.execute("DELETE FROM api_token WHERE id = ?1", params![id_trimmed])?;
         if deleted > 0 {
             let creator_id = format!("token:{id_trimmed}");
-            conn.execute(
+            tx.execute(
                 "UPDATE share_link SET revoked = 1 WHERE created_by = ?1",
                 params![creator_id],
             )?;
             if let Some(name) = token_name {
                 let creator_name = format!("token:{name}");
-                conn.execute(
+                tx.execute(
                     "UPDATE share_link SET revoked = 1 WHERE created_by = ?1",
                     params![creator_name],
                 )?;
             }
         }
+        tx.commit()?;
         Ok(deleted > 0)
     }
 
     pub fn is_api_token_active_by_name(&self, name_or_id: &str, now_ts: f64) -> Result<bool> {
         let target = name_or_id.trim();
-        if target.is_empty() {
+        if target.is_empty() || !now_ts.is_finite() {
             return Ok(false);
         }
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let count: i64 = conn.query_row(
             r#"
             SELECT COUNT(*)
@@ -1145,26 +1289,45 @@ impl NinjaDatabase {
         raw_token: &str,
         now_ts: f64,
     ) -> Result<Option<(String, String)>> {
-        if !raw_token.starts_with("nnvr_") {
+        if !raw_token.starts_with("nnvr_") || !now_ts.is_finite() {
             return Ok(None);
         }
         let hash_bytes = Sha256::digest(raw_token.as_bytes());
         let token_hash: String = hash_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let row: Option<(String, String, String, Option<f64>)> = conn
+        let conn = self.lock_conn();
+        let row: Option<(String, String, String, Option<f64>, bool)> = conn
             .query_row(
                 "SELECT id, name, scope, expires_at FROM api_token WHERE token_hash = ?1",
                 params![token_hash],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3).ok().flatten())),
+                |r| {
+                    let exp_ref = r.get_ref(3)?;
+                    let (exp_val, exp_invalid) = match exp_ref {
+                        rusqlite::types::ValueRef::Null => (None, false),
+                        other => match value_to_f64(&other) {
+                            Some(v) => (Some(v), false),
+                            None => (None, true),
+                        },
+                    };
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, exp_val, exp_invalid))
+                },
             )
             .optional()?;
 
-        let Some((id, name, scope, expires_at)) = row else {
+        let Some((id, name, scope, expires_at, exp_invalid)) = row else {
             return Ok(None);
         };
+        if exp_invalid {
+            return Ok(None);
+        }
+        let norm_scope = match scope.trim().to_ascii_lowercase().as_str() {
+            "read_only" => "read_only",
+            "metrics" => "metrics",
+            "full" => "full",
+            _ => return Ok(None),
+        };
         if let Some(exp) = expires_at
-            && now_ts >= exp
+            && (!exp.is_finite() || now_ts >= exp)
         {
             return Ok(None);
         }
@@ -1172,13 +1335,14 @@ impl NinjaDatabase {
             "UPDATE api_token SET last_used_at = ?1 WHERE id = ?2",
             params![now_ts, id],
         );
-        Ok(Some((name, scope)))
+        Ok(Some((name, norm_scope.to_string())))
     }
 
     pub fn delete_user(&self, username: &str) -> Result<bool> {
         let target = username.trim();
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let target_role: Option<String> = conn
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let target_role: Option<String> = tx
             .query_row(
                 "SELECT COALESCE(role, 'admin') FROM user WHERE username = ?1",
                 params![target],
@@ -1188,9 +1352,9 @@ impl NinjaDatabase {
         let Some(role) = target_role else {
             return Ok(false);
         };
-        if role == "admin" {
-            let other_admins: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM user WHERE COALESCE(role, 'admin') = 'admin' AND username != ?1",
+        if role.trim().eq_ignore_ascii_case("admin") {
+            let other_admins: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM user WHERE LOWER(TRIM(COALESCE(role, 'admin'))) = 'admin' AND username != ?1",
                 params![target],
                 |r| r.get(0),
             )?;
@@ -1198,16 +1362,33 @@ impl NinjaDatabase {
                 anyhow::bail!("Cannot delete the last admin account");
             }
         }
-        let _ = conn.execute(
+        tx.execute(
             "DELETE FROM userreviewstatus WHERE user_id = ?1",
             params![target],
-        );
-        let deleted = conn.execute("DELETE FROM user WHERE username = ?1", params![target])?;
+        )?;
+        let ext_target = format!("ext:{target}");
+        tx.execute(
+            "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 OR created_by = ?2",
+            params![target, ext_target],
+        )?;
+        let deleted = tx.execute("DELETE FROM user WHERE username = ?1", params![target])?;
+        tx.commit()?;
         Ok(deleted > 0)
     }
 
     pub fn query_reviews(&self, filter: &ReviewFilter) -> Result<Vec<ReviewItemDto>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let requested_limit = filter.limit.unwrap_or(250).min(2000);
+        if requested_limit == 0 {
+            return Ok(Vec::new());
+        }
+        if filter.before.is_some_and(|v| !v.is_finite())
+            || filter.after.is_some_and(|v| !v.is_finite())
+            || filter.min_score.is_some_and(|v| !v.is_finite())
+        {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.lock_conn();
         let mut sql = String::from(
             r#"
             SELECT
@@ -1224,43 +1405,48 @@ impl NinjaDatabase {
             WHERE 1=1
             "#,
         );
+        let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
 
         if let Some(before) = filter.before {
-            sql.push_str(&format!(" AND r.start_time <= {before}"));
+            bind_vals.push(rusqlite::types::Value::Real(before));
+            sql.push_str(&format!(" AND r.start_time <= ?{}", bind_vals.len()));
         }
         if let Some(after) = filter.after {
+            bind_vals.push(rusqlite::types::Value::Real(after));
             sql.push_str(&format!(
-                " AND COALESCE(r.end_time, r.start_time) >= {after}"
+                " AND COALESCE(r.end_time, r.start_time) >= ?{}",
+                bind_vals.len()
             ));
         }
         if let Some(ref sev) = filter.severity
             && !sev.is_empty()
             && sev != "all"
         {
-            let sanitized = sev.replace('\'', "");
-            sql.push_str(&format!(" AND r.severity = '{sanitized}'"));
+            bind_vals.push(rusqlite::types::Value::Text(sev.clone()));
+            sql.push_str(&format!(" AND r.severity = ?{}", bind_vals.len()));
         }
         if let Some(ref cams) = filter.cameras
             && !cams.is_empty()
             && !cams.iter().any(|c| c == "all")
         {
-            let list: Vec<String> = cams
-                .iter()
-                .map(|c| format!("'{}'", c.replace('\'', "")))
-                .collect();
-            sql.push_str(&format!(" AND r.camera IN ({})", list.join(",")));
+            let mut placeholders = Vec::with_capacity(cams.len());
+            for c in cams {
+                bind_vals.push(rusqlite::types::Value::Text(c.clone()));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            sql.push_str(&format!(" AND r.camera IN ({})", placeholders.join(",")));
         }
 
         sql.push_str(" GROUP BY r.id");
         if let Some(want_reviewed) = filter.reviewed {
-            let rv = if want_reviewed { 1 } else { 0 };
-            sql.push_str(&format!(" HAVING reviewed = {rv}"));
+            let rv = if want_reviewed { 1i64 } else { 0i64 };
+            bind_vals.push(rusqlite::types::Value::Integer(rv));
+            sql.push_str(&format!(" HAVING reviewed = ?{}", bind_vals.len()));
         }
         sql.push_str(" ORDER BY r.start_time DESC");
 
-        let requested_limit = filter.limit.unwrap_or(250).min(2000);
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |row| {
             let start_time = value_to_f64(&row.get_ref(2)?).unwrap_or(0.0);
             let end_time = value_to_f64(&row.get_ref(3)?);
             let data_raw: Option<String> = row.get(6).ok();
@@ -1342,7 +1528,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_review_by_id(&self, id: &str) -> Result<Option<ReviewItemDto>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let row = conn
             .query_row(
                 r#"
@@ -1377,41 +1563,58 @@ impl NinjaDatabase {
     }
 
     pub fn get_review_by_event_id(&self, event_id: &str) -> Result<Option<ReviewItemDto>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let like_pattern = format!("%\"{}\"%", event_id.replace('"', ""));
-        let row = conn
-            .query_row(
-                r#"
-                SELECT
-                    r.id, r.camera, r.start_time, r.end_time, r.severity, r.thumb_path, r.data,
-                    COALESCE(MAX(u.has_been_reviewed), 0) AS reviewed
-                FROM reviewsegment r
-                LEFT JOIN userreviewstatus u ON u.review_segment_id = r.id
-                WHERE r.data LIKE ?1
-                GROUP BY r.id
-                ORDER BY r.start_time DESC
-                LIMIT 1
-                "#,
-                params![like_pattern],
-                |row| {
-                    let start_time = value_to_f64(&row.get_ref(2)?).unwrap_or(0.0);
-                    let end_time = value_to_f64(&row.get_ref(3)?);
-                    let data_raw: Option<String> = row.get(6).ok();
-                    let reviewed_int: i64 = row.get(7).unwrap_or(0);
-                    Ok(ReviewItemDto {
-                        id: row.get(0)?,
-                        camera: row.get(1)?,
-                        start_time,
-                        end_time,
-                        severity: row.get(4)?,
-                        thumb_path: row.get(5)?,
-                        data: parse_json_or(data_raw, json!({})),
-                        has_been_reviewed: reviewed_int != 0,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(row)
+        let trimmed_event_id = event_id.trim();
+        if trimmed_event_id.is_empty() || trimmed_event_id.contains('"') {
+            return Ok(None);
+        }
+        let conn = self.lock_conn();
+        let like_pattern = format!("%\"{}\"%", escape_sql_like(trimmed_event_id));
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                r.id, r.camera, r.start_time, r.end_time, r.severity, r.thumb_path, r.data,
+                COALESCE(MAX(u.has_been_reviewed), 0) AS reviewed
+            FROM reviewsegment r
+            LEFT JOIN userreviewstatus u ON u.review_segment_id = r.id
+            WHERE r.data LIKE ?1 ESCAPE '\'
+            GROUP BY r.id
+            ORDER BY r.start_time DESC
+            LIMIT 50
+            "#,
+        )?;
+        let rows = stmt.query_map(params![like_pattern], |row| {
+            let start_time = value_to_f64(&row.get_ref(2)?).unwrap_or(0.0);
+            let end_time = value_to_f64(&row.get_ref(3)?);
+            let data_raw: Option<String> = row.get(6).ok();
+            let reviewed_int: i64 = row.get(7).unwrap_or(0);
+            Ok(ReviewItemDto {
+                id: row.get(0)?,
+                camera: row.get(1)?,
+                start_time,
+                end_time,
+                severity: row.get(4)?,
+                thumb_path: row.get(5)?,
+                data: parse_json_or(data_raw, json!({})),
+                has_been_reviewed: reviewed_int != 0,
+            })
+        })?;
+        for r in rows {
+            let item = r?;
+            let matches_detection = item
+                .data
+                .get("detections")
+                .and_then(Value::as_array)
+                .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(trimmed_event_id)))
+                || item
+                    .data
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|eid| eid == trimmed_event_id);
+            if matches_detection {
+                return Ok(Some(item));
+            }
+        }
+        Ok(None)
     }
 
     pub fn get_reviews_by_ids(&self, ids: &[String]) -> Result<Vec<ReviewItemDto>> {
@@ -1429,21 +1632,24 @@ impl NinjaDatabase {
     }
 
     pub fn query_review_summary(&self, cameras: Option<&[String]>) -> Result<Value> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let now = Utc::now().timestamp() as f64;
         let last_24h = now - 86400.0;
         let last_30d = now - 86400.0 * 30.0;
 
+        let mut bind_vals: Vec<rusqlite::types::Value> =
+            vec![rusqlite::types::Value::Real(last_30d)];
         let mut cam_clause = String::new();
         if let Some(cams) = cameras
             && !cams.is_empty()
             && !cams.iter().any(|c| c == "all")
         {
-            let list: Vec<String> = cams
-                .iter()
-                .map(|c| format!("'{}'", c.replace('\'', "")))
-                .collect();
-            cam_clause = format!(" AND r.camera IN ({})", list.join(","));
+            let mut placeholders = Vec::with_capacity(cams.len());
+            for c in cams {
+                bind_vals.push(rusqlite::types::Value::Text(c.clone()));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            cam_clause = format!(" AND r.camera IN ({})", placeholders.join(","));
         }
 
         let sql = format!(
@@ -1454,14 +1660,14 @@ impl NinjaDatabase {
                 COALESCE(MAX(u.has_been_reviewed), 0) AS reviewed
             FROM reviewsegment r
             LEFT JOIN userreviewstatus u ON u.review_segment_id = r.id
-            WHERE r.start_time >= {last_30d} {cam_clause}
+            WHERE r.start_time >= ?1 {cam_clause}
             GROUP BY r.id
             ORDER BY r.start_time DESC
             "#
         );
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |row| {
             let ts = value_to_f64(&row.get_ref(0)?).unwrap_or(0.0);
             let sev: String = row.get(1)?;
             let rev: i64 = row.get(2).unwrap_or(0);
@@ -1544,37 +1750,51 @@ impl NinjaDatabase {
     }
 
     pub fn mark_reviews_viewed(&self, ids: &[String], reviewed: bool) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
         let val = if reviewed { 1 } else { 0 };
         let mut count = 0;
-        for id in ids {
-            count += conn.execute(
+        {
+            let mut stmt = tx.prepare(
                 r#"
                 INSERT INTO userreviewstatus (user_id, review_segment_id, has_been_reviewed)
                 VALUES ('admin', ?1, ?2)
                 ON CONFLICT(user_id, review_segment_id) DO UPDATE SET has_been_reviewed = excluded.has_been_reviewed
                 "#,
-                params![id, val],
             )?;
+            for id in ids {
+                count += stmt.execute(params![id, val])?;
+            }
         }
+        tx.commit()?;
         Ok(count)
     }
 
     pub fn delete_reviews(&self, ids: &[String]) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut count = 0;
-        for id in ids {
-            let _ = conn.execute(
-                "DELETE FROM userreviewstatus WHERE review_segment_id = ?1",
-                params![id],
-            );
-            count += conn.execute("DELETE FROM reviewsegment WHERE id = ?1", params![id])?;
+        if ids.is_empty() {
+            return Ok(0);
         }
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let mut count = 0;
+        {
+            let mut del_status =
+                tx.prepare("DELETE FROM userreviewstatus WHERE review_segment_id = ?1")?;
+            let mut del_seg = tx.prepare("DELETE FROM reviewsegment WHERE id = ?1")?;
+            for id in ids {
+                del_status.execute(params![id])?;
+                count += del_seg.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
         Ok(count)
     }
 
     pub fn insert_review_segment(&self, item: &ReviewItemDto) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let data_str = serde_json::to_string(&item.data)?;
         conn.execute(
             r#"
@@ -1600,7 +1820,18 @@ impl NinjaDatabase {
     }
 
     pub fn query_events(&self, filter: &EventFilter) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let requested_limit = filter.limit.unwrap_or(100).min(1000);
+        if requested_limit == 0 {
+            return Ok(Vec::new());
+        }
+        if filter.before.is_some_and(|v| !v.is_finite())
+            || filter.after.is_some_and(|v| !v.is_finite())
+            || filter.min_score.is_some_and(|v| !v.is_finite())
+        {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.lock_conn();
         let mut sql = String::from(
             r#"
             SELECT
@@ -1611,12 +1842,18 @@ impl NinjaDatabase {
             WHERE 1=1
             "#,
         );
+        let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
 
         if let Some(before) = filter.before {
-            sql.push_str(&format!(" AND start_time <= {before}"));
+            bind_vals.push(rusqlite::types::Value::Real(before));
+            sql.push_str(&format!(" AND start_time <= ?{}", bind_vals.len()));
         }
         if let Some(after) = filter.after {
-            sql.push_str(&format!(" AND COALESCE(end_time, start_time) >= {after}"));
+            bind_vals.push(rusqlite::types::Value::Real(after));
+            sql.push_str(&format!(
+                " AND COALESCE(end_time, start_time) >= ?{}",
+                bind_vals.len()
+            ));
         }
         if let Some(fav) = filter.favorites {
             if fav {
@@ -1629,50 +1866,57 @@ impl NinjaDatabase {
             && !cams.is_empty()
             && !cams.iter().any(|c| c == "all")
         {
-            let list: Vec<String> = cams
-                .iter()
-                .map(|c| format!("'{}'", c.replace('\'', "")))
-                .collect();
-            sql.push_str(&format!(" AND camera IN ({})", list.join(",")));
+            let mut placeholders = Vec::with_capacity(cams.len());
+            for c in cams {
+                bind_vals.push(rusqlite::types::Value::Text(c.clone()));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            sql.push_str(&format!(" AND camera IN ({})", placeholders.join(",")));
         }
         if let Some(ref labels) = filter.labels
             && !labels.is_empty()
             && !labels.iter().any(|l| l == "all")
         {
-            let list: Vec<String> = labels
-                .iter()
-                .map(|l| format!("'{}'", l.replace('\'', "")))
-                .collect();
-            sql.push_str(&format!(" AND label IN ({})", list.join(",")));
+            let mut placeholders = Vec::with_capacity(labels.len());
+            for l in labels {
+                bind_vals.push(rusqlite::types::Value::Text(l.clone()));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            sql.push_str(&format!(" AND label IN ({})", placeholders.join(",")));
         }
         if let Some(ref ex_labels) = filter.exclude_labels
             && !ex_labels.is_empty()
         {
-            let list: Vec<String> = ex_labels
-                .iter()
-                .map(|l| format!("'{}'", l.replace('\'', "")))
-                .collect();
-            sql.push_str(&format!(" AND label NOT IN ({})", list.join(",")));
+            let mut placeholders = Vec::with_capacity(ex_labels.len());
+            for l in ex_labels {
+                bind_vals.push(rusqlite::types::Value::Text(l.clone()));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            sql.push_str(&format!(" AND label NOT IN ({})", placeholders.join(",")));
         }
         if let Some(min_sc) = filter.min_score {
-            sql.push_str(&format!(" AND COALESCE(top_score, score, 0.0) >= {min_sc}"));
+            bind_vals.push(rusqlite::types::Value::Real(min_sc));
+            sql.push_str(&format!(
+                " AND COALESCE(top_score, score, 0.0) >= ?{}",
+                bind_vals.len()
+            ));
         }
         if let Some(ref subs) = filter.sub_labels
             && !subs.is_empty()
             && !subs.iter().any(|s| s == "all")
         {
-            let list: Vec<String> = subs
-                .iter()
-                .map(|s| format!("'{}'", s.replace('\'', "")))
-                .collect();
-            sql.push_str(&format!(" AND sub_label IN ({})", list.join(",")));
+            let mut placeholders = Vec::with_capacity(subs.len());
+            for s in subs {
+                bind_vals.push(rusqlite::types::Value::Text(s.clone()));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            sql.push_str(&format!(" AND sub_label IN ({})", placeholders.join(",")));
         }
 
         sql.push_str(" ORDER BY start_time DESC");
-        let requested_limit = filter.limit.unwrap_or(100).min(1000);
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |row| {
             let start_time = value_to_f64(&row.get_ref(4)?).unwrap_or(0.0);
             let end_time = value_to_f64(&row.get_ref(5)?);
             let zones_raw: Option<String> = row.get(3).ok();
@@ -1684,7 +1928,8 @@ impl NinjaDatabase {
                 .get::<_, Option<f64>>(16)
                 .ok()
                 .flatten()
-                .or_else(|| data_json.get("sub_label_score").and_then(|v| v.as_f64()));
+                .or_else(|| data_json.get("sub_label_score").and_then(|v| v.as_f64()))
+                .filter(|v| v.is_finite());
             if let Some(sc) = sub_label_score_col
                 && let Some(obj) = data_json.as_object_mut()
             {
@@ -1709,7 +1954,7 @@ impl NinjaDatabase {
                 "retain_indefinitely": row.get::<_, i64>(9).unwrap_or(0) != 0,
                 "sub_label": sub_label_col,
                 "sub_label_score": sub_label_score_col,
-                "top_score": row.get::<_, Option<f64>>(11).ok().flatten(),
+                "top_score": row.get::<_, Option<f64>>(11).ok().flatten().filter(|v| v.is_finite()),
                 "false_positive": row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v != 0),
                 "box": parse_json_or(box_raw, Value::Null),
                 "stationary": is_stationary,
@@ -1784,20 +2029,22 @@ impl NinjaDatabase {
     }
 
     pub fn query_events_explore(&self, limit_per_label: usize) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn
-            .prepare("SELECT label, COUNT(*) as cnt FROM event GROUP BY label ORDER BY cnt DESC")?;
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT label, COUNT(*) as cnt FROM event GROUP BY label ORDER BY cnt DESC LIMIT 100",
+        )?;
         let label_counts: Vec<(String, i64)> = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(stmt);
         drop(conn);
 
+        let per_label = limit_per_label.clamp(1, 100);
         let mut out = Vec::new();
         for (label, count) in label_counts {
             let events = self.query_events(&EventFilter {
                 labels: Some(vec![label]),
-                limit: Some(limit_per_label.max(1)),
+                limit: Some(per_label),
                 ..Default::default()
             })?;
             for mut ev in events {
@@ -1811,7 +2058,7 @@ impl NinjaDatabase {
     }
 
     pub fn query_events_summary(&self) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT camera, label, sub_label, zones, start_time FROM event ORDER BY start_time DESC LIMIT 5000",
         )?;
@@ -1855,20 +2102,46 @@ impl NinjaDatabase {
         before: f64,
         allowed_cameras: Option<&[String]>,
     ) -> Result<Value> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !after.is_finite() || !before.is_finite() {
+            return Ok(json!({
+                "window": {
+                    "after": 0.0,
+                    "before": 0.0
+                },
+                "total_events": 0,
+                "counts_by_camera": {},
+                "counts_by_label": {},
+                "counts_by_zone": {},
+                "counts_by_severity": {},
+                "hourly_histogram": {},
+                "unreviewed_alerts": []
+            }));
+        }
+        let conn = self.lock_conn();
+        let mut bind_vals: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Real(after),
+            rusqlite::types::Value::Real(before),
+        ];
+        let mut cam_placeholders = Vec::new();
+        let mut cams_empty = false;
+        if let Some(cams) = allowed_cameras {
+            if cams.is_empty() {
+                cams_empty = true;
+            } else {
+                for c in cams {
+                    bind_vals.push(rusqlite::types::Value::Text(c.clone()));
+                    cam_placeholders.push(format!("?{}", bind_vals.len()));
+                }
+            }
+        }
+
         let mut ev_sql = String::from(
             "SELECT id, camera, label, zones, start_time, top_score FROM event WHERE start_time >= ?1 AND start_time <= ?2",
         );
-        if let Some(cams) = allowed_cameras {
-            let list: Vec<String> = cams
-                .iter()
-                .map(|c| format!("'{}'", c.replace('\'', "")))
-                .collect();
-            if list.is_empty() {
-                ev_sql.push_str(" AND 1=0");
-            } else {
-                ev_sql.push_str(&format!(" AND camera IN ({})", list.join(",")));
-            }
+        if cams_empty {
+            ev_sql.push_str(" AND 1=0");
+        } else if !cam_placeholders.is_empty() {
+            ev_sql.push_str(&format!(" AND camera IN ({})", cam_placeholders.join(",")));
         }
         ev_sql.push_str(" ORDER BY start_time DESC LIMIT 5000");
 
@@ -1880,7 +2153,7 @@ impl NinjaDatabase {
 
         {
             let mut stmt = conn.prepare(&ev_sql)?;
-            let rows = stmt.query_map(params![after, before], |r| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |r| {
                 let cam: String = r.get(1)?;
                 let label: String = r.get(2)?;
                 let zones_raw: Option<String> = r.get(3).ok();
@@ -1916,16 +2189,13 @@ impl NinjaDatabase {
             WHERE r.start_time >= ?1 AND r.start_time <= ?2
             "#,
         );
-        if let Some(cams) = allowed_cameras {
-            let list: Vec<String> = cams
-                .iter()
-                .map(|c| format!("'{}'", c.replace('\'', "")))
-                .collect();
-            if list.is_empty() {
-                rev_sql.push_str(" AND 1=0");
-            } else {
-                rev_sql.push_str(&format!(" AND r.camera IN ({})", list.join(",")));
-            }
+        if cams_empty {
+            rev_sql.push_str(" AND 1=0");
+        } else if !cam_placeholders.is_empty() {
+            rev_sql.push_str(&format!(
+                " AND r.camera IN ({})",
+                cam_placeholders.join(",")
+            ));
         }
         rev_sql.push_str(" GROUP BY r.id ORDER BY r.start_time DESC LIMIT 1000");
 
@@ -1933,7 +2203,7 @@ impl NinjaDatabase {
         let mut unreviewed_alerts = Vec::new();
         {
             let mut stmt = conn.prepare(&rev_sql)?;
-            let rows = stmt.query_map(params![after, before], |r| {
+            let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |r| {
                 let id: String = r.get(0)?;
                 let cam: String = r.get(1)?;
                 let start_time = value_to_f64(&r.get_ref(2)?).unwrap_or(0.0);
@@ -2002,7 +2272,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_event(&self, id: &str) -> Result<Option<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let row = conn
             .query_row(
                 r#"
@@ -2026,7 +2296,8 @@ impl NinjaDatabase {
                         .get::<_, Option<f64>>(16)
                         .ok()
                         .flatten()
-                        .or_else(|| data_json.get("sub_label_score").and_then(|v| v.as_f64()));
+                        .or_else(|| data_json.get("sub_label_score").and_then(|v| v.as_f64()))
+                        .filter(|v| v.is_finite());
                     if let Some(sc) = sub_label_score_col
                         && let Some(obj) = data_json.as_object_mut()
                     {
@@ -2050,7 +2321,7 @@ impl NinjaDatabase {
                         "retain_indefinitely": row.get::<_, i64>(9).unwrap_or(0) != 0,
                         "sub_label": sub_label_col,
                         "sub_label_score": sub_label_score_col,
-                        "top_score": row.get::<_, Option<f64>>(11).ok().flatten(),
+                        "top_score": row.get::<_, Option<f64>>(11).ok().flatten().filter(|v| v.is_finite()),
                         "false_positive": row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v != 0),
                         "box": parse_json_or(box_raw, Value::Null),
                         "stationary": is_stationary,
@@ -2078,7 +2349,7 @@ impl NinjaDatabase {
     }
 
     pub fn set_event_retain(&self, id: &str, retain: bool) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let val = if retain { 1 } else { 0 };
         Ok(conn.execute(
             "UPDATE event SET retain_indefinitely = ?1 WHERE id = ?2",
@@ -2087,17 +2358,28 @@ impl NinjaDatabase {
     }
 
     pub fn set_event_false_positive(&self, id: &str, fp: bool) -> Result<usize> {
-        let ev_opt = self.get_event(id)?;
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
         let val = if fp { 1 } else { 0 };
-        let updated = conn.execute(
+        let updated = tx.execute(
             "UPDATE event SET false_positive = ?1 WHERE id = ?2",
             params![val, id],
         )?;
-        if fp {
-            if let Some(ev) = ev_opt {
-                let camera = ev["camera"].as_str().unwrap_or_default().to_string();
-                let label = ev["label"].as_str().unwrap_or_default().to_string();
+        if fp && updated > 0 {
+            let row_opt: Option<(String, String, Option<String>, Option<String>)> = tx
+                .query_row(
+                    "SELECT camera, label, box, data FROM event WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2).ok(), r.get(3).ok())),
+                )
+                .optional()?;
+            if let Some((camera, label, box_raw, data_raw)) = row_opt {
+                let ev = json!({
+                    "camera": camera,
+                    "label": label,
+                    "box": parse_json_or(box_raw, Value::Null),
+                    "data": parse_json_or(data_raw, json!({})),
+                });
                 let [nx1, ny1, nx2, ny2] = extract_norm_box_from_event(&ev);
                 let dhash64 = extract_dhash64_from_value(&ev["data"]["dhash64"]);
                 let dominant_color = ev["data"]["attributes"]
@@ -2112,13 +2394,24 @@ impl NinjaDatabase {
                     .map(String::from);
                 let now = Utc::now().timestamp_millis() as f64 / 1000.0;
                 if !camera.is_empty() && !label.is_empty() {
-                    conn.execute(
+                    tx.execute(
                         r#"
-                        INSERT OR REPLACE INTO false_positive_signature (
+                        INSERT INTO false_positive_signature (
                             camera, label, norm_x1, norm_y1, norm_x2, norm_y2,
                             dhash64, dominant_color, hit_count, source_event_id,
                             reason, created_at, last_seen_at
                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?11)
+                        ON CONFLICT(source_event_id) DO UPDATE SET
+                            camera = excluded.camera,
+                            label = excluded.label,
+                            norm_x1 = excluded.norm_x1,
+                            norm_y1 = excluded.norm_y1,
+                            norm_x2 = excluded.norm_x2,
+                            norm_y2 = excluded.norm_y2,
+                            dhash64 = excluded.dhash64,
+                            dominant_color = excluded.dominant_color,
+                            reason = excluded.reason,
+                            last_seen_at = excluded.last_seen_at
                         "#,
                         params![
                             camera,
@@ -2136,28 +2429,41 @@ impl NinjaDatabase {
                     )?;
                 }
             }
-        } else {
-            conn.execute(
+        } else if !fp {
+            tx.execute(
                 "DELETE FROM false_positive_signature WHERE source_event_id = ?1",
                 params![id],
             )?;
         }
+        tx.commit()?;
         Ok(updated)
     }
 
     pub fn set_event_ai_verification(&self, id: &str, verification: &Value) -> Result<usize> {
-        let Some(mut ev) = self.get_event(id)? else {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let Some(data_raw): Option<Option<String>> = tx
+            .query_row("SELECT data FROM event WHERE id = ?1", params![id], |r| {
+                Ok(r.get(0).ok())
+            })
+            .optional()?
+        else {
             return Ok(0);
         };
-        if let Some(data_obj) = ev["data"].as_object_mut() {
+        let mut data_val = parse_json_or(data_raw, json!({}));
+        if !data_val.is_object() {
+            data_val = json!({});
+        }
+        if let Some(data_obj) = data_val.as_object_mut() {
             data_obj.insert("ai_verification".to_string(), verification.clone());
         }
-        let data_str = serde_json::to_string(&ev["data"])?;
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        Ok(conn.execute(
+        let data_str = serde_json::to_string(&data_val)?;
+        let updated = tx.execute(
             "UPDATE event SET data = ?1 WHERE id = ?2",
             params![data_str, id],
-        )?)
+        )?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     /// Matches `(camera, label)` against active `false_positive_signature` rows where normalized
@@ -2170,7 +2476,10 @@ impl NinjaDatabase {
         norm_box: [f64; 4],
         dhash64: Option<u64>,
     ) -> Result<Option<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !norm_box.iter().all(|v| v.is_finite()) {
+            return Ok(None);
+        }
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT
@@ -2242,7 +2551,7 @@ impl NinjaDatabase {
         drop(stmt);
 
         if let Some((row, iou, hamming)) = matched {
-            let new_hits = row.9 + 1;
+            let new_hits = row.9.max(0).saturating_add(1);
             let now = Utc::now().timestamp_millis() as f64 / 1000.0;
             conn.execute(
                 "UPDATE false_positive_signature SET hit_count = ?2, last_seen_at = ?3 WHERE id = ?1",
@@ -2273,7 +2582,7 @@ impl NinjaDatabase {
     }
 
     pub fn list_false_positive_signatures(&self, camera: Option<&str>) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let filter_cam = camera.filter(|c| !c.is_empty() && *c != "all");
         let sql = if filter_cam.is_some() {
             r#"
@@ -2284,6 +2593,7 @@ impl NinjaDatabase {
             FROM false_positive_signature
             WHERE camera = ?1
             ORDER BY last_seen_at DESC, id DESC
+            LIMIT 5000
             "#
         } else {
             r#"
@@ -2293,6 +2603,7 @@ impl NinjaDatabase {
                 reason, created_at, last_seen_at
             FROM false_positive_signature
             ORDER BY last_seen_at DESC, id DESC
+            LIMIT 5000
             "#
         };
         let mut stmt = conn.prepare(sql)?;
@@ -2336,8 +2647,9 @@ impl NinjaDatabase {
     }
 
     pub fn delete_false_positive_signature(&self, id: i64) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let src_ev: Option<String> = conn
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let src_ev: Option<String> = tx
             .query_row(
                 "SELECT source_event_id FROM false_positive_signature WHERE id = ?1",
                 params![id],
@@ -2345,16 +2657,17 @@ impl NinjaDatabase {
             )
             .optional()?
             .flatten();
-        let deleted = conn.execute(
+        let deleted = tx.execute(
             "DELETE FROM false_positive_signature WHERE id = ?1",
             params![id],
         )?;
         if let Some(ev_id) = src_ev {
-            let _ = conn.execute(
+            tx.execute(
                 "UPDATE event SET false_positive = 0 WHERE id = ?1",
                 params![ev_id],
-            );
+            )?;
         }
+        tx.commit()?;
         Ok(deleted)
     }
 
@@ -2362,15 +2675,15 @@ impl NinjaDatabase {
         self.set_event_sub_label_with_score(id, sub_label, None)
     }
 
-    pub fn set_event_sub_label_with_score(
-        &self,
+    fn set_event_sub_label_with_score_in_tx(
+        tx: &Connection,
         id: &str,
         sub_label: Option<&str>,
         score: Option<f64>,
     ) -> Result<usize> {
         let normalized_sub = sub_label.map(str::trim).filter(|s| !s.is_empty());
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let prev_sub_label: Option<String> = conn
+        let finite_score = score.filter(|v| v.is_finite());
+        let prev_sub_label: Option<String> = tx
             .query_row(
                 "SELECT sub_label FROM event WHERE id = ?1",
                 params![id],
@@ -2378,24 +2691,25 @@ impl NinjaDatabase {
             )
             .optional()?
             .flatten();
-        let updated = match (normalized_sub, score) {
-            (Some(sl), Some(sc)) => conn.execute(
-                "UPDATE event SET sub_label = ?1, sub_label_score = ?2, data = json_set(COALESCE(data, '{}'), '$.sub_label', ?1, '$.sub_label_score', ?2) WHERE id = ?3",
+        let updated = match (normalized_sub, finite_score) {
+            (Some(sl), Some(sc)) => tx.execute(
+                "UPDATE event SET sub_label = ?1, sub_label_score = ?2, data = json_set(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.sub_label', ?1, '$.sub_label_score', ?2) WHERE id = ?3",
                 params![sl, sc, id],
             )?,
-            (Some(sl), None) => conn.execute(
-                "UPDATE event SET sub_label = ?1, data = json_set(COALESCE(data, '{}'), '$.sub_label', ?1) WHERE id = ?2",
+            (Some(sl), None) => tx.execute(
+                "UPDATE event SET sub_label = ?1, data = json_set(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.sub_label', ?1) WHERE id = ?2",
                 params![sl, id],
             )?,
-            (None, _) => conn.execute(
-                "UPDATE event SET sub_label = NULL, sub_label_score = NULL, data = json_remove(COALESCE(data, '{}'), '$.sub_label', '$.sub_label_score') WHERE id = ?1",
+            (None, _) => tx.execute(
+                "UPDATE event SET sub_label = NULL, sub_label_score = NULL, data = json_remove(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.sub_label', '$.sub_label_score') WHERE id = ?1",
                 params![id],
             )?,
         };
 
         // Propagate sub_label & sub_label_score to any reviewsegment referencing this event ID
-        let like_pattern = format!("%\"{}\"%", id.replace('"', ""));
-        let mut stmt = conn.prepare("SELECT id, data FROM reviewsegment WHERE data LIKE ?1")?;
+        let like_pattern = format!("%\"{}\"%", escape_sql_like(&id.replace('"', "")));
+        let mut stmt =
+            tx.prepare("SELECT id, data FROM reviewsegment WHERE data LIKE ?1 ESCAPE '\\'")?;
         let rev_rows: Vec<(String, String)> = stmt
             .query_map(params![like_pattern], |r| {
                 Ok((
@@ -2444,7 +2758,7 @@ impl NinjaDatabase {
                         .iter()
                         .filter(|d| d.as_str() != id)
                         .any(|sibling_id| {
-                            conn.query_row(
+                            tx.query_row(
                                 "SELECT sub_label FROM event WHERE id = ?1",
                                 params![sibling_id],
                                 |r| r.get::<_, Option<String>>(0),
@@ -2466,7 +2780,7 @@ impl NinjaDatabase {
                     sub_labels.push(sl.to_string());
                 }
                 obj.insert("sub_labels".to_string(), json!(sub_labels));
-                if let Some(sc) = score {
+                if let Some(sc) = finite_score {
                     obj.insert("sub_label_score".to_string(), json!(sc));
                 }
             } else {
@@ -2476,18 +2790,31 @@ impl NinjaDatabase {
                 }
             }
             if let Ok(new_data) = serde_json::to_string(&data_val) {
-                let _ = conn.execute(
+                tx.execute(
                     "UPDATE reviewsegment SET data = ?1 WHERE id = ?2",
                     params![new_data, rev_id],
-                );
+                )?;
             }
         }
 
         Ok(updated)
     }
 
+    pub fn set_event_sub_label_with_score(
+        &self,
+        id: &str,
+        sub_label: Option<&str>,
+        score: Option<f64>,
+    ) -> Result<usize> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let updated = Self::set_event_sub_label_with_score_in_tx(&tx, id, sub_label, score)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     pub fn list_distinct_sub_labels(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT sub_label FROM event WHERE sub_label IS NOT NULL AND TRIM(sub_label) != '' ORDER BY sub_label ASC",
         )?;
@@ -2508,12 +2835,13 @@ impl NinjaDatabase {
             return Ok(0);
         }
 
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
         let matching_event_ids: Vec<String> = {
-            let conn = self.conn.lock().expect("db mutex poisoned");
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT id FROM event
                  WHERE LOWER(TRIM(COALESCE(sub_label, ''))) = LOWER(TRIM(?1))
-                    OR LOWER(TRIM(COALESCE(json_extract(data, '$.sub_label'), ''))) = LOWER(TRIM(?1))",
+                    OR LOWER(TRIM(COALESCE(json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.sub_label'), ''))) = LOWER(TRIM(?1))",
             )?;
             let rows = stmt.query_map(params![clean], |r| r.get::<_, String>(0))?;
             rows.flatten().collect()
@@ -2521,15 +2849,18 @@ impl NinjaDatabase {
 
         let mut cleared_events = 0usize;
         for ev_id in &matching_event_ids {
-            cleared_events += self.set_event_sub_label_with_score(ev_id, None, None)?;
+            cleared_events += Self::set_event_sub_label_with_score_in_tx(&tx, ev_id, None, None)?;
         }
 
         // Also scrub any reviewsegment rows whose `data.sub_labels` still contains `clean` case-insensitively
         {
-            let conn = self.conn.lock().expect("db mutex poisoned");
-            let like_pattern = format!("%{}%", clean.to_lowercase().replace('"', ""));
-            let mut stmt =
-                conn.prepare("SELECT id, data FROM reviewsegment WHERE LOWER(data) LIKE ?1")?;
+            let like_pattern = format!(
+                "%{}%",
+                escape_sql_like(&clean.to_lowercase().replace('"', ""))
+            );
+            let mut stmt = tx.prepare(
+                "SELECT id, data FROM reviewsegment WHERE LOWER(data) LIKE ?1 ESCAPE '\\'",
+            )?;
             let rev_rows: Vec<(String, String)> = stmt
                 .query_map(params![like_pattern], |r| {
                     Ok((
@@ -2561,46 +2892,56 @@ impl NinjaDatabase {
                     }
                     obj.insert("sub_labels".to_string(), json!(filtered));
                     if let Ok(new_data) = serde_json::to_string(&data_val) {
-                        let _ = conn.execute(
+                        tx.execute(
                             "UPDATE reviewsegment SET data = ?1 WHERE id = ?2",
                             params![new_data, rev_id],
-                        );
+                        )?;
                     }
                 }
             }
         }
 
+        tx.commit()?;
         Ok(cleared_events)
     }
 
     pub fn set_event_description(&self, id: &str, description: &str) -> Result<usize> {
-        let Some(mut ev) = self.get_event(id)? else {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let Some(data_raw): Option<Option<String>> = tx
+            .query_row("SELECT data FROM event WHERE id = ?1", params![id], |r| {
+                Ok(r.get(0).ok())
+            })
+            .optional()?
+        else {
             return Ok(0);
         };
-        if let Some(data_obj) = ev["data"].as_object_mut() {
+        let mut data_val = parse_json_or(data_raw, json!({}));
+        if !data_val.is_object() {
+            data_val = json!({});
+        }
+        if let Some(data_obj) = data_val.as_object_mut() {
             data_obj.insert("description".to_string(), json!(description));
         }
-        let data_str = serde_json::to_string(&ev["data"])?;
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        Ok(conn.execute(
+        let data_str = serde_json::to_string(&data_val)?;
+        let updated = tx.execute(
             "UPDATE event SET data = ?1 WHERE id = ?2",
             params![data_str, id],
-        )?)
+        )?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     pub fn set_event_notes(&self, id: &str, notes: &str) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         Ok(conn.execute(
-            "UPDATE event SET data = json_set(COALESCE(data, '{}'), '$.notes', ?1) WHERE id = ?2",
+            "UPDATE event SET data = json_set(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.notes', ?1) WHERE id = ?2",
             params![notes, id],
         )?)
     }
 
     /// Manually sets or clears `data.recognized_license_plate` on an event (normalizing alphanumeric uppercase).
     pub fn set_event_license_plate(&self, id: &str, plate: Option<&str>) -> Result<usize> {
-        let Some(mut ev) = self.get_event(id)? else {
-            return Ok(0);
-        };
         let normalized: Option<String> = plate
             .map(|p| {
                 p.chars()
@@ -2610,10 +2951,21 @@ impl NinjaDatabase {
             })
             .filter(|s| !s.is_empty());
 
-        if !ev["data"].is_object() {
-            ev["data"] = json!({});
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let Some(data_raw): Option<Option<String>> = tx
+            .query_row("SELECT data FROM event WHERE id = ?1", params![id], |r| {
+                Ok(r.get(0).ok())
+            })
+            .optional()?
+        else {
+            return Ok(0);
+        };
+        let mut data_val = parse_json_or(data_raw, json!({}));
+        if !data_val.is_object() {
+            data_val = json!({});
         }
-        if let Some(data_obj) = ev["data"].as_object_mut() {
+        if let Some(data_obj) = data_val.as_object_mut() {
             match normalized {
                 Some(ref norm_plate) => {
                     data_obj.insert("recognized_license_plate".to_string(), json!(norm_plate));
@@ -2632,17 +2984,18 @@ impl NinjaDatabase {
                 }
             }
         }
-        let data_str = serde_json::to_string(&ev["data"])?;
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        Ok(conn.execute(
+        let data_str = serde_json::to_string(&data_val)?;
+        let updated = tx.execute(
             "UPDATE event SET data = ?1 WHERE id = ?2",
             params![data_str, id],
-        )?)
+        )?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     /// Returns a sorted list of distinct non-empty `recognized_license_plate` values stored in `event.data`.
     pub fn query_recognized_license_plates(&self) -> Result<Vec<String>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT data FROM event WHERE data LIKE '%recognized_license_plate%' ORDER BY start_time DESC LIMIT 5000",
         )?;
@@ -2667,9 +3020,9 @@ impl NinjaDatabase {
     }
 
     pub fn set_review_notes(&self, id: &str, notes: &str) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         Ok(conn.execute(
-            "UPDATE reviewsegment SET data = json_set(COALESCE(data, '{}'), '$.notes', ?1) WHERE id = ?2",
+            "UPDATE reviewsegment SET data = json_set(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.notes', ?1) WHERE id = ?2",
             params![notes, id],
         )?)
     }
@@ -2677,14 +3030,14 @@ impl NinjaDatabase {
     /// Executes SQLite query-planner optimization and bounded WAL checkpointing (`PRAGMA optimize`
     /// and `PRAGMA wal_checkpoint(TRUNCATE)`).
     pub fn run_maintenance(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 
     /// Returns total event counts grouped by `(camera, label)` for Prometheus `/api/metrics`.
     pub fn query_event_counts_by_camera_and_label(&self) -> Result<Vec<(String, String, i64)>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             "SELECT camera, label, COUNT(*) FROM event GROUP BY camera, label ORDER BY camera, label",
         )?;
@@ -2703,7 +3056,8 @@ impl NinjaDatabase {
     }
 
     pub fn upsert_event(&self, ev: &EventDto) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
         let zones_str = serde_json::to_string(&ev.zones)?;
         let box_str = ev
             .box_coords
@@ -2725,7 +3079,7 @@ impl NinjaDatabase {
             {
                 obj.insert("stationary".to_string(), json!(true));
             }
-            if let Ok(Some(existing_raw)) = conn
+            if let Ok(Some(existing_raw)) = tx
                 .query_row(
                     "SELECT data FROM event WHERE id = ?1",
                     params![ev.id],
@@ -2742,6 +3096,8 @@ impl NinjaDatabase {
                     "notes",
                     "sub_label",
                     "sub_label_score",
+                    "recognized_license_plate",
+                    "attributes",
                 ] {
                     if obj.get(preserved_key).is_none_or(Value::is_null)
                         && let Some(prev_val) = prev_obj.get(preserved_key)
@@ -2753,9 +3109,12 @@ impl NinjaDatabase {
             }
         }
         let data_str = serde_json::to_string(&merged_data)?;
-        let sub_label_score = merged_data.get("sub_label_score").and_then(|v| v.as_f64());
+        let sub_label_score = merged_data
+            .get("sub_label_score")
+            .and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite());
 
-        conn.execute(
+        tx.execute(
             r#"
             INSERT INTO event (
                 id, label, camera, start_time, end_time, top_score, false_positive,
@@ -2804,21 +3163,30 @@ impl NinjaDatabase {
                 ev.score.map(|s| s as f64)
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_event(&self, id: &str) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let count = conn.execute("DELETE FROM event WHERE id = ?1", params![id])?;
         Ok(count)
     }
 
     pub fn delete_events_bulk(&self, ids: &[String]) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut count = 0;
-        for id in ids {
-            count += conn.execute("DELETE FROM event WHERE id = ?1", params![id])?;
+        if ids.is_empty() {
+            return Ok(0);
         }
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let mut count = 0;
+        {
+            let mut stmt = tx.prepare("DELETE FROM event WHERE id = ?1")?;
+            for id in ids {
+                count += stmt.execute(params![id])?;
+            }
+        }
+        tx.commit()?;
         Ok(count)
     }
 
@@ -2828,7 +3196,10 @@ impl NinjaDatabase {
         after: f64,
         before: f64,
     ) -> Result<Vec<RecordingRow>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !after.is_finite() || !before.is_finite() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT
@@ -2838,12 +3209,15 @@ impl NinjaDatabase {
             FROM recordings
             WHERE camera = ?1 AND end_time >= ?2 AND start_time <= ?3
             ORDER BY start_time ASC
+            LIMIT 50000
             "#,
         )?;
 
         let rows = stmt.query_map(params![camera, after, before], |r| {
             let start_time = value_to_f64(&r.get_ref(3)?).unwrap_or(0.0);
             let end_time = value_to_f64(&r.get_ref(4)?).unwrap_or(0.0);
+            let duration = value_to_f64(&r.get_ref(5)?).unwrap_or(0.0);
+            let segment_size = value_to_f64(&r.get_ref(9)?).unwrap_or(0.0);
             let hm_raw: Option<String> = r.get(11).ok();
             let motion_heatmap = hm_raw.and_then(|s| serde_json::from_str(&s).ok());
             Ok(RecordingRow {
@@ -2852,11 +3226,11 @@ impl NinjaDatabase {
                 path: r.get(2)?,
                 start_time,
                 end_time,
-                duration: r.get(5)?,
+                duration,
                 motion: r.get(6)?,
                 objects: r.get(7)?,
                 dbfs: r.get(8)?,
-                segment_size: r.get(9)?,
+                segment_size,
                 regions: r.get(10)?,
                 motion_heatmap,
             })
@@ -2870,7 +3244,7 @@ impl NinjaDatabase {
     }
 
     pub fn query_all_recordings_summary(&self) -> Result<Value> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let cutoff = (Utc::now().timestamp() - 86400 * 60) as f64;
         let mut stmt = conn.prepare(
             "SELECT DISTINCT CAST(start_time / 86400 AS INTEGER) * 86400 FROM recordings WHERE start_time >= ?1 ORDER BY start_time DESC",
@@ -2887,7 +3261,7 @@ impl NinjaDatabase {
     }
 
     pub fn query_recordings_storage_usage(&self) -> Result<Value> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let cutoff = (Utc::now().timestamp() - 86400) as f64;
         let mut stmt = conn.prepare(
             r#"
@@ -2904,27 +3278,53 @@ impl NinjaDatabase {
         let rows = stmt.query_map(params![cutoff], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, f64>(1)?,
-                r.get::<_, f64>(2)?,
-                r.get::<_, f64>(3)?,
-                r.get::<_, f64>(4)?,
+                r.get::<_, f64>(1).unwrap_or(0.0),
+                r.get::<_, f64>(2).unwrap_or(0.0),
+                r.get::<_, f64>(3).unwrap_or(0.0),
+                r.get::<_, f64>(4).unwrap_or(0.0),
             ))
         })?;
 
         let mut out = serde_json::Map::new();
         for r in rows {
-            let (cam, total_mb, dur_s, rolling_24h_mb, rolling_24h_dur_s) = r?;
-            let bw_mb_hr = if rolling_24h_dur_s > 0.0 {
+            let (cam, raw_total_mb, raw_dur_s, raw_24h_mb, raw_24h_dur_s) = r?;
+            let total_mb = if raw_total_mb.is_finite() && raw_total_mb > 0.0 {
+                raw_total_mb
+            } else {
+                0.0
+            };
+            let dur_s = if raw_dur_s.is_finite() && raw_dur_s > 0.0 {
+                raw_dur_s
+            } else {
+                0.0
+            };
+            let rolling_24h_mb = if raw_24h_mb.is_finite() && raw_24h_mb > 0.0 {
+                raw_24h_mb
+            } else {
+                0.0
+            };
+            let rolling_24h_dur_s = if raw_24h_dur_s.is_finite() && raw_24h_dur_s > 0.0 {
+                raw_24h_dur_s
+            } else {
+                0.0
+            };
+            let raw_bw = if rolling_24h_dur_s > 0.0 {
                 (rolling_24h_mb / (rolling_24h_dur_s / 3600.0) * 100.0).round() / 100.0
             } else if dur_s > 0.0 {
                 (total_mb / (dur_s / 3600.0) * 100.0).round() / 100.0
             } else {
                 0.0
             };
+            let bw_mb_hr = if raw_bw.is_finite() && raw_bw > 0.0 {
+                raw_bw
+            } else {
+                0.0
+            };
+            let usage_rounded = (total_mb * 100.0).round() / 100.0;
             out.insert(
                 cam,
                 json!({
-                    "usage": (total_mb * 100.0).round() / 100.0,
+                    "usage": if usage_rounded.is_finite() { usage_rounded } else { 0.0 },
                     "usage_percent": 0.0,
                     "bandwidth": bw_mb_hr
                 }),
@@ -2939,29 +3339,37 @@ impl NinjaDatabase {
         after: f64,
         before: f64,
     ) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !after.is_finite() || !before.is_finite() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn();
+        let mut bind_vals: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Real(after),
+            rusqlite::types::Value::Real(before),
+        ];
         let mut cam_clause = String::new();
         if let Some(cams) = cameras
             && !cams.is_empty()
             && !cams.iter().any(|c| c == "all")
         {
-            let list: Vec<String> = cams
-                .iter()
-                .map(|c| format!("'{}'", c.replace('\'', "")))
-                .collect();
-            cam_clause = format!(" AND camera IN ({})", list.join(","));
+            let mut placeholders = Vec::with_capacity(cams.len());
+            for c in cams {
+                bind_vals.push(rusqlite::types::Value::Text(c.clone()));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            cam_clause = format!(" AND camera IN ({})", placeholders.join(","));
         }
         let sql = format!(
             r#"
             SELECT start_time, COALESCE(motion, 0), camera
             FROM recordings
-            WHERE end_time >= {after} AND start_time <= {before} {cam_clause}
+            WHERE end_time >= ?1 AND start_time <= ?2 {cam_clause}
             ORDER BY start_time ASC
             LIMIT 2000
             "#
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |r| {
             Ok(json!({
                 "start_time": value_to_f64(&r.get_ref(0)?).unwrap_or(0.0),
                 "motion": r.get::<_, i64>(1).unwrap_or(0),
@@ -2976,7 +3384,7 @@ impl NinjaDatabase {
     }
 
     pub fn query_recordings_summary(&self, camera: &str) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let cutoff = (Utc::now().timestamp() - 86400 * 30) as f64;
         let mut stmt = conn.prepare(
             r#"
@@ -2989,7 +3397,7 @@ impl NinjaDatabase {
         let rows = stmt.query_map(params![camera, cutoff], |r| {
             Ok((
                 value_to_f64(&r.get_ref(0)?).unwrap_or(0.0),
-                r.get::<_, f64>(1).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(1)?).unwrap_or(0.0),
                 r.get::<_, i64>(2).unwrap_or(0),
                 r.get::<_, i64>(3).unwrap_or(0),
                 r.get::<_, i64>(4).unwrap_or(0),
@@ -3009,16 +3417,29 @@ impl NinjaDatabase {
         let mut day_hours: BTreeMap<String, BTreeMap<String, HourAgg>> = BTreeMap::new();
 
         for r in rows {
-            let (ts, dur, motion, objs, dbfs) = r?;
+            let (ts, raw_dur, motion, objs, dbfs) = r?;
+            if !ts.is_finite() {
+                continue;
+            }
+            let dur = if raw_dur.is_finite() && raw_dur > 0.0 {
+                raw_dur
+            } else {
+                0.0
+            };
             if let Some(dt) = Local.timestamp_opt(ts as i64, 0).single() {
                 let day = dt.format("%Y-%m-%d").to_string();
                 let hour = dt.format("%H").to_string();
                 let seg_start = ts as i64;
-                let seg_end = (ts + dur).ceil() as i64;
+                let seg_end_f = (ts + dur).ceil();
+                let seg_end = if seg_end_f.is_finite() {
+                    seg_end_f as i64
+                } else {
+                    seg_start
+                };
                 let h = day_hours.entry(day).or_default().entry(hour).or_default();
                 h.duration += dur;
-                h.motion += motion;
-                h.objects += objs;
+                h.motion = h.motion.saturating_add(motion.max(0));
+                h.objects = h.objects.saturating_add(objs.max(0));
                 if dbfs != 0 && (h.dbfs == 0 || dbfs > h.dbfs) {
                     h.dbfs = dbfs;
                 }
@@ -3041,13 +3462,16 @@ impl NinjaDatabase {
         })?;
         for r in ev_rows {
             let ts = r?;
+            if !ts.is_finite() {
+                continue;
+            }
             if let Some(dt) = Local.timestamp_opt(ts as i64, 0).single() {
                 let day = dt.format("%Y-%m-%d").to_string();
                 let hour = dt.format("%H").to_string();
                 if let Some(hours_map) = day_hours.get_mut(&day)
                     && let Some(h) = hours_map.get_mut(&hour)
                 {
-                    h.events += 1;
+                    h.events = h.events.saturating_add(1);
                 }
             }
         }
@@ -3061,10 +3485,14 @@ impl NinjaDatabase {
             let mut day_end = 0i64;
             let mut hours_vec = Vec::new();
             for (hour, agg) in hours_map.into_iter().rev() {
-                total_events += agg.events;
-                total_motion += agg.motion;
-                let dur_i64 = agg.duration.round() as i64;
-                total_duration += dur_i64;
+                total_events = total_events.saturating_add(agg.events);
+                total_motion = total_motion.saturating_add(agg.motion);
+                let dur_i64 = if agg.duration.is_finite() && agg.duration > 0.0 {
+                    agg.duration.round() as i64
+                } else {
+                    0
+                };
+                total_duration = total_duration.saturating_add(dur_i64);
                 if agg.start_ts > 0 && agg.start_ts < day_start {
                     day_start = agg.start_ts;
                 }
@@ -3097,7 +3525,7 @@ impl NinjaDatabase {
     }
 
     pub fn insert_recording(&self, rec: &RecordingRow) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let hm_str = rec
             .motion_heatmap
             .as_ref()
@@ -3159,14 +3587,23 @@ impl NinjaDatabase {
         pre_capture_sec: f64,
         post_capture_sec: f64,
     ) -> Result<Vec<String>> {
+        if !continuous_before_ts.is_finite()
+            || !motion_before_ts.is_finite()
+            || !event_before_ts.is_finite()
+            || !pre_capture_sec.is_finite()
+            || !post_capture_sec.is_finite()
+        {
+            return Ok(Vec::new());
+        }
         let max_cutoff_ts = continuous_before_ts
             .max(motion_before_ts)
             .max(event_before_ts);
-        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
         let mut ids = Vec::new();
         let mut paths = Vec::new();
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 r#"
                 SELECT r.id, r.path
                 FROM recordings r
@@ -3234,15 +3671,12 @@ impl NinjaDatabase {
         }
 
         if !ids.is_empty() {
-            let tx = conn.transaction()?;
-            {
-                let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1")?;
-                for id in &ids {
-                    del_stmt.execute(params![id])?;
-                }
+            let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1")?;
+            for id in &ids {
+                del_stmt.execute(params![id])?;
             }
-            tx.commit()?;
         }
+        tx.commit()?;
         Ok(paths)
     }
 
@@ -3255,7 +3689,15 @@ impl NinjaDatabase {
         post_capture_sec: f64,
         limit: usize,
     ) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if limit == 0
+            || !before_ts.is_finite()
+            || !pre_capture_sec.is_finite()
+            || !post_capture_sec.is_finite()
+        {
+            return Ok(Vec::new());
+        }
+        let capped_limit = limit.min(10_000) as i64;
+        let conn = self.lock_conn();
         let sql = if idle_only {
             r#"
             SELECT r.id, r.path
@@ -3301,7 +3743,7 @@ impl NinjaDatabase {
                 before_ts,
                 pre_capture_sec,
                 post_capture_sec,
-                limit as i64
+                capped_limit
             ],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )?;
@@ -3313,10 +3755,15 @@ impl NinjaDatabase {
     }
 
     pub fn update_recording_compacted(&self, id: &str, new_size_mb: f64) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let safe_size = if new_size_mb.is_finite() && new_size_mb >= 0.0 {
+            new_size_mb
+        } else {
+            0.0
+        };
+        let conn = self.lock_conn();
         conn.execute(
             "UPDATE recordings SET segment_size = ?2, stream_tier = 'compacted' WHERE id = ?1",
-            params![id, new_size_mb],
+            params![id, safe_size],
         )?;
         Ok(())
     }
@@ -3329,7 +3776,10 @@ impl NinjaDatabase {
         after: f64,
         before: f64,
     ) -> Result<Vec<(String, String, f64)>> {
-        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        if !after.is_finite() || !before.is_finite() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         let mut matched = Vec::new();
         {
@@ -3366,28 +3816,40 @@ impl NinjaDatabase {
     where
         F: Fn(&str) -> bool,
     {
-        let mut conn = self.conn.lock().expect("db mutex poisoned");
-        let tx = conn.transaction()?;
-        let mut orphan_ids = Vec::new();
-        {
-            let mut stmt = tx.prepare("SELECT id, path FROM recordings")?;
+        let candidates: Vec<(String, String)> = {
+            let conn = self.lock_conn();
+            let mut stmt = conn.prepare("SELECT id, path FROM recordings")?;
             let rows =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut list = Vec::new();
             for r in rows {
-                let (id, path) = r?;
-                if !file_exists(&path) {
-                    orphan_ids.push(id);
-                }
+                list.push(r?);
+            }
+            list
+        };
+
+        let mut orphan_entries = Vec::new();
+        for (id, path) in candidates {
+            if !file_exists(&path) {
+                orphan_entries.push((id, path));
             }
         }
-        if !orphan_ids.is_empty() {
-            let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1")?;
-            for id in &orphan_ids {
-                del_stmt.execute(params![id])?;
+
+        if orphan_entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let mut deleted = 0usize;
+        {
+            let mut del_stmt = tx.prepare("DELETE FROM recordings WHERE id = ?1 AND path = ?2")?;
+            for (id, path) in &orphan_entries {
+                deleted += del_stmt.execute(params![id, path])?;
             }
         }
         tx.commit()?;
-        Ok(orphan_ids.len())
+        Ok(deleted)
     }
 
     /// Lists up to `limit` recording segments with `start_time < before_ts` whose `path` matches `hot_prefix_like`
@@ -3398,7 +3860,11 @@ impl NinjaDatabase {
         hot_prefix_like: &str,
         limit: usize,
     ) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if limit == 0 || !before_ts.is_finite() {
+            return Ok(Vec::new());
+        }
+        let capped_limit = limit.min(10_000) as i64;
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, path
@@ -3408,7 +3874,7 @@ impl NinjaDatabase {
             LIMIT ?3
             "#,
         )?;
-        let rows = stmt.query_map(params![before_ts, hot_prefix_like, limit as i64], |r| {
+        let rows = stmt.query_map(params![before_ts, hot_prefix_like, capped_limit], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         let mut out = Vec::new();
@@ -3420,7 +3886,7 @@ impl NinjaDatabase {
 
     /// Updates `recordings.path` atomically after migrating a segment file to the cold archive tier.
     pub fn update_recording_path(&self, id: &str, new_path: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let rows = conn.execute(
             "UPDATE recordings SET path = ?2 WHERE id = ?1",
             params![id, new_path],
@@ -3435,17 +3901,22 @@ impl NinjaDatabase {
         camera: &str,
         max_size_mb: f64,
     ) -> Result<Vec<String>> {
-        let mut conn = self.conn.lock().expect("db mutex poisoned");
-        let total_mb: f64 = conn.query_row(
-            "SELECT COALESCE(SUM(segment_size), 0.0) FROM recordings WHERE camera = ?1",
-            params![camera],
-            |r| r.get(0),
-        )?;
-        if total_mb <= max_size_mb {
+        if !max_size_mb.is_finite() || max_size_mb <= 0.0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let total_mb: f64 = tx
+            .query_row(
+                "SELECT COALESCE(SUM(MAX(COALESCE(segment_size, 0.0), 0.0)), 0.0) FROM recordings WHERE camera = ?1",
+                params![camera],
+                |r| r.get(0),
+            )
+            .unwrap_or(0.0);
+        if !total_mb.is_finite() || total_mb <= max_size_mb {
             return Ok(Vec::new());
         }
         let excess_mb = total_mb - max_size_mb;
-        let tx = conn.transaction()?;
         let mut to_delete = Vec::new();
         let mut accumulated_mb = 0.0;
         {
@@ -3473,8 +3944,13 @@ impl NinjaDatabase {
             })?;
             for r in rows {
                 let (id, path, sz) = r?;
+                let safe_sz = if sz.is_finite() && sz > 0.0 {
+                    sz
+                } else {
+                    0.001
+                };
                 to_delete.push((id, path));
-                accumulated_mb += sz.max(0.001);
+                accumulated_mb += safe_sz.max(0.001);
                 if accumulated_mb >= excess_mb {
                     break;
                 }
@@ -3493,22 +3969,22 @@ impl NinjaDatabase {
     }
 
     pub fn delete_global_recordings_over_quota_mb(&self, max_size_mb: f64) -> Result<Vec<String>> {
-        if max_size_mb <= 0.0 {
+        if !max_size_mb.is_finite() || max_size_mb <= 0.0 {
             return Ok(Vec::new());
         }
-        let mut conn = self.conn.lock().expect("db mutex poisoned");
-        let total_mb: f64 = conn
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let total_mb: f64 = tx
             .query_row(
-                "SELECT COALESCE(SUM(segment_size), 0.0) FROM recordings",
+                "SELECT COALESCE(SUM(MAX(COALESCE(segment_size, 0.0), 0.0)), 0.0) FROM recordings",
                 [],
                 |r| r.get(0),
             )
             .unwrap_or(0.0);
-        if total_mb <= max_size_mb {
+        if !total_mb.is_finite() || total_mb <= max_size_mb {
             return Ok(Vec::new());
         }
         let excess_mb = total_mb - max_size_mb;
-        let tx = conn.transaction()?;
         let mut to_delete = Vec::new();
         let mut accumulated_mb = 0.0;
         {
@@ -3535,8 +4011,13 @@ impl NinjaDatabase {
             })?;
             for r in rows {
                 let (id, path, sz) = r?;
+                let safe_sz = if sz.is_finite() && sz > 0.0 {
+                    sz
+                } else {
+                    0.001
+                };
                 to_delete.push((id, path));
-                accumulated_mb += sz.max(0.001);
+                accumulated_mb += safe_sz.max(0.001);
                 if accumulated_mb >= excess_mb {
                     break;
                 }
@@ -3560,34 +4041,42 @@ impl NinjaDatabase {
         source_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn();
         let mut sql = String::from(
             "SELECT timestamp, camera, source, source_id, class_type, data FROM timeline WHERE 1=1",
         );
+        let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(cam) = camera
             && !cam.is_empty()
             && cam != "all"
         {
-            sql.push_str(&format!(" AND camera = '{}'", cam.replace('\'', "")));
+            bind_vals.push(rusqlite::types::Value::Text(cam.to_string()));
+            sql.push_str(&format!(" AND camera = ?{}", bind_vals.len()));
         }
         if let Some(sid) = source_id
             && !sid.is_empty()
         {
-            let ids: Vec<String> = sid
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("'{}'", s.replace('\'', "")))
-                .collect();
-            if !ids.is_empty() {
-                sql.push_str(&format!(" AND source_id IN ({})", ids.join(",")));
+            let mut placeholders = Vec::new();
+            for s in sid.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                bind_vals.push(rusqlite::types::Value::Text(s.to_string()));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            if !placeholders.is_empty() {
+                sql.push_str(&format!(" AND source_id IN ({})", placeholders.join(",")));
             }
         }
-        let lim = limit.min(1000);
-        sql.push_str(&format!(" ORDER BY timestamp ASC LIMIT {lim}"));
+        let lim = limit.min(1000) as i64;
+        bind_vals.push(rusqlite::types::Value::Integer(lim));
+        sql.push_str(&format!(
+            " ORDER BY timestamp ASC LIMIT ?{}",
+            bind_vals.len()
+        ));
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |r| {
             let ts = value_to_f64(&r.get_ref(0)?).unwrap_or(0.0);
             let data_raw: Option<String> = r.get(5).ok();
             Ok(json!({
@@ -3615,7 +4104,7 @@ impl NinjaDatabase {
         class_type: &str,
         data: &Value,
     ) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let data_str = serde_json::to_string(data)?;
         conn.execute(
             r#"
@@ -3628,9 +4117,9 @@ impl NinjaDatabase {
     }
 
     pub fn query_exports(&self) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, camera, name, date, video_path, thumb_path, in_progress, export_case_id FROM export ORDER BY date DESC",
+            "SELECT id, camera, name, date, video_path, thumb_path, in_progress, export_case_id FROM export ORDER BY date DESC LIMIT 5000",
         )?;
         let rows = stmt.query_map([], |r| {
             let date = value_to_f64(&r.get_ref(3)?).unwrap_or(0.0);
@@ -3657,7 +4146,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_export(&self, id: &str) -> Result<Option<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let row = conn
             .query_row(
                 "SELECT id, camera, name, date, video_path, thumb_path, in_progress, export_case_id FROM export WHERE id = ?1",
@@ -3691,11 +4180,11 @@ impl NinjaDatabase {
             "target_id": r.get::<_, String>(2)?,
             "camera": r.get::<_, Option<String>>(3).ok().flatten(),
             "created_by": r.get::<_, String>(4)?,
-            "created_at": r.get::<_, f64>(5).unwrap_or(0.0),
-            "expires_at": r.get::<_, f64>(6).unwrap_or(0.0),
-            "revoked": r.get::<_, i64>(7).unwrap_or(0) != 0,
+            "created_at": value_to_f64(&r.get_ref(5)?).unwrap_or(0.0),
+            "expires_at": value_to_f64(&r.get_ref(6)?).unwrap_or(0.0),
+            "revoked": r.get::<_, i64>(7).unwrap_or(1) != 0,
             "access_count": r.get::<_, i64>(8).unwrap_or(0),
-            "last_accessed_at": r.get::<_, Option<f64>>(9).ok().flatten(),
+            "last_accessed_at": value_to_f64(&r.get_ref(9)?),
             "max_views": r.get::<_, Option<i64>>(10).ok().flatten(),
         }))
     }
@@ -3728,8 +4217,11 @@ impl NinjaDatabase {
         expires_at: f64,
         max_views: Option<u64>,
     ) -> Result<Value> {
+        if !created_at.is_finite() || !expires_at.is_finite() {
+            anyhow::bail!("Share link timestamps must be finite");
+        }
         let max_views_i64 = max_views.map(|v| v.min(i64::MAX as u64) as i64);
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         conn.execute(
             r#"
             INSERT OR REPLACE INTO share_link (
@@ -3764,7 +4256,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_share_link(&self, id: &str) -> Result<Option<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let row = conn
             .query_row(
                 r#"
@@ -3781,7 +4273,7 @@ impl NinjaDatabase {
     }
 
     pub fn list_share_links(&self) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT id, kind, target_id, camera, created_by, created_at, expires_at,
@@ -3800,7 +4292,10 @@ impl NinjaDatabase {
     }
 
     pub fn record_share_link_access(&self, id: &str, accessed_at: f64) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !accessed_at.is_finite() {
+            return Ok(false);
+        }
+        let conn = self.lock_conn();
         let updated = conn.execute(
             r#"
             UPDATE share_link
@@ -3817,7 +4312,10 @@ impl NinjaDatabase {
     }
 
     pub fn touch_share_link_last_accessed(&self, id: &str, accessed_at: f64) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !accessed_at.is_finite() {
+            return Ok(false);
+        }
+        let conn = self.lock_conn();
         let updated = conn.execute(
             r#"
             UPDATE share_link
@@ -3833,7 +4331,10 @@ impl NinjaDatabase {
     }
 
     pub fn prune_expired_share_links(&self, before_ts: f64) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !before_ts.is_finite() {
+            return Ok(0);
+        }
+        let conn = self.lock_conn();
         let deleted = conn.execute(
             "DELETE FROM share_link WHERE expires_at <= ?1",
             params![before_ts],
@@ -3845,7 +4346,10 @@ impl NinjaDatabase {
         &self,
         before_ts: f64,
     ) -> Result<Vec<String>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !before_ts.is_finite() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT DISTINCT target_id
@@ -3853,6 +4357,7 @@ impl NinjaDatabase {
             WHERE expires_at <= ?1
                OR revoked != 0
                OR (max_views IS NOT NULL AND access_count >= max_views)
+            LIMIT 5000
             "#,
         )?;
         let rows = stmt.query_map(params![before_ts], |r| r.get::<_, String>(0))?;
@@ -3864,7 +4369,10 @@ impl NinjaDatabase {
     }
 
     pub fn has_active_share_links_for_target(&self, target_id: &str, now_ts: f64) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !now_ts.is_finite() {
+            return Ok(false);
+        }
+        let conn = self.lock_conn();
         let count: i64 = conn.query_row(
             r#"
             SELECT COUNT(*)
@@ -3886,7 +4394,10 @@ impl NinjaDatabase {
         now_ts: f64,
         grace_sec: f64,
     ) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !now_ts.is_finite() || !grace_sec.is_finite() || grace_sec <= 0.0 {
+            return Ok(false);
+        }
+        let conn = self.lock_conn();
         let count: i64 = conn.query_row(
             r#"
             SELECT COUNT(*)
@@ -3904,7 +4415,7 @@ impl NinjaDatabase {
     }
 
     pub fn revoke_share_link(&self, id: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let updated = conn.execute(
             "UPDATE share_link SET revoked = 1 WHERE id = ?1",
             params![id],
@@ -3917,7 +4428,7 @@ impl NinjaDatabase {
         kind: Option<&str>,
         target_id: &str,
     ) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let updated = match kind {
             Some(k) => conn.execute(
                 "UPDATE share_link SET revoked = 1 WHERE kind = ?1 AND target_id = ?2",
@@ -3934,7 +4445,7 @@ impl NinjaDatabase {
     pub fn revoke_share_links_by_creator(&self, created_by: &str) -> Result<usize> {
         let trimmed = created_by.trim();
         let ext_creator = format!("ext:{trimmed}");
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let updated = conn.execute(
             "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 OR created_by = ?2",
             params![trimmed, ext_creator],
@@ -3943,7 +4454,7 @@ impl NinjaDatabase {
     }
 
     pub fn is_share_link_revoked(&self, id: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let revoked: Option<i64> = conn
             .query_row(
                 "SELECT revoked FROM share_link WHERE id = ?1",
@@ -3955,19 +4466,24 @@ impl NinjaDatabase {
     }
 
     pub fn is_share_link_active(&self, id: &str, now_ts: f64) -> Result<bool> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let row: Option<(i64, f64)> = conn
+        if !now_ts.is_finite() {
+            return Ok(false);
+        }
+        let conn = self.lock_conn();
+        let row: Option<(i64, Option<f64>)> = conn
             .query_row(
                 "SELECT revoked, expires_at FROM share_link WHERE id = ?1",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, value_to_f64(&r.get_ref(1)?))),
             )
             .optional()?;
-        Ok(row.is_some_and(|(revoked, expires_at)| revoked == 0 && expires_at > now_ts))
+        Ok(row.is_some_and(|(revoked, expires_at)| {
+            revoked == 0 && expires_at.is_some_and(|exp| exp > now_ts)
+        }))
     }
 
     pub fn insert_export(&self, exp: &ExportRow) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         conn.execute(
             r#"
             INSERT INTO export (id, camera, name, date, video_path, thumb_path, in_progress)
@@ -3991,7 +4507,7 @@ impl NinjaDatabase {
     }
 
     pub fn rename_export(&self, id: &str, new_name: &str) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         Ok(conn.execute(
             "UPDATE export SET name = ?1 WHERE id = ?2",
             params![new_name, id],
@@ -3999,8 +4515,9 @@ impl NinjaDatabase {
     }
 
     pub fn delete_export(&self, id: &str) -> Result<Option<(String, String)>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let paths: Option<(String, String)> = conn
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let paths: Option<(String, String)> = tx
             .query_row(
                 "SELECT video_path, thumb_path FROM export WHERE id = ?1",
                 params![id],
@@ -4008,18 +4525,33 @@ impl NinjaDatabase {
             )
             .optional()?;
         if paths.is_some() {
-            conn.execute("DELETE FROM export WHERE id = ?1", params![id])?;
+            tx.execute("DELETE FROM export WHERE id = ?1", params![id])?;
         }
+        tx.commit()?;
         Ok(paths)
     }
 
     pub fn delete_exports_bulk(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
         let mut deleted_paths = Vec::new();
-        for id in ids {
-            if let Some(paths) = self.delete_export(id)? {
-                deleted_paths.push(paths);
+        {
+            let mut sel = tx.prepare("SELECT video_path, thumb_path FROM export WHERE id = ?1")?;
+            let mut del = tx.prepare("DELETE FROM export WHERE id = ?1")?;
+            for id in ids {
+                let paths: Option<(String, String)> = sel
+                    .query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                if let Some(p) = paths {
+                    del.execute(params![id])?;
+                    deleted_paths.push(p);
+                }
             }
         }
+        tx.commit()?;
         Ok(deleted_paths)
     }
 
@@ -4034,7 +4566,7 @@ impl NinjaDatabase {
         let now = Utc::now().timestamp() as f64;
         let events_json = serde_json::to_string(event_ids)?;
         let exports_json = serde_json::to_string(export_ids)?;
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         conn.execute(
             r#"
             INSERT INTO exportcase (id, name, description, created_at, updated_at, event_ids, export_ids)
@@ -4060,9 +4592,9 @@ impl NinjaDatabase {
     }
 
     pub fn query_cases(&self) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, created_at, updated_at, COALESCE(event_ids, '[]'), COALESCE(export_ids, '[]') FROM exportcase ORDER BY created_at DESC",
+            "SELECT id, name, description, created_at, updated_at, COALESCE(event_ids, '[]'), COALESCE(export_ids, '[]') FROM exportcase ORDER BY created_at DESC LIMIT 1000",
         )?;
         let rows = stmt.query_map([], |r| {
             let ev_raw: Option<String> = r.get(5).ok();
@@ -4089,7 +4621,7 @@ impl NinjaDatabase {
     }
 
     pub fn get_case(&self, id: &str) -> Result<Option<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let row = conn
             .query_row(
                 "SELECT id, name, description, created_at, updated_at, COALESCE(event_ids, '[]'), COALESCE(export_ids, '[]') FROM exportcase WHERE id = ?1",
@@ -4113,13 +4645,17 @@ impl NinjaDatabase {
     }
 
     pub fn query_previews(&self, camera: &str, after: f64, before: f64) -> Result<Vec<Value>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !after.is_finite() || !before.is_finite() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             r#"
             SELECT camera, path, start_time, end_time, duration
             FROM previews
             WHERE (?1 = 'all' OR camera = ?1) AND end_time >= ?2 AND start_time <= ?3
             ORDER BY start_time ASC
+            LIMIT 10000
             "#,
         )?;
         let rows = stmt.query_map(params![camera, after, before], |r| {
@@ -4133,7 +4669,7 @@ impl NinjaDatabase {
                 "type": "video/mp4",
                 "start": value_to_f64(&r.get_ref(2)?).unwrap_or(0.0),
                 "end": value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
-                "duration": r.get::<_, f64>(4).unwrap_or(0.0)
+                "duration": value_to_f64(&r.get_ref(4)?).unwrap_or(0.0)
             }))
         })?;
         let mut out = Vec::new();
@@ -4152,7 +4688,7 @@ impl NinjaDatabase {
         end_time: f64,
         duration: f64,
     ) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         conn.execute(
             r#"
             INSERT INTO previews (id, camera, path, start_time, end_time, duration)
@@ -4169,7 +4705,7 @@ impl NinjaDatabase {
     }
 
     pub fn last_preview_end_time(&self, camera: &str) -> Result<Option<f64>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let val: Option<f64> = conn
             .query_row(
                 "SELECT MAX(end_time) FROM previews WHERE camera = ?1",
@@ -4187,7 +4723,11 @@ impl NinjaDatabase {
         alerts_before_ts: f64,
         detections_before_ts: f64,
     ) -> Result<Vec<String>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        if !alerts_before_ts.is_finite() || !detections_before_ts.is_finite() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
         let mut files_to_remove = Vec::new();
         let is_safe_id = |id: &str| -> bool {
             !id.is_empty()
@@ -4196,10 +4736,12 @@ impl NinjaDatabase {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
         };
+        let is_safe_path = |p: &str| -> bool { !p.is_empty() && !p.contains("..") };
+        let safe_camera = is_safe_id(camera);
 
         // 1. Expired review segments
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 r#"
                 SELECT id, thumb_path
                 FROM reviewsegment
@@ -4220,21 +4762,21 @@ impl NinjaDatabase {
             for r in rows {
                 let (id, thumb) = r?;
                 ids.push(id);
-                if !thumb.is_empty() {
+                if is_safe_path(&thumb) {
                     files_to_remove.push(thumb);
                 }
             }
             drop(stmt);
             for id in ids {
-                let _ = conn.execute(
+                tx.execute(
                     "DELETE FROM userreviewstatus WHERE review_segment_id = ?1",
                     params![id],
-                );
-                let _ = conn.execute("DELETE FROM reviewsegment WHERE id = ?1", params![id]);
-                let _ = conn.execute(
+                )?;
+                tx.execute("DELETE FROM reviewsegment WHERE id = ?1", params![id])?;
+                tx.execute(
                     "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
                     params![id],
-                );
+                )?;
                 if is_safe_id(&id) {
                     files_to_remove
                         .push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
@@ -4251,7 +4793,7 @@ impl NinjaDatabase {
         // 2. Expired events (excluding retain_indefinitely = 1), respecting alert vs detection cutoffs
         let min_cutoff = alerts_before_ts.min(detections_before_ts);
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 r#"
                 SELECT id
                 FROM event
@@ -4259,8 +4801,8 @@ impl NinjaDatabase {
                   AND retain_indefinitely = 0
                   AND end_time IS NOT NULL
                   AND (
-                    (COALESCE(json_extract(data, '$.max_severity'), 'alert') = 'alert' AND end_time < ?2)
-                    OR (COALESCE(json_extract(data, '$.max_severity'), 'alert') != 'alert' AND end_time < ?3)
+                    (COALESCE(json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.max_severity'), 'alert') = 'alert' AND end_time < ?2)
+                    OR (COALESCE(json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.max_severity'), 'alert') != 'alert' AND end_time < ?3)
                   )
                 LIMIT 500
                 "#,
@@ -4275,7 +4817,9 @@ impl NinjaDatabase {
             for id in ids {
                 if is_safe_id(&id) {
                     files_to_remove.push(format!("/media/ninjanvr/clips/{id}.jpg"));
-                    files_to_remove.push(format!("/media/ninjanvr/clips/{camera}-{id}.webp"));
+                    if safe_camera {
+                        files_to_remove.push(format!("/media/ninjanvr/clips/{camera}-{id}.webp"));
+                    }
                     files_to_remove
                         .push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
                     files_to_remove.push(format!(
@@ -4285,21 +4829,21 @@ impl NinjaDatabase {
                     files_to_remove.push(format!("/media/ninjanvr/clips/share_redacted_{id}.webp"));
                     files_to_remove.push(format!("/media/ninjanvr/clips/share_clip_{id}.webp"));
                 }
-                let _ = conn.execute(
+                tx.execute(
                     "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
                     params![id],
-                );
-                let _ = conn.execute("DELETE FROM event WHERE id = ?1", params![id]);
+                )?;
+                tx.execute("DELETE FROM event WHERE id = ?1", params![id])?;
             }
         }
 
         // 3. Expired timeline & previews
-        let _ = conn.execute(
+        tx.execute(
             "DELETE FROM timeline WHERE camera = ?1 AND timestamp < ?2",
             params![camera, min_cutoff],
-        );
+        )?;
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = tx.prepare(
                 "SELECT id, path FROM previews WHERE camera = ?1 AND end_time < ?2 LIMIT 200",
             )?;
             let rows = stmt.query_map(params![camera, min_cutoff], |r| {
@@ -4309,14 +4853,17 @@ impl NinjaDatabase {
             for r in rows {
                 let (pid, ppath) = r?;
                 pids.push(pid);
-                files_to_remove.push(ppath);
+                if is_safe_path(&ppath) {
+                    files_to_remove.push(ppath);
+                }
             }
             drop(stmt);
             for pid in pids {
-                let _ = conn.execute("DELETE FROM previews WHERE id = ?1", params![pid]);
+                tx.execute("DELETE FROM previews WHERE id = ?1", params![pid])?;
             }
         }
 
+        tx.commit()?;
         Ok(files_to_remove)
     }
 
@@ -4329,7 +4876,12 @@ impl NinjaDatabase {
         let annotations_json = serde_json::to_string(&sample.annotations)?;
         let verified_int = if sample.verified { 1 } else { 0 };
         let night_int = if sample.night_mode { 1 } else { 0 };
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let created_at = if sample.created_at.is_finite() {
+            sample.created_at
+        } else {
+            0.0
+        };
+        let conn = self.lock_conn();
         conn.execute(
             r#"
             INSERT INTO dataset_sample (
@@ -4360,11 +4912,12 @@ impl NinjaDatabase {
                 annotations_json,
                 verified_int,
                 night_int,
-                sample.created_at
+                created_at
             ],
         )?;
         let mut out = sample.clone();
         out.split = split;
+        out.created_at = created_at;
         Ok(out)
     }
 
@@ -4379,12 +4932,12 @@ impl NinjaDatabase {
             split: r.get(3)?,
             sample_kind: r.get(4)?,
             image_path: r.get(5)?,
-            width: r.get::<_, i64>(6)?.max(0) as u32,
-            height: r.get::<_, i64>(7)?.max(0) as u32,
+            width: r.get::<_, i64>(6)?.clamp(0, u32::MAX as i64) as u32,
+            height: r.get::<_, i64>(7)?.clamp(0, u32::MAX as i64) as u32,
             annotations,
             verified: r.get::<_, i64>(9)? != 0,
             night_mode: r.get::<_, i64>(10)? != 0,
-            created_at: r.get(11)?,
+            created_at: value_to_f64(&r.get_ref(11)?).unwrap_or(0.0),
         })
     }
 
@@ -4394,44 +4947,45 @@ impl NinjaDatabase {
         sample_kind: Option<&str>,
         verified: Option<bool>,
     ) -> Result<Vec<DatasetSampleDto>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(
+        let conn = self.lock_conn();
+        let mut sql = String::from(
             r#"
             SELECT
                 id, event_id, camera, split, sample_kind, image_path,
                 width, height, annotations, verified, night_mode, created_at
             FROM dataset_sample
-            ORDER BY created_at DESC, id DESC
+            WHERE 1=1
             "#,
+        );
+        let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(cam) = camera.filter(|c| !c.is_empty() && *c != "all") {
+            bind_vals.push(rusqlite::types::Value::Text(cam.to_string()));
+            sql.push_str(&format!(" AND camera = ?{}", bind_vals.len()));
+        }
+        if let Some(kind) = sample_kind.filter(|k| !k.is_empty() && *k != "all") {
+            bind_vals.push(rusqlite::types::Value::Text(kind.to_string()));
+            sql.push_str(&format!(" AND sample_kind = ?{}", bind_vals.len()));
+        }
+        if let Some(ver) = verified {
+            bind_vals.push(rusqlite::types::Value::Integer(if ver { 1 } else { 0 }));
+            sql.push_str(&format!(" AND verified = ?{}", bind_vals.len()));
+        }
+        sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT 10000");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(bind_vals.iter()),
+            Self::map_dataset_sample_row,
         )?;
-        let filter_cam = camera.filter(|c| !c.is_empty() && *c != "all");
-        let filter_kind = sample_kind.filter(|k| !k.is_empty() && *k != "all");
-        let rows = stmt.query_map([], Self::map_dataset_sample_row)?;
         let mut out = Vec::new();
         for row_res in rows {
-            let item = row_res?;
-            if let Some(cam) = filter_cam
-                && item.camera != cam
-            {
-                continue;
-            }
-            if let Some(kind) = filter_kind
-                && item.sample_kind != kind
-            {
-                continue;
-            }
-            if let Some(ver) = verified
-                && item.verified != ver
-            {
-                continue;
-            }
-            out.push(item);
+            out.push(row_res?);
         }
         Ok(out)
     }
 
     pub fn get_dataset_sample(&self, id: &str) -> Result<Option<DatasetSampleDto>> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         let sample = conn
             .query_row(
                 r#"
@@ -4456,7 +5010,22 @@ impl NinjaDatabase {
         verified: Option<bool>,
         split: Option<&str>,
     ) -> Result<Option<DatasetSampleDto>> {
-        let Some(mut current) = self.get_dataset_sample(id)? else {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let Some(mut current) = tx
+            .query_row(
+                r#"
+                SELECT
+                    id, event_id, camera, split, sample_kind, image_path,
+                    width, height, annotations, verified, night_mode, created_at
+                FROM dataset_sample
+                WHERE id = ?1
+                "#,
+                params![id],
+                Self::map_dataset_sample_row,
+            )
+            .optional()?
+        else {
             return Ok(None);
         };
         if let Some(anns) = annotations {
@@ -4477,8 +5046,7 @@ impl NinjaDatabase {
         }
         let annotations_json = serde_json::to_string(&current.annotations)?;
         let verified_int = if current.verified { 1 } else { 0 };
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
+        tx.execute(
             r#"
             UPDATE dataset_sample
             SET annotations = ?2, sample_kind = ?3, verified = ?4, split = ?5
@@ -4492,11 +5060,12 @@ impl NinjaDatabase {
                 current.split
             ],
         )?;
+        tx.commit()?;
         Ok(Some(current))
     }
 
     pub fn delete_dataset_sample(&self, id: &str) -> Result<usize> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
+        let conn = self.lock_conn();
         Ok(conn.execute("DELETE FROM dataset_sample WHERE id = ?1", params![id])?)
     }
 
@@ -7740,6 +8309,631 @@ mod tests {
         assert!(db.get_review_by_id("../rev_traversal").unwrap().is_none());
         assert!(db.is_share_link_revoked("sl_ev_../ev_traversal").unwrap());
         assert!(db.is_share_link_revoked("sl_rev_../rev_traversal").unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn audit_p0_01_pbkdf2_zero_and_extreme_iterations_and_salt_sanitization_work() {
+        // 1. Zero-iteration PBKDF2 hash string must never verify against any password
+        let zero_iter_hash =
+            "pbkdf2_sha256$0$e1c16db9bfff2200$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        assert!(!verify_password("any-password", zero_iter_hash));
+        assert!(!verify_password("", zero_iter_hash));
+
+        // Sub-minimum (< 1000) and excessive (> 10_000_000) iterations are rejected immediately
+        assert!(!verify_password(
+            "pass",
+            "pbkdf2_sha256$999$e1c16db9bfff2200$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        ));
+        assert!(!verify_password(
+            "pass",
+            "pbkdf2_sha256$10000001$e1c16db9bfff2200$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        ));
+        assert!(!verify_password(
+            "pass",
+            "pbkdf2_sha256$4294967295$e1c16db9bfff2200$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        ));
+
+        // 2. hash_password(0) clamps to MIN_PBKDF2_ITERATIONS (1000) and sanitizes invalid salts
+        let clamped = hash_password("Secret!2026", Some("salthex"), 0);
+        assert!(clamped.starts_with("pbkdf2_sha256$1000$salthex$"));
+        assert!(verify_password("Secret!2026", &clamped));
+        assert!(!verify_password("Wrong!2026", &clamped));
+
+        let sanitized_dollar = hash_password("Secret!2026", Some("bad$salt"), 1000);
+        assert_eq!(sanitized_dollar.split('$').count(), 4);
+        assert!(verify_password("Secret!2026", &sanitized_dollar));
+
+        let sanitized_empty = hash_password("Secret!2026", Some(""), 1000);
+        assert!(verify_password("Secret!2026", &sanitized_empty));
+
+        // 3. ensure_default_admin(0) clamps iterations and restores admin role/wildcard cameras
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_audit_p0_01_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+        db.execute_batch(
+            "INSERT INTO user (username, role, allowed_cameras, password_hash, notification_tokens)
+             VALUES ('admin', 'viewer', 'front_door', '', '[]');",
+        )
+        .unwrap();
+        let gen_pw = db.ensure_default_admin(0).unwrap().unwrap();
+        let admin = db.get_user("  admin  ").unwrap().unwrap();
+        assert_eq!(admin.role, "admin");
+        assert_eq!(admin.allowed_cameras, "*");
+        assert!(admin.password_hash.starts_with("pbkdf2_sha256$1000$"));
+        assert!(verify_password(&gen_pw, &admin.password_hash));
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn audit_p0_02_api_token_and_share_link_nan_inf_and_corrupted_column_fail_closed() {
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_audit_p0_02_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. create_api_token rejects NaN, Infinity, zero, and negative expires_at
+        for bad_exp in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -100.0] {
+            assert!(
+                db.create_api_token("nan_tok", "full", Some(bad_exp))
+                    .is_err(),
+                "create_api_token must reject non-finite or non-positive expires_at={bad_exp}"
+            );
+        }
+
+        let (meta, plain) = db
+            .create_api_token("exp_tok", "full", Some(2000.0))
+            .unwrap();
+        let tok_id = meta["id"].as_str().unwrap().to_string();
+
+        // 2. verify_api_token and is_api_token_active_by_name reject non-finite now_ts
+        for bad_now in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(db.verify_api_token(&plain, bad_now).unwrap().is_none());
+            assert!(!db.is_api_token_active_by_name("exp_tok", bad_now).unwrap());
+        }
+
+        // Corrupted expires_at text or invalid scope in api_token fails closed
+        db.execute_batch(&format!(
+            "UPDATE api_token SET expires_at = 'not_a_timestamp' WHERE id = '{tok_id}';"
+        ))
+        .unwrap();
+        assert!(db.verify_api_token(&plain, 1000.0).unwrap().is_none());
+
+        db.execute_batch(&format!(
+            "UPDATE api_token SET expires_at = 5000.0, scope = 'invalid_root' WHERE id = '{tok_id}';"
+        ))
+        .unwrap();
+        assert!(db.verify_api_token(&plain, 1000.0).unwrap().is_none());
+
+        // 3. Share link non-finite timestamps and corrupted revoked column fail closed
+        assert!(
+            db.insert_share_link("sl_nan", "event", "ev_1", None, "admin", f64::NAN, 2000.0)
+                .is_err()
+        );
+        assert!(
+            db.insert_share_link(
+                "sl_inf",
+                "event",
+                "ev_1",
+                None,
+                "admin",
+                1000.0,
+                f64::INFINITY
+            )
+            .is_err()
+        );
+
+        db.insert_share_link_with_options(
+            "sl_ok",
+            "event",
+            "ev_1",
+            Some("front_door"),
+            "admin",
+            1000.0,
+            2000.0,
+            Some(5),
+        )
+        .unwrap();
+        assert!(db.record_share_link_access("sl_ok", 1500.0).unwrap());
+
+        for bad_ts in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!db.is_share_link_active("sl_ok", bad_ts).unwrap());
+            assert!(
+                !db.has_active_share_links_for_target("ev_1", bad_ts)
+                    .unwrap()
+            );
+            assert!(
+                !db.has_recently_accessed_share_links_for_target("ev_1", bad_ts, 900.0)
+                    .unwrap()
+            );
+            assert!(
+                !db.has_recently_accessed_share_links_for_target("ev_1", 1600.0, bad_ts)
+                    .unwrap()
+            );
+            assert!(!db.record_share_link_access("sl_ok", bad_ts).unwrap());
+            assert!(!db.touch_share_link_last_accessed("sl_ok", bad_ts).unwrap());
+        }
+
+        // Corrupting share_link.revoked to non-integer text defaults to revoked=true in map_share_link_row
+        db.execute_batch("UPDATE share_link SET revoked = 'corrupted' WHERE id = 'sl_ok';")
+            .unwrap();
+        let row = db.get_share_link("sl_ok").unwrap().unwrap();
+        assert_eq!(row["revoked"], true);
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn audit_p0_03_user_deletion_and_admin_to_operator_demotion_cascade_share_links() {
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_audit_p0_03_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        db.create_user_with_cameras("root_admin", "StrongPass!1", "admin", "*", 1000)
+            .unwrap();
+        db.create_user_with_cameras("scoped_admin", "StrongPass!2", "admin", "front_door", 1000)
+            .unwrap();
+        db.create_user_with_cameras("temp_operator", "StrongPass!3", "operator", "*", 1000)
+            .unwrap();
+
+        // 1. Demoting scoped_admin (allowed_cameras="front_door") from admin to operator
+        //    revokes backyard and NULL-camera links while preserving front_door link
+        db.insert_share_link(
+            "sl_sa_fd",
+            "event",
+            "ev_1",
+            Some("front_door"),
+            "scoped_admin",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_sa_by",
+            "event",
+            "ev_2",
+            Some("backyard"),
+            "scoped_admin",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_sa_ext_null",
+            "export",
+            "exp_1",
+            None,
+            "ext:scoped_admin",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+
+        assert!(db.update_user_role("scoped_admin", "operator").unwrap());
+        assert!(!db.is_share_link_revoked("sl_sa_fd").unwrap());
+        assert!(db.is_share_link_revoked("sl_sa_by").unwrap());
+        assert!(db.is_share_link_revoked("sl_sa_ext_null").unwrap());
+
+        // 2. Deleting a user atomically revokes both `<user>` and `ext:<user>` share links
+        db.insert_share_link(
+            "sl_del_u1",
+            "event",
+            "ev_1",
+            Some("front_door"),
+            "temp_operator",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        db.insert_share_link(
+            "sl_del_u1_ext",
+            "event",
+            "ev_2",
+            Some("front_door"),
+            "ext:temp_operator",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+
+        assert!(db.delete_user("temp_operator").unwrap());
+        assert!(db.is_share_link_revoked("sl_del_u1").unwrap());
+        assert!(db.is_share_link_revoked("sl_del_u1_ext").unwrap());
+        assert!(!db.is_share_link_revoked("sl_sa_fd").unwrap());
+
+        // 3. create_api_token prevents creating a token whose name collides with an existing token's id
+        let (tok_meta, _) = db.create_api_token("bot_one", "read_only", None).unwrap();
+        let tok_id = tok_meta["id"].as_str().unwrap();
+        assert!(db.create_api_token(tok_id, "full", None).is_err());
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn audit_p0_04_quota_and_retention_reject_nan_inf_and_unsafe_camera_paths() {
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_audit_p0_04_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        db.insert_recording(&RecordingRow {
+            id: "rec_keep_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/front_door/rec_keep_1.mp4".to_string(),
+            start_time: 1000.0,
+            end_time: 1010.0,
+            duration: 10.0,
+            motion: 0,
+            objects: 0,
+            dbfs: 0,
+            segment_size: 25.0,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        // 1. Quota eviction with 0.0, negative, NaN, or Infinity must never wipe recordings
+        for bad_quota in [0.0, -10.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                db.delete_recordings_over_quota_mb("front_door", bad_quota)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                db.delete_global_recordings_over_quota_mb(bad_quota)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        // 2. Retention cleanup with NaN or Infinity cutoff timestamps must not wipe live recordings
+        for bad_cutoff in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                db.delete_expired_recordings_with_window(
+                    "front_door",
+                    bad_cutoff,
+                    bad_cutoff,
+                    bad_cutoff,
+                    5.0,
+                    5.0
+                )
+                .unwrap()
+                .is_empty()
+            );
+            assert!(
+                db.delete_expired_idle_main_recordings("front_door", bad_cutoff)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                db.cleanup_expired_events_and_reviews("front_door", bad_cutoff, bad_cutoff)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            db.query_recordings("front_door", 900.0, 1100.0)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 3. cleanup_expired_events_and_reviews filters unsafe camera and traversal thumb_path/preview paths
+        db.upsert_event(&EventDto {
+            id: "ev_cam_trav".to_string(),
+            camera: "../bad_cam".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 100.0,
+            end_time: Some(110.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.9),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"max_severity": "alert"}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.9),
+            stationary: false,
+        })
+        .unwrap();
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_thumb_trav".to_string(),
+            camera: "../bad_cam".to_string(),
+            start_time: 100.0,
+            end_time: Some(110.0),
+            severity: "alert".to_string(),
+            thumb_path: "/media/ninjanvr/clips/../../etc/passwd".to_string(),
+            data: json!({}),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        let removed = db
+            .cleanup_expired_events_and_reviews("../bad_cam", 500.0, 500.0)
+            .unwrap();
+        assert!(!removed.iter().any(|p| p.contains("..")));
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn audit_p1_01_parameterized_queries_like_escaping_and_zero_limit_work() {
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_audit_p1_01_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. Sub-labels and camera filters with single quotes work accurately and safely
+        db.upsert_event(&EventDto {
+            id: "ev_quote_1".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!(["porch"]),
+            start_time: 1000.0,
+            end_time: Some(1005.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: Some("O'Connor".to_string()),
+            top_score: Some(0.92),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.92),
+            stationary: false,
+        })
+        .unwrap();
+
+        let matched_quote = db
+            .query_events(&EventFilter {
+                sub_labels: Some(vec!["O'Connor".to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(matched_quote.len(), 1);
+        assert_eq!(matched_quote[0]["id"], "ev_quote_1");
+
+        let sqli_attempt = db
+            .query_events(&EventFilter {
+                sub_labels: Some(vec!["' OR 1=1 --".to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(sqli_attempt.is_empty());
+
+        // limit: Some(0) returns empty Vec and NaN bounds return empty Vec without SQL error
+        assert!(
+            db.query_events(&EventFilter {
+                limit: Some(0),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            db.query_events(&EventFilter {
+                before: Some(f64::NAN),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+        );
+
+        // 2. get_review_by_event_id escapes LIKE wildcards (%, _) and checks data.detections
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_real".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            severity: "alert".to_string(),
+            thumb_path: "/clips/rev_real.webp".to_string(),
+            data: json!({
+                "detections": ["ev_1_1"],
+                "objects": ["person"]
+            }),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_newer_false_match".to_string(),
+            camera: "backyard".to_string(),
+            start_time: 2000.0,
+            end_time: Some(2010.0),
+            severity: "alert".to_string(),
+            thumb_path: "/clips/rev_newer.webp".to_string(),
+            data: json!({
+                "detections": ["ev_1X1"],
+                "notes": "unrelated to \"ev_1_1\""
+            }),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        assert!(db.get_review_by_event_id("%").unwrap().is_none());
+        assert!(db.get_review_by_event_id("___").unwrap().is_none());
+        let found = db.get_review_by_event_id("ev_1_1").unwrap().unwrap();
+        assert_eq!(found.id, "rev_real");
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn audit_p1_02_corrupted_json_resilience_and_upsert_event_plate_preservation() {
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_audit_p1_02_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. Seed an event and reviewsegment with corrupted non-JSON `data`
+        db.upsert_event(&EventDto {
+            id: "ev_corrupt".to_string(),
+            camera: "front_door".to_string(),
+            label: "car".to_string(),
+            zones: json!([]),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: Some("Erik".to_string()),
+            top_score: Some(0.9),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.9),
+            stationary: false,
+        })
+        .unwrap();
+        db.execute_batch("UPDATE event SET data = '{corrupted_json' WHERE id = 'ev_corrupt';")
+            .unwrap();
+
+        // Mutations and retention cleanup must not fail with SQLite `malformed JSON`
+        assert_eq!(
+            db.set_event_notes("ev_corrupt", "repaired note").unwrap(),
+            1
+        );
+        assert_eq!(
+            db.set_event_sub_label_with_score("ev_corrupt", Some("Erik"), Some(0.95))
+                .unwrap(),
+            1
+        );
+        db.execute_batch("UPDATE event SET data = '' WHERE id = 'ev_corrupt';")
+            .unwrap();
+        assert_eq!(db.clear_face_profile_sub_labels("Erik").unwrap(), 1);
+
+        // 2. upsert_event preserves recognized_license_plate and attributes across track updates
+        let mut ev_plate = EventDto {
+            id: "ev_plate_track".to_string(),
+            camera: "front_door".to_string(),
+            label: "car".to_string(),
+            zones: json!(["driveway"]),
+            start_time: 3000.0,
+            end_time: None,
+            has_clip: false,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.93),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"attributes": ["color:silver"]}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.93),
+            stationary: false,
+        };
+        db.upsert_event(&ev_plate).unwrap();
+        db.set_event_license_plate("ev_plate_track", Some("xyz-9876"))
+            .unwrap();
+
+        // Track ends with a fresh data payload lacking recognized_license_plate
+        ev_plate.end_time = Some(3012.0);
+        ev_plate.data = json!({"type": "object"});
+        db.upsert_event(&ev_plate).unwrap();
+
+        let fetched = db.get_event("ev_plate_track").unwrap().unwrap();
+        assert_eq!(fetched["data"]["recognized_license_plate"], "XYZ9876");
+
+        // 3. cleanup_expired_events_and_reviews succeeds even when event.data is malformed JSON
+        db.execute_batch("UPDATE event SET data = '{bad_json' WHERE id = 'ev_corrupt';")
+            .unwrap();
+        let cleaned = db
+            .cleanup_expired_events_and_reviews("front_door", 2000.0, 2000.0)
+            .unwrap();
+        assert!(!cleaned.is_empty());
+        assert!(db.get_event("ev_corrupt").unwrap().is_none());
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn audit_p1_03_mutex_poison_recovery_callback_lock_safety_and_overflow_guards() {
+        let tmp =
+            std::env::temp_dir().join(format!("ninjanvr_audit_p1_03_{}.db", rand::random::<u32>()));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. Poisoning the internal mutex on another thread does not brick NinjaDatabase
+        let db_clone = db.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = db_clone.conn.lock().unwrap();
+            panic!("simulated thread panic while holding db lock");
+        })
+        .join();
+        assert!(db.list_users().is_ok());
+
+        // 2. prune_missing_recording_files releases the DB lock before invoking file_exists,
+        //    so calling a DB read method inside file_exists does not deadlock
+        db.insert_recording(&RecordingRow {
+            id: "rec_cb_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/front_door/rec_cb_1.mp4".to_string(),
+            start_time: 1000.0,
+            end_time: 1010.0,
+            duration: 10.0,
+            motion: 0,
+            objects: 0,
+            dbfs: 0,
+            segment_size: 1.0,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+        let pruned = db
+            .prune_missing_recording_files(|_path| {
+                let _ = db.list_users().unwrap();
+                false
+            })
+            .unwrap();
+        assert_eq!(pruned, 1);
+
+        // 3. compute_norm_box_iou and match_false_positive_signature handle NaN/Inf and i64::MAX hit_count safely
+        assert_eq!(
+            compute_norm_box_iou([f64::NAN, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]),
+            0.0
+        );
+        assert_eq!(
+            compute_norm_box_iou(
+                [f64::NEG_INFINITY, 0.0, f64::INFINITY, 1.0],
+                [0.0, 0.0, 1.0, 1.0]
+            ),
+            0.0
+        );
+
+        db.execute_batch(&format!(
+            "INSERT INTO false_positive_signature (
+                camera, label, norm_x1, norm_y1, norm_x2, norm_y2,
+                dhash64, dominant_color, hit_count, source_event_id,
+                reason, created_at, last_seen_at
+            ) VALUES ('front_door', 'person', 0.1, 0.1, 0.5, 0.5, NULL, NULL, {}, 'ev_max', NULL, 1000.0, 1000.0);",
+            i64::MAX
+        ))
+        .unwrap();
+        let matched = db
+            .match_false_positive_signature("front_door", "person", [0.1, 0.1, 0.5, 0.5], None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched["hit_count"], i64::MAX);
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);
