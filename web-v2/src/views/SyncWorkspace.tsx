@@ -1,13 +1,65 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Sparkles } from "lucide-react";
 import { useI18n } from "../i18n";
-import { useNvrStore } from "../store/useNvrStore";
+import { resolveRealCameraSource, useNvrStore } from "../store/useNvrStore";
 import { RecordingSegment, ReviewItem } from "../types/nvr";
 import { formatDateTime, formatTs } from "../utils/format";
 import { VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 
 export const MAX_SYNC_QUAD_SLOTS = 4;
+export const SYNC_SEEK_DEBOUNCE_MS = 120;
+
+export function clampSyncTimestamp(
+  ts: number,
+  nowSec: number = Math.floor(Date.now() / 1000)
+): number {
+  const safeNow =
+    Number.isFinite(nowSec) && nowSec > 60
+      ? Math.floor(nowSec)
+      : Math.floor(Date.now() / 1000);
+  const maxAllowed = Math.max(1, safeNow - 5);
+  if (!Number.isFinite(ts) || ts <= 0) {
+    return Math.max(1, safeNow - 30);
+  }
+  return Math.max(1, Math.min(maxAllowed, Math.floor(ts)));
+}
+
+export function computeSyncVodWindow(
+  masterTs: number,
+  windowSec: number = 120,
+  nowSec: number = Math.floor(Date.now() / 1000)
+): { startTime: number; endTime: number } {
+  const startTime = clampSyncTimestamp(masterTs, nowSec);
+  const safeDur = Number.isFinite(windowSec)
+    ? Math.max(12, Math.floor(windowSec))
+    : 120;
+  const safeNow =
+    Number.isFinite(nowSec) && nowSec > 60
+      ? Math.floor(nowSec)
+      : Math.floor(Date.now() / 1000);
+  const endTime = Math.max(
+    startTime + 12,
+    Math.min(startTime + safeDur, Math.max(startTime + 12, safeNow))
+  );
+  return { startTime, endTime };
+}
+
+export function resolveSafeSyncThumbSrc(
+  thumbPath: string | null | undefined,
+  camera: string
+): string {
+  const encodedCam = encodeURIComponent(camera || "camera");
+  const fallback = `/api/${encodedCam}/latest.webp`;
+  if (typeof thumbPath !== "string") return fallback;
+  const trimmed = thumbPath.trim();
+  if (!trimmed || /[\u0000-\u001F\u007F]/.test(trimmed)) return fallback;
+  const stripped = trimmed.replace(/^\/media\/[^/]+/, "").trim();
+  if (!stripped || !stripped.startsWith("/") || stripped.startsWith("//")) {
+    return fallback;
+  }
+  return stripped;
+}
 
 export function resolveSyncQuadCameras(
   cameraNames: string[],
@@ -40,7 +92,11 @@ export function assignSyncQuadSlot(
 ): string[] {
   const resolved = resolveSyncQuadCameras(allCameras, currentQuad);
   if (resolved.length === 0) return [];
-  const safeSlot = Math.max(0, Math.min(slotIndex, resolved.length - 1));
+  if (!allCameras.includes(camera)) {
+    return resolved.slice(0, MAX_SYNC_QUAD_SLOTS);
+  }
+  const rawSlot = Number.isFinite(slotIndex) ? Math.trunc(slotIndex) : 0;
+  const safeSlot = Math.max(0, Math.min(rawSlot, resolved.length - 1));
   const next = [...resolved];
   const existingIdx = next.indexOf(camera);
   if (existingIdx !== -1 && existingIdx !== safeSlot) {
@@ -56,20 +112,32 @@ export function autoPickActiveCamerasAtTimestamp(
   timestampSec: number,
   windowSec: number = 60
 ): string[] {
+  if (!Number.isFinite(timestampSec)) {
+    return cameraNames.slice(0, MAX_SYNC_QUAD_SLOTS);
+  }
+  const safeWindow = Number.isFinite(windowSec) ? Math.max(1, windowSec) : 60;
   const scores = new Map<string, number>();
   for (const cam of cameraNames) {
     scores.set(cam, 0);
   }
   for (const rev of reviews) {
-    if (!scores.has(rev.camera)) continue;
+    if (!scores.has(rev.camera) || !Number.isFinite(rev.start_time)) continue;
     const revStart = rev.start_time;
-    const revEnd = rev.end_time ?? revStart + 15;
+    const revEnd =
+      rev.end_time !== undefined &&
+      rev.end_time !== null &&
+      Number.isFinite(rev.end_time)
+        ? rev.end_time
+        : revStart + 15;
     if (
-      revStart <= timestampSec + windowSec &&
-      revEnd >= timestampSec - windowSec
+      revStart <= timestampSec + safeWindow &&
+      revEnd >= timestampSec - safeWindow
     ) {
       const dist = Math.abs(revStart - timestampSec);
-      const proximityBonus = Math.max(1, windowSec - Math.min(windowSec, dist));
+      const proximityBonus = Math.max(
+        1,
+        safeWindow - Math.min(safeWindow, dist)
+      );
       const severityWeight = rev.severity === "alert" ? 200 : 100;
       scores.set(
         rev.camera,
@@ -122,11 +190,50 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
   const hudPosition = useNvrStore((s) => s.hudPosition);
   const syncQuadCameras = useNvrStore((s) => s.syncQuadCameras);
   const setSyncQuadCameras = useNvrStore((s) => s.setSyncQuadCameras);
+  const config = useNvrStore((s) => s.config);
+
+  const safeMasterTs = clampSyncTimestamp(syncMasterTs);
+  const [committedVodTs, setCommittedVodTs] = useState<number>(() => safeMasterTs);
+  const seekDebounceTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (seekDebounceTimerRef.current !== null) {
+      window.clearTimeout(seekDebounceTimerRef.current);
+      seekDebounceTimerRef.current = null;
+    }
+    if (committedVodTs === safeMasterTs) {
+      return;
+    }
+    seekDebounceTimerRef.current = window.setTimeout(() => {
+      seekDebounceTimerRef.current = null;
+      setCommittedVodTs(safeMasterTs);
+    }, SYNC_SEEK_DEBOUNCE_MS);
+    return () => {
+      if (seekDebounceTimerRef.current !== null) {
+        window.clearTimeout(seekDebounceTimerRef.current);
+        seekDebounceTimerRef.current = null;
+      }
+    };
+  }, [safeMasterTs, committedVodTs]);
+
+  const vodWindow = useMemo(
+    () => computeSyncVodWindow(committedVodTs, 120),
+    [committedVodTs]
+  );
 
   const activeQuadCameras = useMemo(
     () => resolveSyncQuadCameras(cameraNames, syncQuadCameras),
     [cameraNames, syncQuadCameras]
   );
+
+  const applyBoundedSyncSeek = (nextTs: number) => {
+    const clamped = clampSyncTimestamp(nextTs);
+    setSyncMasterTs(clamped);
+  };
+
+  const stepSyncMasterBy = (deltaSec: number) => {
+    setSyncMasterTs((prev) => clampSyncTimestamp(clampSyncTimestamp(prev) + deltaSec));
+  };
 
   return (
     <>
@@ -134,18 +241,18 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
           <span className="nvr-badge rewind">{t.sync.syncLocked}</span>
           <span className="mono" style={{ fontWeight: 700, color: "var(--text-primary)" }}>
-            {formatDateTime(syncMasterTs)}
+            {formatDateTime(safeMasterTs)}
           </span>
-          <button className="nvr-btn" onClick={() => setSyncMasterTs((ts) => ts - 30)}>
+          <button className="nvr-btn" onClick={() => stepSyncMasterBy(-30)}>
             {t.sync.jumpBack30}
           </button>
-          <button className="nvr-btn" onClick={() => setSyncMasterTs((ts) => ts - 10)}>
+          <button className="nvr-btn" onClick={() => stepSyncMasterBy(-10)}>
             {t.sync.jumpBack10}
           </button>
-          <button className="nvr-btn" onClick={() => setSyncMasterTs((ts) => ts + 10)}>
+          <button className="nvr-btn" onClick={() => stepSyncMasterBy(10)}>
             {t.sync.jumpFwd10}
           </button>
-          <button className="nvr-btn" onClick={() => setSyncMasterTs((ts) => ts + 30)}>
+          <button className="nvr-btn" onClick={() => stepSyncMasterBy(30)}>
             {t.sync.jumpFwd30}
           </button>
           <span className="nvr-divider" aria-hidden="true" />
@@ -180,7 +287,7 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
             style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
             onClick={() =>
               setSyncQuadCameras(
-                autoPickActiveCamerasAtTimestamp(cameraNames, reviews, syncMasterTs)
+                autoPickActiveCamerasAtTimestamp(cameraNames, reviews, safeMasterTs)
               )
             }
             title="Automatically select the 4 cameras with active alerts or detections near the current timestamp"
@@ -210,23 +317,27 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
           </div>
           <div className="nvr-scroll-y">
             {reviews.slice(0, 35).map((rev) => {
-              const isSelected = Math.abs(rev.start_time - syncMasterTs) < 5;
+              const isSelected = Math.abs(rev.start_time - safeMasterTs) < 5;
+              const thumbSrc = resolveSafeSyncThumbSrc(
+                rev.thumb_path,
+                rev.camera
+              );
               return (
                 <div
                   key={rev.id}
                   role="button"
                   tabIndex={0}
                   className={`nvr-list-row ${isSelected ? "is-selected" : ""}`}
-                  onClick={() => setSyncMasterTs(Math.floor(rev.start_time))}
+                  onClick={() => applyBoundedSyncSeek(Math.floor(rev.start_time))}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
-                      setSyncMasterTs(Math.floor(rev.start_time));
+                      applyBoundedSyncSeek(Math.floor(rev.start_time));
                     }
                   }}
                 >
                   <img
-                    src={rev.thumb_path.replace(/^\/media\/[^/]+/, "")}
+                    src={thumbSrc}
                     alt={rev.camera}
                     width={68}
                     height={40}
@@ -272,34 +383,42 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
         </div>
 
         <div className="nvr-matrix-2x2">
-          {activeQuadCameras.map((cam, slotIdx) => (
-            <div key={`${cam}-${slotIdx}`} className="nvr-cam-tile">
-              <VodHlsPlayer
-                camera={cam}
-                startTime={syncMasterTs}
-                endTime={syncMasterTs + 120}
-                playbackRate={syncSpeed}
-                controls={false}
-              />
-              <div className={`nvr-cam-hud pos-${hudPosition}`}>
-                <span className="nvr-badge rewind">
-                  S{slotIdx + 1} · {cam.toUpperCase()} // SYNC @ {formatTs(syncMasterTs)}
-                </span>
-                <button
-                  className="nvr-btn nvr-tile-action"
-                  style={{
-                    height: 22,
-                    padding: "0 8px",
-                    fontSize: "var(--text-xs)",
-                    pointerEvents: "auto",
-                  }}
-                  onClick={() => handleQuickExport(cam, syncMasterTs, syncMasterTs + 60)}
-                >
-                  {t.live.export60s}
-                </button>
+          {activeQuadCameras.map((cam, slotIdx) => {
+            const realCam = resolveRealCameraSource(
+              cam,
+              config?.cameras || cameraNames
+            );
+            return (
+              <div key={`${cam}-${slotIdx}`} className="nvr-cam-tile">
+                <VodHlsPlayer
+                  camera={realCam}
+                  startTime={vodWindow.startTime}
+                  endTime={vodWindow.endTime}
+                  playbackRate={syncSpeed}
+                  controls={false}
+                />
+                <div className={`nvr-cam-hud pos-${hudPosition}`}>
+                  <span className="nvr-badge rewind">
+                    S{slotIdx + 1} · {cam.toUpperCase()} // SYNC @ {formatTs(safeMasterTs)}
+                  </span>
+                  <button
+                    className="nvr-btn nvr-tile-action"
+                    style={{
+                      height: 22,
+                      padding: "0 8px",
+                      fontSize: "var(--text-xs)",
+                      pointerEvents: "auto",
+                    }}
+                    onClick={() =>
+                      handleQuickExport(realCam, safeMasterTs, safeMasterTs + 60)
+                    }
+                  >
+                    {t.live.export60s}
+                  </button>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -309,8 +428,10 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
         onSelectCamera={(cam) => setSelectedCamera(cam)}
         segments={focusSegments}
         reviews={reviews}
-        currentTs={syncMasterTs}
-        onSeek={(ts) => setSyncMasterTs(ts ?? Math.floor(Date.now() / 1000) - 30)}
+        currentTs={safeMasterTs}
+        onSeek={(ts) =>
+          applyBoundedSyncSeek(ts ?? Math.floor(Date.now() / 1000) - 30)
+        }
         onExportRange={handleQuickExport}
         titlePrefix="4-CH SYNC TIMELINE"
       />

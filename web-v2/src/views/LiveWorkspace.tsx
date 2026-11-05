@@ -244,14 +244,22 @@ export function resolveDockTileMode(
   return index < effectiveCap ? "mse" : "snapshot";
 }
 
+function finiteOr(val: number, fallback: number): number {
+  return Number.isFinite(val) ? val : fallback;
+}
+
 export function computeDefaultMapPlacement(
   index: number,
   totalCameras: number
 ): CameraMapPlacement {
-  const n = Math.max(1, totalCameras);
+  const safeTotal = Number.isFinite(totalCameras)
+    ? Math.trunc(totalCameras)
+    : 1;
+  const safeIndex = Number.isFinite(index) ? Math.trunc(index) : 0;
+  const n = Math.max(1, safeTotal);
   const cols = Math.max(1, Math.ceil(Math.sqrt(n)));
   const rows = Math.max(1, Math.ceil(n / cols));
-  const safeIdx = Math.max(0, Math.min(index, n - 1));
+  const safeIdx = Math.max(0, Math.min(safeIndex, n - 1));
   const col = safeIdx % cols;
   const row = Math.floor(safeIdx / cols);
 
@@ -306,9 +314,14 @@ export function computeCameraAimFromTip(
   tipX: number,
   tipY: number
 ): { angle_deg: number; range: number } {
-  const dx = tipX - camX;
-  const dy = tipY - camY;
-  const rawDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+  const sx = finiteOr(camX, 0.5);
+  const sy = finiteOr(camY, 0.5);
+  const tx = finiteOr(tipX, sx + 0.25);
+  const ty = finiteOr(tipY, sy);
+  const dx = tx - sx;
+  const dy = ty - sy;
+  const rawDeg =
+    dx === 0 && dy === 0 ? 0 : (Math.atan2(dy, dx) * 180) / Math.PI;
   const normalizedDeg = ((rawDeg % 360) + 360) % 360;
   const angle_deg = Number(normalizedDeg.toFixed(1)) % 360;
   const dist = Math.hypot(dx, dy);
@@ -322,10 +335,14 @@ export function computeFovConeTipSvgPoint(
   angleDeg: number,
   radius: number
 ): { x: number; y: number } {
-  const rad = (angleDeg * Math.PI) / 180;
+  const safeCx = finiteOr(cx, 500);
+  const safeCy = finiteOr(cy, 300);
+  const safeAngle = finiteOr(angleDeg, 0);
+  const safeRadius = Math.max(0, finiteOr(radius, 100));
+  const rad = (safeAngle * Math.PI) / 180;
   return {
-    x: Number((cx + radius * Math.cos(rad)).toFixed(1)),
-    y: Number((cy + radius * Math.sin(rad)).toFixed(1)),
+    x: Number((safeCx + safeRadius * Math.cos(rad)).toFixed(1)),
+    y: Number((safeCy + safeRadius * Math.sin(rad)).toFixed(1)),
   };
 }
 
@@ -343,6 +360,15 @@ export function mapClientPointToFloorplan(
   viewBoxHeight: number = 600
 ): { x: number; y: number } {
   if (
+    !rect ||
+    !Number.isFinite(clientX) ||
+    !Number.isFinite(clientY) ||
+    !Number.isFinite(rect.left) ||
+    !Number.isFinite(rect.top) ||
+    !Number.isFinite(rect.width) ||
+    !Number.isFinite(rect.height) ||
+    !Number.isFinite(viewBoxWidth) ||
+    !Number.isFinite(viewBoxHeight) ||
     rect.width <= 0 ||
     rect.height <= 0 ||
     viewBoxWidth <= 0 ||
@@ -356,6 +382,14 @@ export function mapClientPointToFloorplan(
   );
   const drawnW = viewBoxWidth * scale;
   const drawnH = viewBoxHeight * scale;
+  if (
+    drawnW <= 0 ||
+    drawnH <= 0 ||
+    !Number.isFinite(drawnW) ||
+    !Number.isFinite(drawnH)
+  ) {
+    return { x: 0.5, y: 0.5 };
+  }
   const offsetX = (rect.width - drawnW) / 2;
   const offsetY = (rect.height - drawnH) / 2;
   const normX = (clientX - rect.left - offsetX) / drawnW;
@@ -367,9 +401,11 @@ export function mapClientPointToFloorplan(
 }
 
 export function snapFloorplanCoord(val: number, step: number = 0.02): number {
-  const clamped = Math.max(0, Math.min(1, val));
-  if (step <= 0) return Number(clamped.toFixed(3));
-  return Number((Math.round(clamped / step) * step).toFixed(3));
+  const safeVal = finiteOr(val, 0);
+  const clamped = Math.max(0, Math.min(1, safeVal));
+  if (!Number.isFinite(step) || step <= 0) return Number(clamped.toFixed(3));
+  const snapped = Math.round(clamped / step) * step;
+  return Number(Math.max(0, Math.min(1, snapped)).toFixed(3));
 }
 
 export function normalizeFloorplanRoomRect(
@@ -379,14 +415,15 @@ export function normalizeFloorplanRoomRect(
   y2: number,
   minSize: number = 0.02
 ): { x: number; y: number; w: number; h: number } {
-  const cx1 = Math.max(0, Math.min(1, x1));
-  const cy1 = Math.max(0, Math.min(1, y1));
-  const cx2 = Math.max(0, Math.min(1, x2));
-  const cy2 = Math.max(0, Math.min(1, y2));
+  const safeMin = Math.max(0.005, Math.min(1, finiteOr(minSize, 0.02)));
+  const cx1 = Math.max(0, Math.min(1, finiteOr(x1, 0)));
+  const cy1 = Math.max(0, Math.min(1, finiteOr(y1, 0)));
+  const cx2 = Math.max(0, Math.min(1, finiteOr(x2, cx1 + safeMin)));
+  const cy2 = Math.max(0, Math.min(1, finiteOr(y2, cy1 + safeMin)));
   const rawX = Math.min(cx1, cx2);
   const rawY = Math.min(cy1, cy2);
-  const rawW = Math.max(minSize, Math.abs(cx2 - cx1));
-  const rawH = Math.max(minSize, Math.abs(cy2 - cy1));
+  const rawW = Math.max(safeMin, Math.abs(cx2 - cx1));
+  const rawH = Math.max(safeMin, Math.abs(cy2 - cy1));
   const w = Number(Math.min(1, rawW).toFixed(3));
   const h = Number(Math.min(1, rawH).toFixed(3));
   const x = Number(Math.max(0, Math.min(1 - w, rawX)).toFixed(3));
@@ -405,13 +442,17 @@ export function computeRoomMetrics(
   xM: number;
   yM: number;
 } {
-  const safeW = Math.max(1, floorplanWidthM);
-  const safeH = Math.max(1, floorplanHeightM);
-  const widthM = Number((room.w * safeW).toFixed(2));
-  const heightM = Number((room.h * safeH).toFixed(2));
+  const safeW = Math.max(1, finiteOr(floorplanWidthM, DEFAULT_FLOORPLAN_WIDTH_M));
+  const safeH = Math.max(1, finiteOr(floorplanHeightM, DEFAULT_FLOORPLAN_HEIGHT_M));
+  const rw = Math.max(0, Math.min(1, finiteOr(room?.w, 0.2)));
+  const rh = Math.max(0, Math.min(1, finiteOr(room?.h, 0.2)));
+  const rx = Math.max(0, Math.min(1, finiteOr(room?.x, 0)));
+  const ry = Math.max(0, Math.min(1, finiteOr(room?.y, 0)));
+  const widthM = Number((rw * safeW).toFixed(2));
+  const heightM = Number((rh * safeH).toFixed(2));
   const areaSqM = Number((widthM * heightM).toFixed(2));
-  const xM = Number((room.x * safeW).toFixed(2));
-  const yM = Number((room.y * safeH).toFixed(2));
+  const xM = Number((rx * safeW).toFixed(2));
+  const yM = Number((ry * safeH).toFixed(2));
   return { widthM, heightM, areaSqM, xM, yM };
 }
 
@@ -422,14 +463,18 @@ export function resizeRoomByMeters(
   floorplanWidthM: number = DEFAULT_FLOORPLAN_WIDTH_M,
   floorplanHeightM: number = DEFAULT_FLOORPLAN_HEIGHT_M
 ): FloorplanRoom {
-  const safeW = Math.max(1, floorplanWidthM);
-  const safeH = Math.max(1, floorplanHeightM);
-  const normW = Math.max(0.01, Math.min(1, targetWidthM / safeW));
-  const normH = Math.max(0.01, Math.min(1, targetHeightM / safeH));
+  const safeW = Math.max(1, finiteOr(floorplanWidthM, DEFAULT_FLOORPLAN_WIDTH_M));
+  const safeH = Math.max(1, finiteOr(floorplanHeightM, DEFAULT_FLOORPLAN_HEIGHT_M));
+  const safeTargetW = Math.max(0.1, finiteOr(targetWidthM, safeW * 0.2));
+  const safeTargetH = Math.max(0.1, finiteOr(targetHeightM, safeH * 0.2));
+  const normW = Math.max(0.01, Math.min(1, safeTargetW / safeW));
+  const normH = Math.max(0.01, Math.min(1, safeTargetH / safeH));
   const w = Number(normW.toFixed(3));
   const h = Number(normH.toFixed(3));
-  const x = Number(Math.max(0, Math.min(1 - w, room.x)).toFixed(3));
-  const y = Number(Math.max(0, Math.min(1 - h, room.y)).toFixed(3));
+  const rx = Math.max(0, Math.min(1, finiteOr(room?.x, 0)));
+  const ry = Math.max(0, Math.min(1, finiteOr(room?.y, 0)));
+  const x = Number(Math.max(0, Math.min(1 - w, rx)).toFixed(3));
+  const y = Number(Math.max(0, Math.min(1 - h, ry)).toFixed(3));
   return { ...room, x, y, w, h };
 }
 
@@ -445,13 +490,17 @@ export function computeWallMetrics(
   midX: number;
   midY: number;
 } {
-  const [x1, y1, x2, y2] = points;
-  const safeW = Math.max(1, floorplanWidthM);
-  const safeH = Math.max(1, floorplanHeightM);
+  const x1 = Math.max(0, Math.min(1, finiteOr(points?.[0], 0)));
+  const y1 = Math.max(0, Math.min(1, finiteOr(points?.[1], 0)));
+  const x2 = Math.max(0, Math.min(1, finiteOr(points?.[2], x1)));
+  const y2 = Math.max(0, Math.min(1, finiteOr(points?.[3], y1)));
+  const safeW = Math.max(1, finiteOr(floorplanWidthM, DEFAULT_FLOORPLAN_WIDTH_M));
+  const safeH = Math.max(1, finiteOr(floorplanHeightM, DEFAULT_FLOORPLAN_HEIGHT_M));
   const dxM = (x2 - x1) * safeW;
   const dyM = (y2 - y1) * safeH;
   const lengthM = Number(Math.hypot(dxM, dyM).toFixed(2));
-  const rawDeg = (Math.atan2(dyM, dxM) * 180) / Math.PI;
+  const rawDeg =
+    dxM === 0 && dyM === 0 ? 0 : (Math.atan2(dyM, dxM) * 180) / Math.PI;
   const angleDeg = Number((((rawDeg % 360) + 360) % 360).toFixed(1)) % 360;
   const midX = Number(((x1 + x2) / 2).toFixed(3));
   const midY = Number(((y1 + y2) / 2).toFixed(3));
@@ -464,11 +513,15 @@ export function resizeWallToLengthMeters(
   floorplanWidthM: number = DEFAULT_FLOORPLAN_WIDTH_M,
   floorplanHeightM: number = DEFAULT_FLOORPLAN_HEIGHT_M
 ): [number, number, number, number] {
-  const [x1, y1, x2, y2] = points;
-  const safeW = Math.max(1, floorplanWidthM);
-  const safeH = Math.max(1, floorplanHeightM);
+  const x1 = Math.max(0, Math.min(1, finiteOr(points?.[0], 0.2)));
+  const y1 = Math.max(0, Math.min(1, finiteOr(points?.[1], 0.2)));
+  const x2 = Math.max(0, Math.min(1, finiteOr(points?.[2], 0.4)));
+  const y2 = Math.max(0, Math.min(1, finiteOr(points?.[3], 0.2)));
+  const safeW = Math.max(1, finiteOr(floorplanWidthM, DEFAULT_FLOORPLAN_WIDTH_M));
+  const safeH = Math.max(1, finiteOr(floorplanHeightM, DEFAULT_FLOORPLAN_HEIGHT_M));
   const maxPossibleM = Math.hypot(safeW, safeH);
-  const clampedLen = Math.max(0.1, Math.min(maxPossibleM, targetLengthM));
+  const safeTargetM = finiteOr(targetLengthM, 1.0);
+  const clampedLen = Math.max(0.1, Math.min(maxPossibleM, safeTargetM));
   const dxM = (x2 - x1) * safeW;
   const dyM = (y2 - y1) * safeH;
   const currentLen = Math.hypot(dxM, dyM);
@@ -511,11 +564,15 @@ export function rotateWallToAngleDegrees(
   floorplanWidthM: number = DEFAULT_FLOORPLAN_WIDTH_M,
   floorplanHeightM: number = DEFAULT_FLOORPLAN_HEIGHT_M
 ): [number, number, number, number] {
-  const [x1, y1, x2, y2] = points;
-  const safeW = Math.max(1, floorplanWidthM);
-  const safeH = Math.max(1, floorplanHeightM);
+  const x1 = Math.max(0, Math.min(1, finiteOr(points?.[0], 0.2)));
+  const y1 = Math.max(0, Math.min(1, finiteOr(points?.[1], 0.2)));
+  const x2 = Math.max(0, Math.min(1, finiteOr(points?.[2], 0.4)));
+  const y2 = Math.max(0, Math.min(1, finiteOr(points?.[3], 0.2)));
+  const safeW = Math.max(1, finiteOr(floorplanWidthM, DEFAULT_FLOORPLAN_WIDTH_M));
+  const safeH = Math.max(1, finiteOr(floorplanHeightM, DEFAULT_FLOORPLAN_HEIGHT_M));
   const lenM = Math.max(0.2, Math.hypot((x2 - x1) * safeW, (y2 - y1) * safeH));
-  const rad = (targetAngleDeg * Math.PI) / 180;
+  const safeDeg = finiteOr(targetAngleDeg, 0);
+  const rad = (safeDeg * Math.PI) / 180;
   let nx1 = x1;
   let ny1 = y1;
   let nx2 = x1 + (lenM * Math.cos(rad)) / safeW;
@@ -565,11 +622,16 @@ export function snapWallEndpoint(
     floorplanHeightM = DEFAULT_FLOORPLAN_HEIGHT_M,
   } = options;
 
+  const safeRawX = Math.max(0, Math.min(1, finiteOr(rawX, 0.5)));
+  const safeRawY = Math.max(0, Math.min(1, finiteOr(rawY, 0.5)));
+  const safeRadius = Math.max(0, finiteOr(vertexSnapRadius, 0.015));
+
   // 1. Check magnetic vertex snap to existing wall endpoints / room corners
   let bestVertex: { x: number; y: number } | null = null;
-  let bestDist = vertexSnapRadius;
+  let bestDist = safeRadius;
   for (const v of vertices) {
-    const d = Math.hypot(rawX - v.x, rawY - v.y);
+    if (!Number.isFinite(v.x) || !Number.isFinite(v.y)) continue;
+    const d = Math.hypot(safeRawX - v.x, safeRawY - v.y);
     if (d <= bestDist) {
       bestDist = d;
       bestVertex = v;
@@ -577,19 +639,25 @@ export function snapWallEndpoint(
   }
   if (bestVertex) {
     return {
-      x: Number(bestVertex.x.toFixed(3)),
-      y: Number(bestVertex.y.toFixed(3)),
+      x: Number(Math.max(0, Math.min(1, bestVertex.x)).toFixed(3)),
+      y: Number(Math.max(0, Math.min(1, bestVertex.y)).toFixed(3)),
       snappedToVertex: true,
     };
   }
 
-  let nextX = snapFloorplanCoord(rawX, snapStep);
-  let nextY = snapFloorplanCoord(rawY, snapStep);
+  let nextX = snapFloorplanCoord(safeRawX, snapStep);
+  let nextY = snapFloorplanCoord(safeRawY, snapStep);
 
   // 2. Apply orthogonal / 45-degree angle snap if start point is known
-  if (orthoSnap && startX !== null && startY !== null) {
-    const safeW = Math.max(1, floorplanWidthM);
-    const safeH = Math.max(1, floorplanHeightM);
+  if (
+    orthoSnap &&
+    startX !== null &&
+    startY !== null &&
+    Number.isFinite(startX) &&
+    Number.isFinite(startY)
+  ) {
+    const safeW = Math.max(1, finiteOr(floorplanWidthM, DEFAULT_FLOORPLAN_WIDTH_M));
+    const safeH = Math.max(1, finiteOr(floorplanHeightM, DEFAULT_FLOORPLAN_HEIGHT_M));
     const dxM = (nextX - startX) * safeW;
     const dyM = (nextY - startY) * safeH;
     const distM = Math.hypot(dxM, dyM);
@@ -627,11 +695,15 @@ export function snapWallEndpoint(
 }
 
 export function extractRoomBoundaryWalls(room: FloorplanRoom): FloorplanWall[] {
-  const x1 = Number(room.x.toFixed(3));
-  const y1 = Number(room.y.toFixed(3));
-  const x2 = Number(Math.min(1, room.x + room.w).toFixed(3));
-  const y2 = Number(Math.min(1, room.y + room.h).toFixed(3));
-  const baseLabel = room.label || "ROOM";
+  const rx = Math.max(0, Math.min(1, finiteOr(room?.x, 0)));
+  const ry = Math.max(0, Math.min(1, finiteOr(room?.y, 0)));
+  const rw = Math.max(0.01, Math.min(1, finiteOr(room?.w, 0.2)));
+  const rh = Math.max(0.01, Math.min(1, finiteOr(room?.h, 0.2)));
+  const x1 = Number(rx.toFixed(3));
+  const y1 = Number(ry.toFixed(3));
+  const x2 = Number(Math.min(1, rx + rw).toFixed(3));
+  const y2 = Number(Math.min(1, ry + rh).toFixed(3));
+  const baseLabel = room?.label || "ROOM";
   return [
     { points: [x1, y1, x2, y1], label: `${baseLabel} N`, kind: "wall" },
     { points: [x2, y1, x2, y2], label: `${baseLabel} E`, kind: "wall" },
@@ -640,26 +712,238 @@ export function extractRoomBoundaryWalls(room: FloorplanRoom): FloorplanWall[] {
   ];
 }
 
-function buildFovConeSvgPath(
+export function buildFovConeSvgPath(
   cx: number,
   cy: number,
   angleDeg: number,
   fovDeg: number,
   radius: number
 ): string {
-  const half = Math.max(10, Math.min(89, fovDeg / 2));
-  const startRad = ((angleDeg - half) * Math.PI) / 180;
-  const endRad = ((angleDeg + half) * Math.PI) / 180;
-  const x1 = cx + radius * Math.cos(startRad);
-  const y1 = cy + radius * Math.sin(startRad);
-  const x2 = cx + radius * Math.cos(endRad);
-  const y2 = cy + radius * Math.sin(endRad);
-  const largeArc = fovDeg > 180 ? 1 : 0;
-  return `M ${cx.toFixed(1)} ${cy.toFixed(1)} L ${x1.toFixed(1)} ${y1.toFixed(
+  const safeCx = finiteOr(cx, 500);
+  const safeCy = finiteOr(cy, 300);
+  const safeAngle = finiteOr(angleDeg, 0);
+  const safeFov = finiteOr(fovDeg, 90);
+  const safeRadius = Math.max(1, Math.min(1000, finiteOr(radius, 100)));
+  const half = Math.max(10, Math.min(89, safeFov / 2));
+  const startRad = ((safeAngle - half) * Math.PI) / 180;
+  const endRad = ((safeAngle + half) * Math.PI) / 180;
+  const x1 = safeCx + safeRadius * Math.cos(startRad);
+  const y1 = safeCy + safeRadius * Math.sin(startRad);
+  const x2 = safeCx + safeRadius * Math.cos(endRad);
+  const y2 = safeCy + safeRadius * Math.sin(endRad);
+  const largeArc = half * 2 > 180 ? 1 : 0;
+  return `M ${safeCx.toFixed(1)} ${safeCy.toFixed(1)} L ${x1.toFixed(
     1
-  )} A ${radius.toFixed(1)} ${radius.toFixed(1)} 0 ${largeArc} 1 ${x2.toFixed(
+  )} ${y1.toFixed(1)} A ${safeRadius.toFixed(1)} ${safeRadius.toFixed(
     1
-  )} ${y2.toFixed(1)} Z`;
+  )} 0 ${largeArc} 1 ${x2.toFixed(1)} ${y2.toFixed(1)} Z`;
+}
+
+export function sanitizeFloorplanUrl(
+  rawUrl: string | null | undefined
+): string {
+  if (typeof rawUrl !== "string") return "";
+  const trimmed = rawUrl.trim();
+  if (!trimmed || /[\u0000-\u001F\u007F]/.test(trimmed)) return "";
+  if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
+    return trimmed;
+  }
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  if (/^data:image\/(png|jpeg|jpg|webp|gif);base64,[a-z0-9+/=\s]+$/i.test(trimmed)) {
+    return trimmed;
+  }
+  if (/^data:image\/svg\+xml;base64,([a-z0-9+/=\s]+)$/i.test(trimmed)) {
+    const b64 = trimmed.slice(trimmed.indexOf(",") + 1).replace(/\s+/g, "");
+    try {
+      const decoded = globalThis.atob(b64);
+      if (
+        /<script|javascript:|vbscript:|onload\s*=|onerror\s*=|<foreignobject/i.test(
+          decoded
+        )
+      ) {
+        return "";
+      }
+      return trimmed;
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+export function sanitizeMapPlacement(
+  placement: Partial<CameraMapPlacement> | null | undefined,
+  fallback: CameraMapPlacement = {
+    x: 0.5,
+    y: 0.5,
+    angle_deg: 0,
+    fov_deg: 90,
+    range: 0.25,
+  }
+): CameraMapPlacement {
+  const x = Number(
+    Math.max(0, Math.min(1, finiteOr(placement?.x ?? NaN, fallback.x))).toFixed(
+      3
+    )
+  );
+  const y = Number(
+    Math.max(0, Math.min(1, finiteOr(placement?.y ?? NaN, fallback.y))).toFixed(
+      3
+    )
+  );
+  const rawAngle = finiteOr(placement?.angle_deg ?? NaN, fallback.angle_deg);
+  const angle_deg = Number((((rawAngle % 360) + 360) % 360).toFixed(1)) % 360;
+  const fov_deg = Number(
+    Math.max(
+      10,
+      Math.min(180, finiteOr(placement?.fov_deg ?? NaN, fallback.fov_deg))
+    ).toFixed(1)
+  );
+  const range = Number(
+    Math.max(
+      0.05,
+      Math.min(0.5, finiteOr(placement?.range ?? NaN, fallback.range))
+    ).toFixed(3)
+  );
+  return { x, y, angle_deg, fov_deg, range };
+}
+
+export function buildFloorplanSavePayload(params: {
+  existingCameras: Record<string, CameraConfig>;
+  mapPlacements: Record<string, CameraMapPlacement>;
+  existingUi?: Record<string, unknown>;
+  floorplanUrl: string;
+  floorplanOpacity: number;
+  floorplanWidthM: number;
+  floorplanHeightM: number;
+  floorplanRooms: FloorplanRoom[];
+  floorplanWalls: FloorplanWall[];
+}): {
+  cameras: Record<string, { map: CameraMapPlacement }>;
+  ui: Record<string, unknown>;
+} {
+  const {
+    existingCameras,
+    mapPlacements,
+    existingUi,
+    floorplanUrl,
+    floorplanOpacity,
+    floorplanWidthM,
+    floorplanHeightM,
+    floorplanRooms,
+    floorplanWalls,
+  } = params;
+
+  const camNames = Object.keys(existingCameras || {});
+  const camerasPatch: Record<string, { map: CameraMapPlacement }> = {};
+  camNames.forEach((cam, idx) => {
+    const fallback =
+      existingCameras[cam]?.map ||
+      computeDefaultMapPlacement(idx, camNames.length);
+    const chosen = mapPlacements[cam] || fallback;
+    camerasPatch[cam] = {
+      map: sanitizeMapPlacement(chosen, fallback),
+    };
+  });
+
+  const sanitizedRooms: FloorplanRoom[] = (floorplanRooms || []).map(
+    (r, idx) => {
+      const norm = normalizeFloorplanRoomRect(
+        r.x,
+        r.y,
+        r.x + r.w,
+        r.y + r.h,
+        0.01
+      );
+      return {
+        ...r,
+        id: r.id || `room_${idx + 1}`,
+        label: (r.label || "ROOM").trim() || "ROOM",
+        x: norm.x,
+        y: norm.y,
+        w: norm.w,
+        h: norm.h,
+      };
+    }
+  );
+
+  const sanitizedWalls: FloorplanWall[] = (floorplanWalls || []).map((w) => {
+    const p = w.points || [0.2, 0.2, 0.4, 0.2];
+    const x1 = Number(Math.max(0, Math.min(1, finiteOr(p[0], 0.2))).toFixed(3));
+    const y1 = Number(Math.max(0, Math.min(1, finiteOr(p[1], 0.2))).toFixed(3));
+    const x2 = Number(Math.max(0, Math.min(1, finiteOr(p[2], 0.4))).toFixed(3));
+    const y2 = Number(Math.max(0, Math.min(1, finiteOr(p[3], 0.2))).toFixed(3));
+    return {
+      ...w,
+      points: [x1, y1, x2, y2],
+    };
+  });
+
+  const cleanUrl = sanitizeFloorplanUrl(floorplanUrl);
+  const safeOp = Number(
+    Math.max(0.1, Math.min(1, finiteOr(floorplanOpacity, 0.45))).toFixed(2)
+  );
+  const safeW = Number(
+    Math.max(
+      2,
+      Math.min(500, finiteOr(floorplanWidthM, DEFAULT_FLOORPLAN_WIDTH_M))
+    ).toFixed(2)
+  );
+  const safeH = Number(
+    Math.max(
+      2,
+      Math.min(500, finiteOr(floorplanHeightM, DEFAULT_FLOORPLAN_HEIGHT_M))
+    ).toFixed(2)
+  );
+
+  return {
+    cameras: camerasPatch,
+    ui: {
+      ...(existingUi || {}),
+      floorplan: {
+        background_data_url: cleanUrl || null,
+        opacity: safeOp,
+        width_m: safeW,
+        height_m: safeH,
+        rooms: sanitizedRooms,
+        walls: sanitizedWalls,
+      },
+    },
+  };
+}
+
+export function resolveSafeAlertThumbSrc(
+  thumbPath: string | null | undefined,
+  camera: string
+): string {
+  const encodedCam = encodeURIComponent(camera || "camera");
+  const fallback = `/api/${encodedCam}/latest.webp`;
+  if (typeof thumbPath !== "string") return fallback;
+  const trimmed = thumbPath.trim();
+  if (!trimmed || /[\u0000-\u001F\u007F]/.test(trimmed)) return fallback;
+  const stripped = trimmed.replace(/^\/media\/[^/]+/, "").trim();
+  if (!stripped || !stripped.startsWith("/") || stripped.startsWith("//")) {
+    return fallback;
+  }
+  return stripped;
+}
+
+export function sanitizeTimeShiftSeek(
+  ts: number | null | undefined,
+  nowSec: number = Math.floor(Date.now() / 1000)
+): number | null {
+  if (ts === null || ts === undefined) return null;
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+  const safeNow =
+    Number.isFinite(nowSec) && nowSec > 60
+      ? Math.floor(nowSec)
+      : Math.floor(Date.now() / 1000);
+  if (ts >= safeNow - 2) {
+    return null;
+  }
+  return Math.floor(ts);
 }
 
 export function isCameraPtzEnabled(
@@ -696,8 +980,16 @@ export function resolveCameraPtzPresets(
   return out;
 }
 
+export type PtzMoveDirection =
+  | "left"
+  | "right"
+  | "up"
+  | "down"
+  | "zoom_in"
+  | "zoom_out";
+
 export function buildPtzMovePayload(
-  direction: "left" | "right" | "up" | "down" | "zoom_in" | "zoom_out",
+  direction: PtzMoveDirection,
   speed = 0.5,
   mode: "continuous" | "relative" = "continuous"
 ): {
@@ -708,7 +1000,8 @@ export function buildPtzMovePayload(
   zoom: number;
   speed: number;
 } {
-  const spd = Math.max(0.05, Math.min(1.0, speed));
+  const safeSpeed = Number.isFinite(speed) ? speed : 0.5;
+  const spd = Math.max(0.05, Math.min(1.0, safeSpeed));
   let pan = 0;
   let tilt = 0;
   let zoom = 0;
@@ -721,13 +1014,193 @@ export function buildPtzMovePayload(
   return { mode, action: direction, pan, tilt, zoom, speed: spd };
 }
 
+export interface PtzMoveLifecycleOptions {
+  camera: string;
+  speed?: number;
+  fetchImpl?: typeof fetch;
+  onMoveStarted?: (camera: string, direction: PtzMoveDirection) => void;
+  onMoveStopped?: (camera: string) => void;
+}
+
+export interface PtzMoveLifecycleController {
+  isMoving: () => boolean;
+  getActiveDirection: () => PtzMoveDirection | null;
+  getCamera: () => string;
+  startMove: (direction: PtzMoveDirection) => Promise<void>;
+  stopMove: (force?: boolean) => Promise<void>;
+  setCamera: (nextCamera: string) => Promise<void>;
+  handleWindowBlur: () => Promise<void>;
+  handleVisibilityChange: (visibilityState?: string) => Promise<void>;
+  handleKeyBlur: () => Promise<void>;
+  dispose: () => Promise<void>;
+}
+
+export function createPtzMoveLifecycle(
+  options: PtzMoveLifecycleOptions
+): PtzMoveLifecycleController {
+  let currentCamera = options.camera;
+  const speed = options.speed ?? 0.5;
+  const fetchFn: typeof fetch =
+    options.fetchImpl ?? ((input, init) => fetch(input, init));
+  let moving = false;
+  let activeDirection: PtzMoveDirection | null = null;
+  let disposed = false;
+
+  const sendStopForCamera = async (targetCam: string) => {
+    if (!targetCam) return;
+    try {
+      await fetchFn(`/api/${encodeURIComponent(targetCam)}/ptz/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        keepalive: true,
+        body: JSON.stringify({ pan_tilt: true, zoom: true }),
+      });
+    } catch {
+      // ignore transient network error
+    }
+    options.onMoveStopped?.(targetCam);
+  };
+
+  const stopMove = async (force = false) => {
+    if (!moving && !force) return;
+    const camToStop = currentCamera;
+    moving = false;
+    activeDirection = null;
+    await sendStopForCamera(camToStop);
+  };
+
+  const startMove = async (direction: PtzMoveDirection) => {
+    if (disposed || !currentCamera) return;
+    const targetCam = currentCamera;
+    moving = true;
+    activeDirection = direction;
+    const payload = buildPtzMovePayload(direction, speed, "continuous");
+    options.onMoveStarted?.(targetCam, direction);
+    try {
+      await fetchFn(`/api/${encodeURIComponent(targetCam)}/ptz/move`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      // ignore transient network error
+    }
+  };
+
+  const setCamera = async (nextCamera: string) => {
+    if (nextCamera === currentCamera) return;
+    if (moving) {
+      const prevCam = currentCamera;
+      moving = false;
+      activeDirection = null;
+      currentCamera = nextCamera;
+      await sendStopForCamera(prevCam);
+      return;
+    }
+    currentCamera = nextCamera;
+  };
+
+  return {
+    isMoving: () => moving,
+    getActiveDirection: () => activeDirection,
+    getCamera: () => currentCamera,
+    startMove,
+    stopMove,
+    setCamera,
+    handleWindowBlur: () => stopMove(false),
+    handleVisibilityChange: (visibilityState?: string) => {
+      if (!visibilityState || visibilityState === "hidden") {
+        return stopMove(false);
+      }
+      return stopMove(false);
+    },
+    handleKeyBlur: () => stopMove(false),
+    dispose: () => {
+      disposed = true;
+      return stopMove(false);
+    },
+  };
+}
+
 export const TacticalPtzHudOverlay: React.FC<{
   camera: string;
   cameraConfig?: CameraConfig;
   ptzInfo?: CameraPtzInfoResponse | null;
   onPtzUpdate?: (camera: string, nextInfo: CameraPtzInfoResponse) => void;
 }> = ({ camera, cameraConfig, ptzInfo, onPtzUpdate }) => {
-  if (!isCameraPtzEnabled(cameraConfig, ptzInfo)) {
+  const ptzEnabled = isCameraPtzEnabled(cameraConfig, ptzInfo);
+  const onPtzUpdateRef = useRef(onPtzUpdate);
+  onPtzUpdateRef.current = onPtzUpdate;
+  const ptzInfoRef = useRef(ptzInfo);
+  ptzInfoRef.current = ptzInfo;
+  const lifecycleRef = useRef<PtzMoveLifecycleController | null>(null);
+
+  useEffect(() => {
+    if (!ptzEnabled) {
+      if (lifecycleRef.current) {
+        void lifecycleRef.current.dispose();
+        lifecycleRef.current = null;
+      }
+      return;
+    }
+    const ctrl = createPtzMoveLifecycle({
+      camera,
+      speed: 0.5,
+      onMoveStarted: (cam) => {
+        if (onPtzUpdateRef.current) {
+          onPtzUpdateRef.current(cam, {
+            ...(ptzInfoRef.current || { enabled: true }),
+            active_preset: null,
+          });
+        }
+      },
+    });
+    lifecycleRef.current = ctrl;
+
+    const onWindowBlur = () => {
+      void ctrl.handleWindowBlur();
+    };
+    const onWindowPointerEnd = () => {
+      void ctrl.stopMove(false);
+    };
+    const onVisibilityChange = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        void ctrl.handleVisibilityChange("hidden");
+      } else {
+        void ctrl.handleVisibilityChange();
+      }
+    };
+
+    if (typeof window !== "undefined") {
+      window.addEventListener("blur", onWindowBlur);
+      window.addEventListener("pagehide", onWindowBlur);
+      window.addEventListener("pointerup", onWindowPointerEnd);
+      window.addEventListener("pointercancel", onWindowPointerEnd);
+    }
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
+
+    return () => {
+      if (typeof window !== "undefined") {
+        window.removeEventListener("blur", onWindowBlur);
+        window.removeEventListener("pagehide", onWindowBlur);
+        window.removeEventListener("pointerup", onWindowPointerEnd);
+        window.removeEventListener("pointercancel", onWindowPointerEnd);
+      }
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+      void ctrl.dispose();
+      if (lifecycleRef.current === ctrl) {
+        lifecycleRef.current = null;
+      }
+    };
+  }, [camera, ptzEnabled]);
+
+  if (!ptzEnabled) {
     return null;
   }
 
@@ -737,44 +1210,63 @@ export const TacticalPtzHudOverlay: React.FC<{
       ? ptzInfo.active_preset
       : cameraConfig?.onvif?.return_preset || null;
 
-  const sendMove = async (
-    dir: "left" | "right" | "up" | "down" | "zoom_in" | "zoom_out"
-  ) => {
-    const payload = buildPtzMovePayload(dir, 0.5, "continuous");
-    try {
-      await fetch(`/api/${encodeURIComponent(camera)}/ptz/move`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify(payload),
-      });
-      if (onPtzUpdate) {
-        onPtzUpdate(camera, {
-          ...(ptzInfo || { enabled: true }),
-          active_preset: null,
-        });
-      }
-    } catch {
-      // ignore transient network errors
-    }
+  const startContinuousMove = (dir: PtzMoveDirection) => {
+    void lifecycleRef.current?.startMove(dir);
   };
 
-  const sendStop = async () => {
-    try {
-      await fetch(`/api/${encodeURIComponent(camera)}/ptz/stop`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ pan_tilt: true, zoom: true }),
-      });
-    } catch {
-      // ignore
-    }
+  const stopContinuousMove = (force = false) => {
+    void lifecycleRef.current?.stopMove(force);
   };
+
+  const bindDirectionButtonProps = (
+    dir: PtzMoveDirection,
+    ariaLabel: string,
+    title: string
+  ) => ({
+    type: "button" as const,
+    className: "nvr-btn nvr-tile-action mono",
+    style: { height: 20, padding: "0 5px", fontSize: "var(--text-xs)" },
+    "aria-label": ariaLabel,
+    title,
+    onPointerDown: (e: React.PointerEvent<HTMLButtonElement>) => {
+      e.stopPropagation();
+      startContinuousMove(dir);
+    },
+    onPointerUp: (e: React.PointerEvent<HTMLButtonElement>) => {
+      e.stopPropagation();
+      stopContinuousMove(false);
+    },
+    onPointerCancel: (e: React.PointerEvent<HTMLButtonElement>) => {
+      e.stopPropagation();
+      stopContinuousMove(false);
+    },
+    onPointerLeave: (e: React.PointerEvent<HTMLButtonElement>) => {
+      e.stopPropagation();
+      stopContinuousMove(false);
+    },
+    onKeyDown: (e: React.KeyboardEvent<HTMLButtonElement>) => {
+      if ((e.key === " " || e.key === "Enter") && !e.repeat) {
+        e.preventDefault();
+        e.stopPropagation();
+        startContinuousMove(dir);
+      }
+    },
+    onKeyUp: (e: React.KeyboardEvent<HTMLButtonElement>) => {
+      if (e.key === " " || e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        stopContinuousMove(false);
+      }
+    },
+    onBlur: () => {
+      stopContinuousMove(false);
+    },
+  });
 
   const sendPreset = async (preset: string) => {
     const clean = preset.trim();
     if (!clean) return;
+    stopContinuousMove(false);
     try {
       const res = await fetch(`/api/${encodeURIComponent(camera)}/ptz/preset`, {
         method: "POST",
@@ -820,64 +1312,22 @@ export const TacticalPtzHudOverlay: React.FC<{
       >
         PTZ{activePreset ? `:${activePreset}` : ""}
       </span>
-      <button
-        type="button"
-        className="nvr-btn nvr-tile-action mono"
-        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-        aria-label={`PTZ Pan Left ${camera}`}
-        title="Pan Left"
-        onClick={() => sendMove("left")}
-      >
+      <button {...bindDirectionButtonProps("left", `PTZ Pan Left ${camera}`, "Pan Left")}>
         ◀
       </button>
-      <button
-        type="button"
-        className="nvr-btn nvr-tile-action mono"
-        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-        aria-label={`PTZ Tilt Up ${camera}`}
-        title="Tilt Up"
-        onClick={() => sendMove("up")}
-      >
+      <button {...bindDirectionButtonProps("up", `PTZ Tilt Up ${camera}`, "Tilt Up")}>
         ▲
       </button>
-      <button
-        type="button"
-        className="nvr-btn nvr-tile-action mono"
-        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-        aria-label={`PTZ Tilt Down ${camera}`}
-        title="Tilt Down"
-        onClick={() => sendMove("down")}
-      >
+      <button {...bindDirectionButtonProps("down", `PTZ Tilt Down ${camera}`, "Tilt Down")}>
         ▼
       </button>
-      <button
-        type="button"
-        className="nvr-btn nvr-tile-action mono"
-        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-        aria-label={`PTZ Pan Right ${camera}`}
-        title="Pan Right"
-        onClick={() => sendMove("right")}
-      >
+      <button {...bindDirectionButtonProps("right", `PTZ Pan Right ${camera}`, "Pan Right")}>
         ▶
       </button>
-      <button
-        type="button"
-        className="nvr-btn nvr-tile-action mono"
-        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-        aria-label={`PTZ Zoom In ${camera}`}
-        title="Zoom In"
-        onClick={() => sendMove("zoom_in")}
-      >
+      <button {...bindDirectionButtonProps("zoom_in", `PTZ Zoom In ${camera}`, "Zoom In")}>
         Z+
       </button>
-      <button
-        type="button"
-        className="nvr-btn nvr-tile-action mono"
-        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-        aria-label={`PTZ Zoom Out ${camera}`}
-        title="Zoom Out"
-        onClick={() => sendMove("zoom_out")}
-      >
+      <button {...bindDirectionButtonProps("zoom_out", `PTZ Zoom Out ${camera}`, "Zoom Out")}>
         Z-
       </button>
       <button
@@ -886,7 +1336,7 @@ export const TacticalPtzHudOverlay: React.FC<{
         style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
         aria-label={`PTZ Stop ${camera}`}
         title="Stop PTZ Movement"
-        onClick={() => sendStop()}
+        onClick={() => stopContinuousMove(true)}
       >
         ■
       </button>
@@ -898,7 +1348,7 @@ export const TacticalPtzHudOverlay: React.FC<{
           value={activePreset || ""}
           onChange={(e) => {
             if (e.target.value) {
-              sendPreset(e.target.value);
+              void sendPreset(e.target.value);
             }
           }}
         >
@@ -1011,7 +1461,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const [draggingAimCam, setDraggingAimCam] = useState<string | null>(null);
   const [mapFloorplanUrl, setMapFloorplanUrl] = useState<string>(() => {
     try {
-      return window.localStorage?.getItem("ninjanvr_floorplan_url") || "";
+      return sanitizeFloorplanUrl(
+        window.localStorage?.getItem("ninjanvr_floorplan_url") || ""
+      );
     } catch {
       return "";
     }
@@ -1074,8 +1526,67 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const [mapPlacements, setMapPlacements] = useState<Record<string, CameraMapPlacement>>({});
   const [mapSaveStatus, setMapSaveStatus] = useState<string | null>(null);
   const [ptzInfoByCam, setPtzInfoByCam] = useState<Record<string, CameraPtzInfoResponse>>({});
+  const [pttResetEpoch, setPttResetEpoch] = useState<number>(0);
+  const activePttCamerasRef = useRef<Set<string>>(new Set());
+  const ptzFetchedCamsRef = useRef<Set<string>>(new Set());
+  const mapSaveTimerRef = useRef<number | null>(null);
+  const activeFileReaderRef = useRef<FileReader | null>(null);
   const mapSvgRef = useRef<SVGSVGElement | null>(null);
   const floorplanFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (mapSaveTimerRef.current !== null) {
+        window.clearTimeout(mapSaveTimerRef.current);
+        mapSaveTimerRef.current = null;
+      }
+      if (activeFileReaderRef.current) {
+        try {
+          activeFileReaderRef.current.abort();
+        } catch {
+          // ignore
+        }
+        activeFileReaderRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const releaseActivePtt = () => {
+      if (activePttCamerasRef.current.size > 0) {
+        activePttCamerasRef.current.clear();
+        setPttResetEpoch((n) => n + 1);
+      }
+    };
+    const onVisibility = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        releaseActivePtt();
+      }
+    };
+    if (typeof window !== "undefined") {
+      window.addEventListener("blur", releaseActivePtt);
+      window.addEventListener("pagehide", releaseActivePtt);
+    }
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibility);
+    }
+    return () => {
+      if (typeof window !== "undefined") {
+        window.removeEventListener("blur", releaseActivePtt);
+        window.removeEventListener("pagehide", releaseActivePtt);
+      }
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibility);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (activePttCamerasRef.current.size > 0) {
+      activePttCamerasRef.current.clear();
+      setPttResetEpoch((n) => n + 1);
+    }
+  }, [liveLayout, selectedCamera, matrixPage, activeCameraGroup, timeShiftTs]);
 
   const snapVertices = useMemo(() => {
     const pts: Array<{ x: number; y: number }> = [];
@@ -1128,14 +1639,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     if (mapEditMode) return;
     const fp = config?.ui?.floorplan;
     if (fp) {
-      if (typeof fp.opacity === "number" && !Number.isNaN(fp.opacity)) {
+      if (typeof fp.opacity === "number" && Number.isFinite(fp.opacity)) {
         setFloorplanOpacity(Math.max(0.1, Math.min(1, fp.opacity)));
       }
-      if (typeof fp.width_m === "number" && fp.width_m >= 2) {
-        setFloorplanWidthM(fp.width_m);
+      if (typeof fp.width_m === "number" && Number.isFinite(fp.width_m) && fp.width_m >= 2) {
+        setFloorplanWidthM(Math.min(500, fp.width_m));
       }
-      if (typeof fp.height_m === "number" && fp.height_m >= 2) {
-        setFloorplanHeightM(fp.height_m);
+      if (typeof fp.height_m === "number" && Number.isFinite(fp.height_m) && fp.height_m >= 2) {
+        setFloorplanHeightM(Math.min(500, fp.height_m));
       }
       if (Array.isArray(fp.rooms)) {
         setFloorplanRooms(fp.rooms);
@@ -1144,28 +1655,36 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         setFloorplanWalls(fp.walls);
       }
       if (fp.background_data_url) {
-        setMapFloorplanUrl(fp.background_data_url);
+        const cleanBg = sanitizeFloorplanUrl(fp.background_data_url);
+        if (cleanBg) {
+          setMapFloorplanUrl(cleanBg);
+        }
       }
     }
   }, [config?.ui?.floorplan, mapEditMode]);
 
   useEffect(() => {
+    let cancelled = false;
     const cams = config?.cameras || {};
     for (const [camName, camCfg] of Object.entries(cams)) {
-      if (isCameraPtzEnabled(camCfg) && !ptzInfoByCam[camName]) {
+      if (isCameraPtzEnabled(camCfg) && !ptzFetchedCamsRef.current.has(camName)) {
+        ptzFetchedCamsRef.current.add(camName);
         fetch(`/api/${encodeURIComponent(camName)}/ptz/info`, {
           credentials: "include",
         })
           .then((res) => (res.ok ? res.json() : null))
           .then((data: CameraPtzInfoResponse | null) => {
-            if (data) {
+            if (!cancelled && data) {
               setPtzInfoByCam((prev) => ({ ...prev, [camName]: data }));
             }
           })
           .catch(() => {});
       }
     }
-  }, [config?.cameras, ptzInfoByCam]);
+    return () => {
+      cancelled = true;
+    };
+  }, [config?.cameras]);
 
   const handlePtzUpdate = (camName: string, nextInfo: CameraPtzInfoResponse) => {
     setPtzInfoByCam((prev) => ({
@@ -1190,13 +1709,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           Math.abs((cfgMap.y ?? 0.5) - 0.5) < 0.001 &&
           Math.abs(cfgMap.angle_deg ?? 0) < 0.001;
         if (cfgMap && !isUnconfiguredDefault) {
-          next[cam] = {
-            x: cfgMap.x ?? fallbackPlacement.x,
-            y: cfgMap.y ?? fallbackPlacement.y,
-            angle_deg: cfgMap.angle_deg ?? fallbackPlacement.angle_deg,
-            fov_deg: cfgMap.fov_deg ?? fallbackPlacement.fov_deg,
-            range: cfgMap.range ?? fallbackPlacement.range,
-          };
+          next[cam] = sanitizeMapPlacement(cfgMap, fallbackPlacement);
         } else if (!next[cam]) {
           next[cam] = fallbackPlacement;
         }
@@ -1208,13 +1721,24 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const handleFloorplanFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (activeFileReaderRef.current) {
+      try {
+        activeFileReaderRef.current.abort();
+      } catch {
+        // ignore
+      }
+    }
     const reader = new FileReader();
+    activeFileReaderRef.current = reader;
     reader.onload = () => {
+      activeFileReaderRef.current = null;
       if (typeof reader.result === "string") {
-        setMapFloorplanUrl(reader.result);
+        const cleanDataUrl = sanitizeFloorplanUrl(reader.result);
+        if (!cleanDataUrl) return;
+        setMapFloorplanUrl(cleanDataUrl);
         setMapEditMode(true);
         try {
-          window.localStorage?.setItem("ninjanvr_floorplan_url", reader.result);
+          window.localStorage?.setItem("ninjanvr_floorplan_url", cleanDataUrl);
         } catch {
           // ignore quota errors for large data URLs in localStorage; saved via config.yml
         }
@@ -1240,32 +1764,22 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       if (!cfgRes.ok) return;
       const currentCfg = await cfgRes.json();
       if (currentCfg && currentCfg.cameras) {
-        for (const [cam, placement] of Object.entries(mapPlacements)) {
-          if (currentCfg.cameras[cam]) {
-            currentCfg.cameras[cam].map = placement;
-          }
-        }
-        const uiPayload = {
-          ...(currentCfg.ui || {}),
-          floorplan: {
-            background_data_url: mapFloorplanUrl.trim()
-              ? mapFloorplanUrl.trim()
-              : null,
-            opacity: Number(floorplanOpacity.toFixed(2)),
-            width_m: Number(Math.max(2, Math.min(500, floorplanWidthM)).toFixed(2)),
-            height_m: Number(Math.max(2, Math.min(500, floorplanHeightM)).toFixed(2)),
-            rooms: floorplanRooms,
-            walls: floorplanWalls,
-          },
-        };
+        const payload = buildFloorplanSavePayload({
+          existingCameras: currentCfg.cameras,
+          mapPlacements,
+          existingUi: currentCfg.ui,
+          floorplanUrl: mapFloorplanUrl,
+          floorplanOpacity,
+          floorplanWidthM,
+          floorplanHeightM,
+          floorplanRooms,
+          floorplanWalls,
+        });
         const saveRes = await fetch("/api/config/structured?save_option=saveonly", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify({
-            cameras: currentCfg.cameras,
-            ui: uiPayload,
-          }),
+          body: JSON.stringify(payload),
         });
         if (saveRes.ok) {
           const savedData = await saveRes.json().catch(() => ({}));
@@ -1273,7 +1787,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             setConfig(savedData.config);
           }
           setMapSaveStatus("Saved to config.yml");
-          window.setTimeout(() => setMapSaveStatus(null), 2500);
+          if (mapSaveTimerRef.current !== null) {
+            window.clearTimeout(mapSaveTimerRef.current);
+          }
+          mapSaveTimerRef.current = window.setTimeout(() => {
+            mapSaveTimerRef.current = null;
+            setMapSaveStatus(null);
+          }, 2500);
         }
       }
     } catch {
@@ -1442,6 +1962,19 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     );
   }, [effectiveCameraGroups]);
 
+  const groupCamSet = useMemo(() => new Set(groupCams), [groupCams]);
+  const groupSpotlightTrail = useMemo(
+    () => spotlightTrail.filter((item) => groupCamSet.has(item.cam)),
+    [spotlightTrail, groupCamSet]
+  );
+  const groupSelectedCam = groupCamSet.has(selectedCamera)
+    ? selectedCamera
+    : groupCams[0] || selectedCamera;
+  const groupLockedSpotlightCam =
+    lockedSpotlightCam && groupCamSet.has(lockedSpotlightCam)
+      ? lockedSpotlightCam
+      : null;
+
   const spotlightPromotedCams = [...groupCams]
     .filter((cam) => nowTick - (lastActiveRef.current[cam] || 0) <= spotlightHoldSec)
     .sort(
@@ -1451,19 +1984,19 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     );
   const liveSpotlightHeroCam = resolveEffectiveSpotlightHeroCam({
     promotedCams: spotlightPromotedCams,
-    trailCams: spotlightTrail,
-    selectedCamera,
+    trailCams: groupSpotlightTrail,
+    selectedCamera: groupSelectedCam,
     fallbackCam: groupCams[0],
     timeShiftTs: null,
     lockedHeroCam: null,
   });
   const spotlightHeroCam = resolveEffectiveSpotlightHeroCam({
     promotedCams: spotlightPromotedCams,
-    trailCams: spotlightTrail,
-    selectedCamera,
+    trailCams: groupSpotlightTrail,
+    selectedCamera: groupSelectedCam,
     fallbackCam: groupCams[0],
     timeShiftTs,
-    lockedHeroCam: lockedSpotlightCam || liveSpotlightHeroCam,
+    lockedHeroCam: groupLockedSpotlightCam || liveSpotlightHeroCam,
   });
 
   useEffect(() => {
@@ -1904,9 +2437,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
           {unreviewedAlerts.slice(0, 14).map((item) => {
             const isHovered = hoveredAlertId === item.id;
-            const thumbSrc = item.thumb_path
-              ? item.thumb_path.replace(/^\/media\/[^/]+/, "")
-              : `/api/${item.camera}/latest.webp`;
+            const thumbSrc = resolveSafeAlertThumbSrc(
+              item.thumb_path,
+              item.camera
+            );
             const objs = item.data?.objects || ["person"];
 
             return (
@@ -2449,7 +2983,18 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         {t.live.returnToLive}
                       </button>
                     ) : !isTimeShifted ? (
-                      <PushToTalkButton camera={realCam} height={22} />
+                      <PushToTalkButton
+                        key={`ptt-${realCam}-${pttResetEpoch}`}
+                        camera={realCam}
+                        height={22}
+                        onStateChange={(state) => {
+                          if (state === "connecting" || state === "talking") {
+                            activePttCamerasRef.current.add(realCam);
+                          } else {
+                            activePttCamerasRef.current.delete(realCam);
+                          }
+                        }}
+                      />
                     ) : null}
                     {isGrid && (
                       <a
@@ -2609,12 +3154,17 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   }
                   onChange={(e) => {
                     if (e.target.value === "[Uploaded Floorplan Image]") return;
-                    setMapFloorplanUrl(e.target.value);
+                    const cleanUrl = sanitizeFloorplanUrl(e.target.value);
+                    setMapFloorplanUrl(cleanUrl);
                     try {
-                      window.localStorage?.setItem(
-                        "ninjanvr_floorplan_url",
-                        e.target.value
-                      );
+                      if (cleanUrl) {
+                        window.localStorage?.setItem(
+                          "ninjanvr_floorplan_url",
+                          cleanUrl
+                        );
+                      } else {
+                        window.localStorage?.removeItem("ninjanvr_floorplan_url");
+                      }
                     } catch {
                       // ignore
                     }
@@ -3803,9 +4353,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 </pattern>
               </defs>
               <rect width="1000" height="600" fill="url(#tacticalGrid)" />
-              {mapFloorplanUrl && (
+              {sanitizeFloorplanUrl(mapFloorplanUrl) && (
                 <image
-                  href={mapFloorplanUrl}
+                  href={sanitizeFloorplanUrl(mapFloorplanUrl)}
                   x="40"
                   y="30"
                   width="920"
@@ -5124,6 +5674,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           onFocusCamera={
             liveLayout !== "focus"
               ? (cam) => {
+                  triggerMainStreamPrewarmIfNeeded(
+                    resolveRealCameraSource(cam, config?.cameras || cameraNames),
+                    true
+                  );
                   setSelectedCamera(cam);
                   setLiveLayout("focus");
                 }
@@ -5132,7 +5686,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           segments={focusSegments}
           reviews={reviews}
           currentTs={timeShiftTs}
-          onSeek={(ts) => setTimeShiftTs(ts)}
+          onSeek={(ts) => setTimeShiftTs(sanitizeTimeShiftSeek(ts))}
           onExportRange={handleQuickExport}
           titlePrefix="TIMELINE"
         />

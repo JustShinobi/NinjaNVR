@@ -1,0 +1,596 @@
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, test } from "bun:test";
+import {
+  TacticalPtzHudOverlay,
+  buildFloorplanSavePayload,
+  buildFovConeSvgPath,
+  buildPtzMovePayload,
+  computeCameraAimFromTip,
+  computeDefaultMapPlacement,
+  computeFovConeTipSvgPoint,
+  computeRoomMetrics,
+  computeWallMetrics,
+  createPtzMoveLifecycle,
+  extractRoomBoundaryWalls,
+  mapClientPointToFloorplan,
+  normalizeFloorplanRoomRect,
+  resizeRoomByMeters,
+  resizeWallToLengthMeters,
+  resolveSafeAlertThumbSrc,
+  rotateWallToAngleDegrees,
+  sanitizeFloorplanUrl,
+  sanitizeMapPlacement,
+  sanitizeTimeShiftSeek,
+  snapFloorplanCoord,
+  snapWallEndpoint,
+} from "../views/LiveWorkspace";
+import {
+  assignSyncQuadSlot,
+  autoPickActiveCamerasAtTimestamp,
+  clampSyncTimestamp,
+  computeSyncVodWindow,
+  resolveSafeSyncThumbSrc,
+} from "../views/SyncWorkspace";
+import {
+  computePolygonSignedArea,
+  deduplicatePolygonVertices,
+  isNonDegeneratePolygon,
+  normalizeZonePoint,
+  sanitizeCameraGeometryDraft,
+  sanitizeConfigGeometryDraft,
+  sanitizeMaskPolygonsValue,
+  sanitizePolygonCoordString,
+  sanitizeStateRoiConfig,
+  sanitizeTripwireLine,
+} from "../views/ZonesWorkspace";
+import { CameraConfig, NinjaConfigResponse, ReviewItem } from "../types/nvr";
+
+function makeBaseCameraConfig(): CameraConfig {
+  return {
+    enabled: true,
+    detect: { enabled: true, width: 1920, height: 1080, fps: 5 },
+    motion: { enabled: true, threshold: 30, contour_area: 10, mask: [] },
+    zones: {},
+    record: { enabled: true },
+    snapshots: { enabled: true },
+  };
+}
+
+describe("Phase 4B LiveWorkspace — ONVIF PTZ Continuous Move/Stop Lifecycle & URL Encoding", () => {
+  test("createPtzMoveLifecycle stops camera on pointer release, window blur, visibilitychange, key blur, camera switch, and unmount", async () => {
+    const calls: Array<{ url: string; body: string; keepalive?: boolean }> = [];
+    const mockFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({
+        url: String(input),
+        body: typeof init?.body === "string" ? init.body : "",
+        keepalive: init?.keepalive,
+      });
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }) as typeof fetch;
+
+    const lifecycle = createPtzMoveLifecycle({
+      camera: "front/gate #1",
+      speed: 0.5,
+      fetchImpl: mockFetch,
+    });
+
+    // Idle blur or stopMove(false) does not spam /ptz/stop
+    await lifecycle.handleWindowBlur();
+    expect(calls.length).toBe(0);
+
+    // 1. Start move -> window blur sends encoded /ptz/stop with keepalive
+    await lifecycle.startMove("left");
+    expect(lifecycle.isMoving()).toBe(true);
+    expect(lifecycle.getActiveDirection()).toBe("left");
+    expect(calls.length).toBe(1);
+    expect(calls[0].url).toBe("/api/front%2Fgate%20%231/ptz/move");
+    expect(JSON.parse(calls[0].body)).toEqual({
+      mode: "continuous",
+      action: "left",
+      pan: -0.5,
+      tilt: 0,
+      zoom: 0,
+      speed: 0.5,
+    });
+
+    await lifecycle.handleWindowBlur();
+    expect(lifecycle.isMoving()).toBe(false);
+    expect(lifecycle.getActiveDirection()).toBeNull();
+    expect(calls.length).toBe(2);
+    expect(calls[1].url).toBe("/api/front%2Fgate%20%231/ptz/stop");
+    expect(calls[1].keepalive).toBe(true);
+    expect(JSON.parse(calls[1].body)).toEqual({ pan_tilt: true, zoom: true });
+
+    // 2. Start move -> document visibilitychange ('hidden') sends /ptz/stop
+    await lifecycle.startMove("up");
+    expect(lifecycle.isMoving()).toBe(true);
+    await lifecycle.handleVisibilityChange("hidden");
+    expect(lifecycle.isMoving()).toBe(false);
+    expect(calls.length).toBe(4);
+    expect(calls[3].url).toBe("/api/front%2Fgate%20%231/ptz/stop");
+
+    // 3. Start move -> keyboard focus loss (handleKeyBlur) sends /ptz/stop
+    await lifecycle.startMove("zoom_in");
+    expect(lifecycle.isMoving()).toBe(true);
+    await lifecycle.handleKeyBlur();
+    expect(lifecycle.isMoving()).toBe(false);
+    expect(calls.length).toBe(6);
+    expect(calls[5].url).toBe("/api/front%2Fgate%20%231/ptz/stop");
+
+    // 4. Start move -> switching camera sends /ptz/stop to the PREVIOUS camera before switching
+    await lifecycle.startMove("right");
+    expect(lifecycle.isMoving()).toBe(true);
+    await lifecycle.setCamera("backyard_ptz");
+    expect(lifecycle.isMoving()).toBe(false);
+    expect(lifecycle.getCamera()).toBe("backyard_ptz");
+    expect(calls.length).toBe(8);
+    expect(calls[7].url).toBe("/api/front%2Fgate%20%231/ptz/stop");
+
+    // 5. Start move on new camera -> dispose (unmount) sends /ptz/stop to backyard_ptz
+    await lifecycle.startMove("down");
+    expect(lifecycle.isMoving()).toBe(true);
+    await lifecycle.dispose();
+    expect(lifecycle.isMoving()).toBe(false);
+    expect(calls.length).toBe(10);
+    expect(calls[9].url).toBe("/api/backyard_ptz/ptz/stop");
+
+    // Further startMove calls after dispose are ignored
+    await lifecycle.startMove("left");
+    expect(calls.length).toBe(10);
+  });
+
+  test("buildPtzMovePayload sanitizes NaN and Infinity speeds safely", () => {
+    const nanPayload = buildPtzMovePayload("left", Number.NaN, "continuous");
+    expect(Number.isFinite(nanPayload.pan)).toBe(true);
+    expect(nanPayload.pan).toBe(-0.5);
+    expect(nanPayload.speed).toBe(0.5);
+
+    const infPayload = buildPtzMovePayload("zoom_in", Number.POSITIVE_INFINITY, "continuous");
+    expect(infPayload.zoom).toBe(0.5);
+    expect(infPayload.speed).toBe(0.5);
+  });
+
+  test("TacticalPtzHudOverlay safely transitions between non-PTZ and PTZ configs without hook order violation", () => {
+    const baseCam = makeBaseCameraConfig();
+    const htmlDisabled = renderToStaticMarkup(
+      React.createElement(TacticalPtzHudOverlay, {
+        camera: "cam_1",
+        cameraConfig: baseCam,
+        ptzInfo: null,
+      })
+    );
+    expect(htmlDisabled).toBe("");
+
+    const htmlEnabled = renderToStaticMarkup(
+      React.createElement(TacticalPtzHudOverlay, {
+        camera: "cam_1",
+        cameraConfig: { ...baseCam, onvif: { host: "192.0.2.55", port: 80 } },
+        ptzInfo: { enabled: true, active_preset: "gate" },
+      })
+    );
+    expect(htmlEnabled).toContain("PTZ:gate");
+  });
+});
+
+describe("Phase 4B LiveWorkspace — Tactical Floorplan CAD Math, XSS URL Sanitization & Config Save Payload", () => {
+  test("floorplan CAD math functions guard against NaN, Infinity, and zero dimensions", () => {
+    const placement = computeDefaultMapPlacement(Number.NaN, Number.NaN);
+    expect(Number.isFinite(placement.x)).toBe(true);
+    expect(Number.isFinite(placement.y)).toBe(true);
+    expect(Number.isFinite(placement.range)).toBe(true);
+
+    const aim = computeCameraAimFromTip(Number.NaN, 0.5, Number.POSITIVE_INFINITY, 0.5);
+    expect(Number.isFinite(aim.angle_deg)).toBe(true);
+    expect(Number.isFinite(aim.range)).toBe(true);
+
+    const tip = computeFovConeTipSvgPoint(Number.NaN, Number.NaN, Number.NaN, Number.NaN);
+    expect(Number.isFinite(tip.x)).toBe(true);
+    expect(Number.isFinite(tip.y)).toBe(true);
+
+    const conePath = buildFovConeSvgPath(500, 300, Number.NaN, 220, Number.NaN);
+    expect(conePath).not.toContain("NaN");
+    // Even if fovDeg > 180, half is clamped to 89 deg (178 deg total < 180), so large-arc-flag must be 0
+    expect(conePath).toContain(" 0 0 1 ");
+
+    const mappedPt = mapClientPointToFloorplan(
+      Number.NaN,
+      200,
+      { left: 0, top: 0, width: Number.NaN, height: 0 },
+      0,
+      0
+    );
+    expect(mappedPt).toEqual({ x: 0.5, y: 0.5 });
+
+    expect(snapFloorplanCoord(Number.NaN, Number.NaN)).toBe(0);
+    expect(snapFloorplanCoord(0.5, 0)).toBe(0.5);
+
+    const rect = normalizeFloorplanRoomRect(
+      Number.NaN,
+      Number.NEGATIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+      Number.NaN
+    );
+    expect(Number.isFinite(rect.x)).toBe(true);
+    expect(Number.isFinite(rect.y)).toBe(true);
+    expect(Number.isFinite(rect.w)).toBe(true);
+    expect(Number.isFinite(rect.h)).toBe(true);
+
+    const rmMetrics = computeRoomMetrics(
+      { x: Number.NaN, y: 0.1, w: Number.NaN, h: 0.3 },
+      Number.NaN,
+      0
+    );
+    expect(Number.isFinite(rmMetrics.areaSqM)).toBe(true);
+
+    const resizedRoom = resizeRoomByMeters(
+      { id: "r1", label: "SALA", x: 0.1, y: 0.1, w: 0.2, h: 0.2 },
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      0,
+      Number.NaN
+    );
+    expect(Number.isFinite(resizedRoom.w)).toBe(true);
+    expect(Number.isFinite(resizedRoom.h)).toBe(true);
+
+    const wallMetrics = computeWallMetrics(
+      [Number.NaN, 0.2, Number.POSITIVE_INFINITY, 0.2],
+      Number.NaN,
+      0
+    );
+    expect(Number.isFinite(wallMetrics.lengthM)).toBe(true);
+    expect(Number.isFinite(wallMetrics.angleDeg)).toBe(true);
+
+    const resizedWall = resizeWallToLengthMeters(
+      [0.2, 0.2, 0.2, 0.2],
+      Number.NaN,
+      0,
+      Number.NaN
+    );
+    expect(resizedWall.every((n) => Number.isFinite(n) && n >= 0 && n <= 1)).toBe(true);
+
+    const rotatedWall = rotateWallToAngleDegrees(
+      [0.2, 0.2, 0.4, 0.2],
+      Number.NaN,
+      0,
+      Number.NaN
+    );
+    expect(rotatedWall.every((n) => Number.isFinite(n) && n >= 0 && n <= 1)).toBe(true);
+
+    const snappedEnd = snapWallEndpoint(0.1, 0.1, Number.NaN, Number.POSITIVE_INFINITY, {
+      snapStep: Number.NaN,
+      floorplanWidthM: 0,
+      floorplanHeightM: Number.NaN,
+    });
+    expect(Number.isFinite(snappedEnd.x)).toBe(true);
+    expect(Number.isFinite(snappedEnd.y)).toBe(true);
+
+    const boundaryWalls = extractRoomBoundaryWalls({
+      id: "r1",
+      label: "SALA",
+      x: Number.NaN,
+      y: 0.1,
+      w: Number.NaN,
+      h: 0.2,
+    });
+    expect(boundaryWalls.length).toBe(4);
+    expect(
+      boundaryWalls.every((w) => w.points.every((n) => Number.isFinite(n)))
+    ).toBe(true);
+  });
+
+  test("sanitizeFloorplanUrl blocks javascript:, data:text/html, protocol-relative, and scripted SVG data URLs", () => {
+    expect(sanitizeFloorplanUrl("javascript:alert(1)")).toBe("");
+    expect(sanitizeFloorplanUrl("JAVASCRIPT:fetch('//evil')")).toBe("");
+    expect(sanitizeFloorplanUrl("data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==")).toBe("");
+    expect(sanitizeFloorplanUrl("//evil.example/floorplan.svg")).toBe("");
+
+    // SVG data URL with embedded <script> is rejected
+    const maliciousSvgB64 = globalThis.btoa(
+      '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+    );
+    expect(sanitizeFloorplanUrl(`data:image/svg+xml;base64,${maliciousSvgB64}`)).toBe("");
+
+    // Clean SVG data URL and PNG data URL and relative/https URLs are allowed
+    const cleanSvgB64 = globalThis.btoa(
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100"/></svg>'
+    );
+    expect(sanitizeFloorplanUrl(`data:image/svg+xml;base64,${cleanSvgB64}`)).toBe(
+      `data:image/svg+xml;base64,${cleanSvgB64}`
+    );
+    expect(sanitizeFloorplanUrl("data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==")).toBe(
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+    );
+    expect(sanitizeFloorplanUrl("/assets/floorplan.png")).toBe("/assets/floorplan.png");
+    expect(sanitizeFloorplanUrl("https://example.com/map.png")).toBe("https://example.com/map.png");
+  });
+
+  test("buildFloorplanSavePayload emits map-only camera patches without clobbering zones/masks and strips simulated cameras", () => {
+    const existingCameras: Record<string, CameraConfig> = {
+      front_door: {
+        ...makeBaseCameraConfig(),
+        privacy_mask: ["0.100,0.100,0.400,0.100,0.400,0.400"],
+        zones: {
+          porch: { coordinates: "0.200,0.200,0.600,0.200,0.600,0.600" },
+        },
+      },
+    };
+    const mapPlacements = {
+      front_door: {
+        x: 0.35,
+        y: 0.45,
+        angle_deg: 135,
+        fov_deg: 95,
+        range: 0.3,
+      },
+      front_door_sim_01: {
+        x: 0.8,
+        y: 0.8,
+        angle_deg: 0,
+        fov_deg: 90,
+        range: 0.25,
+      },
+    };
+
+    const payload = buildFloorplanSavePayload({
+      existingCameras,
+      mapPlacements,
+      existingUi: { theme: "dark", high_contrast: true },
+      floorplanUrl: "javascript:alert(1)",
+      floorplanOpacity: Number.NaN,
+      floorplanWidthM: 25,
+      floorplanHeightM: 15,
+      floorplanRooms: [
+        { id: "r1", label: "SALA", x: -0.2, y: 0.1, w: 0.5, h: 0.4 },
+      ],
+      floorplanWalls: [
+        { points: [-0.5, 0.2, 1.5, 0.2], kind: "wall" },
+      ],
+    });
+
+    // Simulated camera is not injected; real camera patch contains ONLY `map` so zones/privacy_mask are never clobbered
+    expect(Object.keys(payload.cameras)).toEqual(["front_door"]);
+    expect(Object.keys(payload.cameras.front_door)).toEqual(["map"]);
+    expect(payload.cameras.front_door.map).toEqual({
+      x: 0.35,
+      y: 0.45,
+      angle_deg: 135,
+      fov_deg: 95,
+      range: 0.3,
+    });
+
+    const fp = payload.ui.floorplan as {
+      background_data_url: string | null;
+      opacity: number;
+      rooms: Array<{ x: number; y: number; w: number; h: number }>;
+      walls: Array<{ points: [number, number, number, number] }>;
+    };
+    expect(fp.background_data_url).toBeNull();
+    expect(fp.opacity).toBe(0.45);
+    expect(fp.rooms[0].x).toBe(0);
+    expect(fp.walls[0].points).toEqual([0, 0.2, 1, 0.2]);
+  });
+
+  test("resolveSafeAlertThumbSrc and sanitizeTimeShiftSeek encode camera names and bound seeks", () => {
+    expect(resolveSafeAlertThumbSrc("", "front door#1")).toBe(
+      "/api/front%20door%231/latest.webp"
+    );
+    expect(resolveSafeAlertThumbSrc("javascript:alert(1)", "cam_a")).toBe(
+      "/api/cam_a/latest.webp"
+    );
+    expect(resolveSafeAlertThumbSrc("//evil.com/x.webp", "cam_a")).toBe(
+      "/api/cam_a/latest.webp"
+    );
+    expect(
+      resolveSafeAlertThumbSrc("/media/nvr/clips/review/thumb-1.webp", "cam_a")
+    ).toBe("/clips/review/thumb-1.webp");
+
+    const now = 1700001000;
+    expect(sanitizeTimeShiftSeek(null, now)).toBeNull();
+    expect(sanitizeTimeShiftSeek(Number.NaN, now)).toBeNull();
+    expect(sanitizeTimeShiftSeek(-50, now)).toBeNull();
+    // Seeking into the future or within 2s of live edge returns to live (null)
+    expect(sanitizeTimeShiftSeek(now + 100, now)).toBeNull();
+    expect(sanitizeTimeShiftSeek(now - 1, now)).toBeNull();
+    expect(sanitizeTimeShiftSeek(now - 30.8, now)).toBe(now - 31);
+  });
+});
+
+describe("Phase 4B SyncWorkspace — Bounded Time Scrubbing, Safe Thumbnails & Quad Slot Validation", () => {
+  test("clampSyncTimestamp and computeSyncVodWindow prevent future or NaN VOD manifest requests", () => {
+    const now = 1700005000;
+    expect(clampSyncTimestamp(Number.NaN, now)).toBe(now - 30);
+    expect(clampSyncTimestamp(-100, now)).toBe(now - 30);
+    expect(clampSyncTimestamp(now + 600, now)).toBe(now - 5);
+    expect(clampSyncTimestamp(now - 60, now)).toBe(now - 60);
+
+    // Near live edge, endTime is capped at `now` while guaranteeing at least 12s window
+    const nearEdge = computeSyncVodWindow(now - 20, 120, now);
+    expect(nearEdge.startTime).toBe(now - 20);
+    expect(nearEdge.endTime).toBe(now);
+
+    // Historical timestamp gets full 120s window
+    const historical = computeSyncVodWindow(now - 500, 120, now);
+    expect(historical.startTime).toBe(now - 500);
+    expect(historical.endTime).toBe(now - 380);
+  });
+
+  test("assignSyncQuadSlot and autoPickActiveCamerasAtTimestamp reject unknown cameras and NaN inputs", () => {
+    const cams = ["cam_1", "cam_2", "cam_3", "cam_4"];
+    expect(assignSyncQuadSlot(cams, Number.NaN, "cam_3", cams)).toEqual([
+      "cam_3",
+      "cam_2",
+      "cam_1",
+      "cam_4",
+    ]);
+    // Unknown camera is rejected
+    expect(assignSyncQuadSlot(cams, 0, "unknown_cam", cams)).toEqual(cams);
+
+    const reviews: ReviewItem[] = [
+      {
+        id: "rev_nan",
+        camera: "cam_2",
+        start_time: Number.NaN,
+        end_time: Number.NaN,
+        severity: "alert",
+        thumb_path: "",
+        has_been_reviewed: false,
+        data: { objects: ["person"] },
+      },
+      {
+        id: "rev_ok",
+        camera: "cam_3",
+        start_time: 1700000000,
+        end_time: 1700000010,
+        severity: "alert",
+        thumb_path: "",
+        has_been_reviewed: false,
+        data: { objects: ["person"] },
+      },
+    ];
+    expect(
+      autoPickActiveCamerasAtTimestamp(cams, reviews, 1700000000, 60)[0]
+    ).toBe("cam_3");
+    expect(
+      autoPickActiveCamerasAtTimestamp(cams, reviews, Number.NaN, Number.NaN)
+    ).toEqual(cams);
+
+    expect(resolveSafeSyncThumbSrc("", "cam/1?x=2")).toBe(
+      "/api/cam%2F1%3Fx%3D2/latest.webp"
+    );
+  });
+});
+
+describe("Phase 4B ZonesWorkspace — Pixel-to-Normalized Clamping & Degenerate Polygon Rejection", () => {
+  test("normalizeZonePoint converts pixel coordinates to [0..1] and clamps out-of-bounds values", () => {
+    // Normalized coordinates stay normalized
+    expect(normalizeZonePoint([0.25, 0.75], 1920, 1080)).toEqual([0.25, 0.75]);
+    // Pixel coordinates (960, 540) on 1920x1080 normalize to (0.5, 0.5)
+    expect(normalizeZonePoint([960, 540], 1920, 1080)).toEqual([0.5, 0.5]);
+    // Out-of-bounds and NaN values clamp safely into [0, 1]
+    expect(normalizeZonePoint([-0.4, 2500], 1920, 1080)).toEqual([0, 1]);
+    expect(normalizeZonePoint([Number.NaN, Number.POSITIVE_INFINITY], 1920, 1080)).toEqual([
+      0, 0,
+    ]);
+  });
+
+  test("isNonDegeneratePolygon and sanitizePolygonCoordString reject < 3 points, duplicate vertices, and collinear polygons", () => {
+    // 3 identical points (user triple-clicked the same spot) -> degenerate!
+    const samePoint: Array<[number, number]> = [
+      [0.5, 0.5],
+      [0.5, 0.5],
+      [0.5, 0.5],
+    ];
+    expect(deduplicatePolygonVertices(samePoint).length).toBe(1);
+    expect(isNonDegeneratePolygon(samePoint)).toBe(false);
+    expect(sanitizePolygonCoordString("0.5,0.5,0.5,0.5,0.5,0.5")).toBeNull();
+
+    // 3 collinear horizontal points -> zero shoelace area -> degenerate!
+    const collinear: Array<[number, number]> = [
+      [0.1, 0.3],
+      [0.4, 0.3],
+      [0.8, 0.3],
+    ];
+    expect(computePolygonSignedArea(collinear)).toBe(0);
+    expect(isNonDegeneratePolygon(collinear)).toBe(false);
+    expect(sanitizePolygonCoordString("0.1,0.3,0.4,0.3,0.8,0.3")).toBeNull();
+
+    // 3 collinear diagonal points -> zero shoelace area -> degenerate!
+    expect(sanitizePolygonCoordString("0.1,0.1,0.2,0.2,0.3,0.3")).toBeNull();
+
+    // Valid triangle in normalized space
+    expect(sanitizePolygonCoordString("0.1,0.1,0.6,0.1,0.6,0.6")).toBe(
+      "0.100,0.100,0.600,0.100,0.600,0.600"
+    );
+
+    // Valid rectangle in pixel space (1280x720) -> normalized to [0..1]
+    expect(
+      sanitizePolygonCoordString("0,0,640,0,640,360,0,360", 1280, 720)
+    ).toBe("0.000,0.000,0.500,0.000,0.500,0.500,0.000,0.500");
+  });
+
+  test("sanitizeCameraGeometryDraft and sanitizeConfigGeometryDraft strip degenerate privacy_mask, motion_mask, zones, and tripwires while normalizing pixel coordinates", () => {
+    const camCfg: CameraConfig = {
+      ...makeBaseCameraConfig(),
+      detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+      privacy_mask: [
+        "0.2,0.2,0.2,0.2,0.2,0.2", // degenerate same-point click -> must be stripped so backend FFmpeg drawbox does not fail closed!
+        "0,0,640,0,640,360,0,360", // pixel coordinates -> normalized to 0..0.5
+      ],
+      motion: {
+        enabled: true,
+        threshold: 30,
+        contour_area: 10,
+        mask: ["0.1,0.1,0.2,0.2,0.3,0.3"], // collinear -> stripped
+      },
+      zones: {
+        valid_zone: {
+          coordinates: "0.1,0.1,0.5,0.1,0.5,0.5",
+        },
+        degenerate_zone: {
+          coordinates: "0.4,0.4,0.4,0.4,0.4,0.4",
+        },
+      },
+      lines: {
+        zero_line: {
+          points: [0.3, 0.3, 0.3, 0.3], // zero-length tripwire -> stripped
+          direction: "any",
+        },
+        pixel_line: {
+          points: [0, 360, 1280, 360], // pixel coordinates -> normalized
+          direction: "a_to_b",
+        },
+      },
+      state_rois: {
+        gate_roi: {
+          crop: [640, 360, 320, 180], // reversed pixel crop -> normalized & ordered [0.25, 0.25, 0.5, 0.5]
+          classes: ["closed", "open"],
+        },
+      },
+    };
+
+    const { cleaned, rejectedCount } = sanitizeCameraGeometryDraft(camCfg);
+    expect(rejectedCount).toBe(4);
+    expect(cleaned.privacy_mask).toEqual([
+      "0.000,0.000,0.500,0.000,0.500,0.500,0.000,0.500",
+    ]);
+    expect(cleaned.motion.mask).toEqual([]);
+    expect(Object.keys(cleaned.zones)).toEqual(["valid_zone"]);
+    expect(Object.keys(cleaned.lines || {})).toEqual(["pixel_line"]);
+    expect(cleaned.lines?.pixel_line.points).toEqual([0, 0.5, 1, 0.5]);
+    expect(cleaned.state_rois?.gate_roi.crop).toEqual([0.25, 0.25, 0.5, 0.5]);
+
+    // Also verify sanitizeConfigGeometryDraft across full NinjaConfigResponse
+    const fullCfg: NinjaConfigResponse = {
+      version: "0.9.0",
+      safe_mode: false,
+      mqtt: {
+        enabled: false,
+        host: "localhost",
+        port: 1883,
+        topic_prefix: "nvr",
+        client_id: "ninjanvr",
+        stats_interval: 60,
+      },
+      cameras: { front_door: camCfg },
+    };
+    const fullRes = sanitizeConfigGeometryDraft(fullCfg);
+    expect(fullRes.rejectedCount).toBe(4);
+    expect(fullRes.cleaned.cameras.front_door.privacy_mask).toEqual([
+      "0.000,0.000,0.500,0.000,0.500,0.500,0.000,0.500",
+    ]);
+
+    // Verify individual helpers
+    expect(sanitizeMaskPolygonsValue("0.1,0.1,0.1,0.1,0.1,0.1")).toEqual({
+      sanitized: [],
+      rejectedCount: 1,
+    });
+    expect(
+      sanitizeTripwireLine({ points: [0.5, 0.5, 0.5, 0.5], direction: "any" })
+    ).toBeNull();
+    expect(
+      sanitizeStateRoiConfig({ crop: [0.5, 0.5, 0.5, 0.5], classes: ["closed", "open"] })
+        .crop
+    ).toEqual([0.5, 0.5, 0.51, 0.51]);
+  });
+});

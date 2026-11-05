@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   Camera,
   CheckCircle2,
@@ -13,7 +13,13 @@ import {
   Sliders,
 } from "lucide-react";
 import { useI18n } from "../i18n";
-import { FfprobeItem, NinjaConfigResponse } from "../types/nvr";
+import {
+  CameraConfig,
+  FfprobeItem,
+  LineConfig,
+  NinjaConfigResponse,
+  StateRoiConfig,
+} from "../types/nvr";
 import { buildCleanYamlFromDraft } from "../utils/configYaml";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 import {
@@ -39,6 +45,347 @@ export type SettingsCategory =
   | "recording"
   | "security"
   | "yaml";
+
+export function normalizeZonePoint(
+  pt: [number, number],
+  detectWidth: number = 1280,
+  detectHeight: number = 720
+): [number, number] {
+  const safeW =
+    Number.isFinite(detectWidth) && detectWidth > 1 ? detectWidth : 1280;
+  const safeH =
+    Number.isFinite(detectHeight) && detectHeight > 1 ? detectHeight : 720;
+  const rawX = Number.isFinite(pt?.[0]) ? pt[0] : 0;
+  const rawY = Number.isFinite(pt?.[1]) ? pt[1] : 0;
+  const isPixelSpace = rawX > 1.0 || rawY > 1.0;
+  const normX = isPixelSpace ? rawX / safeW : rawX;
+  const normY = isPixelSpace ? rawY / safeH : rawY;
+  return [
+    Number(Math.max(0, Math.min(1, normX)).toFixed(4)),
+    Number(Math.max(0, Math.min(1, normY)).toFixed(4)),
+  ];
+}
+
+export function deduplicatePolygonVertices(
+  points: Array<[number, number]>,
+  minVertexDist: number = 1e-4
+): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const pt of points) {
+    if (!Array.isArray(pt) || pt.length < 2) continue;
+    if (!Number.isFinite(pt[0]) || !Number.isFinite(pt[1])) continue;
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      Math.hypot(pt[0] - prev[0], pt[1] - prev[1]) <= minVertexDist
+    ) {
+      continue;
+    }
+    out.push([pt[0], pt[1]]);
+  }
+  if (out.length >= 2) {
+    const first = out[0];
+    const last = out[out.length - 1];
+    if (Math.hypot(first[0] - last[0], first[1] - last[1]) <= minVertexDist) {
+      out.pop();
+    }
+  }
+  return out;
+}
+
+export function computePolygonSignedArea(
+  points: Array<[number, number]>
+): number {
+  if (!Array.isArray(points) || points.length < 3) return 0;
+  let sum = 0;
+  for (let i = 0; i < points.length; i++) {
+    const [x1, y1] = points[i];
+    const [x2, y2] = points[(i + 1) % points.length];
+    if (
+      !Number.isFinite(x1) ||
+      !Number.isFinite(y1) ||
+      !Number.isFinite(x2) ||
+      !Number.isFinite(y2)
+    ) {
+      return 0;
+    }
+    sum += x1 * y2 - x2 * y1;
+  }
+  return sum / 2;
+}
+
+export function isNonDegeneratePolygon(
+  points: Array<[number, number]>,
+  minArea: number = 1e-5,
+  minSpan: number = 0.002
+): boolean {
+  const deduped = deduplicatePolygonVertices(points);
+  if (deduped.length < 3) return false;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const [x, y] of deduped) {
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  }
+  if (maxX - minX < minSpan || maxY - minY < minSpan) {
+    return false;
+  }
+  return Math.abs(computePolygonSignedArea(deduped)) >= minArea;
+}
+
+export function sanitizePolygonCoordString(
+  coordStr: string,
+  detectWidth: number = 1280,
+  detectHeight: number = 720
+): string | null {
+  if (typeof coordStr !== "string") return null;
+  const trimmed = coordStr.trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split(",").map((s) => Number(s.trim()));
+  if (
+    parts.length < 6 ||
+    parts.length % 2 !== 0 ||
+    parts.some((n) => !Number.isFinite(n))
+  ) {
+    return null;
+  }
+  const safeW =
+    Number.isFinite(detectWidth) && detectWidth > 1 ? detectWidth : 1280;
+  const safeH =
+    Number.isFinite(detectHeight) && detectHeight > 1 ? detectHeight : 720;
+  const isPixelSpace = parts.some((v) => v > 1.0);
+  const rawPts: Array<[number, number]> = [];
+  for (let i = 0; i < parts.length; i += 2) {
+    const nx = isPixelSpace ? parts[i] / safeW : parts[i];
+    const ny = isPixelSpace ? parts[i + 1] / safeH : parts[i + 1];
+    rawPts.push([
+      Number(Math.max(0, Math.min(1, nx)).toFixed(3)),
+      Number(Math.max(0, Math.min(1, ny)).toFixed(3)),
+    ]);
+  }
+  const deduped = deduplicatePolygonVertices(rawPts);
+  if (!isNonDegeneratePolygon(deduped)) {
+    return null;
+  }
+  return deduped.map(([x, y]) => `${x.toFixed(3)},${y.toFixed(3)}`).join(",");
+}
+
+export function sanitizeMaskPolygonsValue(
+  maskVal: unknown,
+  detectWidth: number = 1280,
+  detectHeight: number = 720
+): { sanitized: unknown; rejectedCount: number } {
+  if (maskVal === null || maskVal === undefined) {
+    return { sanitized: maskVal, rejectedCount: 0 };
+  }
+  if (typeof maskVal === "string") {
+    if (!maskVal.trim()) return { sanitized: "", rejectedCount: 0 };
+    const clean = sanitizePolygonCoordString(maskVal, detectWidth, detectHeight);
+    if (!clean) return { sanitized: [], rejectedCount: 1 };
+    return { sanitized: clean, rejectedCount: 0 };
+  }
+  if (Array.isArray(maskVal)) {
+    if (maskVal.length === 0) return { sanitized: [], rejectedCount: 0 };
+    let rejectedCount = 0;
+    const out: string[] = [];
+    for (const item of maskVal) {
+      if (typeof item === "string") {
+        if (!item.trim()) continue;
+        const clean = sanitizePolygonCoordString(
+          item,
+          detectWidth,
+          detectHeight
+        );
+        if (clean) {
+          out.push(clean);
+        } else {
+          rejectedCount += 1;
+        }
+      } else if (Array.isArray(item)) {
+        const flat = item.flat().map((v) => Number(v));
+        const clean = sanitizePolygonCoordString(
+          flat.join(","),
+          detectWidth,
+          detectHeight
+        );
+        if (clean) {
+          out.push(clean);
+        } else {
+          rejectedCount += 1;
+        }
+      }
+    }
+    return { sanitized: out, rejectedCount };
+  }
+  return { sanitized: maskVal, rejectedCount: 0 };
+}
+
+export function sanitizeTripwireLine(
+  line: LineConfig,
+  detectWidth: number = 1280,
+  detectHeight: number = 720
+): LineConfig | null {
+  if (!line || !Array.isArray(line.points) || line.points.length < 4) {
+    return null;
+  }
+  const [x1, y1, x2, y2] = line.points;
+  if (
+    !Number.isFinite(x1) ||
+    !Number.isFinite(y1) ||
+    !Number.isFinite(x2) ||
+    !Number.isFinite(y2)
+  ) {
+    return null;
+  }
+  const safeW =
+    Number.isFinite(detectWidth) && detectWidth > 1 ? detectWidth : 1280;
+  const safeH =
+    Number.isFinite(detectHeight) && detectHeight > 1 ? detectHeight : 720;
+  const isPixelSpace = x1 > 1.0 || y1 > 1.0 || x2 > 1.0 || y2 > 1.0;
+  const nx1 = Number(
+    Math.max(0, Math.min(1, isPixelSpace ? x1 / safeW : x1)).toFixed(4)
+  );
+  const ny1 = Number(
+    Math.max(0, Math.min(1, isPixelSpace ? y1 / safeH : y1)).toFixed(4)
+  );
+  const nx2 = Number(
+    Math.max(0, Math.min(1, isPixelSpace ? x2 / safeW : x2)).toFixed(4)
+  );
+  const ny2 = Number(
+    Math.max(0, Math.min(1, isPixelSpace ? y2 / safeH : y2)).toFixed(4)
+  );
+  if (Math.hypot(nx2 - nx1, ny2 - ny1) < 0.005) {
+    return null;
+  }
+  return {
+    ...line,
+    points: [nx1, ny1, nx2, ny2],
+  };
+}
+
+export function sanitizeStateRoiConfig(
+  roi: StateRoiConfig,
+  detectWidth: number = 1280,
+  detectHeight: number = 720
+): StateRoiConfig {
+  const rawCrop = Array.isArray(roi?.crop) ? roi.crop : [0.25, 0.25, 0.75, 0.75];
+  const [rx1, ry1, rx2, ry2] = [
+    Number.isFinite(rawCrop[0]) ? rawCrop[0] : 0.25,
+    Number.isFinite(rawCrop[1]) ? rawCrop[1] : 0.25,
+    Number.isFinite(rawCrop[2]) ? rawCrop[2] : 0.75,
+    Number.isFinite(rawCrop[3]) ? rawCrop[3] : 0.75,
+  ];
+  const safeW =
+    Number.isFinite(detectWidth) && detectWidth > 1 ? detectWidth : 1280;
+  const safeH =
+    Number.isFinite(detectHeight) && detectHeight > 1 ? detectHeight : 720;
+  const isPixelSpace = rx1 > 1.0 || ry1 > 1.0 || rx2 > 1.0 || ry2 > 1.0;
+  const cx1 = Math.max(0, Math.min(1, isPixelSpace ? rx1 / safeW : rx1));
+  const cy1 = Math.max(0, Math.min(1, isPixelSpace ? ry1 / safeH : ry1));
+  const cx2 = Math.max(0, Math.min(1, isPixelSpace ? rx2 / safeW : rx2));
+  const cy2 = Math.max(0, Math.min(1, isPixelSpace ? ry2 / safeH : ry2));
+  const minX = Math.min(cx1, cx2);
+  const minY = Math.min(cy1, cy2);
+  const maxX = Math.max(cx1, cx2);
+  const maxY = Math.max(cy1, cy2);
+  const spanX = Math.max(0.01, maxX - minX);
+  const spanY = Math.max(0.01, maxY - minY);
+  const x1 = Number(Math.max(0, Math.min(1 - spanX, minX)).toFixed(4));
+  const y1 = Number(Math.max(0, Math.min(1 - spanY, minY)).toFixed(4));
+  const x2 = Number(Math.min(1, x1 + spanX).toFixed(4));
+  const y2 = Number(Math.min(1, y1 + spanY).toFixed(4));
+  return {
+    ...roi,
+    crop: [x1, y1, x2, y2],
+  };
+}
+
+export function sanitizeCameraGeometryDraft(camCfg: CameraConfig): {
+  cleaned: CameraConfig;
+  rejectedCount: number;
+} {
+  const detW = camCfg?.detect?.width || 1280;
+  const detH = camCfg?.detect?.height || 720;
+  let rejectedCount = 0;
+  const cleaned: CameraConfig = { ...camCfg };
+
+  if (cleaned.zones && typeof cleaned.zones === "object") {
+    const nextZones: Record<string, CameraConfig["zones"][string]> = {};
+    for (const [zName, zCfg] of Object.entries(cleaned.zones)) {
+      const cleanCoords = sanitizePolygonCoordString(
+        zCfg?.coordinates || "",
+        detW,
+        detH
+      );
+      if (cleanCoords) {
+        nextZones[zName] = { ...zCfg, coordinates: cleanCoords };
+      } else {
+        rejectedCount += 1;
+      }
+    }
+    cleaned.zones = nextZones;
+  }
+
+  if (cleaned.motion) {
+    const mRes = sanitizeMaskPolygonsValue(cleaned.motion.mask, detW, detH);
+    rejectedCount += mRes.rejectedCount;
+    cleaned.motion = { ...cleaned.motion, mask: mRes.sanitized };
+  }
+
+  if (cleaned.objects && cleaned.objects.mask !== undefined) {
+    const oRes = sanitizeMaskPolygonsValue(cleaned.objects.mask, detW, detH);
+    rejectedCount += oRes.rejectedCount;
+    cleaned.objects = { ...cleaned.objects, mask: oRes.sanitized };
+  }
+
+  if (cleaned.privacy_mask !== undefined) {
+    const pRes = sanitizeMaskPolygonsValue(cleaned.privacy_mask, detW, detH);
+    rejectedCount += pRes.rejectedCount;
+    cleaned.privacy_mask = pRes.sanitized;
+  }
+
+  if (cleaned.lines && typeof cleaned.lines === "object") {
+    const nextLines: Record<string, LineConfig> = {};
+    for (const [lName, lCfg] of Object.entries(cleaned.lines)) {
+      const cleanLine = sanitizeTripwireLine(lCfg, detW, detH);
+      if (cleanLine) {
+        nextLines[lName] = cleanLine;
+      } else {
+        rejectedCount += 1;
+      }
+    }
+    cleaned.lines = nextLines;
+  }
+
+  if (cleaned.state_rois && typeof cleaned.state_rois === "object") {
+    const nextRois: Record<string, StateRoiConfig> = {};
+    for (const [rName, rCfg] of Object.entries(cleaned.state_rois)) {
+      nextRois[rName] = sanitizeStateRoiConfig(rCfg, detW, detH);
+    }
+    cleaned.state_rois = nextRois;
+  }
+
+  return { cleaned, rejectedCount };
+}
+
+export function sanitizeConfigGeometryDraft(
+  cfg: NinjaConfigResponse
+): { cleaned: NinjaConfigResponse; rejectedCount: number } {
+  const cloned: NinjaConfigResponse = JSON.parse(JSON.stringify(cfg));
+  let rejectedCount = 0;
+  if (cloned.cameras && typeof cloned.cameras === "object") {
+    for (const [camName, camCfg] of Object.entries(cloned.cameras)) {
+      const res = sanitizeCameraGeometryDraft(camCfg);
+      cloned.cameras[camName] = res.cleaned;
+      rejectedCount += res.rejectedCount;
+    }
+  }
+  return { cleaned: cloned, rejectedCount };
+}
 
 interface ZonesWorkspaceProps {
   cameraNames: string[];
@@ -83,13 +430,22 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   const [baselineYaml, setBaselineYaml] = useState<string>("");
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const draftRevisionRef = useRef<number>(0);
+  const isMountedRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   // Sync incoming config into draftConfig when no local unsaved changes exist
   useEffect(() => {
-    if (config && !isDirty) {
+    if (config && !isDirty && !isSaving) {
       setDraftConfig(JSON.parse(JSON.stringify(config)));
     }
-  }, [config, isDirty]);
+  }, [config, isDirty, isSaving]);
 
   useEffect(() => {
     if (rawYaml && !baselineYaml) {
@@ -97,25 +453,73 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     }
   }, [rawYaml, baselineYaml]);
 
+  const allCamKeys = Object.keys(draftConfig?.cameras || {});
+  const displayCams = allCamKeys.length > 0 ? allCamKeys : cameraNames;
+  const effectiveInspectorCam =
+    displayCams.length > 0 && !displayCams.includes(inspectorCam)
+      ? displayCams[0]
+      : inspectorCam;
+
+  useEffect(() => {
+    if (
+      displayCams.length > 0 &&
+      inspectorCam &&
+      !displayCams.includes(inspectorCam)
+    ) {
+      setInspectorCam(displayCams[0]);
+      setDraftPoints([]);
+    }
+  }, [displayCams, inspectorCam, setInspectorCam, setDraftPoints]);
+
+  const currentCamDetectW =
+    draftConfig?.cameras?.[effectiveInspectorCam]?.detect?.width || 1280;
+  const currentCamDetectH =
+    draftConfig?.cameras?.[effectiveInspectorCam]?.detect?.height || 720;
+
+  const setSanitizedDraftPoints: React.Dispatch<
+    React.SetStateAction<Array<[number, number]>>
+  > = useCallback(
+    (action) => {
+      setDraftPoints((prev) => {
+        const rawNext = typeof action === "function" ? action(prev) : action;
+        if (!Array.isArray(rawNext) || rawNext.length === 0) return [];
+        const normalized = rawNext.map((pt) =>
+          normalizeZonePoint(pt, currentCamDetectW, currentCamDetectH)
+        );
+        return deduplicatePolygonVertices(normalized, 0.0005);
+      });
+    },
+    [setDraftPoints, currentCamDetectW, currentCamDetectH]
+  );
+
   const updateDraft = (updater: (next: NinjaConfigResponse) => void) => {
-    setDraftConfig((prev) => {
-      if (!prev) return prev;
-      const cloned: NinjaConfigResponse = JSON.parse(JSON.stringify(prev));
-      updater(cloned);
-      const nextYaml = buildCleanYamlFromDraft(cloned, baselineYaml || rawYaml);
-      setRawYaml(nextYaml);
-      return cloned;
-    });
+    if (!draftConfig) return;
+    const cloned: NinjaConfigResponse = JSON.parse(JSON.stringify(draftConfig));
+    updater(cloned);
+    const { cleaned, rejectedCount } = sanitizeConfigGeometryDraft(cloned);
+    if (rejectedCount > 0) {
+      notify(
+        isPt
+          ? "Polígono ou linha degenerada (colinear / área zero) ignorada para proteger máscaras de privacidade"
+          : "Rejected degenerate (collinear / zero-area) polygon or line to protect backend masks"
+      );
+    }
+    draftRevisionRef.current += 1;
+    setDraftConfig(cleaned);
+    const nextYaml = buildCleanYamlFromDraft(cleaned, baselineYaml || rawYaml);
+    setRawYaml(nextYaml);
     setIsDirty(true);
   };
 
   const handleDiscardDraft = () => {
+    draftRevisionRef.current += 1;
     if (config) {
       setDraftConfig(JSON.parse(JSON.stringify(config)));
     }
     if (baselineYaml) {
       setRawYaml(baselineYaml);
     }
+    setDraftPoints([]);
     setIsDirty(false);
     notify(
       isPt
@@ -125,20 +529,30 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   };
 
   const handleSaveStructured = async (restartAfter = false) => {
-    if (!draftConfig) return;
+    if (!draftConfig || isSaving) return;
+    const saveRev = draftRevisionRef.current;
+    const { cleaned: payloadConfig, rejectedCount } =
+      sanitizeConfigGeometryDraft(draftConfig);
+    if (rejectedCount > 0) {
+      notify(
+        isPt
+          ? "Polígono degenerado removido antes de salvar"
+          : "Stripped degenerate polygon before saving configuration"
+      );
+    }
     setIsSaving(true);
     try {
       const res = await fetch("/api/config/structured", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify(draftConfig),
+        body: JSON.stringify(payloadConfig),
       });
 
       if (res.status === 404) {
         // Fallback for pods running an older backend binary without /api/config/structured
         const generatedYaml = buildCleanYamlFromDraft(
-          draftConfig,
+          payloadConfig,
           baselineYaml || rawYaml
         );
         const saveRes = await fetch(
@@ -151,11 +565,14 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
           }
         );
         const saveData = await saveRes.json().catch(() => ({}));
+        if (!isMountedRef.current) return;
         if (saveRes.ok && saveData.success !== false) {
-          setConfig(JSON.parse(JSON.stringify(draftConfig)));
-          setRawYaml(generatedYaml);
+          setConfig(JSON.parse(JSON.stringify(payloadConfig)));
           setBaselineYaml(generatedYaml);
-          setIsDirty(false);
+          if (draftRevisionRef.current === saveRev) {
+            setRawYaml(generatedYaml);
+            setIsDirty(false);
+          }
           if (restartAfter) {
             await fetch("/api/restart", { method: "POST", credentials: "include" });
           }
@@ -175,16 +592,23 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
       }
 
       const data = await res.json().catch(() => ({}));
+      if (!isMountedRef.current) return;
       if (res.ok && data.success !== false) {
         if (data.config) {
           setConfig(data.config);
-          setDraftConfig(JSON.parse(JSON.stringify(data.config)));
+          if (draftRevisionRef.current === saveRev) {
+            setDraftConfig(JSON.parse(JSON.stringify(data.config)));
+          }
         }
         if (typeof data.raw_yaml === "string") {
-          setRawYaml(data.raw_yaml);
           setBaselineYaml(data.raw_yaml);
+          if (draftRevisionRef.current === saveRev) {
+            setRawYaml(data.raw_yaml);
+          }
         }
-        setIsDirty(false);
+        if (draftRevisionRef.current === saveRev) {
+          setIsDirty(false);
+        }
         if (restartAfter) {
           await fetch("/api/restart", { method: "POST", credentials: "include" });
           notify(
@@ -203,9 +627,32 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
         notify(data.message || "Failed to save structured configuration");
       }
     } catch {
-      notify("Network error while saving structured configuration");
+      if (isMountedRef.current) {
+        notify("Network error while saving structured configuration");
+      }
     } finally {
-      setIsSaving(false);
+      if (isMountedRef.current) {
+        setIsSaving(false);
+      }
+    }
+  };
+
+  const handleSaveRawYaml = async (saveOption: "saveonly" | "restart") => {
+    if (isSaving) return;
+    const saveRev = draftRevisionRef.current;
+    const savedYamlSnapshot = rawYaml;
+    setIsSaving(true);
+    try {
+      await handleSaveConfig(saveOption);
+      if (!isMountedRef.current) return;
+      setBaselineYaml(savedYamlSnapshot);
+      if (draftRevisionRef.current === saveRev) {
+        setIsDirty(false);
+      }
+    } finally {
+      if (isMountedRef.current) {
+        setIsSaving(false);
+      }
     }
   };
 
@@ -217,10 +664,9 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   const selectCategory = (cat: SettingsCategory) => {
     setActiveCategory(cat);
     setZonesSubTab(cat === "yaml" ? "yaml" : "visual");
+    setDraftPoints([]);
   };
 
-  const allCamKeys = Object.keys(draftConfig?.cameras || {});
-  const displayCams = allCamKeys.length > 0 ? allCamKeys : cameraNames;
   const supportsGlobalAndCamScope =
     activeCategory === "ai" || activeCategory === "recording";
   const supportsCameraOnlyBar =
@@ -389,13 +835,16 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                   type="button"
                   className={`nvr-btn mono ${scope === "global" ? "active" : ""}`}
                   style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                  onClick={() => setScope("global")}
+                  onClick={() => {
+                    setScope("global");
+                    setDraftPoints([]);
+                  }}
                 >
                   {isPt ? "PADRÃO GLOBAL" : "GLOBAL DEFAULTS"}
                 </button>
                 <TacticalCameraPicker
                   cameras={displayCams}
-                  selectedCamera={scope === "global" ? "" : inspectorCam}
+                  selectedCamera={scope === "global" ? "" : effectiveInspectorCam}
                   onSelect={(cam) => {
                     setScope("camera");
                     switchInspectorCamera(cam);
@@ -411,13 +860,13 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 <span className="nvr-divider" aria-hidden="true" />
                 <TacticalCameraPicker
                   cameras={displayCams}
-                  selectedCamera={inspectorCam}
+                  selectedCamera={effectiveInspectorCam}
                   onSelect={(cam) => switchInspectorCamera(cam)}
                   cameraGroups={draftConfig?.camera_groups}
                   ariaLabel="Settings channel selector"
                 />
                 <a
-                  href={`/api/camera-proxy/${encodeURIComponent(inspectorCam)}/`}
+                  href={`/api/camera-proxy/${encodeURIComponent(effectiveInspectorCam)}/`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="nvr-btn mono"
@@ -471,22 +920,16 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 <button
                   type="button"
                   className="nvr-btn primary"
-                  onClick={async () => {
-                    setIsDirty(false);
-                    setBaselineYaml(rawYaml);
-                    await handleSaveConfig("saveonly");
-                  }}
+                  disabled={isSaving}
+                  onClick={() => handleSaveRawYaml("saveonly")}
                 >
                   {t.zones.saveOnly}
                 </button>
                 <button
                   type="button"
                   className="nvr-btn success"
-                  onClick={async () => {
-                    setIsDirty(false);
-                    setBaselineYaml(rawYaml);
-                    await handleSaveConfig("restart");
-                  }}
+                  disabled={isSaving}
+                  onClick={() => handleSaveRawYaml("restart")}
                 >
                   {t.zones.saveAndRestart}
                 </button>
@@ -533,6 +976,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               className="nvr-code-editor"
               value={rawYaml}
               onChange={(e) => {
+                draftRevisionRef.current += 1;
                 setRawYaml(e.target.value);
                 setIsDirty(true);
               }}
@@ -544,10 +988,10 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
           <VisionZonesMotionSection
             draftConfig={draftConfig}
             updateDraft={updateDraft}
-            scope={inspectorCam}
-            inspectorCam={inspectorCam}
+            scope={effectiveInspectorCam}
+            inspectorCam={effectiveInspectorCam}
             draftPoints={draftPoints}
-            setDraftPoints={setDraftPoints}
+            setDraftPoints={setSanitizedDraftPoints}
             notify={notify}
           />
         ) : (
@@ -559,15 +1003,15 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 <ChannelsStreamsSection
                   draftConfig={draftConfig}
                   updateDraft={updateDraft}
-                  inspectorCam={inspectorCam}
+                  inspectorCam={effectiveInspectorCam}
                   setInspectorCam={switchInspectorCamera}
                   ffprobeInfo={ffprobeInfo}
                   notify={notify}
                 />
                 <div className="nvr-cfg-card">
                   <div className="nvr-cfg-card-header">
-                    <span>CAMERA TECHNICAL & MAINTENANCE NOTES // {inspectorCam.toUpperCase()}</span>
-                    <span className="mono">cameras.{inspectorCam}.notes</span>
+                    <span>CAMERA TECHNICAL & MAINTENANCE NOTES // {effectiveInspectorCam.toUpperCase()}</span>
+                    <span className="mono">cameras.{effectiveInspectorCam}.notes</span>
                   </div>
                   <div className="nvr-cfg-card-body">
                     <textarea
@@ -575,12 +1019,12 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                       rows={3}
                       style={{ width: "100%", height: "auto", padding: 8, resize: "vertical" }}
                       placeholder="PoE switch port, lens focal length, mounting height, or maintenance log..."
-                      value={draftConfig.cameras?.[inspectorCam]?.notes || ""}
+                      value={draftConfig.cameras?.[effectiveInspectorCam]?.notes || ""}
                       onChange={(e) => {
                         const val = e.target.value;
                         updateDraft((next) => {
-                          if (next.cameras[inspectorCam]) {
-                            next.cameras[inspectorCam].notes = val;
+                          if (next.cameras[effectiveInspectorCam]) {
+                            next.cameras[effectiveInspectorCam].notes = val;
                           }
                         });
                       }}
@@ -594,8 +1038,8 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               <AiDetectionObjectsSection
                 draftConfig={draftConfig}
                 updateDraft={updateDraft}
-                scope={scope === "global" ? "global" : inspectorCam}
-                inspectorCam={inspectorCam}
+                scope={scope === "global" ? "global" : effectiveInspectorCam}
+                inspectorCam={effectiveInspectorCam}
                 notify={notify}
               />
             )}
@@ -612,8 +1056,8 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               <RecordingReviewSection
                 draftConfig={draftConfig}
                 updateDraft={updateDraft}
-                scope={scope === "global" ? "global" : inspectorCam}
-                inspectorCam={inspectorCam}
+                scope={scope === "global" ? "global" : effectiveInspectorCam}
+                inspectorCam={effectiveInspectorCam}
                 notify={notify}
               />
             )}
