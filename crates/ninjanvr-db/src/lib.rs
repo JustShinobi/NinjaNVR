@@ -440,7 +440,28 @@ pub fn compute_norm_box_iou(a: [f64; 4], b: [f64; 4]) -> f64 {
     if !a.iter().all(|v| v.is_finite()) || !b.iter().all(|v| v.is_finite()) {
         return 0.0;
     }
+    let both_valid_xyxy = a[2] > a[0] && a[3] > a[1] && b[2] > b[0] && b[3] > b[1];
     let xyxy = iou_corners(a, b);
+    if both_valid_xyxy {
+        let aw = a[2] - a[0];
+        let ah = a[3] - a[1];
+        let bw = b[2] - b[0];
+        let bh = b[3] - b[1];
+        let y_fixed_xywh_shift = (a[1] - b[1]).abs() < 1e-6
+            && (a[3] - b[3]).abs() < 1e-6
+            && a[1] < 2.5 * ah
+            && (bw < aw * 0.9 || aw < bw * 0.9);
+        let x_fixed_xywh_shift = (a[0] - b[0]).abs() < 1e-6
+            && (a[2] - b[2]).abs() < 1e-6
+            && a[0] < 2.5 * aw
+            && (bh < ah * 0.9 || ah < bh * 0.9);
+        if ((aw < a[0] && ah < a[1]) || (bw < b[0] && bh < b[1]))
+            && !y_fixed_xywh_shift
+            && !x_fixed_xywh_shift
+        {
+            return xyxy;
+        }
+    }
     let can_be_xywh = a[2] > 0.0
         && a[3] > 0.0
         && b[2] > 0.0
@@ -458,6 +479,45 @@ pub fn compute_norm_box_iou(a: [f64; 4], b: [f64; 4]) -> f64 {
     } else {
         xyxy
     }
+}
+
+fn normalize_allowed_cameras_str(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "*";
+    }
+    let mut has_token = false;
+    for part in trimmed.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if part == "*" {
+            return "*";
+        }
+        has_token = true;
+    }
+    if has_token { trimmed } else { "*" }
+}
+
+fn sanitize_annotation_boxes(boxes: &[DatasetAnnotationBox]) -> Vec<DatasetAnnotationBox> {
+    boxes
+        .iter()
+        .map(|b| DatasetAnnotationBox {
+            class_id: b.class_id,
+            label: b.label.clone(),
+            cx: if b.cx.is_finite() { b.cx } else { 0.0 },
+            cy: if b.cy.is_finite() { b.cy } else { 0.0 },
+            w: if b.w.is_finite() && b.w >= 0.0 {
+                b.w
+            } else {
+                0.0
+            },
+            h: if b.h.is_finite() && b.h >= 0.0 {
+                b.h
+            } else {
+                0.0
+            },
+            score: if b.score.is_finite() { b.score } else { 1.0 },
+            source: b.source.clone(),
+        })
+        .collect()
 }
 
 impl NinjaDatabase {
@@ -696,11 +756,27 @@ impl NinjaDatabase {
             "#,
         )?;
         let _ = conn.execute(
+            "ALTER TABLE user ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'admin'",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE user ADD COLUMN allowed_cameras TEXT NOT NULL DEFAULT '*'",
             [],
         );
         let _ = conn.execute(
+            "ALTER TABLE user ADD COLUMN password_changed_at DATETIME NULL",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE recordings ADD COLUMN motion_heatmap TEXT NULL",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE recordings ADD COLUMN stream_tier TEXT NOT NULL DEFAULT 'main'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE export ADD COLUMN export_case_id VARCHAR(30) NULL",
             [],
         );
         let _ = conn.execute(
@@ -791,7 +867,10 @@ impl NinjaDatabase {
                       SELECT 1 FROM event e
                       WHERE e.camera = r.camera
                         AND e.start_time <= r.end_time
-                        AND COALESCE(e.end_time, e.start_time + 15.0) >= r.start_time
+                        AND (
+                          COALESCE(e.end_time, e.start_time + 15.0) >= r.start_time
+                          OR (e.retain_indefinitely = 1 AND COALESCE(e.end_time, e.start_time + 30.0) >= r.start_time)
+                        )
                   )
                 ORDER BY r.start_time ASC
                 LIMIT 200
@@ -955,11 +1034,7 @@ impl NinjaDatabase {
             "admin" => "admin",
             _ => anyhow::bail!("Role must be 'admin', 'operator', or 'viewer'"),
         };
-        let norm_cams = if allowed_cameras.trim().is_empty() {
-            "*"
-        } else {
-            allowed_cameras.trim()
-        };
+        let norm_cams = normalize_allowed_cameras_str(allowed_cameras);
 
         {
             let conn = self.lock_conn();
@@ -1024,14 +1099,18 @@ impl NinjaDatabase {
         target: &str,
         norm_allowed_cameras: &str,
     ) -> Result<()> {
-        if norm_allowed_cameras == "*" {
+        let norm_cams = normalize_allowed_cameras_str(norm_allowed_cameras);
+        if norm_cams == "*" {
             return Ok(());
         }
-        let allowed: Vec<&str> = norm_allowed_cameras
+        let allowed: Vec<&str> = norm_cams
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
+        if allowed.is_empty() || allowed.contains(&"*") {
+            return Ok(());
+        }
         let ext_target = format!("ext:{target}");
         let mut stmt = tx.prepare(
             "SELECT id, camera FROM share_link WHERE revoked = 0 AND (created_by = ?1 OR created_by = ?2)",
@@ -1069,7 +1148,17 @@ impl NinjaDatabase {
         let target = username.trim();
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
-        if norm_role != "admin" {
+        let current_role: Option<String> = tx
+            .query_row(
+                "SELECT COALESCE(role, 'admin') FROM user WHERE username = ?1",
+                params![target],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(existing_role) = current_role else {
+            return Ok(false);
+        };
+        if norm_role != "admin" && existing_role.trim().eq_ignore_ascii_case("admin") {
             let other_admins: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM user WHERE LOWER(TRIM(COALESCE(role, 'admin'))) = 'admin' AND username != ?1",
                 params![target],
@@ -1099,11 +1188,7 @@ impl NinjaDatabase {
                     )
                     .optional()?
                     .unwrap_or_else(|| "*".to_string());
-                let norm_cams = if allowed_cams.trim().is_empty() {
-                    "*"
-                } else {
-                    allowed_cams.trim()
-                };
+                let norm_cams = normalize_allowed_cameras_str(&allowed_cams);
                 Self::revoke_disallowed_camera_share_links_in_tx(&tx, target, norm_cams)?;
             }
         }
@@ -1116,11 +1201,7 @@ impl NinjaDatabase {
         username: &str,
         allowed_cameras: &str,
     ) -> Result<bool> {
-        let norm = if allowed_cameras.trim().is_empty() {
-            "*"
-        } else {
-            allowed_cameras.trim()
-        };
+        let norm = normalize_allowed_cameras_str(allowed_cameras);
         let target = username.trim();
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
@@ -1268,18 +1349,41 @@ impl NinjaDatabase {
             return Ok(false);
         }
         let conn = self.lock_conn();
-        let count: i64 = conn.query_row(
+        let mut stmt = conn.prepare(
             r#"
-            SELECT COUNT(*)
+            SELECT scope, expires_at
             FROM api_token
-            WHERE (id = ?1 OR name = ?1)
-              AND scope = 'full'
-              AND (expires_at IS NULL OR expires_at > ?2)
+            WHERE id = ?1 OR name = ?1
             "#,
-            params![target, now_ts],
-            |r| r.get(0),
         )?;
-        Ok(count > 0)
+        let rows = stmt.query_map(params![target], |r| {
+            let scope: String = r.get(0)?;
+            let exp_ref = r.get_ref(1)?;
+            let (exp_val, exp_invalid) = match exp_ref {
+                rusqlite::types::ValueRef::Null => (None, false),
+                other => match value_to_f64(&other) {
+                    Some(v) => (Some(v), false),
+                    None => (None, true),
+                },
+            };
+            Ok((scope, exp_val, exp_invalid))
+        })?;
+        for r in rows {
+            let (scope, expires_at, exp_invalid) = r?;
+            if exp_invalid {
+                continue;
+            }
+            if !scope.trim().eq_ignore_ascii_case("full") {
+                continue;
+            }
+            if let Some(exp) = expires_at
+                && (!exp.is_finite() || now_ts >= exp)
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Validates an incoming `nnvr_...` bearer token by its SHA-256 hash, checks expiration,
@@ -1761,12 +1865,18 @@ impl NinjaDatabase {
             let mut stmt = tx.prepare(
                 r#"
                 INSERT INTO userreviewstatus (user_id, review_segment_id, has_been_reviewed)
-                VALUES ('admin', ?1, ?2)
+                SELECT 'admin', id, ?2 FROM reviewsegment WHERE id = ?1
                 ON CONFLICT(user_id, review_segment_id) DO UPDATE SET has_been_reviewed = excluded.has_been_reviewed
                 "#,
             )?;
+            let mut clear_other_stmt = tx.prepare(
+                "UPDATE userreviewstatus SET has_been_reviewed = 0 WHERE review_segment_id = ?1",
+            )?;
             for id in ids {
                 count += stmt.execute(params![id, val])?;
+                if !reviewed {
+                    clear_other_stmt.execute(params![id])?;
+                }
             }
         }
         tx.commit()?;
@@ -1784,9 +1894,15 @@ impl NinjaDatabase {
             let mut del_status =
                 tx.prepare("DELETE FROM userreviewstatus WHERE review_segment_id = ?1")?;
             let mut del_seg = tx.prepare("DELETE FROM reviewsegment WHERE id = ?1")?;
+            let mut rev_share =
+                tx.prepare("UPDATE share_link SET revoked = 1 WHERE target_id = ?1")?;
             for id in ids {
                 del_status.execute(params![id])?;
-                count += del_seg.execute(params![id])?;
+                let removed = del_seg.execute(params![id])?;
+                if removed > 0 {
+                    rev_share.execute(params![id])?;
+                }
+                count += removed;
             }
         }
         tx.commit()?;
@@ -1828,6 +1944,44 @@ impl NinjaDatabase {
             || filter.after.is_some_and(|v| !v.is_finite())
             || filter.min_score.is_some_and(|v| !v.is_finite())
         {
+            return Ok(Vec::new());
+        }
+
+        let mut req_plates: Vec<String> = Vec::new();
+        let mut had_non_all_plate_token = false;
+        if let Some(ref p) = filter.plate {
+            for tok in p.split(',') {
+                let trimmed = tok.trim();
+                if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("all") {
+                    had_non_all_plate_token = true;
+                }
+                let norm: String = trimmed
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect();
+                if !norm.is_empty() && !norm.eq_ignore_ascii_case("all") {
+                    req_plates.push(norm);
+                }
+            }
+        }
+        if let Some(ref list) = filter.recognized_license_plates {
+            for tok in list {
+                let trimmed = tok.trim();
+                if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("all") {
+                    had_non_all_plate_token = true;
+                }
+                let norm: String = trimmed
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect();
+                if !norm.is_empty() && !norm.eq_ignore_ascii_case("all") {
+                    req_plates.push(norm);
+                }
+            }
+        }
+        if had_non_all_plate_token && req_plates.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -1977,31 +2131,6 @@ impl NinjaDatabase {
                 let is_stat = item["stationary"].as_bool().unwrap_or(false);
                 if is_stat != req_stat {
                     continue;
-                }
-            }
-            let mut req_plates: Vec<String> = Vec::new();
-            if let Some(ref p) = filter.plate {
-                for tok in p.split(',') {
-                    let norm: String = tok
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric())
-                        .map(|c| c.to_ascii_uppercase())
-                        .collect();
-                    if !norm.is_empty() && !norm.eq_ignore_ascii_case("all") {
-                        req_plates.push(norm);
-                    }
-                }
-            }
-            if let Some(ref list) = filter.recognized_license_plates {
-                for tok in list {
-                    let norm: String = tok
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric())
-                        .map(|c| c.to_ascii_uppercase())
-                        .collect();
-                    if !norm.is_empty() && !norm.eq_ignore_ascii_case("all") {
-                        req_plates.push(norm);
-                    }
                 }
             }
             if !req_plates.is_empty() {
@@ -2512,17 +2641,17 @@ impl NinjaDatabase {
                 r.get(0)?,
                 r.get(1)?,
                 r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
+                value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(4)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(5)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(6)?).unwrap_or(0.0),
                 r.get(7)?,
                 r.get(8)?,
                 r.get(9)?,
                 r.get(10)?,
                 r.get(11)?,
-                r.get(12)?,
-                r.get(13)?,
+                value_to_f64(&r.get_ref(12)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(13)?).unwrap_or(0.0),
             ))
         })?;
 
@@ -2608,10 +2737,10 @@ impl NinjaDatabase {
         };
         let mut stmt = conn.prepare(sql)?;
         let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
-            let nx1: f64 = r.get(3)?;
-            let ny1: f64 = r.get(4)?;
-            let nx2: f64 = r.get(5)?;
-            let ny2: f64 = r.get(6)?;
+            let nx1 = value_to_f64(&r.get_ref(3)?).unwrap_or(0.0);
+            let ny1 = value_to_f64(&r.get_ref(4)?).unwrap_or(0.0);
+            let nx2 = value_to_f64(&r.get_ref(5)?).unwrap_or(0.0);
+            let ny2 = value_to_f64(&r.get_ref(6)?).unwrap_or(0.0);
             let dhash_i64: Option<i64> = r.get(7)?;
             Ok(json!({
                 "id": r.get::<_, i64>(0)?,
@@ -2627,8 +2756,8 @@ impl NinjaDatabase {
                 "hit_count": r.get::<_, i64>(9)?,
                 "source_event_id": r.get::<_, Option<String>>(10)?,
                 "reason": r.get::<_, Option<String>>(11)?,
-                "created_at": r.get::<_, f64>(12)?,
-                "last_seen_at": r.get::<_, f64>(13)?,
+                "created_at": value_to_f64(&r.get_ref(12)?).unwrap_or(0.0),
+                "last_seen_at": value_to_f64(&r.get_ref(13)?).unwrap_or(0.0),
             }))
         };
         let mut out = Vec::new();
@@ -2685,12 +2814,14 @@ impl NinjaDatabase {
         let finite_score = score.filter(|v| v.is_finite());
         let prev_sub_label: Option<String> = tx
             .query_row(
-                "SELECT sub_label FROM event WHERE id = ?1",
+                "SELECT COALESCE(NULLIF(TRIM(sub_label), ''), json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.sub_label')) FROM event WHERE id = ?1",
                 params![id],
                 |r| r.get::<_, Option<String>>(0),
             )
             .optional()?
-            .flatten();
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let updated = match (normalized_sub, finite_score) {
             (Some(sl), Some(sc)) => tx.execute(
                 "UPDATE event SET sub_label = ?1, sub_label_score = ?2, data = json_set(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.sub_label', ?1, '$.sub_label_score', ?2) WHERE id = ?3",
@@ -2707,7 +2838,11 @@ impl NinjaDatabase {
         };
 
         // Propagate sub_label & sub_label_score to any reviewsegment referencing this event ID
-        let like_pattern = format!("%\"{}\"%", escape_sql_like(&id.replace('"', "")));
+        let clean_id = id.trim();
+        if clean_id.is_empty() || clean_id.contains('"') {
+            return Ok(updated);
+        }
+        let like_pattern = format!("%\"{}\"%", escape_sql_like(clean_id));
         let mut stmt =
             tx.prepare("SELECT id, data FROM reviewsegment WHERE data LIKE ?1 ESCAPE '\\'")?;
         let rev_rows: Vec<(String, String)> = stmt
@@ -2751,7 +2886,7 @@ impl NinjaDatabase {
             // If this event previously had a sub_label that changed or was cleared,
             // remove it unless another sibling detection in the same reviewsegment still carries it.
             if let Some(ref old_sl) = prev_sub_label
-                && normalized_sub != Some(old_sl.as_str())
+                && !normalized_sub.is_some_and(|ns| ns.eq_ignore_ascii_case(old_sl))
             {
                 let sibling_still_has_old =
                     det_ids
@@ -2759,24 +2894,23 @@ impl NinjaDatabase {
                         .filter(|d| d.as_str() != id)
                         .any(|sibling_id| {
                             tx.query_row(
-                                "SELECT sub_label FROM event WHERE id = ?1",
+                                "SELECT COALESCE(NULLIF(TRIM(sub_label), ''), json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.sub_label')) FROM event WHERE id = ?1",
                                 params![sibling_id],
                                 |r| r.get::<_, Option<String>>(0),
                             )
                             .ok()
                             .flatten()
-                            .as_deref()
-                                == Some(old_sl.as_str())
+                            .is_some_and(|s| s.trim().eq_ignore_ascii_case(old_sl))
                         });
                 if !sibling_still_has_old {
-                    sub_labels.retain(|x| x != old_sl);
+                    sub_labels.retain(|x| !x.trim().eq_ignore_ascii_case(old_sl));
                 }
             } else if normalized_sub.is_none() && det_ids.len() == 1 {
                 sub_labels.clear();
             }
 
             if let Some(sl) = normalized_sub {
-                if !sub_labels.iter().any(|x| x == sl) {
+                if !sub_labels.iter().any(|x| x.trim().eq_ignore_ascii_case(sl)) {
                     sub_labels.push(sl.to_string());
                 }
                 obj.insert("sub_labels".to_string(), json!(sub_labels));
@@ -2966,21 +3100,45 @@ impl NinjaDatabase {
             data_val = json!({});
         }
         if let Some(data_obj) = data_val.as_object_mut() {
+            let prev_plate = data_obj
+                .get("recognized_license_plate")
+                .and_then(|v| v.as_str())
+                .map(|p| {
+                    p.chars()
+                        .filter(|c| c.is_ascii_alphanumeric())
+                        .map(|c| c.to_ascii_uppercase())
+                        .collect::<String>()
+                })
+                .filter(|s| !s.is_empty());
             match normalized {
                 Some(ref norm_plate) => {
                     data_obj.insert("recognized_license_plate".to_string(), json!(norm_plate));
                     if let Some(attrs) = data_obj
                         .get_mut("attributes")
                         .and_then(|v| v.as_array_mut())
-                        && !attrs
+                    {
+                        if let Some(ref old_p) = prev_plate
+                            && old_p != norm_plate
+                        {
+                            attrs.retain(|a| a.as_str() != Some(old_p.as_str()));
+                        }
+                        if !attrs
                             .iter()
                             .any(|a| a.as_str() == Some(norm_plate.as_str()))
-                    {
-                        attrs.push(json!(norm_plate));
+                        {
+                            attrs.push(json!(norm_plate));
+                        }
                     }
                 }
                 None => {
                     data_obj.insert("recognized_license_plate".to_string(), Value::Null);
+                    if let Some(ref old_p) = prev_plate
+                        && let Some(attrs) = data_obj
+                            .get_mut("attributes")
+                            .and_then(|v| v.as_array_mut())
+                    {
+                        attrs.retain(|a| a.as_str() != Some(old_p.as_str()));
+                    }
                 }
             }
         }
@@ -3114,6 +3272,16 @@ impl NinjaDatabase {
             .and_then(|v| v.as_f64())
             .filter(|v| v.is_finite());
 
+        let safe_start_time = if ev.start_time.is_finite() {
+            ev.start_time
+        } else {
+            0.0
+        };
+        let safe_end_time = ev.end_time.filter(|v| v.is_finite());
+        let safe_top_score = ev.top_score.filter(|v| v.is_finite());
+        let safe_ratio = ev.ratio.map(|r| r as f64).filter(|v| v.is_finite());
+        let safe_score = ev.score.map(|s| s as f64).filter(|v| v.is_finite());
+
         tx.execute(
             r#"
             INSERT INTO event (
@@ -3122,11 +3290,15 @@ impl NinjaDatabase {
                 sub_label, sub_label_score, plus_id, data, area, ratio, score
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
             ON CONFLICT(id) DO UPDATE SET
-                end_time = excluded.end_time,
-                top_score = excluded.top_score,
+                end_time = COALESCE(excluded.end_time, event.end_time),
+                top_score = COALESCE(excluded.top_score, event.top_score),
                 false_positive = CASE
                     WHEN event.false_positive = 1 OR excluded.false_positive = 1 THEN 1
                     ELSE COALESCE(excluded.false_positive, event.false_positive)
+                END,
+                retain_indefinitely = CASE
+                    WHEN event.retain_indefinitely = 1 OR excluded.retain_indefinitely = 1 THEN 1
+                    ELSE 0
                 END,
                 zones = excluded.zones,
                 thumbnail = COALESCE(excluded.thumbnail, event.thumbnail),
@@ -3144,9 +3316,9 @@ impl NinjaDatabase {
                 ev.id,
                 ev.label,
                 ev.camera,
-                ev.start_time,
-                ev.end_time,
-                ev.top_score,
+                safe_start_time,
+                safe_end_time,
+                safe_top_score,
                 ev.false_positive.map(|b| if b { 1 } else { 0 }),
                 zones_str,
                 ev.thumbnail,
@@ -3159,8 +3331,8 @@ impl NinjaDatabase {
                 ev.plus_id,
                 data_str,
                 ev.area,
-                ev.ratio.map(|r| r as f64),
-                ev.score.map(|s| s as f64)
+                safe_ratio,
+                safe_score
             ],
         )?;
         tx.commit()?;
@@ -3168,8 +3340,16 @@ impl NinjaDatabase {
     }
 
     pub fn delete_event(&self, id: &str) -> Result<usize> {
-        let conn = self.lock_conn();
-        let count = conn.execute("DELETE FROM event WHERE id = ?1", params![id])?;
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let count = tx.execute("DELETE FROM event WHERE id = ?1", params![id])?;
+        if count > 0 {
+            tx.execute(
+                "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
         Ok(count)
     }
 
@@ -3182,8 +3362,14 @@ impl NinjaDatabase {
         let mut count = 0;
         {
             let mut stmt = tx.prepare("DELETE FROM event WHERE id = ?1")?;
+            let mut rev_share =
+                tx.prepare("UPDATE share_link SET revoked = 1 WHERE target_id = ?1")?;
             for id in ids {
-                count += stmt.execute(params![id])?;
+                let removed = stmt.execute(params![id])?;
+                if removed > 0 {
+                    rev_share.execute(params![id])?;
+                }
+                count += removed;
             }
         }
         tx.commit()?;
@@ -3246,14 +3432,19 @@ impl NinjaDatabase {
     pub fn query_all_recordings_summary(&self) -> Result<Value> {
         let conn = self.lock_conn();
         let cutoff = (Utc::now().timestamp() - 86400 * 60) as f64;
+        let max_valid_ts = 253_402_300_800.0f64;
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT CAST(start_time / 86400 AS INTEGER) * 86400 FROM recordings WHERE start_time >= ?1 ORDER BY start_time DESC",
+            "SELECT DISTINCT CAST(start_time / 86400 AS INTEGER) * 86400 FROM recordings WHERE typeof(start_time) IN ('real', 'integer') AND start_time >= ?1 AND start_time <= ?2 ORDER BY start_time DESC",
         )?;
-        let rows = stmt.query_map(params![cutoff], |r| r.get::<_, i64>(0))?;
+        let rows = stmt.query_map(params![cutoff, max_valid_ts], |r| {
+            Ok(value_to_f64(&r.get_ref(0)?))
+        })?;
         let mut map = serde_json::Map::new();
         for r in rows {
-            let day_ts = r?;
-            if let Some(dt) = Utc.timestamp_opt(day_ts, 0).single() {
+            if let Some(day_ts_f) = r?
+                && day_ts_f.is_finite()
+                && let Some(dt) = Utc.timestamp_opt(day_ts_f as i64, 0).single()
+            {
                 map.insert(dt.format("%Y-%m-%d").to_string(), json!(true));
             }
         }
@@ -3267,10 +3458,10 @@ impl NinjaDatabase {
             r#"
             SELECT
                 camera,
-                COALESCE(SUM(segment_size), 0.0),
-                COALESCE(SUM(duration), 0.0),
-                COALESCE(SUM(CASE WHEN start_time >= ?1 THEN segment_size ELSE 0.0 END), 0.0),
-                COALESCE(SUM(CASE WHEN start_time >= ?1 THEN duration ELSE 0.0 END), 0.0)
+                COALESCE(SUM(CASE WHEN typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                COALESCE(SUM(CASE WHEN typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END), 0.0),
+                COALESCE(SUM(CASE WHEN start_time >= ?1 AND typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0),
+                COALESCE(SUM(CASE WHEN start_time >= ?1 AND typeof(duration) IN ('real', 'integer') AND duration > 0.0 AND duration < 1.0e12 THEN duration ELSE 0.0 END), 0.0)
             FROM recordings
             GROUP BY camera
             "#,
@@ -3278,10 +3469,10 @@ impl NinjaDatabase {
         let rows = stmt.query_map(params![cutoff], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                r.get::<_, f64>(1).unwrap_or(0.0),
-                r.get::<_, f64>(2).unwrap_or(0.0),
-                r.get::<_, f64>(3).unwrap_or(0.0),
-                r.get::<_, f64>(4).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(1)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(2)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(3)?).unwrap_or(0.0),
+                value_to_f64(&r.get_ref(4)?).unwrap_or(0.0),
             ))
         })?;
 
@@ -3531,6 +3722,26 @@ impl NinjaDatabase {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let safe_start = if rec.start_time.is_finite() {
+            rec.start_time
+        } else {
+            0.0
+        };
+        let safe_end = if rec.end_time.is_finite() {
+            rec.end_time
+        } else {
+            safe_start
+        };
+        let safe_dur = if rec.duration.is_finite() && rec.duration >= 0.0 {
+            rec.duration
+        } else {
+            0.0
+        };
+        let safe_size = if rec.segment_size.is_finite() && rec.segment_size >= 0.0 {
+            rec.segment_size
+        } else {
+            0.0
+        };
         conn.execute(
             r#"
             INSERT INTO recordings (
@@ -3548,12 +3759,12 @@ impl NinjaDatabase {
                 rec.id,
                 rec.camera,
                 rec.path,
-                rec.start_time,
-                rec.end_time,
-                rec.duration,
+                safe_start,
+                safe_end,
+                safe_dur,
                 rec.objects,
                 rec.motion,
-                rec.segment_size,
+                safe_size,
                 rec.dbfs,
                 rec.regions,
                 hm_str
@@ -3595,6 +3806,8 @@ impl NinjaDatabase {
         {
             return Ok(Vec::new());
         }
+        let pre_sec = pre_capture_sec.max(0.0);
+        let post_sec = post_capture_sec.max(0.0);
         let max_cutoff_ts = continuous_before_ts
             .max(motion_before_ts)
             .max(event_before_ts);
@@ -3609,6 +3822,13 @@ impl NinjaDatabase {
                 FROM recordings r
                 WHERE r.camera = ?1
                   AND r.end_time < ?7
+                  AND NOT EXISTS (
+                    SELECT 1 FROM event e
+                    WHERE e.camera = r.camera
+                      AND e.retain_indefinitely = 1
+                      AND e.start_time <= (r.end_time + ?4)
+                      AND COALESCE(e.end_time, e.start_time + 30.0) >= (r.start_time - ?5)
+                  )
                   AND (
                     r.end_time < ?3
                     OR (
@@ -3656,8 +3876,8 @@ impl NinjaDatabase {
                     camera,
                     continuous_before_ts,
                     event_before_ts,
-                    pre_capture_sec,
-                    post_capture_sec,
+                    pre_sec,
+                    post_sec,
                     motion_before_ts,
                     max_cutoff_ts
                 ],
@@ -3696,6 +3916,8 @@ impl NinjaDatabase {
         {
             return Ok(Vec::new());
         }
+        let pre_sec = pre_capture_sec.max(0.0);
+        let post_sec = post_capture_sec.max(0.0);
         let capped_limit = limit.min(10_000) as i64;
         let conn = self.lock_conn();
         let sql = if idle_only {
@@ -3738,13 +3960,7 @@ impl NinjaDatabase {
         };
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(
-            params![
-                camera,
-                before_ts,
-                pre_capture_sec,
-                post_capture_sec,
-                capped_limit
-            ],
+            params![camera, before_ts, pre_sec, post_sec, capped_limit],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )?;
         let mut out = Vec::new();
@@ -3794,7 +4010,7 @@ impl NinjaDatabase {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, f64>(2).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(2)?).unwrap_or(0.0).max(0.0),
                 ))
             })?;
             for r in rows {
@@ -3908,7 +4124,7 @@ impl NinjaDatabase {
         let tx = conn.transaction()?;
         let total_mb: f64 = tx
             .query_row(
-                "SELECT COALESCE(SUM(MAX(COALESCE(segment_size, 0.0), 0.0)), 0.0) FROM recordings WHERE camera = ?1",
+                "SELECT COALESCE(SUM(CASE WHEN typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0) FROM recordings WHERE camera = ?1",
                 params![camera],
                 |r| r.get(0),
             )
@@ -3939,7 +4155,7 @@ impl NinjaDatabase {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, f64>(2).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(2)?).unwrap_or(0.0),
                 ))
             })?;
             for r in rows {
@@ -3976,7 +4192,7 @@ impl NinjaDatabase {
         let tx = conn.transaction()?;
         let total_mb: f64 = tx
             .query_row(
-                "SELECT COALESCE(SUM(MAX(COALESCE(segment_size, 0.0), 0.0)), 0.0) FROM recordings",
+                "SELECT COALESCE(SUM(CASE WHEN typeof(segment_size) IN ('real', 'integer') AND segment_size > 0.0 AND segment_size < 1.0e12 THEN segment_size ELSE 0.0 END), 0.0) FROM recordings",
                 [],
                 |r| r.get(0),
             )
@@ -4006,7 +4222,7 @@ impl NinjaDatabase {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, f64>(2).unwrap_or(0.0),
+                    value_to_f64(&r.get_ref(2)?).unwrap_or(0.0),
                 ))
             })?;
             for r in rows {
@@ -4302,9 +4518,10 @@ impl NinjaDatabase {
             SET access_count = access_count + 1,
                 last_accessed_at = ?2
             WHERE id = ?1
-              AND revoked = 0
-              AND expires_at > ?2
-              AND (max_views IS NULL OR access_count < max_views)
+              AND typeof(revoked) = 'integer' AND revoked = 0
+              AND typeof(expires_at) IN ('real', 'integer') AND expires_at < 1.0e300 AND expires_at > ?2
+              AND typeof(access_count) = 'integer' AND access_count >= 0
+              AND (max_views IS NULL OR (typeof(max_views) = 'integer' AND max_views > 0 AND access_count < max_views))
             "#,
             params![id, accessed_at],
         )?;
@@ -4323,7 +4540,9 @@ impl NinjaDatabase {
                 WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
                 ELSE last_accessed_at
             END
-            WHERE id = ?1 AND revoked = 0
+            WHERE id = ?1
+              AND typeof(revoked) = 'integer' AND revoked = 0
+              AND typeof(expires_at) IN ('real', 'integer') AND expires_at < 1.0e300 AND expires_at > ?2
             "#,
             params![id, accessed_at],
         )?;
@@ -4378,9 +4597,10 @@ impl NinjaDatabase {
             SELECT COUNT(*)
             FROM share_link
             WHERE target_id = ?1
-              AND revoked = 0
-              AND expires_at > ?2
-              AND (max_views IS NULL OR access_count < max_views)
+              AND typeof(revoked) = 'integer' AND revoked = 0
+              AND typeof(expires_at) IN ('real', 'integer') AND expires_at < 1.0e300 AND expires_at > ?2
+              AND typeof(access_count) = 'integer' AND access_count >= 0
+              AND (max_views IS NULL OR (typeof(max_views) = 'integer' AND max_views > 0 AND access_count < max_views))
             "#,
             params![target_id, now_ts],
             |r| r.get(0),
@@ -4403,9 +4623,9 @@ impl NinjaDatabase {
             SELECT COUNT(*)
             FROM share_link
             WHERE target_id = ?1
-              AND revoked = 0
-              AND expires_at > ?2
-              AND last_accessed_at IS NOT NULL
+              AND typeof(revoked) = 'integer' AND revoked = 0
+              AND typeof(expires_at) IN ('real', 'integer') AND expires_at < 1.0e300 AND expires_at > ?2
+              AND typeof(last_accessed_at) IN ('real', 'integer') AND last_accessed_at < 1.0e300
               AND last_accessed_at + ?3 > ?2
             "#,
             params![target_id, now_ts, grace_sec],
@@ -4459,7 +4679,7 @@ impl NinjaDatabase {
             .query_row(
                 "SELECT revoked FROM share_link WHERE id = ?1",
                 params![id],
-                |r| r.get(0),
+                |r| Ok(r.get::<_, i64>(0).unwrap_or(1)),
             )
             .optional()?;
         Ok(revoked.unwrap_or(0) != 0)
@@ -4474,7 +4694,12 @@ impl NinjaDatabase {
             .query_row(
                 "SELECT revoked, expires_at FROM share_link WHERE id = ?1",
                 params![id],
-                |r| Ok((r.get(0)?, value_to_f64(&r.get_ref(1)?))),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0).unwrap_or(1),
+                        value_to_f64(&r.get_ref(1)?),
+                    ))
+                },
             )
             .optional()?;
         Ok(row.is_some_and(|(revoked, expires_at)| {
@@ -4526,6 +4751,10 @@ impl NinjaDatabase {
             .optional()?;
         if paths.is_some() {
             tx.execute("DELETE FROM export WHERE id = ?1", params![id])?;
+            tx.execute(
+                "UPDATE share_link SET revoked = 1 WHERE kind = 'export' AND target_id = ?1",
+                params![id],
+            )?;
         }
         tx.commit()?;
         Ok(paths)
@@ -4541,12 +4770,16 @@ impl NinjaDatabase {
         {
             let mut sel = tx.prepare("SELECT video_path, thumb_path FROM export WHERE id = ?1")?;
             let mut del = tx.prepare("DELETE FROM export WHERE id = ?1")?;
+            let mut rev_share = tx.prepare(
+                "UPDATE share_link SET revoked = 1 WHERE kind = 'export' AND target_id = ?1",
+            )?;
             for id in ids {
                 let paths: Option<(String, String)> = sel
                     .query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
                     .optional()?;
                 if let Some(p) = paths {
                     del.execute(params![id])?;
+                    rev_share.execute(params![id])?;
                     deleted_paths.push(p);
                 }
             }
@@ -4798,7 +5031,7 @@ impl NinjaDatabase {
                 SELECT id
                 FROM event
                 WHERE camera = ?1
-                  AND retain_indefinitely = 0
+                  AND COALESCE(retain_indefinitely, 0) = 0
                   AND end_time IS NOT NULL
                   AND (
                     (COALESCE(json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.max_severity'), 'alert') = 'alert' AND end_time < ?2)
@@ -4819,6 +5052,8 @@ impl NinjaDatabase {
                     files_to_remove.push(format!("/media/ninjanvr/clips/{id}.jpg"));
                     if safe_camera {
                         files_to_remove.push(format!("/media/ninjanvr/clips/{camera}-{id}.webp"));
+                        files_to_remove
+                            .push(format!("/media/ninjanvr/clips/{camera}-{id}-clean.webp"));
                     }
                     files_to_remove
                         .push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
@@ -4873,7 +5108,8 @@ impl NinjaDatabase {
         } else {
             deterministic_dataset_split(&sample.id).to_string()
         };
-        let annotations_json = serde_json::to_string(&sample.annotations)?;
+        let sanitized_anns = sanitize_annotation_boxes(&sample.annotations);
+        let annotations_json = serde_json::to_string(&sanitized_anns)?;
         let verified_int = if sample.verified { 1 } else { 0 };
         let night_int = if sample.night_mode { 1 } else { 0 };
         let created_at = if sample.created_at.is_finite() {
@@ -4916,6 +5152,7 @@ impl NinjaDatabase {
             ],
         )?;
         let mut out = sample.clone();
+        out.annotations = sanitized_anns;
         out.split = split;
         out.created_at = created_at;
         Ok(out)
@@ -5029,7 +5266,7 @@ impl NinjaDatabase {
             return Ok(None);
         };
         if let Some(anns) = annotations {
-            current.annotations = anns.to_vec();
+            current.annotations = sanitize_annotation_boxes(anns);
         }
         if let Some(kind) = sample_kind
             && !kind.trim().is_empty()
@@ -8934,6 +9171,719 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(matched["hit_count"], i64::MAX);
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cycle2_p0_01_disjoint_xyxy_boxes_in_upper_left_and_center_quadrants_never_match_fp_signature()
+     {
+        // Disjoint [x1, y1, x2, y2] boxes where x1 + x2 <= 1.0 and y1 + y2 <= 1.0
+        // must evaluate to 0.0 IoU instead of being misinterpreted as [x, y, w, h].
+        assert_eq!(
+            compute_norm_box_iou([0.40, 0.40, 0.45, 0.45], [0.40, 0.45, 0.45, 0.50]),
+            0.0
+        );
+        assert_eq!(
+            compute_norm_box_iou([0.47, 0.47, 0.49, 0.49], [0.495, 0.495, 0.50, 0.50]),
+            0.0
+        );
+        assert_eq!(
+            compute_norm_box_iou([0.10, 0.10, 0.20, 0.20], [0.25, 0.25, 0.35, 0.35]),
+            0.0
+        );
+
+        // Barely-overlapping [x1, y1, x2, y2] boxes in the upper-left/center quadrant
+        // must return their true corner IoU (< 0.10, NOT >= 0.72).
+        let iou_touch_y =
+            compute_norm_box_iou([0.40, 0.40, 0.45, 0.45], [0.40, 0.4499, 0.45, 0.50]);
+        assert!(iou_touch_y > 0.0 && iou_touch_y < 0.01);
+
+        let iou_corner_overlap =
+            compute_norm_box_iou([0.44, 0.44, 0.47, 0.47], [0.46, 0.46, 0.50, 0.50]);
+        assert!((iou_corner_overlap - (0.0001 / 0.0024)).abs() < 1e-6);
+        assert!(iou_corner_overlap < 0.10);
+
+        // Shifted [x, y, w, h] boxes where x < w and y < h and a[2] <= b[0]
+        // must return their true [x, y, w, h] IoU (~0.80 >= 0.72, NOT 0.0).
+        let iou_shifted_xywh =
+            compute_norm_box_iou([0.20, 0.15, 0.22, 0.50], [0.22, 0.15, 0.23, 0.50]);
+        assert!((iou_shifted_xywh - 0.80).abs() < 1e-6);
+
+        // 1. Disjoint [x1, y1, x2, y2] with different heights -> 0.0
+        assert_eq!(
+            compute_norm_box_iou([0.40, 0.40, 0.45, 0.45], [0.40, 0.45, 0.45, 0.465]),
+            0.0
+        );
+
+        // 2. Concentric / corner-scaled [x1, y1, x2, y2] -> ~0.1111 and 0.25 (< 0.72)
+        let iou_concentric =
+            compute_norm_box_iou([0.40, 0.40, 0.45, 0.45], [0.35, 0.35, 0.50, 0.50]);
+        assert!((iou_concentric - (1.0 / 9.0)).abs() < 1e-6);
+        assert!(iou_concentric < 0.72);
+
+        let iou_corner_scaled =
+            compute_norm_box_iou([0.40, 0.40, 0.44, 0.44], [0.40, 0.40, 0.48, 0.48]);
+        assert!((iou_corner_scaled - 0.25).abs() < 1e-6);
+        assert!(iou_corner_scaled < 0.72);
+
+        // 3. Disjoint slender [x1, y1, x2, y2] -> 0.0
+        assert_eq!(
+            compute_norm_box_iou([0.40, 0.30, 0.43, 0.46], [0.43, 0.30, 0.46, 0.46]),
+            0.0
+        );
+
+        // 4. Shifted [x, y, w, h] boxes -> ~0.7843 and 0.75 (>= 0.72)
+        let iou_shifted_xywh_2 =
+            compute_norm_box_iou([0.20, 0.15, 0.22, 0.22], [0.22, 0.15, 0.235, 0.22]);
+        assert!((iou_shifted_xywh_2 - (0.20 / 0.255)).abs() < 1e-6);
+        assert!(iou_shifted_xywh_2 >= 0.72);
+
+        let iou_shifted_xywh_3 =
+            compute_norm_box_iou([0.10, 0.10, 0.20, 0.20], [0.12, 0.10, 0.22, 0.20]);
+        assert!((iou_shifted_xywh_3 - 0.75).abs() < 1e-6);
+        assert!(iou_shifted_xywh_3 >= 0.72);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_cycle2_p0_01_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        db.upsert_event(&EventDto {
+            id: "ev_fp_center".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 1000.0,
+            end_time: Some(1005.0),
+            has_clip: false,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.85),
+            false_positive: Some(false),
+            box_coords: Some(json!([0.40, 0.40, 0.45, 0.45])),
+            data: json!({"box": [0.40, 0.40, 0.45, 0.45]}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.85),
+            stationary: true,
+        })
+        .unwrap();
+        assert_eq!(
+            db.set_event_false_positive("ev_fp_center", true).unwrap(),
+            1
+        );
+
+        // Disjoint or barely-overlapping [x1, y1, x2, y2] boxes must NOT match the false-positive signature
+        let disjoint_match = db
+            .match_false_positive_signature("front_door", "person", [0.40, 0.45, 0.45, 0.50], None)
+            .unwrap();
+        assert!(disjoint_match.is_none());
+
+        let barely_overlapping_match = db
+            .match_false_positive_signature(
+                "front_door",
+                "person",
+                [0.40, 0.4499, 0.45, 0.50],
+                None,
+            )
+            .unwrap();
+        assert!(barely_overlapping_match.is_none());
+
+        // Shifted [x, y, w, h] false-positive signature at [0.20, 0.15, 0.22, 0.50] matches [0.22, 0.15, 0.23, 0.50]
+        db.upsert_event(&EventDto {
+            id: "ev_fp_xywh".to_string(),
+            camera: "patio".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 1010.0,
+            end_time: Some(1015.0),
+            has_clip: false,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.85),
+            false_positive: Some(false),
+            box_coords: Some(json!([0.20, 0.15, 0.22, 0.50])),
+            data: json!({"box": [0.20, 0.15, 0.22, 0.50]}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.85),
+            stationary: true,
+        })
+        .unwrap();
+        assert_eq!(db.set_event_false_positive("ev_fp_xywh", true).unwrap(), 1);
+        let shifted_xywh_match = db
+            .match_false_positive_signature("patio", "person", [0.22, 0.15, 0.23, 0.50], None)
+            .unwrap();
+        assert!(shifted_xywh_match.is_some());
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cycle2_p0_02_sqlite_type_affinity_corrupted_token_and_share_link_columns_fail_closed() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_cycle2_p0_02_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        let (tok_meta, _plain) = db
+            .create_api_token("ci_full_tok", "full", Some(3000.0))
+            .unwrap();
+        let tok_id = tok_meta["id"].as_str().unwrap().to_string();
+        assert!(
+            db.is_api_token_active_by_name("ci_full_tok", 2000.0)
+                .unwrap()
+        );
+
+        // Corrupt expires_at to non-numeric TEXT or +Inf: is_api_token_active_by_name must fail closed
+        db.execute_batch(&format!(
+            "UPDATE api_token SET expires_at = 'corrupted_text' WHERE id = '{tok_id}';"
+        ))
+        .unwrap();
+        assert!(
+            !db.is_api_token_active_by_name("ci_full_tok", 2000.0)
+                .unwrap()
+        );
+        db.execute_batch(&format!(
+            "UPDATE api_token SET expires_at = 9e999 WHERE id = '{tok_id}';"
+        ))
+        .unwrap();
+        assert!(
+            !db.is_api_token_active_by_name("ci_full_tok", 2000.0)
+                .unwrap()
+        );
+
+        // Share link: touch_share_link_last_accessed must reject expired links (accessed_at >= expires_at)
+        db.insert_share_link_with_options(
+            "sl_c2_exp",
+            "event",
+            "ev_c2_target",
+            Some("front_door"),
+            "admin",
+            1000.0,
+            2000.0,
+            Some(2),
+        )
+        .unwrap();
+        assert!(
+            db.touch_share_link_last_accessed("sl_c2_exp", 1500.0)
+                .unwrap()
+        );
+        assert!(
+            !db.touch_share_link_last_accessed("sl_c2_exp", 2000.0)
+                .unwrap()
+        );
+        assert!(
+            !db.touch_share_link_last_accessed("sl_c2_exp", 2500.0)
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_share_link("sl_c2_exp").unwrap().unwrap()["last_accessed_at"],
+            1500.0
+        );
+
+        // Corrupt share_link columns to TEXT / +Inf: all access and active checks must fail closed
+        db.execute_batch(
+            "UPDATE share_link SET expires_at = 'corrupted_exp' WHERE id = 'sl_c2_exp';",
+        )
+        .unwrap();
+        assert!(!db.record_share_link_access("sl_c2_exp", 1200.0).unwrap());
+        assert!(
+            !db.touch_share_link_last_accessed("sl_c2_exp", 1600.0)
+                .unwrap()
+        );
+        assert!(
+            !db.has_active_share_links_for_target("ev_c2_target", 1200.0)
+                .unwrap()
+        );
+        assert!(
+            !db.has_recently_accessed_share_links_for_target("ev_c2_target", 1600.0, 900.0)
+                .unwrap()
+        );
+
+        db.execute_batch(
+            "UPDATE share_link SET expires_at = 5000.0, max_views = 'corrupted_max' WHERE id = 'sl_c2_exp';",
+        )
+        .unwrap();
+        assert!(!db.record_share_link_access("sl_c2_exp", 1200.0).unwrap());
+        assert!(
+            !db.has_active_share_links_for_target("ev_c2_target", 1200.0)
+                .unwrap()
+        );
+
+        db.execute_batch(
+            "UPDATE share_link SET max_views = 5, revoked = 'corrupted_rev' WHERE id = 'sl_c2_exp';",
+        )
+        .unwrap();
+        assert!(db.is_share_link_revoked("sl_c2_exp").unwrap());
+        assert!(!db.is_share_link_active("sl_c2_exp", 1200.0).unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cycle2_p0_03_retention_preserves_pinned_event_recordings_clamps_negative_margins_and_cleans_clean_webp()
+     {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_cycle2_p0_03_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. Pinned event (retain_indefinitely = true) at [1000, 1010] protects overlapping recording
+        //    even when event_before_ts (3000.0) > r.end_time (1010.0)
+        db.upsert_event(&EventDto {
+            id: "ev_pinned_1".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: true,
+            sub_label: None,
+            top_score: Some(0.95),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"max_severity": "alert"}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.95),
+            stationary: false,
+        })
+        .unwrap();
+
+        db.insert_recording(&RecordingRow {
+            id: "rec_pinned_seg".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/front_door/rec_pinned_seg.mp4".to_string(),
+            start_time: 1000.0,
+            end_time: 1010.0,
+            duration: 10.0,
+            motion: 100,
+            objects: 2,
+            dbfs: 0,
+            segment_size: 2.0,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+        db.insert_recording(&RecordingRow {
+            id: "rec_unpinned_old".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/front_door/rec_unpinned_old.mp4".to_string(),
+            start_time: 500.0,
+            end_time: 510.0,
+            duration: 10.0,
+            motion: 100,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 2.0,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        let pruned = db
+            .delete_expired_recordings_with_window(
+                "front_door",
+                3000.0,
+                3000.0,
+                3000.0,
+                -50.0,
+                -50.0,
+            )
+            .unwrap();
+        assert_eq!(
+            pruned,
+            vec!["/media/ninjanvr/recordings/front_door/rec_unpinned_old.mp4"]
+        );
+        let remaining = db.query_recordings("front_door", 900.0, 1100.0).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "rec_pinned_seg");
+
+        // 2. cleanup_expired_events_and_reviews includes {camera}-{id}-clean.webp for expired events
+        db.upsert_event(&EventDto {
+            id: "ev_exp_clean_snap".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 1200.0,
+            end_time: Some(1210.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.9),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"max_severity": "alert"}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.9),
+            stationary: false,
+        })
+        .unwrap();
+
+        let removed_files = db
+            .cleanup_expired_events_and_reviews("front_door", 2000.0, 2000.0)
+            .unwrap();
+        assert!(removed_files.contains(
+            &"/media/ninjanvr/clips/front_door-ev_exp_clean_snap-clean.webp".to_string()
+        ));
+        assert!(
+            !removed_files.iter().any(|p| p.contains("ev_pinned_1")),
+            "pinned event snapshots must never be scheduled for removal"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cycle2_p1_01_target_deletion_cascades_share_links_and_role_camera_scoping_edge_cases_work() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_cycle2_p1_01_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. update_user_role on non-existent user returns Ok(false) even when 0 admins exist
+        assert!(!db.update_user_role("ghost_user", "viewer").unwrap());
+
+        // Comma-only and wildcard-mixed allowed_cameras normalize to "*"
+        db.create_user_with_cameras("op_comma", "Pass123!", "operator", " , , ", 1000)
+            .unwrap();
+        assert_eq!(
+            db.get_user("op_comma").unwrap().unwrap().allowed_cameras,
+            "*"
+        );
+        assert!(
+            db.update_user_allowed_cameras("op_comma", "*,front_door")
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_user("op_comma").unwrap().unwrap().allowed_cameras,
+            "*"
+        );
+
+        // 2. delete_event, delete_events_bulk, delete_reviews, delete_export, delete_exports_bulk
+        //    atomically revoke associated share links
+        for id in ["ev_del_1", "ev_del_2", "ev_del_3"] {
+            db.upsert_event(&EventDto {
+                id: id.to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: 1000.0,
+                end_time: Some(1005.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.9),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({}),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.9),
+                stationary: false,
+            })
+            .unwrap();
+            db.insert_share_link(
+                &format!("sl_{id}"),
+                "event",
+                id,
+                Some("front_door"),
+                "admin",
+                1000.0,
+                5000.0,
+            )
+            .unwrap();
+        }
+        assert_eq!(db.delete_event("ev_del_1").unwrap(), 1);
+        assert!(db.is_share_link_revoked("sl_ev_del_1").unwrap());
+        assert!(!db.is_share_link_revoked("sl_ev_del_2").unwrap());
+
+        assert_eq!(
+            db.delete_events_bulk(&["ev_del_2".to_string(), "ev_del_3".to_string()])
+                .unwrap(),
+            2
+        );
+        assert!(db.is_share_link_revoked("sl_ev_del_2").unwrap());
+        assert!(db.is_share_link_revoked("sl_ev_del_3").unwrap());
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_del_1".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            severity: "alert".to_string(),
+            thumb_path: "/clips/rev_del_1.webp".to_string(),
+            data: json!({}),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+        db.insert_share_link(
+            "sl_rev_del_1",
+            "review",
+            "rev_del_1",
+            Some("front_door"),
+            "admin",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        assert_eq!(db.delete_reviews(&["rev_del_1".to_string()]).unwrap(), 1);
+        assert!(db.is_share_link_revoked("sl_rev_del_1").unwrap());
+
+        for id in ["exp_del_1", "exp_del_2"] {
+            db.insert_export(&ExportRow {
+                id: id.to_string(),
+                camera: "front_door".to_string(),
+                name: id.to_string(),
+                date: 1000.0,
+                video_path: format!("/media/ninjanvr/exports/{id}.mp4"),
+                thumb_path: format!("/media/ninjanvr/clips/{id}.webp"),
+                in_progress: false,
+            })
+            .unwrap();
+            db.insert_share_link(
+                &format!("sl_{id}"),
+                "export",
+                id,
+                Some("front_door"),
+                "admin",
+                1000.0,
+                5000.0,
+            )
+            .unwrap();
+        }
+        assert!(db.delete_export("exp_del_1").unwrap().is_some());
+        assert!(db.is_share_link_revoked("sl_exp_del_1").unwrap());
+        assert!(!db.is_share_link_revoked("sl_exp_del_2").unwrap());
+
+        assert_eq!(
+            db.delete_exports_bulk(&["exp_del_2".to_string()])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db.is_share_link_revoked("sl_exp_del_2").unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cycle2_p1_02_plate_filter_non_alnum_mark_reviews_viewed_fk_and_stale_plate_sub_label_scrubbing()
+     {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_cycle2_p1_02_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        db.upsert_event(&EventDto {
+            id: "ev_plate_c2".to_string(),
+            camera: "front_door".to_string(),
+            label: "car".to_string(),
+            zones: json!([]),
+            start_time: 1000.0,
+            end_time: Some(1005.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: Some("eRIK".to_string()),
+            top_score: Some(0.92),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({"attributes": ["color:blue"]}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.92),
+            stationary: false,
+        })
+        .unwrap();
+
+        // 1. Non-alphanumeric plate filter ("---") must return 0 events, not all events
+        assert!(
+            db.query_events(&EventFilter {
+                plate: Some("---".to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            db.query_events(&EventFilter {
+                recognized_license_plates: Some(vec!["!@#$".to_string()]),
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty()
+        );
+
+        // 2. set_event_license_plate scrubs previous plate from data.attributes on update and clear
+        db.set_event_license_plate("ev_plate_c2", Some("OLD-1111"))
+            .unwrap();
+        let ev_old = db.get_event("ev_plate_c2").unwrap().unwrap();
+        assert_eq!(
+            ev_old["data"]["attributes"],
+            json!(["color:blue", "OLD1111"])
+        );
+
+        db.set_event_license_plate("ev_plate_c2", Some("NEW-2222"))
+            .unwrap();
+        let ev_new = db.get_event("ev_plate_c2").unwrap().unwrap();
+        assert_eq!(
+            ev_new["data"]["attributes"],
+            json!(["color:blue", "NEW2222"])
+        );
+
+        db.set_event_license_plate("ev_plate_c2", None).unwrap();
+        let ev_cleared = db.get_event("ev_plate_c2").unwrap().unwrap();
+        assert_eq!(ev_cleared["data"]["attributes"], json!(["color:blue"]));
+
+        // 3. set_event_sub_label removes case-mismatched old sub_label from reviewsegment
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_c2_1".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 1000.0,
+            end_time: Some(1010.0),
+            severity: "alert".to_string(),
+            thumb_path: "/clips/rev_c2_1.webp".to_string(),
+            data: json!({
+                "detections": ["ev_plate_c2", "ev_other"],
+                "sub_labels": ["Erik"]
+            }),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+        db.set_event_sub_label("ev_plate_c2", Some("Alice"))
+            .unwrap();
+        let rev_after_sub = db.get_review_by_id("rev_c2_1").unwrap().unwrap();
+        assert_eq!(rev_after_sub.data["sub_labels"], json!(["Alice"]));
+
+        // 4. mark_reviews_viewed ignores non-existent review IDs without FK failure and clears multi-user status on unview
+        let marked = db
+            .mark_reviews_viewed(
+                &["rev_c2_1".to_string(), "rev_missing_fk".to_string()],
+                true,
+            )
+            .unwrap();
+        assert_eq!(marked, 1);
+        db.execute_batch(
+            "INSERT INTO userreviewstatus (user_id, review_segment_id, has_been_reviewed) VALUES ('operator1', 'rev_c2_1', 1);",
+        )
+        .unwrap();
+        db.mark_reviews_viewed(&["rev_c2_1".to_string()], false)
+            .unwrap();
+        assert!(
+            !db.get_review_by_id("rev_c2_1")
+                .unwrap()
+                .unwrap()
+                .has_been_reviewed
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cycle2_p1_03_infinite_segment_size_quota_resilience_dataset_nan_sanitization_and_legacy_migrations()
+     {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_cycle2_p1_03_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. Corrupted +Inf segment_size or start_time row in SQLite must not brick quota eviction or summary queries
+        for i in 0..3 {
+            db.insert_recording(&RecordingRow {
+                id: format!("rec_q_{i}"),
+                camera: "front_door".to_string(),
+                path: format!("/media/ninjanvr/recordings/front_door/rec_q_{i}.mp4"),
+                start_time: 1000.0 + (i as f64) * 10.0,
+                end_time: 1010.0 + (i as f64) * 10.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 100.0,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        }
+        db.execute_batch(
+            "INSERT INTO recordings (id, camera, path, start_time, end_time, duration, segment_size)
+             VALUES ('rec_inf', 'front_door', '/media/ninjanvr/recordings/front_door/rec_inf.mp4', 9e999, 9e999, 9e999, 9e999);",
+        )
+        .unwrap();
+
+        assert!(db.query_all_recordings_summary().is_ok());
+        let usage = db.query_recordings_storage_usage().unwrap();
+        assert_eq!(usage["front_door"]["usage"], 300.0);
+
+        let evicted = db
+            .delete_recordings_over_quota_mb("front_door", 150.0)
+            .unwrap();
+        assert_eq!(evicted.len(), 2);
+
+        // 2. upsert_dataset_sample sanitizes NaN/Inf annotation coordinates/scores so JSON roundtrip never drops boxes
+        let sample = db
+            .upsert_dataset_sample(&DatasetSampleDto {
+                id: "ds_nan_box".to_string(),
+                event_id: None,
+                camera: "front_door".to_string(),
+                split: "train".to_string(),
+                sample_kind: "true_positive".to_string(),
+                image_path: "/media/ninjanvr/dataset/ds_nan_box.webp".to_string(),
+                width: 640,
+                height: 360,
+                annotations: vec![DatasetAnnotationBox {
+                    class_id: 0,
+                    label: "person".to_string(),
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 0.2,
+                    h: 0.4,
+                    score: f64::NAN,
+                    source: "manual".to_string(),
+                }],
+                verified: true,
+                night_mode: false,
+                created_at: 1000.0,
+            })
+            .unwrap();
+        assert_eq!(sample.annotations.len(), 1);
+        let loaded = db.get_dataset_sample("ds_nan_box").unwrap().unwrap();
+        assert_eq!(loaded.annotations.len(), 1);
+        assert_eq!(loaded.annotations[0].score, 1.0);
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);
