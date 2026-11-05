@@ -84,9 +84,15 @@ impl BoundingBox {
         if ix2 <= ix1 || iy2 <= iy1 {
             return 0.0;
         }
-        let inter = ((ix2 - ix1) as f32) * ((iy2 - iy1) as f32);
-        let union = (self.area() as f32) + (other.area() as f32) - inter;
-        if union <= 0.0 { 0.0 } else { inter / union }
+        let inter = ((ix2 - ix1) as f64) * ((iy2 - iy1) as f64);
+        let self_area = (self.width() as f64) * (self.height() as f64);
+        let other_area = (other.width() as f64) * (other.height() as f64);
+        let union = self_area + other_area - inter;
+        if union <= 0.0 {
+            0.0
+        } else {
+            ((inter / union) as f32).clamp(0.0, 1.0)
+        }
     }
 
     pub fn intersection_over_min(&self, other: &Self) -> f32 {
@@ -97,12 +103,14 @@ impl BoundingBox {
         if ix2 <= ix1 || iy2 <= iy1 {
             return 0.0;
         }
-        let inter = ((ix2 - ix1) as f32) * ((iy2 - iy1) as f32);
-        let min_area = self.area().min(other.area()) as f32;
+        let inter = ((ix2 - ix1) as f64) * ((iy2 - iy1) as f64);
+        let self_area = (self.width() as f64) * (self.height() as f64);
+        let other_area = (other.width() as f64) * (other.height() as f64);
+        let min_area = self_area.min(other_area);
         if min_area <= 0.0 {
             0.0
         } else {
-            inter / min_area
+            ((inter / min_area) as f32).clamp(0.0, 1.0)
         }
     }
 
@@ -192,27 +200,35 @@ impl PolygonMask {
     }
 
     fn parse_coord_str(s: &str, frame_w: u32, frame_h: u32) -> Option<Vec<(f32, f32)>> {
-        let nums: Vec<f32> = s
-            .split(',')
-            .filter_map(|p| p.trim().parse::<f32>().ok())
-            .collect();
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let mut nums = Vec::new();
+        for part in trimmed.split(',') {
+            let v = part.trim().parse::<f32>().ok()?;
+            if !v.is_finite() {
+                return None;
+            }
+            nums.push(v);
+        }
         if nums.len() < 6 || !nums.len().is_multiple_of(2) {
             return None;
         }
         let is_normalized = nums.iter().all(|&v| (0.0..=1.0).contains(&v));
+        let fw = frame_w.max(1) as f32;
+        let fh = frame_h.max(1) as f32;
         let mut pts = Vec::with_capacity(nums.len() / 2);
         for &[px, py] in nums.as_chunks::<2>().0 {
-            let x = if is_normalized {
-                px * (frame_w as f32)
-            } else {
-                px
-            };
-            let y = if is_normalized {
-                py * (frame_h as f32)
-            } else {
-                py
-            };
+            let x = if is_normalized { px * fw } else { px };
+            let y = if is_normalized { py * fh } else { py };
+            if !x.is_finite() || !y.is_finite() {
+                return None;
+            }
             pts.push((x, y));
+        }
+        if polygon_signed_area2(&pts).abs() <= 1e-5 {
+            return None;
         }
         Some(pts)
     }
@@ -228,8 +244,27 @@ impl PolygonMask {
     }
 }
 
-pub fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+fn polygon_signed_area2(poly: &[(f32, f32)]) -> f32 {
     if poly.len() < 3 {
+        return 0.0;
+    }
+    let mut area2 = 0.0f32;
+    for i in 0..poly.len() {
+        let (x1, y1) = poly[i];
+        let (x2, y2) = poly[(i + 1) % poly.len()];
+        area2 += x1 * y2 - x2 * y1;
+    }
+    if area2.is_finite() { area2 } else { 0.0 }
+}
+
+pub fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+    if !x.is_finite()
+        || !y.is_finite()
+        || poly.len() < 3
+        || poly
+            .iter()
+            .any(|(px, py)| !px.is_finite() || !py.is_finite())
+    {
         return false;
     }
     let mut inside = false;
@@ -237,8 +272,8 @@ pub fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
     for i in 0..poly.len() {
         let (xi, yi) = poly[i];
         let (xj, yj) = poly[j];
-        let intersect =
-            ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-7) + xi);
+        let dy = yj - yi;
+        let intersect = ((yi > y) != (yj > y)) && dy != 0.0 && (x < (xj - xi) * (y - yi) / dy + xi);
         if intersect {
             inside = !inside;
         }
@@ -276,14 +311,17 @@ pub struct SimdMotionDetector {
 
 impl SimdMotionDetector {
     pub fn new(frame_w: u32, frame_h: u32, config: MotionConfig) -> Self {
-        let motion_h = config.frame_height.clamp(32, frame_h.max(32));
+        let safe_fw = frame_w.max(1);
+        let safe_fh = frame_h.max(1);
+        let max_motion_h = safe_fh.clamp(32, 1080);
+        let motion_h = config.frame_height.clamp(32, max_motion_h);
         let motion_w =
-            ((frame_w as u64 * motion_h as u64) / (frame_h.max(1) as u64)).max(32) as u32;
-        let len = (motion_w * motion_h) as usize;
-        let scale_x = (frame_w as f32) / (motion_w as f32);
-        let scale_y = (frame_h as f32) / (motion_h as f32);
+            ((safe_fw as u64 * motion_h as u64) / (safe_fh as u64)).clamp(32, 1920) as u32;
+        let len = (motion_w as usize) * (motion_h as usize);
+        let scale_x = (safe_fw as f32) / (motion_w as f32);
+        let scale_y = (safe_fh as f32) / (motion_h as f32);
 
-        let poly_mask = PolygonMask::from_config_value(&config.mask, frame_w, frame_h);
+        let poly_mask = PolygonMask::from_config_value(&config.mask, safe_fw, safe_fh);
         let mut masked_indices = Vec::new();
         let mut masked_bitmap = vec![false; len];
         if !poly_mask.is_empty() {
@@ -332,16 +370,26 @@ impl SimdMotionDetector {
     }
 
     pub fn detect(&mut self, frame: &YuvFrame) -> Vec<BoundingBox> {
-        let y_plane = frame.y_plane();
-        if y_plane.len() < (self.frame_w * self.frame_h) as usize {
+        if self.frame_w == 0
+            || self.frame_h == 0
+            || frame.width < self.frame_w
+            || frame.height < self.frame_h
+        {
             return Vec::new();
         }
-
-        // 1. Box-averaging downscale of Y-plane into `work_gray` (suppresses sensor & H.264 pixel noise)
         let mw = self.motion_w as usize;
         let mh = self.motion_h as usize;
         let fw = self.frame_w as usize;
         let fh = self.frame_h as usize;
+        let Some(expected_y_len) = fw.checked_mul(fh) else {
+            return Vec::new();
+        };
+        let y_plane = frame.y_plane();
+        if y_plane.len() < expected_y_len {
+            return Vec::new();
+        }
+
+        // 1. Box-averaging downscale of Y-plane into `work_gray` (suppresses sensor & H.264 pixel noise)
 
         for my in 0..mh {
             let sy0 = (my * fh) / mh;
@@ -409,7 +457,12 @@ impl SimdMotionDetector {
                 self.smooth_min_v = raw_min as f32;
                 self.smooth_max_v = raw_max as f32;
             } else {
-                let c_alpha = self.config.frame_alpha.clamp(0.005, 0.25);
+                let raw_fa = if self.config.frame_alpha.is_finite() {
+                    self.config.frame_alpha
+                } else {
+                    0.02
+                };
+                let c_alpha = raw_fa.clamp(0.005, 0.25);
                 self.smooth_min_v =
                     (1.0 - c_alpha) * self.smooth_min_v + c_alpha * (raw_min as f32);
                 self.smooth_max_v =
@@ -444,7 +497,12 @@ impl SimdMotionDetector {
         self.frame_counter += 1;
 
         // 6. Compute frameDelta, EMA avg_delta, and threshold
-        let delta_alpha = self.config.delta_alpha.clamp(0.01, 1.0);
+        let raw_da = if self.config.delta_alpha.is_finite() {
+            self.config.delta_alpha
+        } else {
+            0.2
+        };
+        let delta_alpha = raw_da.clamp(0.01, 1.0);
         let thresh_val = self.config.threshold;
         let mut active_pixels = 0usize;
 
@@ -476,7 +534,12 @@ impl SimdMotionDetector {
 
         // Lightning / IR cut-filter switch rejection
         let active_fraction = (active_pixels as f32) / (self.work_blurred.len().max(1) as f32);
-        if active_fraction >= self.config.lightning_threshold {
+        let lightning_thresh = if self.config.lightning_threshold.is_finite() {
+            self.config.lightning_threshold.clamp(0.05, 1.0)
+        } else {
+            0.8
+        };
+        if active_fraction >= lightning_thresh {
             for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
                 *avg = px as f32;
             }
@@ -491,7 +554,7 @@ impl SimdMotionDetector {
         let motion_boxes = self.extract_connected_boxes();
 
         // 9. Update background model (`delta_alpha` = 0.2 default, so static changes settle in ~1.5s)
-        let bg_alpha = self.config.delta_alpha.clamp(0.05, 0.5);
+        let bg_alpha = raw_da.clamp(0.05, 0.5);
         for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
             *avg = (1.0 - bg_alpha) * (*avg) + bg_alpha * (px as f32);
         }
@@ -703,6 +766,9 @@ pub fn compute_inference_regions(
     motion_boxes: &[BoundingBox],
     tracked_boxes: &[BoundingBox],
 ) -> Vec<BoundingBox> {
+    if frame_w == 0 || frame_h == 0 {
+        return Vec::new();
+    }
     let mut candidates: Vec<BoundingBox> =
         Vec::with_capacity(motion_boxes.len() + tracked_boxes.len());
     candidates.extend_from_slice(tracked_boxes);
@@ -727,8 +793,8 @@ pub fn compute_inference_regions(
                 let expanded_a = BoundingBox::new(
                     a.x_min.saturating_sub(pad),
                     a.y_min.saturating_sub(pad),
-                    (a.x_max + pad).min(frame_w),
-                    (a.y_max + pad).min(frame_h),
+                    a.x_max.saturating_add(pad).min(frame_w),
+                    a.y_max.saturating_add(pad).min(frame_h),
                 );
                 if expanded_a.intersects(&b) {
                     candidates[i] = a.union(&b);
@@ -743,15 +809,25 @@ pub fn compute_inference_regions(
     candidates.sort_by_key(|b| std::cmp::Reverse(b.width().max(b.height())));
 
     let min_dim = frame_w.min(frame_h).max(1);
+    let safe_model_size = model_size.max(4);
     let mut regions = Vec::with_capacity(candidates.len());
     for c in candidates {
-        let raw_size = ((c.width().max(c.height()) as f32) * 1.2) as u32;
-        let size = (raw_size.max(model_size) / 4 * 4).clamp(model_size.min(min_dim), min_dim);
+        let raw_size = ((c.width().max(c.height()) as f64) * 1.2) as u32;
+        let size = (raw_size.max(safe_model_size) / 4 * 4)
+            .clamp(safe_model_size.min(min_dim), min_dim)
+            .max(1);
         let (cx, cy) = c.center();
-        let half = (size / 2) as i32;
-        let x0 = ((cx as i32) - half).clamp(0, (frame_w.saturating_sub(size)) as i32) as u32;
-        let y0 = ((cy as i32) - half).clamp(0, (frame_h.saturating_sub(size)) as i32) as u32;
-        let reg = BoundingBox::new(x0, y0, (x0 + size).min(frame_w), (y0 + size).min(frame_h));
+        let half = (size / 2) as i64;
+        let max_x0 = frame_w.saturating_sub(size) as i64;
+        let max_y0 = frame_h.saturating_sub(size) as i64;
+        let x0 = ((cx as i64) - half).clamp(0, max_x0) as u32;
+        let y0 = ((cy as i64) - half).clamp(0, max_y0) as u32;
+        let reg = BoundingBox::new(
+            x0,
+            y0,
+            x0.saturating_add(size).min(frame_w),
+            y0.saturating_add(size).min(frame_h),
+        );
         if !regions.iter().any(|r: &BoundingBox| reg.inside(r)) {
             regions.push(reg);
         }
@@ -782,9 +858,25 @@ pub fn crop_yuv420p_to_tensor_nhwc(
 ) {
     let fw = frame.width as usize;
     let fh = frame.height as usize;
-    let y_size = fw * fh;
-    let uv_size = y_size / 4;
-    if frame.data.len() < y_size + uv_size * 2 {
+    if fw < 2 || fh < 2 || model_w == 0 || model_h == 0 {
+        out_tensor.fill(0);
+        return;
+    }
+    let uv_stride = fw / 2;
+    let uv_rows = fh / 2;
+    let Some(y_size) = fw.checked_mul(fh) else {
+        out_tensor.fill(0);
+        return;
+    };
+    let Some(uv_size) = uv_stride.checked_mul(uv_rows) else {
+        out_tensor.fill(0);
+        return;
+    };
+    let Some(min_buf_len) = y_size.checked_add(uv_size.saturating_mul(2)) else {
+        out_tensor.fill(0);
+        return;
+    };
+    if frame.data.len() < min_buf_len {
         out_tensor.fill(0);
         return;
     }
@@ -792,21 +884,20 @@ pub fn crop_yuv420p_to_tensor_nhwc(
     let y_plane = &frame.data[..y_size];
     let u_plane = &frame.data[y_size..y_size + uv_size];
     let v_plane = &frame.data[y_size + uv_size..y_size + uv_size * 2];
-    let uv_stride = fw / 2;
 
     let rw = region.width().max(1) as usize;
     let rh = region.height().max(1) as usize;
-    let rx0 = region.x_min as usize;
-    let ry0 = region.y_min as usize;
+    let rx0 = (region.x_min as usize).min(fw - 1);
+    let ry0 = (region.y_min as usize).min(fh - 1);
     let mw = model_w as usize;
     let mh = model_h as usize;
 
     for ty in 0..mh {
-        let sy = (ry0 + (ty * rh) / mh).min(fh - 1);
-        let uv_y = sy / 2;
+        let sy = ry0.saturating_add((ty.saturating_mul(rh)) / mh).min(fh - 1);
+        let uv_y = (sy / 2).min(uv_rows - 1);
         for tx in 0..mw {
-            let sx = (rx0 + (tx * rw) / mw).min(fw - 1);
-            let uv_x = sx / 2;
+            let sx = rx0.saturating_add((tx.saturating_mul(rw)) / mw).min(fw - 1);
+            let uv_x = (sx / 2).min(uv_stride - 1);
             let y_val = y_plane[sy * fw + sx];
             let u_val = u_plane[uv_y * uv_stride + uv_x];
             let v_val = v_plane[uv_y * uv_stride + uv_x];
@@ -845,9 +936,21 @@ pub fn yuv420p_to_rgb_image_scaled(
 ) -> RgbImage {
     let fw = frame.width as usize;
     let fh = frame.height as usize;
-    let y_size = fw * fh;
-    let uv_size = y_size / 4;
-    if frame.data.len() < y_size + uv_size * 2 {
+    if fw < 2 || fh < 2 {
+        return RgbImage::new(320, 180);
+    }
+    let uv_stride = fw / 2;
+    let uv_rows = fh / 2;
+    let Some(y_size) = fw.checked_mul(fh) else {
+        return RgbImage::new(320, 180);
+    };
+    let Some(uv_size) = uv_stride.checked_mul(uv_rows) else {
+        return RgbImage::new(320, 180);
+    };
+    let Some(min_buf_len) = y_size.checked_add(uv_size.saturating_mul(2)) else {
+        return RgbImage::new(320, 180);
+    };
+    if frame.data.len() < min_buf_len {
         return RgbImage::new(320, 180);
     }
 
@@ -867,16 +970,17 @@ pub fn yuv420p_to_rgb_image_scaled(
     let y_plane = &frame.data[..y_size];
     let u_plane = &frame.data[y_size..y_size + uv_size];
     let v_plane = &frame.data[y_size + uv_size..y_size + uv_size * 2];
-    let uv_stride = fw / 2;
 
     for dy in 0..out_h {
-        let sy =
-            (region.y_min as usize + (dy as usize * rh as usize) / (out_h as usize)).min(fh - 1);
-        let uv_y = sy / 2;
+        let sy = (region.y_min as usize)
+            .saturating_add((dy as usize).saturating_mul(rh as usize) / (out_h as usize))
+            .min(fh - 1);
+        let uv_y = (sy / 2).min(uv_rows - 1);
         for dx in 0..out_w {
-            let sx = (region.x_min as usize + (dx as usize * rw as usize) / (out_w as usize))
+            let sx = (region.x_min as usize)
+                .saturating_add((dx as usize).saturating_mul(rw as usize) / (out_w as usize))
                 .min(fw - 1);
-            let uv_x = sx / 2;
+            let uv_x = (sx / 2).min(uv_stride - 1);
             let (r, g, b) = yuv_to_rgb_pixel(
                 y_plane[sy * fw + sx],
                 u_plane[uv_y * uv_stride + uv_x],
@@ -888,6 +992,9 @@ pub fn yuv420p_to_rgb_image_scaled(
 
     // Draw 2px bounding boxes scaled to (out_w, out_h)
     for (bbox, color) in boxes {
+        if !bbox.intersects(&region) {
+            continue;
+        }
         let rx1 = bbox.x_min.saturating_sub(region.x_min);
         let ry1 = bbox.y_min.saturating_sub(region.y_min);
         let rx2 = bbox.x_max.saturating_sub(region.x_min);
@@ -1024,9 +1131,12 @@ pub fn check_frame_tamper(yuv_data: &[u8], width: u32, height: u32) -> FrameInte
 /// chroma planes with near-zero CPU overhead. Returns `true` when the mean chroma deviation
 /// `|U - 128| + |V - 128| < 3.0`.
 pub fn is_monochrome_ir(yuv_data: &[u8], width: u32, height: u32) -> bool {
+    if width < 2 || height < 2 {
+        return false;
+    }
     let y_len = (width as usize).saturating_mul(height as usize);
-    let uv_len = y_len / 4;
-    if uv_len == 0 || yuv_data.len() < y_len + uv_len * 2 {
+    let uv_len = (width as usize / 2).saturating_mul(height as usize / 2);
+    if uv_len == 0 || yuv_data.len() < y_len.saturating_add(uv_len.saturating_mul(2)) {
         return false;
     }
     let u_plane = &yuv_data[y_len..y_len + uv_len];
@@ -1058,16 +1168,20 @@ pub fn classify_dominant_color_tag(
 ) -> String {
     let fw = width as usize;
     let fh = height as usize;
+    if fw < 2 || fh < 2 {
+        return "color:gray".to_string();
+    }
+    let uv_stride = fw / 2;
+    let uv_rows = fh / 2;
     let y_size = fw.saturating_mul(fh);
-    let uv_size = y_size / 4;
-    if fw == 0 || fh == 0 || yuv_data.len() < y_size + uv_size * 2 {
+    let uv_size = uv_stride.saturating_mul(uv_rows);
+    if yuv_data.len() < y_size.saturating_add(uv_size.saturating_mul(2)) {
         return "color:gray".to_string();
     }
 
     let y_plane = &yuv_data[..y_size];
     let u_plane = &yuv_data[y_size..y_size + uv_size];
     let v_plane = &yuv_data[y_size + uv_size..y_size + uv_size * 2];
-    let uv_stride = fw / 2;
 
     let x1 = (bbox.x_min as usize).min(fw - 1);
     let y1 = (bbox.y_min as usize).min(fh - 1);
@@ -1083,10 +1197,10 @@ pub fn classify_dominant_color_tag(
 
     let mut sy = y1;
     while sy < y2 {
-        let uv_y = (sy / 2).min(fh / 2 - 1);
+        let uv_y = (sy / 2).min(uv_rows - 1);
         let mut sx = x1;
         while sx < x2 {
-            let uv_x = (sx / 2).min(uv_stride.saturating_sub(1));
+            let uv_x = (sx / 2).min(uv_stride - 1);
             let (r, g, b) = yuv_to_rgb_pixel(
                 y_plane[sy * fw + sx],
                 u_plane[uv_y * uv_stride + uv_x],
@@ -1159,25 +1273,25 @@ pub fn apply_privacy_mask_pixelated_rgb(img: &mut RgbImage, mask: &PolygonMask, 
     }
     let w = img.width();
     let h = img.height();
-    let bs = block_size.max(2);
+    let bs = block_size.clamp(2, 256);
     let mut by = 0u32;
     while by < h {
-        let y_end = (by + bs).min(h);
+        let y_end = by.saturating_add(bs).min(h);
         let mut bx = 0u32;
         while bx < w {
-            let x_end = (bx + bs).min(w);
-            let mut r_sum = 0u32;
-            let mut g_sum = 0u32;
-            let mut b_sum = 0u32;
-            let mut count = 0u32;
+            let x_end = bx.saturating_add(bs).min(w);
+            let mut r_sum = 0u64;
+            let mut g_sum = 0u64;
+            let mut b_sum = 0u64;
+            let mut count = 0u64;
             let mut any_masked = false;
             for y in by..y_end {
                 let fy = y as f32;
                 for x in bx..x_end {
                     let px = img.get_pixel(x, y);
-                    r_sum += px[0] as u32;
-                    g_sum += px[1] as u32;
-                    b_sum += px[2] as u32;
+                    r_sum += px[0] as u64;
+                    g_sum += px[1] as u64;
+                    b_sum += px[2] as u64;
                     count += 1;
                     if mask.contains_point(x as f32, fy) {
                         any_masked = true;
@@ -1199,9 +1313,9 @@ pub fn apply_privacy_mask_pixelated_rgb(img: &mut RgbImage, mask: &PolygonMask, 
                     }
                 }
             }
-            bx += bs;
+            bx = bx.saturating_add(bs);
         }
-        by += bs;
+        by = by.saturating_add(bs);
     }
 }
 
@@ -1326,9 +1440,14 @@ pub fn annotate_rgb_image_with_boxes(img: &mut RgbImage, boxes: &[(BoundingBox, 
 /// Resolves a normalized (`0.0..=1.0`) or pixel-space `[x1, y1, x2, y2]` ROI crop array
 /// into a valid `BoundingBox` clamped within `(0..frame_w, 0..frame_h)`.
 pub fn resolve_roi_crop_bbox(crop: [f32; 4], frame_w: u32, frame_h: u32) -> BoundingBox {
-    let fw = frame_w.max(1) as f32;
-    let fh = frame_h.max(1) as f32;
-    let is_normalized = crop.iter().all(|&v| v <= 1.0);
+    let safe_w = frame_w.max(1);
+    let safe_h = frame_h.max(1);
+    if crop.iter().any(|v| !v.is_finite()) {
+        return BoundingBox::new(0, 0, safe_w, safe_h);
+    }
+    let fw = safe_w as f32;
+    let fh = safe_h as f32;
+    let is_normalized = crop.iter().all(|&v| (0.0..=1.0).contains(&v));
     let raw_x1 = if is_normalized { crop[0] * fw } else { crop[0] };
     let raw_y1 = if is_normalized { crop[1] * fh } else { crop[1] };
     let raw_x2 = if is_normalized { crop[2] * fw } else { crop[2] };
@@ -1337,19 +1456,19 @@ pub fn resolve_roi_crop_bbox(crop: [f32; 4], frame_w: u32, frame_h: u32) -> Boun
     let x_min = raw_x1
         .min(raw_x2)
         .round()
-        .clamp(0.0, (frame_w.saturating_sub(1)) as f32) as u32;
+        .clamp(0.0, (safe_w.saturating_sub(1)) as f32) as u32;
     let y_min = raw_y1
         .min(raw_y2)
         .round()
-        .clamp(0.0, (frame_h.saturating_sub(1)) as f32) as u32;
+        .clamp(0.0, (safe_h.saturating_sub(1)) as f32) as u32;
     let x_max = raw_x1
         .max(raw_x2)
         .round()
-        .clamp((x_min + 1) as f32, frame_w.max(1) as f32) as u32;
+        .clamp((x_min + 1) as f32, safe_w as f32) as u32;
     let y_max = raw_y1
         .max(raw_y2)
         .round()
-        .clamp((y_min + 1) as f32, frame_h.max(1) as f32) as u32;
+        .clamp((y_min + 1) as f32, safe_h as f32) as u32;
     BoundingBox::new(x_min, y_min, x_max, y_max)
 }
 
@@ -1461,10 +1580,15 @@ pub fn classify_roi_crop(
     }
 
     let sig = compute_roi_crop_signature(yuv_data, width, height, cfg.crop);
+    let score = if sig.activity_score.is_finite() {
+        sig.activity_score.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let n = classes.len();
-    let raw_idx = (sig.activity_score * (n as f32)).floor() as usize;
+    let raw_idx = (score * (n as f32)).floor() as usize;
     let idx = raw_idx.min(n - 1);
-    let conf = (0.55 + (sig.activity_score - 0.5).abs() * 0.9).clamp(0.50, 0.99);
+    let conf = (0.55 + (score - 0.5).abs() * 0.9).clamp(0.50, 0.99);
     (classes[idx].to_string(), conf)
 }
 
@@ -1544,7 +1668,11 @@ impl RoiStateTracker {
     }
 
     pub fn anomaly_elapsed_sec(&self, now: f64) -> f64 {
-        if self.is_anomalous() && self.initialized {
+        if self.is_anomalous()
+            && self.initialized
+            && now.is_finite()
+            && self.state_since_ts.is_finite()
+        {
             (now - self.state_since_ts).max(0.0)
         } else {
             0.0
@@ -1555,12 +1683,16 @@ impl RoiStateTracker {
     /// either on the first frame, when `interval_sec` has elapsed, while confirming a pending
     /// hysteresis transition, or immediately after motion inside the ROI settles.
     pub fn should_evaluate(&mut self, now: f64, motion_in_roi: bool) -> bool {
+        if !now.is_finite() {
+            return false;
+        }
         if motion_in_roi {
             self.had_motion_in_roi = true;
         }
         let motion_settled = self.had_motion_in_roi && !motion_in_roi;
         let interval_due = match self.last_eval_ts {
             None => true,
+            Some(last) if !last.is_finite() || now < last => true,
             Some(last) => (now - last) >= (self.config.interval_sec.max(1) as f64),
         };
         if motion_settled || interval_due {
@@ -1583,7 +1715,21 @@ impl RoiStateTracker {
         confidence: f32,
         now: f64,
     ) -> RoiStateTransition {
-        self.last_eval_ts = Some(now);
+        let safe_now = if now.is_finite() {
+            now
+        } else {
+            self.last_eval_ts.filter(|t| t.is_finite()).unwrap_or(0.0)
+        };
+        let safe_conf = if confidence.is_finite() {
+            confidence.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.last_eval_ts = Some(safe_now);
+        if !self.state_since_ts.is_finite() || (self.initialized && safe_now < self.state_since_ts)
+        {
+            self.state_since_ts = safe_now;
+        }
         let mut previous_state = None;
         let mut state_changed = false;
 
@@ -1592,12 +1738,12 @@ impl RoiStateTracker {
             self.pending_count = 0;
             if !self.initialized {
                 self.initialized = true;
-                self.state_since_ts = now;
+                self.state_since_ts = safe_now;
             }
         } else {
             if !self.initialized {
                 self.initialized = true;
-                self.state_since_ts = now;
+                self.state_since_ts = safe_now;
             }
             let same_pending = self
                 .pending_state
@@ -1616,7 +1762,7 @@ impl RoiStateTracker {
                 self.confirmed_state = candidate_state.to_string();
                 self.pending_state = None;
                 self.pending_count = 0;
-                self.state_since_ts = now;
+                self.state_since_ts = safe_now;
                 self.anomaly_alert_emitted = false;
                 state_changed = true;
             }
@@ -1624,7 +1770,7 @@ impl RoiStateTracker {
 
         let is_anomalous = self.is_anomalous();
         let anomaly_elapsed_sec = if is_anomalous {
-            (now - self.state_since_ts).max(0.0)
+            (safe_now - self.state_since_ts).max(0.0)
         } else {
             self.anomaly_alert_emitted = false;
             0.0
@@ -1643,7 +1789,7 @@ impl RoiStateTracker {
             roi_name: self.roi_name.clone(),
             previous_state,
             current_state: self.confirmed_state.clone(),
-            confidence,
+            confidence: safe_conf,
             state_changed,
             is_anomalous,
             anomaly_triggered,
@@ -2525,5 +2671,117 @@ mod tests {
             assert!(r.x_max <= 1920);
             assert!(r.y_max <= 1080);
         }
+    }
+
+    #[test]
+    fn regression_odd_and_zero_yuv_dimensions_never_panic_across_vision_functions() {
+        for (w, h) in [
+            (0u32, 0u32),
+            (0, 180),
+            (320, 0),
+            (1, 1),
+            (2, 1),
+            (1, 4),
+            (641, 2),
+            (641, 361),
+        ] {
+            let y_len = (w as usize) * (h as usize);
+            let uv_len = y_len / 4;
+            let buf = vec![128u8; y_len + uv_len * 2];
+            let frame = YuvFrame {
+                camera: Arc::from("cam"),
+                timestamp: 1.0,
+                width: w,
+                height: h,
+                data: Arc::new(buf.clone()),
+            };
+            let region = BoundingBox::new(0, 0, w.max(10), h.max(10));
+            let mut tensor = vec![255u8; 16 * 16 * 3];
+            crop_yuv420p_to_tensor_nhwc(&frame, &region, 16, 16, false, &mut tensor);
+
+            let img = yuv420p_to_rgb_image_scaled(
+                &frame,
+                Some(region),
+                &[(region, [255, 0, 0])],
+                Some(90),
+            );
+            assert!(img.width() > 0 && img.height() > 0);
+
+            let _ = classify_dominant_color_tag(&buf, w, h, region);
+            let _ = is_monochrome_ir(&buf, w, h);
+            let _ = check_frame_tamper(&buf, w, h);
+            let _ = compute_crop_dhash64(&buf, w, h, region);
+
+            let mut det = SimdMotionDetector::new(w, h, MotionConfig::default());
+            let _ = det.detect(&frame);
+        }
+        assert!(
+            compute_inference_regions(0, 0, 320, &[BoundingBox::new(0, 0, 50, 50)], &[]).is_empty()
+        );
+    }
+
+    #[test]
+    fn regression_polygon_mask_rejects_nan_inf_collinear_and_malformed_tokens() {
+        // Malformed token or NaN/Inf must reject the entire polygon instead of shifting coordinates
+        for invalid in [
+            "0.1,0.1,NaN,0.1,0.5,0.5,0.1,0.5",
+            "0.1,0.1,inf,0.1,0.5,0.5,0.1,0.5",
+            "0.1,0.1,bad,0.1,0.5,0.5,0.1,0.5",
+            "10,10,20,20,30,30",
+        ] {
+            let m = PolygonMask::from_config_value(&serde_json::json!(invalid), 100, 100);
+            assert!(
+                m.is_empty(),
+                "expected invalid polygon '{invalid}' to be rejected"
+            );
+        }
+
+        // point_in_polygon safely handles non-finite queries and vertices and negative small dy (-1e-7)
+        let sq = [(10.0, 10.0), (90.0, 10.0), (90.0, 90.0), (10.0, 90.0)];
+        assert!(!point_in_polygon(f32::NAN, 50.0, &sq));
+        assert!(!point_in_polygon(50.0, f32::INFINITY, &sq));
+        assert!(!point_in_polygon(
+            50.0,
+            50.0,
+            &[(10.0, 10.0), (f32::NAN, 10.0), (50.0, 50.0)]
+        ));
+
+        // Pixelated privacy mask with extreme block_size (u32::MAX) must not overflow
+        let mut img = RgbImage::from_pixel(32, 32, Rgb([200, 100, 50]));
+        let valid_mask = PolygonMask::from_config_value(
+            &serde_json::json!("0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0"),
+            32,
+            32,
+        );
+        apply_privacy_mask_pixelated_rgb(&mut img, &valid_mask, u32::MAX);
+        assert_eq!(*img.get_pixel(16, 16), Rgb([200, 100, 50]));
+    }
+
+    #[test]
+    fn regression_roi_crop_and_state_tracker_resist_nan_and_backward_clock_jumps() {
+        let nan_bbox = resolve_roi_crop_bbox([f32::NAN, 0.2, 0.8, 0.8], 640, 360);
+        assert_eq!(nan_bbox, BoundingBox::new(0, 0, 640, 360));
+
+        // Negative pixel crop is not misclassified as normalized (0..=1)
+        let neg_bbox = resolve_roi_crop_bbox([-20.0, -10.0, 100.0, 80.0], 640, 360);
+        assert_eq!(neg_bbox, BoundingBox::new(0, 0, 100, 80));
+
+        let cfg = StateRoiConfig {
+            crop: [0.2, 0.2, 0.8, 0.8],
+            classes: vec!["closed".to_string(), "open".to_string()],
+            interval_sec: 10,
+            hysteresis: 1,
+            anomaly_state: Some("open".to_string()),
+            anomaly_timeout_sec: 30,
+        };
+        let mut tracker = RoiStateTracker::new("door", cfg);
+        assert!(!tracker.should_evaluate(f64::NAN, false));
+        let _ = tracker.observe_state("open", f32::NAN, 1000.0);
+        // Clock jumps backward to 500.0 -> should_evaluate immediately recovers instead of stalling 500s
+        assert!(tracker.should_evaluate(500.0, false));
+        let tr = tracker.observe_state("open", 0.9, 500.0);
+        assert!(tr.confidence.is_finite());
+        let tr_timeout = tracker.observe_state("open", 0.9, 531.0);
+        assert!(tr_timeout.anomaly_triggered);
     }
 }
