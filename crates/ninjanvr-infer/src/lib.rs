@@ -695,39 +695,31 @@ impl AiDetectorEngine {
             }
         };
 
+        let mt = effective_model.model_type.to_ascii_lowercase();
+        let is_yolo = mt.contains("yolo") || effective_model.path.ends_with(".onnx");
+        let nchw_layout = effective_model.input_tensor.eq_ignore_ascii_case("nchw");
+
         // Reconcile configured width/height against compiled input tensor byte size
         // so changing width/height in UI without changing the underlying .xml/.onnx model never overflows.
         if let Some(InferenceRuntimeBackend::OpenVino(ref ctx)) = backend {
-            let expected_u8 = (model_w as usize)
-                .saturating_mul(model_h as usize)
-                .saturating_mul(3);
-            let expected_f32 = expected_u8.saturating_mul(4);
-            if ctx.in_bytes != expected_u8 && ctx.in_bytes != expected_f32 {
-                let pixels = if ctx.in_bytes.is_multiple_of(12) {
-                    ctx.in_bytes / 12
-                } else if ctx.in_bytes.is_multiple_of(3) {
-                    ctx.in_bytes / 3
-                } else {
-                    0
-                };
-                if pixels > 0 {
-                    let side = (pixels as f64).sqrt().round() as usize;
-                    if side.saturating_mul(side) == pixels
-                        && (64..=(MAX_MODEL_DIMENSION as usize)).contains(&side)
-                    {
-                        info!(
-                            "Reconciled model input dimensions from {}x{} to compiled tensor {}x{} (in_bytes={})",
-                            model_w, model_h, side, side, ctx.in_bytes
-                        );
-                        model_w = side as u32;
-                        model_h = side as u32;
-                    }
-                }
+            let (rec_w, rec_h) = Self::reconcile_openvino_dimensions(
+                model_w,
+                model_h,
+                ctx.in_bytes,
+                ctx.out_floats,
+                is_yolo,
+                nchw_layout,
+                &effective_model.path,
+            );
+            if (rec_w, rec_h) != (model_w, model_h) {
+                info!(
+                    "Reconciled model input dimensions from {}x{} to compiled tensor {}x{} (in_bytes={})",
+                    model_w, model_h, rec_w, rec_h, ctx.in_bytes
+                );
+                model_w = rec_w;
+                model_h = rec_h;
             }
         }
-
-        let mt = effective_model.model_type.to_ascii_lowercase();
-        let is_yolo = mt.contains("yolo") || effective_model.path.ends_with(".onnx");
 
         DetectorRuntimeState {
             model_w,
@@ -735,13 +727,78 @@ impl AiDetectorEngine {
             bgr_order: effective_model
                 .input_pixel_format
                 .eq_ignore_ascii_case("bgr"),
-            nchw_layout: effective_model.input_tensor.eq_ignore_ascii_case("nchw"),
+            nchw_layout,
             is_yolo,
             active_backend,
             active_device,
             active_model_path: effective_model.path.clone(),
             labelmap,
             backend,
+        }
+    }
+
+    fn reconcile_openvino_dimensions(
+        model_w: u32,
+        model_h: u32,
+        in_bytes: usize,
+        out_floats: usize,
+        is_yolo: bool,
+        nchw_layout: bool,
+        model_path: &str,
+    ) -> (u32, u32) {
+        let expected_u8 = (model_w as usize)
+            .saturating_mul(model_h as usize)
+            .saturating_mul(3);
+        let expected_f32 = expected_u8.saturating_mul(4);
+        let ssd_like_output = out_floats > 0
+            && out_floats.is_multiple_of(7)
+            && !out_floats.is_multiple_of(84)
+            && !out_floats.is_multiple_of(85)
+            && !out_floats.is_multiple_of(6);
+        let prefer_u8 = (!is_yolo && !nchw_layout)
+            || model_path.to_ascii_lowercase().contains("ssd")
+            || ssd_like_output;
+
+        let square_side = |bytes_per_px: usize| -> Option<u32> {
+            if bytes_per_px == 0 || !in_bytes.is_multiple_of(bytes_per_px) {
+                return None;
+            }
+            let pixels = in_bytes / bytes_per_px;
+            if pixels == 0 {
+                return None;
+            }
+            let side = (pixels as f64).sqrt().round() as usize;
+            if side.saturating_mul(side) == pixels
+                && (64..=(MAX_MODEL_DIMENSION as usize)).contains(&side)
+            {
+                Some(side as u32)
+            } else {
+                None
+            }
+        };
+
+        if prefer_u8 {
+            if in_bytes == expected_u8 {
+                (model_w, model_h)
+            } else if let Some(side) = square_side(3) {
+                (side, side)
+            } else if in_bytes == expected_f32 {
+                (model_w, model_h)
+            } else if let Some(side) = square_side(12) {
+                (side, side)
+            } else {
+                (model_w, model_h)
+            }
+        } else if in_bytes == expected_f32 {
+            (model_w, model_h)
+        } else if let Some(side) = square_side(12) {
+            (side, side)
+        } else if in_bytes == expected_u8 {
+            (model_w, model_h)
+        } else if let Some(side) = square_side(3) {
+            (side, side)
+        } else {
+            (model_w, model_h)
         }
     }
 
@@ -1165,15 +1222,19 @@ impl AiDetectorEngine {
             };
 
             let log_id = CString::new("ninjanvr").unwrap();
-            check_status(create_env(2, log_id.as_ptr(), &mut ctx.env), "CreateEnv")?;
-            if ctx.env.is_null() {
+            let mut env_ptr: *mut c_void = std::ptr::null_mut();
+            check_status(create_env(2, log_id.as_ptr(), &mut env_ptr), "CreateEnv")?;
+            if env_ptr.is_null() {
                 bail!("ONNX Runtime CreateEnv returned null handle");
             }
+            ctx.env = env_ptr;
 
-            check_status(create_opts(&mut ctx.session_opts), "CreateSessionOptions")?;
-            if ctx.session_opts.is_null() {
+            let mut opts_ptr: *mut c_void = std::ptr::null_mut();
+            check_status(create_opts(&mut opts_ptr), "CreateSessionOptions")?;
+            if opts_ptr.is_null() {
                 bail!("ONNX Runtime CreateSessionOptions returned null handle");
             }
+            ctx.session_opts = opts_ptr;
             check_status(
                 set_intra_threads(ctx.session_opts, 1),
                 "SetIntraOpNumThreads",
@@ -1243,18 +1304,15 @@ impl AiDetectorEngine {
             }
 
             let c_model = CString::new(model_path.to_string_lossy().as_bytes())?;
+            let mut sess_ptr: *mut c_void = std::ptr::null_mut();
             check_status(
-                create_session(
-                    ctx.env,
-                    c_model.as_ptr(),
-                    ctx.session_opts,
-                    &mut ctx.session,
-                ),
+                create_session(ctx.env, c_model.as_ptr(), ctx.session_opts, &mut sess_ptr),
                 "CreateSession",
             )?;
-            if ctx.session.is_null() {
+            if sess_ptr.is_null() {
                 bail!("ONNX Runtime CreateSession returned null handle");
             }
+            ctx.session = sess_ptr;
 
             let mut alloc: *mut c_void = std::ptr::null_mut();
             check_status(get_alloc(&mut alloc), "GetAllocatorWithDefaultOptions")?;
@@ -1322,13 +1380,12 @@ impl AiDetectorEngine {
                 }
             }
 
-            check_status(
-                create_cpu_mem(0, 0, &mut ctx.mem_info),
-                "CreateCpuMemoryInfo",
-            )?;
-            if ctx.mem_info.is_null() {
+            let mut mem_ptr: *mut c_void = std::ptr::null_mut();
+            check_status(create_cpu_mem(0, 0, &mut mem_ptr), "CreateCpuMemoryInfo")?;
+            if mem_ptr.is_null() {
                 bail!("ONNX Runtime CreateCpuMemoryInfo returned null handle");
             }
+            ctx.mem_info = mem_ptr;
 
             let num_elems = (model_w as usize)
                 .checked_mul(model_h as usize)
@@ -1692,367 +1749,384 @@ impl AiDetectorEngine {
             let model_w = guard.model_w;
             let model_h = guard.model_h;
             let nchw_layout = guard.nchw_layout;
+            let expected_elems = (model_w as usize)
+                .saturating_mul(model_h as usize)
+                .saturating_mul(3);
 
-            match guard.backend.as_mut() {
-                Some(InferenceRuntimeBackend::OpenVino(ctx)) => {
-                    let _ = (ctx.input_tensor, ctx.output_tensor);
-                    if !ctx.in_ptr.is_null()
-                        && ctx.in_bytes > 0
-                        && ctx.in_bytes <= MAX_TENSOR_BYTES
-                        && !tensor_nhwc.is_empty()
-                    {
-                        unsafe {
-                            let expected_f32_bytes =
-                                tensor_nhwc.len().checked_mul(std::mem::size_of::<f32>());
-                            if expected_f32_bytes == Some(ctx.in_bytes)
-                                && (ctx.in_ptr as usize).is_multiple_of(std::mem::align_of::<f32>())
-                            {
-                                let dst_f32 = std::slice::from_raw_parts_mut(
-                                    ctx.in_ptr as *mut f32,
-                                    tensor_nhwc.len(),
-                                );
-                                prepare_input_tensor_f32(
-                                    tensor_nhwc,
-                                    model_w,
-                                    model_h,
-                                    nchw_layout,
-                                    dst_f32,
-                                );
-                            } else if expected_f32_bytes == Some(ctx.in_bytes) {
-                                let mut tmp_f32 = vec![0.0f32; tensor_nhwc.len()];
-                                prepare_input_tensor_f32(
-                                    tensor_nhwc,
-                                    model_w,
-                                    model_h,
-                                    nchw_layout,
-                                    &mut tmp_f32,
-                                );
-                                std::ptr::copy_nonoverlapping(
-                                    tmp_f32.as_ptr() as *const u8,
-                                    ctx.in_ptr,
-                                    ctx.in_bytes,
-                                );
-                            } else if nchw_layout && ctx.in_bytes == tensor_nhwc.len() {
-                                let dst_u8 =
-                                    std::slice::from_raw_parts_mut(ctx.in_ptr, tensor_nhwc.len());
-                                prepare_input_tensor_u8(
-                                    tensor_nhwc,
-                                    model_w,
-                                    model_h,
-                                    true,
-                                    dst_u8,
-                                );
-                            } else {
-                                let copy_len = tensor_nhwc.len().min(ctx.in_bytes);
-                                if copy_len > 0 {
+            if expected_elems > 0
+                && expected_elems <= MAX_TENSOR_FLOATS
+                && tensor_nhwc.len() >= expected_elems
+            {
+                let tensor_nhwc = &tensor_nhwc[..expected_elems];
+
+                match guard.backend.as_mut() {
+                    Some(InferenceRuntimeBackend::OpenVino(ctx)) => {
+                        let _ = (ctx.input_tensor, ctx.output_tensor);
+                        let expected_f32_bytes =
+                            expected_elems.checked_mul(std::mem::size_of::<f32>());
+                        let size_matches = expected_f32_bytes == Some(ctx.in_bytes)
+                            || ctx.in_bytes == expected_elems;
+                        if !ctx.in_ptr.is_null()
+                            && ctx.in_bytes > 0
+                            && ctx.in_bytes <= MAX_TENSOR_BYTES
+                            && size_matches
+                        {
+                            unsafe {
+                                if expected_f32_bytes == Some(ctx.in_bytes)
+                                    && (ctx.in_ptr as usize)
+                                        .is_multiple_of(std::mem::align_of::<f32>())
+                                {
+                                    let dst_f32 = std::slice::from_raw_parts_mut(
+                                        ctx.in_ptr as *mut f32,
+                                        expected_elems,
+                                    );
+                                    prepare_input_tensor_f32(
+                                        tensor_nhwc,
+                                        model_w,
+                                        model_h,
+                                        nchw_layout,
+                                        dst_f32,
+                                    );
+                                } else if expected_f32_bytes == Some(ctx.in_bytes) {
+                                    let mut tmp_f32 = vec![0.0f32; expected_elems];
+                                    prepare_input_tensor_f32(
+                                        tensor_nhwc,
+                                        model_w,
+                                        model_h,
+                                        nchw_layout,
+                                        &mut tmp_f32,
+                                    );
+                                    std::ptr::copy_nonoverlapping(
+                                        tmp_f32.as_ptr() as *const u8,
+                                        ctx.in_ptr,
+                                        ctx.in_bytes,
+                                    );
+                                } else {
                                     let dst_u8 =
-                                        std::slice::from_raw_parts_mut(ctx.in_ptr, copy_len);
+                                        std::slice::from_raw_parts_mut(ctx.in_ptr, expected_elems);
                                     prepare_input_tensor_u8(
                                         tensor_nhwc,
                                         model_w,
                                         model_h,
-                                        false,
+                                        nchw_layout,
                                         dst_u8,
                                     );
                                 }
-                            }
 
-                            let rc = (ctx.infer_fn)(ctx.infer_req);
-                            if rc == 0
-                                && !ctx.out_ptr.is_null()
-                                && (6..=MAX_TENSOR_FLOATS).contains(&ctx.out_floats)
-                            {
-                                if (ctx.out_ptr as usize)
-                                    .is_multiple_of(std::mem::align_of::<f32>())
+                                let rc = (ctx.infer_fn)(ctx.infer_req);
+                                if rc == 0
+                                    && !ctx.out_ptr.is_null()
+                                    && (6..=MAX_TENSOR_FLOATS).contains(&ctx.out_floats)
                                 {
-                                    let slice =
-                                        std::slice::from_raw_parts(ctx.out_ptr, ctx.out_floats);
-                                    out_results = Self::decode_output_with_state(
-                                        &guard,
-                                        slice,
-                                        region,
-                                        frame_w,
-                                        frame_h,
-                                        score_threshold,
-                                    );
-                                } else {
-                                    let mut aligned_out = vec![0.0f32; ctx.out_floats];
-                                    std::ptr::copy_nonoverlapping(
-                                        ctx.out_ptr as *const u8,
-                                        aligned_out.as_mut_ptr() as *mut u8,
-                                        ctx.out_floats * std::mem::size_of::<f32>(),
-                                    );
-                                    out_results = Self::decode_output_with_state(
-                                        &guard,
-                                        &aligned_out,
-                                        region,
-                                        frame_w,
-                                        frame_h,
-                                        score_threshold,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx)) => unsafe {
-                    if !ort_ctx.vtable.is_null()
-                        && !ort_ctx.session.is_null()
-                        && !ort_ctx.mem_info.is_null()
-                    {
-                        let vt = std::slice::from_raw_parts(ort_ctx.vtable, 101);
-                        let slots_ok = [9usize, 49, 51, 64, 65, 93, 96, 99]
-                            .iter()
-                            .all(|&idx| !vt[idx].is_null());
-                        if slots_ok {
-                            let create_tensor: OrtCreateTensorWithDataFn =
-                                std::mem::transmute::<*const c_void, OrtCreateTensorWithDataFn>(
-                                    vt[49],
-                                );
-                            let run_fn: OrtRunFn =
-                                std::mem::transmute::<*const c_void, OrtRunFn>(vt[9]);
-                            let get_mut_data: OrtGetTensorMutableDataFn =
-                                std::mem::transmute::<*const c_void, OrtGetTensorMutableDataFn>(
-                                    vt[51],
-                                );
-                            let get_type_shape: OrtGetTensorTypeAndShapeFn =
-                                std::mem::transmute::<*const c_void, OrtGetTensorTypeAndShapeFn>(
-                                    vt[65],
-                                );
-                            let get_elem_count: OrtGetTensorShapeElementCountFn =
-                                std::mem::transmute::<*const c_void, OrtGetTensorShapeElementCountFn>(
-                                    vt[64],
-                                );
-                            let release_val: OrtReleaseFn =
-                                std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[96]);
-                            let release_shape: OrtReleaseFn =
-                                std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[99]);
-                            let release_status: OrtReleaseFn =
-                                std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[93]);
-
-                            let shape: [i64; 4] = if nchw_layout {
-                                [1, 3, model_h as i64, model_w as i64]
-                            } else {
-                                [1, model_h as i64, model_w as i64, 3]
-                            };
-
-                            let mut in_val: *mut c_void = std::ptr::null_mut();
-                            let create_st = if ort_ctx.input_is_u8 {
-                                prepare_input_tensor_u8(
-                                    tensor_nhwc,
-                                    model_w,
-                                    model_h,
-                                    nchw_layout,
-                                    &mut ort_ctx.in_u8_buf,
-                                );
-                                create_tensor(
-                                    ort_ctx.mem_info,
-                                    ort_ctx.in_u8_buf.as_mut_ptr() as *mut c_void,
-                                    ort_ctx.in_u8_buf.len(),
-                                    shape.as_ptr(),
-                                    shape.len(),
-                                    ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8,
-                                    &mut in_val,
-                                )
-                            } else {
-                                prepare_input_tensor_f32(
-                                    tensor_nhwc,
-                                    model_w,
-                                    model_h,
-                                    nchw_layout,
-                                    &mut ort_ctx.in_f32_buf,
-                                );
-                                create_tensor(
-                                    ort_ctx.mem_info,
-                                    ort_ctx.in_f32_buf.as_mut_ptr() as *mut c_void,
-                                    ort_ctx
-                                        .in_f32_buf
-                                        .len()
-                                        .saturating_mul(std::mem::size_of::<f32>()),
-                                    shape.as_ptr(),
-                                    shape.len(),
-                                    ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-                                    &mut in_val,
-                                )
-                            };
-
-                            if !create_st.is_null() {
-                                release_status(create_st);
-                                if !in_val.is_null() {
-                                    release_val(in_val);
-                                }
-                            } else if !in_val.is_null() {
-                                let in_names = [ort_ctx.input_name.as_ptr()];
-                                let in_vals = [in_val as *const c_void];
-                                let out_names = [ort_ctx.output_name.as_ptr()];
-                                let mut out_val: *mut c_void = std::ptr::null_mut();
-
-                                let run_st = run_fn(
-                                    ort_ctx.session,
-                                    std::ptr::null(),
-                                    in_names.as_ptr(),
-                                    in_vals.as_ptr(),
-                                    1,
-                                    out_names.as_ptr(),
-                                    1,
-                                    &mut out_val,
-                                );
-                                if !run_st.is_null() {
-                                    release_status(run_st);
-                                    if !out_val.is_null() {
-                                        release_val(out_val);
-                                    }
-                                    release_val(in_val);
-                                } else if !out_val.is_null() {
-                                    let mut out_ptr: *mut c_void = std::ptr::null_mut();
-                                    let mut shape_info: *mut c_void = std::ptr::null_mut();
-                                    let mut valid_elem_count: Option<usize> = None;
-
-                                    let st1 = get_mut_data(out_val, &mut out_ptr);
-                                    let st2 = get_type_shape(out_val, &mut shape_info);
-                                    if st1.is_null() && st2.is_null() && !shape_info.is_null() {
-                                        let mut is_float_tensor = true;
-                                        if !vt[60].is_null() {
-                                            let get_elem_type: OrtGetTensorElementTypeFn =
-                                                std::mem::transmute::<
-                                                    *const c_void,
-                                                    OrtGetTensorElementTypeFn,
-                                                >(
-                                                    vt[60]
-                                                );
-                                            let mut out_elem_ty: c_int =
-                                                ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
-                                            let st_ty = get_elem_type(shape_info, &mut out_elem_ty);
-                                            if st_ty.is_null() {
-                                                is_float_tensor = out_elem_ty
-                                                    == ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
-                                            } else {
-                                                release_status(st_ty);
-                                                is_float_tensor = false;
-                                            }
-                                        }
-
-                                        let mut dims_valid = true;
-                                        let mut dims_product: Option<usize> = None;
-                                        if !vt[61].is_null() && !vt[62].is_null() {
-                                            let get_dims_count: OrtGetDimensionsCountFn =
-                                                std::mem::transmute::<
-                                                    *const c_void,
-                                                    OrtGetDimensionsCountFn,
-                                                >(
-                                                    vt[61]
-                                                );
-                                            let get_dims: OrtGetDimensionsFn = std::mem::transmute::<
-                                                *const c_void,
-                                                OrtGetDimensionsFn,
-                                            >(
-                                                vt[62]
-                                            );
-                                            let mut ndims: usize = 0;
-                                            let st_dc = get_dims_count(shape_info, &mut ndims);
-                                            if st_dc.is_null() && (1..=16).contains(&ndims) {
-                                                let mut raw_dims = vec![0i64; ndims];
-                                                let st_d = get_dims(
-                                                    shape_info,
-                                                    raw_dims.as_mut_ptr(),
-                                                    ndims,
-                                                );
-                                                if st_d.is_null() {
-                                                    dims_product = raw_dims.iter().try_fold(
-                                                        1usize,
-                                                        |acc, &d| {
-                                                            if d <= 0 {
-                                                                None
-                                                            } else {
-                                                                usize::try_from(d).ok().and_then(
-                                                                    |u| acc.checked_mul(u),
-                                                                )
-                                                            }
-                                                        },
-                                                    );
-                                                    dims_valid = dims_product.is_some();
-                                                } else {
-                                                    release_status(st_d);
-                                                    dims_valid = false;
-                                                }
-                                            } else {
-                                                if !st_dc.is_null() {
-                                                    release_status(st_dc);
-                                                }
-                                                dims_valid = false;
-                                            }
-                                        }
-
-                                        if is_float_tensor && dims_valid {
-                                            let mut elem_count: usize = 0;
-                                            let st3 = get_elem_count(shape_info, &mut elem_count);
-                                            if st3.is_null() {
-                                                let count_matches_dims = dims_product
-                                                    .is_none_or(|prod| prod == elem_count);
-                                                if count_matches_dims
-                                                    && (6..=MAX_TENSOR_FLOATS).contains(&elem_count)
-                                                {
-                                                    valid_elem_count = Some(elem_count);
-                                                }
-                                            } else {
-                                                release_status(st3);
-                                            }
-                                        }
-                                    } else {
-                                        if !st1.is_null() {
-                                            release_status(st1);
-                                        }
-                                        if !st2.is_null() {
-                                            release_status(st2);
-                                        }
-                                    }
-                                    if !shape_info.is_null() {
-                                        release_shape(shape_info);
-                                    }
-
-                                    if let Some(out_floats) = valid_elem_count
-                                        && !out_ptr.is_null()
+                                    if (ctx.out_ptr as usize)
+                                        .is_multiple_of(std::mem::align_of::<f32>())
                                     {
-                                        ort_ctx.out_floats = out_floats;
-                                        let slice_vec: Vec<f32> = if (out_ptr as usize)
-                                            .is_multiple_of(std::mem::align_of::<f32>())
-                                        {
-                                            std::slice::from_raw_parts(
-                                                out_ptr as *const f32,
-                                                out_floats,
-                                            )
-                                            .to_vec()
-                                        } else {
-                                            let mut aligned = vec![0.0f32; out_floats];
-                                            std::ptr::copy_nonoverlapping(
-                                                out_ptr as *const u8,
-                                                aligned.as_mut_ptr() as *mut u8,
-                                                out_floats * std::mem::size_of::<f32>(),
-                                            );
-                                            aligned
-                                        };
-                                        release_val(out_val);
-                                        release_val(in_val);
+                                        let slice =
+                                            std::slice::from_raw_parts(ctx.out_ptr, ctx.out_floats);
                                         out_results = Self::decode_output_with_state(
                                             &guard,
-                                            &slice_vec,
+                                            slice,
                                             region,
                                             frame_w,
                                             frame_h,
                                             score_threshold,
                                         );
                                     } else {
-                                        release_val(out_val);
-                                        release_val(in_val);
+                                        let mut aligned_out = vec![0.0f32; ctx.out_floats];
+                                        std::ptr::copy_nonoverlapping(
+                                            ctx.out_ptr as *const u8,
+                                            aligned_out.as_mut_ptr() as *mut u8,
+                                            ctx.out_floats * std::mem::size_of::<f32>(),
+                                        );
+                                        out_results = Self::decode_output_with_state(
+                                            &guard,
+                                            &aligned_out,
+                                            region,
+                                            frame_w,
+                                            frame_h,
+                                            score_threshold,
+                                        );
                                     }
-                                } else {
-                                    release_val(in_val);
                                 }
                             }
                         }
                     }
-                },
-                None => {}
+                    Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx)) => unsafe {
+                        if !ort_ctx.vtable.is_null()
+                            && !ort_ctx.session.is_null()
+                            && !ort_ctx.mem_info.is_null()
+                        {
+                            let vt = std::slice::from_raw_parts(ort_ctx.vtable, 101);
+                            let slots_ok = [9usize, 49, 51, 64, 65, 93, 96, 99]
+                                .iter()
+                                .all(|&idx| !vt[idx].is_null());
+                            if slots_ok {
+                                let create_tensor: OrtCreateTensorWithDataFn = std::mem::transmute::<
+                                    *const c_void,
+                                    OrtCreateTensorWithDataFn,
+                                >(
+                                    vt[49]
+                                );
+                                let run_fn: OrtRunFn =
+                                    std::mem::transmute::<*const c_void, OrtRunFn>(vt[9]);
+                                let get_mut_data: OrtGetTensorMutableDataFn = std::mem::transmute::<
+                                    *const c_void,
+                                    OrtGetTensorMutableDataFn,
+                                >(
+                                    vt[51]
+                                );
+                                let get_type_shape: OrtGetTensorTypeAndShapeFn =
+                                    std::mem::transmute::<*const c_void, OrtGetTensorTypeAndShapeFn>(
+                                        vt[65],
+                                    );
+                                let get_elem_count: OrtGetTensorShapeElementCountFn =
+                                    std::mem::transmute::<
+                                        *const c_void,
+                                        OrtGetTensorShapeElementCountFn,
+                                    >(vt[64]);
+                                let release_val: OrtReleaseFn =
+                                    std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[96]);
+                                let release_shape: OrtReleaseFn =
+                                    std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[99]);
+                                let release_status: OrtReleaseFn =
+                                    std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[93]);
+
+                                let shape: [i64; 4] = if nchw_layout {
+                                    [1, 3, model_h as i64, model_w as i64]
+                                } else {
+                                    [1, model_h as i64, model_w as i64, 3]
+                                };
+
+                                let mut in_val: *mut c_void = std::ptr::null_mut();
+                                let create_st = if ort_ctx.input_is_u8 {
+                                    if ort_ctx.in_u8_buf.len() != expected_elems {
+                                        ort_ctx.in_u8_buf.resize(expected_elems, 0u8);
+                                    }
+                                    prepare_input_tensor_u8(
+                                        tensor_nhwc,
+                                        model_w,
+                                        model_h,
+                                        nchw_layout,
+                                        &mut ort_ctx.in_u8_buf,
+                                    );
+                                    create_tensor(
+                                        ort_ctx.mem_info,
+                                        ort_ctx.in_u8_buf.as_mut_ptr() as *mut c_void,
+                                        ort_ctx.in_u8_buf.len(),
+                                        shape.as_ptr(),
+                                        shape.len(),
+                                        ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+                                        &mut in_val,
+                                    )
+                                } else {
+                                    if ort_ctx.in_f32_buf.len() != expected_elems {
+                                        ort_ctx.in_f32_buf.resize(expected_elems, 0.0f32);
+                                    }
+                                    prepare_input_tensor_f32(
+                                        tensor_nhwc,
+                                        model_w,
+                                        model_h,
+                                        nchw_layout,
+                                        &mut ort_ctx.in_f32_buf,
+                                    );
+                                    create_tensor(
+                                        ort_ctx.mem_info,
+                                        ort_ctx.in_f32_buf.as_mut_ptr() as *mut c_void,
+                                        ort_ctx
+                                            .in_f32_buf
+                                            .len()
+                                            .saturating_mul(std::mem::size_of::<f32>()),
+                                        shape.as_ptr(),
+                                        shape.len(),
+                                        ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                                        &mut in_val,
+                                    )
+                                };
+
+                                if !create_st.is_null() {
+                                    release_status(create_st);
+                                    if !in_val.is_null() {
+                                        release_val(in_val);
+                                    }
+                                } else if !in_val.is_null() {
+                                    let in_names = [ort_ctx.input_name.as_ptr()];
+                                    let in_vals = [in_val as *const c_void];
+                                    let out_names = [ort_ctx.output_name.as_ptr()];
+                                    let mut out_val: *mut c_void = std::ptr::null_mut();
+
+                                    let run_st = run_fn(
+                                        ort_ctx.session,
+                                        std::ptr::null(),
+                                        in_names.as_ptr(),
+                                        in_vals.as_ptr(),
+                                        1,
+                                        out_names.as_ptr(),
+                                        1,
+                                        &mut out_val,
+                                    );
+                                    if !run_st.is_null() {
+                                        release_status(run_st);
+                                        if !out_val.is_null() {
+                                            release_val(out_val);
+                                        }
+                                        release_val(in_val);
+                                    } else if !out_val.is_null() {
+                                        let mut out_ptr: *mut c_void = std::ptr::null_mut();
+                                        let mut shape_info: *mut c_void = std::ptr::null_mut();
+                                        let mut valid_elem_count: Option<usize> = None;
+
+                                        let st1 = get_mut_data(out_val, &mut out_ptr);
+                                        let st2 = get_type_shape(out_val, &mut shape_info);
+                                        if st1.is_null() && st2.is_null() && !shape_info.is_null() {
+                                            let mut is_float_tensor = true;
+                                            if !vt[60].is_null() {
+                                                let get_elem_type: OrtGetTensorElementTypeFn =
+                                                    std::mem::transmute::<
+                                                        *const c_void,
+                                                        OrtGetTensorElementTypeFn,
+                                                    >(
+                                                        vt[60]
+                                                    );
+                                                let mut out_elem_ty: c_int =
+                                                    ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+                                                let st_ty =
+                                                    get_elem_type(shape_info, &mut out_elem_ty);
+                                                if st_ty.is_null() {
+                                                    is_float_tensor = out_elem_ty
+                                                        == ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+                                                } else {
+                                                    release_status(st_ty);
+                                                    is_float_tensor = false;
+                                                }
+                                            }
+
+                                            let mut dims_valid = true;
+                                            let mut dims_product: Option<usize> = None;
+                                            if !vt[61].is_null() && !vt[62].is_null() {
+                                                let get_dims_count: OrtGetDimensionsCountFn =
+                                                    std::mem::transmute::<
+                                                        *const c_void,
+                                                        OrtGetDimensionsCountFn,
+                                                    >(
+                                                        vt[61]
+                                                    );
+                                                let get_dims: OrtGetDimensionsFn =
+                                                    std::mem::transmute::<
+                                                        *const c_void,
+                                                        OrtGetDimensionsFn,
+                                                    >(
+                                                        vt[62]
+                                                    );
+                                                let mut ndims: usize = 0;
+                                                let st_dc = get_dims_count(shape_info, &mut ndims);
+                                                if st_dc.is_null() && (1..=16).contains(&ndims) {
+                                                    let mut raw_dims = vec![0i64; ndims];
+                                                    let st_d = get_dims(
+                                                        shape_info,
+                                                        raw_dims.as_mut_ptr(),
+                                                        ndims,
+                                                    );
+                                                    if st_d.is_null() {
+                                                        dims_product = raw_dims.iter().try_fold(
+                                                            1usize,
+                                                            |acc, &d| {
+                                                                if d <= 0 {
+                                                                    None
+                                                                } else {
+                                                                    usize::try_from(d)
+                                                                        .ok()
+                                                                        .and_then(|u| {
+                                                                            acc.checked_mul(u)
+                                                                        })
+                                                                }
+                                                            },
+                                                        );
+                                                        dims_valid = dims_product.is_some();
+                                                    } else {
+                                                        release_status(st_d);
+                                                        dims_valid = false;
+                                                    }
+                                                } else {
+                                                    if !st_dc.is_null() {
+                                                        release_status(st_dc);
+                                                    }
+                                                    dims_valid = false;
+                                                }
+                                            }
+
+                                            if is_float_tensor && dims_valid {
+                                                let mut elem_count: usize = 0;
+                                                let st3 =
+                                                    get_elem_count(shape_info, &mut elem_count);
+                                                if st3.is_null() {
+                                                    let count_matches_dims = dims_product
+                                                        .is_none_or(|prod| prod == elem_count);
+                                                    if count_matches_dims
+                                                        && (6..=MAX_TENSOR_FLOATS)
+                                                            .contains(&elem_count)
+                                                    {
+                                                        valid_elem_count = Some(elem_count);
+                                                    }
+                                                } else {
+                                                    release_status(st3);
+                                                }
+                                            }
+                                        } else {
+                                            if !st1.is_null() {
+                                                release_status(st1);
+                                            }
+                                            if !st2.is_null() {
+                                                release_status(st2);
+                                            }
+                                        }
+                                        if !shape_info.is_null() {
+                                            release_shape(shape_info);
+                                        }
+
+                                        if let Some(out_floats) = valid_elem_count
+                                            && !out_ptr.is_null()
+                                        {
+                                            ort_ctx.out_floats = out_floats;
+                                            let slice_vec: Vec<f32> = if (out_ptr as usize)
+                                                .is_multiple_of(std::mem::align_of::<f32>())
+                                            {
+                                                std::slice::from_raw_parts(
+                                                    out_ptr as *const f32,
+                                                    out_floats,
+                                                )
+                                                .to_vec()
+                                            } else {
+                                                let mut aligned = vec![0.0f32; out_floats];
+                                                std::ptr::copy_nonoverlapping(
+                                                    out_ptr as *const u8,
+                                                    aligned.as_mut_ptr() as *mut u8,
+                                                    out_floats * std::mem::size_of::<f32>(),
+                                                );
+                                                aligned
+                                            };
+                                            release_val(out_val);
+                                            release_val(in_val);
+                                            out_results = Self::decode_output_with_state(
+                                                &guard,
+                                                &slice_vec,
+                                                region,
+                                                frame_w,
+                                                frame_h,
+                                                score_threshold,
+                                            );
+                                        } else {
+                                            release_val(out_val);
+                                            release_val(in_val);
+                                        }
+                                    } else {
+                                        release_val(in_val);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    None => {}
+                }
             }
         }
 
@@ -2222,8 +2296,12 @@ impl AiDetectorEngine {
             {
                 continue;
             }
-            let scale_w = if bw > 1.5 || cx > 1.5 { mw } else { 1.0 };
-            let scale_h = if bh > 1.5 || cy > 1.5 { mh } else { 1.0 };
+            let is_pixel_coords = bw > 1.5 || bh > 1.5 || cx > 1.5 || cy > 1.5;
+            let (scale_w, scale_h) = if is_pixel_coords {
+                (mw, mh)
+            } else {
+                (1.0, 1.0)
+            };
             let nx1 = (cx - bw * 0.5) / scale_w;
             let ny1 = (cy - bh * 0.5) / scale_h;
             let nx2 = (cx + bw * 0.5) / scale_w;
@@ -2291,8 +2369,12 @@ impl AiDetectorEngine {
             {
                 continue;
             }
-            let scale_w = if bw > 1.5 || cx > 1.5 { mw } else { 1.0 };
-            let scale_h = if bh > 1.5 || cy > 1.5 { mh } else { 1.0 };
+            let is_pixel_coords = bw > 1.5 || bh > 1.5 || cx > 1.5 || cy > 1.5;
+            let (scale_w, scale_h) = if is_pixel_coords {
+                (mw, mh)
+            } else {
+                (1.0, 1.0)
+            };
             let nx1 = (cx - bw * 0.5) / scale_w;
             let ny1 = (cy - bh * 0.5) / scale_h;
             let nx2 = (cx + bw * 0.5) / scale_w;
@@ -2349,14 +2431,15 @@ impl AiDetectorEngine {
                 if !img_id.is_finite()
                     || img_id < 0.0
                     || !raw_label.is_finite()
-                    || !(0.0..=(i32::MAX as f32)).contains(&raw_label)
+                    || !(0.0..=10_000.0).contains(&raw_label)
+                    || (raw_label - raw_label.round()).abs() > 1e-3
                     || !score.is_finite()
                     || score < score_threshold
                     || score > 1.0001
                 {
                     continue;
                 }
-                let label_id = raw_label as i32;
+                let label_id = raw_label.round() as i32;
                 let Some(label) = state.labelmap.get(&label_id) else {
                     continue;
                 };
@@ -2372,15 +2455,28 @@ impl AiDetectorEngine {
                     frame_dims,
                 );
             }
-            return out_results;
+            return nms_detections(out_results, 0.50);
         }
 
         // 2. Dynamic & 80-class Transposed YOLOv8 / YOLOv9 / YOLOv11 [1, 4 + C, N]
+        //    (and exact-anchor Row-Major [1, N, 5 + C] when cols == 5 + C)
         if expected_anchors > 0 && slice.len().is_multiple_of(expected_anchors) {
             let cols = slice.len() / expected_anchors;
             let prefers_row_major =
                 (c_cfg.is_some_and(|c| cols == 5 + c)) || (c_cfg.is_none() && cols == 85);
-            if (5..=204).contains(&cols) && !prefers_row_major {
+            if prefers_row_major && (6..=205).contains(&cols) {
+                let dets = Self::decode_row_major_yolo(
+                    state,
+                    slice,
+                    cols - 5,
+                    region,
+                    frame_dims,
+                    score_threshold,
+                );
+                if !dets.is_empty() || !slice.len().is_multiple_of(cols - 1) {
+                    return dets;
+                }
+            } else if (5..=204).contains(&cols) {
                 let num_classes = cols - 4;
                 let dets = Self::decode_transposed_yolo(
                     state,
@@ -2483,7 +2579,8 @@ impl AiDetectorEngine {
                     || score < score_threshold
                     || score > 1.0001
                     || !raw_label.is_finite()
-                    || !(0.0..=(i32::MAX as f32)).contains(&raw_label)
+                    || !(0.0..=10_000.0).contains(&raw_label)
+                    || (raw_label - raw_label.round()).abs() > 1e-3
                     || !row[0].is_finite()
                     || !row[1].is_finite()
                     || !row[2].is_finite()
@@ -2491,14 +2588,20 @@ impl AiDetectorEngine {
                 {
                     continue;
                 }
-                let label_id = raw_label as i32;
+                let label_id = raw_label.round() as i32;
                 let Some(label) = Self::resolve_yolo_label(state, label_id) else {
                     continue;
                 };
-                let nx1 = if row[2] > 1.5 { row[0] / mw } else { row[0] };
-                let ny1 = if row[3] > 1.5 { row[1] / mh } else { row[1] };
-                let nx2 = if row[2] > 1.5 { row[2] / mw } else { row[2] };
-                let ny2 = if row[3] > 1.5 { row[3] / mh } else { row[3] };
+                let is_pixel_coords = row[0] > 1.5 || row[1] > 1.5 || row[2] > 1.5 || row[3] > 1.5;
+                let (scale_w, scale_h) = if is_pixel_coords {
+                    (mw, mh)
+                } else {
+                    (1.0, 1.0)
+                };
+                let nx1 = row[0] / scale_w;
+                let ny1 = row[1] / scale_h;
+                let nx2 = row[2] / scale_w;
+                let ny2 = row[3] / scale_h;
                 Self::push_box_from_norm(
                     &mut out_results,
                     label,
@@ -2508,6 +2611,7 @@ impl AiDetectorEngine {
                     frame_dims,
                 );
             }
+            return nms_detections(out_results, 0.50);
         }
         out_results
     }
@@ -2669,18 +2773,29 @@ pub fn resolve_face_crop_bbox(
     if frame_w == 0 || frame_h == 0 {
         return None;
     }
-    if let Some(fb) = face_attr_bbox {
-        let x_min = fb.x_min.min(frame_w - 1);
-        let y_min = fb.y_min.min(frame_h - 1);
-        let x_max = fb.x_max.min(frame_w).max(x_min.saturating_add(1));
-        let y_max = fb.y_max.min(frame_h).max(y_min.saturating_add(1));
-        let clamped = BoundingBox::new(x_min, y_min, x_max, y_max);
-        if clamped.area() >= min_face_area {
-            return Some(clamped);
+    if let Some(fb) = face_attr_bbox
+        && fb.width() > 0
+        && fb.height() > 0
+        && fb.x_min < frame_w
+        && fb.y_min < frame_h
+    {
+        let x_min = fb.x_min;
+        let y_min = fb.y_min;
+        let x_max = fb.x_max.min(frame_w);
+        let y_max = fb.y_max.min(frame_h);
+        if x_max > x_min && y_max > y_min {
+            let clamped = BoundingBox::new(x_min, y_min, x_max, y_max);
+            if clamped.area() >= min_face_area {
+                return Some(clamped);
+            }
         }
     }
 
-    if person_bbox.height() >= 120 {
+    if person_bbox.width() > 0
+        && person_bbox.height() >= 120
+        && person_bbox.x_min < frame_w
+        && person_bbox.y_min < frame_h
+    {
         let pw = person_bbox.width();
         let ph = person_bbox.height();
         let inset_x = pw / 5;
@@ -2821,13 +2936,16 @@ impl FaceGallery {
             Ok(e) => e,
             Err(_) => return Ok(()),
         };
-        for entry in entries.flatten() {
+        let mut dir_paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_real_directory(p))
+            .collect();
+        dir_paths.sort();
+
+        for path in dir_paths {
             if self.profiles.len() >= MAX_FACE_PROFILES {
                 break;
-            }
-            let path = entry.path();
-            if !is_real_directory(&path) {
-                continue;
             }
             let Some(raw_name) = path.file_name().and_then(|s| s.to_str()) else {
                 continue;
@@ -3140,13 +3258,19 @@ pub fn nms_detections(
     mut detections: Vec<DetectionResult>,
     iou_threshold: f32,
 ) -> Vec<DetectionResult> {
+    let thresh = if iou_threshold.is_finite() {
+        iou_threshold.clamp(0.01, 0.99)
+    } else {
+        0.50
+    };
     detections.retain(|d| d.score.is_finite());
     detections.sort_by(|a, b| b.score.total_cmp(&a.score));
+    detections.truncate(512);
     let mut kept: Vec<DetectionResult> = Vec::with_capacity(detections.len());
     for det in detections {
         if !kept.iter().any(|k| {
             k.label == det.label
-                && (k.bbox.iou(&det.bbox) > iou_threshold
+                && (k.bbox.iou(&det.bbox) > thresh
                     || k.bbox.intersection_over_min(&det.bbox) > 0.80)
         }) {
             kept.push(det);
@@ -3554,7 +3678,11 @@ fn eval_sequence(
                 match &atom.matcher {
                     AtomMatcher::Group(g) => {
                         for end_p in eval_node(g, input, p, memo) {
-                            if end_p > p && !next_frontier.contains(&end_p) {
+                            if end_p == p {
+                                if !next_atom_positions.contains(&p) {
+                                    next_atom_positions.push(p);
+                                }
+                            } else if end_p > p && !next_frontier.contains(&end_p) {
                                 next_frontier.push(end_p);
                             }
                         }
@@ -5902,5 +6030,128 @@ detectors:
         })
         .join();
         assert_eq!(engine.model_dimensions().0, 300);
+    }
+
+    #[test]
+    fn regression_cycle2_ov_dim_reconcile_split_axis_yolo_row_major_and_nullable_regex_groups() {
+        // 1. OpenVINO dimension reconciliation:
+        //    (a) 300x300 u8 SSD model (in_bytes = 270,000 = 12 * 150^2) configured with 320x320 or 640x640
+        //        must reconcile to 300x300 (u8), NOT 150x150 (f32).
+        assert_eq!(
+            AiDetectorEngine::reconcile_openvino_dimensions(
+                640,
+                640,
+                300 * 300 * 3,
+                700,
+                false,
+                false,
+                "/openvino-model/ssdlite_mobilenet_v2.xml",
+            ),
+            (300, 300)
+        );
+        //    (b) 320x320 f32 YOLO model (in_bytes = 1,228,800 = 640 * 640 * 3) configured with 640x640
+        //        must reconcile to 320x320 (f32), NOT stay at 640x640 (u8).
+        assert_eq!(
+            AiDetectorEngine::reconcile_openvino_dimensions(
+                640,
+                640,
+                320 * 320 * 3 * 4,
+                84 * 2100,
+                true,
+                true,
+                "/config/models/yolov9t.xml",
+            ),
+            (320, 320)
+        );
+
+        // 2. Unified pixel-vs-normalized coordinate scaling across X and Y axes:
+        //    A sub-pixel height artifact (cx = 200.0, cy = 0.5, bw = 60.0, bh = 0.8) in a 640x640
+        //    pixel-space YOLO tensor must NOT keep scale_h = 1.0 and inflate bh = 0.8 to 80% of frame height.
+        let mut cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/c2.yml")).unwrap();
+        cfg.model.model_type = "yolo-generic".to_string();
+        cfg.model.width = 640;
+        cfg.model.height = 640;
+        cfg.model.input_tensor = "nchw".to_string();
+        let engine = AiDetectorEngine::new(&cfg);
+        let region = BoundingBox::new(0, 0, 1280, 720);
+
+        let mut transposed_subpixel = vec![0.0f32; 84 * 10];
+        transposed_subpixel[0] = 200.0; // cx > 1.5 (pixel coords)
+        transposed_subpixel[10] = 0.5; // cy <= 1.5
+        transposed_subpixel[20] = 60.0; // bw > 1.5
+        transposed_subpixel[30] = 0.8; // bh <= 1.5 (0.8px degenerate height)
+        transposed_subpixel[40] = 0.95; // class 0 score
+        assert!(
+            engine
+                .parse_raw_output_slice(&transposed_subpixel, region, 1280, 720, 0.5)
+                .is_empty(),
+            "0.8px-tall pixel-space box must not be interpreted as 0.8 normalized height"
+        );
+
+        let yolo6_subpixel = [100.0f32, 0.1, 200.0, 0.9, 0.95, 0.0];
+        assert!(
+            engine
+                .parse_raw_output_slice(&yolo6_subpixel, region, 1280, 720, 0.5)
+                .is_empty(),
+            "0.8px-tall 6-column YOLO box must not be interpreted as 0.8 normalized height"
+        );
+
+        // Non-integer raw_label in SSD / 6-col YOLO (e.g. 0.45) must be rejected, not truncated to 0 ("person")
+        let yolo6_non_int_cls = [50.0f32, 50.0, 200.0, 200.0, 0.95, 0.45];
+        assert!(
+            engine
+                .parse_raw_output_slice(&yolo6_non_int_cls, region, 1280, 720, 0.5)
+                .is_empty()
+        );
+
+        // 3. Row-Major YOLOv5 [1, 2100, 5 + C] when C=10 (4 + C = 14 divides 2100) must decode as Row-Major
+        cfg.model.width = 320;
+        cfg.model.height = 320;
+        engine.reload(&cfg);
+        let mut custom10 = BTreeMap::new();
+        for i in 0..10i32 {
+            custom10.insert(i, format!("cls_{i}"));
+        }
+        engine.set_labelmap(custom10);
+
+        let stride = 15usize; // 5 + 10 classes
+        let mut rm_2100 = vec![0.0f32; 2100 * stride];
+        // Put valid detection at row 0 and background noise at other rows that would alias transposed [14, 2250]
+        rm_2100[0] = 160.0;
+        rm_2100[1] = 160.0;
+        rm_2100[2] = 100.0;
+        rm_2100[3] = 120.0;
+        rm_2100[4] = 0.92;
+        rm_2100[5 + 3] = 0.95; // cls_3
+        let rm_dets = engine.parse_raw_output_slice(&rm_2100, region, 1280, 720, 0.5);
+        assert_eq!(rm_dets.len(), 1);
+        assert_eq!(rm_dets[0].label, "cls_3");
+
+        // 4. Out-of-frame or inverted face_attr_bbox falls back to person_bbox head region instead of 1x1 corner
+        let person = BoundingBox::new(100, 100, 300, 400);
+        let oob_face = BoundingBox::new(1500, 900, 1600, 1000);
+        let resolved =
+            resolve_face_crop_bbox(person, Some(oob_face), 1280, 720, 1).expect("fallback to head");
+        assert!(resolved.inside(&person));
+        assert!(resolved.area() >= 750);
+
+        // 5. Nullable parenthesized regex groups without outer ?/* quantifier match empty branch cleanly
+        assert!(validate_license_plate(
+            "ABC1D23",
+            Some(r"^(?:BR|)[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$")
+        ));
+        assert!(validate_license_plate(
+            "BRABC1D23",
+            Some(r"^(?:BR|)[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$")
+        ));
+        assert!(validate_license_plate(
+            "ABC1234",
+            Some(r"^([A-Z]?)[A-Z]{3}[0-9]{4}$")
+        ));
+        assert!(validate_license_plate(
+            "XABC1234",
+            Some(r"^([A-Z]?)[A-Z]{3}[0-9]{4}$")
+        ));
     }
 }
