@@ -7,11 +7,29 @@ use axum::body::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Notify, RwLock, broadcast};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 pub const MAX_GOP_FRAGMENTS: usize = 90;
 pub const MAX_GOP_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_INIT_SEGMENT_BYTES: usize = 512 * 1024;
+pub const MAX_CODEC_MSG_BYTES: usize = 4096;
+pub const MAX_CACHED_STREAMS: usize = 64;
 pub const MAX_GOP_CACHE_AGE: Duration = Duration::from_secs(10);
 pub const PREWARM_KEEPALIVE_TTL: Duration = Duration::from_secs(45);
+pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const UPSTREAM_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Validates that a `go2rtc` stream identifier is 1..=128 ASCII `[A-Za-z0-9_-]` characters
+/// and does not start with `.` so stream names cannot inject query parameters, fragments,
+/// or path traversal sequences into upstream WebSocket URLs.
+pub fn is_valid_stream_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
 
 #[derive(Debug, Clone)]
 pub struct MseGopBurst {
@@ -57,6 +75,9 @@ impl MseGopCache {
     }
 
     pub fn ingest_text(&mut self, text: &str) -> bool {
+        if text.is_empty() || text.len() > MAX_CODEC_MSG_BYTES {
+            return false;
+        }
         if text.contains("\"type\"") && text.contains("\"mse\"") {
             self.codec_msg = Some(text.to_string());
             self.updated_at = Instant::now();
@@ -70,10 +91,13 @@ impl MseGopCache {
     }
 
     pub fn ingest_binary_with_seq(&mut self, bytes: Bytes) -> (bool, Option<MseLivePacket>) {
-        if bytes.is_empty() {
+        if bytes.is_empty() || bytes.len() > MAX_GOP_BYTES {
             return (false, None);
         }
         if ninjanvr_vod::is_fmp4_init_segment(&bytes) {
+            if bytes.len() > MAX_INIT_SEGMENT_BYTES {
+                return (false, None);
+            }
             self.init_segment = Some(bytes.clone());
             self.gop_fragments.clear();
             self.gop_bytes = 0;
@@ -84,11 +108,8 @@ impl MseGopCache {
         let seq = self.last_seq;
         if ninjanvr_vod::is_fmp4_sync_fragment(&bytes) {
             self.gop_fragments.clear();
-            self.gop_bytes = 0;
-            if bytes.len() <= MAX_GOP_BYTES {
-                self.gop_bytes = bytes.len();
-                self.gop_fragments.push_back(bytes.clone());
-            }
+            self.gop_bytes = bytes.len();
+            self.gop_fragments.push_back(bytes.clone());
             self.updated_at = Instant::now();
             return (true, Some(MseLivePacket::Fragment { seq, bytes }));
         }
@@ -103,6 +124,10 @@ impl MseGopCache {
             self.updated_at = Instant::now();
         }
         (false, Some(MseLivePacket::Fragment { seq, bytes }))
+    }
+
+    pub fn has_ready_burst(&self) -> bool {
+        self.codec_msg.is_some() && self.init_segment.is_some() && !self.gop_fragments.is_empty()
     }
 
     pub fn snapshot_fresh_burst(&self, max_age: Duration) -> Option<MseGopBurst> {
@@ -137,6 +162,27 @@ pub struct MseClientSubscription {
     active_clients: Arc<AtomicUsize>,
 }
 
+impl MseClientSubscription {
+    /// Receives the next live packet or, if the subscriber lagged behind the broadcast ring,
+    /// refreshes `self.burst` from the hub's current GOP cache so the caller can resync cleanly
+    /// at an IDR keyframe boundary instead of feeding broken delta frames.
+    pub async fn recv_or_resync(
+        &mut self,
+        hub: &MseStreamHub,
+        stream: &str,
+    ) -> Result<MseLivePacket, Option<MseGopBurst>> {
+        match self.rx.recv().await {
+            Ok(pkt) => Ok(pkt),
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                let fresh = hub.get_fresh_burst(stream).await;
+                self.burst = fresh.clone();
+                Err(fresh)
+            }
+            Err(broadcast::error::RecvError::Closed) => Err(None),
+        }
+    }
+}
+
 impl Drop for MseClientSubscription {
     fn drop(&mut self) {
         self.active_clients.fetch_sub(1, Ordering::SeqCst);
@@ -154,38 +200,48 @@ impl MseStreamHub {
         Self::default()
     }
 
+    fn prune_stale_caches_locked(caches: &mut HashMap<String, MseGopCache>) {
+        if caches.len() < MAX_CACHED_STREAMS {
+            return;
+        }
+        caches.retain(|_, c| c.updated_at.elapsed() <= MAX_GOP_CACHE_AGE);
+    }
+
     pub async fn ingest_upstream_text(&self, stream: &str, text: &str) {
-        if stream.is_empty() {
+        let stream_key = stream.trim();
+        if !is_valid_stream_name(stream_key) {
             return;
         }
         let updated = {
             let mut guard = self.caches.write().await;
+            Self::prune_stale_caches_locked(&mut guard);
             guard
-                .entry(stream.to_string())
+                .entry(stream_key.to_string())
                 .or_default()
                 .ingest_text(text)
         };
-        if updated && let Some(sess) = self.sessions.read().await.get(stream) {
+        if updated && let Some(sess) = self.sessions.read().await.get(stream_key) {
             let _ = sess.tx.send(MseLivePacket::Codec(text.to_string()));
         }
     }
 
     pub async fn ingest_upstream_binary(&self, stream: &str, bytes: Bytes) -> bool {
-        if stream.is_empty() {
+        let stream_key = stream.trim();
+        if !is_valid_stream_name(stream_key) {
             return false;
         }
-        let (is_sync, pkt_opt) = {
+        let (is_sync, burst_ready, pkt_opt) = {
             let mut guard = self.caches.write().await;
-            guard
-                .entry(stream.to_string())
-                .or_default()
-                .ingest_binary_with_seq(bytes)
+            Self::prune_stale_caches_locked(&mut guard);
+            let cache = guard.entry(stream_key.to_string()).or_default();
+            let (is_sync, pkt_opt) = cache.ingest_binary_with_seq(bytes);
+            (is_sync, cache.has_ready_burst(), pkt_opt)
         };
-        if let Some(sess) = self.sessions.read().await.get(stream) {
+        if let Some(sess) = self.sessions.read().await.get(stream_key) {
             if let Some(pkt) = pkt_opt {
                 let _ = sess.tx.send(pkt);
             }
-            if is_sync {
+            if is_sync && burst_ready {
                 sess.ready_notify.notify_waiters();
             }
         }
@@ -193,12 +249,13 @@ impl MseStreamHub {
     }
 
     pub async fn get_fresh_burst(&self, stream: &str) -> Option<MseGopBurst> {
-        if stream.is_empty() {
+        let stream_key = stream.trim();
+        if !is_valid_stream_name(stream_key) {
             return None;
         }
         let guard = self.caches.read().await;
         guard
-            .get(stream)
+            .get(stream_key)
             .and_then(|c| c.snapshot_fresh_burst(MAX_GOP_CACHE_AGE))
     }
 
@@ -258,7 +315,7 @@ impl MseStreamHub {
     /// that keeps its `MseGopCache` warm for `PREWARM_KEEPALIVE_TTL` (45s).
     pub async fn prewarm_stream(&self, go2rtc_ws_base: &str, stream: &str) -> bool {
         let stream_key = stream.trim();
-        if stream_key.is_empty() {
+        if !is_valid_stream_name(stream_key) {
             return false;
         }
 
@@ -266,11 +323,15 @@ impl MseStreamHub {
             .ensure_upstream_session(go2rtc_ws_base, stream_key, false)
             .await;
 
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
         if self.get_fresh_burst(stream_key).await.is_some() {
             return true;
         }
 
-        let _ = tokio::time::timeout(Duration::from_millis(250), notify.notified()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(250), notified).await;
         self.get_fresh_burst(stream_key).await.is_some()
     }
 
@@ -283,16 +344,18 @@ impl MseStreamHub {
     ) {
         for cam in cameras {
             let trimmed = cam.trim();
-            if trimmed.is_empty() {
+            if !is_valid_stream_name(trimmed) {
                 continue;
             }
             let _ = self
                 .ensure_upstream_session(go2rtc_ws_base, trimmed, true)
                 .await;
             let sub = format!("{trimmed}_sub");
-            let _ = self
-                .ensure_upstream_session(go2rtc_ws_base, &sub, true)
-                .await;
+            if is_valid_stream_name(&sub) {
+                let _ = self
+                    .ensure_upstream_session(go2rtc_ws_base, &sub, true)
+                    .await;
+            }
         }
     }
 
@@ -305,36 +368,44 @@ impl MseStreamHub {
         stream: &str,
     ) -> Option<MseClientSubscription> {
         let stream_key = stream.trim();
-        if stream_key.is_empty() {
+        if !is_valid_stream_name(stream_key) {
             return None;
         }
 
-        let (notify, _initial_rx, active_clients) = self
+        let (notify, initial_rx, active_clients) = self
             .ensure_upstream_session(go2rtc_ws_base, stream_key, false)
             .await;
         active_clients.fetch_add(1, Ordering::SeqCst);
+        let mut sub = MseClientSubscription {
+            burst: None,
+            rx: initial_rx,
+            active_clients,
+        };
+
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
 
         if self.get_fresh_burst(stream_key).await.is_none() {
-            let _ = tokio::time::timeout(Duration::from_millis(120), notify.notified()).await;
+            let _ = tokio::time::timeout(Duration::from_millis(120), notified).await;
         }
 
         // Subscribe and snapshot under the locks so `last_seq` aligns with `rx`
-        let rx = {
+        let rx_opt = {
             let sessions = self.sessions.read().await;
-            sessions.get(stream_key)?.tx.subscribe()
+            sessions.get(stream_key).map(|s| s.tx.subscribe())
         };
-        let burst = {
+        if let Some(fresh_rx) = rx_opt {
+            sub.rx = fresh_rx;
+        }
+        sub.burst = {
             let caches = self.caches.read().await;
             caches
                 .get(stream_key)
                 .and_then(|c| c.snapshot_fresh_burst(MAX_GOP_CACHE_AGE))
         };
 
-        Some(MseClientSubscription {
-            burst,
-            rx,
-            active_clients,
-        })
+        Some(sub)
     }
 }
 
@@ -344,27 +415,54 @@ async fn run_upstream_worker(
     stream: String,
     notify: Arc<Notify>,
 ) {
-    let ws_url = format!("{}/api/ws?src={}", go2rtc_ws_base, stream);
+    if !is_valid_stream_name(&stream) {
+        notify.notify_waiters();
+        return;
+    }
+    let ws_url = format!(
+        "{}/api/ws?src={}",
+        go2rtc_ws_base.trim_end_matches('/'),
+        stream
+    );
+    let ws_cfg = WebSocketConfig::default()
+        .max_message_size(Some(MAX_GOP_BYTES))
+        .max_frame_size(Some(MAX_GOP_BYTES));
+
     loop {
         let should_run = {
-            let sessions = hub.sessions.read().await;
-            sessions
+            let mut sessions = hub.sessions.write().await;
+            let active = sessions
                 .get(&stream)
                 .map(|s| {
                     s.persistent
                         || s.active_clients.load(Ordering::SeqCst) > 0
                         || Instant::now() < s.expires_at
                 })
-                .unwrap_or(false)
+                .unwrap_or(false);
+            if !active {
+                sessions.remove(&stream);
+            }
+            active
         };
         if !should_run {
             break;
         }
 
-        if let Ok((ws_stream, _)) = tokio_tungstenite::connect_async(&ws_url).await {
+        if let Ok(Ok((ws_stream, _))) = tokio::time::timeout(
+            UPSTREAM_CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_cfg), false),
+        )
+        .await
+        {
             let (mut sink, mut stream_rx) = ws_stream.split();
             let handshake = r#"{"type":"mse","value":"avc1.640029,avc1.64002A,avc1.640028,avc1.4D401F,avc1.4D0029,avc1.42E01E,hev1.1.6.L153.B0,mp4a.40.2,mp4a.40.5,flac,opus"}"#;
-            if sink.send(TungMsg::Text(handshake.into())).await.is_ok() {
+            if tokio::time::timeout(
+                UPSTREAM_SEND_TIMEOUT,
+                sink.send(TungMsg::Text(handshake.into())),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok())
+            {
                 let mut consecutive_timeouts = 0u8;
                 loop {
                     let keep_alive = {
@@ -381,6 +479,8 @@ async fn run_upstream_worker(
                         }
                     };
                     if !keep_alive {
+                        let _ =
+                            tokio::time::timeout(Duration::from_millis(200), sink.close()).await;
                         break;
                     }
 
@@ -395,7 +495,11 @@ async fn run_upstream_worker(
                         }
                         Ok(Some(Ok(TungMsg::Ping(p)))) => {
                             consecutive_timeouts = 0;
-                            let _ = sink.send(TungMsg::Pong(p)).await;
+                            let _ = tokio::time::timeout(
+                                UPSTREAM_SEND_TIMEOUT,
+                                sink.send(TungMsg::Pong(p)),
+                            )
+                            .await;
                         }
                         Ok(Some(Ok(TungMsg::Pong(_)))) => {
                             consecutive_timeouts = 0;
@@ -414,15 +518,19 @@ async fn run_upstream_worker(
         }
 
         let should_retry = {
-            let sessions = hub.sessions.read().await;
-            sessions
+            let mut sessions = hub.sessions.write().await;
+            let active = sessions
                 .get(&stream)
                 .map(|s| {
                     s.persistent
                         || s.active_clients.load(Ordering::SeqCst) > 0
                         || Instant::now() < s.expires_at
                 })
-                .unwrap_or(false)
+                .unwrap_or(false);
+            if !active {
+                sessions.remove(&stream);
+            }
+            active
         };
         if !should_retry {
             break;
@@ -430,20 +538,31 @@ async fn run_upstream_worker(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    hub.sessions.write().await.remove(&stream);
+    {
+        let mut caches = hub.caches.write().await;
+        if let Some(c) = caches.get(&stream)
+            && c.updated_at.elapsed() > MAX_GOP_CACHE_AGE
+        {
+            caches.remove(&stream);
+        }
+    }
     notify.notify_waiters();
 }
 
 pub fn extract_stream_src_from_query(query: &str) -> Option<String> {
+    let mut matched_src: Option<String> = None;
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=')
             && k == "src"
-            && !v.is_empty()
         {
-            return Some(v.to_string());
+            let trimmed = v.trim();
+            if !is_valid_stream_name(trimmed) || matched_src.is_some() {
+                return None;
+            }
+            matched_src = Some(trimmed.to_string());
         }
     }
-    None
+    matched_src
 }
 
 #[cfg(test)]
@@ -602,5 +721,118 @@ mod tests {
             "MseStreamHub must retry upstream go2rtc while active client is subscribed"
         );
         assert!(hub.get_fresh_burst("cozinha_sub").await.is_some());
+    }
+
+    #[test]
+    fn extract_stream_src_and_stream_validation_reject_injection_and_duplicate_keys() {
+        assert_eq!(
+            extract_stream_src_from_query("src=front_door_sub"),
+            Some("front_door_sub".to_string())
+        );
+        assert_eq!(
+            extract_stream_src_from_query("foo=1&src=cam-01&bar=2"),
+            Some("cam-01".to_string())
+        );
+        // Reject query/path/fragment injection & duplicate src parameters
+        assert_eq!(
+            extract_stream_src_from_query("src=front_door&src=evil"),
+            None
+        );
+        assert_eq!(extract_stream_src_from_query("src=../etc/passwd"), None);
+        assert_eq!(extract_stream_src_from_query("src=cam%20name"), None);
+        assert_eq!(extract_stream_src_from_query("src=cam#frag"), None);
+        assert_eq!(
+            extract_stream_src_from_query(&format!("src={}", "a".repeat(129))),
+            None
+        );
+        assert!(!is_valid_stream_name(".hidden"));
+        assert!(!is_valid_stream_name("cam/sub"));
+    }
+
+    #[test]
+    fn mse_gop_cache_rejects_oversized_codec_init_and_sync_frames_without_corrupting_existing_gop()
+    {
+        let mut cache = MseGopCache::new();
+        let valid_codec = r#"{"type":"mse","value":"video/mp4; codecs=\"avc1.640029\""}"#;
+        assert!(cache.ingest_text(valid_codec));
+
+        // Oversized codec message (> MAX_CODEC_MSG_BYTES) must be rejected and preserve valid_codec
+        let huge_codec = format!(
+            r#"{{"type":"mse","value":"{}"}}"#,
+            "A".repeat(MAX_CODEC_MSG_BYTES + 128)
+        );
+        assert!(!cache.ingest_text(&huge_codec));
+        assert_eq!(cache.codec_msg.as_deref(), Some(valid_codec));
+
+        // Valid init + sync keyframe
+        let init = build_test_init_segment();
+        cache.ingest_binary(init.clone());
+        let gop1_i = build_test_fragment(true, &[0x33; 128]);
+        assert!(cache.ingest_binary(gop1_i.clone()));
+        assert!(cache.has_ready_burst());
+
+        // Oversized init segment (> MAX_INIT_SEGMENT_BYTES) must be rejected without clearing GOP
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso6dashmp41");
+        let huge_moov = make_box(b"moov", &vec![0u8; MAX_INIT_SEGMENT_BYTES + 1024]);
+        let mut huge_init = Vec::with_capacity(ftyp.len() + huge_moov.len());
+        huge_init.extend_from_slice(&ftyp);
+        huge_init.extend_from_slice(&huge_moov);
+        let (is_sync_init, pkt_init) = cache.ingest_binary_with_seq(Bytes::from(huge_init));
+        assert!(!is_sync_init);
+        assert!(pkt_init.is_none());
+        assert_eq!(cache.init_segment, Some(init));
+        assert_eq!(cache.gop_fragments.len(), 1);
+
+        // Oversized sync keyframe (> MAX_GOP_BYTES) must be rejected without wiping gop_fragments
+        let huge_sync = build_test_fragment(true, &vec![0x77u8; MAX_GOP_BYTES]);
+        let (is_sync_huge, pkt_huge) = cache.ingest_binary_with_seq(huge_sync);
+        assert!(!is_sync_huge);
+        assert!(pkt_huge.is_none());
+        assert_eq!(cache.gop_fragments.len(), 1);
+        assert_eq!(cache.gop_fragments[0], gop1_i);
+    }
+
+    #[tokio::test]
+    async fn mse_subscription_recovers_from_broadcast_lag_and_decrements_active_clients_on_drop() {
+        let hub = MseStreamHub::new();
+        let stream = "yard_sub";
+        hub.ingest_upstream_text(
+            stream,
+            r#"{"type":"mse","value":"video/mp4; codecs=\"avc1.640029\""}"#,
+        )
+        .await;
+        hub.ingest_upstream_binary(stream, build_test_init_segment())
+            .await;
+        hub.ingest_upstream_binary(stream, build_test_fragment(true, &[0x10; 64]))
+            .await;
+
+        let mut sub = hub
+            .subscribe_client("ws://127.0.0.1:9", stream)
+            .await
+            .expect("subscription must succeed from warm cache");
+        assert_eq!(sub.active_clients.load(Ordering::SeqCst), 1);
+
+        // Overflow the 256-slot broadcast channel to force RecvError::Lagged on `sub.rx`
+        for i in 0..300u16 {
+            let is_key = i == 290;
+            let payload = [(i & 0xFF) as u8; 32];
+            hub.ingest_upstream_binary(stream, build_test_fragment(is_key, &payload))
+                .await;
+        }
+
+        let resync = sub.recv_or_resync(&hub, stream).await;
+        assert!(
+            resync.is_err(),
+            "lagged receiver must trigger resync burst error branch"
+        );
+        let refreshed_burst = resync
+            .err()
+            .flatten()
+            .expect("resync must provide the latest fresh GOP burst");
+        assert!(!refreshed_burst.gop_fragments.is_empty());
+
+        let active_ref = sub.active_clients.clone();
+        drop(sub);
+        assert_eq!(active_ref.load(Ordering::SeqCst), 0);
     }
 }
