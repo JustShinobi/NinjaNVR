@@ -44,12 +44,12 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          token: ${{ secrets.PLATFORM_GITOPS_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cut SemVer release (Pre-Release on dev, Stable on main)
         id: release
         env:
-          GH_TOKEN: ${{ secrets.PLATFORM_GITOPS_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/ci/cut-release
 
   publish-ghcr:
@@ -127,7 +127,7 @@ jobs:
 
       - name: Prune old GHCR RC and untagged versions (keep latest 10 RC tags)
         env:
-          GH_TOKEN: ${{ secrets.PLATFORM_GITOPS_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PACKAGE_OWNER: ${{ github.repository_owner }}
         run: |
           python3 - <<'PY'
