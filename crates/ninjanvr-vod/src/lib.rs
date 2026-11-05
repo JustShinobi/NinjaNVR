@@ -7,6 +7,9 @@ const MAX_MOOV_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SEGMENT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SAMPLES_PER_TRACK: usize = 65_536;
 const MAX_TABLE_ENTRIES: usize = 65_536;
+const MAX_BOXES_PER_LEVEL: usize = 4_096;
+const MAX_TRAK_BOXES: usize = 16;
+const MAX_TRACKS: usize = 8;
 
 fn validate_segment_path(path: &Path) -> Result<u64> {
     if path.as_os_str().is_empty() || path.components().any(|c| matches!(c, Component::ParentDir)) {
@@ -222,6 +225,9 @@ struct Mp4BoxSlice<'a> {
 fn iter_boxes(mut buf: &[u8]) -> Vec<Mp4BoxSlice<'_>> {
     let mut out = Vec::new();
     while buf.len() >= 8 {
+        if out.len() >= MAX_BOXES_PER_LEVEL {
+            break;
+        }
         let size32 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
         let box_type = [buf[4], buf[5], buf[6], buf[7]];
         let (box_len_u64, hdr_len) = if size32 == 1 {
@@ -309,7 +315,12 @@ fn read_moov_from_file(path: &Path) -> Result<(Vec<u8>, usize)> {
         .with_context(|| format!("failed to open MP4 segment {}", path.display()))?;
     let mut pos = 0u64;
     let mut hdr = [0u8; 8];
+    let mut boxes_seen = 0usize;
     while pos.checked_add(8).is_some_and(|end| end <= file_len) {
+        if boxes_seen >= MAX_BOXES_PER_LEVEL {
+            break;
+        }
+        boxes_seen += 1;
         file.seek(SeekFrom::Start(pos))?;
         file.read_exact(&mut hdr)?;
         let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
@@ -368,9 +379,15 @@ fn parse_tracks_from_moov(
     }
 
     let mut tracks = Vec::new();
+    let mut trak_boxes_seen = 0usize;
+    let mut cumulative_sample_bytes = 0usize;
     for b in &moov_boxes {
         if &b.box_type != b"trak" {
             continue;
+        }
+        trak_boxes_seen += 1;
+        if trak_boxes_seen > MAX_TRAK_BOXES {
+            bail!("moov contains too many trak boxes (exceeds maximum allowed {MAX_TRAK_BOXES})");
         }
         if let Ok(mut t) = parse_single_trak(b.payload) {
             // Sanitize sample bounds; if an audio (`soun`) track has corrupted or out-of-bounds
@@ -385,9 +402,22 @@ fn parse_tracks_from_moov(
                             .map(|end| end <= file_len)
                             .unwrap_or(false)
                 });
-                if t.samples.is_empty() {
+                let soun_bytes: Option<usize> = t
+                    .samples
+                    .iter()
+                    .try_fold(0usize, |acc, s| acc.checked_add(s.size as usize));
+                let Some(soun_total) = soun_bytes else {
+                    continue;
+                };
+                if t.samples.is_empty()
+                    || soun_total > file_len
+                    || cumulative_sample_bytes
+                        .checked_add(soun_total)
+                        .is_none_or(|tot| tot > file_len)
+                {
                     continue;
                 }
+                cumulative_sample_bytes += soun_total;
             } else {
                 t.samples.retain(|s| {
                     s.size > 0
@@ -399,8 +429,18 @@ fn parse_tracks_from_moov(
                 if t.samples.is_empty() {
                     continue;
                 }
+                if let Some(track_total) = t
+                    .samples
+                    .iter()
+                    .try_fold(0usize, |acc, s| acc.checked_add(s.size as usize))
+                {
+                    cumulative_sample_bytes = cumulative_sample_bytes.saturating_add(track_total);
+                }
             }
             tracks.push(t);
+            if tracks.len() >= MAX_TRACKS {
+                break;
+            }
         }
     }
     if tracks.is_empty() {
@@ -481,6 +521,9 @@ fn parse_single_trak(trak_payload: &[u8]) -> Result<ParsedTrack> {
     let stbl = find_box(&minf_boxes, b"stbl").ok_or_else(|| anyhow!("missing stbl"))?;
     let stbl_boxes = iter_boxes(stbl);
     let stsd = find_box(&stbl_boxes, b"stsd").ok_or_else(|| anyhow!("missing stsd"))?;
+    if stsd.len() < 8 {
+        bail!("stsd too short");
+    }
 
     let samples = parse_sample_table(&stbl_boxes, &handler_type)?;
 
@@ -653,7 +696,7 @@ fn parse_sample_table(
     }
 
     let stsc = find_box(stbl_boxes, b"stsc").ok_or_else(|| anyhow!("missing stsc"))?;
-    let mut stsc_entries = Vec::new();
+    let mut stsc_entries: Vec<(usize, usize)> = Vec::new();
     if stsc.len() >= 8 {
         let entry_count = u32::from_be_bytes([stsc[4], stsc[5], stsc[6], stsc[7]]) as usize;
         for i in 0..entry_count.min(MAX_TABLE_ENTRIES) {
@@ -667,21 +710,28 @@ fn parse_sample_table(
                 u32::from_be_bytes([stsc[p], stsc[p + 1], stsc[p + 2], stsc[p + 3]]) as usize;
             let samples_per_chunk =
                 u32::from_be_bytes([stsc[p + 4], stsc[p + 5], stsc[p + 6], stsc[p + 7]]) as usize;
-            stsc_entries.push((first_chunk.max(1), samples_per_chunk));
+            let norm_first = first_chunk.max(1);
+            if let Some(last) = stsc_entries.last_mut() {
+                if norm_first == last.0 {
+                    last.1 = samples_per_chunk;
+                } else if norm_first > last.0 {
+                    stsc_entries.push((norm_first, samples_per_chunk));
+                }
+            } else {
+                stsc_entries.push((norm_first, samples_per_chunk));
+            }
         }
     }
 
     let mut samples = Vec::with_capacity(sample_count);
     let mut sample_idx = 0usize;
+    let mut stsc_cursor = 0usize;
+    let mut spc = 1usize;
     for (chunk_idx_0, &chunk_offset) in chunk_offsets.iter().enumerate() {
         let chunk_num_1 = chunk_idx_0 + 1;
-        let mut spc = 1usize;
-        for &(first_c, count_c) in &stsc_entries {
-            if chunk_num_1 >= first_c {
-                spc = count_c;
-            } else {
-                break;
-            }
+        while stsc_cursor < stsc_entries.len() && chunk_num_1 >= stsc_entries[stsc_cursor].0 {
+            spc = stsc_entries[stsc_cursor].1;
+            stsc_cursor += 1;
         }
         let mut cur_offset = chunk_offset;
         let take = spc.min(sample_count.saturating_sub(sample_idx));
@@ -793,9 +843,22 @@ pub fn build_media_segment_m4s(
     validate_segment_path(segment_path)?;
     let file_bytes = std::fs::read(segment_path)
         .with_context(|| format!("failed to read MP4 file {}", segment_path.display()))?;
+    if file_bytes.len() as u64 > MAX_SEGMENT_FILE_BYTES {
+        bail!(
+            "MP4 segment {} exceeds maximum allowed size ({} bytes)",
+            segment_path.display(),
+            file_bytes.len()
+        );
+    }
     let top_boxes = iter_boxes(&file_bytes);
     let moov_payload =
         find_box(&top_boxes, b"moov").ok_or_else(|| anyhow!("missing moov in segment"))?;
+    if moov_payload.len() as u64 > MAX_MOOV_BYTES {
+        bail!(
+            "moov box exceeds maximum allowed size in {}",
+            segment_path.display()
+        );
+    }
     let (_mvhd, tracks) = parse_tracks_from_moov(moov_payload, file_bytes.len())?;
 
     // Two-pass moof construction so `data_offset` in each `trun` points accurately into `mdat`
@@ -1967,5 +2030,152 @@ mod tests {
             parse_trun_first_sample_is_sync(&truncated_trun, Some(0x0200_0000)),
             None
         );
+    }
+
+    #[test]
+    fn cycle2_vod_linear_stsc_cursor_trak_cap_box_cap_and_soun_alias_strip() {
+        // 1. VOD-C2-01: 65,536 stco entries x 65,536 stsc entries (all first_chunk = 1, samples_per_chunk = 0)
+        //    must finish in O(N) via monotonic cursor without a 4.29B iteration O(N^2) spin
+        let mut stsz_body = Vec::new();
+        stsz_body.extend_from_slice(&64u32.to_be_bytes());
+        stsz_body.extend_from_slice(&1u32.to_be_bytes());
+        let stsz = make_full_box(b"stsz", 0, 0, &stsz_body);
+
+        let mut stts_body = Vec::new();
+        stts_body.extend_from_slice(&1u32.to_be_bytes());
+        stts_body.extend_from_slice(&1u32.to_be_bytes());
+        stts_body.extend_from_slice(&3000u32.to_be_bytes());
+        let stts = make_full_box(b"stts", 0, 0, &stts_body);
+
+        let mut stco_body = Vec::with_capacity(4 + MAX_TABLE_ENTRIES * 4);
+        stco_body.extend_from_slice(&(MAX_TABLE_ENTRIES as u32).to_be_bytes());
+        for _ in 0..MAX_TABLE_ENTRIES {
+            stco_body.extend_from_slice(&32u32.to_be_bytes());
+        }
+        let stco = make_full_box(b"stco", 0, 0, &stco_body);
+
+        let mut stsc_body = Vec::with_capacity(4 + MAX_TABLE_ENTRIES * 12);
+        stsc_body.extend_from_slice(&(MAX_TABLE_ENTRIES as u32).to_be_bytes());
+        for _ in 0..MAX_TABLE_ENTRIES {
+            stsc_body.extend_from_slice(&1u32.to_be_bytes()); // first_chunk = 1
+            stsc_body.extend_from_slice(&0u32.to_be_bytes()); // samples_per_chunk = 0
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+        }
+        let stsc = make_full_box(b"stsc", 0, 0, &stsc_body);
+
+        let mut stbl_children = Vec::new();
+        stbl_children.extend_from_slice(&stsz);
+        stbl_children.extend_from_slice(&stts);
+        stbl_children.extend_from_slice(&stco);
+        stbl_children.extend_from_slice(&stsc);
+        let stbl = make_box(b"stbl", &stbl_children);
+        let stbl_boxes = iter_boxes(&stbl[8..]);
+        let samples = parse_sample_table(&stbl_boxes, b"vide").expect("linear stsc cursor");
+        assert!(samples.is_empty());
+
+        // 2. VOD-C2-02a: moov with > MAX_TRAK_BOXES (e.g. 20 trak boxes) must fail fast
+        let mvhd = make_full_box(b"mvhd", 0, 0, &[0u8; 96]);
+        let mut many_traks_moov = mvhd.clone();
+        for _ in 0..(MAX_TRAK_BOXES + 4) {
+            many_traks_moov.extend_from_slice(&make_box(b"trak", &[0u8; 16]));
+        }
+        let err_traks = parse_tracks_from_moov(&many_traks_moov, 4096)
+            .expect_err("excessive trak boxes must be rejected");
+        assert!(err_traks.to_string().contains("too many trak boxes"));
+
+        // 3. VOD-C2-02b: iter_boxes caps sibling box count at MAX_BOXES_PER_LEVEL
+        let mut many_free = Vec::with_capacity((MAX_BOXES_PER_LEVEL + 100) * 8);
+        for _ in 0..(MAX_BOXES_PER_LEVEL + 100) {
+            many_free.extend_from_slice(&8u32.to_be_bytes());
+            many_free.extend_from_slice(b"free");
+        }
+        assert_eq!(iter_boxes(&many_free).len(), MAX_BOXES_PER_LEVEL);
+
+        // 4. VOD-C2-02c: soun track with chunk-aliasing (each sample fits in file_len, but sum > file_len)
+        //    is stripped cleanly so video track remuxing still succeeds
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00isom");
+        let video_sample = vec![0x65u8; 64];
+        let mdat_offset = (ftyp.len() + 8) as u32;
+        let mdat = make_box(b"mdat", &video_sample);
+
+        let build_trak_n = |track_id: u32,
+                            handler: &[u8; 4],
+                            sample_offset: u32,
+                            sample_size: u32,
+                            chunk_count: u32| {
+            let mut tkhd_body = vec![0u8; 80];
+            tkhd_body[8..12].copy_from_slice(&track_id.to_be_bytes());
+            let tkhd = make_full_box(b"tkhd", 0, 3, &tkhd_body);
+            let mut mdhd_body = vec![0u8; 20];
+            mdhd_body[8..12].copy_from_slice(&90000u32.to_be_bytes());
+            mdhd_body[12..16].copy_from_slice(&90000u32.to_be_bytes());
+            let mdhd = make_full_box(b"mdhd", 0, 0, &mdhd_body);
+            let mut hdlr_body = vec![0u8; 20];
+            hdlr_body[4..8].copy_from_slice(handler);
+            let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+            let stsd = make_full_box(b"stsd", 0, 0, &[0, 0, 0, 1]);
+
+            let mut stsz_b = Vec::new();
+            stsz_b.extend_from_slice(&sample_size.to_be_bytes());
+            stsz_b.extend_from_slice(&chunk_count.to_be_bytes());
+            let stsz_box = make_full_box(b"stsz", 0, 0, &stsz_b);
+
+            let mut stts_b = Vec::new();
+            stts_b.extend_from_slice(&1u32.to_be_bytes());
+            stts_b.extend_from_slice(&chunk_count.to_be_bytes());
+            stts_b.extend_from_slice(&1024u32.to_be_bytes());
+            let stts_box = make_full_box(b"stts", 0, 0, &stts_b);
+
+            let mut stsc_b = Vec::new();
+            stsc_b.extend_from_slice(&1u32.to_be_bytes());
+            stsc_b.extend_from_slice(&1u32.to_be_bytes());
+            stsc_b.extend_from_slice(&1u32.to_be_bytes());
+            stsc_b.extend_from_slice(&1u32.to_be_bytes());
+            let stsc_box = make_full_box(b"stsc", 0, 0, &stsc_b);
+
+            let mut stco_b = Vec::new();
+            stco_b.extend_from_slice(&chunk_count.to_be_bytes());
+            for _ in 0..chunk_count {
+                stco_b.extend_from_slice(&sample_offset.to_be_bytes());
+            }
+            let stco_box = make_full_box(b"stco", 0, 0, &stco_b);
+
+            let mut stbl_c = Vec::new();
+            stbl_c.extend_from_slice(&stsd);
+            stbl_c.extend_from_slice(&stsz_box);
+            stbl_c.extend_from_slice(&stts_box);
+            stbl_c.extend_from_slice(&stsc_box);
+            stbl_c.extend_from_slice(&stco_box);
+            let minf = make_box(b"minf", &make_box(b"stbl", &stbl_c));
+            let mut mdia_c = Vec::new();
+            mdia_c.extend_from_slice(&mdhd);
+            mdia_c.extend_from_slice(&hdlr);
+            mdia_c.extend_from_slice(&minf);
+            let mut trak_c = Vec::new();
+            trak_c.extend_from_slice(&tkhd);
+            trak_c.extend_from_slice(&make_box(b"mdia", &mdia_c));
+            make_box(b"trak", &trak_c)
+        };
+
+        let vide_trak = build_trak_n(1, b"vide", mdat_offset, 64, 1);
+        // soun track has 50 aliased chunks of 64 bytes (= 3200 bytes > ~700 byte file_len)
+        let aliased_soun_trak = build_trak_n(2, b"soun", mdat_offset, 64, 50);
+        let mut moov_c = Vec::new();
+        moov_c.extend_from_slice(&mvhd);
+        moov_c.extend_from_slice(&vide_trak);
+        moov_c.extend_from_slice(&aliased_soun_trak);
+        let moov = make_box(b"moov", &moov_c);
+
+        let mut mp4_bytes = Vec::new();
+        mp4_bytes.extend_from_slice(&ftyp);
+        mp4_bytes.extend_from_slice(&mdat);
+        mp4_bytes.extend_from_slice(&moov);
+
+        let tmp_soun_alias = std::env::temp_dir().join("ninjanvr-vod-soun-alias-strip.mp4");
+        std::fs::write(&tmp_soun_alias, &mp4_bytes).unwrap();
+        let m4s = build_media_segment_m4s(&tmp_soun_alias, 1, 0.0)
+            .expect("corrupted soun track with chunk aliasing should be stripped so vide succeeds");
+        assert!(m4s.ends_with(&video_sample));
+        let _ = std::fs::remove_file(&tmp_soun_alias);
     }
 }
