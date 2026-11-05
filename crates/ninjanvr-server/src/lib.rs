@@ -1059,6 +1059,59 @@ pub fn normalize_http_path_for_auth(raw: &str) -> Option<String> {
     }
 }
 
+fn is_safe_go2rtc_stream_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn validate_go2rtc_query_streams(
+    query: Option<&str>,
+    allowed_set: Option<&[String]>,
+) -> Result<Vec<String>, &'static str> {
+    let Some(q) = query.filter(|s| !s.trim().is_empty()) else {
+        return Err("Missing stream src query parameter");
+    };
+    let mut query_cams = Vec::new();
+    for kv in q.split('&') {
+        if kv.is_empty() {
+            continue;
+        }
+        let (raw_k, raw_v) = kv.split_once('=').unwrap_or((kv, ""));
+        let Some(k) = percent_decode_segment(raw_k) else {
+            return Err("Invalid query encoding");
+        };
+        let Some(v) = percent_decode_segment(raw_v) else {
+            return Err("Invalid query encoding");
+        };
+        if k.chars().any(|c| c.is_control()) || v.chars().any(|c| c.is_control()) {
+            return Err("Invalid query encoding");
+        }
+        if k.eq_ignore_ascii_case("src") || k.eq_ignore_ascii_case("dst") {
+            if !is_safe_go2rtc_stream_name(&v) {
+                return Err("Invalid stream identifier");
+            }
+            let base_cam = v.strip_suffix("_sub").unwrap_or(&v).trim();
+            if base_cam.is_empty() {
+                return Err("Invalid stream identifier");
+            }
+            if let Some(allowed) = allowed_set
+                && !allowed.iter().any(|a| a == base_cam || a == "*")
+            {
+                return Err("Stream camera is not permitted for this user");
+            }
+            query_cams.push(base_cam.to_string());
+        }
+    }
+    if query_cams.is_empty() {
+        return Err("Missing stream src query parameter");
+    }
+    Ok(query_cams)
+}
+
 fn strip_static_media_prefix(p: &str) -> Option<&str> {
     p.strip_prefix("/exports/")
         .or_else(|| p.strip_prefix("/clips/"))
@@ -1401,17 +1454,66 @@ async fn auth_gate_middleware(
                     .into_response();
             }
 
-            // Enforce per-camera scoping when user is restricted to specific cameras
-            if role_lc != "admin"
-                && let Some(allowed_set) = resolve_user_allowed_cameras(
-                    &state,
-                    &jar,
-                    req.headers(),
-                    &auth_cfg,
-                    &user,
-                    &role,
-                )
+            // Enforce go2rtc stream syntax and camera scoping unconditionally for all callers
+            let allowed_set_opt = if role_lc != "admin" {
+                resolve_user_allowed_cameras(&state, &jar, req.headers(), &auth_cfg, &user, &role)
+            } else {
+                None
+            };
+            if (path.starts_with("/live/") || path == "/live" || path == "/api/go2rtc/webrtc")
+                && let Err(msg) =
+                    validate_go2rtc_query_streams(req.uri().query(), allowed_set_opt.as_deref())
             {
+                let status = if msg == "Stream camera is not permitted for this user"
+                    || (msg == "Missing stream src query parameter" && allowed_set_opt.is_some())
+                {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                state.log_hub.push_nginx(&method, &path, status.as_u16());
+                return (status, Json(json!({ "message": msg }))).into_response();
+            }
+            if let Some(after_streams) = path.strip_prefix("/api/go2rtc/streams/") {
+                let raw_seg = after_streams
+                    .strip_suffix("/prewarm")
+                    .unwrap_or(after_streams)
+                    .trim_matches('/');
+                let Some(decoded_seg) = percent_decode_segment(raw_seg) else {
+                    state.log_hub.push_nginx(&method, &path, 400);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "message": "Invalid stream identifier" })),
+                    )
+                        .into_response();
+                };
+                if !is_safe_go2rtc_stream_name(&decoded_seg) {
+                    state.log_hub.push_nginx(&method, &path, 400);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "message": "Invalid stream identifier" })),
+                    )
+                        .into_response();
+                }
+                let base_cam = decoded_seg
+                    .strip_suffix("_sub")
+                    .unwrap_or(&decoded_seg)
+                    .trim();
+                if let Some(ref allowed_set) = allowed_set_opt
+                    && (base_cam.is_empty()
+                        || !allowed_set.iter().any(|a| a == base_cam || a == "*"))
+                {
+                    state.log_hub.push_nginx(&method, &path, 403);
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "message": format!("Camera '{base_cam}' is not permitted for this user") })),
+                    )
+                        .into_response();
+                }
+            }
+
+            // Enforce per-camera scoping when user is restricted to specific cameras
+            if let Some(allowed_set) = allowed_set_opt {
                 let is_static_media = path.starts_with("/exports/")
                     || path == "/exports"
                     || path.starts_with("/recordings/")
@@ -1433,75 +1535,6 @@ async fn auth_gate_middleware(
                         Json(json!({ "message": "Static media resource is not permitted for this user" })),
                     )
                         .into_response();
-                }
-                if path.starts_with("/live/") || path == "/live" || path == "/api/go2rtc/webrtc" {
-                    let mut query_cams = Vec::new();
-                    let mut invalid_query = false;
-                    if let Some(q) = req.uri().query() {
-                        for kv in q.split('&') {
-                            if kv.is_empty() {
-                                continue;
-                            }
-                            let (raw_k, raw_v) = kv.split_once('=').unwrap_or((kv, ""));
-                            let Some(k) = percent_decode_segment(raw_k) else {
-                                invalid_query = true;
-                                break;
-                            };
-                            if k.eq_ignore_ascii_case("src") || k.eq_ignore_ascii_case("dst") {
-                                let Some(v) = percent_decode_segment(raw_v) else {
-                                    invalid_query = true;
-                                    break;
-                                };
-                                let base_cam =
-                                    v.strip_suffix("_sub").unwrap_or(&v).trim().to_string();
-                                if base_cam.is_empty() {
-                                    invalid_query = true;
-                                    break;
-                                }
-                                query_cams.push(base_cam);
-                            }
-                        }
-                    }
-                    if invalid_query
-                        || query_cams.is_empty()
-                        || query_cams
-                            .iter()
-                            .any(|cam| !allowed_set.iter().any(|a| a == cam || a == "*"))
-                    {
-                        state.log_hub.push_nginx(&method, &path, 403);
-                        return (
-                            StatusCode::FORBIDDEN,
-                            Json(json!({ "message": "Stream camera is not permitted for this user" })),
-                        )
-                            .into_response();
-                    }
-                }
-                if let Some(after_streams) = path.strip_prefix("/api/go2rtc/streams/") {
-                    let raw_seg = after_streams
-                        .strip_suffix("/prewarm")
-                        .unwrap_or(after_streams)
-                        .trim_matches('/');
-                    let Some(decoded_seg) = percent_decode_segment(raw_seg) else {
-                        state.log_hub.push_nginx(&method, &path, 403);
-                        return (
-                            StatusCode::FORBIDDEN,
-                            Json(json!({ "message": "Stream camera is not permitted for this user" })),
-                        )
-                            .into_response();
-                    };
-                    let base_cam = decoded_seg
-                        .strip_suffix("_sub")
-                        .unwrap_or(&decoded_seg)
-                        .trim();
-                    if base_cam.is_empty() || !allowed_set.iter().any(|a| a == base_cam || a == "*")
-                    {
-                        state.log_hub.push_nginx(&method, &path, 403);
-                        return (
-                            StatusCode::FORBIDDEN,
-                            Json(json!({ "message": format!("Camera '{base_cam}' is not permitted for this user") })),
-                        )
-                            .into_response();
-                    }
                 }
                 let query_cam = if path.starts_with("/api/go2rtc") {
                     req.uri().query().and_then(|q| {
@@ -1842,27 +1875,69 @@ fn generate_pkce_pair() -> (String, String, String) {
 }
 
 fn resolve_external_base_url(headers: &HeaderMap, uri: &Uri) -> String {
-    let host = headers
+    let x_forwarded_host = headers
         .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').next().unwrap_or(s).trim())
-        .filter(|s| !s.is_empty())
-        .or_else(|| uri.authority().map(|a| a.as_str()))
-        .unwrap_or("localhost:5000");
-    let proto = headers
+        .filter(|s| !s.is_empty());
+    let host_header = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim())
+        .filter(|s| !s.is_empty());
+    let uri_authority = uri
+        .authority()
+        .map(|a| a.as_str().trim())
+        .filter(|s| !s.is_empty());
+
+    let primary_host = host_header.or(uri_authority);
+    let allow_xfh = match (x_forwarded_host, primary_host) {
+        (Some(_), None) => true,
+        (Some(xfh), Some(pri)) => {
+            is_internal_backend_host(pri)
+                || bare_hostname(xfh).eq_ignore_ascii_case(bare_hostname(pri))
+        }
+        (None, _) => false,
+    };
+
+    let raw_host = if allow_xfh {
+        x_forwarded_host.or(primary_host)
+    } else {
+        primary_host
+    }
+    .unwrap_or("localhost:5000");
+
+    let is_valid_host = !raw_host.is_empty()
+        && !raw_host.contains(['/', '\\', '?', '#', '@'])
+        && !raw_host
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control());
+    let host = if is_valid_host {
+        raw_host
+    } else {
+        "localhost:5000"
+    };
+
+    let default_proto = if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+        "http"
+    } else {
+        "https"
+    };
+    let raw_proto = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').next().unwrap_or(s).trim())
         .filter(|s| !s.is_empty())
         .or_else(|| uri.scheme_str())
-        .unwrap_or(
-            if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
-                "http"
-            } else {
-                "https"
-            },
-        );
+        .unwrap_or(default_proto);
+    let proto = if raw_proto.eq_ignore_ascii_case("http") {
+        "http"
+    } else if raw_proto.eq_ignore_ascii_case("https") {
+        "https"
+    } else {
+        default_proto
+    };
+
     format!("{proto}://{host}")
 }
 
@@ -2074,16 +2149,48 @@ async fn api_auth_oidc_callback(
             .body(form_body)
             .send()
             .await
-            && let Ok(tok_json) = tok_resp.json::<Value>().await
         {
-            let mut merged_claims = json!({});
-            if let Some(id_token) = tok_json.get("id_token").and_then(|v| v.as_str()) {
-                let parts: Vec<&str> = id_token.split('.').collect();
-                if parts.len() >= 2
-                    && let Ok(payload_bytes) =
+            if !tok_resp.status().is_success() {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "message": "OIDC token endpoint rejected authorization code" })),
+                )
+                    .into_response();
+            }
+            if let Ok(tok_json) = tok_resp.json::<Value>().await {
+                if tok_json.get("error").is_some() {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "message": "OIDC token response contained an error" })),
+                    )
+                        .into_response();
+                }
+                let mut merged_claims = json!({});
+                if let Some(id_token) = tok_json.get("id_token").and_then(|v| v.as_str()) {
+                    let parts: Vec<&str> = id_token.split('.').collect();
+                    if parts.len() != 3 || parts[2].trim().is_empty() {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Malformed or unsigned OIDC ID token" })),
+                        )
+                            .into_response();
+                    }
+                    let Ok(payload_bytes) =
                         base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1])
-                    && let Ok(claims_json) = serde_json::from_slice::<Value>(&payload_bytes)
-                {
+                    else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Malformed OIDC ID token payload" })),
+                        )
+                            .into_response();
+                    };
+                    let Ok(claims_json) = serde_json::from_slice::<Value>(&payload_bytes) else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Malformed OIDC ID token claims JSON" })),
+                        )
+                            .into_response();
+                    };
                     if claims_json
                         .get("exp")
                         .and_then(|v| v.as_u64())
@@ -2095,63 +2202,157 @@ async fn api_auth_oidc_callback(
                         )
                             .into_response();
                     }
+                    if let Some(iss_val) = claims_json.get("iss") {
+                        let iss_ok = iss_val
+                            .as_str()
+                            .is_some_and(|s| s.trim().trim_end_matches('/') == issuer.as_str());
+                        if !iss_ok {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "OIDC ID token issuer mismatch" })),
+                            )
+                                .into_response();
+                        }
+                    }
+                    if let Some(aud_val) = claims_json.get("aud") {
+                        let aud_ok = match aud_val {
+                            Value::String(s) => s.trim() == client_id.as_str(),
+                            Value::Array(arr) => arr.iter().any(|v| {
+                                v.as_str().is_some_and(|s| s.trim() == client_id.as_str())
+                            }),
+                            _ => false,
+                        };
+                        if !aud_ok {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "OIDC ID token audience mismatch" })),
+                            )
+                                .into_response();
+                        }
+                    }
                     merged_claims = claims_json;
                 }
-            }
-            if let Some(access_token) = tok_json.get("access_token").and_then(|v| v.as_str())
-                && let Ok(ui_resp) = client
-                    .get(&userinfo_endpoint)
-                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
-                    .send()
-                    .await
-                && let Ok(Value::Object(ui_map)) = ui_resp.json::<Value>().await
-                && let Some(obj) = merged_claims.as_object_mut()
-            {
-                for (k, v) in ui_map {
-                    obj.insert(k, v);
+                if let Some(access_token) = tok_json.get("access_token").and_then(|v| v.as_str()) {
+                    let Ok(ui_resp) = client
+                        .get(&userinfo_endpoint)
+                        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                        .send()
+                        .await
+                    else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC UserInfo request failed" })),
+                        )
+                            .into_response();
+                    };
+                    if !ui_resp.status().is_success() {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC UserInfo endpoint rejected access token" })),
+                        )
+                            .into_response();
+                    }
+                    let Ok(Value::Object(ui_map)) = ui_resp.json::<Value>().await else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Invalid OIDC UserInfo response payload" })),
+                        )
+                            .into_response();
+                    };
+                    if ui_map.contains_key("error") {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC UserInfo response contained an error" })),
+                        )
+                            .into_response();
+                    }
+                    if let (Some(id_sub), Some(ui_sub)) = (
+                        merged_claims.get("sub").and_then(|v| v.as_str()),
+                        ui_map.get("sub").and_then(|v| v.as_str()),
+                    ) && id_sub != ui_sub
+                    {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC subject mismatch between ID token and UserInfo" })),
+                        )
+                            .into_response();
+                    }
+                    if let Some(obj) = merged_claims.as_object_mut() {
+                        for (k, v) in ui_map {
+                            obj.insert(k, v);
+                        }
+                    }
                 }
-            }
-            if merged_claims.as_object().is_some_and(|m| !m.is_empty()) {
-                let username = merged_claims
-                    .get(&oidc_cfg.username_claim)
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        merged_claims
-                            .get("preferred_username")
-                            .and_then(|v| v.as_str())
-                    })
-                    .or_else(|| merged_claims.get("email").and_then(|v| v.as_str()))
-                    .or_else(|| merged_claims.get("sub").and_then(|v| v.as_str()))
-                    .unwrap_or("oidc_user")
-                    .to_string();
-                let role = resolve_oidc_role(&merged_claims, &oidc_cfg);
-                let now = unix_now();
-                let jwt_claims = JwtClaims {
-                    sub: username,
-                    role,
-                    allowed_cameras: Some("*".to_string()),
-                    iat: now,
-                    exp: now + session_len,
-                };
-                let session_token = jsonwebtoken::encode(
-                    &Header::new(Algorithm::HS256),
-                    &jwt_claims,
-                    &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
-                )
-                .unwrap_or_default();
-                let mut session_cookie = Cookie::new(cookie_name, session_token);
-                session_cookie.set_path("/");
-                session_cookie.set_http_only(true);
-                session_cookie.set_secure(cookie_secure);
-                session_cookie.set_same_site(SameSite::Lax);
+                if merged_claims.as_object().is_some_and(|m| !m.is_empty()) {
+                    let identity_opt = merged_claims
+                        .get(&oidc_cfg.username_claim)
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            merged_claims
+                                .get("preferred_username")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                        })
+                        .or_else(|| {
+                            merged_claims
+                                .get("email")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                        })
+                        .or_else(|| {
+                            merged_claims
+                                .get("sub")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                        });
+                    let Some(username_str) = identity_opt else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC claims missing valid subject/username identity" })),
+                        )
+                            .into_response();
+                    };
+                    let username = username_str.to_string();
+                    let role = resolve_oidc_role(&merged_claims, &oidc_cfg);
+                    let now = unix_now();
+                    let jwt_claims = JwtClaims {
+                        sub: username,
+                        role,
+                        allowed_cameras: Some("*".to_string()),
+                        iat: now,
+                        exp: now + session_len,
+                    };
+                    let session_token = jsonwebtoken::encode(
+                        &Header::new(Algorithm::HS256),
+                        &jwt_claims,
+                        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+                    )
+                    .unwrap_or_default();
+                    let mut session_cookie = Cookie::new(cookie_name, session_token);
+                    session_cookie.set_path("/");
+                    session_cookie.set_http_only(true);
+                    session_cookie.set_secure(cookie_secure);
+                    session_cookie.set_same_site(SameSite::Lax);
 
-                let mut clear_pkce = Cookie::from("ninjanvr_oidc_pkce");
-                clear_pkce.set_path("/");
-                return (
-                    jar.remove(clear_pkce).add(session_cookie),
-                    Redirect::to("/"),
-                )
-                    .into_response();
+                    let mut clear_pkce = Cookie::from("ninjanvr_oidc_pkce");
+                    clear_pkce.set_path("/");
+                    return (
+                        jar.remove(clear_pkce).add(session_cookie),
+                        Redirect::to("/"),
+                    )
+                        .into_response();
+                } else {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "message": "OIDC token response contained no valid identity claims" })),
+                    )
+                        .into_response();
+                }
             }
         }
     }
@@ -2454,26 +2655,14 @@ async fn api_profile(
     );
 
     let (username, role) = user_opt.unwrap_or_else(|| ("admin".to_string(), "admin".to_string()));
-    let scoped_cameras: Vec<String> = if role.eq_ignore_ascii_case("admin") {
-        cameras
-    } else if let Ok(Some(u)) = state.db.get_user(&username) {
-        let raw = u.allowed_cameras.trim();
-        if raw.is_empty() || raw == "*" {
-            cameras
-        } else {
-            let allowed: Vec<String> = raw
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            cameras
+    let scoped_cameras: Vec<String> =
+        match resolve_user_allowed_cameras(&state, &jar, &headers, &cfg.auth, &username, &role) {
+            None => cameras,
+            Some(allowed) => cameras
                 .into_iter()
-                .filter(|c| allowed.contains(c))
-                .collect()
-        }
-    } else {
-        cameras
-    };
+                .filter(|c| allowed.iter().any(|a| a == c || a == "*"))
+                .collect(),
+        };
 
     Json(json!({
         "username": username,
@@ -3012,6 +3201,104 @@ fn scope_cameras_filter(
     }
 }
 
+fn is_safe_labelmap_path_str(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || trimmed.contains('\\')
+        || trimmed.chars().any(|c| c.is_control())
+    {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for forbidden_prefix in [
+        "/proc",
+        "/sys",
+        "/etc",
+        "/dev",
+        "/root",
+        "/var/run",
+        "/run/secrets",
+    ] {
+        if lower == forbidden_prefix || lower.starts_with(&format!("{forbidden_prefix}/")) {
+            return false;
+        }
+    }
+    let path = Path::new(trimmed);
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
+    {
+        return false;
+    }
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => return false,
+            std::path::Component::Normal(os) => {
+                let Some(s) = os.to_str() else {
+                    return false;
+                };
+                if s.starts_with('.') {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        let canon_str = canon.to_string_lossy().to_ascii_lowercase();
+        for forbidden_prefix in [
+            "/proc",
+            "/sys",
+            "/etc",
+            "/dev",
+            "/root",
+            "/var/run",
+            "/run/secrets",
+        ] {
+            if canon_str == forbidden_prefix
+                || canon_str.starts_with(&format!("{forbidden_prefix}/"))
+            {
+                return false;
+            }
+        }
+        if !canon
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("txt"))
+        {
+            return false;
+        }
+        if canon
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_none_or(|f| f.starts_with('.'))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn validate_config_labelmap_paths(cfg: &NinjaConfig) -> Result<(), &'static str> {
+    if !is_safe_labelmap_path_str(&cfg.model.labelmap_path) {
+        return Err(
+            "Invalid model.labelmap_path: must be a safe .txt path without '..', dotfiles, or system paths",
+        );
+    }
+    for det in cfg.detectors.values() {
+        if let Some(ref m) = det.model
+            && !is_safe_labelmap_path_str(&m.labelmap_path)
+        {
+            return Err(
+                "Invalid detector model.labelmap_path: must be a safe .txt path without '..', dotfiles, or system paths",
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn api_config(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -3019,7 +3306,22 @@ async fn api_config(
 ) -> Json<Value> {
     let mut api_cfg = {
         let cfg = state.config.read().await;
-        cfg.to_api_config()
+        if validate_config_labelmap_paths(&cfg).is_ok() {
+            cfg.to_api_config()
+        } else {
+            let mut safe_clone = cfg.clone();
+            if !is_safe_labelmap_path_str(&safe_clone.model.labelmap_path) {
+                safe_clone.model.labelmap_path = "/openvino-model/coco_91cl_bkgr.txt".to_string();
+            }
+            for det in safe_clone.detectors.values_mut() {
+                if let Some(ref mut m) = det.model
+                    && !is_safe_labelmap_path_str(&m.labelmap_path)
+                {
+                    m.labelmap_path = "/openvino-model/coco_91cl_bkgr.txt".to_string();
+                }
+            }
+            safe_clone.to_api_config()
+        }
     };
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         if let Some(cams_obj) = api_cfg.get_mut("cameras").and_then(|v| v.as_object_mut()) {
@@ -3078,9 +3380,23 @@ async fn api_config_save(
     let path = { state.config.read().await.config_path.clone() };
     match NinjaConfig::from_yaml_str(&body, path.clone()) {
         Ok(mut new_cfg) => {
+            if let Err(msg) = validate_config_labelmap_paths(&new_cfg) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "success": false, "message": msg })),
+                )
+                    .into_response();
+            }
             {
                 let prev = state.config.read().await;
                 new_cfg.restore_scrubbed_from_previous(&prev);
+            }
+            if let Err(msg) = validate_config_labelmap_paths(&new_cfg) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "success": false, "message": msg })),
+                )
+                    .into_response();
             }
             if let Err(err) = std::fs::write(&path, &new_cfg.raw_yaml) {
                 error!("Failed to persist config.yml: {err:#}");
@@ -3129,6 +3445,13 @@ async fn api_config_structured(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "success": false, "message": format!("{err:#}") })),
+        )
+            .into_response();
+    }
+    if let Err(msg) = validate_config_labelmap_paths(&next_cfg) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": msg })),
         )
             .into_response();
     }
@@ -3281,14 +3604,14 @@ fn async_stream_lines(
 
 fn filter_stats_snapshot_for_allowed_cameras(val: &mut Value, allow_list: &[String]) {
     if let Some(cams) = val.get_mut("cameras").and_then(|v| v.as_object_mut()) {
-        cams.retain(|k, _| allow_list.iter().any(|a| a == k));
+        cams.retain(|k, _| allow_list.iter().any(|a| a == k || a == "*"));
     }
     if let Some(cam_storage) = val
         .get_mut("service")
         .and_then(|s| s.get_mut("camera_storage"))
         .and_then(|v| v.as_object_mut())
     {
-        cam_storage.retain(|k, _| allow_list.iter().any(|a| a == k));
+        cam_storage.retain(|k, _| allow_list.iter().any(|a| a == k || a == "*"));
     }
 }
 
@@ -3316,8 +3639,16 @@ async fn api_stats_history(
     Json(Value::Array(items))
 }
 
-async fn api_prometheus_metrics(State(state): State<AppState>) -> Response {
-    let stats_val = compute_stats_snapshot(&state).await;
+async fn api_prometheus_metrics(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Response {
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    let mut stats_val = compute_stats_snapshot(&state).await;
+    if let Some(ref allow_list) = allowed {
+        filter_stats_snapshot_for_allowed_cameras(&mut stats_val, allow_list);
+    }
     let mut out = String::with_capacity(4096);
 
     out.push_str("# HELP ninjanvr_camera_fps Per-camera frame rate by pipeline role.\n");
@@ -3435,6 +3766,11 @@ async fn api_prometheus_metrics(State(state): State<AppState>) -> Response {
     out.push_str("# TYPE ninjanvr_events_total counter\n");
     if let Ok(ev_counts) = state.db.query_event_counts_by_camera_and_label() {
         for (cam, lbl, cnt) in ev_counts {
+            if let Some(ref allow_list) = allowed
+                && !allow_list.iter().any(|a| a == &cam || a == "*")
+            {
+                continue;
+            }
             out.push_str(&format!(
                 "ninjanvr_events_total{{camera=\"{cam}\",label=\"{lbl}\"}} {cnt}\n"
             ));
@@ -7191,7 +7527,95 @@ fn sample_dto_to_response_json(sample: &ninjanvr_db::DatasetSampleDto) -> Value 
     base
 }
 
-async fn api_dataset_summary(State(state): State<AppState>) -> Json<Value> {
+async fn api_dataset_summary(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
+    if let Some(allow_list) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allow_list.iter().any(|a| a == "*")
+    {
+        let samples: Vec<_> = state
+            .db
+            .list_dataset_samples(None, None, None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| allow_list.iter().any(|a| a == &s.camera))
+            .collect();
+        let total_samples = samples.len();
+        let mut true_positive_count = 0usize;
+        let mut hard_negative_count = 0usize;
+        let mut ai_annotated_count = 0usize;
+        let mut train_count = 0usize;
+        let mut val_count = 0usize;
+        let mut verified_count = 0usize;
+        let mut night_mode_count = 0usize;
+        let mut total_annotations = 0usize;
+        let mut by_camera: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_class: BTreeMap<String, usize> = BTreeMap::new();
+        for &cls in &ninjanvr_db::NINJANVR_SECURITY_CLASSES {
+            by_class.insert(cls.to_string(), 0);
+        }
+        for s in &samples {
+            match s.sample_kind.as_str() {
+                "hard_negative" => hard_negative_count += 1,
+                "ai_annotated" => ai_annotated_count += 1,
+                _ => true_positive_count += 1,
+            }
+            if s.split == "val" {
+                val_count += 1;
+            } else {
+                train_count += 1;
+            }
+            if s.verified {
+                verified_count += 1;
+            }
+            if s.night_mode {
+                night_mode_count += 1;
+            }
+            *by_camera.entry(s.camera.clone()).or_insert(0) += 1;
+            total_annotations += s.annotations.len();
+            for ann in &s.annotations {
+                let cls_name = ninjanvr_db::security_class_label(ann.class_id)
+                    .map(String::from)
+                    .unwrap_or_else(|| ann.label.clone());
+                *by_class.entry(cls_name).or_insert(0) += 1;
+            }
+        }
+        let positive_samples = true_positive_count + ai_annotated_count;
+        let positive_ratio = if total_samples > 0 {
+            positive_samples as f64 / total_samples as f64
+        } else {
+            0.0
+        };
+        let hard_negative_ratio = if total_samples > 0 {
+            hard_negative_count as f64 / total_samples as f64
+        } else {
+            0.0
+        };
+        let unverified_count = total_samples.saturating_sub(verified_count);
+        return Json(json!({
+            "total_samples": total_samples,
+            "true_positive_count": true_positive_count,
+            "hard_negative_count": hard_negative_count,
+            "ai_annotated_count": ai_annotated_count,
+            "positive_samples": positive_samples,
+            "train_count": train_count,
+            "val_count": val_count,
+            "verified_count": verified_count,
+            "unverified_count": unverified_count,
+            "night_mode_count": night_mode_count,
+            "total_annotations": total_annotations,
+            "positive_ratio": positive_ratio,
+            "hard_negative_ratio": hard_negative_ratio,
+            "target_positive_ratio": 0.8,
+            "target_hard_negative_ratio": 0.2,
+            "by_camera": by_camera,
+            "by_class": by_class,
+            "classes": ninjanvr_db::NINJANVR_SECURITY_CLASSES,
+            "ready_for_export": total_samples > 0
+        }));
+    }
     let summary = state
         .db
         .get_dataset_summary()
@@ -14124,8 +14548,27 @@ async fn api_camera_latest_frame(
 
 async fn api_go2rtc_stream_prewarm(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(stream): AxumPath<String>,
 ) -> Response {
+    if !is_safe_go2rtc_stream_name(&stream) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid stream identifier" })),
+        )
+            .into_response();
+    }
+    let base_cam = stream.strip_suffix("_sub").unwrap_or(&stream).trim();
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == base_cam || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Stream camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
     let warm = state
         .mse_hub
         .prewarm_stream(&state.go2rtc_ws_base, &stream)
@@ -14178,8 +14621,27 @@ async fn api_go2rtc_streams(
 
 async fn api_go2rtc_stream_one(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(stream): AxumPath<String>,
 ) -> Response {
+    if !is_safe_go2rtc_stream_name(&stream) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid stream identifier" })),
+        )
+            .into_response();
+    }
+    let base_cam = stream.strip_suffix("_sub").unwrap_or(&stream).trim();
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == base_cam || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Stream camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
     let encoded_stream = urlencoding_simple(&stream);
     let url = format!(
         "{}/api/streams?src={encoded_stream}&video=all&audio=all&microphone=",
@@ -14199,10 +14661,20 @@ async fn api_go2rtc_stream_one(
 
 async fn api_go2rtc_webrtc(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    if let Err(msg) = validate_go2rtc_query_streams(uri.query(), allowed.as_deref()) {
+        let status = if msg == "Stream camera is not permitted for this user" {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        return (status, Json(json!({ "success": false, "message": msg }))).into_response();
+    }
     let query = uri.query().unwrap_or("");
     let url = if query.is_empty() {
         format!("{}/api/webrtc", state.go2rtc_http_base)
@@ -14414,45 +14886,18 @@ async fn ws_go2rtc_proxy(
     uri: Uri,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let query = uri.query().unwrap_or("").to_string();
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
-        let mut query_cams = Vec::new();
-        let mut invalid_query = false;
-        for kv in query.split('&') {
-            if kv.is_empty() {
-                continue;
-            }
-            let (raw_k, raw_v) = kv.split_once('=').unwrap_or((kv, ""));
-            let Some(k) = percent_decode_segment(raw_k) else {
-                invalid_query = true;
-                break;
-            };
-            if k.eq_ignore_ascii_case("src") || k.eq_ignore_ascii_case("dst") {
-                let Some(v) = percent_decode_segment(raw_v) else {
-                    invalid_query = true;
-                    break;
-                };
-                let base_cam = v.strip_suffix("_sub").unwrap_or(&v).trim().to_string();
-                if base_cam.is_empty() {
-                    invalid_query = true;
-                    break;
-                }
-                query_cams.push(base_cam);
-            }
-        }
-        if invalid_query
-            || query_cams.is_empty()
-            || query_cams
-                .iter()
-                .any(|cam| !allowed.iter().any(|a| a == cam || a == "*"))
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    if let Err(msg) = validate_go2rtc_query_streams(uri.query(), allowed.as_deref()) {
+        let status = if msg == "Stream camera is not permitted for this user"
+            || (msg == "Missing stream src query parameter" && allowed.is_some())
         {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "message": "Stream camera is not permitted for this user" })),
-            )
-                .into_response();
-        }
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        return (status, Json(json!({ "message": msg }))).into_response();
     }
+    let query = uri.query().unwrap_or("").to_string();
     ws.on_upgrade(move |client_ws| bridge_go2rtc_ws(client_ws, state, query))
         .into_response()
 }
@@ -31529,6 +31974,735 @@ cameras:
             serde_json::from_slice(&to_bytes(r_rec_stor.into_body(), 16384).await.unwrap())
                 .unwrap();
         assert!(rec_stor_json.get("backyard").is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn security_round18_critical_audit_findings_regression_work() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-r18-crit-audit-{}", rand::random::<u64>()));
+        let web_dir = tmp_dir.join("web");
+        let media_dir = tmp_dir.join("media");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::create_dir_all(&media_dir).unwrap();
+        std::fs::write(web_dir.join("index.html"), "<html>Console v2</html>").unwrap();
+
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let yaml = format!(
+            r#"
+mqtt:
+  enabled: false
+database:
+  path: {}
+auth:
+  enabled: true
+go2rtc:
+  streams:
+    front_door: "rtsp://camuser:campass123@192.0.2.10:554/main"
+    front_door_sub: "rtsp://camuser:campass123@192.0.2.10:554/sub"
+    backyard: "rtsp://byuser:bypass456@192.0.2.20:554/main"
+    backyard_sub: "rtsp://byuser:bypass456@192.0.2.20:554/sub"
+cameras:
+  front_door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://camuser:campass123@192.0.2.10:554/main
+          roles: [record, detect]
+  backyard:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://byuser:bypass456@192.0.2.20:554/main
+          roles: [record, detect]
+"#,
+            db_path.display()
+        );
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_user_with_cameras("scoped_fd", "pass1234", "operator", "front_door", 1000)
+            .unwrap();
+        state
+            .db
+            .create_user_with_cameras("unrestricted_viewer", "pass1234", "viewer", "*", 1000)
+            .unwrap();
+
+        let auth_app = build_router_with_auth(state.clone(), true);
+        let unauth_app = build_router(state.clone());
+        let now = unix_now();
+        let mint_jwt = |sub: &str, role: &str, cams: Option<&str>| -> String {
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &JwtClaims {
+                    sub: sub.to_string(),
+                    role: role.to_string(),
+                    allowed_cameras: cams.map(str::to_string),
+                    iat: now,
+                    exp: now + 3600,
+                },
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            )
+            .unwrap()
+        };
+        let admin_bearer = format!("Bearer {}", mint_jwt("admin", "admin", Some("*")));
+        let viewer_bearer = format!(
+            "Bearer {}",
+            mint_jwt("unrestricted_viewer", "viewer", Some("*"))
+        );
+        let scoped_bearer = format!(
+            "Bearer {}",
+            mint_jwt("scoped_fd", "operator", Some("front_door"))
+        );
+        let (_ro_meta, ro_tok) = state
+            .db
+            .create_api_token("ro_bot", "read_only", None)
+            .unwrap();
+        let ro_bearer = format!("Bearer {ro_tok}");
+
+        // =========================================================================
+        // 1. [R18-CRIT-01] Block Inline Producer RCE/SSRF & Raw WS Tunneling for All Callers
+        // =========================================================================
+        assert!(is_safe_go2rtc_stream_name("front_door"));
+        assert!(is_safe_go2rtc_stream_name("front_door_sub"));
+        assert!(is_safe_go2rtc_stream_name("cam-01"));
+        for bad_stream in [
+            "",
+            ".hidden",
+            "exec:id",
+            "echo:hello",
+            "expr:1+1",
+            "ffmpeg:rtsp://127.0.0.1:8554/cam",
+            "http://169.254.169.254/latest/meta-data",
+            "rtsp://127.0.0.1:8554/front_door",
+            "file:///etc/passwd",
+            "front.door",
+            "front/door",
+            "front\\door",
+            "front?door",
+            "front#door",
+            "front door",
+            "front\0door",
+            &"a".repeat(129),
+        ] {
+            assert!(
+                !is_safe_go2rtc_stream_name(bad_stream),
+                "is_safe_go2rtc_stream_name must reject '{bad_stream}'"
+            );
+        }
+
+        assert_eq!(
+            validate_go2rtc_query_streams(Some("src=front_door&status=201"), None),
+            Ok(vec!["front_door".to_string()])
+        );
+        assert!(validate_go2rtc_query_streams(None, None).is_err());
+        assert!(validate_go2rtc_query_streams(Some(""), None).is_err());
+        assert!(validate_go2rtc_query_streams(Some("video=h264"), None).is_err());
+        assert!(validate_go2rtc_query_streams(Some("src=exec:id"), None).is_err());
+        assert!(validate_go2rtc_query_streams(Some("%73rc=exec%3Aid"), None).is_err());
+        assert!(validate_go2rtc_query_streams(Some("dst=echo:test"), None).is_err());
+        assert!(
+            validate_go2rtc_query_streams(Some("src=backyard"), Some(&["front_door".to_string()]))
+                .is_err()
+        );
+
+        // Even admin, unrestricted viewer, and read_only API tokens are blocked from inline producers & missing src
+        for (method, bad_go2rtc_uri) in [
+            ("GET", "/api/go2rtc/streams/exec:id"),
+            ("GET", "/api/go2rtc/streams/echo%3Ahello"),
+            ("GET", "/api/go2rtc/streams/front.door"),
+            ("POST", "/api/go2rtc/streams/exec:id/prewarm"),
+            ("POST", "/api/go2rtc/streams/ffmpeg%3Afile/prewarm"),
+            ("POST", "/api/go2rtc/webrtc"),
+            ("POST", "/api/go2rtc/webrtc?video=all"),
+            ("POST", "/api/go2rtc/webrtc?src=exec:id"),
+            ("POST", "/api/go2rtc/webrtc?src=front_door&dst=exec:id"),
+            ("GET", "/live/mse/api/ws"),
+            ("GET", "/live/mse/api/ws?video=h264"),
+            ("GET", "/live/mse/api/ws?src=exec:id"),
+            ("GET", "/live/mse/api/ws?%73rc=exec%3Aid"),
+            ("GET", "/live/webrtc/api/ws?src=rtsp://127.0.0.1:8554/main"),
+        ] {
+            for bearer in [&admin_bearer, &viewer_bearer, &ro_bearer, &scoped_bearer] {
+                let r = auth_app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(bad_go2rtc_uri)
+                            .header(header::AUTHORIZATION, bearer)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    r.status() == StatusCode::BAD_REQUEST || r.status() == StatusCode::FORBIDDEN,
+                    "{method} {bad_go2rtc_uri} with bearer {bearer} must return 400 or 403, got {}",
+                    r.status()
+                );
+            }
+            // Also verify direct handler enforcement on unauth_app
+            let r_unauth = unauth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(bad_go2rtc_uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_unauth.status(),
+                StatusCode::BAD_REQUEST,
+                "Direct handler {method} {bad_go2rtc_uri} must return 400 BAD_REQUEST"
+            );
+        }
+
+        // =========================================================================
+        // 2. [R18-CRIT-02] Defense-in-Depth Validation of Configured labelmap_path
+        // =========================================================================
+        assert!(is_safe_labelmap_path_str(
+            "/openvino-model/coco_91cl_bkgr.txt"
+        ));
+        assert!(is_safe_labelmap_path_str(
+            "models/ninjanvr_security_15cl.txt"
+        ));
+        for bad_lbl_path in [
+            "",
+            "/config/.jwt_secret",
+            ".jwt_secret",
+            "/config/config.yml",
+            "../coco.txt",
+            "/openvino-model/../.jwt_secret.txt",
+            "/proc/self/environ",
+            "/sys/kernel/uevent_helper",
+            "/etc/passwd",
+            "/dev/zero",
+            "/run/secrets/token.txt",
+        ] {
+            assert!(
+                !is_safe_labelmap_path_str(bad_lbl_path),
+                "is_safe_labelmap_path_str must reject '{bad_lbl_path}'"
+            );
+        }
+
+        for bad_save_yaml in [
+            format!(
+                "database:\n  path: {}\nmodel:\n  labelmap_path: /config/.jwt_secret\ncameras: {{}}\n",
+                db_path.display()
+            ),
+            format!(
+                "database:\n  path: {}\nmodel:\n  labelmap_path: /etc/passwd\ncameras: {{}}\n",
+                db_path.display()
+            ),
+            format!(
+                "database:\n  path: {}\nmodel:\n  labelmap_path: ../labels.txt\ncameras: {{}}\n",
+                db_path.display()
+            ),
+            format!(
+                "database:\n  path: {}\ndetectors:\n  ov:\n    type: openvino\n    model:\n      labelmap_path: .jwt_secret\ncameras: {{}}\n",
+                db_path.display()
+            ),
+        ] {
+            let r_bad_save = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/config/save")
+                        .header(header::AUTHORIZATION, &admin_bearer)
+                        .body(Body::from(bad_save_yaml))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r_bad_save.status(), StatusCode::BAD_REQUEST);
+        }
+
+        for bad_struct_json in [
+            json!({ "model": { "labelmap_path": "/config/.jwt_secret" } }),
+            json!({ "model": { "labelmap_path": "/proc/self/environ" } }),
+            json!({ "model": { "labelmap_path": "../secret.txt" } }),
+            json!({ "detectors": { "cpu1": { "type": "cpu", "model": { "labelmap_path": ".jwt_secret" } } } }),
+        ] {
+            let r_bad_struct = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/config/structured")
+                        .header(header::AUTHORIZATION, &admin_bearer)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(bad_struct_json.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r_bad_struct.status(), StatusCode::BAD_REQUEST);
+        }
+
+        // Even if model.labelmap_path in memory points to .jwt_secret, GET /api/config never leaks .jwt_secret
+        let jwt_secret_file = tmp_dir.join(".jwt_secret");
+        {
+            let mut cfg = state.config.write().await;
+            cfg.model.labelmap_path = jwt_secret_file.to_string_lossy().to_string();
+        }
+        let r_cfg_safe = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::AUTHORIZATION, &viewer_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_cfg_safe.status(), StatusCode::OK);
+        let cfg_safe_str = String::from_utf8(
+            to_bytes(r_cfg_safe.into_body(), 65536)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            !cfg_safe_str.contains(&state.jwt_secret),
+            "GET /api/config must never leak .jwt_secret via model.labelmap"
+        );
+        {
+            let mut cfg = state.config.write().await;
+            cfg.model.labelmap_path = "/openvino-model/coco_91cl_bkgr.txt".to_string();
+        }
+
+        // =========================================================================
+        // 3. [R18-CRIT-03] OIDC Callback Status/Claim Verification & resolve_external_base_url
+        // =========================================================================
+        // 3a. resolve_external_base_url blocks X-Forwarded-Host spoofing when Host is external
+        let uri_login: Uri = "/api/auth/oidc/login".parse().unwrap();
+        let mut spoof_hdrs = HeaderMap::new();
+        spoof_hdrs.insert(header::HOST, "nvr.local:8971".parse().unwrap());
+        spoof_hdrs.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        spoof_hdrs.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(
+            resolve_external_base_url(&spoof_hdrs, &uri_login),
+            "https://nvr.local:8971"
+        );
+
+        // Honors X-Forwarded-Host when Host is internal loopback
+        let mut proxy_hdrs = HeaderMap::new();
+        proxy_hdrs.insert(header::HOST, "127.0.0.1:5000".parse().unwrap());
+        proxy_hdrs.insert("x-forwarded-host", "nvr.example.invalid".parse().unwrap());
+        proxy_hdrs.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(
+            resolve_external_base_url(&proxy_hdrs, &uri_login),
+            "https://nvr.example.invalid"
+        );
+
+        // Sanitizes dangerous characters in Host / X-Forwarded-Proto
+        let mut bad_host_hdrs = HeaderMap::new();
+        bad_host_hdrs.insert("x-forwarded-host", "evil.example/path@foo".parse().unwrap());
+        bad_host_hdrs.insert("x-forwarded-proto", "javascript".parse().unwrap());
+        assert_eq!(
+            resolve_external_base_url(&bad_host_hdrs, &uri_login),
+            "http://localhost:5000"
+        );
+
+        // 3b. Mock OIDC IdP testing api_auth_oidc_callback
+        let oidc_mode = Arc::new(std::sync::Mutex::new("tok_400".to_string()));
+        let oidc_mode_tok = oidc_mode.clone();
+        let oidc_mode_ui = oidc_mode.clone();
+        let mock_idp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_idp_addr = mock_idp_listener.local_addr().unwrap();
+        let issuer_url = format!("http://{mock_idp_addr}");
+        let issuer_for_tok = issuer_url.clone();
+
+        let make_b64_jwt = |claims: &Value, sig: &str| -> String {
+            let hdr = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+            let pay = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(claims.to_string().as_bytes());
+            format!("{hdr}.{pay}.{sig}")
+        };
+
+        let mock_idp = Router::new()
+            .route(
+                "/oauth/v2/token",
+                post(move || {
+                    let mode = oidc_mode_tok.lock().unwrap().clone();
+                    let iss = issuer_for_tok.clone();
+                    let exp = unix_now() + 3600;
+                    async move {
+                        match mode.as_str() {
+                            "tok_400" => (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "id_token": make_b64_jwt(&json!({"sub":"admin","iss":iss,"aud":"ninjanvr-client","exp":exp}), "sig"),
+                                    "access_token": "tok_bad"
+                                })),
+                            )
+                                .into_response(),
+                            "tok_error_field" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "error": "invalid_grant",
+                                    "id_token": make_b64_jwt(&json!({"sub":"admin","iss":iss,"aud":"ninjanvr-client","exp":exp}), "sig")
+                                })),
+                            )
+                                .into_response(),
+                            "unsigned_id_token" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "id_token": make_b64_jwt(&json!({"sub":"admin","iss":iss,"aud":"ninjanvr-client","exp":exp}), "")
+                                })),
+                            )
+                                .into_response(),
+                            "bad_iss" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "id_token": make_b64_jwt(&json!({"sub":"admin","iss":"https://evil.example","aud":"ninjanvr-client","exp":exp}), "sig")
+                                })),
+                            )
+                                .into_response(),
+                            "bad_aud" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "id_token": make_b64_jwt(&json!({"sub":"admin","iss":iss,"aud":"other-client","exp":exp}), "sig")
+                                })),
+                            )
+                                .into_response(),
+                            "ui_401" | "sub_mismatch" | "no_identity" | "valid" => {
+                                let id_claims = if mode == "no_identity" {
+                                    json!({"iss":iss,"aud":"ninjanvr-client","exp":exp})
+                                } else {
+                                    json!({"sub":"alice","iss":iss,"aud":["ninjanvr-client"],"exp":exp,"groups":["admins"]})
+                                };
+                                (
+                                    StatusCode::OK,
+                                    Json(json!({
+                                        "id_token": make_b64_jwt(&id_claims, "sig"),
+                                        "access_token": "valid_access_tok"
+                                    })),
+                                )
+                                    .into_response()
+                            }
+                            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/oidc/v1/userinfo",
+                get(move || {
+                    let mode = oidc_mode_ui.lock().unwrap().clone();
+                    async move {
+                        match mode.as_str() {
+                            "ui_401" => (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "error": "invalid_token" })),
+                            )
+                                .into_response(),
+                            "sub_mismatch" => (
+                                StatusCode::OK,
+                                Json(json!({ "sub": "bob", "preferred_username": "bob" })),
+                            )
+                                .into_response(),
+                            "no_identity" => (
+                                StatusCode::OK,
+                                Json(json!({ "groups": ["admins"] })),
+                            )
+                                .into_response(),
+                            "valid" => (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "sub": "alice",
+                                    "preferred_username": "alice_oidc",
+                                    "groups": ["admins"]
+                                })),
+                            )
+                                .into_response(),
+                            _ => StatusCode::UNAUTHORIZED.into_response(),
+                        }
+                    }
+                }),
+            );
+        let idp_handle = tokio::spawn(async move {
+            let _ = axum::serve(mock_idp_listener, mock_idp).await;
+        });
+
+        {
+            let mut cfg = state.config.write().await;
+            cfg.auth.oidc.enabled = true;
+            cfg.auth.oidc.issuer_url = issuer_url.clone();
+            cfg.auth.oidc.client_id = "ninjanvr-client".to_string();
+        }
+
+        for rejected_mode in [
+            "tok_400",
+            "tok_error_field",
+            "unsigned_id_token",
+            "bad_iss",
+            "bad_aud",
+            "ui_401",
+            "sub_mismatch",
+            "no_identity",
+        ] {
+            *oidc_mode.lock().unwrap() = rejected_mode.to_string();
+            let r_cb = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/auth/oidc/callback?code=test_code&state=state123")
+                        .header(
+                            header::COOKIE,
+                            "ninjanvr_oidc_pkce=state123:verifier123:http://localhost:5000/api/auth/oidc/callback",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_cb.status(),
+                StatusCode::UNAUTHORIZED,
+                "OIDC callback mode '{rejected_mode}' must be rejected with 401 UNAUTHORIZED"
+            );
+            assert!(
+                r_cb.headers().get(header::SET_COOKIE).is_none(),
+                "OIDC callback mode '{rejected_mode}' must never issue a session cookie"
+            );
+        }
+
+        *oidc_mode.lock().unwrap() = "valid".to_string();
+        let r_cb_ok = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/callback?code=test_code&state=state123")
+                    .header(
+                        header::COOKIE,
+                        "ninjanvr_oidc_pkce=state123:verifier123:http://localhost:5000/api/auth/oidc/callback",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_cb_ok.status(), StatusCode::SEE_OTHER);
+        assert!(
+            r_cb_ok
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .any(|v| v.to_str().unwrap_or("").contains("ninjanvr_token=")),
+            "Valid OIDC callback must issue ninjanvr_token session cookie"
+        );
+
+        idp_handle.abort();
+        {
+            let mut cfg = state.config.write().await;
+            cfg.auth.oidc.enabled = false;
+            cfg.auth.oidc.issuer_url.clear();
+        }
+
+        // =========================================================================
+        // 4. [R18-CRIT-04] Camera Scoping in /api/profile, /api/metrics, & /api/dataset/summary
+        // =========================================================================
+        // 4a. GET /api/profile for deleted local user (OIDC disabled) returns allowed_cameras: []
+        let ghost_bearer = format!(
+            "Bearer {}",
+            mint_jwt("deleted_local_user", "operator", Some("*"))
+        );
+        let r_prof_ghost = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/profile")
+                    .header(header::AUTHORIZATION, &ghost_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_prof_ghost.status(), StatusCode::OK);
+        let prof_ghost_json: Value =
+            serde_json::from_slice(&to_bytes(r_prof_ghost.into_body(), 8192).await.unwrap())
+                .unwrap();
+        assert_eq!(prof_ghost_json["allowed_cameras"], json!([]));
+
+        // GET /api/profile for non-DB OIDC user with scoped JWT claim returns only ["front_door"]
+        {
+            let mut cfg = state.config.write().await;
+            cfg.auth.oidc.enabled = true;
+            cfg.auth.oidc.issuer_url = "https://idp.example.invalid".to_string();
+        }
+        let oidc_scoped_bearer = format!(
+            "Bearer {}",
+            mint_jwt("oidc_viewer_fd", "viewer", Some("front_door"))
+        );
+        let r_prof_oidc = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/profile")
+                    .header(header::AUTHORIZATION, &oidc_scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_prof_oidc.status(), StatusCode::OK);
+        let prof_oidc_json: Value =
+            serde_json::from_slice(&to_bytes(r_prof_oidc.into_body(), 8192).await.unwrap())
+                .unwrap();
+        assert_eq!(prof_oidc_json["allowed_cameras"], json!(["front_door"]));
+        {
+            let mut cfg = state.config.write().await;
+            cfg.auth.oidc.enabled = false;
+            cfg.auth.oidc.issuer_url.clear();
+        }
+
+        // 4b. GET /api/metrics scopes ninjanvr_camera_fps, ninjanvr_camera_online, and ninjanvr_events_total
+        let clips_dir = media_dir.join("clips");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        let mut dummy_img = image::RgbImage::new(32, 32);
+        for p in dummy_img.pixels_mut() {
+            *p = image::Rgb([100, 120, 140]);
+        }
+        let dummy_webp = ninjanvr_vision::encode_image_webp(&dummy_img).unwrap();
+        for (cam, ev_id) in [("front_door", "ev_r18_fd"), ("backyard", "ev_r18_by")] {
+            std::fs::write(clips_dir.join(format!("{cam}-{ev_id}.webp")), &dummy_webp).unwrap();
+            state
+                .db
+                .upsert_event(&ninjanvr_db::EventDto {
+                    id: ev_id.to_string(),
+                    camera: cam.to_string(),
+                    label: "person".to_string(),
+                    zones: json!([]),
+                    start_time: 5000.0,
+                    end_time: Some(5005.0),
+                    has_clip: false,
+                    has_snapshot: true,
+                    plus_id: None,
+                    retain_indefinitely: false,
+                    sub_label: None,
+                    top_score: Some(0.9),
+                    false_positive: Some(false),
+                    box_coords: Some(json!([0.1, 0.1, 0.5, 0.5])),
+                    data: json!({"box": [0.1, 0.1, 0.5, 0.5]}),
+                    thumbnail: None,
+                    area: None,
+                    ratio: None,
+                    score: Some(0.9),
+                    stationary: false,
+                })
+                .unwrap();
+            let _ = create_dataset_sample_from_event(
+                &state.db,
+                &media_dir,
+                ev_id,
+                "true_positive",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let r_metrics_scoped = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_metrics_scoped.status(), StatusCode::OK);
+        let metrics_scoped_text = String::from_utf8(
+            to_bytes(r_metrics_scoped.into_body(), 65536)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(metrics_scoped_text.contains("camera=\"front_door\""));
+        assert!(
+            !metrics_scoped_text.contains("camera=\"backyard\""),
+            "Scoped user GET /api/metrics must never leak backyard camera metrics"
+        );
+
+        let r_metrics_admin = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let metrics_admin_text = String::from_utf8(
+            to_bytes(r_metrics_admin.into_body(), 65536)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(metrics_admin_text.contains("camera=\"front_door\""));
+        assert!(metrics_admin_text.contains("camera=\"backyard\""));
+
+        // 4c. GET /api/dataset/summary scopes by_camera and sample totals for camera-restricted users
+        let r_ds_scoped = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dataset/summary")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_ds_scoped.status(), StatusCode::OK);
+        let ds_scoped_json: Value =
+            serde_json::from_slice(&to_bytes(r_ds_scoped.into_body(), 16384).await.unwrap())
+                .unwrap();
+        assert_eq!(ds_scoped_json["total_samples"], 1);
+        assert_eq!(ds_scoped_json["by_camera"]["front_door"], 1);
+        assert!(
+            ds_scoped_json["by_camera"].get("backyard").is_none(),
+            "Scoped user GET /api/dataset/summary must never leak backyard in by_camera"
+        );
+
+        let r_ds_admin = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dataset/summary")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let ds_admin_json: Value =
+            serde_json::from_slice(&to_bytes(r_ds_admin.into_body(), 16384).await.unwrap())
+                .unwrap();
+        assert_eq!(ds_admin_json["total_samples"], 2);
+        assert_eq!(ds_admin_json["by_camera"]["front_door"], 1);
+        assert_eq!(ds_admin_json["by_camera"]["backyard"], 1);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
