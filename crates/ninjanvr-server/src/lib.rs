@@ -65,12 +65,28 @@ pub fn sanitize_logged_path(path: &str) -> String {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let trimmed_slashes = clean.trim_start_matches('/');
-    if let Some(rest) = trimmed_slashes.strip_prefix("share/") {
-        if let Some((_, suffix)) = rest.split_once('/') {
-            return format!("/share/<redacted>/{suffix}");
-        } else if !rest.is_empty() {
-            return "/share/<redacted>".to_string();
+    let redact_share = |candidate: &str| -> Option<String> {
+        let trimmed = candidate.trim_start_matches('/');
+        if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("share/") {
+            let rest = &trimmed[6..];
+            if let Some((_, suffix)) = rest.split_once('/') {
+                return Some(format!("/share/<redacted>/{suffix}"));
+            } else if !rest.is_empty() {
+                return Some("/share/<redacted>".to_string());
+            }
+        }
+        None
+    };
+    if let Some(redacted) = redact_share(&clean) {
+        return redacted;
+    }
+    if let Some(decoded) = percent_decode_path(&clean) {
+        let clean_dec: String = decoded
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if let Some(redacted) = redact_share(&clean_dec) {
+            return redacted;
         }
     }
     clean
@@ -121,7 +137,7 @@ impl LogBufferHub {
     pub fn push_raw(&self, service: &str, line: String) {
         let safe_line: String = scrub_rtsp_credentials(&line)
             .chars()
-            .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+            .map(|c| if c.is_control() { ' ' } else { c })
             .collect();
         {
             let mut guard = self.buffers.lock().expect("log mutex poisoned");
@@ -911,7 +927,12 @@ async fn api_ui_switch(Query(q): Query<UiSwitchParams>) -> Response {
     let redirect_to = q
         .redirect
         .as_deref()
-        .filter(|r| r.starts_with('/') && !r.starts_with("//"))
+        .filter(|r| {
+            r.starts_with('/')
+                && !r.starts_with("//")
+                && !r.contains('\\')
+                && !r.chars().any(|c| c.is_control())
+        })
         .unwrap_or("/");
     let cookie_val = "ninjanvr_ui=v2; Path=/; Max-Age=31536000; SameSite=Lax".to_string();
     (
@@ -948,14 +969,26 @@ async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri)
         && !rel_path.contains("..")
         && !rel_path.contains('\\')
         && !rel_path.split('/').any(|seg| seg.starts_with('.'))
+        && percent_decode_path(rel_path).is_some_and(|dec| {
+            !dec.contains("..")
+                && !dec.contains('\\')
+                && !dec.split('/').any(|seg| seg.starts_with('.'))
+        })
     {
         let mut file_candidate = primary_dir.join(rel_path);
         if rel_path == "favicon.ico" && !file_candidate.is_file() {
             file_candidate = primary_dir.join("favicon.svg");
         }
-        if file_candidate.is_file()
-            && let Ok(bytes) = tokio::fs::read(&file_candidate).await
-        {
+        let is_safe_regular_file = std::fs::symlink_metadata(&file_candidate)
+            .is_ok_and(|m| m.file_type().is_file())
+            && match (
+                std::fs::canonicalize(primary_dir),
+                std::fs::canonicalize(&file_candidate),
+            ) {
+                (Ok(base_c), Ok(cand_c)) => cand_c.starts_with(&base_c),
+                _ => false,
+            };
+        if is_safe_regular_file && let Ok(bytes) = tokio::fs::read(&file_candidate).await {
             let mime = match file_candidate.extension().and_then(|e| e.to_str()) {
                 Some("js" | "mjs") => "application/javascript; charset=utf-8",
                 Some("css") => "text/css; charset=utf-8",
@@ -1758,13 +1791,9 @@ async fn api_auth_verify(
     headers: HeaderMap,
 ) -> Response {
     let cfg = state.config.read().await;
-    if let Some((user, role)) = extract_authenticated_user(
-        &state,
-        &jar,
-        &headers,
-        &cfg.auth.cookie_name,
-        cfg.auth.enabled,
-    ) {
+    if let Some((user, role)) =
+        extract_authenticated_user_with_cfg(&state, &jar, &headers, &cfg.auth)
+    {
         if role.eq_ignore_ascii_case("metrics") {
             return (
                 StatusCode::FORBIDDEN,
@@ -2109,8 +2138,13 @@ async fn api_auth_oidc_login(
             .get(format!("{issuer}/.well-known/openid-configuration"))
             .send()
             .await
+        && resp.status().is_success()
         && let Ok(disc_bytes) = read_upstream_body_bounded(resp, 256 * 1024).await
         && let Ok(disc) = serde_json::from_slice::<Value>(&disc_bytes)
+        && disc
+            .get("issuer")
+            .and_then(|v| v.as_str())
+            .is_none_or(|s| s.trim().trim_end_matches('/') == issuer.as_str())
         && let Some(ep) = disc.get("authorization_endpoint").and_then(|v| v.as_str())
         && is_valid_oidc_discovered_endpoint(ep, &issuer)
     {
@@ -2240,19 +2274,33 @@ async fn api_auth_oidc_callback(
     }
     let client_secret = std::env::var(&oidc_cfg.client_secret_env).unwrap_or_default();
 
-    let redirect_uri = saved_redirect_uri
-        .filter(|r| {
-            (r.starts_with("http://") || r.starts_with("https://"))
-                && r.ends_with("/api/auth/oidc/callback")
-                && !r.chars().any(|c| c.is_whitespace() || c.is_control())
-        })
-        .unwrap_or_else(|| {
-            let base_url = resolve_external_base_url(&headers, &uri);
-            format!("{base_url}/api/auth/oidc/callback")
-        });
+    let expected_callback_uri = {
+        let base_url = resolve_external_base_url(&headers, &uri);
+        format!("{base_url}/api/auth/oidc/callback")
+    };
+    let redirect_uri = match saved_redirect_uri {
+        Some(ref r) => {
+            if !(r.starts_with("http://") || r.starts_with("https://"))
+                || !r.ends_with("/api/auth/oidc/callback")
+                || r.contains("..")
+                || r.contains(['?', '#', '@', '\\'])
+                || r.chars().any(|c| c.is_whitespace() || c.is_control())
+                || !r.eq_ignore_ascii_case(&expected_callback_uri)
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "message": "OIDC PKCE redirect_uri mismatch" })),
+                )
+                    .into_response();
+            }
+            r.clone()
+        }
+        None => expected_callback_uri,
+    };
 
     let mut token_endpoint = format!("{issuer}/oauth/v2/token");
     let mut userinfo_endpoint = format!("{issuer}/oidc/v1/userinfo");
+    let mut jwks_endpoint: Option<String> = None;
     if let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -2262,18 +2310,59 @@ async fn api_auth_oidc_callback(
             .get(format!("{issuer}/.well-known/openid-configuration"))
             .send()
             .await
+            && resp.status().is_success()
             && let Ok(disc_bytes) = read_upstream_body_bounded(resp, 256 * 1024).await
             && let Ok(disc) = serde_json::from_slice::<Value>(&disc_bytes)
         {
-            if let Some(ep) = disc.get("token_endpoint").and_then(|v| v.as_str())
-                && is_valid_oidc_discovered_endpoint(ep, &issuer)
+            if let Some(disc_iss) = disc.get("issuer")
+                && !disc_iss
+                    .as_str()
+                    .is_some_and(|s| s.trim().trim_end_matches('/') == issuer.as_str())
             {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "message": "OIDC discovery issuer mismatch" })),
+                )
+                    .into_response();
+            }
+            if let Some(ep_val) = disc.get("token_endpoint") {
+                let Some(ep) = ep_val
+                    .as_str()
+                    .filter(|ep| is_valid_oidc_discovered_endpoint(ep, &issuer))
+                else {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "message": "Invalid or disallowed OIDC token_endpoint" })),
+                    )
+                        .into_response();
+                };
                 token_endpoint = ep.trim().to_string();
             }
-            if let Some(uep) = disc.get("userinfo_endpoint").and_then(|v| v.as_str())
-                && is_valid_oidc_discovered_endpoint(uep, &issuer)
-            {
+            if let Some(uep_val) = disc.get("userinfo_endpoint") {
+                let Some(uep) = uep_val
+                    .as_str()
+                    .filter(|uep| is_valid_oidc_discovered_endpoint(uep, &issuer))
+                else {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "message": "Invalid or disallowed OIDC userinfo_endpoint" })),
+                    )
+                        .into_response();
+                };
                 userinfo_endpoint = uep.trim().to_string();
+            }
+            if let Some(jep_val) = disc.get("jwks_uri") {
+                let Some(jep) = jep_val
+                    .as_str()
+                    .filter(|jep| is_valid_oidc_discovered_endpoint(jep, &issuer))
+                else {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "message": "Invalid or disallowed OIDC jwks_uri" })),
+                    )
+                        .into_response();
+                };
+                jwks_endpoint = Some(jep.trim().to_string());
             }
         }
 
@@ -2317,7 +2406,12 @@ async fn api_auth_oidc_callback(
                 let mut merged_claims = json!({});
                 if let Some(id_token) = tok_json.get("id_token").and_then(|v| v.as_str()) {
                     let parts: Vec<&str> = id_token.split('.').collect();
-                    if parts.len() != 3 || parts[2].trim().is_empty() {
+                    if parts.len() != 3
+                        || parts[2].trim().is_empty()
+                        || base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(parts[2].trim())
+                            .is_err()
+                    {
                         return (
                             StatusCode::UNAUTHORIZED,
                             Json(json!({ "message": "Malformed or unsigned OIDC ID token" })),
@@ -2340,17 +2434,114 @@ async fn api_auth_oidc_callback(
                         )
                             .into_response();
                     };
-                    let alg_ok = hdr_json
+                    let Some(alg_str) = hdr_json
                         .get("alg")
                         .and_then(|v| v.as_str())
                         .map(str::trim)
-                        .is_some_and(|alg| !alg.is_empty() && !alg.eq_ignore_ascii_case("none"));
-                    if !alg_ok {
+                        .filter(|alg| !alg.is_empty() && !alg.eq_ignore_ascii_case("none"))
+                    else {
                         return (
                             StatusCode::UNAUTHORIZED,
                             Json(json!({ "message": "Malformed or unsigned OIDC ID token" })),
                         )
                             .into_response();
+                    };
+                    if let Some(ref jwks_url) = jwks_endpoint {
+                        let Ok(jwks_resp) = client.get(jwks_url).send().await else {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "Failed to fetch OIDC JWKS" })),
+                            )
+                                .into_response();
+                        };
+                        if !jwks_resp.status().is_success() {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "OIDC JWKS endpoint returned error status" })),
+                            )
+                                .into_response();
+                        }
+                        let Ok(jwks_bytes) =
+                            read_upstream_body_bounded(jwks_resp, 256 * 1024).await
+                        else {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "Invalid OIDC JWKS payload" })),
+                            )
+                                .into_response();
+                        };
+                        let Ok(jwk_set) =
+                            serde_json::from_slice::<jsonwebtoken::jwk::JwkSet>(&jwks_bytes)
+                        else {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "Malformed OIDC JWKS JSON" })),
+                            )
+                                .into_response();
+                        };
+                        let Ok(jwt_hdr) = jsonwebtoken::decode_header(id_token) else {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "Unsupported OIDC ID token algorithm" })),
+                            )
+                                .into_response();
+                        };
+                        let mut sig_verified = false;
+                        for jwk in &jwk_set.keys {
+                            if let Some(ref req_kid) = jwt_hdr.kid
+                                && let Some(ref key_kid) = jwk.common.key_id
+                                && req_kid != key_kid
+                            {
+                                continue;
+                            }
+                            if let Ok(dec_key) = DecodingKey::from_jwk(jwk) {
+                                let mut val = Validation::new(jwt_hdr.alg);
+                                val.validate_exp = false;
+                                val.validate_aud = false;
+                                val.required_spec_claims.clear();
+                                if jsonwebtoken::decode::<Value>(id_token, &dec_key, &val).is_ok() {
+                                    sig_verified = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !sig_verified {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "OIDC ID token JWKS signature verification failed" })),
+                            )
+                                .into_response();
+                        }
+                    } else if matches!(alg_str, "HS256" | "HS384" | "HS512") {
+                        if client_secret.is_empty() {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "HMAC OIDC ID token requires client_secret" })),
+                            )
+                                .into_response();
+                        }
+                        let hmac_alg = match alg_str {
+                            "HS384" => Algorithm::HS384,
+                            "HS512" => Algorithm::HS512,
+                            _ => Algorithm::HS256,
+                        };
+                        let mut val = Validation::new(hmac_alg);
+                        val.validate_exp = false;
+                        val.validate_aud = false;
+                        val.required_spec_claims.clear();
+                        if jsonwebtoken::decode::<Value>(
+                            id_token,
+                            &DecodingKey::from_secret(client_secret.as_bytes()),
+                            &val,
+                        )
+                        .is_err()
+                        {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "OIDC ID token HMAC signature verification failed" })),
+                            )
+                                .into_response();
+                        }
                     }
                     let Ok(payload_bytes) =
                         base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1])
@@ -2368,6 +2559,17 @@ async fn api_auth_oidc_callback(
                         )
                             .into_response();
                     };
+                    let has_sub = claims_json
+                        .get("sub")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.trim().is_empty());
+                    if !has_sub {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC ID token missing required sub claim" })),
+                        )
+                            .into_response();
+                    }
                     let now_ts = unix_now();
                     let Some(exp) = claims_json.get("exp").and_then(|v| v.as_u64()) else {
                         return (
@@ -2463,24 +2665,30 @@ async fn api_auth_oidc_callback(
                         )
                             .into_response();
                     }
+                    let Some(ui_sub) = ui_map
+                        .get("sub")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC UserInfo missing required sub claim" })),
+                        )
+                            .into_response();
+                    };
                     if let Some(id_sub) = merged_claims
                         .get("sub")
                         .and_then(|v| v.as_str())
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
+                        && ui_sub != id_sub
                     {
-                        let ui_sub_opt = ui_map
-                            .get("sub")
-                            .and_then(|v| v.as_str())
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty());
-                        if ui_sub_opt != Some(id_sub) {
-                            return (
-                                StatusCode::UNAUTHORIZED,
-                                Json(json!({ "message": "OIDC subject mismatch between ID token and UserInfo" })),
-                            )
-                                .into_response();
-                        }
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC subject mismatch between ID token and UserInfo" })),
+                        )
+                            .into_response();
                     }
                     if let Some(obj) = merged_claims.as_object_mut() {
                         for (k, v) in ui_map {
@@ -2826,27 +3034,6 @@ async fn api_logout(
     (jar.remove(removal), Redirect::to("/login")).into_response()
 }
 
-fn extract_authenticated_user(
-    state: &AppState,
-    jar: &CookieJar,
-    headers: &HeaderMap,
-    cookie_name: &str,
-    auth_enabled: bool,
-) -> Option<(String, String)> {
-    if !auth_enabled {
-        return Some(("admin".to_string(), "admin".to_string()));
-    }
-    if let Ok(cfg) = state.config.try_read() {
-        return extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth);
-    }
-    let fallback = ninjanvr_config::AuthConfig {
-        cookie_name: cookie_name.to_string(),
-        enabled: auth_enabled,
-        ..Default::default()
-    };
-    extract_authenticated_user_with_cfg(state, jar, headers, &fallback)
-}
-
 fn parse_authorization_bearer(raw: &str) -> Option<&str> {
     let trimmed = raw.trim_start();
     if trimmed
@@ -3024,13 +3211,7 @@ async fn api_profile(
 ) -> Response {
     let cfg = state.config.read().await;
     let cameras: Vec<String> = cfg.cameras.keys().cloned().collect();
-    let user_opt = extract_authenticated_user(
-        &state,
-        &jar,
-        &headers,
-        &cfg.auth.cookie_name,
-        cfg.auth.enabled,
-    );
+    let user_opt = extract_authenticated_user_with_cfg(&state, &jar, &headers, &cfg.auth);
 
     let (username, role) = user_opt.unwrap_or_else(|| ("admin".to_string(), "admin".to_string()));
     let scoped_cameras: Vec<String> =
@@ -3237,11 +3418,17 @@ async fn api_user_password(
         .db
         .update_user_password(&username, &body.password, iterations)
     {
-        Ok(true) => Json(json!({
-            "success": true,
-            "message": format!("Password updated for '{username}'")
-        }))
-        .into_response(),
+        Ok(true) => {
+            clear_login_failures(&state.jwt_secret, username.trim());
+            if username.trim().eq_ignore_ascii_case("admin") {
+                state.config.write().await.auth.admin_first_time_login = false;
+            }
+            Json(json!({
+                "success": true,
+                "message": format!("Password updated for '{username}'")
+            }))
+            .into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "success": false, "message": "User not found" })),
@@ -3383,6 +3570,7 @@ async fn api_user_delete(
     }
     match state.db.delete_user(&username) {
         Ok(true) => {
+            clear_login_failures(&state.jwt_secret, username.trim());
             let _ = state.db.revoke_share_links_by_creator(&username);
             if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
                 remove_creator_from_auto_revoked(&state, &mut auto_map, Some(&username), None);
@@ -3438,6 +3626,30 @@ async fn api_token_create(
             Json(json!({
                 "success": false,
                 "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    let trimmed_name = body.name.trim();
+    if trimmed_name.is_empty()
+        || trimmed_name.len() > 128
+        || trimmed_name.chars().any(|c| c.is_control())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Token name must be 1..=128 printable characters"
+            })),
+        )
+            .into_response();
+    }
+    if body.expires_in_days.is_some_and(|d| d == 0 || d > 36500) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "expires_in_days must be between 1 and 36500"
             })),
         )
             .into_response();
@@ -3590,9 +3802,16 @@ fn resolve_user_allowed_cameras(
                         .unwrap_or_default()
                         .trim()
                         .is_empty());
+            let trusted_cidrs = if !auth_cfg.proxy.trusted_proxies.is_empty() {
+                &auth_cfg.proxy.trusted_proxies
+            } else {
+                &auth_cfg.trusted_proxies
+            };
+            let verified_proxy_peer = extract_trusted_proxy_peer_ip(headers)
+                .is_some_and(|ip| ip_matches_trusted_proxies(ip, trusted_cidrs));
             let is_proxy_header_auth = auth_cfg.proxy.enabled
                 && !headers.contains_key(header::AUTHORIZATION)
-                && jar.get(&auth_cfg.cookie_name).is_none()
+                && (jar.get(&auth_cfg.cookie_name).is_none() || verified_proxy_peer)
                 && {
                     let user_hdr_trimmed = auth_cfg.proxy.user_header.trim();
                     let user_hdr_name = if user_hdr_trimmed.is_empty() {
@@ -3606,22 +3825,15 @@ fn resolve_user_allowed_cameras(
                         .is_some_and(|u| u.trim() == user)
                 }
                 && {
-                    let trusted_cidrs = if !auth_cfg.proxy.trusted_proxies.is_empty() {
-                        &auth_cfg.proxy.trusted_proxies
-                    } else {
-                        &auth_cfg.trusted_proxies
-                    };
                     let has_any_ip_hdr = headers.contains_key("x-peer-ip")
                         || headers.contains_key("x-real-ip")
                         || headers.contains_key("x-forwarded-for");
-                    !has_any_ip_hdr
-                        || extract_trusted_proxy_peer_ip(headers)
-                            .is_some_and(|ip| ip_matches_trusted_proxies(ip, trusted_cidrs))
+                    !has_any_ip_hdr || verified_proxy_peer
                 };
             if !oidc_active && !is_proxy_header_auth {
                 return Some(Vec::new());
             }
-            if role.eq_ignore_ascii_case("admin") {
+            if role.eq_ignore_ascii_case("admin") || is_proxy_header_auth {
                 return None;
             }
             match extract_jwt_allowed_cameras(state, jar, headers, &auth_cfg.cookie_name) {
@@ -3639,7 +3851,6 @@ fn resolve_user_allowed_cameras(
                     }
                 }
                 Some(raw) if raw.trim() == "*" => None,
-                _ if is_proxy_header_auth => None,
                 _ => Some(Vec::new()),
             }
         }
@@ -3657,8 +3868,9 @@ async fn caller_allowed_cameras(
     {
         return resolve_user_allowed_cameras(state, jar, headers, &cfg.auth, &user, &role);
     }
-    let has_supplied_credentials =
-        headers.contains_key(header::AUTHORIZATION) || jar.get(&cfg.auth.cookie_name).is_some();
+    let has_supplied_credentials = headers.contains_key(header::AUTHORIZATION)
+        || jar.get(&cfg.auth.cookie_name).is_some()
+        || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some());
     if cfg.auth.enabled && has_supplied_credentials {
         Some(Vec::new())
     } else {
@@ -3671,7 +3883,14 @@ fn scope_cameras_filter(
     allowed: Option<Vec<String>>,
 ) -> Option<Vec<String>> {
     match (requested, allowed) {
-        (req, None) => req,
+        (Some(req_list), None) => {
+            if req_list.iter().any(|c| c == "all" || c == "*") {
+                None
+            } else {
+                Some(req_list)
+            }
+        }
+        (None, None) => None,
         (None, Some(allow_list)) => {
             if allow_list.iter().any(|a| a == "*") {
                 return None;
@@ -3685,6 +3904,9 @@ fn scope_cameras_filter(
         }
         (Some(req_list), Some(allow_list)) => {
             if allow_list.iter().any(|a| a == "*") {
+                if req_list.iter().any(|c| c == "all" || c == "*") {
+                    return None;
+                }
                 return Some(req_list);
             }
             let safe_allow: Vec<String> = allow_list.into_iter().filter(|a| a != "all").collect();
@@ -3739,9 +3961,10 @@ fn is_safe_labelmap_path_str(raw: &str) -> bool {
     {
         return false;
     }
+    let mut normal_segments: Vec<String> = Vec::new();
     for comp in path.components() {
         match comp {
-            std::path::Component::ParentDir => return false,
+            std::path::Component::ParentDir | std::path::Component::CurDir => return false,
             std::path::Component::Normal(os) => {
                 let Some(s) = os.to_str() else {
                     return false;
@@ -3749,9 +3972,26 @@ fn is_safe_labelmap_path_str(raw: &str) -> bool {
                 if s.starts_with('.') {
                     return false;
                 }
+                normal_segments.push(s.to_ascii_lowercase());
             }
             _ => {}
         }
+    }
+    if path.is_absolute()
+        && let Some(first) = normal_segments.first().map(String::as_str)
+    {
+        if matches!(first, "proc" | "sys" | "etc" | "dev" | "root") {
+            return false;
+        }
+        let second = normal_segments.get(1).map(String::as_str);
+        if (first == "var" && second == Some("run"))
+            || (first == "run" && second == Some("secrets"))
+        {
+            return false;
+        }
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return false;
     }
     if let Ok(canon) = std::fs::canonicalize(path) {
         let canon_str = canon.to_string_lossy().to_ascii_lowercase();
@@ -3830,9 +4070,46 @@ fn is_sensitive_yaml_secret_key_name(key: &str) -> bool {
     )
 }
 
+fn collect_yaml_sensitive_secrets(val: &serde_yaml::Value, out: &mut Vec<String>) {
+    match val {
+        serde_yaml::Value::Mapping(map) => {
+            for (k, v) in map {
+                if let Some(k_str) = k.as_str()
+                    && is_sensitive_yaml_secret_key_name(k_str)
+                    && let Some(s) = v.as_str()
+                {
+                    let t = s.trim();
+                    if !t.is_empty()
+                        && !t.eq_ignore_ascii_case("null")
+                        && t != "~"
+                        && t != "***"
+                        && t != "*"
+                    {
+                        out.push(t.to_string());
+                        for line in s.lines() {
+                            let lt = line.trim();
+                            if lt.len() >= 3 && lt != "***" {
+                                out.push(lt.to_string());
+                            }
+                        }
+                    }
+                }
+                collect_yaml_sensitive_secrets(v, out);
+            }
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            for item in seq {
+                collect_yaml_sensitive_secrets(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> String {
     let base_scrubbed = ninjanvr_config::scrub_yaml_credentials(raw_yaml);
     let mut out = String::with_capacity(base_scrubbed.len());
+    let mut skip_block_scalar_indent: Option<usize> = None;
     for chunk in base_scrubbed.split_inclusive('\n') {
         let (line_body, newline) = if let Some(stripped) = chunk.strip_suffix("\r\n") {
             (stripped, "\r\n")
@@ -3842,6 +4119,13 @@ fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> String {
             (chunk, "")
         };
         let trimmed_start = line_body.trim_start();
+        let line_indent = line_body.len() - trimmed_start.len();
+        if let Some(base_indent) = skip_block_scalar_indent {
+            if trimmed_start.is_empty() || line_indent > base_indent {
+                continue;
+            }
+            skip_block_scalar_indent = None;
+        }
         if trimmed_start.starts_with('#') || trimmed_start.is_empty() {
             out.push_str(chunk);
             continue;
@@ -3857,6 +4141,14 @@ fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> String {
         {
             let val_trimmed = raw_v.trim();
             let unquoted = val_trimmed.trim_matches('"').trim_matches('\'').trim();
+            if unquoted.starts_with('|') || unquoted.starts_with('>') {
+                skip_block_scalar_indent = Some(line_indent);
+                out.push_str(leading_prefix);
+                out.push_str(raw_k.trim_end());
+                out.push_str(": \"***\"");
+                out.push_str(newline);
+                continue;
+            }
             if !unquoted.is_empty()
                 && !unquoted.eq_ignore_ascii_case("null")
                 && unquoted != "~"
@@ -3874,30 +4166,33 @@ fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> String {
         out.push_str(newline);
     }
 
-    let mut known_secrets: Vec<&str> = Vec::new();
+    let mut known_secrets: Vec<String> = Vec::new();
+    if let Ok(parsed_yaml) = serde_yaml::from_str::<serde_yaml::Value>(raw_yaml) {
+        collect_yaml_sensitive_secrets(&parsed_yaml, &mut known_secrets);
+    }
     if let Some(ref p) = cfg.mqtt.password {
         let t = p.trim();
         if !t.is_empty() && t != "***" && t != "*" {
-            known_secrets.push(t);
+            known_secrets.push(t.to_string());
         }
     }
     if let Some(ref k) = cfg.genai.api_key {
         let t = k.trim();
         if !t.is_empty() && t != "***" && t != "*" {
-            known_secrets.push(t);
+            known_secrets.push(t.to_string());
         }
     }
     for cam in cfg.cameras.values() {
         if let Some(ref p) = cam.onvif.password {
             let t = p.trim();
             if !t.is_empty() && t != "***" && t != "*" {
-                known_secrets.push(t);
+                known_secrets.push(t.to_string());
             }
         }
     }
-    for secret in known_secrets {
-        if secret.len() >= 3 && out.contains(secret) {
-            out = out.replace(secret, "***");
+    for secret in &known_secrets {
+        if secret.len() >= 3 && out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), "***");
         }
     }
     out
@@ -4600,8 +4895,22 @@ async fn api_mcp_handler(
     headers: HeaderMap,
     Json(req): Json<McpJsonRpcRequest>,
 ) -> Response {
-    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     let id = req.id.clone();
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32003,
+                    "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+                }
+            })),
+        )
+            .into_response();
+    }
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
 
     match req.method.as_str() {
         "initialize" => Json(json!({
@@ -4822,12 +5131,11 @@ async fn api_mcp_handler(
                             || jar.get(&cfg.auth.cookie_name).is_some()
                             || (cfg.auth.proxy.enabled
                                 && extract_trusted_proxy_peer_ip(&headers).is_some());
-                        match extract_authenticated_user(
+                        match extract_authenticated_user_with_cfg(
                             &state,
                             &jar,
                             &headers,
-                            &cfg.auth.cookie_name,
-                            cfg.auth.enabled,
+                            &cfg.auth,
                         ) {
                             Some((_, r)) => r.to_ascii_lowercase(),
                             None if cfg.auth.enabled && has_creds => "unauthorized".to_string(),
@@ -5351,6 +5659,7 @@ fn render_synthetic_mercosul_vehicle_frame(plate: &str) -> image::RgbImage {
 fn is_safe_federation_peer_base_url(raw_url: &str) -> bool {
     let trimmed = raw_url.trim().trim_end_matches('/');
     if trimmed.is_empty()
+        || trimmed.contains("..")
         || trimmed.contains(['\\', '?', '#'])
         || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
     {
@@ -5363,8 +5672,17 @@ fn is_safe_federation_peer_base_url(raw_url: &str) -> bool {
     let Some((_, host_port)) = extract_url_scheme_and_host(trimmed) else {
         return false;
     };
-    let host = bare_hostname(host_port).trim();
-    if host.is_empty() || host.eq_ignore_ascii_case("metadata.google.internal") {
+    let host_port_no_auth = host_port
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(host_port);
+    let host = bare_hostname(host_port_no_auth)
+        .trim()
+        .trim_end_matches('.');
+    if host.is_empty()
+        || host.contains('@')
+        || host.eq_ignore_ascii_case("metadata.google.internal")
+    {
         return false;
     }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -5723,6 +6041,15 @@ async fn api_notifications_test(
         .unwrap_or_else(|| "front_door".to_string());
         (cam, cfg.mqtt.enabled)
     };
+    if let Some(ref allow_list) = allowed
+        && !allow_list.iter().any(|a| a == &first_cam || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
     let now = unix_now() as f64;
     let test_id = format!("test-alert-{}", now as u64);
     let alert_payload = json!({
@@ -6102,19 +6429,35 @@ async fn handle_camera_webui_proxy(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|loc| {
                     let trimmed = loc.trim();
-                    if let Some(after_base) = trimmed.strip_prefix(&base_url) {
-                        let rel = after_base.trim_start_matches('/');
-                        Some(format!("/api/camera-proxy/{camera}/{rel}"))
+                    if trimmed.contains(['\\', '@'])
+                        || trimmed.contains("..")
+                        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+                    {
+                        return None;
+                    }
+                    let rel = if let Some(after_base) = trimmed.strip_prefix(&base_url) {
+                        if !after_base.is_empty() && !after_base.starts_with(['/', '?', '#']) {
+                            return None;
+                        }
+                        after_base.trim_start_matches('/')
                     } else if (trimmed.starts_with('/') && !trimmed.starts_with("//"))
                         || (!trimmed.contains("://")
                             && !trimmed.starts_with("//")
                             && !trimmed.contains(':'))
                     {
-                        let rel = trimmed.trim_start_matches('/');
-                        Some(format!("/api/camera-proxy/{camera}/{rel}"))
+                        trimmed.trim_start_matches('/')
                     } else {
-                        None
+                        return None;
+                    };
+                    let path_part = rel.split(['?', '#']).next().unwrap_or(rel);
+                    let decoded_rel = percent_decode_path(path_part)?;
+                    if decoded_rel.contains("..")
+                        || decoded_rel.contains(['\\', '@'])
+                        || decoded_rel.split('/').any(|seg| seg == "." || seg == "..")
+                    {
+                        return None;
                     }
+                    Some(format!("/api/camera-proxy/{camera}/{rel}"))
                 });
             let Ok(body_bytes) = read_upstream_body_bounded(upstream, 16 * 1024 * 1024).await
             else {

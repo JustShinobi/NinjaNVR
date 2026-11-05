@@ -1099,3 +1099,415 @@ version: 0.18-0
     upstream_task.abort();
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[tokio::test]
+async fn phase3a_cycle2_oidc_jwks_yaml_block_scrub_ssrf_userinfo_and_proxy_hardening_work() {
+    let tmp_dir = std::env::temp_dir().join(format!("ninjanvr-p3a-c2-{}", rand::random::<u64>()));
+    let web_dir = tmp_dir.join("web-v2");
+    let media_dir = tmp_dir.join("media");
+    std::fs::create_dir_all(&web_dir).unwrap();
+    std::fs::create_dir_all(&media_dir).unwrap();
+    std::fs::write(web_dir.join("index.html"), "<html>Console v2</html>").unwrap();
+
+    // 1. sanitize_logged_path redacts percent-encoded and mixed-case /share/<token> paths
+    assert_eq!(
+        sanitize_logged_path("/%73hare/secret_tok_999/video.mp4"),
+        "/share/<redacted>/video.mp4"
+    );
+    assert_eq!(
+        sanitize_logged_path("/SHARE/secret_tok_999"),
+        "/share/<redacted>"
+    );
+
+    // 2. Mock upstream for OIDC Discovery + JWKS + Camera WebUI redirect tests
+    let oidc_mode = Arc::new(std::sync::Mutex::new("jwks_bad_sig".to_string()));
+    let oidc_mode_disc = oidc_mode.clone();
+    let oidc_mode_tok = oidc_mode.clone();
+    let oidc_mode_ui = oidc_mode.clone();
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let issuer = format!("http://{upstream_addr}");
+    let iss_disc = issuer.clone();
+    let iss_tok = issuer.clone();
+
+    let jwk_secret = b"oidc-jwks-oct-signing-key-32byte";
+    let jwk_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(jwk_secret);
+
+    let mock_upstream = Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let mode = oidc_mode_disc.lock().unwrap().clone();
+                let iss = iss_disc.clone();
+                async move {
+                    if mode == "disc_bad_issuer" {
+                        return Json(json!({
+                            "issuer": "https://evil.example",
+                            "token_endpoint": format!("{iss}/oauth/v2/token"),
+                            "userinfo_endpoint": format!("{iss}/oidc/v1/userinfo"),
+                            "jwks_uri": format!("{iss}/jwks.json")
+                        }))
+                        .into_response();
+                    }
+                    if mode == "disc_ssrf_jwks" {
+                        return Json(json!({
+                            "issuer": iss,
+                            "token_endpoint": format!("{iss}/oauth/v2/token"),
+                            "userinfo_endpoint": format!("{iss}/oidc/v1/userinfo"),
+                            "jwks_uri": "http://169.254.169.254/jwks.json"
+                        }))
+                        .into_response();
+                    }
+                    Json(json!({
+                        "issuer": iss,
+                        "token_endpoint": format!("{iss}/oauth/v2/token"),
+                        "userinfo_endpoint": format!("{iss}/oidc/v1/userinfo"),
+                        "jwks_uri": format!("{iss}/jwks.json")
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+        .route(
+            "/jwks.json",
+            get(move || {
+                let k = jwk_b64.clone();
+                async move {
+                    Json(json!({
+                        "keys": [
+                            {
+                                "kty": "oct",
+                                "alg": "HS256",
+                                "kid": "k1",
+                                "k": k
+                            }
+                        ]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/oauth/v2/token",
+            post(move || {
+                let mode = oidc_mode_tok.lock().unwrap().clone();
+                let iss = iss_tok.clone();
+                let exp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600;
+                async move {
+                    let mut hdr = Header::new(Algorithm::HS256);
+                    hdr.kid = Some("k1".to_string());
+                    match mode.as_str() {
+                        "jwks_bad_sig" => {
+                            let bad_tok = jsonwebtoken::encode(
+                                &hdr,
+                                &json!({"sub":"alice","iss":iss,"aud":"nvr-client","exp":exp}),
+                                &EncodingKey::from_secret(b"wrong-signing-key-00000000000000"),
+                            )
+                            .unwrap();
+                            Json(json!({ "id_token": bad_tok })).into_response()
+                        }
+                        "id_missing_sub" => {
+                            let no_sub_tok = jsonwebtoken::encode(
+                                &hdr,
+                                &json!({"preferred_username":"admin","iss":iss,"aud":"nvr-client","exp":exp,"groups":["nvr-admins"]}),
+                                &EncodingKey::from_secret(jwk_secret),
+                            )
+                            .unwrap();
+                            Json(json!({ "id_token": no_sub_tok })).into_response()
+                        }
+                        "ui_only_missing_sub" => {
+                            Json(json!({ "access_token": "tok_only_ui" })).into_response()
+                        }
+                        "jwks_valid" => {
+                            let ok_tok = jsonwebtoken::encode(
+                                &hdr,
+                                &json!({"sub":"alice","preferred_username":"alice","iss":iss,"aud":"nvr-client","exp":exp,"groups":["nvr-admins"]}),
+                                &EncodingKey::from_secret(jwk_secret),
+                            )
+                            .unwrap();
+                            Json(json!({
+                                "id_token": ok_tok,
+                                "access_token": "tok_ok"
+                            }))
+                            .into_response()
+                        }
+                        _ => StatusCode::BAD_REQUEST.into_response(),
+                    }
+                }
+            }),
+        )
+        .route(
+            "/oidc/v1/userinfo",
+            get(move || {
+                let mode = oidc_mode_ui.lock().unwrap().clone();
+                async move {
+                    if mode == "ui_only_missing_sub" {
+                        return Json(json!({
+                            "preferred_username": "admin",
+                            "groups": ["nvr-admins"]
+                        }))
+                        .into_response();
+                    }
+                    Json(json!({
+                        "sub": "alice",
+                        "preferred_username": "alice",
+                        "groups": ["nvr-admins"]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+    let upstream_task = tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, mock_upstream).await;
+    });
+
+    let db_path = tmp_dir.join("ninjanvr.db");
+    let cfg_path = tmp_dir.join("config.yml");
+    let yaml = format!(
+        r#"
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+  proxy:
+    enabled: true
+    trusted_proxies:
+      - "10.42.0.0/16"
+    user_header: "Remote-User"
+    groups_header: "Remote-Groups"
+  oidc:
+    enabled: true
+    issuer_url: "{}"
+    client_id: "nvr-client"
+    client_secret: |-
+      block_scalar_oidc_secret_987654
+    role_mapping:
+      admin: ["nvr-admins"]
+mqtt: {{ enabled: false, password: "flow_mapping_mqtt_secret_654321" }}
+cameras:
+  front_door:
+    enabled: true
+  backyard:
+    enabled: true
+peers:
+  ssrf_userinfo_meta:
+    enabled: true
+    url: "http://user:pass@169.254.169.254/latest/meta-data"
+  ssrf_userinfo_gcp:
+    enabled: true
+    url: "http://user:pass@metadata.google.internal."
+version: 0.18-0
+"#,
+        db_path.display(),
+        issuer
+    );
+    std::fs::write(&cfg_path, yaml).unwrap();
+
+    let state = new_app_state(&cfg_path, web_dir, media_dir, false)
+        .await
+        .unwrap();
+    let _ = state.db.ensure_default_admin(1000).unwrap();
+    let app = build_router_with_auth(state.clone(), true);
+    let admin_bearer = format!(
+        "Bearer {}",
+        mint_test_jwt(&state.jwt_secret, "admin", "admin", Some("*"))
+    );
+
+    // 3. OIDC JWKS verification rejects forged signature, discovery issuer mismatch, SSRF jwks_uri, and missing sub
+    for bad_mode in [
+        "jwks_bad_sig",
+        "disc_bad_issuer",
+        "disc_ssrf_jwks",
+        "id_missing_sub",
+        "ui_only_missing_sub",
+    ] {
+        *oidc_mode.lock().unwrap() = bad_mode.to_string();
+        let r_cb = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/callback?code=c1&state=st1")
+                    .header(
+                        header::COOKIE,
+                        "ninjanvr_oidc_pkce=st1:ver1:http://localhost:5000/api/auth/oidc/callback",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_cb.status(),
+            StatusCode::UNAUTHORIZED,
+            "OIDC callback mode '{bad_mode}' must be rejected with 401 UNAUTHORIZED"
+        );
+    }
+
+    // Tampered PKCE redirect_uri pointing to external host must be rejected with 403 FORBIDDEN
+    *oidc_mode.lock().unwrap() = "jwks_valid".to_string();
+    let r_cb_tampered_redirect = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/oidc/callback?code=c1&state=st1")
+                .header(
+                    header::COOKIE,
+                    "ninjanvr_oidc_pkce=st1:ver1:https://evil.example/api/auth/oidc/callback",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_cb_tampered_redirect.status(), StatusCode::FORBIDDEN);
+
+    // Valid JWKS-signed ID token succeeds with 303 SEE_OTHER
+    let r_cb_valid = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/oidc/callback?code=c1&state=st1")
+                .header(
+                    header::COOKIE,
+                    "ninjanvr_oidc_pkce=st1:ver1:http://localhost:5000/api/auth/oidc/callback",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_cb_valid.status(), StatusCode::SEE_OTHER);
+
+    // 4. GET /api/config/raw scrubs both YAML block scalar (|-) and inline flow mapping ({ password: ... }) secrets
+    let r_raw = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/config/raw")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_raw.status(), StatusCode::OK);
+    let raw_str: String =
+        serde_json::from_slice(&to_bytes(r_raw.into_body(), 65536).await.unwrap()).unwrap();
+    assert!(
+        !raw_str.contains("block_scalar_oidc_secret_987654"),
+        "GET /api/config/raw must scrub YAML block scalar secrets"
+    );
+    assert!(
+        !raw_str.contains("flow_mapping_mqtt_secret_654321"),
+        "GET /api/config/raw must scrub inline YAML flow mapping secrets"
+    );
+
+    // 5. POST /api/config/save rejects '//etc/shadow.txt' and '/./etc/passwd.txt' labelmap_path bypasses
+    for bad_labelmap in [
+        "//etc/shadow.txt",
+        "/./etc/passwd.txt",
+        "/var//run/secrets.txt",
+    ] {
+        let r_save_bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/save")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::from(format!(
+                        "model:\n  labelmap_path: \"{bad_labelmap}\"\ncameras: {{}}\n"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_save_bad.status(),
+            StatusCode::BAD_REQUEST,
+            "labelmap_path '{bad_labelmap}' must be rejected"
+        );
+    }
+
+    // 6. Federation proxy blocks SSRF peer URLs with embedded userinfo@ on link-local and metadata.google.internal.
+    for peer_node in ["ssrf_userinfo_meta", "ssrf_userinfo_gcp"] {
+        let r_ssrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/federation/{peer_node}/stats"))
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_ssrf.status(),
+            StatusCode::BAD_REQUEST,
+            "Federation peer '{peer_node}' with userinfo@ SSRF host must be rejected"
+        );
+    }
+
+    // 7. Trusted Proxy request accompanied by a stale scoped cookie still grants full proxy camera access
+    let stale_scoped_jwt = mint_test_jwt(
+        &state.jwt_secret,
+        "stale_cookie_user",
+        "viewer",
+        Some("front_door"),
+    );
+    let r_proxy_with_stale_cookie = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/profile")
+                .header("x-peer-ip", "10.42.0.25")
+                .header("remote-user", "proxy_operator")
+                .header("remote-groups", "nvr-operators")
+                .header(header::COOKIE, format!("ninjanvr_token={stale_scoped_jwt}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_proxy_with_stale_cookie.status(), StatusCode::OK);
+    let prof_json: Value = serde_json::from_slice(
+        &to_bytes(r_proxy_with_stale_cookie.into_body(), 8192)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(prof_json["username"], "proxy_operator");
+    let cams_arr = prof_json["allowed_cameras"].as_array().unwrap();
+    assert_eq!(
+        cams_arr.len(),
+        2,
+        "Trusted proxy user must not be restricted by an unrelated stale cookie in CookieJar"
+    );
+
+    // 8. API token creation rejects expires_in_days = 0 and control-char names
+    let r_tok_zero_exp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tokens")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"zero_exp","scope":"read_only","expires_in_days":0}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_tok_zero_exp.status(), StatusCode::BAD_REQUEST);
+
+    upstream_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
