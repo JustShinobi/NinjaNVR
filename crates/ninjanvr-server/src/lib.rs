@@ -977,11 +977,16 @@ fn is_protected_path(path: &str) -> bool {
         p.starts_with("/api/")
             || p == "/api"
             || p.starts_with("/vod/")
+            || p == "/vod"
             || p.starts_with("/live/")
+            || p == "/live"
             || p == "/ws"
             || p.starts_with("/clips/")
+            || p == "/clips"
             || p.starts_with("/recordings/")
+            || p == "/recordings"
             || p.starts_with("/exports/")
+            || p == "/exports"
     };
     if check_protected(path) {
         return true;
@@ -1029,6 +1034,31 @@ pub fn percent_decode_path(raw: &str) -> Option<String> {
     Some(decoded_segments.join("/"))
 }
 
+pub fn normalize_http_path_for_auth(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.chars().any(|c| c.is_control() || c == '\\') {
+        return None;
+    }
+    let decoded = percent_decode_path(raw)?;
+    if decoded.chars().any(|c| c.is_control() || c == '\\') {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for seg in decoded.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        if seg == "." || seg == ".." {
+            return None;
+        }
+        segments.push(seg);
+    }
+    if segments.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(format!("/{}", segments.join("/")))
+    }
+}
+
 fn strip_static_media_prefix(p: &str) -> Option<&str> {
     p.strip_prefix("/exports/")
         .or_else(|| p.strip_prefix("/clips/"))
@@ -1062,10 +1092,13 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
     if is_hidden_static_media_path(path) {
         return None;
     }
-    let decoded = percent_decode_path(path)?;
-    let path = decoded.as_str();
+    let normalized = normalize_http_path_for_auth(path)?;
+    if is_hidden_static_media_path(&normalized) {
+        return None;
+    }
+    let path = normalized.as_str();
     if let Some(rest) = path.strip_prefix("/exports/") {
-        let fname = rest.split('/').next().unwrap_or("");
+        let fname = rest.split('/').find(|s| !s.is_empty()).unwrap_or("");
         let raw_id = fname.strip_suffix(".mp4").unwrap_or(fname);
         let is_share_artifact =
             raw_id.starts_with("share_redacted_") || raw_id.starts_with("share_clip_");
@@ -1089,6 +1122,21 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
             }
             return None;
         }
+        if !fname.is_empty()
+            && let Ok(exports) = state.db.query_exports()
+        {
+            let suffix = format!("/{fname}");
+            for exp in exports {
+                if exp["video_path"]
+                    .as_str()
+                    .is_some_and(|vp| vp == fname || vp.ends_with(&suffix))
+                    && let Some(cam) = exp["camera"].as_str()
+                    && !cam.is_empty()
+                {
+                    return Some(cam.to_string());
+                }
+            }
+        }
         return exp_id
             .rsplitn(3, '_')
             .nth(2)
@@ -1111,14 +1159,45 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
             return Some(parts[1].to_string());
         }
         if parts.first() == Some(&"review") && parts.len() >= 2 {
-            if let Some(after_thumb) = parts[1].strip_prefix("thumb-")
-                && let Some(cam) = after_thumb
+            if let Some(raw_after_thumb) = parts[1].strip_prefix("thumb-") {
+                let after_thumb = raw_after_thumb
+                    .strip_suffix(".webp")
+                    .or_else(|| raw_after_thumb.strip_suffix(".jpg"))
+                    .unwrap_or(raw_after_thumb);
+                if let Ok(cfg) = state.config.try_read() {
+                    let mut matched_cam: Option<&str> = None;
+                    for cam in cfg.cameras.keys() {
+                        let prefix = format!("{cam}-");
+                        if after_thumb.starts_with(&prefix)
+                            && matched_cam.is_none_or(|prev| cam.len() > prev.len())
+                        {
+                            matched_cam = Some(cam.as_str());
+                        }
+                    }
+                    if let Some(cam) = matched_cam {
+                        let rest_rev_id = &after_thumb[cam.len() + 1..];
+                        if let Ok(Some(rev)) = state.db.get_review_by_id(rest_rev_id) {
+                            return Some(rev.camera);
+                        }
+                        if let Some((_, tail_rev_id)) = rest_rev_id.split_once('-')
+                            && let Ok(Some(rev)) = state.db.get_review_by_id(tail_rev_id)
+                        {
+                            return Some(rev.camera);
+                        }
+                        return Some(cam.to_string());
+                    }
+                }
+                if let Ok(Some(rev)) = state.db.get_review_by_id(after_thumb) {
+                    return Some(rev.camera);
+                }
+                if let Some(cam) = after_thumb
                     .rsplitn(3, '-')
                     .nth(2)
                     .or_else(|| after_thumb.split_once('-').map(|(c, _)| c))
                     .filter(|s| !s.is_empty())
-            {
-                return Some(cam.to_string());
+                {
+                    return Some(cam.to_string());
+                }
             }
             return None;
         }
@@ -1133,30 +1212,49 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
                 .strip_prefix("share_redacted_")
                 .or_else(|| raw_stem.strip_prefix("share_clip_"))
                 .unwrap_or(raw_stem);
-            if let Ok(Some(ev)) = state.db.get_event(stem)
-                && let Some(cam) = ev["camera"].as_str()
+            if !is_share_artifact
+                && let Some(latest_cam) = stem.strip_prefix("latest_").filter(|s| !s.is_empty())
             {
-                return Some(cam.to_string());
+                return Some(latest_cam.to_string());
             }
-            if let Ok(Some(exp)) = state.db.get_export_by_id(stem)
-                && let Some(cam) = exp["camera"].as_str()
-            {
-                return Some(cam.to_string());
-            }
-            if let Ok(Some(rev)) = state.db.get_review_by_id(stem) {
-                return Some(rev.camera);
+            let clean_stem = stem.strip_suffix("-clean").unwrap_or(stem);
+            for candidate in [clean_stem, stem] {
+                if let Ok(Some(ev)) = state.db.get_event(candidate)
+                    && let Some(cam) = ev["camera"].as_str()
+                {
+                    return Some(cam.to_string());
+                }
+                if let Ok(Some(exp)) = state.db.get_export_by_id(candidate)
+                    && let Some(cam) = exp["camera"].as_str()
+                {
+                    return Some(cam.to_string());
+                }
+                if let Ok(Some(rev)) = state.db.get_review_by_id(candidate) {
+                    return Some(rev.camera);
+                }
             }
             if is_share_artifact {
                 return None;
             }
-            if let Some((cam, _)) = stem.split_once('-')
-                && state
-                    .config
-                    .try_read()
-                    .map(|c| c.cameras.contains_key(cam))
-                    .unwrap_or(false)
-            {
-                return Some(cam.to_string());
+            if let Ok(cfg) = state.config.try_read() {
+                let mut matched_cam: Option<&str> = None;
+                for cam in cfg.cameras.keys() {
+                    let prefix = format!("{cam}-");
+                    if clean_stem.starts_with(&prefix)
+                        && matched_cam.is_none_or(|prev| cam.len() > prev.len())
+                    {
+                        matched_cam = Some(cam.as_str());
+                    }
+                }
+                if let Some(cam) = matched_cam {
+                    let ev_part = &clean_stem[cam.len() + 1..];
+                    if let Ok(Some(ev)) = state.db.get_event(ev_part)
+                        && let Some(ev_cam) = ev["camera"].as_str()
+                    {
+                        return Some(ev_cam.to_string());
+                    }
+                    return Some(cam.to_string());
+                }
             }
         }
     }
@@ -1170,7 +1268,23 @@ async fn auth_gate_middleware(
     next: axum::middleware::Next,
 ) -> Response {
     let method = req.method().as_str().to_string();
-    let path = req.uri().path().to_string();
+    let raw_path = req.uri().path().to_string();
+    if is_hidden_static_media_path(&raw_path) {
+        state.log_hub.push_nginx(&method, &raw_path, 403);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Hidden or internal static media artifacts are forbidden" })),
+        )
+            .into_response();
+    }
+    let Some(path) = normalize_http_path_for_auth(&raw_path) else {
+        state.log_hub.push_nginx(&method, &raw_path, 403);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Invalid or forbidden request path" })),
+        )
+            .into_response();
+    };
     if is_hidden_static_media_path(&path) {
         state.log_hub.push_nginx(&method, &path, 403);
         return (
@@ -1239,6 +1353,7 @@ async fn auth_gate_middleware(
                 || path.starts_with("/api/streams/probe")
                 || path.starts_with("/api/federation")
                 || path.starts_with("/api/debug/")
+                || path == "/api/debug"
                 || path.starts_with("/api/notifications/test")
                 || (method != "GET"
                     && method != "HEAD"
@@ -1261,7 +1376,8 @@ async fn auth_gate_middleware(
 
             if role_lc == "read_only"
                 && !path.starts_with("/api/mcp")
-                && ((method != "GET" && method != "HEAD") || !path.starts_with("/api/"))
+                && ((method != "GET" && method != "HEAD")
+                    || !(path.starts_with("/api/") || path == "/api"))
             {
                 state.log_hub.push_nginx(&method, &path, 403);
                 return (
@@ -1296,10 +1412,12 @@ async fn auth_gate_middleware(
                     &role,
                 )
             {
-                let decoded_path = percent_decode_path(&path).unwrap_or_else(|| path.clone());
-                let is_static_media = decoded_path.starts_with("/exports/")
-                    || decoded_path.starts_with("/recordings/")
-                    || decoded_path.starts_with("/clips/");
+                let is_static_media = path.starts_with("/exports/")
+                    || path == "/exports"
+                    || path.starts_with("/recordings/")
+                    || path == "/recordings"
+                    || path.starts_with("/clips/")
+                    || path == "/clips";
                 let static_media_cam = if is_static_media {
                     resolve_static_media_camera(&state, &path)
                 } else {
@@ -1316,7 +1434,7 @@ async fn auth_gate_middleware(
                     )
                         .into_response();
                 }
-                if path.starts_with("/live/") || path == "/api/go2rtc/webrtc" {
+                if path.starts_with("/live/") || path == "/live" || path == "/api/go2rtc/webrtc" {
                     let mut query_cams = Vec::new();
                     let mut invalid_query = false;
                     if let Some(q) = req.uri().query() {
@@ -1405,9 +1523,21 @@ async fn auth_gate_middleware(
                     Some(sc.as_str())
                 } else if let Some(ref qc) = query_cam {
                     Some(qc.as_str())
-                } else if let Some(rest) = path.strip_prefix("/vod/") {
-                    let vod_rest = rest.strip_prefix("clip/").unwrap_or(rest);
-                    vod_rest.split('/').next()
+                } else if path == "/vod" || path.starts_with("/vod/") {
+                    let rest = path.strip_prefix("/vod/").unwrap_or("");
+                    let vod_rest = rest
+                        .strip_prefix("clip/")
+                        .unwrap_or_else(|| if rest == "clip" { "" } else { rest });
+                    let vod_cam = vod_rest.split('/').find(|s| !s.is_empty()).unwrap_or("");
+                    if vod_cam.is_empty() && !allowed_set.iter().any(|a| a == "*") {
+                        state.log_hub.push_nginx(&method, &path, 403);
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "message": "VOD camera is not permitted for this user" })),
+                        )
+                            .into_response();
+                    }
+                    Some(vod_cam)
                 } else if let Some(rest) = path.strip_prefix("/api/") {
                     let first = rest.split('/').next().unwrap_or("");
                     if matches!(
@@ -1468,8 +1598,23 @@ async fn auth_gate_middleware(
                             .strip_prefix(first)
                             .unwrap_or("")
                             .trim_start_matches('/');
-                        let after_clip = after_first.strip_prefix("clip/").unwrap_or(after_first);
-                        after_clip.split('/').next()
+                        let after_clip = after_first.strip_prefix("clip/").unwrap_or_else(|| {
+                            if after_first == "clip" {
+                                ""
+                            } else {
+                                after_first
+                            }
+                        });
+                        let vod_cam = after_clip.split('/').find(|s| !s.is_empty()).unwrap_or("");
+                        if vod_cam.is_empty() && !allowed_set.iter().any(|a| a == "*") {
+                            state.log_hub.push_nginx(&method, &path, 403);
+                            return (
+                                StatusCode::FORBIDDEN,
+                                Json(json!({ "message": "VOD camera is not permitted for this user" })),
+                            )
+                                .into_response();
+                        }
+                        Some(vod_cam)
                     } else if first == "export" {
                         let after_first = rest
                             .strip_prefix(first)
@@ -1489,7 +1634,7 @@ async fn auth_gate_middleware(
                 };
                 if let Some(cam) = target_cam
                     && !cam.is_empty()
-                    && !allowed_set.iter().any(|a| a == cam)
+                    && !allowed_set.iter().any(|a| a == cam || a == "*")
                 {
                     state.log_hub.push_nginx(&method, &path, 403);
                     return (
@@ -2876,17 +3021,42 @@ async fn api_config(
         let cfg = state.config.read().await;
         cfg.to_api_config()
     };
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && let Some(cams_obj) = api_cfg.get_mut("cameras").and_then(|v| v.as_object_mut())
-    {
-        cams_obj.retain(|k, _| allowed.contains(k));
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+        if let Some(cams_obj) = api_cfg.get_mut("cameras").and_then(|v| v.as_object_mut()) {
+            cams_obj.retain(|k, _| allowed.contains(k));
+        }
+        if let Some(streams_obj) = api_cfg
+            .get_mut("go2rtc")
+            .and_then(|g| g.get_mut("streams"))
+            .and_then(|v| v.as_object_mut())
+        {
+            streams_obj.retain(|k, _| {
+                let base_cam = k.strip_suffix("_sub").unwrap_or(k);
+                allowed.iter().any(|a| a == base_cam)
+            });
+        }
+        if let Some(groups_obj) = api_cfg
+            .get_mut("camera_groups")
+            .and_then(|v| v.as_object_mut())
+        {
+            groups_obj.retain(|_, grp_val| {
+                if let Some(cams_arr) = grp_val.get_mut("cameras").and_then(|v| v.as_array_mut()) {
+                    cams_arr.retain(|c| c.as_str().is_some_and(|s| allowed.iter().any(|a| a == s)));
+                    !cams_arr.is_empty()
+                } else {
+                    false
+                }
+            });
+        }
     }
     Json(api_cfg)
 }
 
 async fn api_config_raw(State(state): State<AppState>) -> Json<Value> {
     let cfg = state.config.read().await;
-    Json(Value::String(cfg.raw_yaml.clone()))
+    Json(Value::String(ninjanvr_config::scrub_yaml_credentials(
+        &cfg.raw_yaml,
+    )))
 }
 
 async fn api_config_save(
@@ -2907,8 +3077,12 @@ async fn api_config_save(
     }
     let path = { state.config.read().await.config_path.clone() };
     match NinjaConfig::from_yaml_str(&body, path.clone()) {
-        Ok(new_cfg) => {
-            if let Err(err) = std::fs::write(&path, &body) {
+        Ok(mut new_cfg) => {
+            {
+                let prev = state.config.read().await;
+                new_cfg.restore_scrubbed_from_previous(&prev);
+            }
+            if let Err(err) = std::fs::write(&path, &new_cfg.raw_yaml) {
                 error!("Failed to persist config.yml: {err:#}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2974,7 +3148,7 @@ async fn api_config_structured(
         evaluate_system_heuristics(&next_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
     emit_heuristics_to_logs(&state.log_hub, &heuristics);
     let api_cfg = next_cfg.to_api_config();
-    let raw_yaml = next_cfg.raw_yaml.clone();
+    let raw_yaml = ninjanvr_config::scrub_yaml_credentials(&next_cfg.raw_yaml);
     *state.config.write().await = next_cfg;
     Json(json!({
         "success": true,
@@ -3105,19 +3279,45 @@ fn async_stream_lines(
     })
 }
 
-async fn api_stats_history(State(state): State<AppState>) -> Json<Value> {
+fn filter_stats_snapshot_for_allowed_cameras(val: &mut Value, allow_list: &[String]) {
+    if let Some(cams) = val.get_mut("cameras").and_then(|v| v.as_object_mut()) {
+        cams.retain(|k, _| allow_list.iter().any(|a| a == k));
+    }
+    if let Some(cam_storage) = val
+        .get_mut("service")
+        .and_then(|s| s.get_mut("camera_storage"))
+        .and_then(|v| v.as_object_mut())
+    {
+        cam_storage.retain(|k, _| allow_list.iter().any(|a| a == k));
+    }
+}
+
+async fn api_stats_history(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     let history = state.stats_history.read().await;
     if history.is_empty() {
         drop(history);
-        let Json(current) = api_stats(State(state)).await;
+        let mut current = compute_stats_snapshot(&state).await;
+        if let Some(ref allow_list) = allowed {
+            filter_stats_snapshot_for_allowed_cameras(&mut current, allow_list);
+        }
         return Json(json!([current]));
     }
-    let items: Vec<Value> = history.iter().cloned().collect();
+    let mut items: Vec<Value> = history.iter().cloned().collect();
+    if let Some(ref allow_list) = allowed {
+        for item in &mut items {
+            filter_stats_snapshot_for_allowed_cameras(item, allow_list);
+        }
+    }
     Json(Value::Array(items))
 }
 
 async fn api_prometheus_metrics(State(state): State<AppState>) -> Response {
-    let Json(stats_val) = api_stats(State(state.clone())).await;
+    let stats_val = compute_stats_snapshot(&state).await;
     let mut out = String::with_capacity(4096);
 
     out.push_str("# HELP ninjanvr_camera_fps Per-camera frame rate by pipeline role.\n");
@@ -3530,7 +3730,11 @@ async fn api_mcp_handler(
                         .map(|(_, r)| r.to_ascii_lowercase())
                         .unwrap_or_else(|| "admin".to_string())
                     };
-                    if caller_role == "viewer" || caller_role == "read_only" || caller_role == "metrics" {
+                    if caller_role == "viewer"
+                        || caller_role == "read_only"
+                        || caller_role == "metrics"
+                        || allowed.is_some()
+                    {
                         return (
                             StatusCode::FORBIDDEN,
                             Json(json!({
@@ -3538,7 +3742,7 @@ async fn api_mcp_handler(
                                 "id": id,
                                 "error": {
                                     "code": -32003,
-                                    "message": "Read-only role or token cannot modify security profile"
+                                    "message": "Read-only or camera-restricted role or token cannot modify security profile"
                                 }
                             })),
                         )
@@ -3677,10 +3881,13 @@ async fn api_debug_reprocess(
     let mut tensor_buf = vec![0u8; (model_w * model_h * 3) as usize];
 
     for rec in recs.iter().take(4) {
-        let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
-        if !disk_path.exists() {
+        let Some(disk_path) = ensure_path_within_media_dir(
+            &state.media_dir,
+            &resolve_recording_disk_path(&state.media_dir, &rec.path),
+        )
+        .filter(|p| p.is_file()) else {
             continue;
-        }
+        };
         let Ok(output) = tokio::process::Command::new("ffmpeg")
             .args([
                 "-hide_banner",
@@ -4465,6 +4672,37 @@ async fn handle_camera_webui_proxy(
     subpath: &str,
     query: Option<&str>,
 ) -> Response {
+    let Some(decoded_sub) = percent_decode_path(subpath) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Invalid camera proxy subpath"
+            })),
+        )
+            .into_response();
+    };
+    if subpath.contains("..")
+        || decoded_sub.contains("..")
+        || subpath.contains('\\')
+        || decoded_sub.contains('\\')
+        || subpath.contains('@')
+        || decoded_sub.contains('@')
+        || subpath.chars().any(|c| c.is_control() || c.is_whitespace())
+        || decoded_sub
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Invalid camera proxy subpath"
+            })),
+        )
+            .into_response();
+    }
+
     let base_url_opt = {
         let cfg = state.config.read().await;
         cfg.resolve_camera_webui_base_url(camera)
@@ -4532,16 +4770,20 @@ async fn handle_camera_webui_proxy(
             }
             resp
         }
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "success": false,
-                "camera": camera,
-                "target": base_url,
-                "message": format!("Camera Web UI unreachable: {err}")
-            })),
-        )
-            .into_response(),
+        Err(err) => {
+            let scrubbed_base = scrub_rtsp_credentials(&base_url);
+            let scrubbed_err = scrub_rtsp_credentials(&err.to_string());
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "success": false,
+                    "camera": camera,
+                    "target": scrubbed_base,
+                    "message": format!("Camera Web UI unreachable: {scrubbed_err}")
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -4575,7 +4817,19 @@ fn stat_mount_mb(path: &Path, mount_type: &str) -> Value {
     }
 }
 
-async fn api_stats(State(state): State<AppState>) -> Json<Value> {
+async fn api_stats(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let mut val = compute_stats_snapshot(&state).await;
+    if let Some(allow_list) = caller_allowed_cameras(&state, &jar, &headers).await {
+        filter_stats_snapshot_for_allowed_cameras(&mut val, &allow_list);
+    }
+    Json(val)
+}
+
+async fn compute_stats_snapshot(state: &AppState) -> Value {
     let cfg = state.config.read().await;
     let metrics_map = state.camera_metrics.read().await;
     let pid = std::process::id();
@@ -4822,7 +5076,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
     );
     storage_map.insert("/dev/shm".to_string(), shm_stat);
 
-    Json(json!({
+    json!({
         "cameras": cameras_stats,
         "detectors": detectors_stats,
         "camera_fps": (total_cam_fps * 10.0).round() / 10.0,
@@ -4860,7 +5114,7 @@ async fn api_stats(State(state): State<AppState>) -> Json<Value> {
                 "mem": format!("{go2rtc_mem:.1}")
             }
         }
-    }))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5824,12 +6078,21 @@ pub struct FalsePositiveSignaturesQuery {
 
 async fn api_list_false_positive_signatures(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     Query(params): Query<FalsePositiveSignaturesQuery>,
 ) -> Json<Value> {
-    let items = state
+    let mut items = state
         .db
         .list_false_positive_signatures(params.camera.as_deref())
         .unwrap_or_default();
+    if let Some(allow_list) = caller_allowed_cameras(&state, &jar, &headers).await {
+        items.retain(|s| {
+            s["camera"]
+                .as_str()
+                .is_some_and(|cam| allow_list.iter().any(|a| a == cam))
+        });
+    }
     Json(json!(items))
 }
 
@@ -8794,11 +9057,20 @@ async fn api_event_clip_mp4(
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn api_all_recordings_summary(State(state): State<AppState>) -> Json<Value> {
-    let summary = state
+async fn api_all_recordings_summary(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let mut summary = state
         .db
         .query_all_recordings_summary()
         .unwrap_or_else(|_| json!({}));
+    if let Some(allow_list) = caller_allowed_cameras(&state, &jar, &headers).await
+        && let Some(obj) = summary.as_object_mut()
+    {
+        obj.retain(|k, _| allow_list.iter().any(|a| a == k));
+    }
     Json(summary)
 }
 
@@ -9064,11 +9336,20 @@ async fn api_keyframe_analysis() -> Json<Value> {
     }))
 }
 
-async fn api_recordings_storage(State(state): State<AppState>) -> Json<Value> {
+async fn api_recordings_storage(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
     let mut usage = state
         .db
         .query_recordings_storage_usage()
         .unwrap_or_else(|_| json!({}));
+    if let Some(allow_list) = caller_allowed_cameras(&state, &jar, &headers).await
+        && let Some(map) = usage.as_object_mut()
+    {
+        map.retain(|k, _| allow_list.iter().any(|a| a == k));
+    }
     let rec_dir = state.media_dir.join("recordings");
     let stat = stat_mount_mb(&rec_dir, "ext4");
     let total_mb = stat["total"].as_f64().unwrap_or(100_000.0).max(1.0);
@@ -12005,8 +12286,66 @@ async fn api_exports(
     Json(Value::Array(exports))
 }
 
-async fn api_cases(State(state): State<AppState>) -> Json<Value> {
-    let cases = state.db.query_cases().unwrap_or_default();
+fn case_is_permitted_for_allowed_cameras(
+    state: &AppState,
+    event_ids: &[String],
+    export_ids: &[String],
+    allowed: &[String],
+) -> bool {
+    for ev_id in event_ids {
+        if let Ok(Some(ev)) = state.db.get_event(ev_id)
+            && let Some(cam) = ev["camera"].as_str()
+            && !allowed.iter().any(|a| a == cam)
+        {
+            return false;
+        }
+    }
+    for exp_id in export_ids {
+        if let Ok(Some(exp)) = state.db.get_export_by_id(exp_id)
+            && let Some(cam) = exp["camera"].as_str()
+            && !allowed.iter().any(|a| a == cam)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn case_value_is_permitted_for_allowed_cameras(
+    state: &AppState,
+    case_val: &Value,
+    allowed: &[String],
+) -> bool {
+    let event_ids: Vec<String> = case_val
+        .get("event_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let export_ids: Vec<String> = case_val
+        .get("export_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    case_is_permitted_for_allowed_cameras(state, &event_ids, &export_ids, allowed)
+}
+
+async fn api_cases(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let mut cases = state.db.query_cases().unwrap_or_default();
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+        cases.retain(|c| case_value_is_permitted_for_allowed_cameras(&state, c, &allowed));
+    }
     Json(Value::Array(cases))
 }
 
@@ -12021,7 +12360,12 @@ pub struct CreateCaseBody {
     pub export_ids: Vec<String>,
 }
 
-async fn api_case_create(State(state): State<AppState>, body: Bytes) -> Response {
+async fn api_case_create(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     if body.is_empty() {
         return Json(json!({ "success": true })).into_response();
     }
@@ -12057,6 +12401,38 @@ async fn api_case_create(State(state): State<AppState>, body: Bytes) -> Response
                 rand::random::<u32>()
             )
         });
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+        if !case_is_permitted_for_allowed_cameras(
+            &state,
+            &parsed.event_ids,
+            &parsed.export_ids,
+            &allowed,
+        ) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "success": false,
+                    "message": "Case references events or exports outside permitted cameras"
+                })),
+            )
+                .into_response();
+        }
+        if let Ok(existing_cases) = state.db.query_cases()
+            && let Some(existing) = existing_cases
+                .iter()
+                .find(|c| c["id"].as_str() == Some(case_id.as_str()))
+            && !case_value_is_permitted_for_allowed_cameras(&state, existing, &allowed)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "success": false,
+                    "message": "Cannot overwrite a case belonging to non-permitted cameras"
+                })),
+            )
+                .into_response();
+        }
+    }
     match state.db.create_case(
         &case_id,
         name,
@@ -12482,6 +12858,8 @@ async fn api_preview_thumbnail(
     }
     api_camera_latest_frame(
         State(state),
+        jar,
+        headers,
         AxumPath(camera),
         Query(LatestFrameQuery {
             height: Some(360),
@@ -12902,7 +13280,7 @@ async fn send_onvif_soap_request(
         Err(err) => {
             return Err((
                 StatusCode::BAD_GATEWAY,
-                format!("ONVIF {action} request failed: {err}"),
+                scrub_rtsp_credentials(&format!("ONVIF {action} request failed: {err}")),
             ));
         }
     };
@@ -13182,7 +13560,7 @@ async fn api_camera_ptz_info(
         "enabled": true,
         "online": online,
         "camera": camera,
-        "host": cam_cfg.onvif.host,
+        "host": cam_cfg.onvif.host.as_deref().map(scrub_rtsp_credentials),
         "port": cam_cfg.onvif.port,
         "autotracking": cam_cfg.onvif.autotracking,
         "return_preset": cam_cfg.onvif.return_preset,
@@ -13496,10 +13874,29 @@ pub struct LatestFrameQuery {
 
 async fn api_camera_latest_frame(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(camera): AxumPath<String>,
     Query(query): Query<LatestFrameQuery>,
     uri: Uri,
 ) -> Response {
+    if camera.is_empty() || !is_safe_id(&camera) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Invalid camera identifier" })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+
     let _ = query.bbox;
     let is_webp = uri.path().ends_with(".webp");
     let target_height = query.height.filter(|&h| h > 0);
@@ -13519,14 +13916,21 @@ async fn api_camera_latest_frame(
 
     let ts_hdr = header::HeaderName::from_static("x-last-frame-timestamp");
 
+    let priv_mask = {
+        let cfg = state.config.read().await;
+        cfg.cameras.get(&camera).map(|c| c.privacy_mask.clone())
+    };
+    let mask_active = has_active_privacy_mask(priv_mask.as_ref());
+
     // 1. Check short-lived 400ms in-memory encoded snapshot cache
     let cache_key = (camera.clone(), target_height.unwrap_or(0), is_webp);
-    if let Some((cached_at, cached_bytes, cached_ts)) = state
-        .lazy_snapshot_cache
-        .read()
-        .await
-        .get(&cache_key)
-        .cloned()
+    if !mask_active
+        && let Some((cached_at, cached_bytes, cached_ts)) = state
+            .lazy_snapshot_cache
+            .read()
+            .await
+            .get(&cache_key)
+            .cloned()
         && cached_at.elapsed() <= Duration::from_millis(400)
     {
         return (
@@ -13541,14 +13945,10 @@ async fn api_camera_latest_frame(
 
     // 2. Encode on demand from latest_yuv_frames (zero-copy raw YuvFrame)
     if let Some(yuv_frame) = state.latest_yuv_frames.read().await.get(&camera).cloned() {
-        let priv_mask = {
-            let cfg = state.config.read().await;
-            cfg.cameras.get(&camera).map(|c| c.privacy_mask.clone())
-        };
         let mut rgb =
             ninjanvr_vision::yuv420p_to_rgb_image_scaled(&yuv_frame, None, &[], target_height);
         if let Some(ref mask) = priv_mask
-            && !mask.is_null()
+            && mask_active
         {
             ninjanvr_vision::apply_privacy_masks_from_value(&mut rgb, mask);
         }
@@ -13566,11 +13966,13 @@ async fn api_camera_latest_frame(
             } else {
                 unix_now()
             };
-            state
-                .lazy_snapshot_cache
-                .write()
-                .await
-                .insert(cache_key, (Instant::now(), out_bytes.clone(), ts));
+            if !mask_active {
+                state
+                    .lazy_snapshot_cache
+                    .write()
+                    .await
+                    .insert(cache_key, (Instant::now(), out_bytes.clone(), ts));
+            }
             return (
                 [
                     (header::CONTENT_TYPE, content_type),
@@ -13588,6 +13990,30 @@ async fn api_camera_latest_frame(
         } else {
             unix_now()
         };
+        if let Some(ref mask) = priv_mask
+            && mask_active
+        {
+            if let Ok(dyn_img) = image::load_from_memory(&frame_bytes) {
+                let mut rgb = dyn_img.to_rgb8();
+                ninjanvr_vision::apply_privacy_masks_from_value(&mut rgb, mask);
+                let encoded_res = if is_webp {
+                    ninjanvr_vision::encode_image_webp(&rgb)
+                } else {
+                    ninjanvr_vision::encode_image_jpeg(&rgb)
+                };
+                if let Ok(out_bytes) = encoded_res {
+                    return (
+                        [
+                            (header::CONTENT_TYPE, content_type),
+                            (ts_hdr, ts.to_string()),
+                        ],
+                        out_bytes,
+                    )
+                        .into_response();
+                }
+            }
+            return placeholder_jpeg_response();
+        }
         return (
             [
                 (header::CONTENT_TYPE, "image/jpeg".to_string()),
@@ -13602,19 +14028,44 @@ async fn api_camera_latest_frame(
         .media_dir
         .join("clips")
         .join(format!("latest_{camera}.jpg"));
-    if let Ok(disk_bytes) = tokio::fs::read(&disk_latest).await
+    if let Some(safe_disk_latest) = ensure_path_within_media_dir(&state.media_dir, &disk_latest)
+        && let Ok(disk_bytes) = tokio::fs::read(&safe_disk_latest).await
         && !disk_bytes.is_empty()
     {
         let disk_ts = if metric_ts > 0.0 {
             metric_ts as u64
         } else {
-            std::fs::metadata(&disk_latest)
+            std::fs::metadata(&safe_disk_latest)
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or_else(unix_now)
         };
+        if let Some(ref mask) = priv_mask
+            && mask_active
+        {
+            if let Ok(dyn_img) = image::load_from_memory(&disk_bytes) {
+                let mut rgb = dyn_img.to_rgb8();
+                ninjanvr_vision::apply_privacy_masks_from_value(&mut rgb, mask);
+                let encoded_res = if is_webp {
+                    ninjanvr_vision::encode_image_webp(&rgb)
+                } else {
+                    ninjanvr_vision::encode_image_jpeg(&rgb)
+                };
+                if let Ok(out_bytes) = encoded_res {
+                    return (
+                        [
+                            (header::CONTENT_TYPE, content_type),
+                            (ts_hdr, disk_ts.to_string()),
+                        ],
+                        out_bytes,
+                    )
+                        .into_response();
+                }
+            }
+            return placeholder_jpeg_response();
+        }
         return (
             [
                 (header::CONTENT_TYPE, "image/jpeg".to_string()),
@@ -13625,9 +14076,10 @@ async fn api_camera_latest_frame(
             .into_response();
     }
 
+    let encoded_cam = urlencoding_simple(&camera);
     let url = format!(
-        "{}/api/frame.jpeg?src={}_sub",
-        state.go2rtc_http_base, camera
+        "{}/api/frame.jpeg?src={encoded_cam}_sub",
+        state.go2rtc_http_base
     );
     if let Ok(resp) = state
         .http_client
@@ -13638,28 +14090,31 @@ async fn api_camera_latest_frame(
         && resp.status().is_success()
         && let Ok(bytes) = resp.bytes().await
     {
-        let priv_mask = {
-            let cfg = state.config.read().await;
-            cfg.cameras.get(&camera).map(|c| c.privacy_mask.clone())
-        };
-        let out_bytes = if let Some(ref mask) = priv_mask
-            && !mask.is_null()
-            && let Ok(dyn_img) = image::load_from_memory(&bytes)
+        if let Some(ref mask) = priv_mask
+            && mask_active
         {
-            let mut rgb = dyn_img.to_rgb8();
-            ninjanvr_vision::apply_privacy_masks_from_value(&mut rgb, mask);
-            ninjanvr_vision::encode_image_jpeg(&rgb)
-                .map(axum::body::Bytes::from)
-                .unwrap_or(bytes)
-        } else {
-            bytes
-        };
+            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                let mut rgb = dyn_img.to_rgb8();
+                ninjanvr_vision::apply_privacy_masks_from_value(&mut rgb, mask);
+                if let Ok(out_vec) = ninjanvr_vision::encode_image_jpeg(&rgb) {
+                    return (
+                        [
+                            (header::CONTENT_TYPE, "image/jpeg".to_string()),
+                            (ts_hdr, unix_now().to_string()),
+                        ],
+                        Bytes::from(out_vec),
+                    )
+                        .into_response();
+                }
+            }
+            return placeholder_jpeg_response();
+        }
         return (
             [
                 (header::CONTENT_TYPE, "image/jpeg".to_string()),
                 (ts_hdr, unix_now().to_string()),
             ],
-            out_bytes,
+            bytes,
         )
             .into_response();
     }
@@ -14185,12 +14640,21 @@ fn resolve_recording_disk_path(media_dir: &Path, db_path: &str) -> PathBuf {
 }
 
 async fn vod_master_m3u8(
-    AxumPath((_camera, _start, _end)): AxumPath<(String, f64, f64)>,
-) -> impl IntoResponse {
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath((camera, _start, _end)): AxumPath<(String, f64, f64)>,
+) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     (
         [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
         ninjanvr_vod::build_master_playlist(),
     )
+        .into_response()
 }
 
 fn existing_recordings_for_vod(
@@ -14204,14 +14668,24 @@ fn existing_recordings_for_vod(
         .query_recordings(camera, start, end)
         .unwrap_or_default()
         .into_iter()
-        .filter(|r| resolve_recording_disk_path(&state.media_dir, &r.path).exists())
+        .filter(|r| {
+            let disk_path = resolve_recording_disk_path(&state.media_dir, &r.path);
+            ensure_path_within_media_dir(&state.media_dir, &disk_path).is_some_and(|p| p.is_file())
+        })
         .collect()
 }
 
 async fn vod_index_m3u8(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath((camera, start, end)): AxumPath<(String, f64, f64)>,
 ) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let recs = existing_recordings_for_vod(&state, &camera, start, end);
     if recs.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
@@ -14220,11 +14694,13 @@ async fn vod_index_m3u8(
         .iter()
         .map(|r| {
             let disk_path = resolve_recording_disk_path(&state.media_dir, &r.path);
-            ninjanvr_vod::probe_mp4_resolution(&disk_path).unwrap_or(if r.objects > 0 {
-                (1920, 1080)
-            } else {
-                (640, 360)
-            })
+            ensure_path_within_media_dir(&state.media_dir, &disk_path)
+                .and_then(|safe_p| ninjanvr_vod::probe_mp4_resolution(&safe_p))
+                .unwrap_or(if r.objects > 0 {
+                    (1920, 1080)
+                } else {
+                    (640, 360)
+                })
         })
         .collect();
     match ninjanvr_vod::build_media_playlist_with_resolutions(&recs, Some(&resolutions)) {
@@ -14244,13 +14720,25 @@ pub struct VodInitQuery {
 
 async fn vod_init_mp4(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath((camera, start, end)): AxumPath<(String, f64, f64)>,
     Query(q): Query<VodInitQuery>,
 ) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let recs = existing_recordings_for_vod(&state, &camera, start, end);
     let start_idx = q.seg.unwrap_or(1).saturating_sub(1);
     for rec in recs.into_iter().skip(start_idx) {
-        let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+        let Some(disk_path) = ensure_path_within_media_dir(
+            &state.media_dir,
+            &resolve_recording_disk_path(&state.media_dir, &rec.path),
+        ) else {
+            continue;
+        };
         if let Ok(Ok(init_bytes)) =
             tokio::task::spawn_blocking(move || ninjanvr_vod::build_init_mp4(&disk_path)).await
         {
@@ -14262,8 +14750,15 @@ async fn vod_init_mp4(
 
 async fn vod_segment_m4s(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath((camera, start, end, segment)): AxumPath<(String, f64, f64, String)>,
 ) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera)
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Some(num_str) = segment
         .strip_prefix("seg-")
         .and_then(|s| s.split('-').next())
@@ -14287,7 +14782,12 @@ async fn vod_segment_m4s(
         .take(seq_num - 1)
         .map(|r| r.duration.max(0.0))
         .sum::<f64>();
-    let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
+    let Some(disk_path) = ensure_path_within_media_dir(
+        &state.media_dir,
+        &resolve_recording_disk_path(&state.media_dir, &rec.path),
+    ) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     match tokio::task::spawn_blocking(move || {
         ninjanvr_vod::build_media_segment_m4s(&disk_path, seq_num as u32, base_time)
     })
@@ -14552,7 +15052,7 @@ pub async fn new_app_state(
 
     // Seed 30 initial stats_history points so all 30 bars in /system#general and /system#cameras render with zero 0-padding
     {
-        let Json(base_snap) = api_stats(State(state.clone())).await;
+        let base_snap = compute_stats_snapshot(&state).await;
         let now_ts = unix_now();
         let mut hist = state.stats_history.write().await;
         for i in (0..30).rev() {
@@ -14586,7 +15086,7 @@ pub async fn new_app_state(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let Json(stats_val) = api_stats(State(stats_state.clone())).await;
+                let stats_val = compute_stats_snapshot(&stats_state).await;
                 {
                     let mut hist = stats_state.stats_history.write().await;
                     hist.push_back(stats_val.clone());
@@ -30364,6 +30864,671 @@ cameras:
                 .unwrap();
             assert_eq!(r_fed_bad.status(), StatusCode::BAD_REQUEST);
         }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn security_round16_critical_audit_findings_regression_work() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-r16-crit-audit-{}", rand::random::<u64>()));
+        let web_dir = tmp_dir.join("web");
+        let media_dir = tmp_dir.join("media");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::create_dir_all(&media_dir).unwrap();
+        std::fs::write(web_dir.join("index.html"), "<html>Console v2</html>").unwrap();
+
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        let yaml = format!(
+            r#"
+mqtt:
+  enabled: false
+  user: mqtt_admin
+  password: "mqtt_super_secret_password"
+database:
+  path: {}
+auth:
+  enabled: true
+genai:
+  enabled: true
+  provider: openai
+  api_key: "sk-r16-super-secret-genai-key"
+  base_url: "https://saved-llm.example.invalid/v1"
+go2rtc:
+  streams:
+    front_door: "rtsp://camuser:campass123@192.0.2.10:554/main"
+    front_door_sub: "rtsp://camuser:campass123@192.0.2.10:554/sub"
+    backyard: "rtsp://byuser:bypass456@192.0.2.20:554/main"
+    backyard_sub: "rtsp://byuser:bypass456@192.0.2.20:554/sub"
+camera_groups:
+  mixed_group:
+    order: 1
+    cameras: [front_door, backyard]
+  forbidden_group:
+    order: 2
+    cameras: [backyard]
+cameras:
+  front_door:
+    enabled: true
+    webui_url: "http://192.0.2.10:1"
+    onvif:
+      host: "http://onvifuser:onvifpass789@192.0.2.10:1"
+      port: 1
+      user: onvifuser
+      password: "onvif_secret_password"
+      timeout_sec: 1
+    ffmpeg:
+      inputs:
+        - path: rtsp://camuser:campass123@192.0.2.10:554/main
+          roles: [record, detect]
+  backyard:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://byuser:bypass456@192.0.2.20:554/main
+          roles: [record, detect]
+  front-door:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://192.0.2.30:554/main
+          roles: [record, detect]
+"#,
+            db_path.display()
+        );
+        std::fs::write(&cfg_path, yaml).unwrap();
+
+        let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+            .await
+            .unwrap();
+        state
+            .db
+            .create_user_with_cameras("scoped_fd", "pass1234", "operator", "front_door", 1000)
+            .unwrap();
+
+        let auth_app = build_router_with_auth(state.clone(), true);
+        let now = unix_now();
+        let mint_jwt = |sub: &str, role: &str, cams: &str| -> String {
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &JwtClaims {
+                    sub: sub.to_string(),
+                    role: role.to_string(),
+                    allowed_cameras: Some(cams.to_string()),
+                    iat: now,
+                    exp: now + 3600,
+                },
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            )
+            .unwrap()
+        };
+        let admin_bearer = format!("Bearer {}", mint_jwt("admin", "admin", "*"));
+        let scoped_bearer = format!("Bearer {}", mint_jwt("scoped_fd", "operator", "front_door"));
+
+        // =========================================================================
+        // 1. [R16-CRIT-01] Config/ONVIF Scrubbing, Save Restore, Scoped Config, & Camera Proxy
+        // =========================================================================
+        let r_raw = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config/raw")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_raw.status(), StatusCode::OK);
+        let raw_yaml_str: String =
+            serde_json::from_slice(&to_bytes(r_raw.into_body(), 65536).await.unwrap()).unwrap();
+        for secret in [
+            "campass123",
+            "bypass456",
+            "mqtt_super_secret_password",
+            "onvif_secret_password",
+            "onvifpass789",
+            "sk-r16-super-secret-genai-key",
+        ] {
+            assert!(
+                !raw_yaml_str.contains(secret),
+                "GET /api/config/raw must scrub secret '{secret}'"
+            );
+        }
+
+        // Saving the scrubbed YAML via POST /api/config/save restores secrets on disk
+        let r_save = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/save")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::from(raw_yaml_str.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_save.status(), StatusCode::OK);
+        let saved_disk = std::fs::read_to_string(&cfg_path).unwrap();
+        for secret in [
+            "campass123",
+            "bypass456",
+            "mqtt_super_secret_password",
+            "onvif_secret_password",
+            "sk-r16-super-secret-genai-key",
+        ] {
+            assert!(
+                saved_disk.contains(secret),
+                "POST /api/config/save must restore secret '{secret}' on disk instead of clobbering"
+            );
+        }
+
+        // POST /api/config/structured returns scrubbed raw_yaml while keeping secrets on disk
+        let r_struct = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/structured")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "ui": {
+                                "timezone": "UTC"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_struct.status(), StatusCode::OK);
+        let struct_json: Value =
+            serde_json::from_slice(&to_bytes(r_struct.into_body(), 65536).await.unwrap()).unwrap();
+        let struct_raw_yaml = struct_json["raw_yaml"].as_str().unwrap();
+        assert!(!struct_raw_yaml.contains("campass123"));
+        assert!(!struct_raw_yaml.contains("sk-r16-super-secret-genai-key"));
+        let disk_after_struct = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(disk_after_struct.contains("campass123"));
+        assert!(disk_after_struct.contains("sk-r16-super-secret-genai-key"));
+
+        // Scoped GET /api/config filters cameras, go2rtc.streams, and camera_groups
+        let r_cfg_scoped = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_cfg_scoped.status(), StatusCode::OK);
+        let cfg_scoped_json: Value =
+            serde_json::from_slice(&to_bytes(r_cfg_scoped.into_body(), 65536).await.unwrap())
+                .unwrap();
+        assert!(cfg_scoped_json["cameras"].get("front_door").is_some());
+        assert!(cfg_scoped_json["cameras"].get("backyard").is_none());
+        let go2rtc_streams = cfg_scoped_json["go2rtc"]["streams"].as_object().unwrap();
+        assert!(go2rtc_streams.contains_key("front_door"));
+        assert!(go2rtc_streams.contains_key("front_door_sub"));
+        assert!(!go2rtc_streams.contains_key("backyard"));
+        assert!(!go2rtc_streams.contains_key("backyard_sub"));
+        let cam_groups = cfg_scoped_json["camera_groups"].as_object().unwrap();
+        assert_eq!(cam_groups["mixed_group"]["cameras"], json!(["front_door"]));
+        assert!(!cam_groups.contains_key("forbidden_group"));
+
+        // ONVIF ptz/info scrubs onvif.host and error messages
+        let r_ptz_info = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/ptz/info?timeout_ms=25")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_ptz_info.status(), StatusCode::OK);
+        let ptz_info_bytes = to_bytes(r_ptz_info.into_body(), 16384).await.unwrap();
+        let ptz_info_str = std::str::from_utf8(&ptz_info_bytes).unwrap();
+        assert!(
+            !ptz_info_str.contains("onvifpass789"),
+            "ptz/info must scrub credentials in onvif.host and SOAP error"
+        );
+
+        // Camera WebUI proxy rejects traversal/authority injection in subpath with 400 BAD_REQUEST
+        for bad_proxy_uri in [
+            "/api/camera-proxy/front_door/evil@attacker.example/login",
+            "/api/camera-proxy/front_door/a..b/index.html",
+        ] {
+            let r_proxy_bad = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(bad_proxy_uri)
+                        .header(header::AUTHORIZATION, &admin_bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r_proxy_bad.status(), StatusCode::BAD_REQUEST);
+        }
+        let r_proxy_direct_bad =
+            handle_camera_webui_proxy(&state, "front_door", "../admin", None).await;
+        assert_eq!(r_proxy_direct_bad.status(), StatusCode::BAD_REQUEST);
+
+        // =========================================================================
+        // 2. [R16-CRIT-02] Canonical Path Normalization & Static Media Camera Attribution
+        // =========================================================================
+        assert_eq!(
+            normalize_http_path_for_auth("/api//front_door/%72ecordings/"),
+            Some("/api/front_door/recordings".to_string())
+        );
+        assert_eq!(normalize_http_path_for_auth("/api/../users"), None);
+        assert_eq!(normalize_http_path_for_auth("/api/%2e%2e/users"), None);
+
+        // Percent-encoded, trailing-slash, and double-slash admin-only bypasses are blocked for non-admin
+        for (method, bypass_uri) in [
+            ("DELETE", "/api/front_door/%72ecordings"),
+            ("DELETE", "/api/front_door/recordings/"),
+            ("GET", "/api/%63onfig/raw"),
+            ("GET", "/api//config/raw"),
+            ("GET", "/vod//backyard/start/0/end/10/master.m3u8"),
+            ("GET", "/vod/clip//backyard/start/0/end/10/master.m3u8"),
+            ("GET", "/vod/"),
+        ] {
+            let r_bypass = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(bypass_uri)
+                        .header(header::AUTHORIZATION, &scoped_bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_bypass.status(),
+                StatusCode::FORBIDDEN,
+                "Path normalization must block {method} {bypass_uri} with 403 FORBIDDEN"
+            );
+        }
+
+        // Static media attribution: -clean snapshots, spoofed event ID prefix, latest_{camera}.jpg, review thumbs
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "front_door-spoof_by".to_string(),
+                camera: "backyard".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: 8000.0,
+                end_time: Some(8005.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.9),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({}),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.9),
+                stationary: false,
+            })
+            .unwrap();
+        assert_eq!(
+            resolve_static_media_camera(&state, "/clips/front_door-spoof_by-clean.jpg").as_deref(),
+            Some("backyard")
+        );
+        assert_eq!(
+            resolve_static_media_camera(&state, "/clips/front_door-front_door-spoof_by-clean.webp")
+                .as_deref(),
+            Some("backyard")
+        );
+        assert_eq!(
+            resolve_static_media_camera(&state, "/clips/front-door-unseeded_ev-clean.webp")
+                .as_deref(),
+            Some("front-door")
+        );
+        assert_eq!(
+            resolve_static_media_camera(&state, "/clips/latest_backyard.jpg").as_deref(),
+            Some("backyard")
+        );
+        assert_eq!(
+            resolve_static_media_camera(&state, "/clips/review/thumb-front-door-rev1.webp")
+                .as_deref(),
+            Some("front-door")
+        );
+        assert_eq!(
+            resolve_static_media_camera(&state, "/clips/review/thumb-front_door-1700-abc-1.webp")
+                .as_deref(),
+            Some("front_door")
+        );
+
+        // =========================================================================
+        // 3. [R16-CRIT-03] VOD Handler Guards, ensure_path_within_media_dir, & Privacy Mask on latest.jpg
+        // =========================================================================
+        // Recording row pointing outside media_dir is rejected by existing_recordings_for_vod
+        let outside_mp4 = tmp_dir.join("outside_secret.mp4");
+        std::fs::write(&outside_mp4, b"OUTSIDE_MP4_DATA").unwrap();
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "rec_outside_r16".to_string(),
+                camera: "front_door".to_string(),
+                path: outside_mp4.to_string_lossy().to_string(),
+                start_time: 9000.0,
+                end_time: 9010.0,
+                duration: 10.0,
+                motion: 1,
+                objects: 1,
+                dbfs: -20,
+                segment_size: 0.1,
+                regions: 1,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        assert!(existing_recordings_for_vod(&state, "front_door", 8990.0, 9020.0).is_empty());
+
+        // Invalid camera ID on /api/{camera}/latest.jpg returns 400 BAD_REQUEST
+        let r_bad_cam_latest = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front..door/latest.jpg")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_bad_cam_latest.status(), StatusCode::BAD_REQUEST);
+
+        // Privacy mask is enforced on state.latest_frames AND clips/latest_{camera}.jpg
+        let mut white_img = image::RgbImage::new(64, 64);
+        for p in white_img.pixels_mut() {
+            *p = image::Rgb([250, 250, 250]);
+        }
+        let white_jpeg = ninjanvr_vision::encode_image_jpeg(&white_img).unwrap();
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("front_door").unwrap().privacy_mask =
+                json!(["0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0"]);
+        }
+        state
+            .latest_frames
+            .write()
+            .await
+            .insert("front_door".to_string(), white_jpeg.clone());
+        let r_masked_mem = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/latest.jpg")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_masked_mem.status(), StatusCode::OK);
+        let masked_mem_bytes = to_bytes(r_masked_mem.into_body(), 65536).await.unwrap();
+        let masked_mem_img = image::load_from_memory(&masked_mem_bytes)
+            .unwrap()
+            .to_rgb8();
+        assert!(
+            masked_mem_img.get_pixel(32, 32).0[0] < 30,
+            "state.latest_frames must apply privacy_mask before returning latest.jpg"
+        );
+
+        state.latest_frames.write().await.remove("front_door");
+        let clips_dir = media_dir.join("clips");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        std::fs::write(clips_dir.join("latest_front_door.jpg"), &white_jpeg).unwrap();
+        let r_masked_disk = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/latest.jpg")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_masked_disk.status(), StatusCode::OK);
+        let masked_disk_bytes = to_bytes(r_masked_disk.into_body(), 65536).await.unwrap();
+        let masked_disk_img = image::load_from_memory(&masked_disk_bytes)
+            .unwrap()
+            .to_rgb8();
+        assert!(
+            masked_disk_img.get_pixel(32, 32).0[0] < 30,
+            "clips/latest_front_door.jpg must apply privacy_mask before returning latest.jpg"
+        );
+
+        // =========================================================================
+        // 4. [R16-CRIT-04] MCP set_security_profile, /api/cases, FP Signatures, & Telemetry Scoping
+        // =========================================================================
+        // Scoped operator cannot globally disarm NVR via MCP set_security_profile
+        let r_mcp_disarm = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mcp")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "set_security_profile",
+                                "arguments": { "profile": "disarmed" }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_mcp_disarm.status(), StatusCode::FORBIDDEN);
+
+        // Cases: admin creates case referencing backyard event; scoped user cannot read or overwrite it
+        state
+            .db
+            .create_case(
+                "case_admin_by",
+                "Backyard Investigation",
+                Some("Confidential backyard case"),
+                &["front_door-spoof_by".to_string()],
+                &[],
+            )
+            .unwrap();
+        let r_cases_scoped = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/cases")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_cases_scoped.status(), StatusCode::OK);
+        let cases_arr: Vec<Value> =
+            serde_json::from_slice(&to_bytes(r_cases_scoped.into_body(), 16384).await.unwrap())
+                .unwrap();
+        assert!(
+            cases_arr.iter().all(|c| c["id"] != "case_admin_by"),
+            "Scoped user must not see cases referencing forbidden camera events"
+        );
+
+        // Scoped user cannot overwrite case_admin_by or attach forbidden event IDs
+        for bad_case_payload in [
+            json!({
+                "id": "case_admin_by",
+                "name": "Clobbered",
+                "event_ids": []
+            }),
+            json!({
+                "id": "case_scoped_spoof",
+                "name": "Forbidden Event Ref",
+                "event_ids": ["front_door-spoof_by"]
+            }),
+        ] {
+            let r_case_forbid = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/cases")
+                        .header(header::AUTHORIZATION, &scoped_bearer)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(bad_case_payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r_case_forbid.status(), StatusCode::FORBIDDEN);
+        }
+
+        // FP signatures, stats, stats/history, recordings/summary, and recordings/storage are scoped
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_fp_fd_r16".to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: 8000.0,
+                end_time: Some(8005.0),
+                has_clip: false,
+                has_snapshot: false,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.8),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.1, 0.1, 0.2, 0.2])),
+                data: json!({"box": [0.1, 0.1, 0.2, 0.2]}),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.8),
+                stationary: false,
+            })
+            .unwrap();
+        state
+            .db
+            .set_event_false_positive("ev_fp_fd_r16", true)
+            .unwrap();
+        state
+            .db
+            .set_event_false_positive("front_door-spoof_by", true)
+            .unwrap();
+        state
+            .db
+            .insert_recording(&ninjanvr_db::RecordingRow {
+                id: "rec_by_r16".to_string(),
+                camera: "backyard".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-04/12/backyard/10.00.mp4".to_string(),
+                start_time: 8000.0,
+                end_time: 8010.0,
+                duration: 10.0,
+                motion: 2,
+                objects: 1,
+                dbfs: -20,
+                segment_size: 1.5,
+                regions: 1,
+                motion_heatmap: None,
+            })
+            .unwrap();
+
+        let r_fp = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/false_positives/signatures")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let fp_arr: Vec<Value> =
+            serde_json::from_slice(&to_bytes(r_fp.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(fp_arr.len(), 1);
+        assert_eq!(fp_arr[0]["camera"], "front_door");
+
+        let r_stats = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/stats")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let stats_json: Value =
+            serde_json::from_slice(&to_bytes(r_stats.into_body(), 65536).await.unwrap()).unwrap();
+        assert!(stats_json["cameras"].get("front_door").is_some());
+        assert!(stats_json["cameras"].get("backyard").is_none());
+        assert!(
+            stats_json["service"]["camera_storage"]
+                .get("backyard")
+                .is_none()
+        );
+
+        let r_rec_sum = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recordings/summary")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let rec_sum_json: Value =
+            serde_json::from_slice(&to_bytes(r_rec_sum.into_body(), 16384).await.unwrap()).unwrap();
+        assert!(rec_sum_json.get("backyard").is_none());
+
+        let r_rec_stor = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/recordings/storage")
+                    .header(header::AUTHORIZATION, &scoped_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let rec_stor_json: Value =
+            serde_json::from_slice(&to_bytes(r_rec_stor.into_body(), 16384).await.unwrap())
+                .unwrap();
+        assert!(rec_stor_json.get("backyard").is_none());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
