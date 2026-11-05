@@ -746,6 +746,13 @@ export function sanitizeFloorplanUrl(
   const trimmed = rawUrl.trim();
   if (!trimmed || /[\u0000-\u001F\u007F]/.test(trimmed)) return "";
   if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
+    if (
+      trimmed.includes("\\") ||
+      trimmed.includes("..") ||
+      /%2e%2e|%5c/i.test(trimmed)
+    ) {
+      return "";
+    }
     return trimmed;
   }
   if (/^https?:\/\//i.test(trimmed)) {
@@ -759,7 +766,7 @@ export function sanitizeFloorplanUrl(
     try {
       const decoded = globalThis.atob(b64);
       if (
-        /<script|javascript:|vbscript:|onload\s*=|onerror\s*=|<foreignobject/i.test(
+        /<script|<iframe|<object|<embed|<use\b|<foreignobject|javascript:|vbscript:|data:\s*text\/html|\bon[a-z]+\s*=|&#/i.test(
           decoded
         )
       ) {
@@ -918,13 +925,20 @@ export function resolveSafeAlertThumbSrc(
   thumbPath: string | null | undefined,
   camera: string
 ): string {
-  const encodedCam = encodeURIComponent(camera || "camera");
+  const cleanCam = (camera || "").trim() || "camera";
+  const encodedCam = encodeURIComponent(cleanCam);
   const fallback = `/api/${encodedCam}/latest.webp`;
   if (typeof thumbPath !== "string") return fallback;
   const trimmed = thumbPath.trim();
-  if (!trimmed || /[\u0000-\u001F\u007F]/.test(trimmed)) return fallback;
+  if (!trimmed || /[\u0000-\u001F\u007F\\]/.test(trimmed)) return fallback;
   const stripped = trimmed.replace(/^\/media\/[^/]+/, "").trim();
-  if (!stripped || !stripped.startsWith("/") || stripped.startsWith("//")) {
+  if (
+    !stripped ||
+    !stripped.startsWith("/") ||
+    stripped.startsWith("//") ||
+    stripped.includes("..") ||
+    /%2e%2e|%5c/i.test(stripped)
+  ) {
     return fallback;
   }
   return stripped;
@@ -1038,13 +1052,20 @@ export interface PtzMoveLifecycleController {
 export function createPtzMoveLifecycle(
   options: PtzMoveLifecycleOptions
 ): PtzMoveLifecycleController {
-  let currentCamera = options.camera;
+  let currentCamera = (options.camera || "").trim();
   const speed = options.speed ?? 0.5;
   const fetchFn: typeof fetch =
     options.fetchImpl ?? ((input, init) => fetch(input, init));
   let moving = false;
   let activeDirection: PtzMoveDirection | null = null;
   let disposed = false;
+  let pendingOp: Promise<void> = Promise.resolve();
+
+  const enqueueOp = (task: () => Promise<void>): Promise<void> => {
+    const next = pendingOp.then(task, task);
+    pendingOp = next.catch(() => {});
+    return next;
+  };
 
   const sendStopForCamera = async (targetCam: string) => {
     if (!targetCam) return;
@@ -1067,39 +1088,46 @@ export function createPtzMoveLifecycle(
     const camToStop = currentCamera;
     moving = false;
     activeDirection = null;
-    await sendStopForCamera(camToStop);
+    await enqueueOp(() => sendStopForCamera(camToStop));
   };
 
   const startMove = async (direction: PtzMoveDirection) => {
     if (disposed || !currentCamera) return;
+    if (moving && activeDirection === direction) {
+      await pendingOp;
+      return;
+    }
     const targetCam = currentCamera;
     moving = true;
     activeDirection = direction;
     const payload = buildPtzMovePayload(direction, speed, "continuous");
     options.onMoveStarted?.(targetCam, direction);
-    try {
-      await fetchFn(`/api/${encodeURIComponent(targetCam)}/ptz/move`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify(payload),
-      });
-    } catch {
-      // ignore transient network error
-    }
+    await enqueueOp(async () => {
+      try {
+        await fetchFn(`/api/${encodeURIComponent(targetCam)}/ptz/move`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify(payload),
+        });
+      } catch {
+        // ignore transient network error
+      }
+    });
   };
 
   const setCamera = async (nextCamera: string) => {
-    if (nextCamera === currentCamera) return;
+    const cleanNext = (nextCamera || "").trim();
+    if (cleanNext === currentCamera) return;
     if (moving) {
       const prevCam = currentCamera;
       moving = false;
       activeDirection = null;
-      currentCamera = nextCamera;
-      await sendStopForCamera(prevCam);
+      currentCamera = cleanNext;
+      await enqueueOp(() => sendStopForCamera(prevCam));
       return;
     }
-    currentCamera = nextCamera;
+    currentCamera = cleanNext;
   };
 
   return {
@@ -1135,9 +1163,12 @@ export const TacticalPtzHudOverlay: React.FC<{
   onPtzUpdateRef.current = onPtzUpdate;
   const ptzInfoRef = useRef(ptzInfo);
   ptzInfoRef.current = ptzInfo;
+  const activeCameraRef = useRef<string | null>(camera);
+  activeCameraRef.current = camera;
   const lifecycleRef = useRef<PtzMoveLifecycleController | null>(null);
 
   useEffect(() => {
+    activeCameraRef.current = camera;
     if (!ptzEnabled) {
       if (lifecycleRef.current) {
         void lifecycleRef.current.dispose();
@@ -1184,6 +1215,9 @@ export const TacticalPtzHudOverlay: React.FC<{
     }
 
     return () => {
+      if (activeCameraRef.current === camera) {
+        activeCameraRef.current = null;
+      }
       if (typeof window !== "undefined") {
         window.removeEventListener("blur", onWindowBlur);
         window.removeEventListener("pagehide", onWindowBlur);
@@ -1265,18 +1299,23 @@ export const TacticalPtzHudOverlay: React.FC<{
 
   const sendPreset = async (preset: string) => {
     const clean = preset.trim();
-    if (!clean) return;
-    stopContinuousMove(false);
+    const targetCam = (camera || "").trim();
+    if (!clean || !targetCam) return;
+    await lifecycleRef.current?.stopMove(false);
     try {
-      const res = await fetch(`/api/${encodeURIComponent(camera)}/ptz/preset`, {
+      const res = await fetch(`/api/${encodeURIComponent(targetCam)}/ptz/preset`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
         body: JSON.stringify({ preset: clean }),
       });
-      if (res.ok && onPtzUpdate) {
-        onPtzUpdate(camera, {
-          ...(ptzInfo || { enabled: true }),
+      if (
+        res.ok &&
+        activeCameraRef.current === targetCam &&
+        onPtzUpdateRef.current
+      ) {
+        onPtzUpdateRef.current(targetCam, {
+          ...(ptzInfoRef.current || { enabled: true }),
           active_preset: clean,
         });
       }
@@ -1529,13 +1568,17 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const [pttResetEpoch, setPttResetEpoch] = useState<number>(0);
   const activePttCamerasRef = useRef<Set<string>>(new Set());
   const ptzFetchedCamsRef = useRef<Set<string>>(new Set());
+  const ptzInFlightCamsRef = useRef<Set<string>>(new Set());
+  const isMountedRef = useRef<boolean>(true);
   const mapSaveTimerRef = useRef<number | null>(null);
   const activeFileReaderRef = useRef<FileReader | null>(null);
   const mapSvgRef = useRef<SVGSVGElement | null>(null);
   const floorplanFileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       if (mapSaveTimerRef.current !== null) {
         window.clearTimeout(mapSaveTimerRef.current);
         mapSaveTimerRef.current = null;
@@ -1615,6 +1658,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         setWallPreviewPoint(null);
         setSelectedRoomId(null);
         setSelectedWallIdx(null);
+        setDraggingCam(null);
+        setDraggingAimCam(null);
+        setDraggingRoom(null);
+        setResizingRoom(null);
+        setDraggingWall(null);
       } else if (e.key === "Delete" || e.key === "Backspace") {
         if (selectedRoomId) {
           e.preventDefault();
@@ -1622,12 +1670,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             prev.filter((r) => r.id !== selectedRoomId)
           );
           setSelectedRoomId(null);
+          setDraggingRoom(null);
+          setResizingRoom(null);
         } else if (selectedWallIdx !== null) {
           e.preventDefault();
           setFloorplanWalls((prev) =>
             prev.filter((_, idx) => idx !== selectedWallIdx)
           );
           setSelectedWallIdx(null);
+          setDraggingWall(null);
         }
       }
     };
@@ -1667,18 +1718,26 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     let cancelled = false;
     const cams = config?.cameras || {};
     for (const [camName, camCfg] of Object.entries(cams)) {
-      if (isCameraPtzEnabled(camCfg) && !ptzFetchedCamsRef.current.has(camName)) {
-        ptzFetchedCamsRef.current.add(camName);
+      if (
+        isCameraPtzEnabled(camCfg) &&
+        !ptzFetchedCamsRef.current.has(camName) &&
+        !ptzInFlightCamsRef.current.has(camName)
+      ) {
+        ptzInFlightCamsRef.current.add(camName);
         fetch(`/api/${encodeURIComponent(camName)}/ptz/info`, {
           credentials: "include",
         })
           .then((res) => (res.ok ? res.json() : null))
           .then((data: CameraPtzInfoResponse | null) => {
-            if (!cancelled && data) {
+            ptzInFlightCamsRef.current.delete(camName);
+            if (!cancelled && isMountedRef.current && data) {
+              ptzFetchedCamsRef.current.add(camName);
               setPtzInfoByCam((prev) => ({ ...prev, [camName]: data }));
             }
           })
-          .catch(() => {});
+          .catch(() => {
+            ptzInFlightCamsRef.current.delete(camName);
+          });
       }
     }
     return () => {
@@ -1761,8 +1820,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const handleSaveMapPlacements = async () => {
     try {
       const cfgRes = await fetch("/api/config", { credentials: "include" });
-      if (!cfgRes.ok) return;
+      if (!cfgRes.ok || !isMountedRef.current) return;
       const currentCfg = await cfgRes.json();
+      if (!isMountedRef.current) return;
       if (currentCfg && currentCfg.cameras) {
         const payload = buildFloorplanSavePayload({
           existingCameras: currentCfg.cameras,
@@ -1781,8 +1841,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           credentials: "include",
           body: JSON.stringify(payload),
         });
-        if (saveRes.ok) {
+        if (saveRes.ok && isMountedRef.current) {
           const savedData = await saveRes.json().catch(() => ({}));
+          if (!isMountedRef.current) return;
           if (savedData.config) {
             setConfig(savedData.config);
           }
@@ -1792,7 +1853,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           }
           mapSaveTimerRef.current = window.setTimeout(() => {
             mapSaveTimerRef.current = null;
-            setMapSaveStatus(null);
+            if (isMountedRef.current) {
+              setMapSaveStatus(null);
+            }
           }, 2500);
         }
       }
@@ -2456,14 +2519,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 onClick={() => {
                   setSelectedCamera(item.camera);
                   setLiveLayout("focus");
-                  setTimeShiftTs(Math.floor(item.start_time));
+                  setTimeShiftTs(sanitizeTimeShiftSeek(item.start_time));
                 }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
                     setSelectedCamera(item.camera);
                     setLiveLayout("focus");
-                    setTimeShiftTs(Math.floor(item.start_time));
+                    setTimeShiftTs(sanitizeTimeShiftSeek(item.start_time));
                   }
                 }}
               >
@@ -4341,6 +4404,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 setResizingRoom(null);
                 setDraggingWall(null);
               }}
+              onPointerCancel={() => {
+                setCursorNorm(null);
+                setRoomDraft(null);
+                setDraggingCam(null);
+                setDraggingAimCam(null);
+                setDraggingRoom(null);
+                setResizingRoom(null);
+                setDraggingWall(null);
+              }}
             >
               <defs>
                 <pattern id="tacticalGrid" width="50" height="50" patternUnits="userSpaceOnUse">
@@ -5042,7 +5114,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       strokeWidth={isSelected ? 2 : 1.2}
                       style={{ pointerEvents: "none" }}
                     />
-                    {(mapEditMode || isSelected) && (
+                    {mapEditMode && (
                       <>
                         <line
                           x1={cx}
@@ -5067,7 +5139,6 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                             if (isDrawingMode) return;
                             e.stopPropagation();
                             setSelectedCamera(cam);
-                            setMapEditMode(true);
                             setMapTool("select");
                             setDraggingAimCam(cam);
                           }}
@@ -5102,9 +5173,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         if (isDrawingMode) return;
                         e.stopPropagation();
                         setSelectedCamera(cam);
-                        setMapEditMode(true);
-                        setMapTool("select");
-                        setDraggingCam(cam);
+                        if (mapEditMode) {
+                          setMapTool("select");
+                          setDraggingCam(cam);
+                        }
                       }}
                     />
                     <text
@@ -5119,9 +5191,10 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         if (isDrawingMode) return;
                         e.stopPropagation();
                         setSelectedCamera(cam);
-                        setMapEditMode(true);
-                        setMapTool("select");
-                        setDraggingCam(cam);
+                        if (mapEditMode) {
+                          setMapTool("select");
+                          setDraggingCam(cam);
+                        }
                       }}
                     >
                       {cam.toUpperCase()}
@@ -5644,9 +5717,12 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         setFloorplanWalls((prev) =>
                           prev.filter((_, idx) => idx !== wIdx)
                         );
-                        if (selectedWallIdx === wIdx) {
-                          setSelectedWallIdx(null);
-                        }
+                        setDraggingWall(null);
+                        setSelectedWallIdx((prevIdx) => {
+                          if (prevIdx === null) return null;
+                          if (prevIdx === wIdx) return null;
+                          return prevIdx > wIdx ? prevIdx - 1 : prevIdx;
+                        });
                       }}
                       title="Delete wall"
                     >

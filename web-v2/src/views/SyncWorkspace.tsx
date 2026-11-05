@@ -49,13 +49,20 @@ export function resolveSafeSyncThumbSrc(
   thumbPath: string | null | undefined,
   camera: string
 ): string {
-  const encodedCam = encodeURIComponent(camera || "camera");
+  const cleanCam = (camera || "").trim() || "camera";
+  const encodedCam = encodeURIComponent(cleanCam);
   const fallback = `/api/${encodedCam}/latest.webp`;
   if (typeof thumbPath !== "string") return fallback;
   const trimmed = thumbPath.trim();
-  if (!trimmed || /[\u0000-\u001F\u007F]/.test(trimmed)) return fallback;
+  if (!trimmed || /[\u0000-\u001F\u007F\\]/.test(trimmed)) return fallback;
   const stripped = trimmed.replace(/^\/media\/[^/]+/, "").trim();
-  if (!stripped || !stripped.startsWith("/") || stripped.startsWith("//")) {
+  if (
+    !stripped ||
+    !stripped.startsWith("/") ||
+    stripped.startsWith("//") ||
+    stripped.includes("..") ||
+    /%2e%2e|%5c/i.test(stripped)
+  ) {
     return fallback;
   }
   return stripped;
@@ -193,8 +200,18 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
   const config = useNvrStore((s) => s.config);
 
   const safeMasterTs = clampSyncTimestamp(syncMasterTs);
+  const safeSyncSpeed =
+    Number.isFinite(syncSpeed) && syncSpeed > 0
+      ? Math.max(0.25, Math.min(16, syncSpeed))
+      : 1;
   const [committedVodTs, setCommittedVodTs] = useState<number>(() => safeMasterTs);
   const seekDebounceTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (syncMasterTs !== safeMasterTs) {
+      setSyncMasterTs(safeMasterTs);
+    }
+  }, [syncMasterTs, safeMasterTs, setSyncMasterTs]);
 
   useEffect(() => {
     if (seekDebounceTimerRef.current !== null) {
@@ -232,6 +249,7 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
   };
 
   const stepSyncMasterBy = (deltaSec: number) => {
+    if (!Number.isFinite(deltaSec)) return;
     setSyncMasterTs((prev) => clampSyncTimestamp(clampSyncTimestamp(prev) + deltaSec));
   };
 
@@ -394,7 +412,7 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
                   camera={realCam}
                   startTime={vodWindow.startTime}
                   endTime={vodWindow.endTime}
-                  playbackRate={syncSpeed}
+                  playbackRate={safeSyncSpeed}
                   controls={false}
                 />
                 <div className={`nvr-cam-hud pos-${hudPosition}`}>

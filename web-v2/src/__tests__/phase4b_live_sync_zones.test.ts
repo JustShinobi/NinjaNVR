@@ -35,6 +35,7 @@ import {
 import {
   computePolygonSignedArea,
   deduplicatePolygonVertices,
+  hasSelfIntersectingEdges,
   isNonDegeneratePolygon,
   normalizeZonePoint,
   sanitizeCameraGeometryDraft,
@@ -592,5 +593,223 @@ describe("Phase 4B ZonesWorkspace — Pixel-to-Normalized Clamping & Degenerate 
       sanitizeStateRoiConfig({ crop: [0.5, 0.5, 0.5, 0.5], classes: ["closed", "open"] })
         .crop
     ).toEqual([0.5, 0.5, 0.51, 0.51]);
+  });
+
+  test("Cycle 2: createPtzMoveLifecycle serializes in-flight /ptz/move before /ptz/stop on rapid pointer release and deduplicates active direction", async () => {
+    const completionOrder: string[] = [];
+    const gate: { release?: () => void } = {};
+
+    const delayedFetch: typeof fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/ptz/move")) {
+        await new Promise<void>((resolve) => {
+          gate.release = resolve;
+        });
+        completionOrder.push(`DONE:${url}`);
+      } else {
+        completionOrder.push(`DONE:${url}`);
+      }
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }) as typeof fetch;
+
+    const lifecycle = createPtzMoveLifecycle({
+      camera: "  ptz_cam_01  ",
+      speed: 0.5,
+      fetchImpl: delayedFetch,
+    });
+
+    // Fire unawaited startMove("left"), duplicate startMove("left"), and rapid stopMove(false) + window pointerup stopMove(false)
+    const movePromise = lifecycle.startMove("left");
+    const dupMovePromise = lifecycle.startMove("left");
+    expect(lifecycle.isMoving()).toBe(true);
+
+    const stopPromise1 = lifecycle.stopMove(false);
+    const stopPromise2 = lifecycle.stopMove(false);
+    // Synchronously marked stopped so UI/blur handlers see moving=false immediately
+    expect(lifecycle.isMoving()).toBe(false);
+    // /ptz/stop has NOT been sent yet because /ptz/move is still in flight
+    expect(completionOrder).toEqual([]);
+
+    // Release the in-flight /ptz/move network response
+    await Promise.resolve();
+    gate.release?.();
+    await Promise.all([movePromise, dupMovePromise, stopPromise1, stopPromise2]);
+
+    // /ptz/move strictly completes before a single /ptz/stop (no duplicate stop spam, no out-of-order stop-before-move)
+    expect(completionOrder).toEqual([
+      "DONE:/api/ptz_cam_01/ptz/move",
+      "DONE:/api/ptz_cam_01/ptz/stop",
+    ]);
+  });
+
+  test("Cycle 2: URL & thumbnail sanitizers block backslash authority-relative URLs, path traversal, whitespace cameras, and SVG on* / iframe / entity vectors", () => {
+    expect(sanitizeFloorplanUrl("/\\evil.example/floorplan.svg")).toBe("");
+    expect(sanitizeFloorplanUrl("/assets/../../api/logout")).toBe("");
+    expect(sanitizeFloorplanUrl("/assets/%2e%2e/secret")).toBe("");
+    expect(sanitizeFloorplanUrl("/assets/%5cevil")).toBe("");
+
+    const onmouseoverSvgB64 = globalThis.btoa(
+      '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10" onmouseover="alert(1)"/></svg>'
+    );
+    expect(sanitizeFloorplanUrl(`data:image/svg+xml;base64,${onmouseoverSvgB64}`)).toBe("");
+
+    const entitySvgB64 = globalThis.btoa(
+      '<svg xmlns="http://www.w3.org/2000/svg"><a href="&#x6a;avascript:alert(1)"><rect width="10" height="10"/></a></svg>'
+    );
+    expect(sanitizeFloorplanUrl(`data:image/svg+xml;base64,${entitySvgB64}`)).toBe("");
+
+    expect(resolveSafeAlertThumbSrc("/\\evil.example/pixel.webp", "cam_a")).toBe(
+      "/api/cam_a/latest.webp"
+    );
+    expect(resolveSafeAlertThumbSrc("/clips/../../api/logout", "cam_a")).toBe(
+      "/api/cam_a/latest.webp"
+    );
+    expect(resolveSafeAlertThumbSrc("/clips/%2e%2e/api/logout", "   ")).toBe(
+      "/api/camera/latest.webp"
+    );
+
+    expect(resolveSafeSyncThumbSrc("/\\evil.example/pixel.webp", "cam_b")).toBe(
+      "/api/cam_b/latest.webp"
+    );
+    expect(resolveSafeSyncThumbSrc("/clips/../../api/logout", "   ")).toBe(
+      "/api/camera/latest.webp"
+    );
+  });
+
+  test("Cycle 2: ZonesWorkspace clamps slight [0..1] canvas overshoots (1.0 < v <= 1.5), rejects empty tokens & bowties, and sanitizes object/filter/global masks", () => {
+    // 1. Slight canvas pointer overshoot (1.02) clamps to 1.0 instead of dividing by 1920x1080
+    expect(normalizeZonePoint([1.02, 0.5], 1920, 1080)).toEqual([1, 0.5]);
+    expect(
+      sanitizePolygonCoordString("0.2,0.2,1.02,0.2,1.02,0.8,0.2,0.8", 1920, 1080)
+    ).toBe("0.200,0.200,1.000,0.200,1.000,0.800,0.200,0.800");
+    expect(
+      sanitizeTripwireLine(
+        { points: [0.2, 0.5, 1.02, 0.5], direction: "a_to_b" },
+        1920,
+        1080
+      )?.points
+    ).toEqual([0.2, 0.5, 1, 0.5]);
+    expect(
+      sanitizeStateRoiConfig(
+        { crop: [0.5, 0.5, 1.02, 0.9], classes: ["closed", "open"] },
+        1920,
+        1080
+      ).crop
+    ).toEqual([0.5, 0.5, 1, 0.9]);
+
+    // 2. Empty comma tokens and non-numeric array items are rejected rather than coerced via Number("") === 0
+    expect(sanitizePolygonCoordString(",,,,,")).toBeNull();
+    expect(sanitizePolygonCoordString("0.1,0.1,0.5,0.1,0.5,")).toBeNull();
+    expect(sanitizePolygonCoordString("0.1,0.1,0.5,0.1,,0.5")).toBeNull();
+    expect(
+      sanitizeMaskPolygonsValue([[null, null, true, false, "", 0.5]])
+    ).toEqual({
+      sanitized: [],
+      rejectedCount: 1,
+    });
+
+    // 3. Asymmetric 4-vertex self-intersecting bowtie is rejected
+    const asymmetricBowtie: Array<[number, number]> = [
+      [0.1, 0.1],
+      [0.9, 0.9],
+      [0.9, 0.1],
+      [0.1, 0.4],
+    ];
+    expect(hasSelfIntersectingEdges(asymmetricBowtie)).toBe(true);
+    expect(isNonDegeneratePolygon(asymmetricBowtie)).toBe(false);
+    expect(
+      sanitizePolygonCoordString("0.1,0.1,0.9,0.9,0.9,0.1,0.1,0.4")
+    ).toBeNull();
+
+    // 4. Object-form masks ({ coordinates: string }, pixelate objects) and global/per-filter masks are sanitized
+    const arrayOfCoordObjs = sanitizeMaskPolygonsValue(
+      [
+        { coordinates: "0,0,640,0,640,360,0,360" },
+        { coordinates: "0.2,0.2,0.2,0.2,0.2,0.2" },
+      ],
+      1280,
+      720
+    );
+    expect(arrayOfCoordObjs).toEqual({
+      sanitized: [{ coordinates: "0.000,0.000,0.500,0.000,0.500,0.500,0.000,0.500" }],
+      rejectedCount: 1,
+    });
+
+    const pixelatedObjMask = sanitizeMaskPolygonsValue(
+      {
+        mode: "pixelate",
+        block_size: 8,
+        coordinates: "0,0,640,0,640,360,0,360",
+        bad_poly: "0.1,0.1,0.1,0.1,0.1,0.1",
+      },
+      1280,
+      720
+    );
+    expect(pixelatedObjMask).toEqual({
+      sanitized: {
+        mode: "pixelate",
+        block_size: 8,
+        coordinates: "0.000,0.000,0.500,0.000,0.500,0.500,0.000,0.500",
+      },
+      rejectedCount: 1,
+    });
+
+    const cfgWithGlobalAndFilterMasks: NinjaConfigResponse = {
+      version: "0.9.0",
+      safe_mode: false,
+      detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+      motion: {
+        enabled: true,
+        threshold: 30,
+        contour_area: 10,
+        mask: ["0.1,0.1,0.1,0.1,0.1,0.1"],
+      },
+      objects: {
+        track: ["person"],
+        mask: ["0,0,640,0,640,360,0,360"],
+        filters: {
+          person: {
+            min_area: 500,
+            max_area: 100000,
+            min_ratio: 0.2,
+            max_ratio: 5,
+            threshold: 0.7,
+            min_score: 0.5,
+            mask: ["0.2,0.2,0.2,0.2,0.2,0.2"],
+          },
+        },
+      },
+      cameras: {
+        front_door: {
+          ...makeBaseCameraConfig(),
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          objects: {
+            track: ["person"],
+            filters: {
+              person: {
+                min_area: 500,
+                max_area: 100000,
+                min_ratio: 0.2,
+                max_ratio: 5,
+                threshold: 0.7,
+                min_score: 0.5,
+                mask: ["0.3,0.3,0.3,0.3,0.3,0.3", "0,0,640,0,640,360,0,360"],
+              },
+            },
+          },
+        },
+      },
+    };
+
+    const fullSanitized = sanitizeConfigGeometryDraft(cfgWithGlobalAndFilterMasks);
+    expect(fullSanitized.rejectedCount).toBe(3);
+    expect(fullSanitized.cleaned.motion?.mask).toEqual([]);
+    expect(fullSanitized.cleaned.objects?.mask).toEqual([
+      "0.000,0.000,0.500,0.000,0.500,0.500,0.000,0.500",
+    ]);
+    expect(fullSanitized.cleaned.objects?.filters?.person.mask).toEqual([]);
+    expect(
+      fullSanitized.cleaned.cameras.front_door.objects?.filters?.person.mask
+    ).toEqual(["0.000,0.000,0.500,0.000,0.500,0.500,0.000,0.500"]);
   });
 });

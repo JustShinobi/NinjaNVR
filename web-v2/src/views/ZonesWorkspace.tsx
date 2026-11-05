@@ -57,7 +57,7 @@ export function normalizeZonePoint(
     Number.isFinite(detectHeight) && detectHeight > 1 ? detectHeight : 720;
   const rawX = Number.isFinite(pt?.[0]) ? pt[0] : 0;
   const rawY = Number.isFinite(pt?.[1]) ? pt[1] : 0;
-  const isPixelSpace = rawX > 1.0 || rawY > 1.0;
+  const isPixelSpace = rawX > 1.5 || rawY > 1.5;
   const normX = isPixelSpace ? rawX / safeW : rawX;
   const normY = isPixelSpace ? rawY / safeH : rawY;
   return [
@@ -70,6 +70,8 @@ export function deduplicatePolygonVertices(
   points: Array<[number, number]>,
   minVertexDist: number = 1e-4
 ): Array<[number, number]> {
+  const safeMinDist =
+    Number.isFinite(minVertexDist) && minVertexDist >= 0 ? minVertexDist : 1e-4;
   const out: Array<[number, number]> = [];
   for (const pt of points) {
     if (!Array.isArray(pt) || pt.length < 2) continue;
@@ -77,17 +79,19 @@ export function deduplicatePolygonVertices(
     const prev = out[out.length - 1];
     if (
       prev &&
-      Math.hypot(pt[0] - prev[0], pt[1] - prev[1]) <= minVertexDist
+      Math.hypot(pt[0] - prev[0], pt[1] - prev[1]) <= safeMinDist
     ) {
       continue;
     }
     out.push([pt[0], pt[1]]);
   }
-  if (out.length >= 2) {
+  while (out.length >= 2) {
     const first = out[0];
     const last = out[out.length - 1];
-    if (Math.hypot(first[0] - last[0], first[1] - last[1]) <= minVertexDist) {
+    if (Math.hypot(first[0] - last[0], first[1] - last[1]) <= safeMinDist) {
       out.pop();
+    } else {
+      break;
     }
   }
   return out;
@@ -114,11 +118,53 @@ export function computePolygonSignedArea(
   return sum / 2;
 }
 
+function segmentsProperlyIntersect(
+  a: [number, number],
+  b: [number, number],
+  c: [number, number],
+  d: [number, number]
+): boolean {
+  const cross = (
+    p: [number, number],
+    q: [number, number],
+    r: [number, number]
+  ) => (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+  const o1 = cross(a, b, c);
+  const o2 = cross(a, b, d);
+  const o3 = cross(c, d, a);
+  const o4 = cross(c, d, b);
+  return o1 * o2 < -1e-9 && o3 * o4 < -1e-9;
+}
+
+export function hasSelfIntersectingEdges(
+  points: Array<[number, number]>
+): boolean {
+  if (!Array.isArray(points) || points.length < 4) return false;
+  const n = points.length;
+  for (let i = 0; i < n; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % n];
+    for (let j = i + 2; j < n; j++) {
+      if (i === 0 && j === n - 1) continue;
+      const c = points[j];
+      const d = points[(j + 1) % n];
+      if (segmentsProperlyIntersect(a, b, c, d)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 export function isNonDegeneratePolygon(
   points: Array<[number, number]>,
   minArea: number = 1e-5,
   minSpan: number = 0.002
 ): boolean {
+  const safeMinArea =
+    Number.isFinite(minArea) && minArea > 0 ? minArea : 1e-5;
+  const safeMinSpan =
+    Number.isFinite(minSpan) && minSpan > 0 ? minSpan : 0.002;
   const deduped = deduplicatePolygonVertices(points);
   if (deduped.length < 3) return false;
   let minX = Infinity;
@@ -131,10 +177,13 @@ export function isNonDegeneratePolygon(
     if (x > maxX) maxX = x;
     if (y > maxY) maxY = y;
   }
-  if (maxX - minX < minSpan || maxY - minY < minSpan) {
+  if (maxX - minX < safeMinSpan || maxY - minY < safeMinSpan) {
     return false;
   }
-  return Math.abs(computePolygonSignedArea(deduped)) >= minArea;
+  if (hasSelfIntersectingEdges(deduped)) {
+    return false;
+  }
+  return Math.abs(computePolygonSignedArea(deduped)) >= safeMinArea;
 }
 
 export function sanitizePolygonCoordString(
@@ -145,19 +194,20 @@ export function sanitizePolygonCoordString(
   if (typeof coordStr !== "string") return null;
   const trimmed = coordStr.trim();
   if (!trimmed) return null;
-  const parts = trimmed.split(",").map((s) => Number(s.trim()));
+  const tokens = trimmed.split(",").map((s) => s.trim());
   if (
-    parts.length < 6 ||
-    parts.length % 2 !== 0 ||
-    parts.some((n) => !Number.isFinite(n))
+    tokens.length < 6 ||
+    tokens.length % 2 !== 0 ||
+    tokens.some((tok) => tok === "" || !Number.isFinite(Number(tok)))
   ) {
     return null;
   }
+  const parts = tokens.map((tok) => Number(tok));
   const safeW =
     Number.isFinite(detectWidth) && detectWidth > 1 ? detectWidth : 1280;
   const safeH =
     Number.isFinite(detectHeight) && detectHeight > 1 ? detectHeight : 720;
-  const isPixelSpace = parts.some((v) => v > 1.0);
+  const isPixelSpace = parts.some((v) => v > 1.5);
   const rawPts: Array<[number, number]> = [];
   for (let i = 0; i < parts.length; i += 2) {
     const nx = isPixelSpace ? parts[i] / safeW : parts[i];
@@ -191,7 +241,7 @@ export function sanitizeMaskPolygonsValue(
   if (Array.isArray(maskVal)) {
     if (maskVal.length === 0) return { sanitized: [], rejectedCount: 0 };
     let rejectedCount = 0;
-    const out: string[] = [];
+    const out: unknown[] = [];
     for (const item of maskVal) {
       if (typeof item === "string") {
         if (!item.trim()) continue;
@@ -206,9 +256,21 @@ export function sanitizeMaskPolygonsValue(
           rejectedCount += 1;
         }
       } else if (Array.isArray(item)) {
-        const flat = item.flat().map((v) => Number(v));
+        const flat = item.flat();
+        const hasInvalidElem = flat.some(
+          (v) =>
+            v === null ||
+            v === undefined ||
+            typeof v === "boolean" ||
+            (typeof v === "string" && v.trim() === "") ||
+            !Number.isFinite(Number(v))
+        );
+        if (hasInvalidElem) {
+          rejectedCount += 1;
+          continue;
+        }
         const clean = sanitizePolygonCoordString(
-          flat.join(","),
+          flat.map((v) => Number(v)).join(","),
           detectWidth,
           detectHeight
         );
@@ -217,9 +279,77 @@ export function sanitizeMaskPolygonsValue(
         } else {
           rejectedCount += 1;
         }
+      } else if (
+        item &&
+        typeof item === "object" &&
+        "coordinates" in (item as Record<string, unknown>)
+      ) {
+        const objItem = item as Record<string, unknown>;
+        const rawCoords =
+          typeof objItem.coordinates === "string" ? objItem.coordinates : "";
+        const clean = sanitizePolygonCoordString(
+          rawCoords,
+          detectWidth,
+          detectHeight
+        );
+        if (clean) {
+          out.push({ ...objItem, coordinates: clean });
+        } else {
+          rejectedCount += 1;
+        }
       }
     }
     return { sanitized: out, rejectedCount };
+  }
+  if (typeof maskVal === "object") {
+    const objVal = maskVal as Record<string, unknown>;
+    const nextObj: Record<string, unknown> = {};
+    let rejectedCount = 0;
+    const metaKeys = new Set(["mode", "style", "pixelate", "block_size"]);
+    for (const [k, v] of Object.entries(objVal)) {
+      if (metaKeys.has(k)) {
+        nextObj[k] = v;
+        continue;
+      }
+      if (typeof v === "string") {
+        if (!v.trim()) continue;
+        const clean = sanitizePolygonCoordString(
+          v,
+          detectWidth,
+          detectHeight
+        );
+        if (clean) {
+          nextObj[k] = clean;
+        } else {
+          rejectedCount += 1;
+        }
+      } else if (Array.isArray(v)) {
+        const sub = sanitizeMaskPolygonsValue(v, detectWidth, detectHeight);
+        rejectedCount += sub.rejectedCount;
+        nextObj[k] = sub.sanitized;
+      } else if (
+        v &&
+        typeof v === "object" &&
+        "coordinates" in (v as Record<string, unknown>)
+      ) {
+        const subObj = v as Record<string, unknown>;
+        const rawCoords =
+          typeof subObj.coordinates === "string" ? subObj.coordinates : "";
+        const clean = sanitizePolygonCoordString(
+          rawCoords,
+          detectWidth,
+          detectHeight
+        );
+        if (clean) {
+          nextObj[k] = { ...subObj, coordinates: clean };
+        } else {
+          rejectedCount += 1;
+        }
+      } else {
+        nextObj[k] = v;
+      }
+    }
+    return { sanitized: nextObj, rejectedCount };
   }
   return { sanitized: maskVal, rejectedCount: 0 };
 }
@@ -245,7 +375,7 @@ export function sanitizeTripwireLine(
     Number.isFinite(detectWidth) && detectWidth > 1 ? detectWidth : 1280;
   const safeH =
     Number.isFinite(detectHeight) && detectHeight > 1 ? detectHeight : 720;
-  const isPixelSpace = x1 > 1.0 || y1 > 1.0 || x2 > 1.0 || y2 > 1.0;
+  const isPixelSpace = x1 > 1.5 || y1 > 1.5 || x2 > 1.5 || y2 > 1.5;
   const nx1 = Number(
     Math.max(0, Math.min(1, isPixelSpace ? x1 / safeW : x1)).toFixed(4)
   );
@@ -283,7 +413,7 @@ export function sanitizeStateRoiConfig(
     Number.isFinite(detectWidth) && detectWidth > 1 ? detectWidth : 1280;
   const safeH =
     Number.isFinite(detectHeight) && detectHeight > 1 ? detectHeight : 720;
-  const isPixelSpace = rx1 > 1.0 || ry1 > 1.0 || rx2 > 1.0 || ry2 > 1.0;
+  const isPixelSpace = rx1 > 1.5 || ry1 > 1.5 || rx2 > 1.5 || ry2 > 1.5;
   const cx1 = Math.max(0, Math.min(1, isPixelSpace ? rx1 / safeW : rx1));
   const cy1 = Math.max(0, Math.min(1, isPixelSpace ? ry1 / safeH : ry1));
   const cx2 = Math.max(0, Math.min(1, isPixelSpace ? rx2 / safeW : rx2));
@@ -336,10 +466,27 @@ export function sanitizeCameraGeometryDraft(camCfg: CameraConfig): {
     cleaned.motion = { ...cleaned.motion, mask: mRes.sanitized };
   }
 
-  if (cleaned.objects && cleaned.objects.mask !== undefined) {
-    const oRes = sanitizeMaskPolygonsValue(cleaned.objects.mask, detW, detH);
-    rejectedCount += oRes.rejectedCount;
-    cleaned.objects = { ...cleaned.objects, mask: oRes.sanitized };
+  if (cleaned.objects) {
+    const nextObjects = { ...cleaned.objects };
+    if (nextObjects.mask !== undefined) {
+      const oRes = sanitizeMaskPolygonsValue(nextObjects.mask, detW, detH);
+      rejectedCount += oRes.rejectedCount;
+      nextObjects.mask = oRes.sanitized;
+    }
+    if (nextObjects.filters && typeof nextObjects.filters === "object") {
+      const nextFilters: NonNullable<CameraConfig["objects"]>["filters"] = {};
+      for (const [fLabel, fCfg] of Object.entries(nextObjects.filters)) {
+        if (fCfg && fCfg.mask !== undefined) {
+          const fRes = sanitizeMaskPolygonsValue(fCfg.mask, detW, detH);
+          rejectedCount += fRes.rejectedCount;
+          nextFilters[fLabel] = { ...fCfg, mask: fRes.sanitized };
+        } else {
+          nextFilters[fLabel] = fCfg;
+        }
+      }
+      nextObjects.filters = nextFilters;
+    }
+    cleaned.objects = nextObjects;
   }
 
   if (cleaned.privacy_mask !== undefined) {
@@ -377,6 +524,55 @@ export function sanitizeConfigGeometryDraft(
 ): { cleaned: NinjaConfigResponse; rejectedCount: number } {
   const cloned: NinjaConfigResponse = JSON.parse(JSON.stringify(cfg));
   let rejectedCount = 0;
+  const globalW = cloned.detect?.width || 1280;
+  const globalH = cloned.detect?.height || 720;
+
+  if (cloned.motion && cloned.motion.mask !== undefined) {
+    const gmRes = sanitizeMaskPolygonsValue(
+      cloned.motion.mask,
+      globalW,
+      globalH
+    );
+    rejectedCount += gmRes.rejectedCount;
+    cloned.motion = { ...cloned.motion, mask: gmRes.sanitized };
+  }
+
+  if (cloned.objects) {
+    const nextGlobalObjects = { ...cloned.objects };
+    if (nextGlobalObjects.mask !== undefined) {
+      const goRes = sanitizeMaskPolygonsValue(
+        nextGlobalObjects.mask,
+        globalW,
+        globalH
+      );
+      rejectedCount += goRes.rejectedCount;
+      nextGlobalObjects.mask = goRes.sanitized;
+    }
+    if (
+      nextGlobalObjects.filters &&
+      typeof nextGlobalObjects.filters === "object"
+    ) {
+      const nextGlobalFilters: NonNullable<
+        NinjaConfigResponse["objects"]
+      >["filters"] = {};
+      for (const [fLabel, fCfg] of Object.entries(nextGlobalObjects.filters)) {
+        if (fCfg && fCfg.mask !== undefined) {
+          const gfRes = sanitizeMaskPolygonsValue(
+            fCfg.mask,
+            globalW,
+            globalH
+          );
+          rejectedCount += gfRes.rejectedCount;
+          nextGlobalFilters[fLabel] = { ...fCfg, mask: gfRes.sanitized };
+        } else {
+          nextGlobalFilters[fLabel] = fCfg;
+        }
+      }
+      nextGlobalObjects.filters = nextGlobalFilters;
+    }
+    cloned.objects = nextGlobalObjects;
+  }
+
   if (cloned.cameras && typeof cloned.cameras === "object") {
     for (const [camName, camCfg] of Object.entries(cloned.cameras)) {
       const res = sanitizeCameraGeometryDraft(camCfg);
@@ -440,6 +636,14 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     };
   }, []);
 
+  useEffect(() => {
+    if (zonesSubTab === "yaml" && activeCategory !== "yaml") {
+      setActiveCategory("yaml");
+    } else if (zonesSubTab === "visual" && activeCategory === "yaml") {
+      setActiveCategory("vision");
+    }
+  }, [zonesSubTab, activeCategory]);
+
   // Sync incoming config into draftConfig when no local unsaved changes exist
   useEffect(() => {
     if (config && !isDirty && !isSaving) {
@@ -448,10 +652,10 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   }, [config, isDirty, isSaving]);
 
   useEffect(() => {
-    if (rawYaml && !baselineYaml) {
+    if (rawYaml && !isDirty && !isSaving && baselineYaml !== rawYaml) {
       setBaselineYaml(rawYaml);
     }
-  }, [rawYaml, baselineYaml]);
+  }, [rawYaml, baselineYaml, isDirty, isSaving]);
 
   const allCamKeys = Object.keys(draftConfig?.cameras || {});
   const displayCams = allCamKeys.length > 0 ? allCamKeys : cameraNames;
