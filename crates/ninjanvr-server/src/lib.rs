@@ -61,14 +61,19 @@ impl Default for LogBufferHub {
 }
 
 pub fn sanitize_logged_path(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("/share/") {
+    let clean: String = path
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed_slashes = clean.trim_start_matches('/');
+    if let Some(rest) = trimmed_slashes.strip_prefix("share/") {
         if let Some((_, suffix)) = rest.split_once('/') {
             return format!("/share/<redacted>/{suffix}");
         } else if !rest.is_empty() {
             return "/share/<redacted>".to_string();
         }
     }
-    path.to_string()
+    clean
 }
 
 impl LogBufferHub {
@@ -114,15 +119,22 @@ impl LogBufferHub {
     }
 
     pub fn push_raw(&self, service: &str, line: String) {
+        let safe_line: String = scrub_rtsp_credentials(&line)
+            .chars()
+            .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+            .collect();
         {
             let mut guard = self.buffers.lock().expect("log mutex poisoned");
+            if guard.len() >= 16 && !guard.contains_key(service) {
+                return;
+            }
             let q = guard.entry(service.to_string()).or_default();
-            q.push_back(line.clone());
+            q.push_back(safe_line.clone());
             while q.len() > MAX_LOG_LINES {
                 q.pop_front();
             }
         }
-        let _ = self.stream_tx.send((service.to_string(), line));
+        let _ = self.stream_tx.send((service.to_string(), safe_line));
     }
 
     pub fn query_lines(
@@ -140,7 +152,7 @@ impl LogBufferHub {
             return (0, Vec::new());
         }
         let start_idx = match start {
-            Some(s) if s < 0 => total.saturating_sub((-s) as usize),
+            Some(s) if s < 0 => total.saturating_sub(s.unsigned_abs().min(total as u64) as usize),
             Some(s) => (s as usize).min(total),
             None => 0,
         };
@@ -206,6 +218,12 @@ impl ProcCpuTracker {
 
         let now = Instant::now();
         let mut guard = self.prev_ticks.lock().expect("cpu tracker mutex poisoned");
+        if guard.len() >= 256 && !guard.contains_key(&pid) {
+            guard.retain(|_, (_, inst, _)| now.duration_since(*inst).as_secs() < 600);
+            if guard.len() >= 256 {
+                guard.clear();
+            }
+        }
         let cpu_pct = if let Some((prev_t, prev_inst, prev_ema)) = guard.get(&pid).copied() {
             let dt = now.duration_since(prev_inst).as_secs_f64();
             if dt >= 2.0 && total_ticks >= prev_t {
@@ -926,7 +944,11 @@ async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri)
     let rel_path = uri.path().trim_start_matches('/');
     let primary_dir = &state.web_dir;
 
-    if !rel_path.is_empty() && !rel_path.contains("..") {
+    if !rel_path.is_empty()
+        && !rel_path.contains("..")
+        && !rel_path.contains('\\')
+        && !rel_path.split('/').any(|seg| seg.starts_with('.'))
+    {
         let mut file_candidate = primary_dir.join(rel_path);
         if rel_path == "favicon.ico" && !file_candidate.is_file() {
             file_candidate = primary_dir.join("favicon.svg");
@@ -1151,7 +1173,11 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
     }
     let path = normalized.as_str();
     if let Some(rest) = path.strip_prefix("/exports/") {
-        let fname = rest.split('/').find(|s| !s.is_empty()).unwrap_or("");
+        let segs: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        if segs.len() != 1 {
+            return None;
+        }
+        let fname = segs[0];
         let raw_id = fname.strip_suffix(".mp4").unwrap_or(fname);
         let is_share_artifact =
             raw_id.starts_with("share_redacted_") || raw_id.starts_with("share_clip_");
@@ -1217,6 +1243,17 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
                     .strip_suffix(".webp")
                     .or_else(|| raw_after_thumb.strip_suffix(".jpg"))
                     .unwrap_or(raw_after_thumb);
+                if let Ok(Some(rev)) = state.db.get_review_by_id(after_thumb) {
+                    return Some(rev.camera);
+                }
+                for (idx, _) in after_thumb.match_indices('-') {
+                    let candidate_rev_id = &after_thumb[idx + 1..];
+                    if !candidate_rev_id.is_empty()
+                        && let Ok(Some(rev)) = state.db.get_review_by_id(candidate_rev_id)
+                    {
+                        return Some(rev.camera);
+                    }
+                }
                 if let Ok(cfg) = state.config.try_read() {
                     let mut matched_cam: Option<&str> = None;
                     for cam in cfg.cameras.keys() {
@@ -1228,20 +1265,8 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
                         }
                     }
                     if let Some(cam) = matched_cam {
-                        let rest_rev_id = &after_thumb[cam.len() + 1..];
-                        if let Ok(Some(rev)) = state.db.get_review_by_id(rest_rev_id) {
-                            return Some(rev.camera);
-                        }
-                        if let Some((_, tail_rev_id)) = rest_rev_id.split_once('-')
-                            && let Ok(Some(rev)) = state.db.get_review_by_id(tail_rev_id)
-                        {
-                            return Some(rev.camera);
-                        }
                         return Some(cam.to_string());
                     }
-                }
-                if let Ok(Some(rev)) = state.db.get_review_by_id(after_thumb) {
-                    return Some(rev.camera);
                 }
                 if let Some(cam) = after_thumb
                     .rsplitn(3, '-')
@@ -1289,6 +1314,24 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
             if is_share_artifact {
                 return None;
             }
+            for (idx, _) in clean_stem.match_indices('-') {
+                let ev_part = &clean_stem[idx + 1..];
+                if !ev_part.is_empty() {
+                    if let Ok(Some(ev)) = state.db.get_event(ev_part)
+                        && let Some(ev_cam) = ev["camera"].as_str()
+                    {
+                        return Some(ev_cam.to_string());
+                    }
+                    if let Ok(Some(exp)) = state.db.get_export_by_id(ev_part)
+                        && let Some(exp_cam) = exp["camera"].as_str()
+                    {
+                        return Some(exp_cam.to_string());
+                    }
+                    if let Ok(Some(rev)) = state.db.get_review_by_id(ev_part) {
+                        return Some(rev.camera);
+                    }
+                }
+            }
             if let Ok(cfg) = state.config.try_read() {
                 let mut matched_cam: Option<&str> = None;
                 for cam in cfg.cameras.keys() {
@@ -1300,12 +1343,6 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
                     }
                 }
                 if let Some(cam) = matched_cam {
-                    let ev_part = &clean_stem[cam.len() + 1..];
-                    if let Ok(Some(ev)) = state.db.get_event(ev_part)
-                        && let Some(ev_cam) = ev["camera"].as_str()
-                    {
-                        return Some(ev_cam.to_string());
-                    }
                     return Some(cam.to_string());
                 }
             }
@@ -1379,7 +1416,9 @@ async fn auth_gate_middleware(
             let role_lc = role.to_ascii_lowercase();
             if role_lc == "metrics" {
                 let is_metrics_route = (method == "GET" || method == "HEAD")
-                    && (path.starts_with("/api/stats") || path.starts_with("/api/metrics"));
+                    && (path == "/api/stats"
+                        || path == "/api/stats/history"
+                        || path == "/api/metrics");
                 if !is_metrics_route {
                     state.log_hub.push_nginx(&method, &path, 403);
                     return (
@@ -1573,7 +1612,37 @@ async fn auth_gate_middleware(
                     Some(vod_cam)
                 } else if let Some(rest) = path.strip_prefix("/api/") {
                     let first = rest.split('/').next().unwrap_or("");
-                    if matches!(
+                    let after_first = rest
+                        .strip_prefix(first)
+                        .unwrap_or("")
+                        .trim_start_matches('/');
+                    let is_camera_subroute = matches!(
+                        after_first,
+                        "recordings"
+                            | "recordings/summary"
+                            | "ptz/info"
+                            | "ptz/move"
+                            | "ptz/stop"
+                            | "ptz/preset"
+                            | "state"
+                            | "latest.webp"
+                            | "latest.jpg"
+                    ) && !(first == "recordings"
+                        && after_first == "summary");
+                    if is_camera_subroute {
+                        Some(first)
+                    } else if first == "preview" {
+                        if after_first.contains("/start/") {
+                            let p_cam = after_first.split('/').next().unwrap_or("");
+                            if p_cam.is_empty() || p_cam == "all" {
+                                None
+                            } else {
+                                Some(p_cam)
+                            }
+                        } else {
+                            None
+                        }
+                    } else if matches!(
                         first,
                         "version"
                             | "ui"
@@ -1604,7 +1673,6 @@ async fn auth_gate_middleware(
                             | "exports"
                             | "jobs"
                             | "cases"
-                            | "preview"
                             | "share"
                             | "tokens"
                             | "metrics"
@@ -1627,10 +1695,6 @@ async fn auth_gate_middleware(
                     ) {
                         None
                     } else if first == "vod" {
-                        let after_first = rest
-                            .strip_prefix(first)
-                            .unwrap_or("")
-                            .trim_start_matches('/');
                         let after_clip = after_first.strip_prefix("clip/").unwrap_or_else(|| {
                             if after_first == "clip" {
                                 ""
@@ -1649,10 +1713,6 @@ async fn auth_gate_middleware(
                         }
                         Some(vod_cam)
                     } else if first == "export" {
-                        let after_first = rest
-                            .strip_prefix(first)
-                            .unwrap_or("")
-                            .trim_start_matches('/');
                         let after_clip = after_first.strip_prefix("clip/").unwrap_or(after_first);
                         if after_clip.contains("/start/") {
                             after_clip.split('/').next()
@@ -1705,9 +1765,20 @@ async fn api_auth_verify(
         &cfg.auth.cookie_name,
         cfg.auth.enabled,
     ) {
+        if role.eq_ignore_ascii_case("metrics") {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "message": "Token scope 'metrics' only permits GET /api/stats and /api/metrics"
+                })),
+            )
+                .into_response();
+        }
+        let safe_user: String = user.chars().filter(|c| !c.is_control()).collect();
+        let safe_role: String = role.chars().filter(|c| !c.is_control()).collect();
         (
             StatusCode::ACCEPTED,
-            [("remote-user", user), ("remote-role", role)],
+            [("remote-user", safe_user), ("remote-role", safe_role)],
             "",
         )
             .into_response()
@@ -1755,17 +1826,31 @@ async fn api_auth_providers(State(state): State<AppState>) -> Json<Value> {
 /// Checks whether `ip_str` matches a single CIDR (`"10.42.0.0/16"`, `"127.0.0.1/32"`) or bare IP (`"127.0.0.1"`).
 pub fn ip_matches_cidr(ip_str: &str, cidr_str: &str) -> bool {
     use std::net::IpAddr;
-    let Ok(ip) = ip_str.trim().parse::<IpAddr>() else {
+    let Ok(raw_ip) = ip_str.trim().parse::<IpAddr>() else {
         return false;
     };
+    let ip = raw_ip.to_canonical();
     let cidr = cidr_str.trim();
     if let Some((net_s, prefix_s)) = cidr.split_once('/') {
-        let Ok(net_ip) = net_s.trim().parse::<IpAddr>() else {
+        let Ok(raw_net_ip) = net_s.trim().parse::<IpAddr>() else {
             return false;
         };
         let Ok(prefix_len) = prefix_s.trim().parse::<u32>() else {
             return false;
         };
+        match (raw_ip, raw_net_ip) {
+            (IpAddr::V6(a), IpAddr::V6(b)) if prefix_len <= 128 => {
+                if prefix_len == 0 {
+                    return true;
+                }
+                let mask = !0u128 << (128 - prefix_len);
+                if (u128::from(a) & mask) == (u128::from(b) & mask) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        let net_ip = raw_net_ip.to_canonical();
         match (ip, net_ip) {
             (IpAddr::V4(a), IpAddr::V4(b)) if prefix_len <= 32 => {
                 if prefix_len == 0 {
@@ -1783,8 +1868,8 @@ pub fn ip_matches_cidr(ip_str: &str, cidr_str: &str) -> bool {
             }
             _ => false,
         }
-    } else if let Ok(net_ip) = cidr.parse::<IpAddr>() {
-        ip == net_ip
+    } else if let Ok(raw_net_ip) = cidr.parse::<IpAddr>() {
+        raw_ip == raw_net_ip || ip == raw_net_ip.to_canonical()
     } else {
         false
     }
@@ -1792,6 +1877,44 @@ pub fn ip_matches_cidr(ip_str: &str, cidr_str: &str) -> bool {
 
 pub fn ip_matches_trusted_proxies(ip_str: &str, cidrs: &[String]) -> bool {
     cidrs.iter().any(|c| ip_matches_cidr(ip_str, c))
+}
+
+fn is_valid_oidc_discovered_endpoint(endpoint: &str, issuer: &str) -> bool {
+    let ep = endpoint.trim();
+    if ep.is_empty()
+        || ep.contains(['@', '\\', '#'])
+        || ep.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    let Some((ep_scheme, ep_host)) = extract_url_scheme_and_host(ep) else {
+        return false;
+    };
+    let Some((iss_scheme, iss_host)) = extract_url_scheme_and_host(issuer) else {
+        return false;
+    };
+    ep_scheme.eq_ignore_ascii_case(iss_scheme)
+        && strip_default_port_for_scheme(ep_scheme, ep_host)
+            .eq_ignore_ascii_case(strip_default_port_for_scheme(iss_scheme, iss_host))
+}
+
+async fn read_upstream_body_bounded(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> std::result::Result<Vec<u8>, StatusCode> {
+    if let Some(len) = resp.content_length()
+        && len > max_bytes as u64
+    {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|_| StatusCode::BAD_GATEWAY)? {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Resolves a NinjaNVR role (`"admin"`, `"operator"`, or `"viewer"`) from OIDC ID-token / UserInfo claims,
@@ -1949,6 +2072,7 @@ async fn api_auth_oidc_login(
 ) -> Response {
     let cfg = state.config.read().await;
     let oidc = &cfg.auth.oidc;
+    let cookie_secure = cfg.auth.cookie_secure;
     let issuer = if !oidc.issuer_url.trim().is_empty() {
         oidc.issuer_url.trim().trim_end_matches('/').to_string()
     } else {
@@ -1979,15 +2103,18 @@ async fn api_auth_oidc_login(
     let mut auth_endpoint = format!("{issuer}/authorize");
     if let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         && let Ok(resp) = client
             .get(format!("{issuer}/.well-known/openid-configuration"))
             .send()
             .await
-        && let Ok(disc) = resp.json::<Value>().await
+        && let Ok(disc_bytes) = read_upstream_body_bounded(resp, 256 * 1024).await
+        && let Ok(disc) = serde_json::from_slice::<Value>(&disc_bytes)
         && let Some(ep) = disc.get("authorization_endpoint").and_then(|v| v.as_str())
+        && is_valid_oidc_discovered_endpoint(ep, &issuer)
     {
-        auth_endpoint = ep.to_string();
+        auth_endpoint = ep.trim().to_string();
     }
 
     let scope_str = if oidc.scopes.is_empty() {
@@ -2009,6 +2136,7 @@ async fn api_auth_oidc_login(
     );
     pkce_cookie.set_path("/");
     pkce_cookie.set_http_only(true);
+    pkce_cookie.set_secure(cookie_secure);
     pkce_cookie.set_same_site(SameSite::Lax);
 
     (jar.add(pkce_cookie), Redirect::to(&redirect_target)).into_response()
@@ -2071,7 +2199,7 @@ async fn api_auth_oidc_callback(
         Some((v, r)) => (v, Some(r.to_string())),
         None => (rest_cookie, None),
     };
-    if expected_state != returned_state {
+    if expected_state.is_empty() || code_verifier.is_empty() || expected_state != returned_state {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "message": "OIDC state mismatch" })),
@@ -2103,30 +2231,49 @@ async fn api_auth_oidc_callback(
     } else {
         std::env::var("NINJANVR_OIDC_CLIENT_ID").unwrap_or_default()
     };
+    if !oidc_cfg.enabled || issuer.is_empty() || client_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "OIDC SSO is not enabled or missing issuer_url/client_id" })),
+        )
+            .into_response();
+    }
     let client_secret = std::env::var(&oidc_cfg.client_secret_env).unwrap_or_default();
 
-    let redirect_uri = saved_redirect_uri.unwrap_or_else(|| {
-        let base_url = resolve_external_base_url(&headers, &uri);
-        format!("{base_url}/api/auth/oidc/callback")
-    });
+    let redirect_uri = saved_redirect_uri
+        .filter(|r| {
+            (r.starts_with("http://") || r.starts_with("https://"))
+                && r.ends_with("/api/auth/oidc/callback")
+                && !r.chars().any(|c| c.is_whitespace() || c.is_control())
+        })
+        .unwrap_or_else(|| {
+            let base_url = resolve_external_base_url(&headers, &uri);
+            format!("{base_url}/api/auth/oidc/callback")
+        });
 
     let mut token_endpoint = format!("{issuer}/oauth/v2/token");
     let mut userinfo_endpoint = format!("{issuer}/oidc/v1/userinfo");
     if let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         if let Ok(resp) = client
             .get(format!("{issuer}/.well-known/openid-configuration"))
             .send()
             .await
-            && let Ok(disc) = resp.json::<Value>().await
+            && let Ok(disc_bytes) = read_upstream_body_bounded(resp, 256 * 1024).await
+            && let Ok(disc) = serde_json::from_slice::<Value>(&disc_bytes)
         {
-            if let Some(ep) = disc.get("token_endpoint").and_then(|v| v.as_str()) {
-                token_endpoint = ep.to_string();
+            if let Some(ep) = disc.get("token_endpoint").and_then(|v| v.as_str())
+                && is_valid_oidc_discovered_endpoint(ep, &issuer)
+            {
+                token_endpoint = ep.trim().to_string();
             }
-            if let Some(uep) = disc.get("userinfo_endpoint").and_then(|v| v.as_str()) {
-                userinfo_endpoint = uep.to_string();
+            if let Some(uep) = disc.get("userinfo_endpoint").and_then(|v| v.as_str())
+                && is_valid_oidc_discovered_endpoint(uep, &issuer)
+            {
+                userinfo_endpoint = uep.trim().to_string();
             }
         }
 
@@ -2157,7 +2304,9 @@ async fn api_auth_oidc_callback(
                 )
                     .into_response();
             }
-            if let Ok(tok_json) = tok_resp.json::<Value>().await {
+            if let Ok(tok_bytes) = read_upstream_body_bounded(tok_resp, 256 * 1024).await
+                && let Ok(tok_json) = serde_json::from_slice::<Value>(&tok_bytes)
+            {
                 if tok_json.get("error").is_some() {
                     return (
                         StatusCode::UNAUTHORIZED,
@@ -2169,6 +2318,34 @@ async fn api_auth_oidc_callback(
                 if let Some(id_token) = tok_json.get("id_token").and_then(|v| v.as_str()) {
                     let parts: Vec<&str> = id_token.split('.').collect();
                     if parts.len() != 3 || parts[2].trim().is_empty() {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Malformed or unsigned OIDC ID token" })),
+                        )
+                            .into_response();
+                    }
+                    let Ok(hdr_bytes) =
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[0])
+                    else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Malformed OIDC ID token header" })),
+                        )
+                            .into_response();
+                    };
+                    let Ok(hdr_json) = serde_json::from_slice::<Value>(&hdr_bytes) else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Malformed OIDC ID token header JSON" })),
+                        )
+                            .into_response();
+                    };
+                    let alg_ok = hdr_json
+                        .get("alg")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .is_some_and(|alg| !alg.is_empty() && !alg.eq_ignore_ascii_case("none"));
+                    if !alg_ok {
                         return (
                             StatusCode::UNAUTHORIZED,
                             Json(json!({ "message": "Malformed or unsigned OIDC ID token" })),
@@ -2191,44 +2368,56 @@ async fn api_auth_oidc_callback(
                         )
                             .into_response();
                     };
-                    if claims_json
-                        .get("exp")
-                        .and_then(|v| v.as_u64())
-                        .is_some_and(|exp| exp <= unix_now())
-                    {
+                    let now_ts = unix_now();
+                    let Some(exp) = claims_json.get("exp").and_then(|v| v.as_u64()) else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC ID token missing required exp claim" })),
+                        )
+                            .into_response();
+                    };
+                    if exp <= now_ts {
                         return (
                             StatusCode::UNAUTHORIZED,
                             Json(json!({ "message": "OIDC ID token has expired" })),
                         )
                             .into_response();
                     }
-                    if let Some(iss_val) = claims_json.get("iss") {
-                        let iss_ok = iss_val
-                            .as_str()
-                            .is_some_and(|s| s.trim().trim_end_matches('/') == issuer.as_str());
-                        if !iss_ok {
-                            return (
-                                StatusCode::UNAUTHORIZED,
-                                Json(json!({ "message": "OIDC ID token issuer mismatch" })),
-                            )
-                                .into_response();
-                        }
+                    if claims_json
+                        .get("nbf")
+                        .and_then(|v| v.as_u64())
+                        .is_some_and(|nbf| nbf > now_ts.saturating_add(60))
+                    {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC ID token is not yet valid (nbf)" })),
+                        )
+                            .into_response();
                     }
-                    if let Some(aud_val) = claims_json.get("aud") {
-                        let aud_ok = match aud_val {
-                            Value::String(s) => s.trim() == client_id.as_str(),
-                            Value::Array(arr) => arr.iter().any(|v| {
-                                v.as_str().is_some_and(|s| s.trim() == client_id.as_str())
-                            }),
-                            _ => false,
-                        };
-                        if !aud_ok {
-                            return (
-                                StatusCode::UNAUTHORIZED,
-                                Json(json!({ "message": "OIDC ID token audience mismatch" })),
-                            )
-                                .into_response();
-                        }
+                    let iss_ok = claims_json
+                        .get("iss")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| s.trim().trim_end_matches('/') == issuer.as_str());
+                    if !iss_ok {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC ID token issuer mismatch" })),
+                        )
+                            .into_response();
+                    }
+                    let aud_ok = match claims_json.get("aud") {
+                        Some(Value::String(s)) => s.trim() == client_id.as_str(),
+                        Some(Value::Array(arr)) => arr
+                            .iter()
+                            .any(|v| v.as_str().is_some_and(|s| s.trim() == client_id.as_str())),
+                        _ => false,
+                    };
+                    if !aud_ok {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC ID token audience mismatch" })),
+                        )
+                            .into_response();
                     }
                     merged_claims = claims_json;
                 }
@@ -2252,7 +2441,15 @@ async fn api_auth_oidc_callback(
                         )
                             .into_response();
                     }
-                    let Ok(Value::Object(ui_map)) = ui_resp.json::<Value>().await else {
+                    let Ok(ui_bytes) = read_upstream_body_bounded(ui_resp, 256 * 1024).await else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Invalid OIDC UserInfo response payload" })),
+                        )
+                            .into_response();
+                    };
+                    let Ok(Value::Object(ui_map)) = serde_json::from_slice::<Value>(&ui_bytes)
+                    else {
                         return (
                             StatusCode::UNAUTHORIZED,
                             Json(json!({ "message": "Invalid OIDC UserInfo response payload" })),
@@ -2266,19 +2463,32 @@ async fn api_auth_oidc_callback(
                         )
                             .into_response();
                     }
-                    if let (Some(id_sub), Some(ui_sub)) = (
-                        merged_claims.get("sub").and_then(|v| v.as_str()),
-                        ui_map.get("sub").and_then(|v| v.as_str()),
-                    ) && id_sub != ui_sub
+                    if let Some(id_sub) = merged_claims
+                        .get("sub")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
                     {
-                        return (
-                            StatusCode::UNAUTHORIZED,
-                            Json(json!({ "message": "OIDC subject mismatch between ID token and UserInfo" })),
-                        )
-                            .into_response();
+                        let ui_sub_opt = ui_map
+                            .get("sub")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        if ui_sub_opt != Some(id_sub) {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                Json(json!({ "message": "OIDC subject mismatch between ID token and UserInfo" })),
+                            )
+                                .into_response();
+                        }
                     }
                     if let Some(obj) = merged_claims.as_object_mut() {
                         for (k, v) in ui_map {
+                            if matches!(k.as_str(), "iss" | "aud" | "exp" | "iat" | "nbf" | "sub")
+                                && obj.contains_key(&k)
+                            {
+                                continue;
+                            }
                             obj.insert(k, v);
                         }
                     }
@@ -2318,12 +2528,18 @@ async fn api_auth_oidc_callback(
                             .into_response();
                     };
                     let username = username_str.to_string();
-                    let role = resolve_oidc_role(&merged_claims, &oidc_cfg);
+                    let (role, allowed_cameras) = match state.db.get_user(&username) {
+                        Ok(Some(db_u)) => (db_u.role, Some(db_u.allowed_cameras)),
+                        _ => (
+                            resolve_oidc_role(&merged_claims, &oidc_cfg),
+                            Some("*".to_string()),
+                        ),
+                    };
                     let now = unix_now();
                     let jwt_claims = JwtClaims {
                         sub: username,
                         role,
-                        allowed_cameras: Some("*".to_string()),
+                        allowed_cameras,
                         iat: now,
                         exp: now + session_len,
                     };
@@ -2364,12 +2580,108 @@ async fn api_auth_oidc_callback(
         .into_response()
 }
 
+type LoginAttemptKey = (String, String);
+type LoginAttemptEntry = (u32, Instant);
+
+const MAX_LOGIN_FAILURES: u32 = 8;
+const LOGIN_LOCKOUT_WINDOW: Duration = Duration::from_secs(60);
+
+fn login_rate_limiter() -> &'static std::sync::Mutex<HashMap<LoginAttemptKey, LoginAttemptEntry>> {
+    static LIMITER: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<LoginAttemptKey, LoginAttemptEntry>>,
+    > = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn check_login_rate_limited(scope_key: &str, user_key: &str) -> bool {
+    let now = Instant::now();
+    let mut guard = login_rate_limiter()
+        .lock()
+        .expect("login rate limiter poisoned");
+    let key = (scope_key.to_string(), user_key.to_ascii_lowercase());
+    if let Some((count, first_inst)) = guard.get(&key).copied() {
+        if now.duration_since(first_inst) >= LOGIN_LOCKOUT_WINDOW {
+            guard.remove(&key);
+            return false;
+        }
+        return count >= MAX_LOGIN_FAILURES;
+    }
+    false
+}
+
+fn record_login_failure(scope_key: &str, user_key: &str) {
+    let now = Instant::now();
+    let mut guard = login_rate_limiter()
+        .lock()
+        .expect("login rate limiter poisoned");
+    let key = (scope_key.to_string(), user_key.to_ascii_lowercase());
+    if !guard.contains_key(&key) && guard.len() >= 1024 {
+        guard.retain(|_, (_, inst)| now.duration_since(*inst) < LOGIN_LOCKOUT_WINDOW);
+        if guard.len() >= 1024 {
+            // Evict only unlocked single-failure entries so active lockouts cannot be evicted by username floods
+            if let Some(unlocked_key) = guard
+                .iter()
+                .filter(|(_, (cnt, _))| *cnt < MAX_LOGIN_FAILURES)
+                .min_by_key(|(_, (_, inst))| *inst)
+                .map(|(k, _)| k.clone())
+            {
+                guard.remove(&unlocked_key);
+            } else {
+                return;
+            }
+        }
+    }
+    match guard.get_mut(&key) {
+        Some((count, first_inst)) => {
+            if now.duration_since(*first_inst) >= LOGIN_LOCKOUT_WINDOW {
+                *count = 1;
+                *first_inst = now;
+            } else {
+                *count = count.saturating_add(1);
+            }
+        }
+        None => {
+            guard.insert(key, (1, now));
+        }
+    }
+}
+
+fn clear_login_failures(scope_key: &str, user_key: &str) {
+    let mut guard = login_rate_limiter()
+        .lock()
+        .expect("login rate limiter poisoned");
+    guard.remove(&(scope_key.to_string(), user_key.to_ascii_lowercase()));
+}
+
 async fn api_login(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<LoginBody>,
 ) -> impl IntoResponse {
-    let (cookie_name, cookie_secure, session_len, auth_enabled, local_login_enabled) = {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            jar,
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "success": false,
+                    "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+                })),
+            )
+                .into_response(),
+        );
+    }
+
+    let (
+        cookie_name,
+        cookie_secure,
+        session_len,
+        auth_enabled,
+        local_login_enabled,
+        hash_iterations,
+    ) = {
         let cfg = state.config.read().await;
         (
             cfg.auth.cookie_name.clone(),
@@ -2377,6 +2689,7 @@ async fn api_login(
             cfg.auth.session_length,
             cfg.auth.enabled,
             cfg.auth.local_login_enabled,
+            cfg.auth.hash_iterations,
         )
     };
 
@@ -2402,7 +2715,38 @@ async fn api_login(
         );
     }
 
-    let Ok(Some(db_user)) = state.db.get_user(&body.user) else {
+    let trimmed_user = body.user.trim();
+    if trimmed_user.is_empty() || trimmed_user.len() > 128 || body.password.len() > 1024 {
+        return (
+            jar,
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "message": "Invalid username or password length" })),
+            )
+                .into_response(),
+        );
+    }
+
+    let rate_scope = state.jwt_secret.as_str();
+    if check_login_rate_limited(rate_scope, trimmed_user) {
+        return (
+            jar,
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "message": "Too many failed login attempts; try again later" })),
+            )
+                .into_response(),
+        );
+    }
+
+    let Ok(Some(db_user)) = state.db.get_user(trimmed_user) else {
+        // Equalize PBKDF2 timing when user does not exist to prevent username enumeration timing oracle
+        let dummy_hash = format!(
+            "pbkdf2_sha256${}$dummysalt0000000$0000000000000000000000000000000000000000000=",
+            hash_iterations.clamp(1_000, 600_000)
+        );
+        let _ = verify_password(&body.password, &dummy_hash);
+        record_login_failure(rate_scope, trimmed_user);
         return (
             jar,
             (
@@ -2414,6 +2758,7 @@ async fn api_login(
     };
 
     if !verify_password(&body.password, &db_user.password_hash) {
+        record_login_failure(rate_scope, trimmed_user);
         return (
             jar,
             (
@@ -2423,6 +2768,8 @@ async fn api_login(
                 .into_response(),
         );
     }
+
+    clear_login_failures(rate_scope, trimmed_user);
 
     if db_user.role == "admin" {
         state.config.write().await.auth.admin_first_time_login = false;
@@ -2453,11 +2800,30 @@ async fn api_login(
     (jar.add(cookie), StatusCode::OK.into_response())
 }
 
-async fn api_logout(State(state): State<AppState>, jar: CookieJar) -> impl IntoResponse {
+async fn api_logout(
+    State(state): State<AppState>,
+    method: axum::http::Method,
+    uri: Uri,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    if method != axum::http::Method::GET
+        && method != axum::http::Method::HEAD
+        && !verify_cookie_csrf_origin(&headers, &uri)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let cookie_name = state.config.read().await.auth.cookie_name.clone();
     let mut removal = Cookie::from(cookie_name);
     removal.set_path("/");
-    (jar.remove(removal), Redirect::to("/login"))
+    (jar.remove(removal), Redirect::to("/login")).into_response()
 }
 
 fn extract_authenticated_user(
@@ -2548,8 +2914,9 @@ fn extract_authenticated_user_with_cfg(
     }
 
     // Hardened Trusted-Proxy ForwardAuth: only trust Remote-User / Remote-Groups headers
-    // when proxy auth is explicitly enabled AND the peer IP matches trusted_proxies CIDRs.
-    if auth_cfg.proxy.enabled {
+    // when proxy auth is explicitly enabled, no explicit Authorization header is present,
+    // AND the peer IP matches trusted_proxies CIDRs.
+    if auth_cfg.proxy.enabled && !headers.contains_key(header::AUTHORIZATION) {
         let peer_ip = extract_trusted_proxy_peer_ip(headers);
 
         let trusted_cidrs = if !auth_cfg.proxy.trusted_proxies.is_empty() {
@@ -2561,18 +2928,29 @@ fn extract_authenticated_user_with_cfg(
         if let Some(ip) = peer_ip
             && ip_matches_trusted_proxies(ip, trusted_cidrs)
         {
-            let user_hdr_name = auth_cfg.proxy.user_header.to_ascii_lowercase();
+            let user_hdr_trimmed = auth_cfg.proxy.user_header.trim();
+            let user_hdr_name = if user_hdr_trimmed.is_empty() {
+                "remote-user".to_string()
+            } else {
+                user_hdr_trimmed.to_ascii_lowercase()
+            };
             if let Some(remote_user) = headers
                 .get(user_hdr_name.as_str())
-                .or_else(|| headers.get("remote-user"))
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
             {
-                let groups_hdr_name = auth_cfg.proxy.groups_header.to_ascii_lowercase();
+                if let Ok(Some(db_u)) = state.db.get_user(remote_user) {
+                    return Some((remote_user.to_string(), db_u.role));
+                }
+                let groups_hdr_trimmed = auth_cfg.proxy.groups_header.trim();
+                let groups_hdr_name = if groups_hdr_trimmed.is_empty() {
+                    "remote-groups".to_string()
+                } else {
+                    groups_hdr_trimmed.to_ascii_lowercase()
+                };
                 let role = if let Some(groups_str) = headers
                     .get(groups_hdr_name.as_str())
-                    .or_else(|| headers.get("remote-groups"))
                     .and_then(|v| v.to_str().ok())
                 {
                     resolve_oidc_role(&json!({ "groups": groups_str }), &auth_cfg.oidc)
@@ -2680,10 +3058,49 @@ pub struct SetProfileBody {
 
 async fn api_profile_set(
     State(state): State<AppState>,
+    uri: Uri,
     jar: CookieJar,
     headers: HeaderMap,
     Json(body): Json<SetProfileBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    let caller_role_opt = {
+        let cfg = state.config.read().await;
+        if cfg.auth.enabled {
+            let has_creds = headers.contains_key(header::AUTHORIZATION)
+                || jar.get(&cfg.auth.cookie_name).is_some()
+                || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(&headers).is_some());
+            match extract_authenticated_user_with_cfg(&state, &jar, &headers, &cfg.auth) {
+                Some((_, r)) => Some(r.to_ascii_lowercase()),
+                None if has_creds => Some("unauthorized".to_string()),
+                None => None,
+            }
+        } else {
+            None
+        }
+    };
+    if matches!(
+        caller_role_opt.as_deref(),
+        Some("viewer" | "read_only" | "metrics" | "unauthorized")
+    ) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Read-only role or token cannot change global NVR security profile"
+            })),
+        )
+            .into_response();
+    }
     if caller_allowed_cameras(&state, &jar, &headers)
         .await
         .is_some()
@@ -2742,8 +3159,27 @@ fn default_admin_role() -> String {
 
 async fn api_user_create(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     Json(body): Json<CreateUserBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if body.password.len() > 1024 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Password exceeds maximum length" })),
+        )
+            .into_response();
+    }
     let iterations = state.config.read().await.auth.hash_iterations;
     let cams = body.allowed_cameras.as_deref().unwrap_or("*");
     match state.db.create_user_with_cameras(
@@ -2774,9 +3210,28 @@ pub struct UpdateUserPasswordBody {
 
 async fn api_user_password(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(username): AxumPath<String>,
     Json(body): Json<UpdateUserPasswordBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if body.password.len() > 1024 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Password exceeds maximum length" })),
+        )
+            .into_response();
+    }
     let iterations = state.config.read().await.auth.hash_iterations;
     match state
         .db
@@ -2829,17 +3284,17 @@ async fn api_user_role(
         )
             .into_response();
     }
-    if let Some(ref cams) = body.allowed_cameras {
-        let _ = state.db.update_user_allowed_cameras(&username, cams);
-    } else if !body.role.trim().eq_ignore_ascii_case("admin")
-        && let Ok(Some(existing_u)) = state.db.get_user(&username)
-    {
-        let _ = state
-            .db
-            .update_user_allowed_cameras(&username, &existing_u.allowed_cameras);
-    }
     match state.db.update_user_role(&username, &body.role) {
         Ok(true) => {
+            if let Some(ref cams) = body.allowed_cameras {
+                let _ = state.db.update_user_allowed_cameras(&username, cams);
+            } else if !body.role.trim().eq_ignore_ascii_case("admin")
+                && let Ok(Some(existing_u)) = state.db.get_user(&username)
+            {
+                let _ = state
+                    .db
+                    .update_user_allowed_cameras(&username, &existing_u.allowed_cameras);
+            }
             if body.role.trim().eq_ignore_ascii_case("viewer") {
                 let _ = state.db.revoke_share_links_by_creator(&username);
                 if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
@@ -2973,8 +3428,20 @@ async fn api_tokens_list(State(state): State<AppState>) -> Json<Value> {
 
 async fn api_token_create(
     State(state): State<AppState>,
+    uri: Uri,
+    headers: HeaderMap,
     Json(body): Json<CreateApiTokenBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let expires_at = body
         .expires_in_days
         .map(|d| (unix_now() as f64) + (d as f64) * 86400.0);
@@ -3100,12 +3567,16 @@ fn resolve_user_allowed_cameras(
             if raw.is_empty() || raw == "*" {
                 return None;
             }
-            Some(
-                raw.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect(),
-            )
+            let list: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if list.is_empty() || list.iter().any(|c| c == "*") {
+                None
+            } else {
+                Some(list)
+            }
         }
         Ok(None) => {
             if user.starts_with("token:")
@@ -3123,10 +3594,14 @@ fn resolve_user_allowed_cameras(
                 && !headers.contains_key(header::AUTHORIZATION)
                 && jar.get(&auth_cfg.cookie_name).is_none()
                 && {
-                    let user_hdr_name = auth_cfg.proxy.user_header.to_ascii_lowercase();
+                    let user_hdr_trimmed = auth_cfg.proxy.user_header.trim();
+                    let user_hdr_name = if user_hdr_trimmed.is_empty() {
+                        "remote-user".to_string()
+                    } else {
+                        user_hdr_trimmed.to_ascii_lowercase()
+                    };
                     headers
                         .get(user_hdr_name.as_str())
-                        .or_else(|| headers.get("remote-user"))
                         .and_then(|v| v.to_str().ok())
                         .is_some_and(|u| u.trim() == user)
                 }
@@ -3150,13 +3625,19 @@ fn resolve_user_allowed_cameras(
                 return None;
             }
             match extract_jwt_allowed_cameras(state, jar, headers, &auth_cfg.cookie_name) {
-                Some(raw) if !raw.trim().is_empty() && raw.trim() != "*" => Some(
-                    raw.trim()
+                Some(raw) if !raw.trim().is_empty() && raw.trim() != "*" => {
+                    let list: Vec<String> = raw
+                        .trim()
                         .split(',')
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
-                        .collect(),
-                ),
+                        .collect();
+                    if list.iter().any(|c| c == "*") {
+                        None
+                    } else {
+                        Some(list)
+                    }
+                }
                 Some(raw) if raw.trim() == "*" => None,
                 _ if is_proxy_header_auth => None,
                 _ => Some(Vec::new()),
@@ -3172,8 +3653,17 @@ async fn caller_allowed_cameras(
     headers: &HeaderMap,
 ) -> Option<Vec<String>> {
     let cfg = state.config.read().await;
-    let (user, role) = extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)?;
-    resolve_user_allowed_cameras(state, jar, headers, &cfg.auth, &user, &role)
+    if let Some((user, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)
+    {
+        return resolve_user_allowed_cameras(state, jar, headers, &cfg.auth, &user, &role);
+    }
+    let has_supplied_credentials =
+        headers.contains_key(header::AUTHORIZATION) || jar.get(&cfg.auth.cookie_name).is_some();
+    if cfg.auth.enabled && has_supplied_credentials {
+        Some(Vec::new())
+    } else {
+        None
+    }
 }
 
 fn scope_cameras_filter(
@@ -3182,15 +3672,32 @@ fn scope_cameras_filter(
 ) -> Option<Vec<String>> {
     match (requested, allowed) {
         (req, None) => req,
-        (None, Some(allow_list)) => Some(if allow_list.is_empty() {
-            vec!["__none__".to_string()]
-        } else {
-            allow_list
-        }),
+        (None, Some(allow_list)) => {
+            if allow_list.iter().any(|a| a == "*") {
+                return None;
+            }
+            let safe_allow: Vec<String> = allow_list.into_iter().filter(|a| a != "all").collect();
+            Some(if safe_allow.is_empty() {
+                vec!["__none__".to_string()]
+            } else {
+                safe_allow
+            })
+        }
         (Some(req_list), Some(allow_list)) => {
+            if allow_list.iter().any(|a| a == "*") {
+                return Some(req_list);
+            }
+            let safe_allow: Vec<String> = allow_list.into_iter().filter(|a| a != "all").collect();
+            if req_list.iter().any(|c| c == "all" || c == "*") {
+                return Some(if safe_allow.is_empty() {
+                    vec!["__none__".to_string()]
+                } else {
+                    safe_allow
+                });
+            }
             let filtered: Vec<String> = req_list
                 .into_iter()
-                .filter(|c| allow_list.contains(c))
+                .filter(|c| c != "all" && safe_allow.contains(c))
                 .collect();
             Some(if filtered.is_empty() {
                 vec!["__none__".to_string()]
@@ -3299,6 +3806,103 @@ fn validate_config_labelmap_paths(cfg: &NinjaConfig) -> Result<(), &'static str>
     Ok(())
 }
 
+fn is_sensitive_yaml_secret_key_name(key: &str) -> bool {
+    matches!(
+        key.trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "password"
+            | "pass"
+            | "passwd"
+            | "pwd"
+            | "api_key"
+            | "apikey"
+            | "secret"
+            | "client_secret"
+            | "token"
+            | "access_token"
+            | "auth_token"
+            | "webhook_secret"
+            | "jwt_secret"
+    )
+}
+
+fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> String {
+    let base_scrubbed = ninjanvr_config::scrub_yaml_credentials(raw_yaml);
+    let mut out = String::with_capacity(base_scrubbed.len());
+    for chunk in base_scrubbed.split_inclusive('\n') {
+        let (line_body, newline) = if let Some(stripped) = chunk.strip_suffix("\r\n") {
+            (stripped, "\r\n")
+        } else if let Some(stripped) = chunk.strip_suffix('\n') {
+            (stripped, "\n")
+        } else {
+            (chunk, "")
+        };
+        let trimmed_start = line_body.trim_start();
+        if trimmed_start.starts_with('#') || trimmed_start.is_empty() {
+            out.push_str(chunk);
+            continue;
+        }
+        let after_list = trimmed_start
+            .strip_prefix("- ")
+            .map(|s| s.trim_start())
+            .unwrap_or(trimmed_start);
+        let prefix_len = line_body.len() - after_list.len();
+        let leading_prefix = &line_body[..prefix_len];
+        if let Some((raw_k, raw_v)) = after_list.split_once(':')
+            && is_sensitive_yaml_secret_key_name(raw_k)
+        {
+            let val_trimmed = raw_v.trim();
+            let unquoted = val_trimmed.trim_matches('"').trim_matches('\'').trim();
+            if !unquoted.is_empty()
+                && !unquoted.eq_ignore_ascii_case("null")
+                && unquoted != "~"
+                && unquoted != "***"
+                && !unquoted.starts_with('#')
+            {
+                out.push_str(leading_prefix);
+                out.push_str(raw_k.trim_end());
+                out.push_str(": \"***\"");
+                out.push_str(newline);
+                continue;
+            }
+        }
+        out.push_str(line_body);
+        out.push_str(newline);
+    }
+
+    let mut known_secrets: Vec<&str> = Vec::new();
+    if let Some(ref p) = cfg.mqtt.password {
+        let t = p.trim();
+        if !t.is_empty() && t != "***" && t != "*" {
+            known_secrets.push(t);
+        }
+    }
+    if let Some(ref k) = cfg.genai.api_key {
+        let t = k.trim();
+        if !t.is_empty() && t != "***" && t != "*" {
+            known_secrets.push(t);
+        }
+    }
+    for cam in cfg.cameras.values() {
+        if let Some(ref p) = cam.onvif.password {
+            let t = p.trim();
+            if !t.is_empty() && t != "***" && t != "*" {
+                known_secrets.push(t);
+            }
+        }
+    }
+    for secret in known_secrets {
+        if secret.len() >= 3 && out.contains(secret) {
+            out = out.replace(secret, "***");
+        }
+    }
+    out
+}
+
 async fn api_config(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -3324,8 +3928,9 @@ async fn api_config(
         }
     };
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+        let is_cam_permitted = |cam_name: &str| allowed.iter().any(|a| a == cam_name || a == "*");
         if let Some(cams_obj) = api_cfg.get_mut("cameras").and_then(|v| v.as_object_mut()) {
-            cams_obj.retain(|k, _| allowed.contains(k));
+            cams_obj.retain(|k, _| is_cam_permitted(k));
         }
         if let Some(streams_obj) = api_cfg
             .get_mut("go2rtc")
@@ -3334,7 +3939,7 @@ async fn api_config(
         {
             streams_obj.retain(|k, _| {
                 let base_cam = k.strip_suffix("_sub").unwrap_or(k);
-                allowed.iter().any(|a| a == base_cam)
+                is_cam_permitted(base_cam)
             });
         }
         if let Some(groups_obj) = api_cfg
@@ -3343,12 +3948,41 @@ async fn api_config(
         {
             groups_obj.retain(|_, grp_val| {
                 if let Some(cams_arr) = grp_val.get_mut("cameras").and_then(|v| v.as_array_mut()) {
-                    cams_arr.retain(|c| c.as_str().is_some_and(|s| allowed.iter().any(|a| a == s)));
+                    cams_arr.retain(|c| c.as_str().is_some_and(is_cam_permitted));
                     !cams_arr.is_empty()
                 } else {
                     false
                 }
             });
+        }
+        if let Some(profiles_obj) = api_cfg.get_mut("profiles").and_then(|v| v.as_object_mut()) {
+            for prof_val in profiles_obj.values_mut() {
+                if let Some(prof_cams) = prof_val.get_mut("cameras").and_then(|v| v.as_object_mut())
+                {
+                    prof_cams.retain(|k, _| is_cam_permitted(k));
+                }
+                for arr_key in ["disabled_alerts_cameras", "disabled_record_cameras"] {
+                    if let Some(arr) = prof_val.get_mut(arr_key).and_then(|v| v.as_array_mut()) {
+                        arr.retain(|c| c.as_str().is_some_and(is_cam_permitted));
+                    }
+                }
+            }
+        }
+        if let Some(rooms_arr) = api_cfg
+            .get_mut("ui")
+            .and_then(|u| u.get_mut("floorplan"))
+            .and_then(|f| f.get_mut("rooms"))
+            .and_then(|v| v.as_array_mut())
+        {
+            for room in rooms_arr.iter_mut() {
+                if let Some(room_obj) = room.as_object_mut()
+                    && let Some(cam_str) = room_obj.get("camera").and_then(|v| v.as_str())
+                    && !cam_str.is_empty()
+                    && !is_cam_permitted(cam_str)
+                {
+                    room_obj.insert("camera".to_string(), Value::Null);
+                }
+            }
         }
     }
     Json(api_cfg)
@@ -3356,8 +3990,9 @@ async fn api_config(
 
 async fn api_config_raw(State(state): State<AppState>) -> Json<Value> {
     let cfg = state.config.read().await;
-    Json(Value::String(ninjanvr_config::scrub_yaml_credentials(
+    Json(Value::String(scrub_raw_yaml_secrets_strict(
         &cfg.raw_yaml,
+        &cfg,
     )))
 }
 
@@ -3377,7 +4012,18 @@ async fn api_config_save(
         )
             .into_response();
     }
-    let path = { state.config.read().await.config_path.clone() };
+    if body.len() > 1_048_576 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "success": false,
+                "message": "Configuration YAML exceeds maximum allowed size (1 MiB)"
+            })),
+        )
+            .into_response();
+    }
+    let mut cfg_guard = state.config.write().await;
+    let path = cfg_guard.config_path.clone();
     match NinjaConfig::from_yaml_str(&body, path.clone()) {
         Ok(mut new_cfg) => {
             if let Err(msg) = validate_config_labelmap_paths(&new_cfg) {
@@ -3387,10 +4033,7 @@ async fn api_config_save(
                 )
                     .into_response();
             }
-            {
-                let prev = state.config.read().await;
-                new_cfg.restore_scrubbed_from_previous(&prev);
-            }
+            new_cfg.restore_scrubbed_from_previous(&cfg_guard);
             if let Err(msg) = validate_config_labelmap_paths(&new_cfg) {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -3413,7 +4056,7 @@ async fn api_config_save(
             let heuristics =
                 evaluate_system_heuristics(&new_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
             emit_heuristics_to_logs(&state.log_hub, &heuristics);
-            *state.config.write().await = new_cfg;
+            *cfg_guard = new_cfg;
             Json(json!({ "success": true, "message": "Config saved successfully" })).into_response()
         }
         Err(err) => (
@@ -3440,7 +4083,8 @@ async fn api_config_structured(
         )
             .into_response();
     }
-    let mut next_cfg = { state.config.read().await.clone() };
+    let mut cfg_guard = state.config.write().await;
+    let mut next_cfg = cfg_guard.clone();
     if let Err(err) = next_cfg.apply_structured_json(&body) {
         return (
             StatusCode::BAD_REQUEST,
@@ -3471,8 +4115,8 @@ async fn api_config_structured(
         evaluate_system_heuristics(&next_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
     emit_heuristics_to_logs(&state.log_hub, &heuristics);
     let api_cfg = next_cfg.to_api_config();
-    let raw_yaml = ninjanvr_config::scrub_yaml_credentials(&next_cfg.raw_yaml);
-    *state.config.write().await = next_cfg;
+    let raw_yaml = scrub_raw_yaml_secrets_strict(&next_cfg.raw_yaml, &next_cfg);
+    *cfg_guard = next_cfg;
     Json(json!({
         "success": true,
         "message": "Structured configuration saved",
@@ -3602,16 +4246,76 @@ fn async_stream_lines(
     })
 }
 
-fn filter_stats_snapshot_for_allowed_cameras(val: &mut Value, allow_list: &[String]) {
-    if let Some(cams) = val.get_mut("cameras").and_then(|v| v.as_object_mut()) {
-        cams.retain(|k, _| allow_list.iter().any(|a| a == k || a == "*"));
+fn escape_prom_label_value(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            _ => out.push(ch),
+        }
     }
-    if let Some(cam_storage) = val
-        .get_mut("service")
-        .and_then(|s| s.get_mut("camera_storage"))
-        .and_then(|v| v.as_object_mut())
-    {
-        cam_storage.retain(|k, _| allow_list.iter().any(|a| a == k || a == "*"));
+    out
+}
+
+fn filter_stats_snapshot_for_allowed_cameras(val: &mut Value, allow_list: &[String]) {
+    if allow_list.iter().any(|a| a == "*") {
+        return;
+    }
+    let is_permitted = |cam: &str| {
+        let base = cam.strip_suffix("_sub").unwrap_or(cam).trim();
+        allow_list.iter().any(|a| a == cam || a == base)
+    };
+    let mut retained_cam_fps = 0.0;
+    let mut retained_det_fps = 0.0;
+    if let Some(cams) = val.get_mut("cameras").and_then(|v| v.as_object_mut()) {
+        cams.retain(|k, _| is_permitted(k));
+        for c_stat in cams.values() {
+            retained_cam_fps += c_stat
+                .get("camera_fps")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            retained_det_fps += c_stat
+                .get("detection_fps")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+        }
+    }
+    if let Some(obj) = val.as_object_mut() {
+        let rounded_cam = (retained_cam_fps * 10.0).round() / 10.0;
+        let rounded_det = (retained_det_fps * 10.0).round() / 10.0;
+        obj.insert("camera_fps".to_string(), json!(rounded_cam));
+        obj.insert("process_fps".to_string(), json!(rounded_cam));
+        obj.insert("detection_fps".to_string(), json!(rounded_det));
+    }
+    if let Some(service_obj) = val.get_mut("service").and_then(|s| s.as_object_mut()) {
+        if let Some(cam_storage) = service_obj
+            .get_mut("camera_storage")
+            .and_then(|v| v.as_object_mut())
+        {
+            cam_storage.retain(|k, _| is_permitted(k));
+        }
+        if let Some(heuristics) = service_obj
+            .get_mut("heuristics")
+            .and_then(|v| v.as_array_mut())
+        {
+            heuristics.retain(|h| {
+                let cat = h.get("category").and_then(|v| v.as_str()).unwrap_or("");
+                let target = h.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                if matches!(cat, "vision" | "streams" | "audio") {
+                    let targets: Vec<&str> = target
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    !targets.is_empty() && targets.into_iter().all(is_permitted)
+                } else {
+                    true
+                }
+            });
+        }
     }
 }
 
@@ -3660,6 +4364,7 @@ async fn api_prometheus_metrics(
 
     if let Some(cams) = stats_val.get("cameras").and_then(|v| v.as_object()) {
         for (cam, c_stat) in cams {
+            let safe_cam = escape_prom_label_value(cam);
             let cam_fps = c_stat
                 .get("camera_fps")
                 .and_then(|v| v.as_f64())
@@ -3674,16 +4379,16 @@ async fn api_prometheus_metrics(
                 .unwrap_or(cam_fps);
             let online = if cam_fps > 0.0 { 1 } else { 0 };
             out.push_str(&format!(
-                "ninjanvr_camera_fps{{camera=\"{cam}\",role=\"camera\"}} {cam_fps:.2}\n"
+                "ninjanvr_camera_fps{{camera=\"{safe_cam}\",role=\"camera\"}} {cam_fps:.2}\n"
             ));
             out.push_str(&format!(
-                "ninjanvr_camera_fps{{camera=\"{cam}\",role=\"detect\"}} {det_fps:.2}\n"
+                "ninjanvr_camera_fps{{camera=\"{safe_cam}\",role=\"detect\"}} {det_fps:.2}\n"
             ));
             out.push_str(&format!(
-                "ninjanvr_camera_fps{{camera=\"{cam}\",role=\"process\"}} {proc_fps:.2}\n"
+                "ninjanvr_camera_fps{{camera=\"{safe_cam}\",role=\"process\"}} {proc_fps:.2}\n"
             ));
             out.push_str(&format!(
-                "ninjanvr_camera_online{{camera=\"{cam}\"}} {online}\n"
+                "ninjanvr_camera_online{{camera=\"{safe_cam}\"}} {online}\n"
             ));
         }
     }
@@ -3694,12 +4399,13 @@ async fn api_prometheus_metrics(
     out.push_str("# TYPE ninjanvr_detector_inference_ms gauge\n");
     if let Some(dets) = stats_val.get("detectors").and_then(|v| v.as_object()) {
         for (det_name, d_stat) in dets {
+            let safe_det = escape_prom_label_value(det_name);
             let ms = d_stat
                 .get("inference_speed")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
             out.push_str(&format!(
-                "ninjanvr_detector_inference_ms{{detector=\"{det_name}\"}} {ms:.2}\n"
+                "ninjanvr_detector_inference_ms{{detector=\"{safe_det}\"}} {ms:.2}\n"
             ));
         }
     }
@@ -3714,7 +4420,7 @@ async fn api_prometheus_metrics(
         .and_then(|v| v.as_object())
     {
         for (mount_path, st) in storages {
-            let label = if mount_path.contains("recordings") {
+            let raw_label = if mount_path.contains("recordings") {
                 "recordings"
             } else if mount_path.contains("clips") {
                 "clips"
@@ -3725,6 +4431,7 @@ async fn api_prometheus_metrics(
             } else {
                 mount_path.as_str()
             };
+            let label = escape_prom_label_value(raw_label);
             let used_mb = st.get("used").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let total_mb = st.get("total").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let used_bytes = (used_mb * 1024.0 * 1024.0).round() as u64;
@@ -3771,8 +4478,10 @@ async fn api_prometheus_metrics(
             {
                 continue;
             }
+            let safe_cam = escape_prom_label_value(&cam);
+            let safe_lbl = escape_prom_label_value(&lbl);
             out.push_str(&format!(
-                "ninjanvr_events_total{{camera=\"{cam}\",label=\"{lbl}\"}} {cnt}\n"
+                "ninjanvr_events_total{{camera=\"{safe_cam}\",label=\"{safe_lbl}\"}} {cnt}\n"
             ));
         }
     }
@@ -3802,16 +4511,19 @@ async fn build_ai_context_digest(
     allowed_cameras: Option<&[String]>,
 ) -> Value {
     let now = unix_now() as f64;
-    let before = before_opt.unwrap_or(now + 5.0);
-    let clamped_hours = hours.clamp(0.1, 720.0);
-    let after = after_opt.unwrap_or(before - clamped_hours * 3600.0);
+    let before = before_opt.filter(|v| v.is_finite()).unwrap_or(now + 5.0);
+    let safe_hours = if hours.is_finite() { hours } else { 24.0 };
+    let clamped_hours = safe_hours.clamp(0.1, 720.0);
+    let after = after_opt
+        .filter(|v| v.is_finite())
+        .unwrap_or(before - clamped_hours * 3600.0);
 
     let cfg = state.config.read().await;
     let metrics_map = state.camera_metrics.read().await;
     let mut cameras_health = serde_json::Map::new();
     for (cam_name, cam_cfg) in &cfg.cameras {
         if let Some(allowed) = allowed_cameras
-            && !allowed.contains(cam_name)
+            && !allowed.iter().any(|a| a == cam_name || a == "*")
         {
             continue;
         }
@@ -3837,9 +4549,13 @@ async fn build_ai_context_digest(
         );
     }
 
+    let db_allowed: Option<&[String]> = match allowed_cameras {
+        Some(list) if list.iter().any(|a| a == "*") => None,
+        other => other,
+    };
     let db_digest = state
         .db
-        .query_ai_digest_summary(after, before, allowed_cameras)
+        .query_ai_digest_summary(after, before, db_allowed)
         .unwrap_or_else(|_| json!({}));
 
     json!({
@@ -3879,6 +4595,7 @@ pub struct McpJsonRpcRequest {
 
 async fn api_mcp_handler(
     State(state): State<AppState>,
+    uri: Uri,
     jar: CookieJar,
     headers: HeaderMap,
     Json(req): Json<McpJsonRpcRequest>,
@@ -3991,25 +4708,56 @@ async fn api_mcp_handler(
                     .into_response()
                 }
                 "search_events" | "query_events" => {
-                    let req_cams = args
-                        .get("camera")
-                        .and_then(|v| v.as_str())
-                        .map(|s| vec![s.to_string()]);
+                    let mut parsed_cams: Vec<String> = Vec::new();
+                    for key in ["camera", "cameras"] {
+                        match args.get(key) {
+                            Some(Value::String(s)) => {
+                                for part in s.split(',') {
+                                    let t = part.trim();
+                                    if !t.is_empty() {
+                                        parsed_cams.push(t.to_string());
+                                    }
+                                }
+                            }
+                            Some(Value::Array(arr)) => {
+                                for item in arr {
+                                    if let Some(s) = item.as_str() {
+                                        let t = s.trim();
+                                        if !t.is_empty() {
+                                            parsed_cams.push(t.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let req_cams = if parsed_cams.is_empty() {
+                        None
+                    } else {
+                        Some(parsed_cams)
+                    };
                     let filter = EventFilter {
                         cameras: scope_cameras_filter(req_cams, allowed),
                         labels: args
                             .get("label")
                             .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
                             .map(|s| vec![s.to_string()]),
                         exclude_labels: None,
                         zones: args
                             .get("zone")
                             .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
                             .map(|s| vec![s.to_string()]),
                         sub_labels: None,
                         plate: args
                             .get("plate")
                             .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
                             .map(str::to_string),
                         recognized_license_plates: None,
                         favorites: None,
@@ -4054,21 +4802,42 @@ async fn api_mcp_handler(
                     .into_response()
                 }
                 "set_security_profile" => {
+                    if !verify_cookie_csrf_origin(&headers, &uri) {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32003,
+                                    "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
                     let caller_role = {
                         let cfg = state.config.read().await;
-                        extract_authenticated_user(
+                        let has_creds = headers.contains_key(header::AUTHORIZATION)
+                            || jar.get(&cfg.auth.cookie_name).is_some()
+                            || (cfg.auth.proxy.enabled
+                                && extract_trusted_proxy_peer_ip(&headers).is_some());
+                        match extract_authenticated_user(
                             &state,
                             &jar,
                             &headers,
                             &cfg.auth.cookie_name,
                             cfg.auth.enabled,
-                        )
-                        .map(|(_, r)| r.to_ascii_lowercase())
-                        .unwrap_or_else(|| "admin".to_string())
+                        ) {
+                            Some((_, r)) => r.to_ascii_lowercase(),
+                            None if cfg.auth.enabled && has_creds => "unauthorized".to_string(),
+                            None => "admin".to_string(),
+                        }
                     };
                     if caller_role == "viewer"
                         || caller_role == "read_only"
                         || caller_role == "metrics"
+                        || caller_role == "unauthorized"
                         || allowed.is_some()
                     {
                         return (
@@ -4150,12 +4919,37 @@ pub struct DebugReprocessBody {
 
 async fn api_debug_reprocess(
     State(state): State<AppState>,
+    uri: Uri,
     jar: CookieJar,
     headers: HeaderMap,
     Json(body): Json<DebugReprocessBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if !is_safe_go2rtc_stream_name(&body.camera) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid camera identifier" })),
+        )
+            .into_response();
+    }
+    if !body.start_time.is_finite() || !body.end_time.is_finite() || body.start_time < 0.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid start_time or end_time" })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && !allowed.contains(&body.camera)
+        && !allowed.iter().any(|a| a == &body.camera || a == "*")
     {
         return (
             StatusCode::FORBIDDEN,
@@ -4172,18 +4966,20 @@ async fn api_debug_reprocess(
         cfg.cameras.get(&body.camera).cloned().unwrap_or_default()
     };
 
-    let det_w = cam_cfg.detect.width.max(320);
-    let det_h = cam_cfg.detect.height.max(180);
+    let det_w = cam_cfg.detect.width.clamp(320, 3840) & !1;
+    let det_h = cam_cfg.detect.height.clamp(180, 2160) & !1;
     let frame_area = (det_w as f64) * (det_h as f64);
 
     let ov = body.override_config.as_ref();
     let eff_min_score = body
         .min_score
         .or_else(|| ov.and_then(|v| v.get("min_score")).and_then(|v| v.as_f64()))
+        .filter(|v| v.is_finite())
         .unwrap_or(0.50);
     let raw_min_area = body
         .min_area
         .or_else(|| ov.and_then(|v| v.get("min_area")).and_then(|v| v.as_f64()))
+        .filter(|v| v.is_finite())
         .unwrap_or(0.0);
     let eff_min_area_px = if raw_min_area > 0.0 && raw_min_area <= 1.0 {
         (raw_min_area * frame_area).round() as u32
@@ -4193,6 +4989,7 @@ async fn api_debug_reprocess(
     let raw_max_area = body
         .max_area
         .or_else(|| ov.and_then(|v| v.get("max_area")).and_then(|v| v.as_f64()))
+        .filter(|v| v.is_finite())
         .unwrap_or(24_000_000.0);
     let eff_max_area_px = if raw_max_area > 0.0 && raw_max_area <= 1.0 {
         (raw_max_area * frame_area).round() as u32
@@ -4224,25 +5021,24 @@ async fn api_debug_reprocess(
         .filter(|p| p.is_file()) else {
             continue;
         };
-        let Ok(output) = tokio::process::Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                disk_path.to_string_lossy().as_ref(),
-                "-vf",
-                &format!("fps=1,scale={det_w}:{det_h}"),
-                "-frames:v",
-                "3",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                "pipe:1",
-            ])
-            .output()
-            .await
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.kill_on_drop(true).args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            disk_path.to_string_lossy().as_ref(),
+            "-vf",
+            &format!("fps=1,scale={det_w}:{det_h}"),
+            "-frames:v",
+            "3",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "pipe:1",
+        ]);
+        let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await
         else {
             continue;
         };
@@ -4301,6 +5097,14 @@ async fn api_debug_reprocess(
                         "area_px": area,
                         "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
                         "reason": "below_min_area"
+                    }));
+                } else if area > eff_max_area_px {
+                    rejected.push(json!({
+                        "label": d.label,
+                        "score": d.score,
+                        "area_px": area,
+                        "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
+                        "reason": "above_max_area"
                     }));
                 }
             }
@@ -4544,12 +5348,61 @@ fn render_synthetic_mercosul_vehicle_frame(plate: &str) -> image::RgbImage {
     img
 }
 
+fn is_safe_federation_peer_base_url(raw_url: &str) -> bool {
+    let trimmed = raw_url.trim().trim_end_matches('/');
+    if trimmed.is_empty()
+        || trimmed.contains(['\\', '?', '#'])
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return false;
+    }
+    let Some((_, host_port)) = extract_url_scheme_and_host(trimmed) else {
+        return false;
+    };
+    let host = bare_hostname(host_port).trim();
+    if host.is_empty() || host.eq_ignore_ascii_case("metadata.google.internal") {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let canon = ip.to_canonical();
+        match canon {
+            std::net::IpAddr::V4(v4) => {
+                if v4.is_unspecified() || v4.is_link_local() || v4.is_multicast() {
+                    return false;
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_unspecified() || v6.is_unicast_link_local() || v6.is_multicast() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 async fn api_debug_lpr_simulate(
     State(state): State<AppState>,
+    uri: Uri,
     jar: CookieJar,
     headers: HeaderMap,
     Json(body): Json<DebugLprSimulateBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     let (camera, lpr_cfg) = {
         let cfg = state.config.read().await;
         let requested_cam = body
@@ -4558,6 +5411,17 @@ async fn api_debug_lpr_simulate(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
+            .or_else(|| {
+                if let Some(ref allow_list) = allowed {
+                    cfg.cameras
+                        .iter()
+                        .find(|(k, c)| c.enabled && allow_list.iter().any(|a| a == *k || a == "*"))
+                        .map(|(k, _)| k.clone())
+                        .or_else(|| allow_list.first().cloned())
+                } else {
+                    None
+                }
+            })
             .or_else(|| {
                 cfg.cameras
                     .iter()
@@ -4569,8 +5433,16 @@ async fn api_debug_lpr_simulate(
         (requested_cam, cfg.lpr.clone())
     };
 
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && !allowed.contains(&camera)
+    if !is_safe_go2rtc_stream_name(&camera) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid camera identifier" })),
+        )
+            .into_response();
+    }
+
+    if let Some(ref allow_list) = allowed
+        && !allow_list.iter().any(|a| a == &camera || a == "*")
     {
         return (
             StatusCode::FORBIDDEN,
@@ -4600,7 +5472,11 @@ async fn api_debug_lpr_simulate(
         .filter(|s| !s.is_empty())
         .unwrap_or("car")
         .to_string();
-    let score = body.score.unwrap_or(0.94).clamp(0.1, 0.999);
+    let score = body
+        .score
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.94)
+        .clamp(0.1, 0.999);
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4785,21 +5661,66 @@ async fn api_debug_lpr_simulate(
 
 async fn api_camera_proxy_root(
     State(state): State<AppState>,
+    method: axum::http::Method,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(camera): AxumPath<String>,
     uri: Uri,
 ) -> Response {
+    if method != axum::http::Method::GET
+        && method != axum::http::Method::HEAD
+        && !verify_cookie_csrf_origin(&headers, &uri)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
     handle_camera_webui_proxy(&state, &camera, "", uri.query()).await
 }
 
-async fn api_notifications_test(State(state): State<AppState>) -> Json<Value> {
+async fn api_notifications_test(
+    State(state): State<AppState>,
+    uri: Uri,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     let (first_cam, mqtt_enabled) = {
         let cfg = state.config.read().await;
-        let cam = cfg
-            .cameras
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "front_door".to_string());
+        let cam = if let Some(ref allow_list) = allowed {
+            cfg.cameras
+                .keys()
+                .find(|k| allow_list.iter().any(|a| a == *k || a == "*"))
+                .cloned()
+                .or_else(|| allow_list.first().cloned())
+        } else {
+            cfg.cameras.keys().next().cloned()
+        }
+        .unwrap_or_else(|| "front_door".to_string());
         (cam, cfg.mqtt.enabled)
     };
     let now = unix_now() as f64;
@@ -4828,14 +5749,23 @@ async fn api_notifications_test(State(state): State<AppState>) -> Json<Value> {
         "camera": first_cam,
         "alert_id": test_id
     }))
+    .into_response()
 }
 
-async fn api_federation_nodes(State(state): State<AppState>) -> Json<Value> {
-    let (local_cams, peers) = {
+async fn api_federation_nodes(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    let (mut local_cams, peers) = {
         let cfg = state.config.read().await;
         let cams: Vec<String> = cfg.cameras.keys().cloned().collect();
         (cams, cfg.peers.clone())
     };
+    if let Some(ref allow_list) = allowed {
+        local_cams.retain(|c| allow_list.iter().any(|a| a == c || a == "*"));
+    }
 
     let mut nodes = vec![json!({
         "id": "local",
@@ -4849,17 +5779,19 @@ async fn api_federation_nodes(State(state): State<AppState>) -> Json<Value> {
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok();
 
     for (peer_id, peer_cfg) in peers {
         let base_url = peer_cfg.url.trim().trim_end_matches('/').to_string();
+        let scrubbed_url = scrub_rtsp_credentials(&base_url);
         let mut online = false;
         let mut version = "unknown".to_string();
         let mut peer_cams: Vec<String> = Vec::new();
 
         if peer_cfg.enabled
-            && !base_url.is_empty()
+            && is_safe_federation_peer_base_url(&base_url)
             && let Some(ref c) = client
         {
             let mut req = c.get(format!("{base_url}/api/stats"));
@@ -4871,7 +5803,8 @@ async fn api_federation_nodes(State(state): State<AppState>) -> Json<Value> {
             }
             if let Ok(resp) = req.send().await
                 && resp.status().is_success()
-                && let Ok(stats_json) = resp.json::<Value>().await
+                && let Ok(stats_bytes) = read_upstream_body_bounded(resp, 2 * 1024 * 1024).await
+                && let Ok(stats_json) = serde_json::from_slice::<Value>(&stats_bytes)
             {
                 online = true;
                 if let Some(v) = stats_json
@@ -4883,6 +5816,9 @@ async fn api_federation_nodes(State(state): State<AppState>) -> Json<Value> {
                 }
                 if let Some(cams_obj) = stats_json.get("cameras").and_then(|v| v.as_object()) {
                     peer_cams = cams_obj.keys().cloned().collect();
+                    if let Some(ref allow_list) = allowed {
+                        peer_cams.retain(|c| allow_list.iter().any(|a| a == c || a == "*"));
+                    }
                 }
             }
         }
@@ -4893,7 +5829,7 @@ async fn api_federation_nodes(State(state): State<AppState>) -> Json<Value> {
             "primary": false,
             "enabled": peer_cfg.enabled,
             "online": online,
-            "url": base_url,
+            "url": scrubbed_url,
             "version": version,
             "cameras": peer_cams
         }));
@@ -4904,17 +5840,43 @@ async fn api_federation_nodes(State(state): State<AppState>) -> Json<Value> {
 
 async fn api_federation_proxy(
     State(state): State<AppState>,
+    method: axum::http::Method,
+    headers: HeaderMap,
     AxumPath((node, subpath)): AxumPath<(String, String)>,
     uri: Uri,
 ) -> Response {
-    let decoded_sub = percent_decode_path(&subpath).unwrap_or_else(|| subpath.clone());
+    if method != axum::http::Method::GET
+        && method != axum::http::Method::HEAD
+        && !verify_cookie_csrf_origin(&headers, &uri)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    let Some(decoded_sub) = percent_decode_path(&subpath) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Invalid federation proxy subpath"
+            })),
+        )
+            .into_response();
+    };
     if subpath.contains("..")
         || decoded_sub.contains("..")
-        || subpath.contains('\\')
-        || decoded_sub.contains('\\')
-        || subpath.contains('@')
-        || decoded_sub.contains('@')
+        || subpath.contains(['\\', '@', '?', '#'])
+        || decoded_sub.contains(['\\', '@', '?', '#'])
         || subpath.chars().any(|c| c.is_control() || c.is_whitespace())
+        || decoded_sub
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+        || decoded_sub.split('/').any(|seg| seg == "." || seg == "..")
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -4941,6 +5903,16 @@ async fn api_federation_proxy(
     };
 
     let base_url = peer_cfg.url.trim().trim_end_matches('/');
+    if !is_safe_federation_peer_base_url(base_url) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": format!("Federated peer node '{node}' has an invalid or disallowed base URL")
+            })),
+        )
+            .into_response();
+    }
     let clean_sub = subpath.trim_start_matches('/');
     let mut target_url = if clean_sub.starts_with("api/") || clean_sub == "api" {
         format!("{base_url}/{clean_sub}")
@@ -4956,6 +5928,7 @@ async fn api_federation_proxy(
 
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -4979,26 +5952,65 @@ async fn api_federation_proxy(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/json")
                 .to_string();
-            let body_bytes = upstream.bytes().await.unwrap_or_default().to_vec();
+            let Ok(body_bytes) = read_upstream_body_bounded(upstream, 16 * 1024 * 1024).await
+            else {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "success": false,
+                        "node": node,
+                        "message": "Federated peer response exceeded maximum allowed size"
+                    })),
+                )
+                    .into_response();
+            };
             (status, [(header::CONTENT_TYPE, content_type)], body_bytes).into_response()
         }
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "success": false,
-                "node": node,
-                "message": format!("Federated peer node '{node}' unreachable: {err}")
-            })),
-        )
-            .into_response(),
+        Err(err) => {
+            let scrubbed_err = scrub_rtsp_credentials(&err.to_string());
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "success": false,
+                    "node": node,
+                    "message": format!("Federated peer node '{node}' unreachable: {scrubbed_err}")
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
 async fn api_camera_proxy_subpath(
     State(state): State<AppState>,
+    method: axum::http::Method,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath((camera, subpath)): AxumPath<(String, String)>,
     uri: Uri,
 ) -> Response {
+    if method != axum::http::Method::GET
+        && method != axum::http::Method::HEAD
+        && !verify_cookie_csrf_origin(&headers, &uri)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
     handle_camera_webui_proxy(&state, &camera, &subpath, uri.query()).await
 }
 
@@ -5020,14 +6032,13 @@ async fn handle_camera_webui_proxy(
     };
     if subpath.contains("..")
         || decoded_sub.contains("..")
-        || subpath.contains('\\')
-        || decoded_sub.contains('\\')
-        || subpath.contains('@')
-        || decoded_sub.contains('@')
+        || subpath.contains(['\\', '@', '?', '#'])
+        || decoded_sub.contains(['\\', '@', '?', '#'])
         || subpath.chars().any(|c| c.is_control() || c.is_whitespace())
         || decoded_sub
             .chars()
             .any(|c| c.is_control() || c.is_whitespace())
+        || decoded_sub.split('/').any(|seg| seg == "." || seg == "..")
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -5089,14 +6100,34 @@ async fn handle_camera_webui_proxy(
                 .headers()
                 .get(header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .map(|loc| {
-                    if let Some(rel) = loc.strip_prefix('/') {
-                        format!("/api/camera-proxy/{camera}/{rel}")
+                .and_then(|loc| {
+                    let trimmed = loc.trim();
+                    if let Some(after_base) = trimmed.strip_prefix(&base_url) {
+                        let rel = after_base.trim_start_matches('/');
+                        Some(format!("/api/camera-proxy/{camera}/{rel}"))
+                    } else if (trimmed.starts_with('/') && !trimmed.starts_with("//"))
+                        || (!trimmed.contains("://")
+                            && !trimmed.starts_with("//")
+                            && !trimmed.contains(':'))
+                    {
+                        let rel = trimmed.trim_start_matches('/');
+                        Some(format!("/api/camera-proxy/{camera}/{rel}"))
                     } else {
-                        loc.to_string()
+                        None
                     }
                 });
-            let body_bytes = upstream.bytes().await.unwrap_or_default().to_vec();
+            let Ok(body_bytes) = read_upstream_body_bounded(upstream, 16 * 1024 * 1024).await
+            else {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "success": false,
+                        "camera": camera,
+                        "message": "Camera Web UI response exceeded maximum allowed size"
+                    })),
+                )
+                    .into_response();
+            };
             let mut resp =
                 (status, [(header::CONTENT_TYPE, content_type)], body_bytes).into_response();
             if let Some(loc_str) = rewritten_loc
