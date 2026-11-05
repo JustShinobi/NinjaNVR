@@ -21,6 +21,97 @@ import {
 import { LiveMsePlayer, VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 
+export const MAX_EXPORT_WINDOW_SEC = 86400;
+
+export interface ExportTimeWindowValidation {
+  valid: boolean;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+  error?: string;
+}
+
+export function validateExportTimeWindow(
+  startSec: number,
+  endSec: number,
+  maxWindowSec: number = MAX_EXPORT_WINDOW_SEC
+): ExportTimeWindowValidation {
+  if (
+    typeof startSec !== "number" ||
+    typeof endSec !== "number" ||
+    !Number.isFinite(startSec) ||
+    !Number.isFinite(endSec) ||
+    startSec < 0
+  ) {
+    return {
+      valid: false,
+      startSec: 0,
+      endSec: 0,
+      durationSec: 0,
+      error: "Invalid export time window: start and end timestamps must be finite",
+    };
+  }
+  const normalizedStart = Math.floor(startSec);
+  const normalizedEnd = Math.ceil(endSec);
+  const durationSec = normalizedEnd - normalizedStart;
+  if (durationSec <= 0) {
+    return {
+      valid: false,
+      startSec: normalizedStart,
+      endSec: normalizedEnd,
+      durationSec: 0,
+      error: "Invalid export time window: end time must be greater than start time",
+    };
+  }
+  const safeMax =
+    typeof maxWindowSec === "number" &&
+    Number.isFinite(maxWindowSec) &&
+    maxWindowSec > 0
+      ? maxWindowSec
+      : MAX_EXPORT_WINDOW_SEC;
+  if (durationSec > safeMax) {
+    return {
+      valid: false,
+      startSec: normalizedStart,
+      endSec: normalizedEnd,
+      durationSec,
+      error: `Export time window exceeds maximum allowed duration (${Math.round(
+        safeMax / 3600
+      )}h)`,
+    };
+  }
+  return {
+    valid: true,
+    startSec: normalizedStart,
+    endSec: normalizedEnd,
+    durationSec,
+  };
+}
+
+export function resolveSafeExportVideoUrl(
+  videoPath: string | null | undefined,
+  exportId?: string
+): string {
+  const cleanId = (exportId || "").trim();
+  const fallback =
+    cleanId && !cleanId.includes("..") && !/[/\\]/.test(cleanId)
+      ? `/exports/${encodeURIComponent(cleanId)}.mp4`
+      : "";
+  const raw = (videoPath || "").trim();
+  if (!raw || /[\u0000-\u001f\u007f\\]/.test(raw)) {
+    return fallback;
+  }
+  const stripped = raw.replace(/^\/media\/[^/]+/, "");
+  if (
+    !stripped.startsWith("/") ||
+    stripped.startsWith("//") ||
+    stripped.includes("..")
+  ) {
+    return fallback;
+  }
+  return stripped;
+}
+
 interface ExportsWorkspaceProps {
   cameraNames: string[];
   config: NinjaConfigResponse | null;
@@ -273,18 +364,48 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
   const [shareUrlMap, setShareUrlMap] = React.useState<Record<string, string>>({});
   const [creatingShareId, setCreatingShareId] = React.useState<string | null>(null);
   const [revokingShareId, setRevokingShareId] = React.useState<string | null>(null);
+  const [deletingExportId, setDeletingExportId] = React.useState<string | null>(null);
+  const isMountedRef = React.useRef(true);
+  const shareFetchSeqRef = React.useRef(0);
+  const shareFetchAbortRef = React.useRef<AbortController | null>(null);
+
+  React.useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (shareFetchAbortRef.current) {
+        shareFetchAbortRef.current.abort();
+        shareFetchAbortRef.current = null;
+      }
+    };
+  }, []);
+
+  React.useEffect(() => {
+    if (
+      activeExportPreview &&
+      !exportsList.some((ex) => ex.id === activeExportPreview.id)
+    ) {
+      setActiveExportPreview(null);
+    }
+  }, [exportsList, activeExportPreview, setActiveExportPreview]);
 
   const fetchShareLinks = React.useCallback(
     async (): Promise<ShareLinkItem[] | null> => {
+      const seq = ++shareFetchSeqRef.current;
+      const controller = new AbortController();
+      shareFetchAbortRef.current = controller;
       try {
         const res = await fetch("/api/share", {
           credentials: "include",
+          signal: controller.signal,
         });
         if (!res.ok) return null;
         const data = await res.json().catch(() => null);
         if (Array.isArray(data)) {
           const parsed = data as ShareLinkItem[];
-          setShareLinks(parsed);
+          if (isMountedRef.current && seq === shareFetchSeqRef.current) {
+            setShareLinks(parsed);
+          }
           return parsed;
         }
         return null;
@@ -522,12 +643,25 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           <button
             className="nvr-btn primary"
             onClick={async () => {
+              const cleanCam = (exportCam || "").trim();
+              if (!cleanCam) {
+                notify("Select a valid camera channel before exporting");
+                return;
+              }
               const now = Math.floor(Date.now() / 1000);
-              await handleQuickExport(
-                exportCam,
+              const win = validateExportTimeWindow(
                 now - exportPresetMin * 60,
-                now,
-                exportLabel || `${exportCam}_${exportPresetMin}m`,
+                now
+              );
+              if (!win.valid) {
+                notify(win.error || "Invalid export time window");
+                return;
+              }
+              await handleQuickExport(
+                cleanCam,
+                win.startSec,
+                win.endSec,
+                exportLabel || `${cleanCam}_${exportPresetMin}m`,
                 includeAudio
               );
             }}
@@ -704,7 +838,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                     Share Link
                   </button>
                   <a
-                    href={ex.video_path.replace(/^\/media\/[^/]+/, "")}
+                    href={resolveSafeExportVideoUrl(ex.video_path, ex.id)}
                     download={`${ex.id}.mp4`}
                     className="nvr-btn"
                     style={{ textDecoration: "none" }}
@@ -718,8 +852,11 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                     className="nvr-btn danger"
                     aria-label={`Delete export ${ex.name}`}
                     title={t.exports.deleteBtn}
+                    disabled={deletingExportId === ex.id}
                     onClick={async (e) => {
                       e.stopPropagation();
+                      if (deletingExportId !== null) return;
+                      setDeletingExportId(ex.id);
                       try {
                         const res = await fetch(
                           `/api/export/${encodeURIComponent(ex.id)}`,
@@ -798,6 +935,10 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                         }
                       } catch {
                         notify("Failed to delete export");
+                      } finally {
+                        if (isMountedRef.current) {
+                          setDeletingExportId(null);
+                        }
                       }
                     }}
                   >
@@ -1000,7 +1141,10 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           <div className="nvr-cam-tile" style={{ flex: 1 }}>
             {activeExportPreview ? (
               <video
-                src={activeExportPreview.video_path.replace(/^\/media\/[^/]+/, "")}
+                src={resolveSafeExportVideoUrl(
+                  activeExportPreview.video_path,
+                  activeExportPreview.id
+                )}
                 controls
                 autoPlay
                 muted
@@ -1033,9 +1177,25 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
               setActiveExportPreview(null);
               setTimeShiftTs(ts);
             }}
-            onExportRange={(cam, start, end, label) =>
-              handleQuickExport(cam, start, end, label, includeAudio)
-            }
+            onExportRange={async (cam, start, end, label) => {
+              const cleanCam = (cam || "").trim();
+              if (!cleanCam) {
+                notify("Select a valid camera channel before exporting");
+                return;
+              }
+              const win = validateExportTimeWindow(start, end);
+              if (!win.valid) {
+                notify(win.error || "Invalid export time window");
+                return;
+              }
+              return handleQuickExport(
+                cleanCam,
+                win.startSec,
+                win.endSec,
+                label,
+                includeAudio
+              );
+            }}
             titlePrefix="EXPORT CLIPPER"
             defaultRangeMode={true}
           />

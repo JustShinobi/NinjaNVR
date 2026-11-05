@@ -19,6 +19,54 @@ export type HealthSortColumn =
   | "ffmpeg_cpu";
 export type HealthSortDirection = "asc" | "desc";
 
+export function toFiniteNumber(val: unknown, fallback: number = 0): number {
+  if (typeof val === "number") {
+    return Number.isFinite(val) ? val : fallback;
+  }
+  if (typeof val === "string") {
+    const parsed = parseFloat(val);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+}
+
+export function normalizeRtspProducerEndpoint(rawUrl: string): string | null {
+  const clean = (rawUrl || "").split("#")[0].trim();
+  if (!clean) return null;
+  const schemeMatch = /^(rtsps?):\/\/(.*)$/i.exec(clean);
+  if (!schemeMatch) return null;
+  const scheme = schemeMatch[1].toLowerCase();
+  const remainder = schemeMatch[2];
+  const slashIdx = remainder.indexOf("/");
+  const authority = slashIdx >= 0 ? remainder.slice(0, slashIdx) : remainder;
+  const pathAndQuery = slashIdx >= 0 ? remainder.slice(slashIdx) : "/";
+  const atIdx = authority.lastIndexOf("@");
+  const hostPort = (atIdx >= 0 ? authority.slice(atIdx + 1) : authority).trim();
+  if (!hostPort) return null;
+
+  let hostOnly = hostPort.toLowerCase();
+  if (hostOnly.startsWith("[")) {
+    const closeBracket = hostOnly.indexOf("]");
+    if (closeBracket < 0) return null;
+    hostOnly = hostOnly.slice(1, closeBracket);
+  } else {
+    const colonIdx = hostOnly.indexOf(":");
+    if (colonIdx >= 0) {
+      hostOnly = hostOnly.slice(0, colonIdx);
+    }
+  }
+  if (
+    !hostOnly ||
+    hostOnly === "localhost" ||
+    hostOnly === "::1" ||
+    hostOnly === "0:0:0:0:0:0:0:1" ||
+    /^127(?:\.\d{1,3}){3}$/.test(hostOnly)
+  ) {
+    return null;
+  }
+  return `${scheme}://${hostPort.toLowerCase()}${pathAndQuery}`;
+}
+
 export function filterAndSortCameraHealth(
   cameraNames: string[],
   statsMap: Record<string, CameraRuntimeStats> | undefined,
@@ -43,10 +91,10 @@ export function filterAndSortCameraHealth(
     }
     const cs = statsMap?.[cam];
     if (statusFilter === "offline") {
-      return (cs?.camera_fps ?? 0) <= 0;
+      return toFiniteNumber(cs?.camera_fps, 0) <= 0;
     }
     if (statusFilter === "active_ai") {
-      return (cs?.detection_fps ?? 0) > 0;
+      return toFiniteNumber(cs?.detection_fps, 0) > 0;
     }
     return true;
   });
@@ -59,21 +107,24 @@ export function filterAndSortCameraHealth(
     if (sortColumn === "channel") {
       diff = a.localeCompare(b, undefined, { numeric: true });
     } else if (sortColumn === "camera_fps") {
-      diff = (csA?.camera_fps ?? 0) - (csB?.camera_fps ?? 0);
+      diff =
+        toFiniteNumber(csA?.camera_fps, 0) - toFiniteNumber(csB?.camera_fps, 0);
     } else if (sortColumn === "detection_fps") {
-      diff = (csA?.detection_fps ?? 0) - (csB?.detection_fps ?? 0);
+      diff =
+        toFiniteNumber(csA?.detection_fps, 0) -
+        toFiniteNumber(csB?.detection_fps, 0);
     } else if (sortColumn === "ffmpeg_cpu") {
       diff =
-        parseFloat(csA?.ffmpeg_cpu || "0") - parseFloat(csB?.ffmpeg_cpu || "0");
+        toFiniteNumber(csA?.ffmpeg_cpu, 0) - toFiniteNumber(csB?.ffmpeg_cpu, 0);
     }
-    if (diff !== 0) {
+    if (diff !== 0 && Number.isFinite(diff)) {
       return diff * dir;
     }
     return a.localeCompare(b, undefined, { numeric: true });
   });
 }
 
-function buildClientFallbackHeuristics(
+export function buildClientFallbackHeuristics(
   config: NinjaConfigResponse | null,
   stats: NinjaStatsResponse | null
 ): HeuristicAlertItem[] {
@@ -94,14 +145,10 @@ function buildClientFallbackHeuristics(
       : typeof sVal === "string"
       ? sVal
       : "";
-    const clean = raw.split("#")[0].trim();
-    if (
-      (clean.startsWith("rtsp://") || clean.startsWith("rtsps://")) &&
-      !clean.includes("127.0.0.1") &&
-      !clean.includes("localhost")
-    ) {
-      if (!urlMap[clean]) urlMap[clean] = [];
-      urlMap[clean].push(sName);
+    const normalizedEndpoint = normalizeRtspProducerEndpoint(raw);
+    if (normalizedEndpoint) {
+      if (!urlMap[normalizedEndpoint]) urlMap[normalizedEndpoint] = [];
+      urlMap[normalizedEndpoint].push(sName);
     }
   }
   for (const names of Object.values(urlMap)) {
@@ -125,8 +172,10 @@ function buildClientFallbackHeuristics(
   // 2. Detect aspect ratio & FFmpeg downscale CPU outlier
   const ffCpus: Array<[string, number]> = [];
   for (const [cName, cCfg] of enabledEntries) {
-    const w = cCfg.detect?.width || 1280;
-    const h = cCfg.detect?.height || 720;
+    const rawW = toFiniteNumber(cCfg.detect?.width, 1280);
+    const rawH = toFiniteNumber(cCfg.detect?.height, 720);
+    const w = rawW > 0 ? rawW : 1280;
+    const h = rawH > 0 ? rawH : 720;
     const ratio = w / Math.max(1, h);
     if (Math.abs(ratio - 16 / 9) > 0.15) {
       out.push({
@@ -142,7 +191,7 @@ function buildClientFallbackHeuristics(
           "Set detect.width: 1280 and detect.height: 720 (16:9) and ensure the go2rtc substream uses a 16:9 VBR profile.",
       });
     }
-    const ffVal = parseFloat(stats?.cameras?.[cName]?.ffmpeg_cpu || "0");
+    const ffVal = toFiniteNumber(stats?.cameras?.[cName]?.ffmpeg_cpu, 0);
     if (ffVal > 0) {
       ffCpus.push([cName, ffVal]);
     }
@@ -171,10 +220,16 @@ function buildClientFallbackHeuristics(
 
   // 3. Storage capacity & retention runway
   const recSt = stats?.service?.storage?.["/media/ninjanvr/recordings"];
-  const estDays = stats?.service?.estimated_retention_days ?? 14;
-  if (recSt && recSt.total > 0) {
-    const usedPct = (recSt.used / recSt.total) * 100;
-    const freeGb = recSt.free / 1024;
+  const estDays = toFiniteNumber(stats?.service?.estimated_retention_days, 14);
+  const recTotal = toFiniteNumber(recSt?.total, 0);
+  const recUsed = Math.max(0, toFiniteNumber(recSt?.used, 0));
+  const recFree = Math.max(
+    0,
+    toFiniteNumber(recSt?.free, Math.max(0, recTotal - recUsed))
+  );
+  if (recSt && recTotal > 0) {
+    const usedPct = Math.min(100, (recUsed / recTotal) * 100);
+    const freeGb = recFree / 1024;
     if (
       usedPct >= 85 &&
       !config?.record?.min_free_gb &&
@@ -201,7 +256,7 @@ function buildClientFallbackHeuristics(
 
   const daysList = enabledEntries
     .filter(([, c]) => c.record?.enabled !== false)
-    .map(([, c]) => c.record?.continuous?.days ?? 14);
+    .map(([, c]) => toFiniteNumber(c.record?.continuous?.days, 14));
   if (daysList.length >= 2) {
     const minD = Math.min(...daysList);
     const maxD = Math.max(...daysList);
@@ -298,11 +353,50 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   const stats = useNvrStore((s) => s.stats);
   const statsHistory = useNvrStore((s) => s.statsHistory);
 
-  const sysCpu = stats?.cpu_usages?.["ninjanvr.full_system"]?.cpu || "6.5";
-  const sysMem = stats?.cpu_usages?.["ninjanvr.full_system"]?.mem || "26.0";
-  const inferMs = stats?.detectors?.detector01?.inference_speed?.toFixed(1) || "7.0";
+  const sysCpu = toFiniteNumber(
+    stats?.cpu_usages?.["ninjanvr.full_system"]?.cpu,
+    6.5
+  ).toFixed(1);
+  const sysMem = toFiniteNumber(
+    stats?.cpu_usages?.["ninjanvr.full_system"]?.mem,
+    26.0
+  ).toFixed(1);
+  const inferMs = toFiniteNumber(
+    stats?.detectors?.detector01?.inference_speed,
+    7.0
+  ).toFixed(1);
   const [aiBriefText, setAiBriefText] = React.useState<string | null>(null);
   const [aiBriefBusy, setAiBriefBusy] = React.useState(false);
+  const [syncStorageBusy, setSyncStorageBusy] = React.useState(false);
+  const isMountedRef = React.useRef(true);
+
+  React.useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  const safeCopyText = async (text: string, successMsg: string) => {
+    if (
+      typeof navigator !== "undefined" &&
+      navigator.clipboard &&
+      typeof navigator.clipboard.writeText === "function"
+    ) {
+      try {
+        await navigator.clipboard.writeText(text);
+        if (isMountedRef.current) {
+          notify(successMsg);
+        }
+        return;
+      } catch {
+        // Fall through to failure notice
+      }
+    }
+    if (isMountedRef.current) {
+      notify("Clipboard access unavailable in this browser context");
+    }
+  };
   const [rightMode, setRightMode] = React.useState<"alerts" | "logs">("alerts");
   const [healthSearch, setHealthSearch] = React.useState("");
   const [healthStatusFilter, setHealthStatusFilter] =
@@ -396,8 +490,10 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
                   onClick={() => {
                     const url = `${window.location.origin}/api/mcp`;
-                    navigator.clipboard?.writeText(url);
-                    notify(`Copied MCP JSON-RPC endpoint: ${url}`);
+                    void safeCopyText(
+                      url,
+                      `Copied MCP JSON-RPC endpoint: ${url}`
+                    );
                   }}
                 >
                   Copy MCP URL
@@ -408,13 +504,16 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
                   disabled={aiBriefBusy}
                   onClick={async () => {
+                    if (aiBriefBusy) return;
                     setAiBriefBusy(true);
                     try {
                       const res = await fetch("/api/ai/context?hours=24", {
                         credentials: "include",
                       });
+                      if (!isMountedRef.current) return;
                       if (res.ok) {
                         const data = await res.json();
+                        if (!isMountedRef.current) return;
                         setAiBriefText(
                           data.markdown_brief || JSON.stringify(data, null, 2)
                         );
@@ -423,9 +522,13 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                         notify(`Failed to fetch AI context (${res.status})`);
                       }
                     } catch {
-                      notify("Failed to reach /api/ai/context");
+                      if (isMountedRef.current) {
+                        notify("Failed to reach /api/ai/context");
+                      }
                     } finally {
-                      setAiBriefBusy(false);
+                      if (isMountedRef.current) {
+                        setAiBriefBusy(false);
+                      }
                     }
                   }}
                 >
@@ -487,8 +590,8 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 </span>
               </div>
               <CanvasSparkline
-                values={statsHistory.map(
-                  (s) => s.detectors?.detector01?.inference_speed || 7.0
+                values={statsHistory.map((s) =>
+                  toFiniteNumber(s.detectors?.detector01?.inference_speed, 7.0)
                 )}
                 color="#0ea5e9"
                 maxVal={20}
@@ -521,7 +624,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               </div>
               <CanvasSparkline
                 values={statsHistory.map((s) =>
-                  parseFloat(s.cpu_usages?.["ninjanvr.full_system"]?.cpu || "6.5")
+                  toFiniteNumber(s.cpu_usages?.["ninjanvr.full_system"]?.cpu, 6.5)
                 )}
                 color="#10b981"
                 maxVal={100}
@@ -554,7 +657,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               </div>
               <CanvasSparkline
                 values={statsHistory.map((s) =>
-                  parseFloat(s.cpu_usages?.["ninjanvr.full_system"]?.mem || "26.0")
+                  toFiniteNumber(s.cpu_usages?.["ninjanvr.full_system"]?.mem, 26.0)
                 )}
                 color="#f59e0b"
                 maxVal={100}
@@ -709,14 +812,19 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 className="nvr-btn mono"
                 style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
                 title="Reconcile SQLite recordings table against on-disk MP4 files"
+                disabled={syncStorageBusy}
                 onClick={async () => {
+                  if (syncStorageBusy) return;
+                  setSyncStorageBusy(true);
                   try {
                     const res = await fetch("/api/recordings/sync", {
                       method: "POST",
                       credentials: "include",
                     });
+                    if (!isMountedRef.current) return;
                     if (res.ok) {
                       const data = await res.json();
+                      if (!isMountedRef.current) return;
                       notify(
                         `Synced Storage DB: removed ${data.removed_orphans ?? 0} orphan segment(s) in ${data.duration_ms ?? 0}ms`
                       );
@@ -724,11 +832,17 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                       notify(`Storage DB sync failed (${res.status})`);
                     }
                   } catch {
-                    notify("Storage DB sync request failed");
+                    if (isMountedRef.current) {
+                      notify("Storage DB sync request failed");
+                    }
+                  } finally {
+                    if (isMountedRef.current) {
+                      setSyncStorageBusy(false);
+                    }
                   }
                 }}
               >
-                Sync Storage DB
+                {syncStorageBusy ? "Syncing..." : "Sync Storage DB"}
               </button>
             </div>
             <table className="nvr-table mono">
@@ -743,9 +857,11 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
               </thead>
               <tbody>
                 {Object.entries(stats?.service?.storage || {}).map(([mPath, st]) => {
-                  const pct = Math.min(
-                    100,
-                    Math.round((st.used / Math.max(1, st.total)) * 100)
+                  const safeUsed = Math.max(0, toFiniteNumber(st?.used, 0));
+                  const safeTotal = Math.max(1, toFiniteNumber(st?.total, 1));
+                  const pct = Math.max(
+                    0,
+                    Math.min(100, Math.round((safeUsed / safeTotal) * 100))
                   );
                   const isCrit = pct >= 90;
                   const isWarn = pct >= 80 && pct < 90;
@@ -772,8 +888,8 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                         </div>
                       </td>
                       <td>{st.mount_type}</td>
-                      <td>{(st.used / 1024).toFixed(1)} GB</td>
-                      <td>{(st.total / 1024).toFixed(1)} GB</td>
+                      <td>{(safeUsed / 1024).toFixed(1)} GB</td>
+                      <td>{(toFiniteNumber(st?.total, 0) / 1024).toFixed(1)} GB</td>
                       <td>
                         <div className="nvr-util-cell">
                           <div className="nvr-util-bar" aria-hidden="true">
@@ -815,10 +931,13 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                     {Object.entries(stats.service.camera_storage).map(([cam, cs]) => (
                       <tr key={cam}>
                         <td style={{ fontWeight: 700, textTransform: "uppercase" }}>{cam}</td>
-                        <td>{((cs.usage || 0) / 1024).toFixed(2)} GB</td>
-                        <td>{(cs.bandwidth || 0).toFixed(1)} MB/h</td>
+                        <td>{(Math.max(0, toFiniteNumber(cs.usage, 0)) / 1024).toFixed(2)} GB</td>
+                        <td>{Math.max(0, toFiniteNumber(cs.bandwidth, 0)).toFixed(1)} MB/h</td>
                         <td style={{ color: "var(--signal-live-text)" }}>
-                          {(cs.estimated_retention_days ?? stats.service.estimated_retention_days ?? 14).toFixed(1)}d
+                          {toFiniteNumber(
+                            cs.estimated_retention_days ?? stats.service.estimated_retention_days,
+                            14
+                          ).toFixed(1)}d
                         </td>
                       </tr>
                     ))}
@@ -928,15 +1047,19 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                         `[${a.severity.toUpperCase()}][${a.category.toUpperCase()}][${a.target}] ${a.title}\n  Detail: ${a.detail}\n  Recommendation: ${a.recommendation}`
                     )
                     .join("\n\n");
-                  navigator.clipboard?.writeText(text);
-                  notify(`Copied ${filteredAlerts.length} heuristic alert(s) to clipboard`);
+                  void safeCopyText(
+                    text,
+                    `Copied ${filteredAlerts.length} heuristic alert(s) to clipboard`
+                  );
                   return;
                 }
                 const visibleLogs = logLines.filter((l) =>
                   logSearch ? l.toLowerCase().includes(logSearch.toLowerCase()) : true
                 );
-                navigator.clipboard?.writeText(visibleLogs.join("\n"));
-                notify(`Copied ${visibleLogs.length} log line(s) to clipboard`);
+                void safeCopyText(
+                  visibleLogs.join("\n"),
+                  `Copied ${visibleLogs.length} log line(s) to clipboard`
+                );
               }}
             >
               <Copy size={11} />

@@ -26,7 +26,11 @@ import {
 } from "./settings/VisionAndAiPanels";
 
 export function formatAiVerificationBadge(verdict: AiVerificationResult): string {
-  const pct = Math.round((verdict.confidence ?? 0) * 100);
+  const rawConf =
+    typeof verdict.confidence === "number" && Number.isFinite(verdict.confidence)
+      ? verdict.confidence
+      : 0;
+  const pct = Math.max(0, Math.min(100, Math.round(rawConf * 100)));
   const status = verdict.is_true_positive ? "TRUE POSITIVE" : "FALSE POSITIVE";
   return `AI JUDGE: ${status} (${pct}%)`;
 }
@@ -38,6 +42,74 @@ export {
   resolveKnownPlateLabel,
   validateLicensePlateFormat,
 };
+
+export interface SavedExploreFilterPreset {
+  name: string;
+  camera: string;
+  label: string;
+  excludeLabel: string;
+  zone: string;
+  minScore: number;
+  stationary: "all" | "moving" | "stationary";
+  retainedOnly: boolean;
+}
+
+export function shouldApplyEventMutationResult(
+  selectedEventId: string | null | undefined,
+  requestEventId: string,
+  responseOk: boolean
+): boolean {
+  return Boolean(
+    responseOk &&
+      requestEventId &&
+      selectedEventId &&
+      selectedEventId === requestEventId
+  );
+}
+
+export function parseSavedExplorePresets(
+  raw: string | null | undefined
+): SavedExploreFilterPreset[] {
+  if (!raw || typeof raw !== "string") return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const out: SavedExploreFilterPreset[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.name !== "string" || !rec.name.trim()) continue;
+      const stationary =
+        rec.stationary === "all" ||
+        rec.stationary === "moving" ||
+        rec.stationary === "stationary"
+          ? rec.stationary
+          : "all";
+      const minScore =
+        typeof rec.minScore === "number" &&
+        Number.isFinite(rec.minScore) &&
+        rec.minScore >= 0
+          ? rec.minScore
+          : 0;
+      out.push({
+        name: rec.name.trim(),
+        camera: typeof rec.camera === "string" && rec.camera ? rec.camera : "all",
+        label: typeof rec.label === "string" && rec.label ? rec.label : "all",
+        excludeLabel:
+          typeof rec.excludeLabel === "string" && rec.excludeLabel
+            ? rec.excludeLabel
+            : "none",
+        zone: typeof rec.zone === "string" && rec.zone ? rec.zone : "all",
+        minScore,
+        stationary,
+        retainedOnly: Boolean(rec.retainedOnly),
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
 
 export function matchesLicensePlateFilter(
   ev: Pick<EventItem, "sub_label" | "data">,
@@ -69,8 +141,14 @@ export function formatEventLabelWithSubLabel(
 }
 
 export function formatDetectedAttributePill(attr: DetectedAttribute): string {
-  const pct = Math.round(attr.score * 100);
-  return `${attr.label.toUpperCase()} ${pct}% · ${attr.area_px}px²`;
+  const safeScore =
+    typeof attr.score === "number" && Number.isFinite(attr.score) ? attr.score : 0;
+  const pct = Math.max(0, Math.min(100, Math.round(safeScore * 100)));
+  const safeArea =
+    typeof attr.area_px === "number" && Number.isFinite(attr.area_px)
+      ? Math.max(0, Math.round(attr.area_px))
+      : 0;
+  return `${(attr.label || "attribute").toUpperCase()} ${pct}% · ${safeArea}px²`;
 }
 
 export function formatSubLabelBadge(
@@ -81,7 +159,9 @@ export function formatSubLabelBadge(
   if (!clean) return null;
   const isUnknown = clean.toLowerCase() === "unknown";
   const scorePct =
-    typeof subLabelScore === "number" && subLabelScore > 0
+    typeof subLabelScore === "number" &&
+    Number.isFinite(subLabelScore) &&
+    subLabelScore > 0
       ? ` ${Math.round(subLabelScore * 100)}%`
       : "";
   return {
@@ -236,13 +316,19 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const [aiVerifyBusy, setAiVerifyBusy] = React.useState(false);
   const [datasetAddBusy, setDatasetAddBusy] = React.useState(false);
   const [addedDatasetIds, setAddedDatasetIds] = React.useState<Record<string, boolean>>({});
+  const selectedEventIdRef = React.useRef<string | null>(selectedEvent?.id ?? null);
+  selectedEventIdRef.current = selectedEvent?.id ?? null;
+  const debugReplayAbortRef = React.useRef<AbortController | null>(null);
+  const debugReplaySeqRef = React.useRef(0);
 
   const handleAddToDataset = async () => {
     if (!selectedEvent || datasetAddBusy) return;
+    const targetEvent = selectedEvent;
+    const targetId = targetEvent.id;
     setDatasetAddBusy(true);
     try {
       const res = await fetch(
-        `/api/dataset/samples/from-event/${encodeURIComponent(selectedEvent.id)}`,
+        `/api/dataset/samples/from-event/${encodeURIComponent(targetId)}`,
         {
           method: "POST",
           credentials: "include",
@@ -250,10 +336,10 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       );
       const data = await res.json().catch(() => null);
       if (res.ok && data) {
-        setAddedDatasetIds((prev) => ({ ...prev, [selectedEvent.id]: true }));
+        setAddedDatasetIds((prev) => ({ ...prev, [targetId]: true }));
         const split = data.split || data.sample?.split || "train";
         notify(
-          `Added event #${selectedEvent.id.slice(-8)} clean frame to Active Learning Dataset (split: ${String(
+          `Added event #${targetId.slice(-8)} clean frame to Active Learning Dataset (split: ${String(
             split
           ).toUpperCase()})`
         );
@@ -269,35 +355,54 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 
   const handleToggleFalsePositive = async () => {
     if (!selectedEvent) return;
-    const nextFp = !selectedEvent.false_positive;
-    const res = await fetch(
-      `/api/events/${encodeURIComponent(selectedEvent.id)}/false_positive`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ false_positive: nextFp }),
-      }
-    );
-    if (res.ok) {
-      setSelectedEvent({
-        ...selectedEvent,
-        false_positive: nextFp,
-      });
-      notify(
-        nextFp
-          ? "Marked as False Positive — spatial & dhash64 suppression signature saved"
-          : "Cleared False Positive flag & removed suppression signature"
+    const targetEvent = selectedEvent;
+    const targetId = targetEvent.id;
+    const nextFp = !targetEvent.false_positive;
+    try {
+      const res = await fetch(
+        `/api/events/${encodeURIComponent(targetId)}/false_positive`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ false_positive: nextFp }),
+        }
       );
+      if (res.ok) {
+        if (
+          shouldApplyEventMutationResult(
+            selectedEventIdRef.current,
+            targetId,
+            true
+          )
+        ) {
+          setSelectedEvent({
+            ...targetEvent,
+            false_positive: nextFp,
+          });
+        }
+        notify(
+          nextFp
+            ? "Marked as False Positive — spatial & dhash64 suppression signature saved"
+            : "Cleared False Positive flag & removed suppression signature"
+        );
+      } else {
+        const data = await res.json().catch(() => null);
+        notify(data?.message || "Failed to update False Positive status");
+      }
+    } catch {
+      notify("Network error while updating False Positive status");
     }
   };
 
   const handleVerifyWithAi = async () => {
     if (!selectedEvent || aiVerifyBusy) return;
+    const targetEvent = selectedEvent;
+    const targetId = targetEvent.id;
     setAiVerifyBusy(true);
     try {
       const res = await fetch(
-        `/api/events/${encodeURIComponent(selectedEvent.id)}/verify-ai`,
+        `/api/events/${encodeURIComponent(targetId)}/verify-ai`,
         {
           method: "POST",
           credentials: "include",
@@ -313,17 +418,25 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           model: data.model,
           verified_at: data.verified_at,
         };
-        setSelectedEvent({
-          ...selectedEvent,
-          false_positive:
-            data.false_positive !== undefined
-              ? Boolean(data.false_positive)
-              : selectedEvent.false_positive,
-          data: {
-            ...(selectedEvent.data || {}),
-            ai_verification: aiVerdict,
-          },
-        });
+        if (
+          shouldApplyEventMutationResult(
+            selectedEventIdRef.current,
+            targetId,
+            true
+          )
+        ) {
+          setSelectedEvent({
+            ...targetEvent,
+            false_positive:
+              data.false_positive !== undefined
+                ? Boolean(data.false_positive)
+                : targetEvent.false_positive,
+            data: {
+              ...(targetEvent.data || {}),
+              ai_verification: aiVerdict,
+            },
+          });
+        }
         notify(
           `${formatAiVerificationBadge(aiVerdict)} — ${aiVerdict.reason}`
         );
@@ -360,13 +473,46 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   ]);
 
   React.useEffect(() => {
-    fetch("/api/faces", { credentials: "include" })
+    selectedEventIdRef.current = selectedEvent?.id ?? null;
+    if (debugReplayAbortRef.current) {
+      debugReplayAbortRef.current.abort();
+      debugReplayAbortRef.current = null;
+    }
+    debugReplaySeqRef.current += 1;
+    setDebugBusy(false);
+    setDebugTrace(null);
+  }, [selectedEvent?.id]);
+
+  React.useEffect(() => {
+    return () => {
+      if (debugReplayAbortRef.current) {
+        debugReplayAbortRef.current.abort();
+        debugReplayAbortRef.current = null;
+      }
+    };
+  }, []);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    fetch("/api/faces", { credentials: "include", signal: controller.signal })
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
-        if (d) setEnrolledFaces(parseFacesApiResponse(d));
+        if (cancelled || !d) return;
+        const parsed = parseFacesApiResponse(d);
+        const deletedLower = lastDeletedFaceProfile?.name?.trim().toLowerCase();
+        setEnrolledFaces(
+          deletedLower
+            ? parsed.filter((p) => p.name.trim().toLowerCase() !== deletedLower)
+            : parsed
+        );
       })
       .catch(() => {});
-  }, [subLabelsRefreshTick]);
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [subLabelsRefreshTick, lastDeletedFaceProfile]);
 
   React.useEffect(() => {
     if (!lastDeletedFaceProfile?.name) return;
@@ -391,26 +537,43 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 
   const handleAssignFaceSubLabel = async (overrideName?: string | null) => {
     if (!selectedEvent) return;
+    const targetEvent = selectedEvent;
+    const targetId = targetEvent.id;
     const raw = overrideName !== undefined ? overrideName : faceNameDraft;
     const clean = raw && raw.trim().length > 0 ? raw.trim() : null;
-    const res = await fetch(
-      `/api/events/${encodeURIComponent(selectedEvent.id)}/sub_label`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ sub_label: clean }),
-      }
-    );
-    if (res.ok) {
-      const [updated] = applyEventSubLabelUpdate(
-        [selectedEvent],
-        selectedEvent.id,
-        clean
+    try {
+      const res = await fetch(
+        `/api/events/${encodeURIComponent(targetId)}/sub_label`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ sub_label: clean }),
+        }
       );
-      setSelectedEvent(updated);
-      bumpSubLabelsRefresh();
-      notify(clean ? `Assigned face name '${clean}' to event` : "Cleared event sub-label");
+      if (res.ok) {
+        if (
+          shouldApplyEventMutationResult(
+            selectedEventIdRef.current,
+            targetId,
+            true
+          )
+        ) {
+          const [updated] = applyEventSubLabelUpdate(
+            [targetEvent],
+            targetId,
+            clean
+          );
+          setSelectedEvent(updated);
+        }
+        bumpSubLabelsRefresh();
+        notify(clean ? `Assigned face name '${clean}' to event` : "Cleared event sub-label");
+      } else {
+        const data = await res.json().catch(() => null);
+        notify(data?.message || "Failed to update event face sub-label");
+      }
+    } catch {
+      notify("Network error while updating event face sub-label");
     }
   };
 
@@ -421,89 +584,142 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       notify("Enter a person name (e.g. Bruno) before enrolling face crop");
       return;
     }
-    const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({
-        event_id: selectedEvent.id,
-        assign_sub_label: true,
-      }),
-    });
-    if (res.ok) {
-      const [updated] = applyEventSubLabelUpdate(
-        [selectedEvent],
-        selectedEvent.id,
-        cleanName,
-        1.0
-      );
-      setSelectedEvent(updated);
-      const listRes = await fetch("/api/faces", { credentials: "include" }).catch(
-        () => null
-      );
-      if (listRes && listRes.ok) {
-        const d = await listRes.json();
-        setEnrolledFaces(parseFacesApiResponse(d));
+    const targetEvent = selectedEvent;
+    const targetId = targetEvent.id;
+    try {
+      const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          event_id: targetId,
+          assign_sub_label: true,
+        }),
+      });
+      if (res.ok) {
+        if (
+          shouldApplyEventMutationResult(
+            selectedEventIdRef.current,
+            targetId,
+            true
+          )
+        ) {
+          const [updated] = applyEventSubLabelUpdate(
+            [targetEvent],
+            targetId,
+            cleanName,
+            1.0
+          );
+          setSelectedEvent(updated);
+        }
+        bumpSubLabelsRefresh();
+        const listRes = await fetch("/api/faces", { credentials: "include" }).catch(
+          () => null
+        );
+        if (listRes && listRes.ok) {
+          const d = await listRes.json().catch(() => null);
+          if (d) setEnrolledFaces(parseFacesApiResponse(d));
+        }
+        notify(`Enrolled '${cleanName}' face crop into gallery and assigned sub-label`);
+      } else {
+        const data = await res.json().catch(() => null);
+        notify(data?.message || "Failed to enroll face crop from event");
       }
-      notify(`Enrolled '${cleanName}' face crop into gallery and assigned sub-label`);
+    } catch {
+      notify("Network error while enrolling face crop from event");
     }
   };
 
   const handleSaveEventLicensePlate = async () => {
     if (!selectedEvent) return;
+    const targetEvent = selectedEvent;
+    const targetId = targetEvent.id;
     const normalized = normalizeLicensePlate(eventPlateDraft);
-    const res = await fetch(
-      `/api/events/${encodeURIComponent(selectedEvent.id)}/license_plate`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({
-          recognized_license_plate: normalized || null,
-        }),
-      }
-    );
-    if (res.ok) {
-      const payload = await res.json().catch(() => ({}));
-      const nextPlate =
-        payload.recognized_license_plate !== undefined
-          ? payload.recognized_license_plate
-          : normalized || null;
-      const nextSubLabel =
-        payload.sub_label !== undefined
-          ? payload.sub_label
-          : selectedEvent.sub_label;
-      setSelectedEvent({
-        ...selectedEvent,
-        sub_label: nextSubLabel,
-        data: {
-          ...(selectedEvent.data || {}),
-          recognized_license_plate: nextPlate,
-        },
-      });
-      setEventPlateDraft(nextPlate || "");
-      notify(
-        nextPlate
-          ? `License plate set to ${nextPlate}`
-          : "Cleared recognized license plate"
+    try {
+      const res = await fetch(
+        `/api/events/${encodeURIComponent(targetId)}/license_plate`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            recognized_license_plate: normalized || null,
+          }),
+        }
       );
+      if (res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        const nextPlate =
+          payload.recognized_license_plate !== undefined
+            ? payload.recognized_license_plate
+            : normalized || null;
+        const nextSubLabel =
+          payload.sub_label !== undefined
+            ? payload.sub_label
+            : targetEvent.sub_label;
+        if (
+          shouldApplyEventMutationResult(
+            selectedEventIdRef.current,
+            targetId,
+            true
+          )
+        ) {
+          setSelectedEvent({
+            ...targetEvent,
+            sub_label: nextSubLabel,
+            data: {
+              ...(targetEvent.data || {}),
+              recognized_license_plate: nextPlate,
+            },
+          });
+          setEventPlateDraft(nextPlate || "");
+        }
+        notify(
+          nextPlate
+            ? `License plate set to ${nextPlate}`
+            : "Cleared recognized license plate"
+        );
+      } else {
+        const data = await res.json().catch(() => null);
+        notify(data?.message || "Failed to save recognized license plate");
+      }
+    } catch {
+      notify("Network error while saving recognized license plate");
     }
   };
 
   const handleSaveEventNote = async () => {
     if (!selectedEvent) return;
-    const res = await fetch(`/api/events/${encodeURIComponent(selectedEvent.id)}/notes`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ notes: eventNoteDraft }),
-    });
-    if (res.ok) {
-      setSelectedEvent({
-        ...selectedEvent,
-        data: { ...(selectedEvent.data || {}), notes: eventNoteDraft },
+    const targetEvent = selectedEvent;
+    const targetId = targetEvent.id;
+    const noteToSave = eventNoteDraft;
+    try {
+      const res = await fetch(`/api/events/${encodeURIComponent(targetId)}/notes`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ notes: noteToSave }),
       });
-      notify("Saved forensic note on event");
+      if (res.ok) {
+        if (
+          shouldApplyEventMutationResult(
+            selectedEventIdRef.current,
+            targetId,
+            true
+          )
+        ) {
+          setSelectedEvent({
+            ...targetEvent,
+            data: { ...(targetEvent.data || {}), notes: noteToSave },
+          });
+        }
+        notify("Saved forensic note on event");
+      } else {
+        const data = await res.json().catch(() => null);
+        notify(data?.message || "Failed to save forensic note");
+      }
+    } catch {
+      notify("Network error while saving forensic note");
     }
   };
   const [showDebugReplay, setShowDebugReplay] = React.useState(false);
@@ -523,31 +739,77 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 
   const handleRunDebugReplay = async () => {
     if (!selectedEvent) return;
+    const targetEvent = selectedEvent;
+    const targetId = targetEvent.id;
+    if (debugReplayAbortRef.current) {
+      debugReplayAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    debugReplayAbortRef.current = controller;
+    const seq = ++debugReplaySeqRef.current;
     setDebugBusy(true);
     try {
+      const safeStart =
+        typeof targetEvent.start_time === "number" &&
+        Number.isFinite(targetEvent.start_time)
+          ? targetEvent.start_time - 2
+          : 0;
+      const safeEnd =
+        typeof targetEvent.end_time === "number" &&
+        Number.isFinite(targetEvent.end_time) &&
+        targetEvent.end_time > targetEvent.start_time
+          ? targetEvent.end_time + 2
+          : safeStart + 19;
       const res = await fetch("/api/debug/reprocess", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
+        signal: controller.signal,
         body: JSON.stringify({
-          camera: selectedEvent.camera,
-          start_time: selectedEvent.start_time - 2,
-          end_time: (selectedEvent.end_time || selectedEvent.start_time + 15) + 2,
+          camera: targetEvent.camera,
+          start_time: safeStart,
+          end_time: safeEnd,
           override_config: {
             min_score: debugMinScore,
             min_area: debugMinArea,
           },
         }),
       });
+      if (
+        seq !== debugReplaySeqRef.current ||
+        !shouldApplyEventMutationResult(
+          selectedEventIdRef.current,
+          targetId,
+          true
+        )
+      ) {
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
-        setDebugTrace(data);
-        setEventViewMode("clip");
+        if (
+          seq === debugReplaySeqRef.current &&
+          shouldApplyEventMutationResult(
+            selectedEventIdRef.current,
+            targetId,
+            true
+          )
+        ) {
+          setDebugTrace(data);
+          setEventViewMode("clip");
+        }
+      } else {
+        const err = await res.json().catch(() => null);
+        notify(err?.message || "Retroactive detection debug replay failed");
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      if ((err as { name?: string })?.name !== "AbortError") {
+        notify("Network error during retroactive detection debug replay");
+      }
     } finally {
-      setDebugBusy(false);
+      if (seq === debugReplaySeqRef.current) {
+        setDebugBusy(false);
+      }
     }
   };
   const [excludeLabel, setExcludeLabel] = React.useState("none");
@@ -558,20 +820,11 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   );
   const [presetName, setPresetName] = React.useState("");
   const [savedPresets, setSavedPresets] = React.useState<
-    Array<{
-      name: string;
-      camera: string;
-      label: string;
-      excludeLabel: string;
-      zone: string;
-      minScore: number;
-      stationary: "all" | "moving" | "stationary";
-      retainedOnly: boolean;
-    }>
+    SavedExploreFilterPreset[]
   >(() => {
     try {
       const raw = window.localStorage?.getItem("ninjanvr_explore_saved_filters");
-      return raw ? JSON.parse(raw) : [];
+      return parseSavedExplorePresets(raw);
     } catch {
       return [];
     }
@@ -966,7 +1219,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 </div>
               );
             })}
-            {filteredEvents.length === 0 && (
+            {visibleEvents.length === 0 && (
               <div
                 style={{
                   padding: 24,
@@ -1229,23 +1482,50 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 >
                   {(() => {
                     const p = selectedEvent.data?.provenance;
-                    const topScore =
+                    const rawTopScore =
                       p?.top_score ??
                       selectedEvent.top_score ??
                       selectedEvent.data?.top_score ??
                       0.85;
-                    const thresh = p?.threshold_cfg ?? 0.7;
-                    const areaPx = p?.area_px ?? selectedEvent.area ?? 0;
-                    const areaPct = p?.area_pct ?? 0;
-                    const ratio =
+                    const topScore =
+                      typeof rawTopScore === "number" && Number.isFinite(rawTopScore)
+                        ? rawTopScore
+                        : 0.85;
+                    const thresh =
+                      typeof p?.threshold_cfg === "number" &&
+                      Number.isFinite(p.threshold_cfg)
+                        ? p.threshold_cfg
+                        : 0.7;
+                    const rawAreaPx = p?.area_px ?? selectedEvent.area ?? 0;
+                    const areaPx =
+                      typeof rawAreaPx === "number" && Number.isFinite(rawAreaPx)
+                        ? Math.max(0, Math.round(rawAreaPx))
+                        : 0;
+                    const areaPct =
+                      typeof p?.area_pct === "number" && Number.isFinite(p.area_pct)
+                        ? Math.max(0, p.area_pct)
+                        : 0;
+                    const rawRatio =
                       p?.aspect_ratio ??
                       (selectedEvent.ratio ? Math.round(selectedEvent.ratio * 100) / 100 : 0.5);
-                    const bbox = p?.bbox ?? [0, 0, 0, 0];
+                    const ratio =
+                      typeof rawRatio === "number" && Number.isFinite(rawRatio)
+                        ? rawRatio
+                        : 0.5;
+                    const bbox =
+                      Array.isArray(p?.bbox) && p.bbox.length >= 4
+                        ? p.bbox.map((v) =>
+                            typeof v === "number" && Number.isFinite(v) ? v : 0
+                          )
+                        : [0, 0, 0, 0];
                     const anchorX = Math.round((bbox[0] + bbox[2]) / 2);
-                    const anchorY = bbox[3];
+                    const anchorY = Math.round(bbox[3]);
                     const zones =
                       (p?.zones && p.zones.length > 0 ? p.zones : selectedEvent.zones) || [];
-                    const triggerTs = p?.trigger_ts ?? selectedEvent.start_time;
+                    const triggerTs =
+                      typeof p?.trigger_ts === "number" && Number.isFinite(p.trigger_ts)
+                        ? p.trigger_ts
+                        : selectedEvent.start_time;
                     return (
                       <>
                         <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>

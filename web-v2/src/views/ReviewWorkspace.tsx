@@ -19,6 +19,132 @@ import {
 } from "./ExploreWorkspace";
 import { normalizeFaceProfileName } from "./settings/VisionAndAiPanels";
 
+export interface SavedReviewFilterPreset {
+  name: string;
+  camera: string;
+  severity: string;
+  object: string;
+  excludeObject: string;
+  zone: string;
+  status: "unreviewed" | "reviewed" | "all";
+}
+
+export function resolveReviewThumbUrl(
+  item: Pick<ReviewItem, "camera" | "thumb_path">
+): string {
+  const safeCamera = encodeURIComponent((item.camera || "unknown").trim() || "unknown");
+  const fallback = `/api/${safeCamera}/latest.webp`;
+  const raw = (item.thumb_path || "").trim();
+  if (!raw || /[\u0000-\u001f\u007f\\]/.test(raw)) {
+    return fallback;
+  }
+  const stripped = raw.replace(/^\/media\/[^/]+/, "");
+  if (
+    !stripped.startsWith("/") ||
+    stripped.startsWith("//") ||
+    stripped.includes("..")
+  ) {
+    return fallback;
+  }
+  return stripped;
+}
+
+export function shouldApplyReviewMutationResult(
+  activeReviewId: string | null | undefined,
+  requestReviewId: string,
+  responseOk: boolean
+): boolean {
+  return Boolean(
+    responseOk &&
+      requestReviewId &&
+      activeReviewId &&
+      activeReviewId === requestReviewId
+  );
+}
+
+export function getVisibleReviewPageIds(
+  visibleReviews: ReadonlyArray<Pick<ReviewItem, "id">>,
+  pageSize: number = 40
+): string[] {
+  const limit = Number.isFinite(pageSize) && pageSize > 0 ? Math.floor(pageSize) : 40;
+  return visibleReviews
+    .slice(0, limit)
+    .map((r) => r.id)
+    .filter((id): id is string => typeof id === "string" && id.length > 0);
+}
+
+export function computeReviewPlaybackWindow(
+  startTime: number,
+  endTime: number | null | undefined,
+  preRollSec: number = 4,
+  postRollSec: number = 6,
+  fallbackDurationSec: number = 20
+): { startSec: number; endSec: number } {
+  const safeStart =
+    typeof startTime === "number" && Number.isFinite(startTime) && startTime > 0
+      ? startTime
+      : Math.floor(Date.now() / 1000) - fallbackDurationSec;
+  const safePre =
+    typeof preRollSec === "number" && Number.isFinite(preRollSec) && preRollSec >= 0
+      ? preRollSec
+      : 0;
+  const safePost =
+    typeof postRollSec === "number" && Number.isFinite(postRollSec) && postRollSec >= 0
+      ? postRollSec
+      : 0;
+  const safeFallbackDur =
+    typeof fallbackDurationSec === "number" &&
+    Number.isFinite(fallbackDurationSec) &&
+    fallbackDurationSec > 0
+      ? fallbackDurationSec
+      : 20;
+  const baseEnd =
+    typeof endTime === "number" && Number.isFinite(endTime) && endTime > safeStart
+      ? endTime
+      : safeStart + safeFallbackDur;
+  const startSec = Math.max(0, safeStart - safePre);
+  const endSec = Math.max(startSec + 1, baseEnd + safePost);
+  return { startSec, endSec };
+}
+
+export function parseSavedReviewPresets(
+  raw: string | null | undefined
+): SavedReviewFilterPreset[] {
+  if (!raw || typeof raw !== "string") return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const out: SavedReviewFilterPreset[] = [];
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.name !== "string" || !rec.name.trim()) continue;
+      const status =
+        rec.status === "unreviewed" ||
+        rec.status === "reviewed" ||
+        rec.status === "all"
+          ? rec.status
+          : "unreviewed";
+      out.push({
+        name: rec.name.trim(),
+        camera: typeof rec.camera === "string" && rec.camera ? rec.camera : "all",
+        severity:
+          typeof rec.severity === "string" && rec.severity ? rec.severity : "all",
+        object: typeof rec.object === "string" && rec.object ? rec.object : "all",
+        excludeObject:
+          typeof rec.excludeObject === "string" && rec.excludeObject
+            ? rec.excludeObject
+            : "none",
+        zone: typeof rec.zone === "string" && rec.zone ? rec.zone : "all",
+        status,
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 interface ReviewWorkspaceProps {
   cameraNames: string[];
   reviews: ReviewItem[];
@@ -166,23 +292,35 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
 
   const handleAssignReviewFace = async (overrideName?: string | null) => {
     if (!activeReview) return;
-    const detId = activeReview.data?.detections?.[0] || activeReview.id;
+    const targetReview = activeReview;
+    const targetId = targetReview.id;
+    const detId = targetReview.data?.detections?.[0] || targetId;
     const raw = overrideName !== undefined ? overrideName : reviewFaceDraft;
     const clean = raw && raw.trim().length > 0 ? raw.trim() : null;
-    const res = await fetch(`/api/events/${encodeURIComponent(detId)}/sub_label`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ sub_label: clean }),
-    });
-    if (res.ok) {
-      const [updated] = applyReviewSubLabelUpdate(
-        [activeReview],
-        activeReview.id,
-        clean
-      );
-      setActiveReview(updated);
-      bumpSubLabelsRefresh();
+    try {
+      const res = await fetch(`/api/events/${encodeURIComponent(detId)}/sub_label`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ sub_label: clean }),
+      });
+      if (
+        shouldApplyReviewMutationResult(
+          activeReviewIdRef.current,
+          targetId,
+          res.ok
+        )
+      ) {
+        const [updated] = applyReviewSubLabelUpdate(
+          [targetReview],
+          targetId,
+          clean
+        );
+        setActiveReview(updated);
+        bumpSubLabelsRefresh();
+      }
+    } catch {
+      // Preserve current review state on transient network failure
     }
   };
 
@@ -190,56 +328,99 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     if (!activeReview) return;
     const cleanName = normalizeFaceProfileName(reviewFaceDraft);
     if (!cleanName) return;
-    const detId = activeReview.data?.detections?.[0] || activeReview.id;
-    const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ event_id: detId, assign_sub_label: true }),
-    });
-    if (res.ok) {
-      const [updated] = applyReviewSubLabelUpdate(
-        [activeReview],
-        activeReview.id,
-        cleanName
-      );
-      setActiveReview(updated);
+    const targetReview = activeReview;
+    const targetId = targetReview.id;
+    const detId = targetReview.data?.detections?.[0] || targetId;
+    try {
+      const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ event_id: detId, assign_sub_label: true }),
+      });
+      if (
+        shouldApplyReviewMutationResult(
+          activeReviewIdRef.current,
+          targetId,
+          res.ok
+        )
+      ) {
+        const [updated] = applyReviewSubLabelUpdate(
+          [targetReview],
+          targetId,
+          cleanName
+        );
+        setActiveReview(updated);
+        bumpSubLabelsRefresh();
+      }
+    } catch {
+      // Preserve current review state on transient network failure
     }
   };
 
   const handleSaveReviewLicensePlate = async () => {
     if (!activeReview) return;
+    const targetReview = activeReview;
+    const targetId = targetReview.id;
     const norm = normalizeLicensePlate(reviewPlateDraft);
-    const primaryEventId = activeReview.data?.detections?.[0] || activeReview.id;
-    await fetch(`/api/events/${encodeURIComponent(primaryEventId)}/license_plate`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ recognized_license_plate: norm || null }),
-    }).catch(() => {});
-    setActiveReview({
-      ...activeReview,
-      data: {
-        ...activeReview.data,
-        recognized_license_plates: norm ? [norm] : [],
-      },
-    });
-    setReviewPlateDraft(norm);
+    const primaryEventId = targetReview.data?.detections?.[0] || targetId;
+    try {
+      const res = await fetch(
+        `/api/events/${encodeURIComponent(primaryEventId)}/license_plate`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ recognized_license_plate: norm || null }),
+        }
+      );
+      if (
+        shouldApplyReviewMutationResult(
+          activeReviewIdRef.current,
+          targetId,
+          res.ok
+        )
+      ) {
+        setActiveReview({
+          ...targetReview,
+          data: {
+            ...targetReview.data,
+            recognized_license_plates: norm ? [norm] : [],
+          },
+        });
+        setReviewPlateDraft(norm);
+      }
+    } catch {
+      // Preserve current review state on transient network failure
+    }
   };
 
   const handleSaveReviewNote = async () => {
     if (!activeReview) return;
-    const res = await fetch(`/api/review/${encodeURIComponent(activeReview.id)}/notes`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ notes: reviewNoteDraft }),
-    });
-    if (res.ok) {
-      setActiveReview({
-        ...activeReview,
-        data: { ...activeReview.data, notes: reviewNoteDraft },
+    const targetReview = activeReview;
+    const targetId = targetReview.id;
+    const noteToSave = reviewNoteDraft;
+    try {
+      const res = await fetch(`/api/review/${encodeURIComponent(targetId)}/notes`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ notes: noteToSave }),
       });
+      if (
+        shouldApplyReviewMutationResult(
+          activeReviewIdRef.current,
+          targetId,
+          res.ok
+        )
+      ) {
+        setActiveReview({
+          ...targetReview,
+          data: { ...targetReview.data, notes: noteToSave },
+        });
+      }
+    } catch {
+      // Preserve current review state on transient network failure
     }
   };
   const [briefingActive, setBriefingActive] = React.useState(false);
@@ -248,19 +429,11 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [briefingQueueIds, setBriefingQueueIds] = React.useState<string[]>([]);
   const [briefingIdx, setBriefingIdx] = React.useState(0);
   const [savedPresets, setSavedPresets] = React.useState<
-    Array<{
-      name: string;
-      camera: string;
-      severity: string;
-      object: string;
-      excludeObject: string;
-      zone: string;
-      status: "unreviewed" | "reviewed" | "all";
-    }>
+    SavedReviewFilterPreset[]
   >(() => {
     try {
       const raw = window.localStorage?.getItem("ninjanvr_saved_filters");
-      return raw ? JSON.parse(raw) : [];
+      return parseSavedReviewPresets(raw);
     } catch {
       return [];
     }
@@ -566,13 +739,13 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         <div className="nvr-panel">
           <div className="nvr-panel-header">
             <span>REVIEW QUEUE</span>
-            {filteredReviews.length > 0 && (
+            {visibleFilteredReviews.length > 0 && (
               <button
                 className="nvr-btn success"
                 style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
                 onClick={() =>
                   handleMarkReviews(
-                    filteredReviews.slice(0, 40).map((r) => r.id),
+                    getVisibleReviewPageIds(visibleFilteredReviews, 40),
                     true
                   )
                 }
@@ -591,9 +764,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 item.start_time,
                 item.end_time
               );
-              const thumbUrl = item.thumb_path
-                ? item.thumb_path.replace(/^\/media\/[^/]+/, "")
-                : `/api/${item.camera}/latest.webp`;
+              const thumbUrl = resolveReviewThumbUrl(item);
               return (
                 <div
                   key={item.id}
@@ -780,7 +951,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 </div>
               );
             })}
-            {filteredReviews.length === 0 && (
+            {visibleFilteredReviews.length === 0 && (
               <div
                 style={{
                   padding: 24,
@@ -1019,14 +1190,21 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   </button>
                   <button
                     className="nvr-btn primary"
-                    onClick={() =>
-                      handleQuickExport(
+                    onClick={() => {
+                      const win = computeReviewPlaybackWindow(
+                        activeReview.start_time,
+                        activeReview.end_time,
+                        5,
+                        5,
+                        20
+                      );
+                      void handleQuickExport(
                         activeReview.camera,
-                        activeReview.start_time - 5,
-                        (activeReview.end_time || activeReview.start_time + 20) + 5,
+                        win.startSec,
+                        win.endSec,
                         `${activeReview.camera}_${activeReview.id}`
-                      )
-                    }
+                      );
+                    }}
                   >
                     {t.review.exportClip}
                   </button>
@@ -1111,17 +1289,42 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 >
                   {(() => {
                     const p = activeReview.data?.provenance;
-                    const topScore = p?.top_score ?? 0.88;
-                    const thresh = p?.threshold_cfg ?? 0.7;
-                    const areaPx = p?.area_px ?? 0;
-                    const areaPct = p?.area_pct ?? 0;
-                    const ratio = p?.aspect_ratio ?? 0.5;
-                    const bbox = p?.bbox ?? [0, 0, 0, 0];
+                    const topScore =
+                      typeof p?.top_score === "number" && Number.isFinite(p.top_score)
+                        ? p.top_score
+                        : 0.88;
+                    const thresh =
+                      typeof p?.threshold_cfg === "number" &&
+                      Number.isFinite(p.threshold_cfg)
+                        ? p.threshold_cfg
+                        : 0.7;
+                    const areaPx =
+                      typeof p?.area_px === "number" && Number.isFinite(p.area_px)
+                        ? Math.max(0, Math.round(p.area_px))
+                        : 0;
+                    const areaPct =
+                      typeof p?.area_pct === "number" && Number.isFinite(p.area_pct)
+                        ? Math.max(0, p.area_pct)
+                        : 0;
+                    const ratio =
+                      typeof p?.aspect_ratio === "number" &&
+                      Number.isFinite(p.aspect_ratio)
+                        ? p.aspect_ratio
+                        : 0.5;
+                    const bbox =
+                      Array.isArray(p?.bbox) && p.bbox.length >= 4
+                        ? p.bbox.map((v) =>
+                            typeof v === "number" && Number.isFinite(v) ? v : 0
+                          )
+                        : [0, 0, 0, 0];
                     const anchorX = Math.round((bbox[0] + bbox[2]) / 2);
-                    const anchorY = bbox[3];
+                    const anchorY = Math.round(bbox[3]);
                     const zones =
                       (p?.zones && p.zones.length > 0 ? p.zones : activeReview.data?.zones) || [];
-                    const triggerTs = p?.trigger_ts ?? activeReview.start_time;
+                    const triggerTs =
+                      typeof p?.trigger_ts === "number" && Number.isFinite(p.trigger_ts)
+                        ? p.trigger_ts
+                        : activeReview.start_time;
                     return (
                       <>
                         <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
@@ -1293,14 +1496,25 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     }}
                   />
                 ) : (
-                  <VodHlsPlayer
-                    camera={activeReview.camera}
-                    startTime={activeReview.start_time - 4}
-                    endTime={(activeReview.end_time || activeReview.start_time + 20) + 6}
-                    fallbackPreviewId={activeReview.id}
-                    playbackRate={briefingActive ? briefingSpeed : playbackSpeed}
-                    onEnded={briefingActive ? handleAdvanceBriefing : undefined}
-                  />
+                  (() => {
+                    const vodWin = computeReviewPlaybackWindow(
+                      activeReview.start_time,
+                      activeReview.end_time,
+                      4,
+                      6,
+                      20
+                    );
+                    return (
+                      <VodHlsPlayer
+                        camera={activeReview.camera}
+                        startTime={vodWin.startSec}
+                        endTime={vodWin.endSec}
+                        fallbackPreviewId={activeReview.id}
+                        playbackRate={briefingActive ? briefingSpeed : playbackSpeed}
+                        onEnded={briefingActive ? handleAdvanceBriefing : undefined}
+                      />
+                    );
+                  })()
                 )}
               </div>
 
