@@ -6750,6 +6750,66 @@ fn emit_heuristics_to_logs(log_hub: &LogBufferHub, alerts: &[HeuristicAlertDto])
     }
 }
 
+const MAX_BULK_IDS: usize = 1000;
+const MAX_GENAI_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+fn redact_image_bytes_with_privacy_mask(
+    raw_bytes: &[u8],
+    privacy_mask: Option<&Value>,
+    prefer_jpeg: bool,
+) -> (Vec<u8>, &'static str) {
+    let default_mime = if prefer_jpeg {
+        "image/jpeg"
+    } else {
+        "image/webp"
+    };
+    if !has_active_privacy_mask(privacy_mask) {
+        return (raw_bytes.to_vec(), default_mime);
+    }
+    let mut rgb = match image::load_from_memory(raw_bytes) {
+        Ok(dyn_img) => dyn_img.to_rgb8(),
+        Err(_) => image::RgbImage::from_pixel(64, 36, image::Rgb([12, 14, 18])),
+    };
+    if let Some(mask) = privacy_mask {
+        ninjanvr_vision::apply_privacy_masks_from_value(&mut rgb, mask);
+    }
+    if prefer_jpeg {
+        let out = ninjanvr_vision::encode_image_jpeg(&rgb).unwrap_or_default();
+        (out, "image/jpeg")
+    } else {
+        let out = ninjanvr_vision::encode_image_webp(&rgb)
+            .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec());
+        (out, "image/webp")
+    }
+}
+
+async fn camera_privacy_mask_value(
+    config: &Arc<RwLock<NinjaConfig>>,
+    camera: &str,
+) -> Option<Value> {
+    let cfg = config.read().await;
+    cfg.cameras.get(camera).map(|c| c.privacy_mask.clone())
+}
+
+async fn redact_dataset_sample_file_if_masked(
+    config: &Arc<RwLock<NinjaConfig>>,
+    media_dir: &Path,
+    sample: &ninjanvr_db::DatasetSampleDto,
+) {
+    let priv_mask = camera_privacy_mask_value(config, &sample.camera).await;
+    if !has_active_privacy_mask(priv_mask.as_ref()) {
+        return;
+    }
+    let sample_path = PathBuf::from(&sample.image_path);
+    if let Some(safe_path) = ensure_path_within_media_dir(media_dir, &sample_path)
+        && let Ok(raw_bytes) = tokio::fs::read(&safe_path).await
+    {
+        let (redacted, _) =
+            redact_image_bytes_with_privacy_mask(&raw_bytes, priv_mask.as_ref(), false);
+        let _ = tokio::fs::write(&safe_path, &redacted).await;
+    }
+}
+
 fn split_csv_opt(raw: &Option<String>) -> Option<Vec<String>> {
     raw.as_ref().map(|s| {
         s.split(',')
@@ -6942,7 +7002,8 @@ async fn api_review_ids(
     headers: HeaderMap,
     Query(q): Query<IdsQueryParams>,
 ) -> Json<Value> {
-    let ids = split_csv_opt(&q.ids).unwrap_or_default();
+    let mut ids = split_csv_opt(&q.ids).unwrap_or_default();
+    ids.truncate(MAX_BULK_IDS);
     let mut items = state.db.get_reviews_by_ids(&ids).unwrap_or_default();
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         items.retain(|r| allowed.iter().any(|a| a == &r.camera));
@@ -6953,9 +7014,20 @@ async fn api_review_ids(
 async fn api_review_unview_one(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         let permitted = state
             .db
@@ -6980,9 +7052,30 @@ async fn api_review_unview_one(
 async fn api_reviews_viewed(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     Json(body): Json<ViewedReviewBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if body.ids.len() > MAX_BULK_IDS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": format!("Bulk review ID list exceeds maximum limit of {MAX_BULK_IDS}")
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         for id in &body.ids {
             let permitted = state
@@ -7067,6 +7160,16 @@ async fn api_reviews_delete(
         )
             .into_response();
     }
+    if body.ids.len() > MAX_BULK_IDS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": format!("Bulk review delete list exceeds maximum limit of {MAX_BULK_IDS}")
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         for id in &body.ids {
             let permitted = state
@@ -7139,7 +7242,8 @@ async fn api_event_ids(
     headers: HeaderMap,
     Query(q): Query<IdsQueryParams>,
 ) -> Json<Value> {
-    let ids = split_csv_opt(&q.ids).unwrap_or_default();
+    let mut ids = split_csv_opt(&q.ids).unwrap_or_default();
+    ids.truncate(MAX_BULK_IDS);
     let mut events = state.db.get_events_by_ids(&ids).unwrap_or_default();
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         events.retain(|ev| {
@@ -7157,15 +7261,39 @@ async fn api_events_explore(
     headers: HeaderMap,
     Query(q): Query<EventQueryParams>,
 ) -> Json<Value> {
-    let limit = q.limit.unwrap_or(10);
-    let mut events = state.db.query_events_explore(limit).unwrap_or_default();
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
-        events.retain(|ev| {
-            ev["camera"]
-                .as_str()
-                .is_some_and(|cam| allowed.iter().any(|a| a == cam))
-        });
+    let limit = q.limit.unwrap_or(10).clamp(1, 100);
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let scoped_events = state
+            .db
+            .query_events(&EventFilter {
+                cameras: scope_cameras_filter(None, Some(allowed)),
+                limit: Some(1000),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        let mut by_label: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for ev in scoped_events {
+            if let Some(lbl) = ev["label"].as_str() {
+                by_label.entry(lbl.to_string()).or_default().push(ev);
+            }
+        }
+        let mut label_groups: Vec<(String, Vec<Value>)> = by_label.into_iter().collect();
+        label_groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+        let mut out = Vec::new();
+        for (_label, group) in label_groups {
+            let count = group.len() as i64;
+            for mut ev in group.into_iter().take(limit) {
+                if let Some(obj) = ev.as_object_mut() {
+                    obj.insert("event_count".to_string(), json!(count));
+                }
+                out.push(ev);
+            }
+        }
+        return Json(Value::Array(out));
     }
+    let events = state.db.query_events_explore(limit).unwrap_or_default();
     Json(Value::Array(events))
 }
 
@@ -7286,6 +7414,16 @@ async fn api_events_bulk_delete(
     } else {
         body.ids
     };
+    if ids.len() > MAX_BULK_IDS {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": format!("Bulk event delete list exceeds maximum limit of {MAX_BULK_IDS}")
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         for id in &ids {
             let permitted = state
@@ -7320,9 +7458,20 @@ async fn api_events_bulk_delete(
 async fn api_event_retain_on(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         let permitted = state
             .db
@@ -7352,9 +7501,20 @@ async fn api_event_retain_on(
 async fn api_event_retain_off(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         let permitted = state
             .db
@@ -7390,10 +7550,21 @@ pub struct FalsePositiveBody {
 async fn api_event_false_positive(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     body: Option<Json<FalsePositiveBody>>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         let permitted = state
             .db
@@ -7419,14 +7590,17 @@ async fn api_event_false_positive(
     let fp = body.map(|b| b.0.false_positive).unwrap_or(true);
     let _ = state.db.set_event_false_positive(&id, fp);
     if fp {
-        let _ = create_dataset_sample_from_event(
+        if let Ok(sample) = create_dataset_sample_from_event(
             &state.db,
             &state.media_dir,
             &id,
             "hard_negative",
             None,
         )
-        .await;
+        .await
+        {
+            redact_dataset_sample_file_if_masked(&state.config, &state.media_dir, &sample).await;
+        }
     } else {
         let sample_id = format!("ds_{id}");
         if let Ok(Some(existing)) = state.db.get_dataset_sample(&sample_id)
@@ -7449,11 +7623,24 @@ async fn api_list_false_positive_signatures(
     headers: HeaderMap,
     Query(params): Query<FalsePositiveSignaturesQuery>,
 ) -> Json<Value> {
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    if let Some(ref allow_list) = allowed
+        && !allow_list.iter().any(|a| a == "*")
+        && let Some(req_cam) = params
+            .camera
+            .as_deref()
+            .filter(|c| !c.is_empty() && *c != "all")
+        && !allow_list.iter().any(|a| a == req_cam)
+    {
+        return Json(json!([]));
+    }
     let mut items = state
         .db
         .list_false_positive_signatures(params.camera.as_deref())
         .unwrap_or_default();
-    if let Some(allow_list) = caller_allowed_cameras(&state, &jar, &headers).await {
+    if let Some(allow_list) = allowed
+        && !allow_list.iter().any(|a| a == "*")
+    {
         items.retain(|s| {
             s["camera"]
                 .as_str()
@@ -7465,8 +7652,46 @@ async fn api_list_false_positive_signatures(
 
 async fn api_delete_false_positive_signature(
     State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<i64>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allow_list) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allow_list.iter().any(|a| a == "*")
+    {
+        let permitted = state
+            .db
+            .list_false_positive_signatures(None)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|s| s["id"].as_i64() == Some(id))
+            .and_then(|s| {
+                s["camera"]
+                    .as_str()
+                    .map(|cam| allow_list.iter().any(|a| a == cam))
+            })
+            .unwrap_or(false);
+        if !permitted {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
+                ),
+            )
+                .into_response();
+        }
+    }
     let deleted = state.db.delete_false_positive_signature(id).unwrap_or(0);
     if deleted == 0 {
         return (
@@ -7501,11 +7726,55 @@ fn is_allowed_genai_api_key_env(name: &str) -> bool {
         || trimmed.starts_with("NINJANVR_TEST_GENAI_")
 }
 
+fn is_disallowed_genai_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let octs = v4.octets();
+    v4.is_unspecified()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || (octs[0] == 169 && octs[1] == 254)
+        || octs == [100, 100, 100, 200]
+        || octs == [192, 0, 0, 192]
+}
+
+fn is_safe_genai_model_name(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 128
+        && !trimmed.contains("..")
+        && !trimmed.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '?' | '#' | '@')
+        })
+}
+
+async fn read_bounded_reqwest_json(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+    context_msg: &'static str,
+) -> Result<Value> {
+    if let Some(len) = resp.content_length()
+        && len > max_bytes as u64
+    {
+        anyhow::bail!("{context_msg}: response body too large ({len} bytes > {max_bytes} bytes)");
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context(context_msg)? {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!(
+                "{context_msg}: response body exceeded maximum limit of {max_bytes} bytes"
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).context(context_msg)
+}
+
 fn validate_genai_base_url(raw: &str) -> Result<()> {
     let trimmed = raw.trim();
     let lower = trimmed.to_ascii_lowercase();
     if (!lower.starts_with("http://") && !lower.starts_with("https://"))
         || trimmed.contains('@')
+        || trimmed.contains('\\')
         || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
     {
         anyhow::bail!("Disallowed or invalid GenAI base_url");
@@ -7523,41 +7792,106 @@ fn validate_genai_base_url(raw: &str) -> Result<()> {
         let Some((ipv6_part, rest)) = after_bracket.split_once(']') else {
             anyhow::bail!("Disallowed or invalid GenAI base_url");
         };
-        let p = rest.strip_prefix(':').and_then(|s| s.parse::<u16>().ok());
+        let p = if rest.is_empty() {
+            None
+        } else if let Some(port_str) = rest.strip_prefix(':') {
+            let Ok(parsed_p) = port_str.parse::<u16>() else {
+                anyhow::bail!("Disallowed or invalid GenAI base_url");
+            };
+            Some(parsed_p)
+        } else {
+            anyhow::bail!("Disallowed or invalid GenAI base_url");
+        };
         (ipv6_part, p)
-    } else if let Some((h, p)) = authority.rsplit_once(':') {
-        (h, p.parse::<u16>().ok())
+    } else if let Some((h, p_str)) = authority.rsplit_once(':') {
+        if h.contains(':') {
+            anyhow::bail!("Disallowed or invalid GenAI base_url");
+        }
+        let Ok(parsed_p) = p_str.parse::<u16>() else {
+            anyhow::bail!("Disallowed or invalid GenAI base_url");
+        };
+        (h, Some(parsed_p))
     } else {
         (authority, None)
     };
-    if matches!(port, Some(5000 | 8971 | 1984 | 8554)) {
+    if matches!(port, Some(0 | 5000 | 8971 | 1984 | 8554)) {
         anyhow::bail!("Disallowed or invalid GenAI base_url");
     }
     let host_lc = host.to_ascii_lowercase();
-    if host_lc.is_empty()
-        || host_lc == "metadata.google.internal"
-        || host_lc.ends_with(".metadata.google.internal")
-        || host_lc == "metadata"
-        || host_lc.starts_with("169.254.")
+    let clean_host = host_lc.trim_end_matches('.');
+    if clean_host.is_empty()
+        || clean_host == "metadata.google.internal"
+        || clean_host.ends_with(".metadata.google.internal")
+        || clean_host == "metadata"
+        || clean_host == "metadata.azure.com"
+        || clean_host.ends_with(".metadata.azure.com")
+        || clean_host == "instance-data"
+        || clean_host.ends_with(".nip.io")
+        || clean_host.ends_with(".sslip.io")
+        || clean_host.ends_with(".xip.io")
+        || clean_host == "localtest.me"
+        || clean_host.ends_with(".localtest.me")
+        || clean_host == "lvh.me"
+        || clean_host.ends_with(".lvh.me")
+        || clean_host.starts_with("169.254.")
     {
         anyhow::bail!("Disallowed or invalid GenAI base_url");
     }
-    if let Ok(ip) = host_lc.parse::<std::net::IpAddr>() {
+    if clean_host.split('.').all(|part| {
+        !part.is_empty()
+            && (part.chars().all(|c| c.is_ascii_digit())
+                || part
+                    .strip_prefix("0x")
+                    .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit())))
+    }) {
+        let Ok(v4) = clean_host.parse::<std::net::Ipv4Addr>() else {
+            anyhow::bail!("Disallowed or invalid GenAI base_url");
+        };
+        if clean_host != v4.to_string() || is_disallowed_genai_ipv4(v4) {
+            anyhow::bail!("Disallowed or invalid GenAI base_url");
+        }
+    }
+    if let Ok(ip) = clean_host.parse::<std::net::IpAddr>() {
         let disallowed = match ip {
             std::net::IpAddr::V4(v4) => {
-                v4.is_unspecified() || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
+                clean_host != v4.to_string() || is_disallowed_genai_ipv4(v4)
             }
             std::net::IpAddr::V6(v6) => {
                 v6.is_unspecified()
+                    || v6.is_multicast()
                     || (v6.segments()[0] & 0xffc0) == 0xfe80
-                    || v6
-                        .to_ipv4_mapped()
-                        .is_some_and(|v4| v4.octets()[0] == 169 && v4.octets()[1] == 254)
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || v6.to_ipv4().is_some_and(|v4| {
+                        is_disallowed_genai_ipv4(v4) || v4.is_loopback() || v4.is_private()
+                    })
+                    || v6.to_ipv4_mapped().is_some_and(|v4| {
+                        is_disallowed_genai_ipv4(v4) || v4.is_loopback() || v4.is_private()
+                    })
             }
         };
         if disallowed {
             anyhow::bail!("Disallowed or invalid GenAI base_url");
         }
+    }
+    let Ok(parsed_url) = reqwest::Url::parse(trimmed) else {
+        anyhow::bail!("Disallowed or invalid GenAI base_url");
+    };
+    if matches!(parsed_url.port(), Some(0 | 5000 | 8971 | 1984 | 8554)) {
+        anyhow::bail!("Disallowed or invalid GenAI base_url");
+    }
+    if let Some(url_host) = parsed_url.host_str() {
+        let url_host_clean = url_host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if let Ok(v4) = url_host_clean.parse::<std::net::Ipv4Addr>()
+            && (clean_host != v4.to_string() || is_disallowed_genai_ipv4(v4))
+        {
+            anyhow::bail!("Disallowed or invalid GenAI base_url");
+        }
+    } else {
+        anyhow::bail!("Disallowed or invalid GenAI base_url");
     }
     Ok(())
 }
@@ -7567,6 +7901,7 @@ fn build_effective_genai_config(
     req: &GenAiValidateRequest,
 ) -> ninjanvr_config::GenAiConfig {
     let mut cfg = saved.clone();
+    let mut base_url_changed = false;
     if let Some(ref p) = req.provider
         && !p.trim().is_empty()
     {
@@ -7586,6 +7921,7 @@ fn build_effective_genai_config(
             cfg.base_url = None;
         } else {
             if Some(trimmed) != saved.base_url.as_deref().map(str::trim) {
+                base_url_changed = true;
                 cfg.api_key = None;
                 cfg.api_key_env = String::new();
             }
@@ -7598,12 +7934,14 @@ fn build_effective_genai_config(
         let trimmed = key.trim();
         if !trimmed.is_empty() && trimmed != "***" && trimmed != "*" {
             if let Some(env_var) = trimmed.strip_prefix('$') {
-                if is_allowed_genai_api_key_env(env_var.trim()) {
+                if !base_url_changed && is_allowed_genai_api_key_env(env_var.trim()) {
                     cfg.api_key = Some(trimmed.to_string());
                 }
-            } else if std::env::var(trimmed).is_ok() && !is_allowed_genai_api_key_env(trimmed) {
-                // Reject unprefixed process environment variable names outside the GenAI allowlist
-            } else {
+            } else if std::env::var(trimmed).is_ok() {
+                if !base_url_changed && is_allowed_genai_api_key_env(trimmed) {
+                    cfg.api_key = Some(trimmed.to_string());
+                }
+            } else if !base_url_changed || !is_allowed_genai_api_key_env(trimmed) {
                 cfg.api_key = Some(trimmed.to_string());
             }
         }
@@ -7828,10 +8166,12 @@ pub async fn discover_genai_models(genai: &ninjanvr_config::GenAiConfig) -> Resu
         anyhow::bail!("API validation HTTP {status}");
     }
 
-    let resp_json: Value = resp
-        .json()
-        .await
-        .context("failed to decode model catalog JSON from AI provider")?;
+    let resp_json: Value = read_bounded_reqwest_json(
+        resp,
+        MAX_GENAI_RESPONSE_BYTES,
+        "failed to decode model catalog JSON from AI provider",
+    )
+    .await?;
     let models = extract_models_from_provider_payload(&provider, &resp_json);
     if models.is_empty() {
         anyhow::bail!(
@@ -7882,10 +8222,14 @@ async fn api_genai_models_post(
         }
     };
     let saved = state.config.read().await.genai.clone();
+    let base_url_matches_saved = match req.base_url.as_deref().map(str::trim) {
+        None | Some("") => true,
+        Some(b) => Some(b) == saved.base_url.as_deref().map(str::trim),
+    };
     let effective = build_effective_genai_config(&saved, &req);
     match discover_genai_models(&effective).await {
         Ok(models) => {
-            if effective.api_key.is_some() {
+            if base_url_matches_saved && effective.api_key.is_some() {
                 state.config.write().await.genai.api_key = effective.api_key.clone();
             }
             Json(json!({
@@ -7921,9 +8265,20 @@ async fn api_genai_models_post(
 async fn api_event_verify_ai(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         let permitted = state
             .db
@@ -7964,7 +8319,12 @@ async fn api_event_verify_ai(
 fn scrub_genai_secret_in_error(raw: String, api_key: &str) -> String {
     let trimmed = api_key.trim();
     if !trimmed.is_empty() && trimmed != "***" && trimmed != "*" {
-        raw.replace(trimmed, "***")
+        let mut out = raw.replace(trimmed, "***");
+        let url_encoded = urlencoding_simple(trimmed);
+        if !url_encoded.is_empty() && url_encoded != trimmed {
+            out = out.replace(&url_encoded, "***");
+        }
+        out
     } else {
         raw
     }
@@ -8077,16 +8437,23 @@ pub async fn verify_event_with_genai_components(
     media_dir: PathBuf,
     event_id: &str,
 ) -> Result<Value> {
+    if !is_safe_id(event_id) {
+        anyhow::bail!("Invalid event_id '{event_id}'");
+    }
     let Some(ev) = db.get_event(event_id)? else {
         anyhow::bail!("Event '{event_id}' not found");
     };
     let camera = ev["camera"].as_str().unwrap_or("camera");
+    if !is_safe_id(camera) {
+        anyhow::bail!("Invalid camera identifier '{camera}'");
+    }
     let label = ev["label"].as_str().unwrap_or("object");
     let score = ev["top_score"]
         .as_f64()
         .or_else(|| ev["data"]["top_score"].as_f64())
         .unwrap_or(0.5);
 
+    let priv_mask = camera_privacy_mask_value(&config, camera).await;
     let clips_dir = media_dir.join("clips");
     let candidates = [
         (
@@ -8104,36 +8471,53 @@ pub async fn verify_event_with_genai_components(
         (clips_dir.join(format!("{event_id}.jpg")), "image/jpeg"),
     ];
 
-    let mut img_b64: Option<String> = None;
-    let mut mime_type = "image/webp";
+    let mut raw_img_bytes: Option<(Vec<u8>, &'static str)> = None;
     for (path, mime) in candidates {
-        if let Ok(bytes) = tokio::fs::read(&path).await
+        if let Some(safe_path) = ensure_path_within_media_dir(&media_dir, &path)
+            && let Ok(bytes) = tokio::fs::read(&safe_path).await
             && !bytes.is_empty()
         {
-            img_b64 = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
-            mime_type = mime;
+            raw_img_bytes = Some((bytes, mime));
             break;
         }
     }
-    if img_b64.is_none() {
-        if let Some(thumb) = ev["thumbnail"].as_str()
-            && !thumb.is_empty()
-        {
-            img_b64 = Some(thumb.to_string());
-            mime_type = "image/webp";
-        } else {
-            // Minimal valid 1x1 WebP fallback when event row has no snapshot file on disk
-            img_b64 = Some(
-                base64::engine::general_purpose::STANDARD.encode(b"RIFF\x1a\x00\x00\x00WEBPVP8 "),
-            );
-            mime_type = "image/webp";
-        }
+    if raw_img_bytes.is_none()
+        && let Some(thumb) = ev["thumbnail"].as_str()
+        && !thumb.is_empty()
+        && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(thumb.trim())
+        && !decoded.is_empty()
+    {
+        raw_img_bytes = Some((decoded, "image/webp"));
     }
-    let img_b64 = img_b64.unwrap_or_default();
+
+    let (final_bytes, mime_type) = match raw_img_bytes {
+        Some((bytes, mime)) => {
+            redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), mime == "image/jpeg")
+        }
+        None => {
+            if let Some(thumb) = ev["thumbnail"].as_str()
+                && !thumb.is_empty()
+                && !has_active_privacy_mask(priv_mask.as_ref())
+            {
+                (
+                    base64::engine::general_purpose::STANDARD
+                        .decode(thumb.trim())
+                        .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec()),
+                    "image/webp",
+                )
+            } else {
+                (b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec(), "image/webp")
+            }
+        }
+    };
+    let img_b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
 
     let genai = config.read().await.genai.clone();
     if genai.model.trim().is_empty() {
         anyhow::bail!("No Vision AI model selected. Validate API and choose a model in Settings.");
+    }
+    if !is_safe_genai_model_name(&genai.model) {
+        anyhow::bail!("Disallowed or invalid GenAI model identifier");
     }
     if let Some(b) = genai
         .base_url
@@ -8238,27 +8622,29 @@ pub async fn verify_event_with_genai_components(
                     genai.model
                 )
             };
-            client
-                .post(&url)
-                .json(&json!({
-                    "contents": [{
-                        "parts": [
-                            { "text": prompt },
-                            {
-                                "inline_data": {
-                                    "mime_type": mime_type,
-                                    "data": img_b64
-                                }
+            let mut req = client.post(&url);
+            if !api_key.is_empty() {
+                req = req.header("x-goog-api-key", &api_key);
+            }
+            req.json(&json!({
+                "contents": [{
+                    "parts": [
+                        { "text": prompt },
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": img_b64
                             }
-                        ]
-                    }],
-                    "generationConfig": {
-                        "responseMimeType": "application/json"
-                    }
-                }))
-                .send()
-                .await
-                .context("Gemini Vision API request failed")?
+                        }
+                    ]
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json"
+                }
+            }))
+            .send()
+            .await
+            .context("Gemini Vision API request failed")?
         }
     };
 
@@ -8267,10 +8653,12 @@ pub async fn verify_event_with_genai_components(
         anyhow::bail!("AI Judge HTTP {status}");
     }
 
-    let resp_json: Value = resp
-        .json()
-        .await
-        .context("failed to decode AI Judge JSON response")?;
+    let resp_json: Value = read_bounded_reqwest_json(
+        resp,
+        MAX_GENAI_RESPONSE_BYTES,
+        "failed to decode AI Judge JSON response",
+    )
+    .await?;
     let (is_true_positive, confidence, reason) = parse_ai_judge_json_verdict(&resp_json)?;
     let verified_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8290,8 +8678,11 @@ pub async fn verify_event_with_genai_components(
     let auto_suppressed = !is_true_positive && genai.auto_suppress_false_positives;
     if auto_suppressed {
         let _ = db.set_event_false_positive(event_id, true)?;
-        let _ = create_dataset_sample_from_event(&db, &media_dir, event_id, "hard_negative", None)
-            .await;
+        if let Ok(sample) =
+            create_dataset_sample_from_event(&db, &media_dir, event_id, "hard_negative", None).await
+        {
+            redact_dataset_sample_file_if_masked(&config, &media_dir, &sample).await;
+        }
     }
 
     Ok(json!({
@@ -8370,36 +8761,23 @@ async fn resolve_event_clean_snapshot_bytes(
 ) -> (Vec<u8>, u32, u32) {
     let camera = ev["camera"].as_str().unwrap_or("camera");
     let clips_dir = media_dir.join("clips");
-    let candidates = [
-        clips_dir.join(format!("{camera}-{event_id}-clean.webp")),
-        clips_dir.join(format!("{camera}-{event_id}.webp")),
-        clips_dir.join(format!("{event_id}-clean.jpg")),
-        clips_dir.join(format!("{event_id}.jpg")),
-    ];
+    let mut candidates = Vec::with_capacity(4);
+    if is_safe_id(camera) && is_safe_id(event_id) {
+        candidates.push(clips_dir.join(format!("{camera}-{event_id}-clean.webp")));
+        candidates.push(clips_dir.join(format!("{camera}-{event_id}.webp")));
+    }
+    if is_safe_id(event_id) {
+        candidates.push(clips_dir.join(format!("{event_id}-clean.jpg")));
+        candidates.push(clips_dir.join(format!("{event_id}.jpg")));
+    }
     let mut found_bytes: Option<Vec<u8>> = None;
     for path in candidates {
-        if let Ok(bytes) = tokio::fs::read(&path).await
+        if let Some(safe_path) = ensure_path_within_media_dir(media_dir, &path)
+            && let Ok(bytes) = tokio::fs::read(&safe_path).await
             && !bytes.is_empty()
         {
             found_bytes = Some(bytes);
             break;
-        }
-    }
-    if found_bytes.is_none() {
-        let suffix = format!("-{event_id}-clean.webp");
-        if let Ok(entries) = std::fs::read_dir(&clips_dir) {
-            for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|n| n.ends_with(&suffix))
-                    && let Ok(bytes) = tokio::fs::read(entry.path()).await
-                    && !bytes.is_empty()
-                {
-                    found_bytes = Some(bytes);
-                    break;
-                }
-            }
         }
     }
     if found_bytes.is_none()
@@ -8667,6 +9045,17 @@ async fn api_dataset_samples(
     headers: HeaderMap,
     Query(params): Query<DatasetSamplesQuery>,
 ) -> Json<Value> {
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    if let Some(ref allow_list) = allowed
+        && !allow_list.iter().any(|a| a == "*")
+        && let Some(req_cam) = params
+            .camera
+            .as_deref()
+            .filter(|c| !c.is_empty() && *c != "all")
+        && !allow_list.iter().any(|a| a == req_cam)
+    {
+        return Json(json!([]));
+    }
     let mut items = state
         .db
         .list_dataset_samples(
@@ -8675,8 +9064,10 @@ async fn api_dataset_samples(
             params.verified,
         )
         .unwrap_or_default();
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
-        items.retain(|s| allowed.iter().any(|a| a == &s.camera));
+    if let Some(allow_list) = allowed
+        && !allow_list.iter().any(|a| a == "*")
+    {
+        items.retain(|s| allow_list.iter().any(|a| a == &s.camera));
     }
     Json(json!(items))
 }
@@ -8690,10 +9081,21 @@ pub struct CreateSampleFromEventBody {
 async fn api_dataset_sample_from_event(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(event_id): AxumPath<String>,
     body: Option<Json<CreateSampleFromEventBody>>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if !is_safe_id(&event_id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -8739,7 +9141,10 @@ async fn api_dataset_sample_from_event(
     )
     .await
     {
-        Ok(sample) => Json(sample_dto_to_response_json(&sample)).into_response(),
+        Ok(sample) => {
+            redact_dataset_sample_file_if_masked(&state.config, &state.media_dir, &sample).await;
+            Json(sample_dto_to_response_json(&sample)).into_response()
+        }
         Err(err) => {
             let msg = err.to_string();
             let status = if msg.contains("not found") {
@@ -8794,9 +9199,41 @@ pub struct UpdateDatasetSampleBody {
 
 async fn api_dataset_sample_update(
     State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<UpdateDatasetSampleBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let permitted = state
+            .db
+            .get_dataset_sample(&id)
+            .ok()
+            .flatten()
+            .is_some_and(|s| allowed.iter().any(|a| a == &s.camera));
+        if !permitted {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
+                ),
+            )
+                .into_response();
+        }
+    }
     match state.db.update_dataset_sample_annotations(
         &id,
         body.annotations.as_deref(),
@@ -8820,12 +9257,42 @@ async fn api_dataset_sample_update(
 
 async fn api_dataset_sample_delete(
     State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    if let Ok(Some(sample)) = state.db.get_dataset_sample(&id) {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    let sample_opt = state.db.get_dataset_sample(&id).ok().flatten();
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let permitted = sample_opt
+            .as_ref()
+            .is_some_and(|s| allowed.iter().any(|a| a == &s.camera));
+        if !permitted {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
+                ),
+            )
+                .into_response();
+        }
+    }
+    if let Some(sample) = sample_opt {
         let p = PathBuf::from(&sample.image_path);
-        if p.starts_with(&state.media_dir) {
-            let _ = tokio::fs::remove_file(&p).await;
+        if let Some(safe_p) = ensure_path_within_media_dir(&state.media_dir, &p) {
+            let _ = tokio::fs::remove_file(&safe_p).await;
         }
     }
     let deleted = state.db.delete_dataset_sample(&id).unwrap_or(0);
@@ -8860,12 +9327,15 @@ async fn api_dataset_sample_image_webp(
         )
             .into_response();
     }
+    let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
     let direct_path = PathBuf::from(&sample.image_path);
     if let Some(safe_direct) = ensure_path_within_media_dir(&state.media_dir, &direct_path)
         && let Ok(bytes) = tokio::fs::read(&safe_direct).await
         && !bytes.is_empty()
     {
-        return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+        let (out_bytes, _) =
+            redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
+        return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
     }
     if is_safe_id(&sample.id) {
         let dataset_fallback = state
@@ -8877,7 +9347,9 @@ async fn api_dataset_sample_image_webp(
             && let Ok(bytes) = tokio::fs::read(&safe_fallback).await
             && !bytes.is_empty()
         {
-            return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+            let (out_bytes, _) =
+                redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
+            return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
         }
     }
     if let Some(ev_id) = sample.event_id {
@@ -9075,18 +9547,44 @@ pub async fn auto_annotate_dataset_sample(
     state: &AppState,
     sample_id: &str,
 ) -> Result<ninjanvr_db::DatasetSampleDto> {
+    if !is_safe_id(sample_id) {
+        anyhow::bail!("Invalid dataset sample_id '{sample_id}'");
+    }
     let Some(sample) = state.db.get_dataset_sample(sample_id)? else {
         anyhow::bail!("Dataset sample '{sample_id}' not found");
     };
-    let img_bytes = tokio::fs::read(&sample.image_path)
-        .await
-        .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec());
+    let raw_img_bytes = if let Some(safe_path) =
+        ensure_path_within_media_dir(&state.media_dir, Path::new(&sample.image_path))
+        && let Ok(bytes) = tokio::fs::read(&safe_path).await
+        && !bytes.is_empty()
+    {
+        bytes
+    } else if is_safe_id(&sample.id)
+        && let Some(safe_fallback) = ensure_path_within_media_dir(
+            &state.media_dir,
+            &state
+                .media_dir
+                .join("dataset")
+                .join(format!("{}.webp", sample.id)),
+        )
+        && let Ok(bytes) = tokio::fs::read(&safe_fallback).await
+        && !bytes.is_empty()
+    {
+        bytes
+    } else {
+        b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec()
+    };
+    let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
+    let (img_bytes, mime_type) =
+        redact_image_bytes_with_privacy_mask(&raw_img_bytes, priv_mask.as_ref(), false);
     let img_b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
-    let mime_type = "image/webp";
 
     let genai = state.config.read().await.genai.clone();
     if genai.model.trim().is_empty() {
         anyhow::bail!("No Vision AI model selected. Validate API and choose a model in Settings.");
+    }
+    if !is_safe_genai_model_name(&genai.model) {
+        anyhow::bail!("Disallowed or invalid GenAI model identifier");
     }
     if let Some(b) = genai
         .base_url
@@ -9193,27 +9691,29 @@ pub async fn auto_annotate_dataset_sample(
                     genai.model
                 )
             };
-            client
-                .post(&url)
-                .json(&json!({
-                    "contents": [{
-                        "parts": [
-                            { "text": prompt },
-                            {
-                                "inline_data": {
-                                    "mime_type": mime_type,
-                                    "data": img_b64
-                                }
+            let mut req = client.post(&url);
+            if !api_key.is_empty() {
+                req = req.header("x-goog-api-key", &api_key);
+            }
+            req.json(&json!({
+                "contents": [{
+                    "parts": [
+                        { "text": prompt },
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": img_b64
                             }
-                        ]
-                    }],
-                    "generationConfig": {
-                        "responseMimeType": "application/json"
-                    }
-                }))
-                .send()
-                .await
-                .context("Gemini auto-annotate request failed")?
+                        }
+                    ]
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json"
+                }
+            }))
+            .send()
+            .await
+            .context("Gemini auto-annotate request failed")?
         }
     };
 
@@ -9222,10 +9722,12 @@ pub async fn auto_annotate_dataset_sample(
         anyhow::bail!("Vision AI Auto-Annotate HTTP {status}");
     }
 
-    let resp_json: Value = resp
-        .json()
-        .await
-        .context("failed to decode Vision AI auto-annotate JSON")?;
+    let resp_json: Value = read_bounded_reqwest_json(
+        resp,
+        MAX_GENAI_RESPONSE_BYTES,
+        "failed to decode Vision AI auto-annotate JSON",
+    )
+    .await?;
     let annotations = parse_ai_auto_annotations(&resp_json, sample.width, sample.height)?;
     let updated = state
         .db
@@ -9242,8 +9744,40 @@ pub async fn auto_annotate_dataset_sample(
 
 async fn api_dataset_sample_auto_annotate(
     State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let permitted = state
+            .db
+            .get_dataset_sample(&id)
+            .ok()
+            .flatten()
+            .is_some_and(|s| allowed.iter().any(|a| a == &s.camera));
+        if !permitted {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
+                ),
+            )
+                .into_response();
+        }
+    }
     match auto_annotate_dataset_sample(&state, &id).await {
         Ok(updated) => Json(sample_dto_to_response_json(&updated)).into_response(),
         Err(err) => {
@@ -9259,16 +9793,52 @@ async fn api_dataset_sample_auto_annotate(
     }
 }
 
-async fn api_dataset_batch_auto_annotate(State(state): State<AppState>) -> Response {
-    let candidates = state
+static BATCH_AUTO_ANNOTATE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+const MAX_BATCH_AUTO_ANNOTATE_SAMPLES: usize = 50;
+
+async fn api_dataset_batch_auto_annotate(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    let Ok(_permit) = BATCH_AUTO_ANNOTATE_SEMAPHORE.try_acquire() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "success": false,
+                "message": "A batch auto-annotation job is already in progress"
+            })),
+        )
+            .into_response();
+    };
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    let mut candidates = state
         .db
         .list_dataset_samples(None, None, Some(false))
         .unwrap_or_default();
+    if let Some(ref allow_list) = allowed
+        && !allow_list.iter().any(|a| a == "*")
+    {
+        candidates.retain(|s| allow_list.iter().any(|a| a == &s.camera));
+    }
     let mut updated_samples = Vec::new();
-    for s in candidates {
-        if s.sample_kind == "hard_negative" {
-            continue;
-        }
+    for s in candidates
+        .into_iter()
+        .filter(|s| s.sample_kind != "hard_negative")
+        .take(MAX_BATCH_AUTO_ANNOTATE_SAMPLES)
+    {
         if let Ok(updated) = auto_annotate_dataset_sample(&state, &s.id).await {
             updated_samples.push(updated);
         }
@@ -9296,15 +9866,40 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
+fn is_safe_zip_entry_name(name: &str) -> bool {
+    if name.is_empty()
+        || name.len() > 1024
+        || name.starts_with('/')
+        || name.starts_with('\\')
+        || name.contains('\\')
+        || name.contains(':')
+        || name.chars().any(|c| c.is_control())
+    {
+        return false;
+    }
+    name.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(".."))
+}
+
 pub fn build_zip_archive(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut central_records: Vec<(String, u32, u32, u32)> = Vec::with_capacity(entries.len());
 
     for (name, data) in entries {
+        if !is_safe_zip_entry_name(name)
+            || central_records.len() >= u16::MAX as usize
+            || data.len() > u32::MAX as usize
+            || buf.len() > u32::MAX as usize
+        {
+            continue;
+        }
         let crc = crc32_ieee(data);
         let size = data.len() as u32;
         let offset = buf.len() as u32;
         let name_bytes = name.as_bytes();
+        let Ok(name_len_u16) = u16::try_from(name_bytes.len()) else {
+            continue;
+        };
 
         buf.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
         buf.extend_from_slice(&20u16.to_le_bytes());
@@ -9315,7 +9910,7 @@ pub fn build_zip_archive(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         buf.extend_from_slice(&crc.to_le_bytes());
         buf.extend_from_slice(&size.to_le_bytes());
         buf.extend_from_slice(&size.to_le_bytes());
-        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&name_len_u16.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(name_bytes);
         buf.extend_from_slice(data);
@@ -9345,7 +9940,7 @@ pub fn build_zip_archive(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
         buf.extend_from_slice(&local_offset.to_le_bytes());
         buf.extend_from_slice(name_bytes);
     }
-    let central_dir_size = (buf.len() as u32) - central_dir_offset;
+    let central_dir_size = (buf.len() as u32).saturating_sub(central_dir_offset);
 
     buf.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes());
@@ -9359,6 +9954,9 @@ pub fn build_zip_archive(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
     buf
 }
 
+const MAX_ZIP_ARCHIVE_ENTRIES: usize = 4096;
+const MAX_ZIP_EXTRACTED_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn parse_zip_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
     if bytes.len() < 22 {
         anyhow::bail!("ZIP archive too small");
@@ -9367,21 +9965,31 @@ pub fn parse_zip_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         .windows(4)
         .rposition(|w| w == 0x0605_4b50u32.to_le_bytes())
         .context("missing ZIP End of Central Directory signature")?;
-    if eocd_pos + 22 > bytes.len() {
+    if eocd_pos.checked_add(22).is_none_or(|end| end > bytes.len()) {
         anyhow::bail!("truncated ZIP EOCD header");
     }
     let total_entries = u16::from_le_bytes([bytes[eocd_pos + 10], bytes[eocd_pos + 11]]) as usize;
+    if total_entries > MAX_ZIP_ARCHIVE_ENTRIES {
+        anyhow::bail!("ZIP archive entry count ({total_entries}) exceeds maximum limit");
+    }
     let cd_offset = u32::from_le_bytes([
         bytes[eocd_pos + 16],
         bytes[eocd_pos + 17],
         bytes[eocd_pos + 18],
         bytes[eocd_pos + 19],
     ]) as usize;
+    if cd_offset > eocd_pos {
+        anyhow::bail!("invalid ZIP Central Directory offset");
+    }
 
     let mut out = BTreeMap::new();
     let mut cursor = cd_offset;
+    let mut cumulative_extracted: usize = 0;
     for _ in 0..total_entries {
-        if cursor + 46 > bytes.len() {
+        let Some(hdr_end) = cursor.checked_add(46) else {
+            anyhow::bail!("integer overflow in Central Directory cursor");
+        };
+        if hdr_end > eocd_pos || hdr_end > bytes.len() {
             anyhow::bail!("truncated Central Directory record");
         }
         let sig = u32::from_le_bytes([
@@ -9392,6 +10000,10 @@ pub fn parse_zip_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         ]);
         if sig != 0x0201_4b50 {
             anyhow::bail!("invalid Central Directory signature");
+        }
+        let cd_method = u16::from_le_bytes([bytes[cursor + 10], bytes[cursor + 11]]);
+        if cd_method != 0 {
+            anyhow::bail!("unsupported ZIP compression method {cd_method} (only Stored=0 allowed)");
         }
         let expected_crc = u32::from_le_bytes([
             bytes[cursor + 16],
@@ -9405,6 +10017,15 @@ pub fn parse_zip_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
             bytes[cursor + 22],
             bytes[cursor + 23],
         ]) as usize;
+        let uncompressed_size = u32::from_le_bytes([
+            bytes[cursor + 24],
+            bytes[cursor + 25],
+            bytes[cursor + 26],
+            bytes[cursor + 27],
+        ]) as usize;
+        if size != uncompressed_size {
+            anyhow::bail!("mismatched compressed and uncompressed size in Stored ZIP entry");
+        }
         let name_len = u16::from_le_bytes([bytes[cursor + 28], bytes[cursor + 29]]) as usize;
         let extra_len = u16::from_le_bytes([bytes[cursor + 30], bytes[cursor + 31]]) as usize;
         let comment_len = u16::from_le_bytes([bytes[cursor + 32], bytes[cursor + 33]]) as usize;
@@ -9415,10 +10036,31 @@ pub fn parse_zip_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
             bytes[cursor + 45],
         ]) as usize;
 
-        let name = String::from_utf8(bytes[cursor + 46..cursor + 46 + name_len].to_vec())?;
-        cursor += 46 + name_len + extra_len + comment_len;
+        let Some(name_end) = hdr_end.checked_add(name_len) else {
+            anyhow::bail!("integer overflow in Central Directory entry name");
+        };
+        let Some(next_cursor) = name_end
+            .checked_add(extra_len)
+            .and_then(|v| v.checked_add(comment_len))
+        else {
+            anyhow::bail!("integer overflow in Central Directory record length");
+        };
+        if name_end > bytes.len() || next_cursor > eocd_pos || next_cursor > bytes.len() {
+            anyhow::bail!("truncated Central Directory entry metadata");
+        }
+        let name = String::from_utf8(bytes[hdr_end..name_end].to_vec())?;
+        if !is_safe_zip_entry_name(&name) {
+            anyhow::bail!("unsafe or traversal ZIP entry path '{name}'");
+        }
+        if out.contains_key(&name) {
+            anyhow::bail!("duplicate ZIP entry path '{name}'");
+        }
+        cursor = next_cursor;
 
-        if local_offset + 30 > bytes.len() {
+        let Some(local_hdr_end) = local_offset.checked_add(30) else {
+            anyhow::bail!("invalid local header offset for {name}");
+        };
+        if local_hdr_end > cd_offset || local_hdr_end > bytes.len() {
             anyhow::bail!("invalid local header offset for {name}");
         }
         let local_sig = u32::from_le_bytes([
@@ -9430,14 +10072,34 @@ pub fn parse_zip_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
         if local_sig != 0x0403_4b50 {
             anyhow::bail!("invalid local file header signature for {name}");
         }
+        let local_method = u16::from_le_bytes([bytes[local_offset + 8], bytes[local_offset + 9]]);
+        if local_method != 0 {
+            anyhow::bail!("unsupported local header compression method {local_method} for {name}");
+        }
         let l_name_len =
             u16::from_le_bytes([bytes[local_offset + 26], bytes[local_offset + 27]]) as usize;
         let l_extra_len =
             u16::from_le_bytes([bytes[local_offset + 28], bytes[local_offset + 29]]) as usize;
-        let data_start = local_offset + 30 + l_name_len + l_extra_len;
-        let data_end = data_start + size;
-        if data_end > bytes.len() {
+        let Some(l_name_end) = local_hdr_end.checked_add(l_name_len) else {
             anyhow::bail!("truncated data payload for {name}");
+        };
+        let Some(data_start) = l_name_end.checked_add(l_extra_len) else {
+            anyhow::bail!("truncated data payload for {name}");
+        };
+        let Some(data_end) = data_start.checked_add(size) else {
+            anyhow::bail!("truncated data payload for {name}");
+        };
+        if data_end > cd_offset || data_end > bytes.len() {
+            anyhow::bail!("truncated data payload for {name}");
+        }
+        if &bytes[local_hdr_end..l_name_end] != name.as_bytes() {
+            anyhow::bail!("local header filename mismatch for {name}");
+        }
+        cumulative_extracted = cumulative_extracted
+            .checked_add(size)
+            .context("ZIP archive extracted size overflow")?;
+        if cumulative_extracted > bytes.len() || cumulative_extracted > MAX_ZIP_EXTRACTED_BYTES {
+            anyhow::bail!("ZIP archive extracted payload exceeds maximum allowed size");
         }
         let payload = bytes[data_start..data_end].to_vec();
         let actual_crc = crc32_ieee(&payload);
@@ -9473,12 +10135,15 @@ async fn api_dataset_export_zip(
     let mut entries: Vec<(String, Vec<u8>)> = vec![("data.yaml".to_string(), yaml.into_bytes())];
 
     for sample in samples {
+        if !is_safe_id(&sample.id) {
+            continue;
+        }
         let split = if sample.split == "val" {
             "val"
         } else {
             "train"
         };
-        let img_bytes = if let Some(safe_path) =
+        let raw_img_bytes = if let Some(safe_path) =
             ensure_path_within_media_dir(&state.media_dir, Path::new(&sample.image_path))
         {
             tokio::fs::read(&safe_path)
@@ -9487,6 +10152,9 @@ async fn api_dataset_export_zip(
         } else {
             b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec()
         };
+        let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
+        let (img_bytes, _) =
+            redact_image_bytes_with_privacy_mask(&raw_img_bytes, priv_mask.as_ref(), false);
         entries.push((format!("images/{split}/{}.webp", sample.id), img_bytes));
 
         let label_txt = if sample.sample_kind == "hard_negative" || sample.annotations.is_empty() {
@@ -9677,12 +10345,23 @@ async fn api_detector_model_upload(
         model_bytes = b"ONNX_SYNTHETIC_MODEL".to_vec();
     }
 
-    let safe_filename = Path::new(&filename)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("custom_yolo11s.onnx")
-        .to_string();
+    let trimmed_fname = filename.trim();
+    if trimmed_fname.is_empty()
+        || trimmed_fname.contains('/')
+        || trimmed_fname.contains('\\')
+        || trimmed_fname.contains("..")
+        || !is_safe_id(trimmed_fname)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Invalid model filename: must be a safe basename ending with .onnx or .xml"
+            })),
+        )
+            .into_response();
+    }
+    let safe_filename = trimmed_fname.to_string();
     let lower_fname = safe_filename.to_ascii_lowercase();
     if safe_filename.starts_with('.')
         || safe_filename.contains("..")
@@ -9700,19 +10379,18 @@ async fn api_detector_model_upload(
     if let Some(ref wf) = weights_filename
         && !wf.trim().is_empty()
     {
-        let safe_wf = Path::new(wf.trim())
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if safe_wf.is_empty()
-            || safe_wf.starts_with('.')
-            || !safe_wf.to_ascii_lowercase().ends_with(".bin")
+        let wf_trimmed = wf.trim();
+        if wf_trimmed.contains('/')
+            || wf_trimmed.contains('\\')
+            || wf_trimmed.contains("..")
+            || !is_safe_id(wf_trimmed)
+            || !wf_trimmed.to_ascii_lowercase().ends_with(".bin")
         {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "success": false,
-                    "message": "Invalid weights filename: must end with .bin"
+                    "message": "Invalid weights filename: must be a safe basename ending with .bin"
                 })),
             )
                 .into_response();
@@ -9722,12 +10400,26 @@ async fn api_detector_model_upload(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("custom_yolo11s");
-    let safe_labelmap_name = labelmap_filename
+    let safe_labelmap_name = match labelmap_filename
         .as_deref()
-        .and_then(|f| Path::new(f).file_name())
-        .and_then(|s| s.to_str())
-        .map(String::from)
-        .unwrap_or_else(|| format!("{stem}.txt"));
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(lf) => {
+            if lf.contains('/') || lf.contains('\\') || lf.contains("..") || !is_safe_id(lf) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "success": false,
+                        "message": "Invalid labelmap filename: must be a safe basename ending with .txt"
+                    })),
+                )
+                    .into_response();
+            }
+            lf.to_string()
+        }
+        None => format!("{stem}.txt"),
+    };
     if safe_labelmap_name.starts_with('.')
         || safe_labelmap_name.contains("..")
         || !safe_labelmap_name.to_ascii_lowercase().ends_with(".txt")
@@ -9762,15 +10454,27 @@ async fn api_detector_model_upload(
         )
             .into_response();
     }
+    if ensure_path_within_media_dir(&state.media_dir, &saved_model_path).is_none() {
+        let _ = tokio::fs::remove_file(&saved_model_path).await;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Model path escapes media_dir" })),
+        )
+            .into_response();
+    }
 
     if let Some(w_bytes) = &weights_bytes {
         let w_name = weights_filename
             .as_deref()
-            .and_then(|f| Path::new(f).file_name())
-            .and_then(|s| s.to_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && is_safe_id(s))
             .map(String::from)
             .unwrap_or_else(|| format!("{stem}.bin"));
-        let _ = tokio::fs::write(models_dir.join(w_name), w_bytes).await;
+        let w_path = models_dir.join(w_name);
+        let _ = tokio::fs::write(&w_path, w_bytes).await;
+        if ensure_path_within_media_dir(&state.media_dir, &w_path).is_none() {
+            let _ = tokio::fs::remove_file(&w_path).await;
+        }
     }
 
     let saved_labelmap_path = models_dir.join(&safe_labelmap_name);
@@ -9849,20 +10553,35 @@ pub struct SubLabelBody {
     pub enroll_face: Option<bool>,
 }
 
-fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> Vec<u8> {
+async fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> Vec<u8> {
+    if !is_safe_id(event_id) {
+        return format!("event-face-sample:{event_id}").into_bytes();
+    }
     let clips_dir = state.media_dir.join("clips");
     if let Ok(Some(ev)) = state.db.get_event(event_id) {
-        if let Some(cam) = ev["camera"].as_str() {
-            for candidate in [
-                clips_dir.join(format!("{cam}-{event_id}-clean.webp")),
-                clips_dir.join(format!("{event_id}-clean.jpg")),
-                clips_dir.join(format!("{cam}-{event_id}.webp")),
-                clips_dir.join(format!("{event_id}.jpg")),
+        let cam_opt = ev["camera"].as_str().filter(|c| is_safe_id(c));
+        let priv_mask = if let Some(cam) = cam_opt {
+            camera_privacy_mask_value(&state.config, cam).await
+        } else {
+            None
+        };
+        if let Some(cam) = cam_opt {
+            for (candidate, is_jpeg) in [
+                (
+                    clips_dir.join(format!("{cam}-{event_id}-clean.webp")),
+                    false,
+                ),
+                (clips_dir.join(format!("{event_id}-clean.jpg")), true),
+                (clips_dir.join(format!("{cam}-{event_id}.webp")), false),
+                (clips_dir.join(format!("{event_id}.jpg")), true),
             ] {
-                if let Ok(bytes) = std::fs::read(&candidate)
+                if let Some(safe_p) = ensure_path_within_media_dir(&state.media_dir, &candidate)
+                    && let Ok(bytes) = tokio::fs::read(&safe_p).await
                     && !bytes.is_empty()
                 {
-                    return bytes;
+                    let (out, _) =
+                        redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), is_jpeg);
+                    return out;
                 }
             }
         }
@@ -9870,7 +10589,9 @@ fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> Vec<u8> {
             && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(thumb_b64.trim())
             && !decoded.is_empty()
         {
-            return decoded;
+            let (out, _) =
+                redact_image_bytes_with_privacy_mask(&decoded, priv_mask.as_ref(), false);
+            return out;
         }
     }
     format!("event-face-sample:{event_id}").into_bytes()
@@ -9879,20 +10600,45 @@ fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> Vec<u8> {
 async fn api_event_sub_label(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<SubLabelBody>,
 ) -> Response {
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && let Ok(Some(ev)) = state.db.get_event(&id)
-        && let Some(cam) = ev["camera"].as_str()
-        && !allowed.iter().any(|c| c == cam)
-    {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
         )
             .into_response();
+    }
+    let allowed_opt = caller_allowed_cameras(&state, &jar, &headers).await;
+    if let Some(ref allowed) = allowed_opt
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let permitted = state
+            .db
+            .get_event(&id)
+            .ok()
+            .flatten()
+            .and_then(|ev| {
+                ev["camera"]
+                    .as_str()
+                    .map(|cam| allowed.iter().any(|c| c == cam))
+            })
+            .unwrap_or(false);
+        if !permitted {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
+                ),
+            )
+                .into_response();
+        }
     }
 
     let clean_sub = body
@@ -9905,12 +10651,17 @@ async fn api_event_sub_label(
         .set_event_sub_label_with_score(&id, clean_sub, body.sub_label_score)
         .unwrap_or(0);
 
+    let is_unrestricted = allowed_opt
+        .as_ref()
+        .is_none_or(|a| a.iter().any(|c| c == "*"));
     if body.enroll_face.unwrap_or(false)
+        && updated > 0
+        && is_unrestricted
         && let Some(name) = clean_sub
         && !name.eq_ignore_ascii_case("unknown")
     {
         let faces_dir = state.media_dir.join("faces");
-        let sample_bytes = load_event_face_sample_bytes(&state, &id);
+        let sample_bytes = load_event_face_sample_bytes(&state, &id).await;
         let _ = state
             .detector
             .enroll_face_profile(&faces_dir, name, &id, &sample_bytes);
@@ -9935,9 +10686,49 @@ pub struct FaceEnrollBody {
     pub assign_sub_label: Option<bool>,
 }
 
-async fn api_faces_list(State(state): State<AppState>) -> Json<Value> {
+async fn api_faces_list(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
     let faces_dir = state.media_dir.join("faces");
-    let profiles = state.detector.list_face_profiles(&faces_dir);
+    let mut profiles = state.detector.list_face_profiles(&faces_dir);
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let scoped_events = state
+            .db
+            .query_events(&EventFilter {
+                cameras: scope_cameras_filter(None, Some(allowed.clone())),
+                limit: Some(1000),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        let mut allowed_sub_labels = BTreeSet::new();
+        for ev in &scoped_events {
+            if let Some(sl) = ev["sub_label"]
+                .as_str()
+                .or_else(|| ev["data"]["sub_label"].as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                allowed_sub_labels.insert(sl.to_ascii_lowercase());
+            }
+        }
+        profiles.retain_mut(|p| {
+            p.sample_files.retain(|fname| {
+                let stem = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname);
+                match state.db.get_event(stem) {
+                    Ok(Some(ev)) => ev["camera"]
+                        .as_str()
+                        .is_some_and(|cam| allowed.iter().any(|a| a == cam)),
+                    _ => false,
+                }
+            });
+            p.sample_count = p.sample_files.len();
+            allowed_sub_labels.contains(&p.name.to_ascii_lowercase()) || !p.sample_files.is_empty()
+        });
+    }
     let mut faces_map = serde_json::Map::new();
     let mut root = serde_json::Map::new();
     for p in &profiles {
@@ -9953,9 +10744,31 @@ async fn api_faces_list(State(state): State<AppState>) -> Json<Value> {
 
 async fn api_face_enroll(
     State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(name): AxumPath<String>,
     body_bytes: Bytes,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera-restricted users cannot modify global face gallery" })),
+        )
+            .into_response();
+    }
     let Some(clean_name) = ninjanvr_infer::sanitize_face_profile_name(&name) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -9974,7 +10787,15 @@ async fn api_face_enroll(
         if let Some(ref ev_id) = parsed.event_id
             && !ev_id.trim().is_empty()
         {
-            sample_id = ev_id.trim().to_string();
+            let trimmed_ev = ev_id.trim();
+            if !is_safe_id(trimmed_ev) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "success": false, "message": "Invalid event_id" })),
+                )
+                    .into_response();
+            }
+            sample_id = trimmed_ev.to_string();
             if parsed.assign_sub_label.unwrap_or(true) {
                 event_to_assign = Some(sample_id.clone());
             }
@@ -9993,7 +10814,7 @@ async fn api_face_enroll(
         } else if let Some(ref ev_id) = parsed.event_id
             && !ev_id.trim().is_empty()
         {
-            load_event_face_sample_bytes(&state, ev_id.trim())
+            load_event_face_sample_bytes(&state, ev_id.trim()).await
         } else {
             format!("face-profile:{clean_name}").into_bytes()
         }
@@ -10044,8 +10865,30 @@ async fn api_face_enroll(
 
 async fn api_face_delete(
     State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
     AxumPath(name): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera-restricted users cannot delete global face profiles" })),
+        )
+            .into_response();
+    }
     let Some(clean_name) = ninjanvr_infer::sanitize_face_profile_name(&name) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -10071,8 +10914,47 @@ async fn api_face_delete(
     .into_response()
 }
 
-async fn api_sub_labels(State(state): State<AppState>) -> Json<Value> {
+async fn api_sub_labels(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
     let mut set = BTreeSet::new();
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let scoped_events = state
+            .db
+            .query_events(&EventFilter {
+                cameras: scope_cameras_filter(None, Some(allowed.clone())),
+                limit: Some(1000),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        for ev in scoped_events {
+            if let Some(sl) = ev["sub_label"]
+                .as_str()
+                .or_else(|| ev["data"]["sub_label"].as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                set.insert(sl.to_string());
+            }
+        }
+        for item in state.db.query_events_summary().unwrap_or_default() {
+            if item["camera"]
+                .as_str()
+                .is_some_and(|cam| allowed.iter().any(|a| a == cam))
+                && let Some(sl) = item["sub_label"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            {
+                set.insert(sl.to_string());
+            }
+        }
+        return Json(json!(set.into_iter().collect::<Vec<_>>()));
+    }
     if let Ok(db_subs) = state.db.list_distinct_sub_labels() {
         for s in db_subs {
             set.insert(s);
@@ -10101,20 +10983,44 @@ pub struct LicensePlateBody {
 async fn api_event_license_plate(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<LicensePlateBody>,
 ) -> Response {
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && let Ok(Some(ev)) = state.db.get_event(&id)
-        && let Some(cam) = ev["camera"].as_str()
-        && !allowed.iter().any(|c| c == cam)
-    {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
         )
             .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let permitted = state
+            .db
+            .get_event(&id)
+            .ok()
+            .flatten()
+            .and_then(|ev| {
+                ev["camera"]
+                    .as_str()
+                    .map(|cam| allowed.iter().any(|c| c == cam))
+            })
+            .unwrap_or(false);
+        if !permitted {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
+                ),
+            )
+                .into_response();
+        }
     }
 
     let normalized_plate = body
@@ -10152,7 +11058,36 @@ async fn api_event_license_plate(
     .into_response()
 }
 
-async fn api_recognized_license_plates(State(state): State<AppState>) -> Json<Value> {
+async fn api_recognized_license_plates(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Json<Value> {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let scoped_events = state
+            .db
+            .query_events(&EventFilter {
+                cameras: scope_cameras_filter(None, Some(allowed)),
+                limit: Some(1000),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        let mut set = BTreeSet::new();
+        for ev in scoped_events {
+            if let Some(p) = ev["recognized_license_plate"]
+                .as_str()
+                .or_else(|| ev["data"]["recognized_license_plate"].as_str())
+            {
+                let norm = ninjanvr_infer::normalize_license_plate(p);
+                if !norm.is_empty() {
+                    set.insert(norm);
+                }
+            }
+        }
+        return Json(Value::Array(set.into_iter().map(Value::String).collect()));
+    }
     let mut plates = state
         .db
         .query_recognized_license_plates()
@@ -10181,10 +11116,21 @@ pub struct DescriptionBody {
 async fn api_event_description(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<DescriptionBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
         let permitted = state
             .db
@@ -10220,20 +11166,44 @@ pub struct NotesBody {
 async fn api_event_notes(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<NotesBody>,
 ) -> Response {
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && let Ok(Some(ev)) = state.db.get_event(&id)
-        && let Some(cam) = ev["camera"].as_str()
-        && !allowed.iter().any(|c| c == cam)
-    {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
         )
             .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let permitted = state
+            .db
+            .get_event(&id)
+            .ok()
+            .flatten()
+            .and_then(|ev| {
+                ev["camera"]
+                    .as_str()
+                    .map(|cam| allowed.iter().any(|c| c == cam))
+            })
+            .unwrap_or(false);
+        if !permitted {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
+                ),
+            )
+                .into_response();
+        }
     }
     let updated = state.db.set_event_notes(&id, &body.notes).unwrap_or(0);
     Json(json!({ "success": updated > 0, "notes": body.notes })).into_response()
@@ -10242,19 +11212,39 @@ async fn api_event_notes(
 async fn api_review_notes(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     Json(body): Json<NotesBody>,
 ) -> Response {
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && let Ok(Some(rev)) = state.db.get_review_by_id(&id)
-        && !allowed.contains(&rev.camera)
-    {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
         return (
             StatusCode::FORBIDDEN,
-            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
         )
             .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let permitted = state
+            .db
+            .get_review_by_id(&id)
+            .ok()
+            .flatten()
+            .is_some_and(|rev| allowed.contains(&rev.camera));
+        if !permitted {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
+                ),
+            )
+                .into_response();
+        }
     }
     let updated = state.db.set_review_notes(&id, &body.notes).unwrap_or(0);
     Json(json!({ "success": updated > 0, "notes": body.notes })).into_response()
@@ -10318,31 +11308,41 @@ async fn api_event_snapshot_clean_webp(
     let clips_dir = state.media_dir.join("clips");
     if let Some(ref ev) = ev_opt
         && let Some(cam) = ev["camera"].as_str()
+        && is_safe_id(cam)
     {
+        let priv_mask = camera_privacy_mask_value(&state.config, cam).await;
         let clean_candidate = clips_dir.join(format!("{cam}-{id}-clean.webp"));
         if let Some(safe_p) = ensure_path_within_media_dir(&state.media_dir, &clean_candidate)
             && let Ok(bytes) = tokio::fs::read(&safe_p).await
         {
-            return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+            let (out_bytes, _) =
+                redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
+            return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
         }
         let webp_candidate = clips_dir.join(format!("{cam}-{id}.webp"));
         if let Some(safe_p) = ensure_path_within_media_dir(&state.media_dir, &webp_candidate)
             && let Ok(bytes) = tokio::fs::read(&safe_p).await
         {
-            return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+            let (out_bytes, _) =
+                redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
+            return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
         }
-    }
-    let suffix = format!("-{id}-clean.webp");
-    if let Ok(entries) = std::fs::read_dir(&clips_dir) {
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|n| n.ends_with(&suffix))
-                && let Some(safe_p) = ensure_path_within_media_dir(&state.media_dir, &entry.path())
-                && let Ok(bytes) = tokio::fs::read(&safe_p).await
-            {
-                return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+    } else if ev_opt.is_none() {
+        let suffix = format!("-{id}-clean.webp");
+        if let Ok(entries) = std::fs::read_dir(&clips_dir) {
+            for entry in entries.flatten() {
+                if let Some(fname) = entry.file_name().to_str()
+                    && let Some(cam_prefix) = fname.strip_suffix(&suffix)
+                    && is_safe_id(cam_prefix)
+                    && let Some(safe_p) =
+                        ensure_path_within_media_dir(&state.media_dir, &entry.path())
+                    && let Ok(bytes) = tokio::fs::read(&safe_p).await
+                {
+                    let priv_mask = camera_privacy_mask_value(&state.config, cam_prefix).await;
+                    let (out_bytes, _) =
+                        redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
+                    return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
+                }
             }
         }
     }
@@ -10390,18 +11390,12 @@ async fn api_event_snapshot_jpg(
     if !is_safe_id(&id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let ev_opt = state.db.get_event(&id).ok().flatten();
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
-        let permitted = state
-            .db
-            .get_event(&id)
-            .ok()
-            .flatten()
-            .and_then(|ev| {
-                ev["camera"]
-                    .as_str()
-                    .map(|c| allowed.iter().any(|a| a == c))
-            })
-            .unwrap_or(false);
+        let permitted = ev_opt
+            .as_ref()
+            .and_then(|ev| ev["camera"].as_str())
+            .is_some_and(|c| allowed.iter().any(|a| a == c));
         if !permitted {
             return (
                 StatusCode::FORBIDDEN,
@@ -10410,11 +11404,17 @@ async fn api_event_snapshot_jpg(
                 .into_response();
         }
     }
+    let priv_mask = if let Some(cam) = ev_opt.as_ref().and_then(|ev| ev["camera"].as_str()) {
+        camera_privacy_mask_value(&state.config, cam).await
+    } else {
+        None
+    };
     let snap_path = state.media_dir.join("clips").join(format!("{id}.jpg"));
     if let Some(safe_p) = ensure_path_within_media_dir(&state.media_dir, &snap_path)
         && let Ok(bytes) = tokio::fs::read(&safe_p).await
     {
-        return ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response();
+        let (out_bytes, _) = redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), true);
+        return ([(header::CONTENT_TYPE, "image/jpeg")], out_bytes).into_response();
     }
     serve_event_thumb(&state, &id, "image/jpeg").await
 }
@@ -10423,14 +11423,23 @@ async fn serve_event_thumb(state: &AppState, id: &str, content_type: &'static st
     if !is_safe_id(id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let prefer_jpeg = content_type == "image/jpeg";
     if let Ok(Some(ev)) = state.db.get_event(id) {
+        let cam_opt = ev["camera"].as_str().filter(|c| is_safe_id(c));
+        let priv_mask = if let Some(cam) = cam_opt {
+            camera_privacy_mask_value(&state.config, cam).await
+        } else {
+            None
+        };
         if let Some(b64) = ev["thumbnail"].as_str()
             && !b64.is_empty()
             && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64)
         {
-            return ([(header::CONTENT_TYPE, content_type)], bytes).into_response();
+            let (out_bytes, _) =
+                redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), prefer_jpeg);
+            return ([(header::CONTENT_TYPE, content_type)], out_bytes).into_response();
         }
-        if let Some(cam) = ev["camera"].as_str() {
+        if let Some(cam) = cam_opt {
             let candidate = state
                 .media_dir
                 .join("clips")
@@ -10438,7 +11447,9 @@ async fn serve_event_thumb(state: &AppState, id: &str, content_type: &'static st
             if let Some(safe_p) = ensure_path_within_media_dir(&state.media_dir, &candidate)
                 && let Ok(bytes) = tokio::fs::read(&safe_p).await
             {
-                return ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response();
+                let (out_bytes, _) =
+                    redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
+                return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
             }
         }
     }
@@ -10486,9 +11497,12 @@ async fn api_event_clip_mp4(
         return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
     }
     if let Some(ev) = ev_opt {
-        if let Some(mock_vid) = ev["data"]["mock_video"].as_str() {
-            let mock_path = state.media_dir.join("clips/mocks").join(mock_vid);
-            if let Some(safe_mock) = ensure_path_within_media_dir(&state.media_dir, &mock_path)
+        if let Some(mock_vid) = ev["data"]["mock_video"].as_str()
+            && is_safe_id(mock_vid)
+        {
+            let mocks_dir = state.media_dir.join("clips/mocks");
+            let mock_path = mocks_dir.join(mock_vid);
+            if let Some(safe_mock) = ensure_path_within_media_dir(&mocks_dir, &mock_path)
                 && let Ok(bytes) = tokio::fs::read(&safe_mock).await
             {
                 return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
@@ -10560,17 +11574,138 @@ fn resolve_ffprobe_bin() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("ffprobe"))
 }
 
+fn is_valid_rtsp_probe_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if (!lower.starts_with("rtsp://") && !lower.starts_with("rtsps://"))
+        || trimmed.contains('\\')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    let Some((_, after_scheme)) = trimmed.split_once("://") else {
+        return false;
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if authority.is_empty() {
+        return false;
+    }
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    let (host, port) = if let Some(after_bracket) = host_port.strip_prefix('[') {
+        let Some((ipv6_part, rest)) = after_bracket.split_once(']') else {
+            return false;
+        };
+        let p = if rest.is_empty() {
+            None
+        } else if let Some(p_str) = rest.strip_prefix(':') {
+            let Ok(parsed_p) = p_str.parse::<u16>() else {
+                return false;
+            };
+            Some(parsed_p)
+        } else {
+            return false;
+        };
+        (ipv6_part, p)
+    } else if let Some((h, p_str)) = host_port.rsplit_once(':') {
+        if h.contains(':') {
+            return false;
+        }
+        let Ok(parsed_p) = p_str.parse::<u16>() else {
+            return false;
+        };
+        (h, Some(parsed_p))
+    } else {
+        (host_port, None)
+    };
+    if matches!(port, Some(0 | 5000 | 8971 | 1984)) {
+        return false;
+    }
+    let clean_host = host.trim_end_matches('.').to_ascii_lowercase();
+    if clean_host.is_empty()
+        || clean_host == "metadata.google.internal"
+        || clean_host.ends_with(".metadata.google.internal")
+        || clean_host == "metadata"
+        || clean_host == "metadata.azure.com"
+        || clean_host.ends_with(".metadata.azure.com")
+        || clean_host == "instance-data"
+        || clean_host.ends_with(".nip.io")
+        || clean_host.ends_with(".sslip.io")
+        || clean_host.ends_with(".xip.io")
+        || clean_host.starts_with("169.254.")
+    {
+        return false;
+    }
+    if clean_host.split('.').all(|part| {
+        !part.is_empty()
+            && (part.chars().all(|c| c.is_ascii_digit())
+                || part
+                    .strip_prefix("0x")
+                    .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit())))
+    }) {
+        let Ok(v4) = clean_host.parse::<std::net::Ipv4Addr>() else {
+            return false;
+        };
+        if clean_host != v4.to_string() || is_disallowed_genai_ipv4(v4) {
+            return false;
+        }
+    }
+    if let Ok(ip) = clean_host.parse::<std::net::IpAddr>() {
+        let disallowed = match ip {
+            std::net::IpAddr::V4(v4) => {
+                clean_host != v4.to_string() || is_disallowed_genai_ipv4(v4)
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || v6
+                        .to_ipv4()
+                        .is_some_and(|v4| is_disallowed_genai_ipv4(v4) || v4.is_loopback())
+                    || v6
+                        .to_ipv4_mapped()
+                        .is_some_and(|v4| is_disallowed_genai_ipv4(v4) || v4.is_loopback())
+            }
+        };
+        if disallowed {
+            return false;
+        }
+    }
+    true
+}
+
 async fn api_streams_probe(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     Json(req): Json<StreamProbeBody>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "latency_ms": 0,
+                "streams": [],
+                "error": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let started = Instant::now();
     let cam_name = req.camera.as_deref().unwrap_or("").trim();
-    if !cam_name.is_empty()
-        && let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && !allowed.iter().any(|a| a == cam_name)
+    let allowed_opt = caller_allowed_cameras(&state, &jar, &headers).await;
+    if let Some(ref allowed) = allowed_opt
+        && !allowed.iter().any(|a| a == "*")
+        && (cam_name.is_empty() || !allowed.iter().any(|a| a == cam_name))
     {
         return (
             StatusCode::FORBIDDEN,
@@ -10585,8 +11720,32 @@ async fn api_streams_probe(
     }
 
     let cfg = state.config.read().await;
+    let is_scoped_caller = allowed_opt
+        .as_ref()
+        .is_some_and(|a| !a.iter().any(|c| c == "*"));
 
-    let resolved_url = if let Some(u) = req.url.as_deref()
+    let resolved_url = if is_scoped_caller {
+        let configured_url = cfg
+            .camera_input_for_role(cam_name, "record")
+            .or_else(|| cfg.camera_input_for_role(cam_name, "detect"))
+            .unwrap_or_default();
+        if let Some(u) = req.url.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && !u.contains(":*:*@")
+            && u != configured_url
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "ok": false,
+                    "latency_ms": started.elapsed().as_millis() as u64,
+                    "streams": [],
+                    "error": "Camera-restricted users cannot probe custom stream URLs"
+                })),
+            )
+                .into_response();
+        }
+        configured_url
+    } else if let Some(u) = req.url.as_deref()
         && !u.trim().is_empty()
         && !u.contains(":*:*@")
     {
@@ -10616,19 +11775,14 @@ async fn api_streams_probe(
         .into_response();
     }
 
-    let lower_url = resolved_url.to_ascii_lowercase();
-    let is_valid_rtsp = (lower_url.starts_with("rtsp://") || lower_url.starts_with("rtsps://"))
-        && !resolved_url
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control());
-    if !is_valid_rtsp {
+    if !is_valid_rtsp_probe_url(&resolved_url) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "ok": false,
                 "latency_ms": started.elapsed().as_millis() as u64,
                 "streams": [],
-                "error": "Disallowed or invalid stream probe URL: only rtsp:// and rtsps:// URLs are permitted"
+                "error": "Disallowed or invalid stream probe URL: only safe rtsp:// and rtsps:// URLs are permitted"
             })),
         )
             .into_response();
@@ -10728,15 +11882,68 @@ async fn api_streams_probe(
 
 async fn api_ffprobe(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     Query(q): Query<FfprobeQueryParams>,
-) -> Json<Value> {
-    let cfg = state.config.read().await;
-    let cam_name = q
+) -> Response {
+    if let Some(ref raw_paths) = q.paths {
+        let trimmed = raw_paths.trim();
+        if !trimmed.is_empty() {
+            let Some(cam_part) = trimmed.strip_prefix("camera:") else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "message": "Invalid ffprobe paths parameter: must be 'camera:<name>'" })),
+                )
+                    .into_response();
+            };
+            if !is_safe_id(cam_part.trim()) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "message": "Invalid camera identifier in ffprobe paths" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if let Some(ref raw_cam) = q.camera
+        && !raw_cam.trim().is_empty()
+        && !is_safe_id(raw_cam.trim())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Invalid camera parameter" })),
+        )
+            .into_response();
+    }
+
+    let requested_cam = q
         .paths
         .as_deref()
+        .map(str::trim)
         .and_then(|p| p.strip_prefix("camera:"))
-        .or(q.camera.as_deref())
-        .unwrap_or("sala");
+        .or_else(|| q.camera.as_deref().map(str::trim).filter(|s| !s.is_empty()));
+
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        let Some(cam) = requested_cam else {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "message": "Camera parameter is required for camera-restricted users" })),
+            )
+                .into_response();
+        };
+        if !allowed.iter().any(|a| a == cam) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "message": "Camera is not permitted for this user" })),
+            )
+                .into_response();
+        }
+    }
+
+    let cam_name = requested_cam.unwrap_or("sala");
+    let cfg = state.config.read().await;
     let (det_w, det_h, det_fps) = cfg
         .cameras
         .get(cam_name)
@@ -10776,6 +11983,7 @@ async fn api_ffprobe(
             }
         }
     ]))
+    .into_response()
 }
 
 async fn api_keyframe_analysis() -> Json<Value> {
@@ -10822,9 +12030,23 @@ async fn api_recordings_storage(
 
 async fn api_camera_recordings(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(camera): AxumPath<String>,
     Query(q): Query<RecordingsQueryParams>,
-) -> Json<Value> {
+) -> Response {
+    if !is_safe_id(&camera) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
     let now = unix_now() as f64;
     let before = q.before.unwrap_or(now);
     let after = q.after.unwrap_or(before - 3600.0);
@@ -10848,11 +12070,12 @@ async fn api_camera_recordings(
             })
         })
         .collect();
-    Json(Value::Array(dto))
+    Json(Value::Array(dto)).into_response()
 }
 
 async fn api_camera_recordings_delete(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     AxumPath(camera): AxumPath<String>,
@@ -10868,6 +12091,21 @@ async fn api_camera_recordings_delete(
         )
             .into_response();
     }
+    if !is_safe_id(&camera) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Camera is not permitted for this user"
+            })),
+        )
+            .into_response();
+    }
     let now = unix_now() as f64;
     let before = q.before.unwrap_or(now);
     let after = q.after.unwrap_or(0.0);
@@ -10879,13 +12117,19 @@ async fn api_camera_recordings_delete(
     let mut freed_bytes: u64 = 0;
     for (_id, db_path, seg_size_mb) in &deleted {
         let disk_path = resolve_recording_disk_path(&state.media_dir, db_path);
-        if let Ok(meta) = std::fs::metadata(&disk_path) {
-            freed_bytes += meta.len();
+        if let Some(safe_disk_path) = ensure_path_within_media_dir(&state.media_dir, &disk_path) {
+            if let Ok(meta) = std::fs::metadata(&safe_disk_path) {
+                freed_bytes += meta.len();
+            } else {
+                freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
+            }
+            let _ = std::fs::remove_file(&safe_disk_path);
+            if let Ok(canon_rec_root) = std::fs::canonicalize(&recordings_root) {
+                ninjanvr_media::prune_empty_parent_dirs(&safe_disk_path, &canon_rec_root);
+            }
         } else {
             freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
         }
-        let _ = std::fs::remove_file(&disk_path);
-        ninjanvr_media::prune_empty_parent_dirs(&disk_path, &recordings_root);
     }
     cleanup_camera_share_clip_artifacts_in_range(&state, &camera, after, before);
     Json(json!({
@@ -10895,13 +12139,38 @@ async fn api_camera_recordings_delete(
     .into_response()
 }
 
-async fn api_recordings_sync(State(state): State<AppState>) -> Json<Value> {
+async fn api_recordings_sync(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Camera-restricted users cannot run global recordings sync" })),
+        )
+            .into_response();
+    }
     let started = Instant::now();
     let media_dir = state.media_dir.clone();
     let removed_orphans = state
         .db
         .prune_missing_recording_files(|db_path| {
-            resolve_recording_disk_path(&media_dir, db_path).exists()
+            let disk_path = resolve_recording_disk_path(&media_dir, db_path);
+            ensure_path_within_media_dir(&media_dir, &disk_path).is_some_and(|p| p.is_file())
         })
         .unwrap_or(0);
     let legacy_dbfs = state
@@ -10911,8 +12180,11 @@ async fn api_recordings_sync(State(state): State<AppState>) -> Json<Value> {
     let mut repaired_dbfs = 0usize;
     for (id, db_path) in legacy_dbfs {
         let disk_path = resolve_recording_disk_path(&media_dir, &db_path);
-        let next_dbfs = if disk_path.exists() {
-            let d = ninjanvr_media::probe_mp4_audio_dbfs_fast(&disk_path);
+        let next_dbfs = if let Some(safe_path) =
+            ensure_path_within_media_dir(&media_dir, &disk_path)
+            && safe_path.is_file()
+        {
+            let d = ninjanvr_media::probe_mp4_audio_dbfs_fast(&safe_path);
             if d == -5 { 0 } else { d }
         } else {
             0
@@ -10927,17 +12199,32 @@ async fn api_recordings_sync(State(state): State<AppState>) -> Json<Value> {
         "repaired_dbfs": repaired_dbfs,
         "duration_ms": duration_ms
     }))
+    .into_response()
 }
 
 async fn api_camera_recordings_summary(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(camera): AxumPath<String>,
-) -> Json<Value> {
+) -> Response {
+    if !is_safe_id(&camera) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
     let summary = state
         .db
         .query_recordings_summary(&camera)
         .unwrap_or_default();
-    Json(Value::Array(summary))
+    Json(Value::Array(summary)).into_response()
 }
 
 async fn api_timeline(
@@ -10946,27 +12233,45 @@ async fn api_timeline(
     headers: HeaderMap,
     Query(q): Query<TimelineQueryParams>,
 ) -> Json<Value> {
+    let limit = q.limit.unwrap_or(100).min(1000);
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     if let (Some(req_cam), Some(allow_list)) = (q.camera.as_deref(), allowed.as_ref())
-        && !allow_list.iter().any(|a| a == req_cam)
+        && !allow_list.iter().any(|a| a == req_cam || a == "*")
     {
         return Json(Value::Array(Vec::new()));
     }
-    let mut items = state
-        .db
-        .query_timeline(
-            q.camera.as_deref(),
-            q.source_id.as_deref(),
-            q.limit.unwrap_or(100),
-        )
-        .unwrap_or_default();
-    if let Some(allow_list) = allowed {
-        items.retain(|item| {
-            item["camera"]
-                .as_str()
-                .is_some_and(|cam| allow_list.iter().any(|a| a == cam))
+    if let Some(allow_list) = allowed
+        && !allow_list.iter().any(|a| a == "*")
+    {
+        if let Some(req_cam) = q.camera.as_deref().filter(|c| !c.is_empty() && *c != "all") {
+            let items = state
+                .db
+                .query_timeline(Some(req_cam), q.source_id.as_deref(), limit)
+                .unwrap_or_default();
+            return Json(Value::Array(items));
+        }
+        let mut merged = Vec::new();
+        for cam in &allow_list {
+            if let Ok(mut cam_items) =
+                state
+                    .db
+                    .query_timeline(Some(cam.as_str()), q.source_id.as_deref(), limit)
+            {
+                merged.append(&mut cam_items);
+            }
+        }
+        merged.sort_by(|a, b| {
+            let ta = a["timestamp"].as_f64().unwrap_or(0.0);
+            let tb = b["timestamp"].as_f64().unwrap_or(0.0);
+            ta.partial_cmp(&tb).unwrap_or(std::cmp::Ordering::Equal)
         });
+        merged.truncate(limit);
+        return Json(Value::Array(merged));
     }
+    let items = state
+        .db
+        .query_timeline(q.camera.as_deref(), q.source_id.as_deref(), limit)
+        .unwrap_or_default();
     Json(Value::Array(items))
 }
 
