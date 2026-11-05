@@ -226,6 +226,46 @@ export function expandSimulatedFleet(
   };
 }
 
+/**
+ * Validates and reconciles `selectedCamera` against `configuredCameras` (preferring enabled cameras)
+ * and `simulatedFleetCount` so the store never stays stuck on a non-existent default camera name
+ * (e.g. `"escritorio"`) when the loaded configuration uses different camera keys.
+ */
+export function resolveValidCameraSelection(
+  selectedCamera: string,
+  configuredCameras?: Record<string, CameraConfig> | null,
+  simulatedFleetCount: SimulatedFleetCount = 0
+): string {
+  const clean = (selectedCamera || "").trim();
+  if (!configuredCameras || typeof configuredCameras !== "object") {
+    return clean || "escritorio";
+  }
+  const allCams = Object.keys(configuredCameras);
+  if (allCams.length === 0) {
+    return clean || "escritorio";
+  }
+  const enabledCams = allCams.filter((k) => configuredCameras[k]?.enabled !== false);
+  const validRealCams = enabledCams.length > 0 ? enabledCams : allCams;
+
+  if (simulatedFleetCount > 0) {
+    const expanded = expandSimulatedFleet(
+      validRealCams,
+      configuredCameras,
+      null,
+      simulatedFleetCount
+    ).cameraNames;
+    if (clean && expanded.includes(clean)) {
+      return clean;
+    }
+    return expanded[0] || validRealCams[0] || "escritorio";
+  }
+
+  if (clean && validRealCams.includes(clean)) {
+    return clean;
+  }
+  return validRealCams[0] || "escritorio";
+}
+
 interface NvrRealtimeState {
   activeTab: WorkspaceTab;
   liveLayout: LiveLayoutMode;
@@ -373,7 +413,11 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
     set({ spotlightTimelineMode });
   },
   setSecurityProfile: (securityProfile) => set({ securityProfile }),
-  setSelectedCamera: (selectedCamera) => set({ selectedCamera }),
+  setSelectedCamera: (selectedCamera) =>
+    set((s) => {
+      const clean = (selectedCamera || "").trim();
+      return { selectedCamera: clean || s.selectedCamera || "escritorio" };
+    }),
   setHudPosition: (hudPosition) => {
     safeStorageSet("ninjanvr_hud_position", hudPosition);
     set({ hudPosition });
@@ -531,8 +575,14 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
         nextHighContrast = config.ui.high_contrast;
       }
       applyThemeToDocument(nextThemeMode, nextHighContrast);
+      const nextSelectedCamera = resolveValidCameraSelection(
+        s.selectedCamera,
+        config?.cameras,
+        s.simulatedFleetCount
+      );
       return {
         config,
+        selectedCamera: nextSelectedCamera,
         themeMode: nextThemeMode,
         highContrast: nextHighContrast,
       };

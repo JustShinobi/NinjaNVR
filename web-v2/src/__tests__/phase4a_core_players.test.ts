@@ -11,6 +11,7 @@ import {
 import {
   MAX_CAMERA_ACTIVITY_ENTRIES,
   MAX_STATS_HISTORY_SAMPLES,
+  resolveValidCameraSelection,
   useNvrStore,
 } from "../store/useNvrStore";
 import {
@@ -59,9 +60,13 @@ import { createPushToTalkController } from "../components/VideoPlayers";
 import {
   computeClientXTimestamp,
   parseLocalDayBounds,
+  sanitizeTimelineThumbUrl,
 } from "../components/TimelineScrubber";
 import { formatReadableDate } from "../components/RecordingCalendarPopover";
-import { resolvePickerMode } from "../components/TacticalCameraPicker";
+import {
+  getCameraPickerStatus,
+  resolvePickerMode,
+} from "../components/TacticalCameraPicker";
 import type { EventItem, NinjaConfigResponse, ReviewItem } from "../types/nvr";
 
 function makeEventItem(id: string): EventItem {
@@ -632,5 +637,323 @@ cameras:
     // Oldest entry (cam_0) was evicted at 256 cap, while recent entry (cam_299) is still within cooldown
     expect(prewarm.shouldPrewarmStream("cam_299", 2000)).toBe(false);
     expect(prewarm.shouldPrewarmStream("cam_0", 2000)).toBe(true);
+  });
+
+  test("[R2-P0-YAML-01] buildCleanYamlFromDraft preserves '***' secret masks when rawYaml is scrubbed or empty, restores '#'/'?' & query-param URLs, and guards NaN integer fields", () => {
+    const scrubbedRawYaml = `
+mqtt:
+  enabled: true
+  host: 127.0.0.1
+  port: 1883
+  password: "***"
+genai:
+  enabled: true
+  provider: gemini
+  api_key: "***"
+go2rtc:
+  streams:
+    hash_pw_cam:
+      - "rtsp://admin:my#pass?1@192.0.2.77:554/stream1"
+    query_pw_cam:
+      - "rtsp://192.0.2.88:554/cam/realmonitor?channel=1&subtype=0&user=admin&password=q_secret_99"
+cameras:
+    "gate_4space":
+        enabled: true
+        onvif:
+            host: 192.0.2.99
+            password: "***"
+`;
+
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      mqtt: {
+        enabled: true,
+        host: "127.0.0.1",
+        port: Number.NaN,
+        topic_prefix: ".5",
+        client_id: "1_000",
+        stats_interval: Number.POSITIVE_INFINITY,
+        user: "nan",
+        has_password: true,
+      },
+      auth: {
+        enabled: true,
+        reset_admin_password: false,
+        cookie_name: "n\u2028injected: true",
+        cookie_secure: false,
+        session_length: Number.NaN,
+        refresh_time: Number.NaN,
+        hash_iterations: Number.NaN,
+        trusted_proxies: [],
+      },
+      genai: {
+        enabled: true,
+        provider: "gemini",
+        api_key_env: "GEMINI_API_KEY",
+        has_api_key: true,
+        model: "gemini-2.5-flash",
+        verify_ambiguous_alerts: true,
+        ambiguous_score_min: 0.45,
+        ambiguous_score_max: 0.72,
+        auto_suppress_false_positives: true,
+      },
+      go2rtc: {
+        streams: {
+          hash_pw_cam: ["rtsp://*:*@192.0.2.77:554/stream1_modified"],
+          query_pw_cam: [
+            "rtsp://192.0.2.88:554/cam/realmonitor?channel=1&subtype=1&user=admin&password=***",
+          ],
+        },
+      },
+      cameras: {
+        gate_4space: {
+          enabled: true,
+          onvif: {
+            host: "192.0.2.99",
+            port: Number.NaN,
+            user: "inf",
+            password: "***",
+            has_password: true,
+          },
+          detect: {
+            enabled: true,
+            width: Number.NaN,
+            height: Number.NaN,
+            fps: Number.NaN,
+          },
+          motion: {
+            enabled: true,
+            threshold: Number.NaN,
+            contour_area: Number.NaN,
+            mask: {},
+          },
+          zones: {},
+          record: { enabled: true },
+          snapshots: { enabled: true, quality: Number.NaN },
+        },
+      },
+    };
+
+    const yaml = buildCleanYamlFromDraft(draft, scrubbedRawYaml);
+    // Masked secrets ("***") must be preserved in YAML so POST /api/config/save restores them from memory
+    expect(yaml).toContain('password: "***"');
+    expect(yaml).toContain('api_key: "***"');
+    // RTSP URL with '#' and '?' in password and modified path is restored losslessly
+    expect(yaml).toContain(
+      '"rtsp://admin:my#pass?1@192.0.2.77:554/stream1_modified"'
+    );
+    // RTSP URL with query-param '?password=***' is restored losslessly
+    expect(yaml).toContain(
+      "rtsp://192.0.2.88:554/cam/realmonitor?channel=1&subtype=1&user=admin&password=q_secret_99"
+    );
+    // NaN integer fields fall back to safe defaults instead of serializing 0
+    expect(yaml).toContain("port: 1883");
+    expect(yaml).toContain("stats_interval: 60");
+    expect(yaml).toContain("session_length: 86400");
+    expect(yaml).toContain("width: 1280");
+    expect(yaml).toContain("height: 720");
+    expect(yaml).toContain("fps: 5");
+    expect(yaml).toContain("quality: 70");
+    // Leading-dot floats, underscored numbers, YAML 'nan'/'inf', and Unicode line-breaks are quoted/escaped
+    expect(yaml).toContain('topic_prefix: ".5"');
+    expect(yaml).toContain('client_id: "1_000"');
+    expect(yaml).toContain('user: "nan"');
+    expect(yaml).toContain('user: "inf"');
+    expect(yaml).toContain('cookie_name: "n\\u2028injected: true"');
+    expect(yaml).not.toContain("\u2028");
+  });
+
+  test("[R2-P1-STORE-01] resolveValidCameraSelection and useNvrStore.setConfig reconcile selectedCamera when default 'escritorio' is absent from config.cameras", () => {
+    useNvrStore.setState({
+      selectedCamera: "escritorio",
+      simulatedFleetCount: 0,
+    });
+    const cfg: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      cameras: {
+        disabled_cam: {
+          enabled: false,
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {},
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+        front_door: {
+          enabled: true,
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {},
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+        back_patio: {
+          enabled: true,
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {},
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+      },
+    };
+
+    expect(resolveValidCameraSelection("escritorio", cfg.cameras, 0)).toBe(
+      "front_door"
+    );
+    expect(resolveValidCameraSelection("back_patio", cfg.cameras, 0)).toBe(
+      "back_patio"
+    );
+    expect(
+      resolveValidCameraSelection("front_door_sim_01", cfg.cameras, 12)
+    ).toBe("front_door_sim_01");
+
+    useNvrStore.getState().setConfig(cfg);
+    expect(useNvrStore.getState().selectedCamera).toBe("front_door");
+  });
+
+  test("[R2-P1-MSE-01] DualSlotMachine rejects late markSlotReady on idle/errored slots and createPushToTalkController closes native RTCPeerConnection on in-flight release", async () => {
+    const machine = new DualSlotMachine();
+    expect(machine.requestStream("   ").action).toBe("noop");
+
+    const s1 = machine.requestStream("cam1_sub");
+    machine.markSlotError(0, s1.sessionId);
+    // Late ready on an errored slot must be rejected and must not promote or mutate status to ready
+    const lateErrReady = machine.markSlotReady(0, s1.sessionId);
+    expect(lateErrReady.promoted).toBe(false);
+    expect(machine.getState().slots[0].status).toBe("error");
+
+    const s2 = machine.requestStream("cam1_sub");
+    machine.markSlotReady(0, s2.sessionId);
+    const s3 = machine.requestStream("cam1");
+    // Abort standby slot 1 by requesting already-active "cam1_sub"
+    const s4 = machine.requestStream("cam1_sub");
+    expect(s4.abortSlot).toBe(1);
+    expect(machine.getState().slots[1].status).toBe("idle");
+    // Late ready for aborted s3.sessionId must keep slot 1 status as "idle"
+    const lateIdleReady = machine.markSlotReady(1, s3.sessionId);
+    expect(lateIdleReady.promoted).toBe(false);
+    expect(machine.getState().slots[1].status).toBe("idle");
+
+    // Verify native RTCPeerConnection (when deps.createPeerConnection is omitted) is closed immediately on in-flight release
+    let nativePcClosed = 0;
+    let notifyFetchStarted!: () => void;
+    const fetchStarted = new Promise<void>((r) => {
+      notifyFetchStarted = r;
+    });
+    let resolveFetch!: (val: {
+      ok: boolean;
+      status: number;
+      text: () => Promise<string>;
+    }) => void;
+    const prevRtc = (globalThis as unknown as { RTCPeerConnection?: unknown })
+      .RTCPeerConnection;
+    (globalThis as unknown as { RTCPeerConnection: unknown }).RTCPeerConnection =
+      class MockNativePeerConnection {
+        localDescription = { type: "offer", sdp: "v=0\r\n" };
+        addTrack() {}
+        async createOffer() {
+          return { type: "offer", sdp: "v=0\r\n" };
+        }
+        async setLocalDescription() {}
+        async setRemoteDescription() {}
+        close() {
+          nativePcClosed += 1;
+        }
+      };
+    try {
+      const ctrl = createPushToTalkController("front_door", {
+        getUserMedia: async () => ({
+          getTracks: () => [{ stop() {} }],
+        }),
+        fetchImpl: () =>
+          new Promise((resolve) => {
+            resolveFetch = resolve;
+            notifyFetchStarted();
+          }),
+      });
+      const p = ctrl.press();
+      await fetchStarted;
+      ctrl.release();
+      expect(nativePcClosed).toBe(1);
+      resolveFetch({
+        ok: true,
+        status: 200,
+        text: async () => "v=0\r\ns=answer\r\n",
+      });
+      expect(await p).toBe(false);
+      expect(nativePcClosed).toBe(1);
+    } finally {
+      (
+        globalThis as unknown as { RTCPeerConnection?: unknown }
+      ).RTCPeerConnection = prevRtc;
+    }
+  });
+
+  test("[R2-P1-TIMELINE-01] sanitizeTimelineThumbUrl, formatReadableDate, parseLocalDayBounds, getCameraPickerStatus, and findMatchingExport guard malformed inputs", () => {
+    expect(
+      sanitizeTimelineThumbUrl(
+        "/media/node1/clips/front_door_1.webp",
+        "front_door"
+      )
+    ).toBe("/clips/front_door_1.webp");
+    expect(
+      sanitizeTimelineThumbUrl("https://evil.example/track.webp", "front_door")
+    ).toBe("/api/front_door/latest.webp");
+    expect(
+      sanitizeTimelineThumbUrl("//evil.example/track.webp", "front_door")
+    ).toBe("/api/front_door/latest.webp");
+    expect(
+      sanitizeTimelineThumbUrl("/clips/%2e%2e/secret.webp", "front_door")
+    ).toBe("/api/front_door/latest.webp");
+
+    // Empty-segment and overflow date strings are rejected
+    expect(formatReadableDate("2026--01")).toBe("2026--01");
+    expect(formatReadableDate("2026-00-15")).toBe("2026-00-15");
+    expect(formatReadableDate("2026-13-01")).toBe("2026-13-01");
+    expect(formatReadableDate("2026-02-31")).toBe("2026-02-31");
+
+    const nowSec = 1770000000;
+    const emptySegBounds = parseLocalDayBounds("2026--01", nowSec);
+    expect(emptySegBounds.isToday).toBe(true);
+
+    // TacticalCameraPicker NaN FPS and prototype key guards
+    expect(
+      getCameraPickerStatus("cam1", {
+        cam1: {
+          camera_fps: Number.NaN,
+          process_fps: 0,
+          skipped_fps: 0,
+          detection_fps: 0,
+          detection_enabled: true,
+          pid: 1,
+          capture_pid: 1,
+          ffmpeg_pid: 1,
+        },
+      })
+    ).toBe("offline");
+    expect(getCameraPickerStatus("toString", {}, {})).toBe("live");
+
+    // findMatchingExport rejects empty timestamp segments ("cam1__9999999999")
+    expect(
+      findMatchingExport(
+        [
+          {
+            id: "cam1__9999999999",
+            camera: "cam1",
+            name: "other",
+            date: 100,
+            video_path: "/exports/a.mp4",
+            thumb_path: "",
+            in_progress: false,
+          },
+        ],
+        "cam1",
+        1700000000,
+        1700000020
+      )
+    ).toBeNull();
   });
 });

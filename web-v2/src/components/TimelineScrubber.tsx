@@ -84,11 +84,72 @@ function formatFullDateTime(unixSec: number): string {
   });
 }
 
+function parseStrictYmd(dayStr: string): [number, number, number] | null {
+  const m = (dayStr || "").trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (
+    !Number.isFinite(year) ||
+    !Number.isFinite(month) ||
+    !Number.isFinite(day) ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return null;
+  }
+  const d = new Date(year, month - 1, day);
+  if (
+    Number.isNaN(d.getTime()) ||
+    d.getFullYear() !== year ||
+    d.getMonth() !== month - 1 ||
+    d.getDate() !== day
+  ) {
+    return null;
+  }
+  return [year, month, day];
+}
+
+export function sanitizeTimelineThumbUrl(
+  rawThumbPath: string | undefined | null,
+  fallbackCamera: string
+): string {
+  const safeCam = encodeURIComponent(
+    (fallbackCamera || "camera").trim() || "camera"
+  );
+  const fallbackUrl = `/api/${safeCam}/latest.webp`;
+  if (!rawThumbPath || typeof rawThumbPath !== "string") {
+    return fallbackUrl;
+  }
+  const stripped = rawThumbPath.trim().replace(/^\/media\/[^/]+/, "");
+  if (
+    !stripped ||
+    /[\u0000-\u0020\u007f\\]/.test(stripped) ||
+    stripped.startsWith("//") ||
+    stripped.includes("..") ||
+    /%2e/i.test(stripped) ||
+    /%5c/i.test(stripped)
+  ) {
+    return fallbackUrl;
+  }
+  if (
+    stripped.startsWith("/clips/") ||
+    stripped.startsWith("/api/") ||
+    stripped.startsWith("/thumbs/") ||
+    stripped.startsWith("/previews/")
+  ) {
+    return stripped;
+  }
+  return fallbackUrl;
+}
+
 function formatDayShort(dayStr: string): string {
-  const parts = (dayStr || "").split("-").map(Number);
-  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return dayStr;
-  const d = new Date(parts[0], parts[1] - 1, parts[2]);
-  if (Number.isNaN(d.getTime())) return dayStr;
+  const parsed = parseStrictYmd(dayStr);
+  if (!parsed) return dayStr;
+  const d = new Date(parsed[0], parsed[1] - 1, parsed[2]);
   return d.toLocaleDateString([], { weekday: "short", month: "short", day: "2-digit" });
 }
 
@@ -118,13 +179,13 @@ export function parseLocalDayBounds(
 ): { dayStart: number; dayEnd: number; isToday: boolean } {
   const safeNow = Number.isFinite(nowSec) ? Math.floor(nowSec) : Math.floor(Date.now() / 1000);
   const todayStr = toLocalDateInputValue(safeNow);
-  const parts = (selectedDay || "").split("-").map(Number);
-  if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
-    const startMs = new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime();
+  const parsed = parseStrictYmd(selectedDay);
+  if (parsed) {
+    const startMs = new Date(parsed[0], parsed[1] - 1, parsed[2], 0, 0, 0).getTime();
     if (Number.isFinite(startMs)) {
       const start = Math.floor(startMs / 1000);
       const fullEnd = start + 86399;
-      const isToday = selectedDay === todayStr;
+      const isToday = selectedDay.trim() === todayStr;
       const end = isToday ? Math.max(start + 300, Math.min(safeNow, fullEnd)) : fullEnd;
       return {
         dayStart: start,
@@ -357,7 +418,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
   // Re-center timeline window when parent seeks to a timestamp outside the current window
   useEffect(() => {
-    if (currentTs === null) return;
+    if (currentTs === null || !Number.isFinite(currentTs)) return;
     const targetDay = toLocalDateInputValue(currentTs);
     if (targetDay !== selectedDay) {
       setSelectedDay(targetDay);
@@ -370,16 +431,20 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   // Fetch 30-day recording summary for the active camera
   useEffect(() => {
     if (!camera) return;
+    let cancelled = false;
     fetch(`/api/${encodeURIComponent(camera)}/recordings/summary`, {
       credentials: "include",
     })
       .then((r) => (r.ok ? r.json() : []))
       .then((arr: RecordingDaySummary[]) => {
-        if (Array.isArray(arr) && arr.length > 0) {
+        if (!cancelled && Array.isArray(arr)) {
           setDaysSummary(arr);
         }
       })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [camera]);
 
   // Fetch exact recording segments and review items covering `[fetchBucketStart, fetchBucketEnd]`
@@ -853,8 +918,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
   // Compute unrecorded offline gaps (> 25s) between consecutive recording segments
   const offlineGaps = useMemo(() => {
-    if (windowSegments.length < 2) return [];
-    const sorted = [...windowSegments].sort((a, b) => a.start_time - b.start_time);
+    const valid = windowSegments.filter(
+      (s) => Number.isFinite(s.start_time) && Number.isFinite(s.end_time)
+    );
+    if (valid.length < 2) return [];
+    const sorted = [...valid].sort((a, b) => a.start_time - b.start_time);
     const gaps: Array<{ start_time: number; end_time: number; duration: number }> = [];
     let prevEnd = sorted[0].end_time;
     for (let i = 1; i < sorted.length; i++) {
@@ -966,9 +1034,20 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
     // 2. Continuous recording base bar & motion/object activity bars
     for (const seg of windowSegments) {
-      if (seg.end_time < winStart || seg.start_time > winEnd) continue;
+      if (
+        !Number.isFinite(seg.start_time) ||
+        !Number.isFinite(seg.end_time) ||
+        seg.end_time < winStart ||
+        seg.start_time > winEnd
+      ) {
+        continue;
+      }
       const x0 = Math.max(0, Math.min(w, ((seg.start_time - winStart) / windowSpanSec) * w));
-      const segW = Math.max(1.5, (seg.duration / windowSpanSec) * w);
+      const safeDur =
+        typeof seg.duration === "number" && Number.isFinite(seg.duration) && seg.duration > 0
+          ? seg.duration
+          : Math.max(1, seg.end_time - seg.start_time);
+      const segW = Math.max(1.5, (safeDur / windowSpanSec) * w);
 
       // Continuous recording base lane (bottom 5px)
       ctx.fillStyle = palette.continuousBarFill;
@@ -1059,6 +1138,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           !/[\u0000-\u0020\u007f\\]/.test(candidate) &&
           !candidate.startsWith("//") &&
           !candidate.includes("..") &&
+          !/%2e/i.test(candidate) &&
+          !/%5c/i.test(candidate) &&
           (candidate.startsWith("/exports/") ||
             candidate.startsWith("/api/") ||
             candidate.startsWith("/vod/") ||
@@ -1320,9 +1401,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 [...windowReviews]
                   .sort((a, b) => a.start_time - b.start_time)
                   .map((rev) => {
-                    const thumbSrc = rev.thumb_path
-                      ? rev.thumb_path.replace(/^\/media\/[^/]+/, "")
-                      : `/api/${encodeURIComponent(rev.camera)}/latest.webp`;
+                    const thumbSrc = sanitizeTimelineThumbUrl(
+                      rev.thumb_path,
+                      rev.camera
+                    );
                     const isHov = hoveredStoryboardId === rev.id;
                     return (
                       <div
@@ -1378,6 +1460,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                               muted
                               loop
                               playsInline
+                              onError={() =>
+                                setHoveredStoryboardId((c) => (c === rev.id ? null : c))
+                              }
                               style={{ width: "100%", height: "100%", objectFit: "contain" }}
                             />
                           ) : (
@@ -2164,11 +2249,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               >
                 {hoveredReviewOnTrack && (
                   <img
-                    src={
-                      hoveredReviewOnTrack.thumb_path
-                        ? hoveredReviewOnTrack.thumb_path.replace(/^\/media\/[^/]+/, "")
-                        : `/api/${encodeURIComponent(hoveredReviewOnTrack.camera)}/latest.webp`
-                    }
+                    src={sanitizeTimelineThumbUrl(
+                      hoveredReviewOnTrack.thumb_path,
+                      hoveredReviewOnTrack.camera
+                    )}
                     alt="preview"
                     width={128}
                     height={72}

@@ -19,12 +19,40 @@ interface RecordingCalendarPopoverProps {
 const WEEKDAYS_SUN = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
 const WEEKDAYS_MON = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 
+function parseValidCalendarDate(dateStr: string): [number, number, number] | null {
+  const m = (dateStr || "").trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (
+    !Number.isFinite(year) ||
+    !Number.isFinite(month) ||
+    !Number.isFinite(day) ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return null;
+  }
+  const d = new Date(year, month - 1, day);
+  if (
+    Number.isNaN(d.getTime()) ||
+    d.getFullYear() !== year ||
+    d.getMonth() !== month - 1 ||
+    d.getDate() !== day
+  ) {
+    return null;
+  }
+  return [year, month, day];
+}
+
 export function formatReadableDate(dateStr: string): string {
   if (!dateStr) return "All Dates";
-  const parts = dateStr.split("-").map(Number);
-  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return dateStr;
-  const d = new Date(parts[0], parts[1] - 1, parts[2]);
-  if (Number.isNaN(d.getTime())) return dateStr;
+  const parsed = parseValidCalendarDate(dateStr);
+  if (!parsed) return dateStr;
+  const d = new Date(parsed[0], parsed[1] - 1, parsed[2]);
   return d.toLocaleDateString([], {
     month: "short",
     day: "2-digit",
@@ -52,17 +80,15 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
   // Month being viewed in the calendar grid
   const initialDate = useMemo(() => {
     if (selectedDate) {
-      const p = selectedDate.split("-").map(Number);
-      if (p.length === 3 && p.every((n) => Number.isFinite(n))) {
-        const d = new Date(p[0], p[1] - 1, 1);
-        if (!Number.isNaN(d.getTime())) return d;
+      const p = parseValidCalendarDate(selectedDate);
+      if (p) {
+        return new Date(p[0], p[1] - 1, 1);
       }
     }
     if (daysSummary.length > 0 && daysSummary[0]?.day) {
-      const p = daysSummary[0].day.split("-").map(Number);
-      if (p.length === 3 && p.every((n) => Number.isFinite(n))) {
-        const d = new Date(p[0], p[1] - 1, 1);
-        if (!Number.isNaN(d.getTime())) return d;
+      const p = parseValidCalendarDate(daysSummary[0].day);
+      if (p) {
+        return new Date(p[0], p[1] - 1, 1);
       }
     }
     const now = new Date();
@@ -80,8 +106,8 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
   // Sync month view when selectedDate changes externally
   useEffect(() => {
     if (!selectedDate) return;
-    const p = selectedDate.split("-").map(Number);
-    if (p.length === 3 && p.every((n) => Number.isFinite(n))) {
+    const p = parseValidCalendarDate(selectedDate);
+    if (p) {
       setViewYear(p[0]);
       setViewMonth(p[1] - 1);
     }

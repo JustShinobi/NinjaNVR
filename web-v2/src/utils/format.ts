@@ -334,14 +334,17 @@ export function findMatchingExport(
       : startTime + 15;
   const itemEnd = Math.ceil(safeEnd);
   for (const ex of exportsList) {
-    if (ex.camera !== camera) continue;
+    if (!ex || ex.camera !== camera || typeof ex.id !== "string") continue;
     const parts = ex.id.split("_");
     if (parts.length >= 3) {
-      const expStart = Number(parts[parts.length - 2]);
-      const expEnd = Number(parts[parts.length - 1]);
+      const rawStartStr = parts[parts.length - 2].trim();
+      const rawEndStr = parts[parts.length - 1].trim();
+      const expStart = rawStartStr ? Number(rawStartStr) : Number.NaN;
+      const expEnd = rawEndStr ? Number(rawEndStr) : Number.NaN;
       if (
         Number.isFinite(expStart) &&
         Number.isFinite(expEnd) &&
+        expStart > 0 &&
         expEnd > 0 &&
         expStart <= itemEnd &&
         expEnd >= itemStart

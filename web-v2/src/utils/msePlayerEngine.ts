@@ -53,6 +53,14 @@ export class DualSlotMachine {
   public requestStream(streamSrc: string): SlotRequestTransition {
     const trimmed = streamSrc.trim();
     const activeState = this.slots[this.activeSlot];
+    if (!trimmed) {
+      return {
+        action: "noop",
+        targetSlot: this.activeSlot,
+        abortSlot: null,
+        sessionId: activeState.sessionId,
+      };
+    }
 
     // If the active slot already has this stream ready
     if (activeState.status === "ready" && activeState.streamSrc === trimmed) {
@@ -61,7 +69,7 @@ export class DualSlotMachine {
         this.slots[aborted] = {
           streamSrc: null,
           status: "idle",
-          sessionId: this.slots[aborted].sessionId,
+          sessionId: 0,
         };
         this.standbySlot = null;
         return {
@@ -103,7 +111,7 @@ export class DualSlotMachine {
         this.slots[sbSlot] = {
           streamSrc: null,
           status: "idle",
-          sessionId: sbState.sessionId,
+          sessionId: 0,
         };
         this.standbySlot = null;
         const sessionId = this.nextSessionId++;
@@ -170,7 +178,10 @@ export class DualSlotMachine {
 
   public markSlotReady(slot: VideoSlotIndex, sessionId?: number): SlotReadyTransition {
     const slotState = this.slots[slot];
-    if (sessionId !== undefined && slotState.sessionId !== sessionId) {
+    if (
+      (sessionId !== undefined && slotState.sessionId !== sessionId) ||
+      (slotState.status !== "connecting" && slotState.status !== "ready")
+    ) {
       return {
         promoted: false,
         activeSlot: this.activeSlot,
@@ -190,7 +201,7 @@ export class DualSlotMachine {
       this.slots[prevActive] = {
         streamSrc: null,
         status: "idle",
-        sessionId: this.slots[prevActive].sessionId,
+        sessionId: 0,
       };
       return {
         promoted: true,

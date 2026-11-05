@@ -37,8 +37,14 @@ export function getCameraPickerStatus(
   cameraStats?: Record<string, CameraStats>,
   cameraActivity?: Record<string, CameraLiveActivity>
 ): "alert" | "offline" | "live" {
-  const act = cameraActivity?.[cam];
-  const stat = cameraStats?.[cam];
+  const act =
+    cameraActivity && Object.prototype.hasOwnProperty.call(cameraActivity, cam)
+      ? cameraActivity[cam]
+      : undefined;
+  const stat =
+    cameraStats && Object.prototype.hasOwnProperty.call(cameraStats, cam)
+      ? cameraStats[cam]
+      : undefined;
   if (
     Boolean(act?.tamper) ||
     (act?.objects && act.objects.length > 0) ||
@@ -46,10 +52,10 @@ export function getCameraPickerStatus(
   ) {
     return "alert";
   }
-  if (stat && stat.camera_fps <= 0) {
+  if (stat && (!Number.isFinite(stat.camera_fps) || stat.camera_fps <= 0)) {
     return "offline";
   }
-  if (stat && stat.detection_fps > 0 && !cameraActivity) {
+  if (stat && Number.isFinite(stat.detection_fps) && stat.detection_fps > 0 && !cameraActivity) {
     return "alert";
   }
   return "live";
@@ -153,16 +159,22 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
   );
 
   useEffect(() => {
-    if (!open) return;
+    if (mode !== "combobox" && open) {
+      setOpen(false);
+    }
+  }, [mode, open]);
+
+  useEffect(() => {
+    if (!open || mode !== "combobox") return;
     setHighlightedIdx(0);
     const tmr = window.setTimeout(() => {
       searchInputRef.current?.focus();
     }, 10);
     return () => window.clearTimeout(tmr);
-  }, [open, query, statusFilter, groupFilter]);
+  }, [open, mode, query, statusFilter, groupFilter]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || mode !== "combobox") return;
     const handlePointerDown = (e: PointerEvent) => {
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
         setOpen(false);
@@ -170,7 +182,7 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
     };
     window.addEventListener("pointerdown", handlePointerDown);
     return () => window.removeEventListener("pointerdown", handlePointerDown);
-  }, [open]);
+  }, [open, mode]);
 
   if (mode === "inline") {
     return (

@@ -54,10 +54,25 @@ export function parseYamlScalarValue(rawField: string): string {
  * from an existing raw YAML string so scrubbed `*:*@` URLs in `draftConfig` can be restored losslessly.
  */
 function extractOriginalUrls(rawYaml: string): string[] {
-  const matches = rawYaml.match(/(?:rtsps?|https?|rtmps?):\/\/[^\s"'#]+[^\s"']*/gi);
+  const matches = rawYaml.match(/(?:rtsps?|https?|rtmps?):\/\/[^\s"']+/gi);
   if (!matches) return [];
-  const cleaned = matches.map((u) => u.replace(/\\"/g, '"').replace(/\\\\/g, "\\"));
+  const cleaned = matches.map((u) =>
+    u
+      .replace(/[,\]}]+$/, "")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\")
+      .replace(/''/g, "'")
+  );
   return Array.from(new Set(cleaned));
+}
+
+function parseYamlMapKey(rawKeySegment: string): string {
+  const trimmed = rawKeySegment.trim();
+  if (!trimmed) return "";
+  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+    return parseYamlScalarValue(trimmed);
+  }
+  return trimmed;
 }
 
 /**
@@ -68,8 +83,10 @@ function extractOriginalOnvifPasswords(rawYaml: string): Record<string, string> 
   const result: Record<string, string> = {};
   const lines = rawYaml.split(/\r?\n/);
   let inCameras = false;
+  let camIndent: number | null = null;
   let currentCam = "";
   let inOnvif = false;
+  let onvifIndent: number | null = null;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -77,21 +94,38 @@ function extractOriginalOnvifPasswords(rawYaml: string): Record<string, string> 
     const indent = line.search(/\S/);
     if (indent === 0) {
       inCameras = /^cameras\s*:/.test(trimmed);
+      camIndent = null;
       currentCam = "";
       inOnvif = false;
+      onvifIndent = null;
       continue;
     }
-    if (inCameras && indent === 2) {
-      const m = trimmed.match(/^(?:"([^"]+)"|'([^']+)'|([a-zA-Z0-9_.-]+))\s*:/);
-      currentCam = m ? m[1] || m[2] || m[3] || "" : "";
-      inOnvif = false;
+    if (!inCameras) continue;
+
+    if (camIndent === null || indent <= camIndent) {
+      const m = trimmed.match(/^((?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[a-zA-Z0-9_.-]+))\s*:/);
+      if (m) {
+        camIndent = indent;
+        currentCam = parseYamlMapKey(m[1]);
+        inOnvif = false;
+        onvifIndent = null;
+      }
       continue;
     }
-    if (inCameras && currentCam && indent === 4) {
-      inOnvif = /^onvif\s*:/.test(trimmed);
-      continue;
+
+    if (currentCam && (onvifIndent === null || indent <= onvifIndent)) {
+      if (/^onvif\s*:/.test(trimmed)) {
+        inOnvif = true;
+        onvifIndent = indent;
+        continue;
+      }
+      if (onvifIndent !== null && indent <= onvifIndent) {
+        inOnvif = false;
+        onvifIndent = null;
+      }
     }
-    if (inCameras && currentCam && inOnvif && indent >= 6) {
+
+    if (currentCam && inOnvif && onvifIndent !== null && indent > onvifIndent) {
       const pwMatch = trimmed.match(/^password\s*:\s*(.+)$/);
       if (pwMatch) {
         const unquoted = parseYamlScalarValue(pwMatch[1]);
@@ -248,22 +282,155 @@ export function normalizeDiscoveredGenAiModels(
   return out;
 }
 
+const SENSITIVE_QUERY_PARAM_KEYS = new Set([
+  "password",
+  "pass",
+  "passwd",
+  "pwd",
+  "token",
+  "access_token",
+  "auth_token",
+  "id_token",
+  "refresh_token",
+  "session_token",
+  "api_key",
+  "apikey",
+  "api-key",
+  "x-api-key",
+  "secret",
+  "client_secret",
+  "webhook_secret",
+  "jwt_secret",
+  "auth",
+  "key",
+  "sig",
+  "signature",
+]);
+
+function findUserinfoAtIndex(afterScheme: string): number {
+  const slashIdx = afterScheme.search(/[/\\]/);
+  const preSlash = slashIdx === -1 ? afterScheme : afterScheme.slice(0, slashIdx);
+  const qOrH = preSlash.search(/[?#]/);
+  if (qOrH !== -1) {
+    const beforeQh = preSlash.slice(0, qOrH);
+    const atInAuth = beforeQh.lastIndexOf("@");
+    if (atInAuth !== -1) {
+      const afterAt = beforeQh.slice(atInAuth + 1);
+      if (afterAt && !afterAt.includes("=") && !afterAt.includes(" ")) {
+        return atInAuth;
+      }
+    }
+    const colonIdx = beforeQh.indexOf(":");
+    if (colonIdx === -1) return -1;
+    const afterColon = beforeQh.slice(colonIdx + 1);
+    if (afterColon.length > 0 && /^\d+$/.test(afterColon)) {
+      return -1;
+    }
+  }
+  const atIdx = preSlash.lastIndexOf("@");
+  if (atIdx === -1) return -1;
+  const afterAt = preSlash.slice(atIdx + 1);
+  const hostEnd = afterAt.search(/[?# \t)\],"']/);
+  const hostPortCandidate = hostEnd === -1 ? afterAt : afterAt.slice(0, hostEnd);
+  if (!hostPortCandidate || hostPortCandidate.includes("=")) {
+    return -1;
+  }
+  return atIdx;
+}
+
+function scrubUrlQueryParams(urlAfterAuthority: string): string {
+  const qIdx = urlAfterAuthority.indexOf("?");
+  if (qIdx === -1) return urlAfterAuthority;
+  const prefix = urlAfterAuthority.slice(0, qIdx + 1);
+  const afterQ = urlAfterAuthority.slice(qIdx + 1);
+  const hIdx = afterQ.indexOf("#");
+  const queryPart = hIdx === -1 ? afterQ : afterQ.slice(0, hIdx);
+  const fragPart = hIdx === -1 ? "" : afterQ.slice(hIdx);
+  const scrubbedPairs = queryPart.split("&").map((pair) => {
+    const eqIdx = pair.indexOf("=");
+    if (eqIdx === -1) return pair;
+    const k = pair.slice(0, eqIdx);
+    const v = pair.slice(eqIdx + 1);
+    if (
+      SENSITIVE_QUERY_PARAM_KEYS.has(k.trim().toLowerCase()) &&
+      v.length > 0 &&
+      v !== "***" &&
+      v !== "*"
+    ) {
+      return `${k}=***`;
+    }
+    if (v.includes("://")) {
+      return `${k}=${scrubUrl(v)}`;
+    }
+    return pair;
+  });
+  return `${prefix}${scrubbedPairs.join("&")}${fragPart}`;
+}
+
+function restoreUrlQueryParams(
+  scrubbedRest: string,
+  origAfterScheme: string
+): string {
+  if (!scrubbedRest.includes("=***")) return scrubbedRest;
+  const qIdx = scrubbedRest.indexOf("?");
+  const origQIdx = origAfterScheme.indexOf("?");
+  if (qIdx === -1 || origQIdx === -1) return scrubbedRest;
+
+  const origAfterQ = origAfterScheme.slice(origQIdx + 1);
+  const origQuery = origAfterQ.split("#")[0];
+  const origParams = new Map<string, string>();
+  for (const pair of origQuery.split("&")) {
+    const eqIdx = pair.indexOf("=");
+    if (eqIdx !== -1) {
+      origParams.set(
+        pair.slice(0, eqIdx).trim().toLowerCase(),
+        pair.slice(eqIdx + 1)
+      );
+    }
+  }
+
+  const prefix = scrubbedRest.slice(0, qIdx + 1);
+  const afterQ = scrubbedRest.slice(qIdx + 1);
+  const hIdx = afterQ.indexOf("#");
+  const queryPart = hIdx === -1 ? afterQ : afterQ.slice(0, hIdx);
+  const fragPart = hIdx === -1 ? "" : afterQ.slice(hIdx);
+  const restoredPairs = queryPart.split("&").map((pair) => {
+    const eqIdx = pair.indexOf("=");
+    if (eqIdx === -1) return pair;
+    const k = pair.slice(0, eqIdx);
+    const v = pair.slice(eqIdx + 1);
+    if (v === "***") {
+      const origV = origParams.get(k.trim().toLowerCase());
+      if (origV !== undefined) {
+        return `${k}=${origV}`;
+      }
+    }
+    return pair;
+  });
+  return `${prefix}${restoredPairs.join("&")}${fragPart}`;
+}
+
 function scrubUrl(input: string): string {
   const schemeIdx = input.indexOf("://");
   if (schemeIdx === -1) return input;
   const afterScheme = input.slice(schemeIdx + 3);
-  const slashIdx = afterScheme.search(/[/?#]/);
-  const authority = slashIdx === -1 ? afterScheme : afterScheme.slice(0, slashIdx);
-  const atIdx = authority.lastIndexOf("@");
-  if (atIdx === -1) return input;
-  const userinfo = authority.slice(0, atIdx);
-  const mask = userinfo.includes(":") ? "*:*" : "*";
-  return `${input.slice(0, schemeIdx + 3)}${mask}@${afterScheme.slice(atIdx + 1)}`;
+  const atIdx = findUserinfoAtIndex(afterScheme);
+  if (atIdx !== -1) {
+    const userinfo = afterScheme.slice(0, atIdx);
+    const mask = userinfo.includes(":") ? "*:*" : "*";
+    const restScrubbed = scrubUrlQueryParams(afterScheme.slice(atIdx + 1));
+    return `${input.slice(0, schemeIdx + 3)}${mask}@${restScrubbed}`;
+  }
+  return `${input.slice(0, schemeIdx + 3)}${scrubUrlQueryParams(afterScheme)}`;
+}
+
+function extractHostPortFromAuthorityRest(rest: string): string {
+  const slashIdx = rest.search(/[/?#\\]/);
+  return slashIdx === -1 ? rest : rest.slice(0, slashIdx);
 }
 
 function extractHostFromAuthorityRest(rest: string): string {
-  const slashIdx = rest.search(/[/?#]/);
-  const hostPort = slashIdx === -1 ? rest : rest.slice(0, slashIdx);
+  const hostPort = extractHostPortFromAuthorityRest(rest);
   if (hostPort.startsWith("[")) {
     const closeIdx = hostPort.indexOf("]");
     if (closeIdx !== -1) {
@@ -273,8 +440,16 @@ function extractHostFromAuthorityRest(rest: string): string {
   return hostPort.split(":")[0];
 }
 
+function isUrlScrubbed(candidate: string): boolean {
+  return (
+    candidate.includes("://*:*@") ||
+    candidate.includes("://*@") ||
+    candidate.includes("=***")
+  );
+}
+
 function restoreUrl(candidate: string, originals: string[]): string {
-  if (!candidate.includes("://*:*@") && !candidate.includes("://*@")) {
+  if (!isUrlScrubbed(candidate)) {
     return candidate;
   }
   for (const orig of originals) {
@@ -282,28 +457,79 @@ function restoreUrl(candidate: string, originals: string[]): string {
       return orig;
     }
   }
-  // Host-based match if path was modified
+
   const schemeIdx = candidate.indexOf("://");
-  if (schemeIdx !== -1) {
-    const afterScheme = candidate.slice(schemeIdx + 3);
-    const atIdx = afterScheme.indexOf("@");
-    if (atIdx !== -1) {
-      const rest = afterScheme.slice(atIdx + 1);
-      const targetHost = extractHostFromAuthorityRest(rest);
+  if (schemeIdx === -1) return candidate;
+
+  const rawSchemePrefix = candidate.slice(0, schemeIdx);
+  const inputScheme = rawSchemePrefix.split(":").pop() || rawSchemePrefix;
+  const afterScheme = candidate.slice(schemeIdx + 3);
+  const atIdx = findUserinfoAtIndex(afterScheme);
+
+  if (atIdx !== -1) {
+    const inputUserinfo = afterScheme.slice(0, atIdx);
+    const userinfoIsMasked = inputUserinfo === "*:*" || inputUserinfo === "*";
+    const rest = afterScheme.slice(atIdx + 1);
+    const targetHostPort = extractHostPortFromAuthorityRest(rest);
+    const targetHost = extractHostFromAuthorityRest(rest);
+
+    for (let tier = 0; tier < 4; tier++) {
       for (const orig of originals) {
-        const oScheme = orig.indexOf("://");
-        if (oScheme !== -1) {
-          const oAfter = orig.slice(oScheme + 3);
-          const oSlash = oAfter.search(/[/?#]/);
-          const oAuth = oSlash === -1 ? oAfter : oAfter.slice(0, oSlash);
-          const oAt = oAuth.lastIndexOf("@");
-          if (oAt !== -1) {
-            const creds = oAuth.slice(0, oAt);
-            const oHost = extractHostFromAuthorityRest(oAuth.slice(oAt + 1));
-            if (oHost === targetHost) {
-              return `${candidate.slice(0, schemeIdx + 3)}${creds}@${rest}`;
-            }
-          }
+        const oSchemeIdx = orig.indexOf("://");
+        if (oSchemeIdx === -1) continue;
+        const oRawScheme = orig.slice(0, oSchemeIdx);
+        const oScheme = oRawScheme.split(":").pop() || oRawScheme;
+        const oAfter = orig.slice(oSchemeIdx + 3);
+        const oAt = findUserinfoAtIndex(oAfter);
+        if (oAt === -1) continue;
+        const creds = oAfter.slice(0, oAt);
+        const oHostPart = oAfter.slice(oAt + 1);
+        const oHostPort = extractHostPortFromAuthorityRest(oHostPart);
+        const oHost = extractHostFromAuthorityRest(oHostPart);
+        const schemeMatches =
+          inputScheme.toLowerCase() === oScheme.toLowerCase();
+        const matched =
+          tier === 0
+            ? schemeMatches && oHostPort === targetHostPort
+            : tier === 1
+            ? oHostPort === targetHostPort
+            : tier === 2
+            ? schemeMatches && oHost === targetHost
+            : oHost === targetHost;
+        if (matched) {
+          const effectiveCreds = userinfoIsMasked ? creds : inputUserinfo;
+          const restoredRest = restoreUrlQueryParams(rest, oAfter);
+          return `${candidate.slice(0, schemeIdx + 3)}${effectiveCreds}@${restoredRest}`;
+        }
+      }
+    }
+  } else if (candidate.includes("=***")) {
+    const targetHostPort = extractHostPortFromAuthorityRest(afterScheme);
+    const targetHost = extractHostFromAuthorityRest(afterScheme);
+    for (let tier = 0; tier < 4; tier++) {
+      for (const orig of originals) {
+        const oSchemeIdx = orig.indexOf("://");
+        if (oSchemeIdx === -1) continue;
+        const oRawScheme = orig.slice(0, oSchemeIdx);
+        const oScheme = oRawScheme.split(":").pop() || oRawScheme;
+        const oAfter = orig.slice(oSchemeIdx + 3);
+        const oAt = findUserinfoAtIndex(oAfter);
+        const oHostPart = oAt !== -1 ? oAfter.slice(oAt + 1) : oAfter;
+        const oHostPort = extractHostPortFromAuthorityRest(oHostPart);
+        const oHost = extractHostFromAuthorityRest(oHostPart);
+        const schemeMatches =
+          inputScheme.toLowerCase() === oScheme.toLowerCase();
+        const matched =
+          tier === 0
+            ? schemeMatches && oHostPort === targetHostPort
+            : tier === 1
+            ? oHostPort === targetHostPort
+            : tier === 2
+            ? schemeMatches && oHost === targetHost
+            : oHost === targetHost;
+        if (matched) {
+          const restoredAfter = restoreUrlQueryParams(afterScheme, oAfter);
+          return `${candidate.slice(0, schemeIdx + 3)}${restoredAfter}`;
         }
       }
     }
@@ -312,9 +538,17 @@ function restoreUrl(candidate: string, originals: string[]): string {
 }
 
 const YAML_RESERVED_SCALAR_RE =
-  /^(true|false|null|yes|no|on|off|~|\.nan|\.inf|-\.inf|\+\.inf)$/i;
+  /^(true|false|null|yes|no|on|off|~|\.nan|nan|\.inf|-\.inf|\+\.inf|inf|-inf|\+inf)$/i;
 const YAML_NUMERIC_STRING_RE =
-  /^(?:[+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|0[xXoObB][0-9a-fA-F_]+|0\d+)$/;
+  /^(?:[+-]?(?:(?:0|[1-9](?:_?\d)*)(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:[eE][+-]?\d+)?|[+-]?0[xXoObB][0-9a-fA-F_]+|[+-]?0\d+)$/;
+
+function escapeJsonQuotedForYaml(str: string): string {
+  return JSON.stringify(str)
+    .replace(/\u0085/g, "\\u0085")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029")
+    .replace(/\ufeff/g, "\\ufeff");
+}
 
 function yamlScalar(val: unknown): string {
   if (val === null || val === undefined) return "null";
@@ -325,13 +559,13 @@ function yamlScalar(val: unknown): string {
   const s = String(val);
   if (
     s === "" ||
-    /[\r\n\t\u0000-\u001f\u007f:#[\]{}&*!|>'"%@`,?]/.test(s) ||
+    /[\r\n\t\u0000-\u001f\u007f-\u009f\u2028\u2029\ufeff:#[\]{}&*!|>'"%@`,?]/.test(s) ||
     /^\s|\s$/.test(s) ||
-    /^[-?]/.test(s) ||
+    /^[-?.]/.test(s) ||
     YAML_RESERVED_SCALAR_RE.test(s) ||
     YAML_NUMERIC_STRING_RE.test(s)
   ) {
-    return JSON.stringify(s);
+    return escapeJsonQuotedForYaml(s);
   }
   return s;
 }
@@ -344,7 +578,7 @@ function yamlKey(key: string): string {
     YAML_RESERVED_SCALAR_RE.test(key) ||
     YAML_NUMERIC_STRING_RE.test(key)
   ) {
-    return JSON.stringify(key);
+    return escapeJsonQuotedForYaml(key);
   }
   return key;
 }
@@ -361,7 +595,9 @@ function toYamlLines(val: unknown, indent = 0): string[] {
     if (val.length === 0) return [`${pad}[]`];
     const lines: string[] = [];
     for (const item of val) {
-      if (item !== null && typeof item === "object" && !Array.isArray(item)) {
+      if (Array.isArray(item)) {
+        lines.push(`${pad}- [${item.map((x) => yamlScalar(x)).join(", ")}]`);
+      } else if (item !== null && typeof item === "object") {
         const entries = Object.entries(item as Record<string, unknown>).filter(
           ([, v]) => v !== undefined && v !== null
         );
@@ -438,6 +674,12 @@ function finiteRound(
   return Number(safe.toFixed(decimals));
 }
 
+function finiteInt(val: number | undefined | null, fallback: number): number {
+  return typeof val === "number" && Number.isFinite(val)
+    ? Math.round(val)
+    : fallback;
+}
+
 /**
  * Builds a clean, NinjaNVR-compatible `config.yml` string from `draftConfig`,
  * preserving any unscrubbed RTSP URLs from `originalRawYaml`.
@@ -488,28 +730,28 @@ export function buildCleanYamlFromDraft(
       },
       detect: {
         enabled: cam.detect?.enabled ?? true,
-        width: cam.detect?.width ?? 1280,
-        height: cam.detect?.height ?? 720,
-        fps: cam.detect?.fps ?? 5,
-        min_initialized: cam.detect?.min_initialized ?? 2,
-        max_disappeared: cam.detect?.max_disappeared ?? 25,
+        width: finiteInt(cam.detect?.width, 1280),
+        height: finiteInt(cam.detect?.height, 720),
+        fps: finiteInt(cam.detect?.fps, 5),
+        min_initialized: finiteInt(cam.detect?.min_initialized, 2),
+        max_disappeared: finiteInt(cam.detect?.max_disappeared, 25),
         stationary: {
-          interval: cam.detect?.stationary?.interval ?? 50,
-          threshold: cam.detect?.stationary?.threshold ?? 50,
+          interval: finiteInt(cam.detect?.stationary?.interval, 50),
+          threshold: finiteInt(cam.detect?.stationary?.threshold, 50),
           classifier: cam.detect?.stationary?.classifier ?? true,
         },
       },
       motion: {
         enabled: cam.motion?.enabled ?? true,
-        threshold: cam.motion?.threshold ?? 30,
+        threshold: finiteInt(cam.motion?.threshold, 30),
         lightning_threshold: finiteRound(
           cam.motion?.lightning_threshold,
           0.8,
           2
         ),
         improve_contrast: cam.motion?.improve_contrast ?? true,
-        contour_area: cam.motion?.contour_area ?? 10,
-        frame_height: cam.motion?.frame_height ?? 100,
+        contour_area: finiteInt(cam.motion?.contour_area, 10),
+        frame_height: finiteInt(cam.motion?.frame_height, 100),
         mask: cam.motion?.mask || {},
       },
       objects: {
@@ -524,8 +766,8 @@ export function buildCleanYamlFromDraft(
       },
       record: {
         enabled: cam.record?.enabled ?? true,
-        continuous: { days: cam.record?.continuous?.days ?? 14 },
-        motion: { days: cam.record?.motion?.days ?? 0 },
+        continuous: { days: finiteInt(cam.record?.continuous?.days, 14) },
+        motion: { days: finiteInt(cam.record?.motion?.days, 0) },
         alerts: cam.record?.alerts || {
           pre_capture: 5,
           post_capture: 5,
@@ -546,7 +788,7 @@ export function buildCleanYamlFromDraft(
         timestamp: cam.snapshots?.timestamp ?? false,
         bounding_box: cam.snapshots?.bounding_box ?? true,
         crop: cam.snapshots?.crop ?? false,
-        quality: cam.snapshots?.quality ?? 70,
+        quality: finiteInt(cam.snapshots?.quality, 70),
         selection:
           cam.snapshots?.selection ||
           draft.snapshots?.selection ||
@@ -607,12 +849,12 @@ export function buildCleanYamlFromDraft(
                     roiCfg.classes && roiCfg.classes.length > 0
                       ? roiCfg.classes
                       : ["closed", "open"],
-                  interval_sec: roiCfg.interval_sec ?? 5,
-                  hysteresis: roiCfg.hysteresis ?? 3,
+                  interval_sec: finiteInt(roiCfg.interval_sec, 5),
+                  hysteresis: finiteInt(roiCfg.hysteresis, 3),
                   ...(roiCfg.anomaly_state
                     ? { anomaly_state: roiCfg.anomaly_state }
                     : {}),
-                  anomaly_timeout_sec: roiCfg.anomaly_timeout_sec ?? 300,
+                  anomaly_timeout_sec: finiteInt(roiCfg.anomaly_timeout_sec, 300),
                 },
               ])
             ),
@@ -622,6 +864,8 @@ export function buildCleanYamlFromDraft(
       ...(cam.onvif &&
       ((cam.onvif.host && cam.onvif.host.trim().length > 0) ||
         (cam.onvif.user && cam.onvif.user.trim().length > 0) ||
+        Boolean(cam.onvif.has_password) ||
+        Boolean(cam.onvif.password && cam.onvif.password.trim().length > 0) ||
         Boolean(cam.onvif.autotracking) ||
         (cam.onvif.return_preset && cam.onvif.return_preset.trim().length > 0))
         ? (() => {
@@ -631,13 +875,18 @@ export function buildCleanYamlFromDraft(
                 cam.onvif.password !== "***" &&
                 cam.onvif.password !== "*"
               ? cam.onvif.password
-              : originalOnvifPasswords[camName];
+              : originalOnvifPasswords[camName] ||
+                (cam.onvif.has_password ||
+                cam.onvif.password === "***" ||
+                cam.onvif.password === "*"
+                  ? "***"
+                  : undefined);
             return {
               onvif: {
                 ...(cam.onvif.host && cam.onvif.host.trim()
                   ? { host: restoreUrl(cam.onvif.host.trim(), originals) }
                   : {}),
-                port: cam.onvif.port ?? 80,
+                port: finiteInt(cam.onvif.port, 80),
                 ...(cam.onvif.user && cam.onvif.user.trim()
                   ? { user: cam.onvif.user.trim() }
                   : {}),
@@ -646,7 +895,7 @@ export function buildCleanYamlFromDraft(
                 ...(cam.onvif.return_preset && cam.onvif.return_preset.trim()
                   ? { return_preset: cam.onvif.return_preset.trim() }
                   : {}),
-                timeout_sec: cam.onvif.timeout_sec ?? 5,
+                timeout_sec: finiteInt(cam.onvif.timeout_sec, 5),
               },
             };
           })()
@@ -655,7 +904,7 @@ export function buildCleanYamlFromDraft(
       (cam.ui.order !== undefined || cam.ui.dashboard !== undefined)
         ? {
             ui: {
-              order: cam.ui.order ?? 0,
+              order: finiteInt(cam.ui.order, 0),
               dashboard: cam.ui.dashboard ?? true,
             },
           }
@@ -691,16 +940,21 @@ export function buildCleanYamlFromDraft(
       draft.mqtt.password !== "***" &&
       draft.mqtt.password !== "*"
     ? draft.mqtt.password
-    : originalMqttPassword;
+    : originalMqttPassword ||
+      (draft.mqtt?.has_password ||
+      draft.mqtt?.password === "***" ||
+      draft.mqtt?.password === "*"
+        ? "***"
+        : undefined);
 
   const rootObj: Record<string, unknown> = {
     mqtt: {
       enabled: draft.mqtt?.enabled ?? true,
       host: draft.mqtt?.host || "127.0.0.1",
-      port: draft.mqtt?.port ?? 1883,
+      port: finiteInt(draft.mqtt?.port, 1883),
       topic_prefix: draft.mqtt?.topic_prefix || "ninjanvr",
       client_id: draft.mqtt?.client_id || "ninjanvr",
-      stats_interval: draft.mqtt?.stats_interval ?? 60,
+      stats_interval: finiteInt(draft.mqtt?.stats_interval, 60),
       ...(draft.mqtt?.user ? { user: draft.mqtt.user } : {}),
       ...(rawMqttPassword ? { password: rawMqttPassword } : {}),
     },
@@ -708,9 +962,9 @@ export function buildCleanYamlFromDraft(
       enabled: draft.auth?.enabled ?? true,
       cookie_name: draft.auth?.cookie_name || "ninjanvr_token",
       cookie_secure: draft.auth?.cookie_secure ?? false,
-      session_length: draft.auth?.session_length ?? 86400,
-      refresh_time: draft.auth?.refresh_time ?? 1800,
-      hash_iterations: draft.auth?.hash_iterations ?? 600000,
+      session_length: finiteInt(draft.auth?.session_length, 86400),
+      refresh_time: finiteInt(draft.auth?.refresh_time, 1800),
+      hash_iterations: finiteInt(draft.auth?.hash_iterations, 600000),
     },
     tls: {
       enabled: draft.tls?.enabled ?? true,
@@ -720,8 +974,8 @@ export function buildCleanYamlFromDraft(
     },
     detectors: detectorsOut,
     model: {
-      width: draft.model?.width ?? 300,
-      height: draft.model?.height ?? 300,
+      width: finiteInt(draft.model?.width, 300),
+      height: finiteInt(draft.model?.height, 300),
       input_tensor: draft.model?.input_tensor || "nhwc",
       input_pixel_format: draft.model?.input_pixel_format || "bgr",
       path: draft.model?.path || "/openvino-model/ssdlite_mobilenet_v2.xml",
@@ -738,7 +992,12 @@ export function buildCleanYamlFromDraft(
               draft.genai.api_key.trim() !== "***" &&
               draft.genai.api_key.trim() !== "*"
             ? draft.genai.api_key.trim()
-            : originalGenAiApiKey;
+            : originalGenAiApiKey ||
+              (draft.genai.has_api_key ||
+              draft.genai.api_key?.trim() === "***" ||
+              draft.genai.api_key?.trim() === "*"
+                ? "***"
+                : undefined);
           return {
             genai: {
               enabled: draft.genai.enabled ?? false,
@@ -763,8 +1022,8 @@ export function buildCleanYamlFromDraft(
               ),
               auto_suppress_false_positives:
                 draft.genai.auto_suppress_false_positives ?? true,
-              ...(draft.genai.timeout_ms
-                ? { timeout_ms: draft.genai.timeout_ms }
+              ...(draft.genai.timeout_ms && Number.isFinite(draft.genai.timeout_ms)
+                ? { timeout_ms: finiteInt(draft.genai.timeout_ms, 5000) }
                 : {}),
             },
           };
@@ -782,7 +1041,7 @@ export function buildCleanYamlFromDraft(
               0.68,
               2
             ),
-            min_face_area: draft.face_recognition.min_face_area ?? 750,
+            min_face_area: finiteInt(draft.face_recognition.min_face_area, 750),
             unknown_alert: draft.face_recognition.unknown_alert ?? false,
           },
         }
@@ -790,11 +1049,11 @@ export function buildCleanYamlFromDraft(
     ...(draft.review ? { review: draft.review } : {}),
     detect: {
       enabled: draft.detect?.enabled ?? true,
-      width: draft.detect?.width ?? 1280,
-      height: draft.detect?.height ?? 720,
-      fps: draft.detect?.fps ?? 5,
-      min_initialized: draft.detect?.min_initialized ?? 2,
-      max_disappeared: draft.detect?.max_disappeared ?? 25,
+      width: finiteInt(draft.detect?.width, 1280),
+      height: finiteInt(draft.detect?.height, 720),
+      fps: finiteInt(draft.detect?.fps, 5),
+      min_initialized: finiteInt(draft.detect?.min_initialized, 2),
+      max_disappeared: finiteInt(draft.detect?.max_disappeared, 25),
     },
     objects: {
       track: draft.objects?.track || ["person"],
@@ -827,9 +1086,9 @@ export function buildCleanYamlFromDraft(
       : {}),
     record: {
       enabled: draft.record?.enabled ?? true,
-      expire_interval: draft.record?.expire_interval ?? 60,
-      continuous: { days: draft.record?.continuous?.days ?? 14 },
-      motion: { days: draft.record?.motion?.days ?? 0 },
+      expire_interval: finiteInt(draft.record?.expire_interval, 60),
+      continuous: { days: finiteInt(draft.record?.continuous?.days, 14) },
+      motion: { days: finiteInt(draft.record?.motion?.days, 0) },
       alerts: draft.record?.alerts || {
         pre_capture: 5,
         post_capture: 5,
@@ -849,7 +1108,7 @@ export function buildCleanYamlFromDraft(
       timestamp: draft.snapshots?.timestamp ?? false,
       bounding_box: draft.snapshots?.bounding_box ?? true,
       crop: draft.snapshots?.crop ?? false,
-      quality: draft.snapshots?.quality ?? 70,
+      quality: finiteInt(draft.snapshots?.quality, 70),
       ...(draft.snapshots?.selection
         ? { selection: draft.snapshots.selection }
         : {}),

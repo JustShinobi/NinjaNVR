@@ -315,11 +315,53 @@ export function createPushToTalkController(
             ? {
                 createPeerConnection: () => {
                   const created = baseCreatePc();
+                  if (unmounted || myToken !== sessionToken) {
+                    closeOnce(null, created);
+                    throw new Error("Push-to-Talk cancelled during peer connection creation");
+                  }
                   activePc = created;
                   return created;
                 },
               }
-            : {}),
+            : {
+                createPeerConnection: () => {
+                  if (typeof RTCPeerConnection === "undefined") {
+                    throw new Error("RTCPeerConnection is unavailable in this browser context");
+                  }
+                  const nativePc = new RTCPeerConnection();
+                  const wrappedPc: PushToTalkPeerConnectionLike = {
+                    get localDescription() {
+                      return nativePc.localDescription;
+                    },
+                    addTrack(track, mediaStream) {
+                      return nativePc.addTrack(
+                        track as MediaStreamTrack,
+                        mediaStream as MediaStream
+                      );
+                    },
+                    createOffer() {
+                      return nativePc.createOffer();
+                    },
+                    setLocalDescription(desc) {
+                      return nativePc.setLocalDescription(
+                        desc as RTCLocalSessionDescriptionInit
+                      );
+                    },
+                    setRemoteDescription(desc) {
+                      return nativePc.setRemoteDescription(desc);
+                    },
+                    close() {
+                      nativePc.close();
+                    },
+                  };
+                  if (unmounted || myToken !== sessionToken) {
+                    closeOnce(null, wrappedPc);
+                    throw new Error("Push-to-Talk cancelled during peer connection creation");
+                  }
+                  activePc = wrappedPc;
+                  return wrappedPc;
+                },
+              }),
         };
         const session = await startPushToTalkSession(camera, wrappedDeps);
         if (unmounted || myToken !== sessionToken) {
@@ -1064,7 +1106,17 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const startSlotSession = useCallback(
     (slot: VideoSlotIndex, streamSrc: string, sessionId: number) => {
       const videoEl = getSlotVideoEl(slot);
-      if (!videoEl || typeof window === "undefined" || !("MediaSource" in window)) {
+      const MediaSourceCtor =
+        typeof window !== "undefined"
+          ? window.MediaSource ||
+            (
+              window as unknown as {
+                ManagedMediaSource?: typeof MediaSource;
+              }
+            ).ManagedMediaSource
+          : undefined;
+      if (!videoEl || !MediaSourceCtor) {
+        slotMachineRef.current.markSlotError(slot, sessionId);
         return;
       }
 
@@ -1080,6 +1132,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
 
       let closed = false;
       let failedOnce = false;
+      let quotaRecoveries = 0;
       let ws: WebSocket | null = null;
       let mediaSource: MediaSource | null = null;
       let sourceBuffer: SourceBuffer | null = null;
@@ -1091,7 +1144,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         streamSrc
       )}`;
 
-      mediaSource = new MediaSource();
+      mediaSource = new MediaSourceCtor();
       const objUrl = URL.createObjectURL(mediaSource);
       videoEl.src = objUrl;
 
@@ -1151,10 +1204,12 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         if (!merged) return;
         try {
           sourceBuffer.appendBuffer(merged);
+          quotaRecoveries = 0;
         } catch (err) {
           const errName = (err as { name?: string } | null)?.name;
           if (
             errName === "QuotaExceededError" &&
+            quotaRecoveries < 2 &&
             !closed &&
             mediaSource &&
             mediaSource.readyState === "open" &&
@@ -1164,11 +1219,12 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             try {
               const start = videoEl.buffered.start(0);
               const end = videoEl.buffered.end(videoEl.buffered.length - 1);
-              if (end > start + 2) {
+              if (end > start + 1) {
+                quotaRecoveries += 1;
                 if (queue.length < 256) {
                   queue.unshift(merged);
                 }
-                sourceBuffer.remove(start, Math.max(start + 0.5, end - 4));
+                sourceBuffer.remove(start, Math.max(start + 0.5, end - 2));
                 return;
               }
             } catch {
@@ -1885,6 +1941,27 @@ interface VodHlsPlayerProps {
   onEnded?: () => void;
 }
 
+function safeSessionStorageGet(key: string): string | null {
+  try {
+    if (typeof window !== "undefined") {
+      return window.sessionStorage?.getItem(key) ?? null;
+    }
+  } catch {
+    // ignore storage access errors
+  }
+  return null;
+}
+
+function safeSessionStorageSet(key: string, val: string): void {
+  try {
+    if (typeof window !== "undefined") {
+      window.sessionStorage?.setItem(key, val);
+    }
+  } catch {
+    // ignore storage access/quota errors
+  }
+}
+
 export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   camera,
   startTime,
@@ -1899,8 +1976,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const endedFiredRef = useRef(false);
+  const configuredCameras = useNvrStore((s) => s.config?.cameras);
+  const realCamera = resolveRealCameraSource(camera, configuredCameras);
   const vodRotateDeg = useNvrStore(
-    (s) => s.config?.cameras?.[camera]?.live?.rotate || 0
+    (s) =>
+      s.config?.cameras?.[camera]?.live?.rotate ||
+      s.config?.cameras?.[realCamera]?.live?.rotate ||
+      0
   );
   const vodIsCorridorRot = vodRotateDeg === 90 || vodRotateDeg === 270;
   const vodRotateTransform = vodRotateDeg
@@ -1908,11 +1990,9 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     : undefined;
   const [useFallbackMp4, setUseFallbackMp4] = useState(false);
   const [userMuted, setUserMuted] = useState<boolean>(() => {
-    if (typeof window !== "undefined") {
-      const saved = window.sessionStorage?.getItem("ninjanvr_vod_muted");
-      if (saved === "false") return false;
-      if (saved === "true") return true;
-    }
+    const saved = safeSessionStorageGet("ninjanvr_vod_muted");
+    if (saved === "false") return false;
+    if (saved === "true") return true;
     return muted;
   });
 
@@ -1926,19 +2006,30 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       : finiteStart + 12;
   const safeStart = Math.floor(finiteStart);
   const safeEnd = Math.ceil(Math.max(finiteEnd, finiteStart + 12));
-  const hlsUrl = `/vod/${encodeURIComponent(camera)}/start/${safeStart}/end/${safeEnd}/index.m3u8`;
+  const hlsUrl = `/vod/${encodeURIComponent(realCamera)}/start/${safeStart}/end/${safeEnd}/index.m3u8`;
   const mp4FallbackUrl = fallbackPreviewId
     ? `/api/review/${encodeURIComponent(fallbackPreviewId)}/preview?format=mp4`
-    : `/api/${encodeURIComponent(camera)}/latest.webp`;
+    : `/api/${encodeURIComponent(realCamera)}/latest.webp`;
 
   useEffect(() => {
     setUseFallbackMp4(false);
     endedFiredRef.current = false;
-  }, [camera, safeStart, safeEnd, fallbackPreviewId]);
+  }, [realCamera, safeStart, safeEnd, fallbackPreviewId]);
 
   useEffect(() => {
     const videoEl = videoRef.current;
-    if (!videoEl || useFallbackMp4) return;
+    if (!videoEl) return;
+    if (useFallbackMp4) {
+      return () => {
+        try {
+          videoEl.pause();
+          videoEl.removeAttribute("src");
+          videoEl.load();
+        } catch {
+          // ignore
+        }
+      };
+    }
 
     let hls: Hls | null = null;
     if (Hls.isSupported()) {
@@ -1993,19 +2084,19 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     return () => {
       if (hls) {
         try {
+          hls.stopLoad();
           hls.detachMedia();
         } catch {
           // ignore
         }
         hls.destroy();
-      } else {
-        try {
-          videoEl.pause();
-          videoEl.removeAttribute("src");
-          videoEl.load();
-        } catch {
-          // ignore
-        }
+      }
+      try {
+        videoEl.pause();
+        videoEl.removeAttribute("src");
+        videoEl.load();
+      } catch {
+        // ignore
       }
     };
   }, [hlsUrl, useFallbackMp4, fallbackPreviewId, autoPlay]);
@@ -2132,7 +2223,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
           onVolumeChange={(e) => {
             const next = e.currentTarget.muted;
             setUserMuted(next);
-            window.sessionStorage?.setItem("ninjanvr_vod_muted", String(next));
+            safeSessionStorageSet("ninjanvr_vod_muted", String(next));
           }}
           onTimeUpdate={(e) =>
             handleTimeUpdateInternal(e.currentTarget.currentTime, e.currentTarget.duration)
@@ -2166,7 +2257,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         onVolumeChange={(e) => {
           const next = e.currentTarget.muted;
           setUserMuted(next);
-          window.sessionStorage?.setItem("ninjanvr_vod_muted", String(next));
+          safeSessionStorageSet("ninjanvr_vod_muted", String(next));
         }}
         onTimeUpdate={(e) =>
           handleTimeUpdateInternal(e.currentTarget.currentTime, e.currentTarget.duration)
@@ -2238,11 +2329,16 @@ export const CanvasSparkline: React.FC<CanvasSparklineProps> = ({
     }
 
     if (values.length < 2) return;
-    const peak = Math.max(maxVal || 0, ...values, 1);
+    const safeValues = values.map((v) =>
+      typeof v === "number" && Number.isFinite(v) ? v : 0
+    );
+    const safeMaxVal =
+      typeof maxVal === "number" && Number.isFinite(maxVal) ? maxVal : 0;
+    const peak = Math.max(safeMaxVal, ...safeValues, 1);
 
     ctx.beginPath();
-    values.forEach((v, idx) => {
-      const x = (idx / (values.length - 1)) * (w - 4) + 2;
+    safeValues.forEach((v, idx) => {
+      const x = (idx / (safeValues.length - 1)) * (w - 4) + 2;
       const y = h - 4 - Math.min(1, Math.max(0, v / peak)) * (h - 10);
       if (idx === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);

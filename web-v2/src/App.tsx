@@ -21,6 +21,7 @@ import {
 import {
   expandSimulatedFleet,
   resolveRealCameraSource,
+  resolveValidCameraSelection,
   useNvrStore,
 } from "./store/useNvrStore";
 import { LiveWorkspace } from "./views/LiveWorkspace";
@@ -198,6 +199,7 @@ export const App: React.FC = () => {
   const [authChecked, setAuthChecked] = useState(false);
   const [authNeeded, setAuthNeeded] = useState(false);
   const manualLogoutRef = useRef(false);
+  const coreFetchSeqRef = useRef(0);
   const [username, setUsername] = useState("admin");
   const [loginUser, setLoginUser] = useState("admin");
   const [userRole, setUserRole] = useState<string>("admin");
@@ -344,6 +346,7 @@ export const App: React.FC = () => {
 
   // Fetch core bootstrap data
   const fetchCoreData = useCallback(async () => {
+    const mySeq = ++coreFetchSeqRef.current;
     try {
       let revUrl = "/api/review?limit=200";
       if (reviewDateFilter) {
@@ -367,6 +370,10 @@ export const App: React.FC = () => {
         fetch("/api/profile", { credentials: "include" }),
       ]);
 
+      if (mySeq !== coreFetchSeqRef.current || manualLogoutRef.current) {
+        return;
+      }
+
       if (
         [cfgRes, statsRes, histRes, revRes, expRes, profRes].some(
           (r) => r.status === 401
@@ -381,33 +388,54 @@ export const App: React.FC = () => {
       setAuthChecked(true);
       if (cfgRes.ok) {
         const cfgJson: NinjaConfigResponse = await cfgRes.json();
+        if (mySeq !== coreFetchSeqRef.current || manualLogoutRef.current) {
+          return;
+        }
         setConfig(cfgJson);
-        const cams = Object.keys(cfgJson.cameras || {});
-        const curSelected = useNvrStore.getState().selectedCamera;
-        const baseSelected = resolveRealCameraSource(
-          curSelected,
-          cfgJson.cameras
+        const allCams = Object.keys(cfgJson.cameras || {});
+        const enabledCams = allCams.filter(
+          (k) => cfgJson.cameras?.[k]?.enabled !== false
         );
-        if (cams.length > 0 && !cams.includes(baseSelected)) {
-          setSelectedCamera(cams[0]);
+        const validCams = enabledCams.length > 0 ? enabledCams : allCams;
+        const curState = useNvrStore.getState();
+        const nextSelected = resolveValidCameraSelection(
+          curState.selectedCamera,
+          cfgJson.cameras,
+          curState.simulatedFleetCount
+        );
+        if (nextSelected !== curState.selectedCamera) {
+          setSelectedCamera(nextSelected);
         }
         setInspectorCam((curr) =>
-          cams.length > 0 && !cams.includes(curr) ? cams[0] : curr
+          validCams.length > 0 && !validCams.includes(curr) ? validCams[0] : curr
         );
         setExportCam((curr) =>
-          cams.length > 0 && !cams.includes(curr) ? cams[0] : curr
+          validCams.length > 0 && !validCams.includes(curr) ? validCams[0] : curr
         );
       }
       if (statsRes.ok) {
-        setStats(await statsRes.json());
+        const nextStats = await statsRes.json();
+        if (mySeq === coreFetchSeqRef.current && !manualLogoutRef.current) {
+          setStats(nextStats);
+        }
       }
       if (histRes.ok) {
         const h = await histRes.json();
-        if (Array.isArray(h)) setStatsHistory(h);
+        if (
+          mySeq === coreFetchSeqRef.current &&
+          !manualLogoutRef.current &&
+          Array.isArray(h)
+        ) {
+          setStatsHistory(h);
+        }
       }
       if (revRes.ok) {
         const revJson: ReviewItem[] = await revRes.json();
-        if (Array.isArray(revJson)) {
+        if (
+          mySeq === coreFetchSeqRef.current &&
+          !manualLogoutRef.current &&
+          Array.isArray(revJson)
+        ) {
           setReviews(revJson.slice(0, MAX_LIVE_REVIEWS));
           if (revJson.length > 0) {
             setActiveReview((curr) => {
@@ -422,12 +450,19 @@ export const App: React.FC = () => {
       }
       if (expRes.ok) {
         const expJson: ExportItem[] = await expRes.json();
-        if (Array.isArray(expJson)) {
+        if (
+          mySeq === coreFetchSeqRef.current &&
+          !manualLogoutRef.current &&
+          Array.isArray(expJson)
+        ) {
           setExportsList(expJson);
         }
       }
       if (profRes.ok) {
         const profJson = await profRes.json();
+        if (mySeq !== coreFetchSeqRef.current || manualLogoutRef.current) {
+          return;
+        }
         if (profJson && typeof profJson.username === "string" && profJson.username.trim()) {
           setUsername(profJson.username.trim());
         }
@@ -464,6 +499,7 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     if (!authNeeded) return;
+    let cancelled = false;
     const oidcErr =
       typeof window !== "undefined"
         ? extractOidcCallbackError(window.location.search, window.location.pathname)
@@ -474,6 +510,7 @@ export const App: React.FC = () => {
     fetch("/api/auth/providers", { credentials: "include" })
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
+        if (cancelled) return;
         if (data && typeof data === "object") {
           setAuthProviders({
             local_login_enabled: data.local_login_enabled !== false,
@@ -490,11 +527,14 @@ export const App: React.FC = () => {
         }
       })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [authNeeded]);
 
   useEffect(() => {
-    fetchCoreData();
     if (authNeeded) return;
+    void fetchCoreData();
     const timer = window.setInterval(fetchCoreData, 5000);
     return () => window.clearInterval(timer);
   }, [fetchCoreData, authNeeded]);
@@ -566,14 +606,23 @@ export const App: React.FC = () => {
           } else if (msg.topic === "events" && msg.payload) {
             const parsed =
               typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
-            if ((parsed?.type === "new" || parsed?.type === "update") && parsed?.after?.id) {
+            if (
+              (parsed?.type === "new" || parsed?.type === "update") &&
+              typeof parsed?.after?.id === "string" &&
+              typeof parsed?.after?.camera === "string"
+            ) {
               const evItem: EventItem = parsed.after;
               setEvents((prev) => upsertBoundedEventList(prev, evItem));
             }
           } else if (msg.topic === "reviews" && msg.payload) {
             const parsed =
               typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
-            if (parsed?.type === "new" && parsed?.after?.severity === "alert") {
+            if (
+              parsed?.type === "new" &&
+              parsed?.after?.severity === "alert" &&
+              typeof parsed?.after?.id === "string" &&
+              typeof parsed?.after?.camera === "string"
+            ) {
               const alertItem: ReviewItem = parsed.after;
               setReviews((prev) => prependBoundedReviewAlert(prev, alertItem));
               if (useNvrStore.getState().audibleAlertChime) {
@@ -653,6 +702,7 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     if (!authChecked || authNeeded || !timelineCam) return;
+    let cancelled = false;
     const now = Math.floor(Date.now() / 1000);
     fetch(
       `/api/${encodeURIComponent(timelineCam)}/recordings?after=${now - 86400}&before=${now + 10}`,
@@ -660,7 +710,7 @@ export const App: React.FC = () => {
     )
       .then((r) => (r.ok ? r.json() : []))
       .then((segs) => {
-        if (Array.isArray(segs)) setFocusSegments(segs);
+        if (!cancelled && Array.isArray(segs)) setFocusSegments(segs);
       })
       .catch(() => {});
     fetch(`/api/${encodeURIComponent(timelineCam)}/recordings/summary`, {
@@ -668,14 +718,18 @@ export const App: React.FC = () => {
     })
       .then((r) => (r.ok ? r.json() : []))
       .then((days) => {
-        if (Array.isArray(days)) setGlobalDaysSummary(days);
+        if (!cancelled && Array.isArray(days)) setGlobalDaysSummary(days);
       })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [authChecked, authNeeded, timelineCam, stats?.service?.last_updated]);
 
   // Tab-specific data loaders
   useEffect(() => {
-    if (authNeeded) return;
+    if (!authChecked || authNeeded) return;
+    let cancelled = false;
     if (activeTab === "explore") {
       let evUrl = "/api/events?limit=120";
       if (reviewDateFilter) {
@@ -693,9 +747,11 @@ export const App: React.FC = () => {
       fetch(evUrl, { credentials: "include" })
         .then((r) => (r.ok ? r.json() : []))
         .then((arr: EventItem[]) => {
-          if (Array.isArray(arr)) {
+          if (!cancelled && Array.isArray(arr)) {
             setEvents(arr.slice(0, MAX_LIVE_EVENTS));
-            if (!selectedEvent && arr.length > 0) setSelectedEvent(arr[0]);
+            if (arr.length > 0) {
+              setSelectedEvent((curr) => curr ?? arr[0]);
+            }
           }
         })
         .catch(() => {});
@@ -703,7 +759,7 @@ export const App: React.FC = () => {
       fetch("/api/exports", { credentials: "include" })
         .then((r) => (r.ok ? r.json() : []))
         .then((arr: ExportItem[]) => {
-          if (Array.isArray(arr)) {
+          if (!cancelled && Array.isArray(arr)) {
             setExportsList(arr);
           }
         })
@@ -721,7 +777,9 @@ export const App: React.FC = () => {
           }
         })
         .then((txt) => {
-          if (txt && !rawYaml) setRawYaml(txt);
+          if (!cancelled && txt) {
+            setRawYaml((curr) => curr || txt);
+          }
         })
         .catch(() => {});
       fetch(`/api/ffprobe?paths=camera:${encodeURIComponent(inspectorCam)}`, {
@@ -729,7 +787,7 @@ export const App: React.FC = () => {
       })
         .then((r) => (r.ok ? r.json() : null))
         .then((info) => {
-          if (Array.isArray(info)) setFfprobeInfo(info);
+          if (!cancelled && Array.isArray(info)) setFfprobeInfo(info);
         })
         .catch(() => {});
     } else if (activeTab === "system" && userRole === "admin" && !logPaused) {
@@ -738,19 +796,21 @@ export const App: React.FC = () => {
       })
         .then((r) => (r.ok ? r.json() : { lines: [] }))
         .then((d) => {
-          if (Array.isArray(d.lines)) setLogLines(d.lines);
+          if (!cancelled && Array.isArray(d.lines)) setLogLines(d.lines);
         })
         .catch(() => {});
     }
+    return () => {
+      cancelled = true;
+    };
   }, [
+    authChecked,
     authNeeded,
     activeTab,
     userRole,
     inspectorCam,
     logService,
     logPaused,
-    rawYaml,
-    selectedEvent,
     reviewDateFilter,
     subLabelsRefreshTick,
     stats?.service?.last_updated,
@@ -758,6 +818,7 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     if (!lastDeletedFaceProfile?.name) return;
+    let cancelled = false;
     setEvents((prev) => clearFaceProfileFromEvents(prev, lastDeletedFaceProfile.name));
     setSelectedEvent((curr) =>
       curr ? clearFaceProfileFromEvents([curr], lastDeletedFaceProfile.name)[0] : null
@@ -769,11 +830,14 @@ export const App: React.FC = () => {
     fetch("/api/events?limit=120", { credentials: "include" })
       .then((r) => (r.ok ? r.json() : null))
       .then((arr: EventItem[] | null) => {
-        if (Array.isArray(arr)) {
-          setEvents(arr);
+        if (!cancelled && Array.isArray(arr)) {
+          setEvents(arr.slice(0, MAX_LIVE_EVENTS));
         }
       })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [lastDeletedFaceProfile]);
 
   // Actions
@@ -1438,6 +1502,7 @@ export const App: React.FC = () => {
             aria-label="Log out of NinjaNVR Console"
             onClick={async () => {
               manualLogoutRef.current = true;
+              coreFetchSeqRef.current += 1;
               try {
                 await fetch("/api/logout", {
                   method: "POST",
@@ -1446,6 +1511,15 @@ export const App: React.FC = () => {
               } catch {
                 // ignore
               }
+              coreFetchSeqRef.current += 1;
+              setConfig(null);
+              setStats(null);
+              setStatsHistory([]);
+              setCameraActivity({});
+              setFocusSegments([]);
+              setGlobalDaysSummary([]);
+              setFfprobeInfo(null);
+              setDraftPoints([]);
               setRawYaml("");
               setEvents([]);
               setReviews([]);
