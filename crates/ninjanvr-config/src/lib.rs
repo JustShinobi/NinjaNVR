@@ -1921,6 +1921,8 @@ impl NinjaConfig {
             }
         }
 
+        validate_go2rtc_streams_map(&cfg.go2rtc.streams)?;
+
         Ok(cfg)
     }
 
@@ -1937,6 +1939,7 @@ impl NinjaConfig {
 
     /// Writes `/dev/shm/go2rtc.yaml` compatible with go2rtc.
     pub fn write_go2rtc_config(&self, target_path: impl AsRef<Path>) -> Result<()> {
+        validate_go2rtc_streams_map(&self.go2rtc.streams)?;
         let target_path = target_path.as_ref();
         if let Some(parent) = target_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1951,6 +1954,12 @@ impl NinjaConfig {
         root.insert("log".to_string(), json!({ "format": "text" }));
         root.insert("webrtc".to_string(), json!({ "candidates": ["stun:8555"] }));
         for (k, v) in &self.go2rtc.extra {
+            if matches!(
+                k.trim().to_ascii_lowercase().as_str(),
+                "exec" | "expr" | "echo" | "hass" | "ngrok"
+            ) {
+                continue;
+            }
             root.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
@@ -1966,10 +1975,22 @@ impl NinjaConfig {
             candidates.push(PathBuf::from(env_path));
         }
         for candidate in candidates {
+            if !is_safe_labelmap_path(&candidate) {
+                continue;
+            }
             if let Ok(content) = std::fs::read_to_string(&candidate) {
                 for (idx, line) in content.lines().enumerate() {
+                    if map.len() >= 256 {
+                        break;
+                    }
                     let trimmed = line.trim();
-                    if !trimmed.is_empty() {
+                    let trimmed_lc = trimmed.to_ascii_lowercase();
+                    if !trimmed.is_empty()
+                        && trimmed.len() <= 128
+                        && !trimmed.contains("://")
+                        && !trimmed_lc.starts_with("password:")
+                        && !trimmed_lc.starts_with("api_key:")
+                    {
                         map.insert(idx.to_string(), trimmed.to_string());
                     }
                 }
@@ -3041,9 +3062,12 @@ impl NinjaConfig {
         if let Some(go2rtc_val) = obj.get("go2rtc")
             && let Some(streams_val) = go2rtc_val.get("streams")
         {
-            self.go2rtc.streams = serde_json::from_value(streams_val.clone())
+            let next_streams: BTreeMap<String, Value> = serde_json::from_value(streams_val.clone())
                 .context("invalid go2rtc.streams config")?;
+            validate_go2rtc_streams_map(&next_streams)?;
+            self.go2rtc.streams = next_streams;
         }
+        validate_go2rtc_streams_map(&self.go2rtc.streams)?;
         if let Some(cams_val) = obj.get("cameras") {
             let mut next_cams: BTreeMap<String, CameraConfig> =
                 serde_json::from_value(cams_val.clone()).context("invalid cameras config")?;
@@ -3167,6 +3191,135 @@ impl NinjaConfig {
         self.raw_yaml = clean_yaml;
         Ok(())
     }
+}
+
+/// Returns `true` if `raw` is an empty, control-character-containing, or command/local-file
+/// `go2rtc` producer string (`exec:`, `echo:`, `expr:`, `file:`, `stdio:`, or `ffmpeg:` wrapping any of those or `/`).
+pub fn is_disallowed_go2rtc_producer(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains(['\0', '\r', '\n']) {
+        return true;
+    }
+    let lc = trimmed.to_ascii_lowercase();
+    if lc.starts_with("exec:")
+        || lc.starts_with("echo:")
+        || lc.starts_with("expr:")
+        || lc.starts_with("file:")
+        || lc.starts_with("stdio:")
+    {
+        return true;
+    }
+    if let Some(after_ffmpeg) = lc.strip_prefix("ffmpeg:") {
+        let after = after_ffmpeg.trim_start();
+        if after.is_empty()
+            || after.starts_with("exec:")
+            || after.starts_with("echo:")
+            || after.starts_with("expr:")
+            || after.starts_with("file:")
+            || after.starts_with("stdio:")
+            || after.starts_with('/')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validates all stream keys and producer entries in `go2rtc.streams`.
+pub fn validate_go2rtc_streams_map(streams: &BTreeMap<String, Value>) -> Result<()> {
+    for (k, v) in streams {
+        if k.is_empty()
+            || k.len() > 128
+            || !k
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            anyhow::bail!("invalid go2rtc stream key '{k}'");
+        }
+        match v {
+            Value::String(s) => {
+                if is_disallowed_go2rtc_producer(s) {
+                    anyhow::bail!("disallowed go2rtc stream producer in '{k}'");
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    let Some(s) = item.as_str() else {
+                        anyhow::bail!("go2rtc stream '{k}' array entries must be strings");
+                    };
+                    if is_disallowed_go2rtc_producer(s) {
+                        anyhow::bail!("disallowed go2rtc stream producer in '{k}'");
+                    }
+                }
+            }
+            _ => {
+                anyhow::bail!("go2rtc stream '{k}' must be a producer string or array of strings");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates that a candidate labelmap path is a safe `.txt` file path without parent traversal,
+/// dotfile components, or system/secret directory prefixes.
+pub fn is_safe_labelmap_path(path: &Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => return false,
+            std::path::Component::Normal(part) => {
+                let Some(s) = part.to_str() else {
+                    return false;
+                };
+                if s.starts_with('.') {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+    {
+        return false;
+    }
+    for prefix in ["/proc", "/sys", "/dev", "/etc", "/root", "/run/secrets"] {
+        if path.starts_with(prefix) {
+            return false;
+        }
+    }
+    if path.exists() || std::fs::symlink_metadata(path).is_ok() {
+        let Ok(canon) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        if !canon
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+        {
+            return false;
+        }
+        if canon
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_none_or(|n| n.starts_with('.'))
+        {
+            return false;
+        }
+        for prefix in ["/proc", "/sys", "/dev", "/etc", "/root", "/run/secrets"] {
+            if canon.starts_with(prefix) {
+                return false;
+            }
+        }
+        if !std::fs::metadata(&canon).is_ok_and(|m| m.is_file() && m.len() <= 256 * 1024) {
+            return false;
+        }
+    }
+    true
 }
 
 fn extract_non_loopback_host(url: &str) -> Option<String> {
@@ -5622,5 +5775,229 @@ cameras:
             cfg.resolve_camera_webui_base_url("valid_cam").as_deref(),
             Some("https://192.0.2.100:8443")
         );
+    }
+
+    #[test]
+    fn go2rtc_producer_and_stream_validation_blocks_command_injection_and_dangerous_extra_keys() {
+        for disallowed in [
+            "",
+            "   ",
+            "rtsp://192.0.2.10:554/main\nexec:id",
+            "rtsp://192.0.2.10:554/main\0",
+            "exec:sh -c id",
+            "EXEC:/bin/sh",
+            "echo:hello",
+            "expr:1+1",
+            "file:/etc/passwd",
+            "stdio:cat /etc/shadow",
+            "ffmpeg:/etc/passwd",
+            "ffmpeg: /config/config.yml",
+            "ffmpeg:exec:id",
+            "ffmpeg:echo:test",
+            "ffmpeg:expr:1+1",
+            "ffmpeg:file:/etc/passwd",
+            "ffmpeg:stdio:sh",
+            "ffmpeg:",
+        ] {
+            assert!(
+                is_disallowed_go2rtc_producer(disallowed),
+                "producer '{disallowed}' must be disallowed"
+            );
+        }
+
+        for allowed in [
+            "rtsp://admin:pass@192.0.2.10:554/h264Preview_01_main",
+            "rtsps://192.0.2.10:322/live",
+            "ffmpeg:front_door#audio=aac",
+            "ffmpeg:rtsp://192.0.2.10:554/main#video=copy",
+        ] {
+            assert!(
+                !is_disallowed_go2rtc_producer(allowed),
+                "producer '{allowed}' must be allowed"
+            );
+        }
+
+        for bad_key in [
+            "",
+            "front door",
+            "front/door",
+            "exec:cam",
+            "../cam",
+            &"a".repeat(129),
+        ] {
+            let mut map = BTreeMap::new();
+            map.insert(
+                bad_key.to_string(),
+                json!("rtsp://192.0.2.10:554/h264Preview_01_main"),
+            );
+            assert!(
+                validate_go2rtc_streams_map(&map).is_err(),
+                "unsafe go2rtc stream key '{bad_key}' must be rejected"
+            );
+        }
+
+        for bad_producer in [
+            "exec:id",
+            "echo:secret",
+            "expr:2+2",
+            "file:/config/.jwt_secret",
+            "ffmpeg:/etc/passwd",
+        ] {
+            let yaml =
+                format!("go2rtc:\n  streams:\n    front_door:\n      - \"{bad_producer}\"\n");
+            assert!(
+                NinjaConfig::from_yaml_str(&yaml, PathBuf::from("/tmp/bad_go2rtc.yml")).is_err(),
+                "from_yaml_str must reject disallowed producer '{bad_producer}'"
+            );
+        }
+
+        let valid_yaml = r#"
+go2rtc:
+  streams:
+    front_door:
+      - rtsp://192.0.2.10:554/main
+  rtsp:
+    listen: ":8554"
+  exec:
+    allow: true
+  expr:
+    allow: true
+  echo:
+    allow: true
+  hass:
+    config: /config
+  ngrok:
+    command: ngrok
+"#;
+        let mut cfg =
+            NinjaConfig::from_yaml_str(valid_yaml, PathBuf::from("/tmp/go2rtc_extra.yml")).unwrap();
+
+        let bad_patch = json!({
+            "go2rtc": {
+                "streams": {
+                    "front_door": ["exec:cat /config/.jwt_secret"]
+                }
+            }
+        });
+        assert!(
+            cfg.apply_structured_json(&bad_patch).is_err(),
+            "apply_structured_json must reject disallowed go2rtc producer"
+        );
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_go2rtc_sec_test_{}", std::process::id()));
+        let out_path = tmp_dir.join("go2rtc.yaml");
+        cfg.write_go2rtc_config(&out_path).unwrap();
+        let written = std::fs::read_to_string(&out_path).unwrap();
+        let parsed: Value = serde_yaml::from_str(&written).unwrap();
+        assert_eq!(parsed["rtsp"]["listen"], ":8554");
+        for blocked_extra in ["exec", "expr", "echo", "hass", "ngrok"] {
+            assert!(
+                parsed.get(blocked_extra).is_none(),
+                "dangerous go2rtc.extra key '{blocked_extra}' must be omitted from go2rtc.yaml"
+            );
+        }
+
+        // Direct mutation of streams must also be caught by write_go2rtc_config
+        cfg.go2rtc
+            .streams
+            .insert("front_door".to_string(), json!("ffmpeg:/etc/passwd"));
+        assert!(cfg.write_go2rtc_config(&out_path).is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn labelmap_path_validation_and_loader_block_secret_exfiltration_and_allow_valid_txt() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_labelmap_sec_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let jwt_secret_file = tmp_dir.join(".jwt_secret");
+        std::fs::write(&jwt_secret_file, "super_secret_jwt_signing_key_hex\n").unwrap();
+
+        let cfg_yml_file = tmp_dir.join("config.yml");
+        std::fs::write(
+            &cfg_yml_file,
+            "mqtt:\n  password: secret_mqtt_pw\ncameras:\n  cam1:\n    path: rtsp://admin:pass@192.0.2.1/live\n",
+        )
+        .unwrap();
+
+        let symlink_to_secret = tmp_dir.join("labels_link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&jwt_secret_file, &symlink_to_secret).unwrap();
+
+        let symlink_to_yml = tmp_dir.join("config_link.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&cfg_yml_file, &symlink_to_yml).unwrap();
+
+        for unsafe_path in [
+            Path::new(""),
+            Path::new("/config/.jwt_secret"),
+            Path::new(".jwt_secret"),
+            Path::new("/config/.env.txt"),
+            Path::new("/config/.active_profile"),
+            Path::new("/config/config.yml"),
+            Path::new("config.yml"),
+            Path::new("/config/models/../../.jwt_secret"),
+            Path::new("../labels.txt"),
+            Path::new("/etc/passwd"),
+            Path::new("/etc/hosts.txt"),
+            Path::new("/proc/self/environ"),
+            Path::new("/sys/kernel/notes.txt"),
+            Path::new("/dev/null.txt"),
+            Path::new("/root/labels.txt"),
+            Path::new("/run/secrets/token.txt"),
+            jwt_secret_file.as_path(),
+            cfg_yml_file.as_path(),
+            symlink_to_secret.as_path(),
+            symlink_to_yml.as_path(),
+        ] {
+            assert!(
+                !is_safe_labelmap_path(unsafe_path),
+                "unsafe labelmap path '{}' must be rejected",
+                unsafe_path.display()
+            );
+        }
+
+        let valid_labelmap = tmp_dir.join("valid_labels.txt");
+        std::fs::write(
+            &valid_labelmap,
+            "person\ncar\nrtsp://user:pass@192.0.2.1/leak\npassword: leaked\napi_key: leaked\nbicycle\n",
+        )
+        .unwrap();
+        assert!(is_safe_labelmap_path(&valid_labelmap));
+        assert!(is_safe_labelmap_path(Path::new("/openvino-model/coco.txt")));
+
+        let mut cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", tmp_dir.join("config.yml")).unwrap();
+
+        // Unsafe paths fall back to standard COCO map without reading secret files
+        for bad in [
+            &jwt_secret_file,
+            &cfg_yml_file,
+            &symlink_to_secret,
+            &symlink_to_yml,
+            &PathBuf::from("/etc/passwd"),
+        ] {
+            cfg.model.labelmap_path = bad.to_string_lossy().to_string();
+            let map = cfg.load_labelmap();
+            assert_eq!(map.get("0").map(String::as_str), Some("__background__"));
+            assert!(!map.values().any(|v| v.contains("super_secret_jwt")));
+            assert!(!map.values().any(|v| v.contains("secret_mqtt_pw")));
+        }
+
+        // Valid .txt file loads valid labels while skipping credential-like lines
+        cfg.model.labelmap_path = valid_labelmap.to_string_lossy().to_string();
+        let filtered_map = cfg.load_labelmap();
+        assert_eq!(filtered_map.get("0").map(String::as_str), Some("person"));
+        assert_eq!(filtered_map.get("1").map(String::as_str), Some("car"));
+        assert_eq!(filtered_map.get("5").map(String::as_str), Some("bicycle"));
+        assert!(!filtered_map.values().any(|v| v.contains("://")));
+        assert!(!filtered_map.values().any(|v| v.starts_with("password:")));
+        assert!(!filtered_map.values().any(|v| v.starts_with("api_key:")));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
