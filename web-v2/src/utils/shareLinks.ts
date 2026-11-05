@@ -55,7 +55,11 @@ export function computeShareLinkRotationParams(
     Number.isFinite(link.max_views) &&
     link.max_views > 0
   ) {
-    const used = Math.max(0, Math.floor(link.access_count ?? 0));
+    const rawUsed =
+      typeof link.access_count === "number" && Number.isFinite(link.access_count)
+        ? link.access_count
+        : 0;
+    const used = Math.max(0, Math.floor(rawUsed));
     const rem = Math.max(1, Math.floor(link.max_views) - used);
     remainingMaxViews = rem;
   }
@@ -120,7 +124,13 @@ export function filterActiveAndRecentShareLinks(
 }
 
 export function isValidShareTokenSegment(seg: string): boolean {
-  return seg.length > 0 && !seg.includes("..") && !/[:/?#\\]/.test(seg);
+  return (
+    seg.length > 0 &&
+    seg.length <= 512 &&
+    seg !== "." &&
+    !seg.includes("..") &&
+    /^[A-Za-z0-9._-]+$/.test(seg)
+  );
 }
 
 export function buildSharePublicUrl(
@@ -128,17 +138,24 @@ export function buildSharePublicUrl(
   tokenOrUrl: string
 ): string {
   const rawTarget = (tokenOrUrl || "").trim();
-  if (!rawTarget || /[\u0000-\u0020\u007f]/.test(rawTarget)) {
+  if (!rawTarget || /[\u0000-\u0020\u007f\\]/.test(rawTarget)) {
     return "";
   }
-  if (rawTarget.startsWith("//") || rawTarget.includes("..")) {
+  if (
+    rawTarget.startsWith("//") ||
+    rawTarget.includes("..") ||
+    /%2e/i.test(rawTarget) ||
+    /%2f/i.test(rawTarget) ||
+    /%5c/i.test(rawTarget) ||
+    /%00/i.test(rawTarget)
+  ) {
     return "";
   }
 
   const cleanOrigin = (origin || "").trim().replace(/\/+$/, "");
   let normalizedOrigin = "";
   if (cleanOrigin) {
-    if (/[\u0000-\u0020\u007f]/.test(cleanOrigin)) {
+    if (/[\u0000-\u0020\u007f\\]/.test(cleanOrigin)) {
       return "";
     }
     try {
@@ -217,7 +234,11 @@ export function buildSharePublicUrl(
 export function formatShareLinkViews(
   link: Pick<ShareLinkItem, "access_count" | "max_views">
 ): string {
-  const count = Math.max(0, Math.floor(link.access_count ?? 0));
+  const rawCount =
+    typeof link.access_count === "number" && Number.isFinite(link.access_count)
+      ? link.access_count
+      : 0;
+  const count = Math.max(0, Math.floor(rawCount));
   if (
     typeof link.max_views === "number" &&
     Number.isFinite(link.max_views) &&

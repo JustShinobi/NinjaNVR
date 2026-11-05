@@ -29,6 +29,66 @@ import {
 
 export type SimulatedFleetCount = 0 | 12 | 36 | 100;
 
+export const MAX_STATS_HISTORY_SAMPLES = 120;
+export const MAX_CAMERA_ACTIVITY_ENTRIES = 256;
+
+function safeStorageGet(key: string): string | null {
+  try {
+    if (typeof window !== "undefined") {
+      return window.localStorage?.getItem(key) ?? null;
+    }
+  } catch {
+    // ignore storage access errors
+  }
+  return null;
+}
+
+function safeStorageSet(key: string, val: string): void {
+  try {
+    if (typeof window !== "undefined") {
+      window.localStorage?.setItem(key, val);
+    }
+  } catch {
+    // ignore storage quota/access errors
+  }
+}
+
+function safeStorageRemove(key: string): void {
+  try {
+    if (typeof window !== "undefined") {
+      window.localStorage?.removeItem(key);
+    }
+  } catch {
+    // ignore storage access errors
+  }
+}
+
+function sanitizeCameraActivityMap(
+  raw: Record<string, CameraLiveActivity> | null | undefined
+): Record<string, CameraLiveActivity> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  const out: Record<string, CameraLiveActivity> = {};
+  const entries = Object.entries(raw);
+  const limit = Math.min(entries.length, MAX_CAMERA_ACTIVITY_ENTRIES);
+  for (let i = 0; i < limit; i++) {
+    const [k, v] = entries[i];
+    if (
+      !k ||
+      k === "__proto__" ||
+      k === "constructor" ||
+      k === "prototype" ||
+      !v ||
+      typeof v !== "object"
+    ) {
+      continue;
+    }
+    out[k] = v;
+  }
+  return out;
+}
+
 export const SIMULATED_FLEET_GROUPS = [
   "Interno",
   "Perímetro",
@@ -37,17 +97,9 @@ export const SIMULATED_FLEET_GROUPS = [
 ] as const;
 
 export function resolveInitialSimulatedFleetCount(): SimulatedFleetCount {
-  try {
-    if (typeof window !== "undefined") {
-      const raw = Number(
-        window.localStorage?.getItem("ninjanvr_simulated_fleet_count") || "0"
-      );
-      if (raw === 12 || raw === 36 || raw === 100) {
-        return raw;
-      }
-    }
-  } catch {
-    // ignore
+  const raw = Number(safeStorageGet("ninjanvr_simulated_fleet_count") || "0");
+  if (raw === 12 || raw === 36 || raw === 100) {
+    return raw;
   }
   return 0;
 }
@@ -281,24 +333,20 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
 
   setActiveTab: (activeTab) => set({ activeTab }),
   setLiveLayout: (liveLayout) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem("ninjanvr_live_layout", liveLayout);
-    }
+    safeStorageSet("ninjanvr_live_layout", liveLayout);
     set({ liveLayout });
   },
   setActiveCameraGroup: (activeCameraGroup) =>
     set({ activeCameraGroup, matrixPage: 0 }),
   setMatrixDensity: (matrixDensity) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem("ninjanvr_matrix_density", matrixDensity);
-    }
+    safeStorageSet("ninjanvr_matrix_density", matrixDensity);
     set({ matrixDensity, matrixPage: 0 });
   },
   setMatrixPage: (pageOrFn) =>
     set((s) => {
       const next =
         typeof pageOrFn === "function" ? pageOrFn(s.matrixPage) : pageOrFn;
-      return { matrixPage: Math.max(0, next) };
+      return { matrixPage: Math.max(0, Number.isFinite(next) ? Math.floor(next) : 0) };
     }),
   setMatrixTourEnabled: (fnOrVal) =>
     set((s) => ({
@@ -306,7 +354,12 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
         typeof fnOrVal === "function" ? fnOrVal(s.matrixTourEnabled) : fnOrVal,
     })),
   setMatrixTourIntervalSec: (matrixTourIntervalSec) =>
-    set({ matrixTourIntervalSec: Math.max(3, matrixTourIntervalSec) }),
+    set({
+      matrixTourIntervalSec: Math.max(
+        3,
+        Number.isFinite(matrixTourIntervalSec) ? matrixTourIntervalSec : 15
+      ),
+    }),
   setSyncQuadCameras: (camsOrFn) =>
     set((s) => {
       const next =
@@ -316,69 +369,48 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   setSpotlightFilter: (spotlightFilter) => set({ spotlightFilter }),
   setSpotlightHoldSec: (spotlightHoldSec) => set({ spotlightHoldSec }),
   setSpotlightTimelineMode: (spotlightTimelineMode) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem(
-        "ninjanvr_spotlight_timeline_mode",
-        spotlightTimelineMode
-      );
-    }
+    safeStorageSet("ninjanvr_spotlight_timeline_mode", spotlightTimelineMode);
     set({ spotlightTimelineMode });
   },
   setSecurityProfile: (securityProfile) => set({ securityProfile }),
   setSelectedCamera: (selectedCamera) => set({ selectedCamera }),
   setHudPosition: (hudPosition) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem("ninjanvr_hud_position", hudPosition);
-    }
+    safeStorageSet("ninjanvr_hud_position", hudPosition);
     set({ hudPosition });
   },
   setUseMainStream: (fnOrVal) =>
     set((s) => {
       const next = typeof fnOrVal === "function" ? fnOrVal(s.useMainStream) : fnOrVal;
-      if (typeof window !== "undefined") {
-        window.localStorage?.setItem("ninjanvr_use_main_stream", String(next));
-      }
+      safeStorageSet("ninjanvr_use_main_stream", String(next));
       return { useMainStream: next };
     }),
   setShowVectors: (fnOrVal) =>
     set((s) => {
       const next = typeof fnOrVal === "function" ? fnOrVal(s.showVectors) : fnOrVal;
-      if (typeof window !== "undefined") {
-        window.localStorage?.setItem("ninjanvr_show_vectors", String(next));
-      }
+      safeStorageSet("ninjanvr_show_vectors", String(next));
       return { showVectors: next };
     }),
   setShowAlertRibbon: (showAlertRibbon) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem("ninjanvr_show_alert_ribbon", String(showAlertRibbon));
-    }
+    safeStorageSet("ninjanvr_show_alert_ribbon", String(showAlertRibbon));
     set({ showAlertRibbon });
   },
   setAudibleAlertChime: (audibleAlertChime) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem("ninjanvr_audible_chime", String(audibleAlertChime));
-    }
+    safeStorageSet("ninjanvr_audible_chime", String(audibleAlertChime));
     set({ audibleAlertChime });
   },
   setBrowserNotifications: (browserNotifications) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem(
-        "ninjanvr_browser_notifications",
-        String(browserNotifications)
-      );
-    }
+    safeStorageSet(
+      "ninjanvr_browser_notifications",
+      String(browserNotifications)
+    );
     set({ browserNotifications });
   },
   setFirstWeekday: (firstWeekday) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem("ninjanvr_first_weekday", firstWeekday);
-    }
+    safeStorageSet("ninjanvr_first_weekday", firstWeekday);
     set({ firstWeekday });
   },
   setThemeMode: (themeMode) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem("ninjanvr_theme_mode", themeMode);
-    }
+    safeStorageSet("ninjanvr_theme_mode", themeMode);
     applyThemeToDocument(themeMode, get().highContrast);
     set({ themeMode });
   },
@@ -386,29 +418,23 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
     set((s) => {
       const next =
         typeof fnOrVal === "function" ? fnOrVal(s.highContrast) : fnOrVal;
-      if (typeof window !== "undefined") {
-        window.localStorage?.setItem("ninjanvr_high_contrast", String(next));
-      }
+      safeStorageSet("ninjanvr_high_contrast", String(next));
       applyThemeToDocument(s.themeMode, next);
       return { highContrast: next };
     }),
   setTimeShiftTs: (timeShiftTs) => set({ timeShiftTs }),
   setPlaybackSpeed: (playbackSpeed) => {
-    if (typeof window !== "undefined") {
-      window.localStorage?.setItem("ninjanvr_playback_speed", String(playbackSpeed));
-    }
+    safeStorageSet("ninjanvr_playback_speed", String(playbackSpeed));
     set({ playbackSpeed });
   },
   setSimulatedFleetCount: (simulatedFleetCount) => {
-    if (typeof window !== "undefined") {
-      if (simulatedFleetCount > 0) {
-        window.localStorage?.setItem(
-          "ninjanvr_simulated_fleet_count",
-          String(simulatedFleetCount)
-        );
-      } else {
-        window.localStorage?.removeItem("ninjanvr_simulated_fleet_count");
-      }
+    if (simulatedFleetCount > 0) {
+      safeStorageSet(
+        "ninjanvr_simulated_fleet_count",
+        String(simulatedFleetCount)
+      );
+    } else {
+      safeStorageRemove("ninjanvr_simulated_fleet_count");
     }
     set((s) => {
       const nextSelected =
@@ -447,24 +473,22 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   bumpSubLabelsRefresh: () =>
     set((s) => ({ subLabelsRefreshTick: s.subLabelsRefreshTick + 1 })),
   resetUiPreferences: () => {
-    if (typeof window !== "undefined") {
-      [
-        "ninjanvr_live_layout",
-        "ninjanvr_matrix_density",
-        "ninjanvr_spotlight_timeline_mode",
-        "ninjanvr_hud_position",
-        "ninjanvr_use_main_stream",
-        "ninjanvr_show_vectors",
-        "ninjanvr_show_alert_ribbon",
-        "ninjanvr_audible_chime",
-        "ninjanvr_browser_notifications",
-        "ninjanvr_first_weekday",
-        "ninjanvr_theme_mode",
-        "ninjanvr_high_contrast",
-        "ninjanvr_playback_speed",
-        "ninjanvr_simulated_fleet_count",
-      ].forEach((k) => window.localStorage?.removeItem(k));
-    }
+    [
+      "ninjanvr_live_layout",
+      "ninjanvr_matrix_density",
+      "ninjanvr_spotlight_timeline_mode",
+      "ninjanvr_hud_position",
+      "ninjanvr_use_main_stream",
+      "ninjanvr_show_vectors",
+      "ninjanvr_show_alert_ribbon",
+      "ninjanvr_audible_chime",
+      "ninjanvr_browser_notifications",
+      "ninjanvr_first_weekday",
+      "ninjanvr_theme_mode",
+      "ninjanvr_high_contrast",
+      "ninjanvr_playback_speed",
+      "ninjanvr_simulated_fleet_count",
+    ].forEach((k) => safeStorageRemove(k));
     applyThemeToDocument("dark", false);
     set({
       liveLayout: "2x2",
@@ -493,12 +517,8 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
     set((s) => {
       let nextThemeMode = s.themeMode;
       let nextHighContrast = s.highContrast;
-      const hasLocalTheme =
-        typeof window !== "undefined" &&
-        window.localStorage?.getItem("ninjanvr_theme_mode") !== null;
-      const hasLocalHc =
-        typeof window !== "undefined" &&
-        window.localStorage?.getItem("ninjanvr_high_contrast") !== null;
+      const hasLocalTheme = safeStorageGet("ninjanvr_theme_mode") !== null;
+      const hasLocalHc = safeStorageGet("ninjanvr_high_contrast") !== null;
 
       const cfgTheme = config?.ui?.theme;
       if (
@@ -518,6 +538,12 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       };
     }),
   setStats: (stats) => set({ stats }),
-  setStatsHistory: (statsHistory) => set({ statsHistory }),
-  setCameraActivity: (cameraActivity) => set({ cameraActivity }),
+  setStatsHistory: (statsHistory) =>
+    set({
+      statsHistory: Array.isArray(statsHistory)
+        ? statsHistory.slice(-MAX_STATS_HISTORY_SAMPLES)
+        : [],
+    }),
+  setCameraActivity: (cameraActivity) =>
+    set({ cameraActivity: sanitizeCameraActivityMap(cameraActivity) }),
 }));

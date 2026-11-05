@@ -76,12 +76,22 @@ export function computeLiveStageDescriptors(
     maxGridLiveDecoders = DEFAULT_MAX_GRID_LIVE_DECODERS,
   } = params;
 
+  const safeMaxDock =
+    typeof maxDockLiveDecoders === "number" && Number.isFinite(maxDockLiveDecoders)
+      ? Math.max(0, Math.floor(maxDockLiveDecoders))
+      : DEFAULT_MAX_DOCK_LIVE_DECODERS;
+  const safeMaxGrid =
+    typeof maxGridLiveDecoders === "number" && Number.isFinite(maxGridLiveDecoders)
+      ? Math.max(0, Math.floor(maxGridLiveDecoders))
+      : DEFAULT_MAX_GRID_LIVE_DECODERS;
+
   if (liveLayout === "2x2") {
-    return visibleMatrixCams.map((cam, idx) => {
+    const canonicalMatrixCams = buildCanonicalCameraList(visibleMatrixCams, "");
+    return canonicalMatrixCams.map((cam, idx) => {
       const isTimelineSelected = cam === selectedCamera;
       const isTimeShifted = isTimelineSelected && timeShiftTs !== null;
       const isLiveGridTile =
-        idx < maxGridLiveDecoders ||
+        idx < safeMaxGrid ||
         isTimelineSelected ||
         hoveredDockCam === cam ||
         !/_sim_\d+$/.test(cam);
@@ -143,7 +153,7 @@ export function computeLiveStageDescriptors(
       }
       const dockIndex = dockCams.indexOf(cam);
       const isLiveDock =
-        dockIndex < maxDockLiveDecoders || hoveredDockCam === cam;
+        dockIndex < safeMaxDock || hoveredDockCam === cam;
       return {
         camera: cam,
         role: "dock",
@@ -179,7 +189,7 @@ export function computeLiveStageDescriptors(
     }
     const dockIndex = dockCams.indexOf(cam);
     const isLiveDock =
-      dockIndex < maxDockLiveDecoders || hoveredDockCam === cam;
+      dockIndex < safeMaxDock || hoveredDockCam === cam;
     return {
       camera: cam,
       role: "dock",
@@ -303,9 +313,14 @@ export function resolvePersistentTileStyle(
   if (liveLayout === "2x2" || liveLayout === "single") {
     return undefined;
   }
+  const safeDockTotal =
+    typeof descriptor.dockTotal === "number" &&
+    Number.isFinite(descriptor.dockTotal)
+      ? Math.max(0, Math.floor(descriptor.dockTotal))
+      : 0;
   const visibleRows = Math.min(
     DEFAULT_MAX_DOCK_LIVE_DECODERS,
-    Math.max(1, descriptor.dockTotal)
+    Math.max(1, safeDockTotal)
   );
   if (descriptor.role === "hero") {
     return {

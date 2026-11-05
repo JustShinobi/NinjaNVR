@@ -47,7 +47,9 @@ interface TimelineScrubberProps {
 }
 
 function formatHHMM(unixSec: number): string {
+  if (!Number.isFinite(unixSec)) return "--:--";
   const d = new Date(unixSec * 1000);
+  if (Number.isNaN(d.getTime())) return "--:--";
   return d.toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
@@ -56,7 +58,9 @@ function formatHHMM(unixSec: number): string {
 }
 
 function formatHHMMSS(unixSec: number): string {
+  if (!Number.isFinite(unixSec)) return "--:--:--";
   const d = new Date(unixSec * 1000);
+  if (Number.isNaN(d.getTime())) return "--:--:--";
   return d.toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
@@ -66,7 +70,9 @@ function formatHHMMSS(unixSec: number): string {
 }
 
 function formatFullDateTime(unixSec: number): string {
+  if (!Number.isFinite(unixSec)) return "--:--:--";
   const d = new Date(unixSec * 1000);
+  if (Number.isNaN(d.getTime())) return "--:--:--";
   return d.toLocaleString([], {
     year: "numeric",
     month: "short",
@@ -79,14 +85,17 @@ function formatFullDateTime(unixSec: number): string {
 }
 
 function formatDayShort(dayStr: string): string {
-  const parts = dayStr.split("-").map(Number);
-  if (parts.length !== 3) return dayStr;
+  const parts = (dayStr || "").split("-").map(Number);
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return dayStr;
   const d = new Date(parts[0], parts[1] - 1, parts[2]);
+  if (Number.isNaN(d.getTime())) return dayStr;
   return d.toLocaleDateString([], { weekday: "short", month: "short", day: "2-digit" });
 }
 
 function toLocalDateInputValue(unixSec: number): string {
-  const d = new Date(unixSec * 1000);
+  const safeSec = Number.isFinite(unixSec) ? unixSec : Math.floor(Date.now() / 1000);
+  const d = new Date(safeSec * 1000);
+  if (Number.isNaN(d.getTime())) return "1970-01-01";
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
@@ -94,11 +103,62 @@ function toLocalDateInputValue(unixSec: number): string {
 }
 
 function toLocalTimeInputValue(unixSec: number): string {
-  const d = new Date(unixSec * 1000);
+  const safeSec = Number.isFinite(unixSec) ? unixSec : Math.floor(Date.now() / 1000);
+  const d = new Date(safeSec * 1000);
+  if (Number.isNaN(d.getTime())) return "00:00:00";
   const h = String(d.getHours()).padStart(2, "0");
   const m = String(d.getMinutes()).padStart(2, "0");
   const s = String(d.getSeconds()).padStart(2, "0");
   return `${h}:${m}:${s}`;
+}
+
+export function parseLocalDayBounds(
+  selectedDay: string,
+  nowSec: number
+): { dayStart: number; dayEnd: number; isToday: boolean } {
+  const safeNow = Number.isFinite(nowSec) ? Math.floor(nowSec) : Math.floor(Date.now() / 1000);
+  const todayStr = toLocalDateInputValue(safeNow);
+  const parts = (selectedDay || "").split("-").map(Number);
+  if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
+    const startMs = new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime();
+    if (Number.isFinite(startMs)) {
+      const start = Math.floor(startMs / 1000);
+      const fullEnd = start + 86399;
+      const isToday = selectedDay === todayStr;
+      const end = isToday ? Math.max(start + 300, Math.min(safeNow, fullEnd)) : fullEnd;
+      return {
+        dayStart: start,
+        dayEnd: end,
+        isToday,
+      };
+    }
+  }
+  const d = new Date(safeNow * 1000);
+  d.setHours(0, 0, 0, 0);
+  const fallbackStart = Math.floor(d.getTime() / 1000);
+  const start = Number.isFinite(fallbackStart) ? fallbackStart : safeNow - 3600;
+  return {
+    dayStart: start,
+    dayEnd: Math.max(start + 300, safeNow),
+    isToday: true,
+  };
+}
+
+export function computeClientXTimestamp(
+  clientX: number,
+  rectLeft: number,
+  rectWidth: number,
+  winStart: number,
+  winEnd: number
+): number {
+  const safeStart = Number.isFinite(winStart) ? winStart : 0;
+  const safeEnd = Number.isFinite(winEnd) && winEnd > safeStart ? winEnd : safeStart + 300;
+  if (!Number.isFinite(rectWidth) || rectWidth <= 0 || !Number.isFinite(clientX) || !Number.isFinite(rectLeft)) {
+    return Math.round(safeEnd);
+  }
+  const span = safeEnd - safeStart;
+  const frac = Math.max(0, Math.min(1, (clientX - rectLeft) / rectWidth));
+  return Math.round(safeStart + frac * span);
 }
 
 export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
@@ -163,6 +223,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     startPlayhead: number;
     moved: boolean;
   } | null>(null);
+  const activePointerIdRef = useRef<number | null>(null);
   const wheelSeekTimerRef = useRef<number | null>(null);
   const pendingWheelPlayheadRef = useRef<number | null>(null);
   const [scrubPreviewTs, setScrubPreviewTs] = useState<number | null>(null);
@@ -180,6 +241,71 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     targetPlayhead: 0,
   });
 
+  const releaseTrackPointerCapture = useCallback(() => {
+    const pid = activePointerIdRef.current;
+    activePointerIdRef.current = null;
+    if (pid !== null && trackRef.current) {
+      try {
+        if (trackRef.current.hasPointerCapture?.(pid)) {
+          trackRef.current.releasePointerCapture(pid);
+        } else {
+          trackRef.current.releasePointerCapture?.(pid);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
+  // Ensure Zero-Decoder-Bloat: unmount any hovered storyboard preview video on deck close, camera switch, or tab hide/blur
+  useEffect(() => {
+    if (!showArchiveDeck || !showStoryboard) {
+      setHoveredStoryboardId(null);
+    }
+  }, [showArchiveDeck, showStoryboard, camera]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const clearHover = () => {
+      setHoveredStoryboardId(null);
+      setHoverTs(null);
+    };
+    const onVisChange = () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        clearHover();
+      }
+    };
+    window.addEventListener("blur", clearHover);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisChange);
+    }
+    return () => {
+      window.removeEventListener("blur", clearHover);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisChange);
+      }
+    };
+  }, []);
+
+  // Cleanup RAF, wheel seek timer, and pointer capture on unmount
+  useEffect(() => {
+    return () => {
+      if (
+        wheelAnimRef.current.rafId !== null &&
+        typeof window !== "undefined" &&
+        typeof window.cancelAnimationFrame === "function"
+      ) {
+        window.cancelAnimationFrame(wheelAnimRef.current.rafId);
+        wheelAnimRef.current.rafId = null;
+      }
+      if (wheelSeekTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(wheelSeekTimerRef.current);
+        wheelSeekTimerRef.current = null;
+      }
+      releaseTrackPointerCapture();
+    };
+  }, [releaseTrackPointerCapture]);
+
   useEffect(() => {
     const timer = window.setInterval(() => {
       setNowSec(Math.floor(Date.now() / 1000));
@@ -188,34 +314,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   }, []);
 
   // Compute exact [00:00:00 .. 23:59:59 (or now)] bounds for the currently selected day
-  const dayBounds = useMemo(() => {
-    const todayStr = toLocalDateInputValue(nowSec);
-    const parts = selectedDay.split("-").map(Number);
-    if (parts.length !== 3 || Number.isNaN(parts[0])) {
-      const d = new Date(nowSec * 1000);
-      d.setHours(0, 0, 0, 0);
-      const start = Math.floor(d.getTime() / 1000);
-      return {
-        dayStart: start,
-        dayEnd: Math.max(start + 300, nowSec),
-        isToday: true,
-      };
-    }
-    const start = Math.floor(
-      new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000
-    );
-    const fullEnd = start + 86399;
-    const isToday = selectedDay === todayStr;
-    const end = isToday ? Math.max(start + 300, Math.min(nowSec, fullEnd)) : fullEnd;
-    return {
-      dayStart: start,
-      dayEnd: end,
-      isToday,
-    };
-  }, [selectedDay, nowSec]);
+  const dayBounds = useMemo(
+    () => parseLocalDayBounds(selectedDay, nowSec),
+    [selectedDay, nowSec]
+  );
 
   const daySpanSec = Math.max(300, dayBounds.dayEnd - dayBounds.dayStart);
-  const windowSpanSec = Math.min(zoomMin * 60, daySpanSec);
+  const windowSpanSec = Math.max(60, Math.min(zoomMin * 60, daySpanSec));
   const rawWinEnd = customWinEnd ?? dayBounds.dayEnd;
   const winEnd = Math.max(
     dayBounds.dayStart + windowSpanSec,
@@ -311,10 +416,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       const el = trackRef.current;
       if (!el) return winEnd;
       const rect = el.getBoundingClientRect();
-      const frac = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
-      return Math.round(winStart + frac * windowSpanSec);
+      return computeClientXTimestamp(clientX, rect.left, rect.width, winStart, winEnd);
     },
-    [winStart, winEnd, windowSpanSec]
+    [winStart, winEnd]
   );
 
   // Global pointer move / up when dragging timeline track (touch/mouse pan) or IN/OUT handles
@@ -350,6 +454,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       }
     };
     const onUp = (e: PointerEvent) => {
+      releaseTrackPointerCapture();
       if (draggingTarget === "track" && dragOriginRef.current) {
         const origin = dragOriginRef.current;
         dragOriginRef.current = null;
@@ -374,13 +479,20 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       }
       setDraggingTarget(null);
     };
+    const onCancel = () => {
+      releaseTrackPointerCapture();
+      dragOriginRef.current = null;
+      setDraggingTarget(null);
+      setScrubPreviewTs(null);
+      setHoverTs(null);
+    };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onUp);
+    window.addEventListener("pointercancel", onCancel);
     return () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", onUp);
+      window.removeEventListener("pointercancel", onCancel);
     };
   }, [
     draggingTarget,
@@ -391,7 +503,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     nowSec,
     onSeek,
     rangeEnd,
+    rangeMode,
     rangeStart,
+    releaseTrackPointerCapture,
+    winEnd,
+    winStart,
     windowSpanSec,
   ]);
 
@@ -518,10 +634,14 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
   // Jump to a specific Day from the Multi-Day Calendar
   const handleSelectDay = (dayObj: RecordingDaySummary) => {
+    const parts = (dayObj.day || "").split("-").map(Number);
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return;
+    const localDayStart = Math.floor(
+      new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000
+    );
+    if (!Number.isFinite(localDayStart)) return;
     setSelectedDay(dayObj.day);
     setSelectedHour(null);
-    const parts = dayObj.day.split("-").map(Number);
-    const localDayStart = new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000;
     const localDayEnd = Math.min(nowSec, localDayStart + 86400);
 
     // Pick the first active hour or noon of that day
@@ -554,13 +674,15 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
   // Jump to a specific Hour (`00`..`23`) within the selected Day
   const handleSelectHour = (dayStr: string, hourStr: string, hourMeta?: RecordingHourSummary) => {
-    setSelectedHour(hourStr);
-    const parts = dayStr.split("-").map(Number);
+    const parts = (dayStr || "").split("-").map(Number);
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return;
     const hNum = parseInt(hourStr, 10) || 0;
     const localHourStart =
       hourMeta?.start_ts && hourMeta.start_ts > 0
         ? hourMeta.start_ts
-        : new Date(parts[0], parts[1] - 1, parts[2], hNum, 0, 0).getTime() / 1000;
+        : Math.floor(new Date(parts[0], parts[1] - 1, parts[2], hNum, 0, 0).getTime() / 1000);
+    if (!Number.isFinite(localHourStart)) return;
+    setSelectedHour(hourStr);
     const localHourEnd = Math.min(nowSec, localHourStart + 3600);
 
     setZoomMin(60);
@@ -574,9 +696,16 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
   // Jump directly to a user-typed Date + Time (`YYYY-MM-DD` + `HH:MM:SS`)
   const handleDirectDateTimeJump = (dateStr: string, timeStr: string) => {
-    const dParts = dateStr.split("-").map(Number);
-    const tParts = timeStr.split(":").map(Number);
-    if (dParts.length !== 3 || tParts.length < 2) return;
+    const dParts = (dateStr || "").split("-").map(Number);
+    const tParts = (timeStr || "").split(":").map(Number);
+    if (
+      dParts.length !== 3 ||
+      dParts.some((n) => !Number.isFinite(n)) ||
+      tParts.length < 2 ||
+      tParts.some((n) => !Number.isFinite(n))
+    ) {
+      return;
+    }
     const dt = new Date(
       dParts[0],
       dParts[1] - 1,
@@ -586,7 +715,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       tParts[2] || 0
     );
     const ts = Math.floor(dt.getTime() / 1000);
-    if (Number.isNaN(ts) || ts <= 0) return;
+    if (!Number.isFinite(ts) || ts <= 0) return;
     setSelectedDay(dateStr);
     setSelectedHour(String(tParts[0] || 0).padStart(2, "0"));
     setCustomWinEnd(Math.min(nowSec, ts + Math.round(windowSpanSec * 0.5)));
@@ -924,7 +1053,19 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         )}`;
       const res = await onExportRange(camera, rangeStart, rangeEnd, label);
       if (res && res.videoUrl) {
-        setReadyDownloadUrl(res.videoUrl);
+        const candidate = res.videoUrl.trim();
+        if (
+          candidate &&
+          !/[\u0000-\u0020\u007f\\]/.test(candidate) &&
+          !candidate.startsWith("//") &&
+          !candidate.includes("..") &&
+          (candidate.startsWith("/exports/") ||
+            candidate.startsWith("/api/") ||
+            candidate.startsWith("/vod/") ||
+            candidate.startsWith("/clips/"))
+        ) {
+          setReadyDownloadUrl(candidate);
+        }
       }
     } finally {
       setExportBusy(false);
@@ -1181,7 +1322,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   .map((rev) => {
                     const thumbSrc = rev.thumb_path
                       ? rev.thumb_path.replace(/^\/media\/[^/]+/, "")
-                      : `/api/${rev.camera}/latest.webp`;
+                      : `/api/${encodeURIComponent(rev.camera)}/latest.webp`;
                     const isHov = hoveredStoryboardId === rev.id;
                     return (
                       <div
@@ -1190,6 +1331,12 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                         tabIndex={0}
                         onPointerEnter={() => setHoveredStoryboardId(rev.id)}
                         onPointerLeave={() =>
+                          setHoveredStoryboardId((c) => (c === rev.id ? null : c))
+                        }
+                        onPointerCancel={() =>
+                          setHoveredStoryboardId((c) => (c === rev.id ? null : c))
+                        }
+                        onBlur={() =>
                           setHoveredStoryboardId((c) => (c === rev.id ? null : c))
                         }
                         onClick={() => {
@@ -1606,7 +1753,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               <button
                 className="nvr-btn mono"
                 style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                onClick={() => setRangeStart((s) => s - 10)}
+                onClick={() => {
+                  setRangeStart((s) => Math.max(dayBounds.dayStart, s - 10));
+                  setReadyDownloadUrl(null);
+                }}
               >
                 -10s
               </button>
@@ -1627,7 +1777,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               <button
                 className="nvr-btn mono"
                 style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                onClick={() => setRangeStart((s) => Math.min(rangeEnd - 5, s + 10))}
+                onClick={() => {
+                  setRangeStart((s) => Math.min(rangeEnd - 5, s + 10));
+                  setReadyDownloadUrl(null);
+                }}
               >
                 +10s
               </button>
@@ -1658,7 +1811,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               <button
                 className="nvr-btn mono"
                 style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                onClick={() => setRangeEnd((e) => Math.max(rangeStart + 5, e - 10))}
+                onClick={() => {
+                  setRangeEnd((e) => Math.max(rangeStart + 5, e - 10));
+                  setReadyDownloadUrl(null);
+                }}
               >
                 -10s
               </button>
@@ -1679,7 +1835,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               <button
                 className="nvr-btn mono"
                 style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                onClick={() => setRangeEnd((e) => Math.min(nowSec, e + 10))}
+                onClick={() => {
+                  setRangeEnd((e) => Math.min(nowSec, e + 10));
+                  setReadyDownloadUrl(null);
+                }}
               >
                 +10s
               </button>
@@ -1716,7 +1875,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 key={p.sec}
                 className="nvr-btn mono"
                 style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                onClick={() => setRangeEnd(Math.min(nowSec, rangeStart + p.sec))}
+                onClick={() => {
+                  setRangeEnd(Math.min(nowSec, rangeStart + p.sec));
+                  setReadyDownloadUrl(null);
+                }}
               >
                 {p.label}
               </button>
@@ -1840,10 +2002,21 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           onPointerLeave={() => {
             if (!draggingTarget) setHoverTs(null);
           }}
+          onPointerCancel={() => {
+            releaseTrackPointerCapture();
+            if (!draggingTarget) setHoverTs(null);
+          }}
+          onLostPointerCapture={() => {
+            activePointerIdRef.current = null;
+          }}
+          onBlur={() => {
+            if (!draggingTarget) setHoverTs(null);
+          }}
           onPointerDown={(e) => {
             if ((e.target as HTMLElement).dataset.handle) return;
             try {
               e.currentTarget.setPointerCapture(e.pointerId);
+              activePointerIdRef.current = e.pointerId;
             } catch {
               // ignore
             }
@@ -1991,7 +2164,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               >
                 {hoveredReviewOnTrack && (
                   <img
-                    src={hoveredReviewOnTrack.thumb_path.replace(/^\/media\/[^/]+/, "")}
+                    src={
+                      hoveredReviewOnTrack.thumb_path
+                        ? hoveredReviewOnTrack.thumb_path.replace(/^\/media\/[^/]+/, "")
+                        : `/api/${encodeURIComponent(hoveredReviewOnTrack.camera)}/latest.webp`
+                    }
                     alt="preview"
                     width={128}
                     height={72}

@@ -171,10 +171,12 @@ export function parseHexColor(hex: string): RgbColor {
 }
 
 export function rgbToHex(rgb: RgbColor): string {
-  const clampByte = (n: number) =>
-    Math.max(0, Math.min(255, Math.round(n)))
+  const clampByte = (n: number) => {
+    const safe = typeof n === "number" && Number.isFinite(n) ? n : 0;
+    return Math.max(0, Math.min(255, Math.round(safe)))
       .toString(16)
       .padStart(2, "0");
+  };
   return `#${clampByte(rgb.r)}${clampByte(rgb.g)}${clampByte(rgb.b)}`;
 }
 
@@ -183,7 +185,11 @@ function resolveRgb(color: string | RgbColor): RgbColor {
 }
 
 export function srgbChannelToLinear(channel8Bit: number): number {
-  const c = Math.max(0, Math.min(255, channel8Bit)) / 255;
+  const safe =
+    typeof channel8Bit === "number" && Number.isFinite(channel8Bit)
+      ? channel8Bit
+      : 0;
+  const c = Math.max(0, Math.min(255, safe)) / 255;
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
@@ -212,7 +218,9 @@ export function cieLightnessLStar(color: string | RgbColor): number {
 }
 
 export function cieLightnessFromLuminance(relativeY: number): number {
-  const y = Math.max(0, Math.min(1, relativeY));
+  const safeY =
+    typeof relativeY === "number" && Number.isFinite(relativeY) ? relativeY : 0;
+  const y = Math.max(0, Math.min(1, safeY));
   const epsilon = 216 / 24389;
   const kappa = 24389 / 27;
   return y <= epsilon ? y * kappa : 116 * Math.cbrt(y) - 16;
@@ -227,7 +235,10 @@ export function deltaLStar(
 
 export function quantizeHdmiLimitedRange(color: string | RgbColor): RgbColor {
   const { r, g, b } = resolveRgb(color);
-  const clamp16To235 = (v: number) => Math.max(16, Math.min(235, Math.round(v)));
+  const clamp16To235 = (v: number) => {
+    const safe = typeof v === "number" && Number.isFinite(v) ? v : 16;
+    return Math.max(16, Math.min(235, Math.round(safe)));
+  };
   return {
     r: clamp16To235(r),
     g: clamp16To235(g),
@@ -245,7 +256,10 @@ export function simulateGamma24Transfer(
   lStar: number;
 } {
   const quantizedRgb = quantizeHdmiLimitedRange(color);
-  const safeGamma = gamma > 0 ? gamma : 2.4;
+  const safeGamma =
+    typeof gamma === "number" && Number.isFinite(gamma) && gamma > 0
+      ? gamma
+      : 2.4;
   const transferChannel = (v: number) => {
     const normLimited = (v - 16) / (235 - 16);
     return Math.pow(Math.max(0, Math.min(1, normLimited)), safeGamma);

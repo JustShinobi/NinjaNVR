@@ -26,7 +26,10 @@ export function resolvePickerMode(
   cameraCount: number,
   threshold: number = DEFAULT_PICKER_THRESHOLD
 ): "inline" | "combobox" {
-  return cameraCount <= threshold ? "inline" : "combobox";
+  const safeThreshold = Number.isFinite(threshold)
+    ? Math.max(0, Math.floor(threshold))
+    : DEFAULT_PICKER_THRESHOLD;
+  return cameraCount <= safeThreshold ? "inline" : "combobox";
 }
 
 export function getCameraPickerStatus(
@@ -198,7 +201,12 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
   }
 
   const currentIdx = Math.max(0, cameras.indexOf(selectedCamera));
+  const displayIdx = cameras.length > 0 ? currentIdx + 1 : 0;
   const activeCamLabel = (selectedCamera || cameras[0] || "CAM").toUpperCase();
+  const safeHighlightedIdx =
+    filteredCameras.length > 0
+      ? Math.min(Math.max(0, highlightedIdx), filteredCameras.length - 1)
+      : 0;
   const activeStatus = getCameraPickerStatus(
     selectedCamera || cameras[0] || "",
     cameraStats,
@@ -242,7 +250,7 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
         <span className={`nvr-dot ${dotClass}`} />
         <Video size={11} />
         <span>
-          {activeCamLabel} ({currentIdx + 1} / {cameras.length})
+          {activeCamLabel} ({displayIdx} / {cameras.length})
         </span>
         <ChevronDown size={11} />
       </button>
@@ -286,7 +294,7 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
               );
             } else if (e.key === "Enter") {
               e.preventDefault();
-              const chosen = filteredCameras[highlightedIdx];
+              const chosen = filteredCameras[safeHighlightedIdx];
               if (chosen) {
                 onSelect(chosen);
                 setOpen(false);
@@ -373,7 +381,7 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
             ) : (
               filteredCameras.map((cam, idx) => {
                 const isSelected = cam === selectedCamera;
-                const isHighlighted = idx === highlightedIdx;
+                const isHighlighted = idx === safeHighlightedIdx;
                 const st = getCameraPickerStatus(cam, cameraStats, cameraActivity);
                 const itemDot =
                   st === "alert" ? "motion" : st === "offline" ? "alert" : "live";
@@ -400,7 +408,9 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
                       </span>
                     </span>
                     <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                      {fps !== undefined ? `${fps.toFixed(1)} FPS` : st.toUpperCase()}
+                      {typeof fps === "number" && Number.isFinite(fps)
+                        ? `${fps.toFixed(1)} FPS`
+                        : st.toUpperCase()}
                     </span>
                   </button>
                 );

@@ -1,12 +1,63 @@
 import { GenAiConfig, NinjaConfigResponse } from "../types/nvr";
 
 /**
- * Extracts all raw `rtsp://...` or `rtsps://...` URLs from an existing raw YAML string
- * so scrubbed `*:*@` URLs in `draftConfig` can be restored losslessly.
+ * Parses a single-line YAML scalar value, preserving `#` characters inside single or double quotes
+ * and unescaping JSON double-quoted strings or YAML single-quoted strings (`''` -> `'`).
+ */
+export function parseYamlScalarValue(rawField: string): string {
+  const trimmed = rawField.trim();
+  if (!trimmed) return "";
+
+  if (trimmed.startsWith('"')) {
+    let escaped = false;
+    for (let i = 1; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        const quotedLiteral = trimmed.slice(0, i + 1);
+        try {
+          const parsed = JSON.parse(quotedLiteral);
+          return typeof parsed === "string" ? parsed : String(parsed);
+        } catch {
+          return trimmed.slice(1, i);
+        }
+      }
+    }
+    return trimmed.slice(1);
+  }
+
+  if (trimmed.startsWith("'")) {
+    for (let i = 1; i < trimmed.length; i++) {
+      if (trimmed[i] === "'") {
+        if (trimmed[i + 1] === "'") {
+          i += 1;
+          continue;
+        }
+        return trimmed.slice(1, i).replace(/''/g, "'");
+      }
+    }
+    return trimmed.slice(1).replace(/''/g, "'");
+  }
+
+  return trimmed.replace(/\s+#.*$/, "").trim();
+}
+
+/**
+ * Extracts all raw `rtsp://...`, `rtsps://...`, `http://...`, `https://...`, `rtmp://...` URLs
+ * from an existing raw YAML string so scrubbed `*:*@` URLs in `draftConfig` can be restored losslessly.
  */
 function extractOriginalUrls(rawYaml: string): string[] {
-  const matches = rawYaml.match(/rtsps?:\/\/[^\s"'#]+[^\s"']*/gi);
-  return matches ? Array.from(new Set(matches)) : [];
+  const matches = rawYaml.match(/(?:rtsps?|https?|rtmps?):\/\/[^\s"'#]+[^\s"']*/gi);
+  if (!matches) return [];
+  const cleaned = matches.map((u) => u.replace(/\\"/g, '"').replace(/\\\\/g, "\\"));
+  return Array.from(new Set(cleaned));
 }
 
 /**
@@ -31,8 +82,8 @@ function extractOriginalOnvifPasswords(rawYaml: string): Record<string, string> 
       continue;
     }
     if (inCameras && indent === 2) {
-      const m = trimmed.match(/^([a-zA-Z0-9_-]+)\s*:/);
-      currentCam = m ? m[1] : "";
+      const m = trimmed.match(/^(?:"([^"]+)"|'([^']+)'|([a-zA-Z0-9_.-]+))\s*:/);
+      currentCam = m ? m[1] || m[2] || m[3] || "" : "";
       inOnvif = false;
       continue;
     }
@@ -43,9 +94,8 @@ function extractOriginalOnvifPasswords(rawYaml: string): Record<string, string> 
     if (inCameras && currentCam && inOnvif && indent >= 6) {
       const pwMatch = trimmed.match(/^password\s*:\s*(.+)$/);
       if (pwMatch) {
-        const rawVal = pwMatch[1].replace(/\s+#.*$/, "").trim();
-        const unquoted = rawVal.replace(/^["']|["']$/g, "");
-        if (unquoted && unquoted !== "***" && unquoted !== "null") {
+        const unquoted = parseYamlScalarValue(pwMatch[1]);
+        if (unquoted && unquoted !== "***" && unquoted !== "*" && unquoted !== "null") {
           result[currentCam] = unquoted;
         }
       }
@@ -68,8 +118,31 @@ function extractOriginalGenAiApiKey(rawYaml: string): string | undefined {
     if (inGenAi && indent >= 2) {
       const m = trimmed.match(/^api_key\s*:\s*(.+)$/);
       if (m) {
-        const rawVal = m[1].replace(/\s+#.*$/, "").trim();
-        const unquoted = rawVal.replace(/^["']|["']$/g, "");
+        const unquoted = parseYamlScalarValue(m[1]);
+        if (unquoted && unquoted !== "***" && unquoted !== "*" && unquoted !== "null") {
+          return unquoted;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+function extractOriginalMqttPassword(rawYaml: string): string | undefined {
+  const lines = rawYaml.split(/\r?\n/);
+  let inMqtt = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const indent = line.search(/\S/);
+    if (indent === 0) {
+      inMqtt = /^mqtt\s*:/.test(trimmed);
+      continue;
+    }
+    if (inMqtt && indent >= 2) {
+      const m = trimmed.match(/^password\s*:\s*(.+)$/);
+      if (m) {
+        const unquoted = parseYamlScalarValue(m[1]);
         if (unquoted && unquoted !== "***" && unquoted !== "*" && unquoted !== "null") {
           return unquoted;
         }
@@ -188,6 +261,18 @@ function scrubUrl(input: string): string {
   return `${input.slice(0, schemeIdx + 3)}${mask}@${afterScheme.slice(atIdx + 1)}`;
 }
 
+function extractHostFromAuthorityRest(rest: string): string {
+  const slashIdx = rest.search(/[/?#]/);
+  const hostPort = slashIdx === -1 ? rest : rest.slice(0, slashIdx);
+  if (hostPort.startsWith("[")) {
+    const closeIdx = hostPort.indexOf("]");
+    if (closeIdx !== -1) {
+      return hostPort.slice(0, closeIdx + 1);
+    }
+  }
+  return hostPort.split(":")[0];
+}
+
 function restoreUrl(candidate: string, originals: string[]): string {
   if (!candidate.includes("://*:*@") && !candidate.includes("://*@")) {
     return candidate;
@@ -204,7 +289,7 @@ function restoreUrl(candidate: string, originals: string[]): string {
     const atIdx = afterScheme.indexOf("@");
     if (atIdx !== -1) {
       const rest = afterScheme.slice(atIdx + 1);
-      const targetHost = rest.split(/[/?#:]/)[0];
+      const targetHost = extractHostFromAuthorityRest(rest);
       for (const orig of originals) {
         const oScheme = orig.indexOf("://");
         if (oScheme !== -1) {
@@ -214,7 +299,7 @@ function restoreUrl(candidate: string, originals: string[]): string {
           const oAt = oAuth.lastIndexOf("@");
           if (oAt !== -1) {
             const creds = oAuth.slice(0, oAt);
-            const oHost = oAuth.slice(oAt + 1).split(":")[0];
+            const oHost = extractHostFromAuthorityRest(oAuth.slice(oAt + 1));
             if (oHost === targetHost) {
               return `${candidate.slice(0, schemeIdx + 3)}${creds}@${rest}`;
             }
@@ -226,19 +311,42 @@ function restoreUrl(candidate: string, originals: string[]): string {
   return candidate;
 }
 
+const YAML_RESERVED_SCALAR_RE =
+  /^(true|false|null|yes|no|on|off|~|\.nan|\.inf|-\.inf|\+\.inf)$/i;
+const YAML_NUMERIC_STRING_RE =
+  /^(?:[+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|0[xXoObB][0-9a-fA-F_]+|0\d+)$/;
+
 function yamlScalar(val: unknown): string {
   if (val === null || val === undefined) return "null";
-  if (typeof val === "boolean" || typeof val === "number") return String(val);
+  if (typeof val === "boolean") return String(val);
+  if (typeof val === "number") {
+    return Number.isFinite(val) ? String(val) : "0";
+  }
   const s = String(val);
   if (
     s === "" ||
-    /[:#[\]{}&*!|>'"%@`]/.test(s) ||
+    /[\r\n\t\u0000-\u001f\u007f:#[\]{}&*!|>'"%@`,?]/.test(s) ||
     /^\s|\s$/.test(s) ||
-    /^(true|false|null|yes|no|on|off)$/i.test(s)
+    /^[-?]/.test(s) ||
+    YAML_RESERVED_SCALAR_RE.test(s) ||
+    YAML_NUMERIC_STRING_RE.test(s)
   ) {
     return JSON.stringify(s);
   }
   return s;
+}
+
+function yamlKey(key: string): string {
+  if (
+    !key ||
+    !/^[a-zA-Z0-9_-]+$/.test(key) ||
+    key.startsWith("-") ||
+    YAML_RESERVED_SCALAR_RE.test(key) ||
+    YAML_NUMERIC_STRING_RE.test(key)
+  ) {
+    return JSON.stringify(key);
+  }
+  return key;
 }
 
 function toYamlLines(val: unknown, indent = 0): string[] {
@@ -260,18 +368,28 @@ function toYamlLines(val: unknown, indent = 0): string[] {
         if (entries.length === 0) {
           lines.push(`${pad}- {}`);
         } else {
-          const [firstKey, firstVal] = entries[0];
+          const [rawFirstKey, firstVal] = entries[0];
+          const firstKey = yamlKey(rawFirstKey);
           if (firstVal !== null && typeof firstVal === "object") {
-            lines.push(`${pad}- ${firstKey}:`);
-            lines.push(...toYamlLines(firstVal, indent + 2));
+            if (Array.isArray(firstVal) && firstVal.length === 0) {
+              lines.push(`${pad}- ${firstKey}: []`);
+            } else if (!Array.isArray(firstVal) && Object.keys(firstVal as object).length === 0) {
+              lines.push(`${pad}- ${firstKey}: {}`);
+            } else {
+              lines.push(`${pad}- ${firstKey}:`);
+              lines.push(...toYamlLines(firstVal, indent + 2));
+            }
           } else {
             lines.push(`${pad}- ${firstKey}: ${yamlScalar(firstVal)}`);
           }
           for (let i = 1; i < entries.length; i++) {
-            const [k, v] = entries[i];
+            const [rawK, v] = entries[i];
+            const k = yamlKey(rawK);
             if (v !== null && typeof v === "object") {
               if (Array.isArray(v) && v.length === 0) {
                 lines.push(`${pad}  ${k}: []`);
+              } else if (!Array.isArray(v) && Object.keys(v as object).length === 0) {
+                lines.push(`${pad}  ${k}: {}`);
               } else {
                 lines.push(`${pad}  ${k}:`);
                 lines.push(...toYamlLines(v, indent + 2));
@@ -294,7 +412,7 @@ function toYamlLines(val: unknown, indent = 0): string[] {
   if (entries.length === 0) return [`${pad}{}`];
   const lines: string[] = [];
   for (const [k, v] of entries) {
-    const safeKey = /^[a-zA-Z0-9_-]+$/.test(k) ? k : JSON.stringify(k);
+    const safeKey = yamlKey(k);
     if (v !== null && typeof v === "object") {
       if (Array.isArray(v) && v.length === 0) {
         lines.push(`${pad}${safeKey}: []`);
@@ -311,6 +429,15 @@ function toYamlLines(val: unknown, indent = 0): string[] {
   return lines;
 }
 
+function finiteRound(
+  val: number | undefined | null,
+  fallback: number,
+  decimals: number
+): number {
+  const safe = typeof val === "number" && Number.isFinite(val) ? val : fallback;
+  return Number(safe.toFixed(decimals));
+}
+
 /**
  * Builds a clean, NinjaNVR-compatible `config.yml` string from `draftConfig`,
  * preserving any unscrubbed RTSP URLs from `originalRawYaml`.
@@ -322,6 +449,7 @@ export function buildCleanYamlFromDraft(
   const originals = extractOriginalUrls(originalRawYaml);
   const originalOnvifPasswords = extractOriginalOnvifPasswords(originalRawYaml);
   const originalGenAiApiKey = extractOriginalGenAiApiKey(originalRawYaml);
+  const originalMqttPassword = extractOriginalMqttPassword(originalRawYaml);
 
   const streamsOut: Record<string, unknown> = {};
   for (const [sName, sVal] of Object.entries(draft.go2rtc?.streams || {})) {
@@ -374,8 +502,10 @@ export function buildCleanYamlFromDraft(
       motion: {
         enabled: cam.motion?.enabled ?? true,
         threshold: cam.motion?.threshold ?? 30,
-        lightning_threshold: Number(
-          (cam.motion?.lightning_threshold ?? 0.8).toFixed(2)
+        lightning_threshold: finiteRound(
+          cam.motion?.lightning_threshold,
+          0.8,
+          2
         ),
         improve_contrast: cam.motion?.improve_contrast ?? true,
         contour_area: cam.motion?.contour_area ?? 10,
@@ -471,7 +601,7 @@ export function buildCleanYamlFromDraft(
                 roiName,
                 {
                   crop: (roiCfg.crop || [0.25, 0.25, 0.75, 0.75]).map((v) =>
-                    Number(Number(v).toFixed(4))
+                    finiteRound(Number(v), 0, 4)
                   ),
                   classes:
                     roiCfg.classes && roiCfg.classes.length > 0
@@ -505,7 +635,7 @@ export function buildCleanYamlFromDraft(
             return {
               onvif: {
                 ...(cam.onvif.host && cam.onvif.host.trim()
-                  ? { host: cam.onvif.host.trim() }
+                  ? { host: restoreUrl(cam.onvif.host.trim(), originals) }
                   : {}),
                 port: cam.onvif.port ?? 80,
                 ...(cam.onvif.user && cam.onvif.user.trim()
@@ -533,11 +663,11 @@ export function buildCleanYamlFromDraft(
       ...(cam.map
         ? {
             map: {
-              x: Number((cam.map.x ?? 0.5).toFixed(3)),
-              y: Number((cam.map.y ?? 0.5).toFixed(3)),
-              angle_deg: Number((cam.map.angle_deg ?? 0).toFixed(1)),
-              fov_deg: Number((cam.map.fov_deg ?? 90).toFixed(1)),
-              range: Number((cam.map.range ?? 0.25).toFixed(3)),
+              x: finiteRound(cam.map.x, 0.5, 3),
+              y: finiteRound(cam.map.y, 0.5, 3),
+              angle_deg: finiteRound(cam.map.angle_deg, 0, 1),
+              fov_deg: finiteRound(cam.map.fov_deg, 90, 1),
+              range: finiteRound(cam.map.range, 0.25, 3),
             },
           }
         : {}),
@@ -555,6 +685,14 @@ export function buildCleanYamlFromDraft(
     };
   }
 
+  const rawMqttPassword = draft.mqtt?.clear_password
+    ? undefined
+    : draft.mqtt?.password &&
+      draft.mqtt.password !== "***" &&
+      draft.mqtt.password !== "*"
+    ? draft.mqtt.password
+    : originalMqttPassword;
+
   const rootObj: Record<string, unknown> = {
     mqtt: {
       enabled: draft.mqtt?.enabled ?? true,
@@ -564,7 +702,7 @@ export function buildCleanYamlFromDraft(
       client_id: draft.mqtt?.client_id || "ninjanvr",
       stats_interval: draft.mqtt?.stats_interval ?? 60,
       ...(draft.mqtt?.user ? { user: draft.mqtt.user } : {}),
-      ...(draft.mqtt?.password ? { password: draft.mqtt.password } : {}),
+      ...(rawMqttPassword ? { password: rawMqttPassword } : {}),
     },
     auth: {
       enabled: draft.auth?.enabled ?? true,
@@ -605,17 +743,23 @@ export function buildCleanYamlFromDraft(
             genai: {
               enabled: draft.genai.enabled ?? false,
               provider: draft.genai.provider || "gemini",
-              ...(draft.genai.base_url ? { base_url: draft.genai.base_url } : {}),
+              ...(draft.genai.base_url
+                ? { base_url: restoreUrl(draft.genai.base_url, originals) }
+                : {}),
               ...(rawApiKey ? { api_key: rawApiKey } : {}),
               api_key_env: draft.genai.api_key_env || "GEMINI_API_KEY",
               model: draft.genai.model ?? "",
               verify_ambiguous_alerts:
                 draft.genai.verify_ambiguous_alerts ?? false,
-              ambiguous_score_min: Number(
-                (draft.genai.ambiguous_score_min ?? 0.45).toFixed(2)
+              ambiguous_score_min: finiteRound(
+                draft.genai.ambiguous_score_min,
+                0.45,
+                2
               ),
-              ambiguous_score_max: Number(
-                (draft.genai.ambiguous_score_max ?? 0.72).toFixed(2)
+              ambiguous_score_max: finiteRound(
+                draft.genai.ambiguous_score_max,
+                0.72,
+                2
               ),
               auto_suppress_false_positives:
                 draft.genai.auto_suppress_false_positives ?? true,
@@ -633,8 +777,10 @@ export function buildCleanYamlFromDraft(
             model_path:
               draft.face_recognition.model_path ||
               "/config/models/arcface_r50.onnx",
-            similarity_threshold: Number(
-              (draft.face_recognition.similarity_threshold ?? 0.68).toFixed(2)
+            similarity_threshold: finiteRound(
+              draft.face_recognition.similarity_threshold,
+              0.68,
+              2
             ),
             min_face_area: draft.face_recognition.min_face_area ?? 750,
             unknown_alert: draft.face_recognition.unknown_alert ?? false,
@@ -667,8 +813,10 @@ export function buildCleanYamlFromDraft(
             ...(draft.lpr.ocr_model_path
               ? { ocr_model_path: draft.lpr.ocr_model_path }
               : {}),
-            min_confidence: Number(
-              (draft.lpr.min_confidence ?? 0.75).toFixed(2)
+            min_confidence: finiteRound(
+              draft.lpr.min_confidence,
+              0.75,
+              2
             ),
             ...(draft.lpr.format_regex
               ? { format_regex: draft.lpr.format_regex }
@@ -735,26 +883,28 @@ export function buildCleanYamlFromDraft(
                             draft.ui.floorplan.background_data_url,
                         }
                       : {}),
-                    opacity: Number(
-                      (draft.ui.floorplan.opacity ?? 0.45).toFixed(2)
+                    opacity: finiteRound(
+                      draft.ui.floorplan.opacity,
+                      0.45,
+                      2
                     ),
                     ...(draft.ui.floorplan.width_m !== undefined
-                      ? { width_m: Number(draft.ui.floorplan.width_m.toFixed(2)) }
+                      ? { width_m: finiteRound(draft.ui.floorplan.width_m, 20, 2) }
                       : {}),
                     ...(draft.ui.floorplan.height_m !== undefined
-                      ? { height_m: Number(draft.ui.floorplan.height_m.toFixed(2)) }
+                      ? { height_m: finiteRound(draft.ui.floorplan.height_m, 12, 2) }
                       : {}),
                     rooms: (draft.ui.floorplan.rooms || []).map((r) => ({
                       id: r.id,
                       label: r.label,
-                      x: Number(r.x.toFixed(3)),
-                      y: Number(r.y.toFixed(3)),
-                      w: Number(r.w.toFixed(3)),
-                      h: Number(r.h.toFixed(3)),
+                      x: finiteRound(r.x, 0, 3),
+                      y: finiteRound(r.y, 0, 3),
+                      w: finiteRound(r.w, 0.1, 3),
+                      h: finiteRound(r.h, 0.1, 3),
                       ...(r.color ? { color: r.color } : {}),
                     })),
                     walls: (draft.ui.floorplan.walls || []).map((w) => ({
-                      points: w.points.map((p) => Number(p.toFixed(3))),
+                      points: w.points.map((p) => finiteRound(p, 0, 3)),
                       ...(w.label ? { label: w.label } : {}),
                       ...(w.kind && w.kind !== "wall" ? { kind: w.kind } : {}),
                     })),
@@ -792,15 +942,12 @@ export function validateLicensePlateFormat(
 ): boolean {
   const norm = normalizeLicensePlate(plate);
   if (norm.length < 4 || norm.length > 10) return false;
-  const pattern =
-    formatRegex && formatRegex.trim().length > 0
+  const trimmedRegex =
+    formatRegex && formatRegex.trim().length > 0 && formatRegex.trim().length <= 256
       ? formatRegex.trim()
       : DEFAULT_LPR_FORMAT_REGEX;
   try {
-    const anchored =
-      pattern.startsWith("^") && pattern.endsWith("$")
-        ? pattern
-        : `^(?:${pattern.replace(/^\^/, "").replace(/\$$/, "")})$`;
+    const anchored = `^(?:${trimmedRegex.replace(/^\^/, "").replace(/\$$/, "")})$`;
     return new RegExp(anchored).test(norm);
   } catch {
     return new RegExp(DEFAULT_LPR_FORMAT_REGEX).test(norm);

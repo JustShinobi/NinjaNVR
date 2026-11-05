@@ -239,14 +239,28 @@ export function createPushToTalkController(
     }
   };
 
+  const closedObjects = new WeakSet<object>();
+  const closeOnce = (
+    streamToClose: PushToTalkStreamLike | null | undefined,
+    pcToClose: PushToTalkPeerConnectionLike | null | undefined
+  ) => {
+    const filteredStream =
+      streamToClose && !closedObjects.has(streamToClose) ? streamToClose : null;
+    const filteredPc =
+      pcToClose && !closedObjects.has(pcToClose) ? pcToClose : null;
+    if (filteredStream) closedObjects.add(filteredStream);
+    if (filteredPc) closedObjects.add(filteredPc);
+    if (filteredStream || filteredPc) {
+      closePushToTalkSession(filteredStream, filteredPc);
+    }
+  };
+
   const cleanupActive = () => {
     const streamToClose = activeStream;
     const pcToClose = activePc;
     activeStream = null;
     activePc = null;
-    if (streamToClose || pcToClose) {
-      closePushToTalkSession(streamToClose, pcToClose);
-    }
+    closeOnce(streamToClose, pcToClose);
   };
 
   return {
@@ -261,9 +275,56 @@ export function createPushToTalkController(
       notify("connecting", null);
 
       try {
-        const session = await startPushToTalkSession(camera, deps);
+        const baseGetUserMedia = deps?.getUserMedia;
+        const baseCreatePc = deps?.createPeerConnection;
+        const wrappedDeps: PushToTalkDependencies = {
+          ...deps,
+          ...(baseGetUserMedia
+            ? {
+                getUserMedia: async (constraints) => {
+                  const s = await baseGetUserMedia(constraints);
+                  if (unmounted || myToken !== sessionToken) {
+                    closeOnce(s, null);
+                    throw new Error("Push-to-Talk cancelled during microphone acquisition");
+                  }
+                  activeStream = s;
+                  return s;
+                },
+              }
+            : {
+                getUserMedia: async (constraints) => {
+                  if (
+                    typeof navigator === "undefined" ||
+                    !navigator.mediaDevices ||
+                    typeof navigator.mediaDevices.getUserMedia !== "function"
+                  ) {
+                    throw new Error(
+                      "Microphone capture (getUserMedia) is unavailable in this browser context"
+                    );
+                  }
+                  const s = await navigator.mediaDevices.getUserMedia(constraints);
+                  if (unmounted || myToken !== sessionToken) {
+                    closeOnce(s, null);
+                    throw new Error("Push-to-Talk cancelled during microphone acquisition");
+                  }
+                  activeStream = s;
+                  return s;
+                },
+              }),
+          ...(baseCreatePc
+            ? {
+                createPeerConnection: () => {
+                  const created = baseCreatePc();
+                  activePc = created;
+                  return created;
+                },
+              }
+            : {}),
+        };
+        const session = await startPushToTalkSession(camera, wrappedDeps);
         if (unmounted || myToken !== sessionToken) {
-          closePushToTalkSession(session.stream, session.pc);
+          closeOnce(session.stream, session.pc);
+          cleanupActive();
           return false;
         }
         activeStream = session.stream;
@@ -271,7 +332,12 @@ export function createPushToTalkController(
         notify("talking", null);
         return true;
       } catch (err) {
-        cleanupActive();
+        // startPushToTalkSession already closes its stream and pc on internal failure;
+        // mark them in closedObjects so cleanupActive does not double-stop tracks.
+        if (activeStream) closedObjects.add(activeStream);
+        if (activePc) closedObjects.add(activePc);
+        activeStream = null;
+        activePc = null;
         if (!unmounted && myToken === sessionToken) {
           const msg = err instanceof Error ? err.message : String(err);
           notify("error", msg);
@@ -374,11 +440,30 @@ export const PushToTalkButton: React.FC<PushToTalkButtonProps> = ({
       }}
       onPointerUp={(e) => {
         e.stopPropagation();
+        try {
+          if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          }
+        } catch {
+          // ignore
+        }
         controllerRef.current?.release();
       }}
       onPointerCancel={(e) => {
         e.stopPropagation();
+        try {
+          if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          }
+        } catch {
+          // ignore
+        }
         controllerRef.current?.release();
+      }}
+      onLostPointerCapture={() => {
+        if (isTalking || isConnecting) {
+          controllerRef.current?.release();
+        }
       }}
       onKeyDown={(e) => {
         if ((e.key === " " || e.key === "Enter") && !e.repeat) {
@@ -546,10 +631,28 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
       onPointerUp={(e) => {
         if (!isDragging) return;
         e.stopPropagation();
+        try {
+          if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          }
+        } catch {
+          // ignore
+        }
         setIsDragging(false);
         dragOriginRef.current = null;
       }}
-      onPointerCancel={() => {
+      onPointerCancel={(e) => {
+        try {
+          if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+            e.currentTarget.releasePointerCapture(e.pointerId);
+          }
+        } catch {
+          // ignore
+        }
+        setIsDragging(false);
+        dragOriginRef.current = null;
+      }}
+      onLostPointerCapture={() => {
         setIsDragging(false);
         dragOriginRef.current = null;
       }}
@@ -800,6 +903,17 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     null,
     null,
   ]);
+  const slotTeardownTimersRef = useRef<[number | null, number | null]>([
+    null,
+    null,
+  ]);
+  const clearSlotTeardownTimer = useCallback((slot: VideoSlotIndex) => {
+    const t = slotTeardownTimersRef.current[slot];
+    if (t !== null && typeof window !== "undefined") {
+      window.clearTimeout(t);
+      slotTeardownTimersRef.current[slot] = null;
+    }
+  }, []);
   const [activeSlot, setActiveSlot] = useState<VideoSlotIndex>(0);
   const [outgoingSlot, setOutgoingSlot] = useState<VideoSlotIndex | null>(null);
   const [mseReady, setMseReady] = useState(false);
@@ -954,6 +1068,9 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         return;
       }
 
+      clearSlotTeardownTimer(slot);
+      setOutgoingSlot((cur) => (cur === slot ? null : cur));
+
       if (slot === slotMachineRef.current.getState().activeSlot) {
         captureVideoElementFrame(realCameraRef.current, videoEl);
       }
@@ -980,7 +1097,6 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
 
       let initialBurstSeekDone = false;
       let promotedOnce = false;
-      let teardownTimer: number | null = null;
 
       const clearWatchdog = () => {
         if (watchdogTimer !== null) {
@@ -1020,7 +1136,14 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       resetWatchdog(MSE_HANDSHAKE_TIMEOUT_MS);
 
       const flushQueue = () => {
-        if (closed || !sourceBuffer || sourceBuffer.updating || queue.length === 0) {
+        if (
+          closed ||
+          !sourceBuffer ||
+          sourceBuffer.updating ||
+          queue.length === 0 ||
+          !mediaSource ||
+          mediaSource.readyState !== "open"
+        ) {
           return;
         }
         const batch = queue.splice(0, queue.length);
@@ -1028,10 +1151,31 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         if (!merged) return;
         try {
           sourceBuffer.appendBuffer(merged);
-        } catch {
-          if (videoEl.error || (mediaSource && mediaSource.readyState !== "open")) {
-            handleSlotFailure();
+        } catch (err) {
+          const errName = (err as { name?: string } | null)?.name;
+          if (
+            errName === "QuotaExceededError" &&
+            !closed &&
+            mediaSource &&
+            mediaSource.readyState === "open" &&
+            !sourceBuffer.updating &&
+            videoEl.buffered.length > 0
+          ) {
+            try {
+              const start = videoEl.buffered.start(0);
+              const end = videoEl.buffered.end(videoEl.buffered.length - 1);
+              if (end > start + 2) {
+                if (queue.length < 256) {
+                  queue.unshift(merged);
+                }
+                sourceBuffer.remove(start, Math.max(start + 0.5, end - 4));
+                return;
+              }
+            } catch {
+              // fall through to failure recovery
+            }
           }
+          handleSlotFailure();
         }
       };
 
@@ -1057,7 +1201,12 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             if (videoEl.readyState >= 2) {
               tryPromoteSlot();
             }
-            if (end - start > 18 && !sourceBuffer.updating && queue.length === 0) {
+            if (
+              end - start > 18 &&
+              !sourceBuffer.updating &&
+              mediaSource &&
+              mediaSource.readyState === "open"
+            ) {
               try {
                 sourceBuffer.remove(start, end - 10);
                 return;
@@ -1072,7 +1221,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         flushQueue();
       };
 
-      mediaSource.addEventListener("sourceopen", () => {
+      const onSourceOpen = () => {
         if (closed) return;
         ws = new WebSocket(wsUrl);
         ws.binaryType = "arraybuffer";
@@ -1114,19 +1263,24 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         ws.onmessage = (ev) => {
           if (closed) return;
           if (typeof ev.data === "string") {
+            let msg: { type?: unknown; value?: unknown } | null = null;
             try {
-              const msg = JSON.parse(ev.data);
-              if (msg.type === "mse" && typeof msg.value === "string" && mediaSource) {
-                if (!sourceBuffer && mediaSource.readyState === "open") {
+              msg = JSON.parse(ev.data);
+            } catch {
+              return;
+            }
+            if (msg && msg.type === "mse" && typeof msg.value === "string" && mediaSource) {
+              if (!sourceBuffer && mediaSource.readyState === "open") {
+                try {
                   sourceBuffer = mediaSource.addSourceBuffer(msg.value);
                   sourceBuffer.mode = "segments";
                   sourceBuffer.addEventListener("updateend", onUpdateEnd);
                   sourceBuffer.addEventListener("error", handleSlotFailure);
                   flushQueue();
+                } catch {
+                  handleSlotFailure();
                 }
               }
-            } catch {
-              // ignore malformed JSON
             }
           } else if (ev.data instanceof ArrayBuffer) {
             if (promotedOnce) {
@@ -1138,7 +1292,9 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             flushQueue();
           }
         };
-      });
+      };
+
+      mediaSource.addEventListener("sourceopen", onSourceOpen);
 
       const tryPromoteSlot = () => {
         if (closed || promotedOnce) return;
@@ -1165,11 +1321,19 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
           videoEl.play().catch(() => {});
           if (res.teardownSlot !== null) {
             const oldSlot = res.teardownSlot;
+            const cleanupToRun = slotCleanupsRef.current[oldSlot];
+            clearSlotTeardownTimer(oldSlot);
             setOutgoingSlot(oldSlot);
-            teardownTimer = window.setTimeout(() => {
+            slotTeardownTimersRef.current[oldSlot] = window.setTimeout(() => {
+              slotTeardownTimersRef.current[oldSlot] = null;
               setOutgoingSlot((cur) => (cur === oldSlot ? null : cur));
-              slotCleanupsRef.current[oldSlot]?.();
-              slotCleanupsRef.current[oldSlot] = null;
+              if (
+                cleanupToRun &&
+                slotCleanupsRef.current[oldSlot] === cleanupToRun
+              ) {
+                cleanupToRun();
+                slotCleanupsRef.current[oldSlot] = null;
+              }
             }, 80);
           }
         }
@@ -1214,10 +1378,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       slotCleanupsRef.current[slot] = () => {
         closed = true;
         clearWatchdog();
-        if (teardownTimer !== null) {
-          window.clearTimeout(teardownTimer);
-          teardownTimer = null;
-        }
+        clearSlotTeardownTimer(slot);
+        queue.length = 0;
         videoEl.removeEventListener("loadeddata", onLoadedData);
         videoEl.removeEventListener("canplay", onCanPlayOrSeeked);
         videoEl.removeEventListener("seeked", onCanPlayOrSeeked);
@@ -1225,15 +1387,31 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         videoEl.removeEventListener("error", onVideoError);
         videoEl.removeEventListener("resize", updateOverlayGeometry);
         try {
-          sourceBuffer?.removeEventListener("updateend", onUpdateEnd);
-          sourceBuffer?.removeEventListener("error", handleSlotFailure);
+          mediaSource?.removeEventListener("sourceopen", onSourceOpen);
         } catch {
           // ignore
         }
         try {
-          ws?.close();
+          sourceBuffer?.removeEventListener("updateend", onUpdateEnd);
+          sourceBuffer?.removeEventListener("error", handleSlotFailure);
+          if (sourceBuffer && mediaSource && mediaSource.readyState === "open") {
+            sourceBuffer.abort();
+            mediaSource.removeSourceBuffer(sourceBuffer);
+          }
         } catch {
           // ignore
+        }
+        if (ws) {
+          ws.onopen = null;
+          ws.onmessage = null;
+          ws.onerror = null;
+          ws.onclose = null;
+          try {
+            ws.close();
+          } catch {
+            // ignore
+          }
+          ws = null;
         }
         try {
           videoEl.pause();
@@ -1245,7 +1423,13 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         URL.revokeObjectURL(objUrl);
       };
     },
-    [clearReconnectTimer, getSlotVideoEl, scheduleReconnect, updateOverlayGeometry]
+    [
+      clearReconnectTimer,
+      clearSlotTeardownTimer,
+      getSlotVideoEl,
+      scheduleReconnect,
+      updateOverlayGeometry,
+    ]
   );
 
   const connectDesiredStream = useCallback(
@@ -1340,12 +1524,14 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     return () => {
       unmountedRef.current = true;
       clearReconnectTimer();
+      clearSlotTeardownTimer(0);
+      clearSlotTeardownTimer(1);
       captureVideoElementFrame(realCameraRef.current, getActiveVideoEl());
       slotCleanupsRef.current[0]?.();
       slotCleanupsRef.current[1]?.();
       slotCleanupsRef.current = [null, null];
     };
-  }, [clearReconnectTimer, getActiveVideoEl]);
+  }, [clearReconnectTimer, clearSlotTeardownTimer, getActiveVideoEl]);
 
   const masks = extractMaskPolygons(cameraConfig?.motion?.mask);
   const objectMasks = extractMaskPolygons(cameraConfig?.objects?.mask);
@@ -1730,8 +1916,16 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     return muted;
   });
 
-  const safeStart = Math.floor(startTime);
-  const safeEnd = Math.ceil(Math.max(endTime, startTime + 12));
+  const finiteStart =
+    typeof startTime === "number" && Number.isFinite(startTime)
+      ? startTime
+      : Math.floor(Date.now() / 1000) - 60;
+  const finiteEnd =
+    typeof endTime === "number" && Number.isFinite(endTime)
+      ? endTime
+      : finiteStart + 12;
+  const safeStart = Math.floor(finiteStart);
+  const safeEnd = Math.ceil(Math.max(finiteEnd, finiteStart + 12));
   const hlsUrl = `/vod/${encodeURIComponent(camera)}/start/${safeStart}/end/${safeEnd}/index.m3u8`;
   const mp4FallbackUrl = fallbackPreviewId
     ? `/api/review/${encodeURIComponent(fallbackPreviewId)}/preview?format=mp4`
@@ -1798,7 +1992,20 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 
     return () => {
       if (hls) {
+        try {
+          hls.detachMedia();
+        } catch {
+          // ignore
+        }
         hls.destroy();
+      } else {
+        try {
+          videoEl.pause();
+          videoEl.removeAttribute("src");
+          videoEl.load();
+        } catch {
+          // ignore
+        }
       }
     };
   }, [hlsUrl, useFallbackMp4, fallbackPreviewId, autoPlay]);

@@ -35,6 +35,102 @@ import { ExportsWorkspace } from "./views/ExportsWorkspace";
 import { ZonesWorkspace } from "./views/ZonesWorkspace";
 import { SystemWorkspace } from "./views/SystemWorkspace";
 
+export const MAX_LIVE_EVENTS = 250;
+export const MAX_LIVE_REVIEWS = 300;
+
+export function upsertBoundedEventList(
+  prev: EventItem[],
+  incoming: EventItem,
+  maxItems = MAX_LIVE_EVENTS
+): EventItem[] {
+  const cap = Math.max(1, Math.floor(maxItems));
+  const idx = prev.findIndex((x) => x.id === incoming.id);
+  if (idx >= 0) {
+    const copy = [...prev];
+    copy[idx] = incoming;
+    return copy.slice(0, cap);
+  }
+  return [incoming, ...prev].slice(0, cap);
+}
+
+export function prependBoundedReviewAlert(
+  prev: ReviewItem[],
+  incoming: ReviewItem,
+  maxItems = MAX_LIVE_REVIEWS
+): ReviewItem[] {
+  const cap = Math.max(1, Math.floor(maxItems));
+  if (prev.some((r) => r.id === incoming.id)) {
+    return prev.slice(0, cap);
+  }
+  return [incoming, ...prev].slice(0, cap);
+}
+
+export function extractOidcCallbackError(
+  search: string,
+  pathname = ""
+): string | null {
+  try {
+    const rawSearch = (search || "").trim();
+    if (rawSearch) {
+      const params = new URLSearchParams(
+        rawSearch.startsWith("?") ? rawSearch.slice(1) : rawSearch
+      );
+      const errCode =
+        params.get("oidc_error") ||
+        params.get("auth_error") ||
+        params.get("error");
+      const errDesc = params.get("error_description");
+      if (errCode || errDesc) {
+        const cleanDesc = (errDesc || errCode || "SSO authentication failed")
+          .replace(/[\u0000-\u001f\u007f]/g, " ")
+          .trim()
+          .slice(0, 200);
+        return cleanDesc || "SSO authentication failed";
+      }
+    }
+    if (pathname.startsWith("/api/auth/oidc/callback")) {
+      return "SSO callback failed";
+    }
+  } catch {
+    // ignore malformed URL query
+  }
+  return null;
+}
+
+export function sanitizeExportVideoUrl(
+  rawUrl: string | undefined | null,
+  fallbackCamera: string,
+  startSec: number,
+  endSec: number
+): string {
+  const safeCam = encodeURIComponent((fallbackCamera || "camera").trim() || "camera");
+  const s = Number.isFinite(startSec) ? Math.floor(startSec) : 0;
+  const e = Number.isFinite(endSec) ? Math.ceil(Math.max(endSec, s + 5)) : s + 5;
+  const fallbackPath = `/exports/${safeCam}_${s}_${e}.mp4`;
+
+  const candidate = (rawUrl || "").trim();
+  if (!candidate || /[\u0000-\u0020\u007f\\]/.test(candidate)) {
+    return fallbackPath;
+  }
+  if (
+    candidate.startsWith("//") ||
+    candidate.includes("..") ||
+    /%2e/i.test(candidate) ||
+    /%5c/i.test(candidate)
+  ) {
+    return fallbackPath;
+  }
+  if (
+    candidate.startsWith("/exports/") ||
+    candidate.startsWith("/api/") ||
+    candidate.startsWith("/vod/") ||
+    candidate.startsWith("/clips/")
+  ) {
+    return candidate;
+  }
+  return fallbackPath;
+}
+
 export function playTacticalAlertChime(): void {
   try {
     const AudioCtx =
@@ -42,6 +138,15 @@ export function playTacticalAlertChime(): void {
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!AudioCtx) return;
     const ctx = new AudioCtx();
+    const closeCtx = () => {
+      try {
+        if (ctx.state !== "closed") {
+          void ctx.close().catch(() => {});
+        }
+      } catch {
+        // ignore close error
+      }
+    };
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
@@ -52,8 +157,12 @@ export function playTacticalAlertChime(): void {
     gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
     osc.connect(gain);
     gain.connect(ctx.destination);
+    osc.onended = closeCtx;
     osc.start(now);
     osc.stop(now + 0.28);
+    if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
+      window.setTimeout(closeCtx, 400);
+    }
   } catch {
     // ignore autoplay restriction
   }
@@ -150,11 +259,28 @@ export const App: React.FC = () => {
   const [logSearch, setLogSearch] = useState("");
   const [logPaused, setLogPaused] = useState(false);
 
+  const toastTimerRef = useRef<number | null>(null);
+
   const notify = useCallback((msg: string) => {
     setToastMsg(msg);
-    window.setTimeout(() => {
-      setToastMsg((curr) => (curr === msg ? null : curr));
-    }, 3200);
+    if (toastTimerRef.current !== null && typeof window !== "undefined") {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    if (typeof window !== "undefined") {
+      toastTimerRef.current = window.setTimeout(() => {
+        toastTimerRef.current = null;
+        setToastMsg((curr) => (curr === msg ? null : curr));
+      }, 3200);
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current !== null && typeof window !== "undefined") {
+        window.clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+    };
   }, []);
 
   // Synchronize documentElement data-theme and data-high-contrast attributes + OS prefers-color-scheme listener
@@ -222,12 +348,14 @@ export const App: React.FC = () => {
       let revUrl = "/api/review?limit=200";
       if (reviewDateFilter) {
         const parts = reviewDateFilter.split("-").map(Number);
-        if (parts.length === 3) {
+        if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
           const dayStart = Math.floor(
             new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000
           );
-          const dayEnd = dayStart + 86400;
-          revUrl = `/api/review?after=${dayStart}&before=${dayEnd}&limit=300`;
+          if (Number.isFinite(dayStart)) {
+            const dayEnd = dayStart + 86400;
+            revUrl = `/api/review?after=${dayStart}&before=${dayEnd}&limit=300`;
+          }
         }
       }
       const [cfgRes, statsRes, histRes, revRes, expRes, profRes] = await Promise.all([
@@ -239,7 +367,11 @@ export const App: React.FC = () => {
         fetch("/api/profile", { credentials: "include" }),
       ]);
 
-      if (cfgRes.status === 401 || statsRes.status === 401) {
+      if (
+        [cfgRes, statsRes, histRes, revRes, expRes, profRes].some(
+          (r) => r.status === 401
+        )
+      ) {
         setAuthNeeded(true);
         setAuthChecked(true);
         return;
@@ -251,19 +383,20 @@ export const App: React.FC = () => {
         const cfgJson: NinjaConfigResponse = await cfgRes.json();
         setConfig(cfgJson);
         const cams = Object.keys(cfgJson.cameras || {});
+        const curSelected = useNvrStore.getState().selectedCamera;
         const baseSelected = resolveRealCameraSource(
-          selectedCamera,
+          curSelected,
           cfgJson.cameras
         );
         if (cams.length > 0 && !cams.includes(baseSelected)) {
           setSelectedCamera(cams[0]);
         }
-        if (cams.length > 0 && !cams.includes(inspectorCam)) {
-          setInspectorCam(cams[0]);
-        }
-        if (cams.length > 0 && !cams.includes(exportCam)) {
-          setExportCam(cams[0]);
-        }
+        setInspectorCam((curr) =>
+          cams.length > 0 && !cams.includes(curr) ? cams[0] : curr
+        );
+        setExportCam((curr) =>
+          cams.length > 0 && !cams.includes(curr) ? cams[0] : curr
+        );
       }
       if (statsRes.ok) {
         setStats(await statsRes.json());
@@ -274,10 +407,17 @@ export const App: React.FC = () => {
       }
       if (revRes.ok) {
         const revJson: ReviewItem[] = await revRes.json();
-        setReviews(revJson);
-        if (!activeReview && revJson.length > 0) {
-          setActiveReview(revJson[0]);
-          setSyncMasterTs(Math.floor(revJson[0].start_time));
+        if (Array.isArray(revJson)) {
+          setReviews(revJson.slice(0, MAX_LIVE_REVIEWS));
+          if (revJson.length > 0) {
+            setActiveReview((curr) => {
+              if (!curr) {
+                setSyncMasterTs(Math.floor(revJson[0].start_time));
+                return revJson[0];
+              }
+              return curr;
+            });
+          }
         }
       }
       if (expRes.ok) {
@@ -288,8 +428,16 @@ export const App: React.FC = () => {
       }
       if (profRes.ok) {
         const profJson = await profRes.json();
+        if (profJson && typeof profJson.username === "string" && profJson.username.trim()) {
+          setUsername(profJson.username.trim());
+        }
         if (profJson && typeof profJson.role === "string") {
-          setUserRole(profJson.role.trim().toLowerCase());
+          const nextRole = profJson.role.trim().toLowerCase();
+          setUserRole(nextRole);
+          const curTab = useNvrStore.getState().activeTab;
+          if (nextRole !== "admin" && (curTab === "zones" || curTab === "system")) {
+            switchTab("live");
+          }
         }
         if (profJson && typeof profJson.active_profile === "string") {
           const p = profJson.active_profile.trim().toLowerCase();
@@ -302,16 +450,13 @@ export const App: React.FC = () => {
       // network retry on next tick
     }
   }, [
-    selectedCamera,
-    inspectorCam,
-    exportCam,
-    activeReview,
     reviewDateFilter,
     setConfig,
     setSelectedCamera,
     setStats,
     setStatsHistory,
     setSecurityProfile,
+    switchTab,
   ]);
 
   const fetchCoreDataRef = useRef(fetchCoreData);
@@ -319,6 +464,13 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     if (!authNeeded) return;
+    const oidcErr =
+      typeof window !== "undefined"
+        ? extractOidcCallbackError(window.location.search, window.location.pathname)
+        : null;
+    if (oidcErr) {
+      setLoginError(oidcErr);
+    }
     fetch("/api/auth/providers", { credentials: "include" })
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
@@ -330,7 +482,8 @@ export const App: React.FC = () => {
           if (
             data.oidc?.enabled &&
             data.oidc?.auto_redirect &&
-            !manualLogoutRef.current
+            !manualLogoutRef.current &&
+            !oidcErr
           ) {
             window.location.href = "/api/auth/oidc/login";
           }
@@ -354,22 +507,40 @@ export const App: React.FC = () => {
     let reconnectTimer: number | null = null;
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
 
+    const disposeSocket = (target: WebSocket | null) => {
+      if (!target) return;
+      target.onopen = null;
+      target.onclose = null;
+      target.onerror = null;
+      target.onmessage = null;
+      try {
+        target.close();
+      } catch {
+        // ignore close errors
+      }
+    };
+
     const connect = () => {
       if (closed) return;
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
-      ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+      if (ws) {
+        disposeSocket(ws);
+        ws = null;
+      }
+      const currentWs = new WebSocket(`${proto}//${window.location.host}/ws`);
+      ws = currentWs;
 
-      ws.onopen = () => {
-        if (!closed) {
+      currentWs.onopen = () => {
+        if (!closed && ws === currentWs) {
           setWsOnline(true);
           void fetchCoreDataRef.current();
         }
       };
-      ws.onclose = () => {
-        if (!closed) {
+      currentWs.onclose = () => {
+        if (!closed && ws === currentWs) {
           setWsOnline(false);
           if (reconnectTimer === null) {
             reconnectTimer = window.setTimeout(() => {
@@ -379,8 +550,8 @@ export const App: React.FC = () => {
           }
         }
       };
-      ws.onmessage = (ev) => {
-        if (closed || typeof ev.data !== "string") return;
+      currentWs.onmessage = (ev) => {
+        if (closed || ws !== currentWs || typeof ev.data !== "string") return;
         try {
           const msg = JSON.parse(ev.data);
           if (msg.topic === "camera_activity" && msg.payload) {
@@ -397,24 +568,14 @@ export const App: React.FC = () => {
               typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
             if ((parsed?.type === "new" || parsed?.type === "update") && parsed?.after?.id) {
               const evItem: EventItem = parsed.after;
-              setEvents((prev) => {
-                const idx = prev.findIndex((x) => x.id === evItem.id);
-                if (idx >= 0) {
-                  const copy = [...prev];
-                  copy[idx] = evItem;
-                  return copy;
-                }
-                return [evItem, ...prev];
-              });
+              setEvents((prev) => upsertBoundedEventList(prev, evItem));
             }
           } else if (msg.topic === "reviews" && msg.payload) {
             const parsed =
               typeof msg.payload === "string" ? JSON.parse(msg.payload) : msg.payload;
             if (parsed?.type === "new" && parsed?.after?.severity === "alert") {
               const alertItem: ReviewItem = parsed.after;
-              setReviews((prev) =>
-                prev.some((r) => r.id === alertItem.id) ? prev : [alertItem, ...prev]
-              );
+              setReviews((prev) => prependBoundedReviewAlert(prev, alertItem));
               if (useNvrStore.getState().audibleAlertChime) {
                 playTacticalAlertChime();
               }
@@ -468,10 +629,10 @@ export const App: React.FC = () => {
       window.removeEventListener("offline", onBrowserOffline);
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
-      if (ws) {
-        ws.close();
-      }
+      disposeSocket(ws);
+      ws = null;
     };
   }, [
     authChecked,
@@ -479,8 +640,6 @@ export const App: React.FC = () => {
     setWsOnline,
     setCameraActivity,
     setSecurityProfile,
-    audibleAlertChime,
-    browserNotifications,
     switchTab,
   ]);
 
@@ -521,19 +680,21 @@ export const App: React.FC = () => {
       let evUrl = "/api/events?limit=120";
       if (reviewDateFilter) {
         const parts = reviewDateFilter.split("-").map(Number);
-        if (parts.length === 3) {
+        if (parts.length === 3 && parts.every((n) => Number.isFinite(n))) {
           const dayStart = Math.floor(
             new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000
           );
-          const dayEnd = dayStart + 86400;
-          evUrl = `/api/events?after=${dayStart}&before=${dayEnd}&limit=250`;
+          if (Number.isFinite(dayStart)) {
+            const dayEnd = dayStart + 86400;
+            evUrl = `/api/events?after=${dayStart}&before=${dayEnd}&limit=250`;
+          }
         }
       }
       fetch(evUrl, { credentials: "include" })
         .then((r) => (r.ok ? r.json() : []))
         .then((arr: EventItem[]) => {
           if (Array.isArray(arr)) {
-            setEvents(arr);
+            setEvents(arr.slice(0, MAX_LIVE_EVENTS));
             if (!selectedEvent && arr.length > 0) setSelectedEvent(arr[0]);
           }
         })
@@ -547,7 +708,7 @@ export const App: React.FC = () => {
           }
         })
         .catch(() => {});
-    } else if (activeTab === "zones") {
+    } else if (activeTab === "zones" && userRole === "admin") {
       fetch("/api/config/raw", { credentials: "include" })
         .then(async (r) => {
           if (!r.ok) return "";
@@ -571,8 +732,10 @@ export const App: React.FC = () => {
           if (Array.isArray(info)) setFfprobeInfo(info);
         })
         .catch(() => {});
-    } else if (activeTab === "system" && !logPaused) {
-      fetch(`/api/logs/${logService}?start=-120`, { credentials: "include" })
+    } else if (activeTab === "system" && userRole === "admin" && !logPaused) {
+      fetch(`/api/logs/${encodeURIComponent(logService)}?start=-120`, {
+        credentials: "include",
+      })
         .then((r) => (r.ok ? r.json() : { lines: [] }))
         .then((d) => {
           if (Array.isArray(d.lines)) setLogLines(d.lines);
@@ -582,6 +745,7 @@ export const App: React.FC = () => {
   }, [
     authNeeded,
     activeTab,
+    userRole,
     inspectorCam,
     logService,
     logPaused,
@@ -625,7 +789,8 @@ export const App: React.FC = () => {
         body: JSON.stringify({ user: loginUser, password: loginPass }),
       });
       if (res.ok) {
-        setUsername(loginUser);
+        manualLogoutRef.current = false;
+        setUsername(loginUser.trim() || "admin");
         setAuthNeeded(false);
         setLoginPass("");
         fetchCoreData();
@@ -705,7 +870,7 @@ export const App: React.FC = () => {
         }
         return {
           exportId: data.export_id,
-          videoUrl: data.video_url || `/exports/${camera}_${s}_${e}.mp4`,
+          videoUrl: sanitizeExportVideoUrl(data.video_url, camera, s, e),
         };
       } else {
         notify(data.message || `Export failed (${res.status})`);
@@ -740,12 +905,15 @@ export const App: React.FC = () => {
   };
 
   const handleSaveConfig = async (saveOption: "saveonly" | "restart") => {
-    const res = await fetch(`/api/config/save?save_option=${saveOption}`, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain" },
-      credentials: "include",
-      body: rawYaml,
-    });
+    const res = await fetch(
+      `/api/config/save?save_option=${encodeURIComponent(saveOption)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        credentials: "include",
+        body: rawYaml,
+      }
+    );
     const data = await res.json().catch(() => ({}));
     if (res.ok && data.success !== false) {
       if (saveOption === "restart") {
@@ -1278,6 +1446,19 @@ export const App: React.FC = () => {
               } catch {
                 // ignore
               }
+              setRawYaml("");
+              setEvents([]);
+              setReviews([]);
+              setExportsList([]);
+              setLogLines([]);
+              setActiveReview(null);
+              setSelectedEvent(null);
+              setActiveExportPreview(null);
+              setUserRole("viewer");
+              setWsOnline(false);
+              if (activeTab === "zones" || activeTab === "system") {
+                switchTab("live");
+              }
               setAuthNeeded(true);
             }}
           >
@@ -1422,7 +1603,7 @@ export const App: React.FC = () => {
           />
         )}
 
-        {activeTab === "zones" && (
+        {activeTab === "zones" && userRole === "admin" && (
           <ZonesWorkspace
             cameraNames={cameraNames}
             config={config}
@@ -1441,7 +1622,7 @@ export const App: React.FC = () => {
           />
         )}
 
-        {activeTab === "system" && (
+        {activeTab === "system" && userRole === "admin" && (
           <SystemWorkspace
             cameraNames={cameraNames}
             logService={logService}

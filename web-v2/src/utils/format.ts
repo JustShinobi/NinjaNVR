@@ -27,10 +27,14 @@ export type EffectiveTheme = "dark" | "light";
 export function resolveInitialThemeMode(
   fallback: ThemeMode = "dark"
 ): ThemeMode {
-  if (typeof window === "undefined") return fallback;
-  const saved = window.localStorage?.getItem("ninjanvr_theme_mode");
-  if (saved === "dark" || saved === "light" || saved === "system") {
-    return saved;
+  try {
+    if (typeof window === "undefined") return fallback;
+    const saved = window.localStorage?.getItem("ninjanvr_theme_mode");
+    if (saved === "dark" || saved === "light" || saved === "system") {
+      return saved;
+    }
+  } catch {
+    // ignore storage access errors
   }
   return fallback;
 }
@@ -98,40 +102,52 @@ export function resolveInitialTab(): WorkspaceTab {
 }
 
 export function resolveInitialHudPosition(): HudPosition {
-  if (typeof window === "undefined") return "bottom-right";
-  const saved = window.localStorage?.getItem("ninjanvr_hud_position");
-  if (
-    saved === "bottom-right" ||
-    saved === "top-right" ||
-    saved === "top-left" ||
-    saved === "bottom-left" ||
-    saved === "hidden"
-  ) {
-    return saved;
+  try {
+    if (typeof window === "undefined") return "bottom-right";
+    const saved = window.localStorage?.getItem("ninjanvr_hud_position");
+    if (
+      saved === "bottom-right" ||
+      saved === "top-right" ||
+      saved === "top-left" ||
+      saved === "bottom-left" ||
+      saved === "hidden"
+    ) {
+      return saved;
+    }
+  } catch {
+    // ignore storage access errors
   }
   return "bottom-right";
 }
 
 export function resolveInitialLiveLayout(): LiveLayoutMode {
-  if (typeof window === "undefined") return "2x2";
-  const saved = window.localStorage?.getItem("ninjanvr_live_layout");
-  if (
-    saved === "2x2" ||
-    saved === "focus" ||
-    saved === "single" ||
-    saved === "spotlight" ||
-    saved === "map"
-  ) {
-    return saved;
+  try {
+    if (typeof window === "undefined") return "2x2";
+    const saved = window.localStorage?.getItem("ninjanvr_live_layout");
+    if (
+      saved === "2x2" ||
+      saved === "focus" ||
+      saved === "single" ||
+      saved === "spotlight" ||
+      saved === "map"
+    ) {
+      return saved;
+    }
+  } catch {
+    // ignore storage access errors
   }
   return "2x2";
 }
 
 export function resolveInitialMatrixDensity(): MatrixDensity {
-  if (typeof window === "undefined") return "2x2";
-  const saved = window.localStorage?.getItem("ninjanvr_matrix_density");
-  if (saved === "2x2" || saved === "3x3" || saved === "4x4") {
-    return saved;
+  try {
+    if (typeof window === "undefined") return "2x2";
+    const saved = window.localStorage?.getItem("ninjanvr_matrix_density");
+    if (saved === "2x2" || saved === "3x3" || saved === "4x4") {
+      return saved;
+    }
+  } catch {
+    // ignore storage access errors
   }
   return "2x2";
 }
@@ -154,31 +170,49 @@ export function resolveInitialSpotlightTimelineMode(
 }
 
 export function resolveInitialBool(key: string, fallback: boolean): boolean {
-  if (typeof window === "undefined") return fallback;
-  const saved = window.localStorage?.getItem(key);
-  if (saved === "true") return true;
-  if (saved === "false") return false;
+  try {
+    if (typeof window === "undefined") return fallback;
+    const saved = window.localStorage?.getItem(key);
+    if (saved === "true") return true;
+    if (saved === "false") return false;
+  } catch {
+    // ignore storage access errors
+  }
   return fallback;
 }
 
 export function resolveInitialPlaybackSpeed(): number {
-  if (typeof window === "undefined") return 1;
-  const saved = Number(window.localStorage?.getItem("ninjanvr_playback_speed"));
-  if (saved === 0.5 || saved === 1 || saved === 2 || saved === 4) {
-    return saved;
+  try {
+    if (typeof window === "undefined") return 1;
+    const saved = Number(window.localStorage?.getItem("ninjanvr_playback_speed"));
+    if (saved === 0.5 || saved === 1 || saved === 2 || saved === 4) {
+      return saved;
+    }
+  } catch {
+    // ignore storage access errors
   }
   return 1;
 }
 
 export function resolveInitialFirstWeekday(): FirstWeekday {
-  if (typeof window === "undefined") return "sunday";
-  const saved = window.localStorage?.getItem("ninjanvr_first_weekday");
-  if (saved === "monday" || saved === "sunday") return saved;
+  try {
+    if (typeof window === "undefined") return "sunday";
+    const saved = window.localStorage?.getItem("ninjanvr_first_weekday");
+    if (saved === "monday" || saved === "sunday") return saved;
+  } catch {
+    // ignore storage access errors
+  }
   return "sunday";
 }
 
 export function formatTs(unixSec: number): string {
+  if (typeof unixSec !== "number" || !Number.isFinite(unixSec)) {
+    return "--:--:--";
+  }
   const d = new Date(unixSec * 1000);
+  if (Number.isNaN(d.getTime())) {
+    return "--:--:--";
+  }
   return d.toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
@@ -192,7 +226,8 @@ export function formatClockTime(unixSec: number): string {
 }
 
 export function formatDuration(sec: number): string {
-  const total = Math.max(1, Math.round(sec));
+  const safeSec = typeof sec === "number" && Number.isFinite(sec) ? sec : 0;
+  const total = Math.max(1, Math.round(safeSec));
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
@@ -202,7 +237,13 @@ export function formatDuration(sec: number): string {
 }
 
 export function formatDateTime(unixSec: number): string {
+  if (typeof unixSec !== "number" || !Number.isFinite(unixSec)) {
+    return "--:--:--";
+  }
   const d = new Date(unixSec * 1000);
+  if (Number.isNaN(d.getTime())) {
+    return "--:--:--";
+  }
   return d.toLocaleString([], {
     month: "short",
     day: "2-digit",
@@ -214,6 +255,9 @@ export function formatDateTime(unixSec: number): string {
 }
 
 export function formatRelTime(unixSec: number): string {
+  if (typeof unixSec !== "number" || !Number.isFinite(unixSec) || unixSec <= 0) {
+    return "0s ago";
+  }
   const diff = Math.max(0, Math.round(Date.now() / 1000 - unixSec));
   if (diff < 60) return `${diff}s ago`;
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
@@ -222,9 +266,13 @@ export function formatRelTime(unixSec: number): string {
 }
 
 export function formatUptime(sec: number): string {
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
+  const safeSec =
+    typeof sec === "number" && Number.isFinite(sec)
+      ? Math.max(0, Math.floor(sec))
+      : 0;
+  const h = Math.floor(safeSec / 3600);
+  const m = Math.floor((safeSec % 3600) / 60);
+  const s = safeSec % 60;
   return `${h}h ${m}m ${s}s`;
 }
 
@@ -248,7 +296,10 @@ export function resolveHeaderTelemetryMeta(
   wsOnline: boolean,
   channelCount: number
 ): HeaderTelemetryMeta {
-  const safeCount = Math.max(0, Math.floor(channelCount || 0));
+  const safeCount =
+    typeof channelCount === "number" && Number.isFinite(channelCount)
+      ? Math.max(0, Math.floor(channelCount))
+      : 0;
   const channelBadge = `${safeCount} CH`;
   const wsDotClass = wsOnline ? "live" : "motion";
   const wsStatusLabel = wsOnline
@@ -268,9 +319,20 @@ export function findMatchingExport(
   startTime: number,
   endTime: number | null
 ): ExportItem | null {
-  if (!exportsList || exportsList.length === 0) return null;
+  if (
+    !exportsList ||
+    exportsList.length === 0 ||
+    typeof startTime !== "number" ||
+    !Number.isFinite(startTime)
+  ) {
+    return null;
+  }
   const itemStart = Math.floor(startTime);
-  const itemEnd = Math.ceil(endTime && endTime > startTime ? endTime : startTime + 15);
+  const safeEnd =
+    typeof endTime === "number" && Number.isFinite(endTime) && endTime > startTime
+      ? endTime
+      : startTime + 15;
+  const itemEnd = Math.ceil(safeEnd);
   for (const ex of exportsList) {
     if (ex.camera !== camera) continue;
     const parts = ex.id.split("_");

@@ -19,11 +19,12 @@ interface RecordingCalendarPopoverProps {
 const WEEKDAYS_SUN = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
 const WEEKDAYS_MON = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
 
-function formatReadableDate(dateStr: string): string {
+export function formatReadableDate(dateStr: string): string {
   if (!dateStr) return "All Dates";
   const parts = dateStr.split("-").map(Number);
-  if (parts.length !== 3) return dateStr;
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return dateStr;
   const d = new Date(parts[0], parts[1] - 1, parts[2]);
+  if (Number.isNaN(d.getTime())) return dateStr;
   return d.toLocaleDateString([], {
     month: "short",
     day: "2-digit",
@@ -52,11 +53,17 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
   const initialDate = useMemo(() => {
     if (selectedDate) {
       const p = selectedDate.split("-").map(Number);
-      if (p.length === 3) return new Date(p[0], p[1] - 1, 1);
+      if (p.length === 3 && p.every((n) => Number.isFinite(n))) {
+        const d = new Date(p[0], p[1] - 1, 1);
+        if (!Number.isNaN(d.getTime())) return d;
+      }
     }
-    if (daysSummary.length > 0) {
+    if (daysSummary.length > 0 && daysSummary[0]?.day) {
       const p = daysSummary[0].day.split("-").map(Number);
-      if (p.length === 3) return new Date(p[0], p[1] - 1, 1);
+      if (p.length === 3 && p.every((n) => Number.isFinite(n))) {
+        const d = new Date(p[0], p[1] - 1, 1);
+        if (!Number.isNaN(d.getTime())) return d;
+      }
     }
     const now = new Date();
     return new Date(now.getFullYear(), now.getMonth(), 1);
@@ -74,7 +81,7 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
   useEffect(() => {
     if (!selectedDate) return;
     const p = selectedDate.split("-").map(Number);
-    if (p.length === 3 && !Number.isNaN(p[0]) && !Number.isNaN(p[1])) {
+    if (p.length === 3 && p.every((n) => Number.isFinite(n))) {
       setViewYear(p[0]);
       setViewMonth(p[1] - 1);
     }
@@ -448,8 +455,12 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
                 className="nvr-btn primary"
                 style={{ height: 24, fontSize: "var(--text-xs)" }}
                 onClick={() => {
+                  const now = new Date();
+                  const localToday = `${now.getFullYear()}-${String(
+                    now.getMonth() + 1
+                  ).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
                   const targetDate =
-                    selectedDate || daysSummary[0]?.day || new Date().toISOString().slice(0, 10);
+                    selectedDate || daysSummary[0]?.day || localToday;
                   onSelectDateTime?.(targetDate, timeInput);
                   setIsOpen(false);
                 }}

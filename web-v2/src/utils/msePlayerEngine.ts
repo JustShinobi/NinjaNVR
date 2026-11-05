@@ -89,6 +89,36 @@ export class DualSlotMachine {
           sessionId: activeState.sessionId,
         };
       }
+      if (this.standbySlot !== null) {
+        const sbSlot = this.standbySlot;
+        const sbState = this.slots[sbSlot];
+        if (sbState.status === "connecting" && sbState.streamSrc === trimmed) {
+          return {
+            action: "noop",
+            targetSlot: sbSlot,
+            abortSlot: null,
+            sessionId: sbState.sessionId,
+          };
+        }
+        this.slots[sbSlot] = {
+          streamSrc: null,
+          status: "idle",
+          sessionId: sbState.sessionId,
+        };
+        this.standbySlot = null;
+        const sessionId = this.nextSessionId++;
+        this.slots[this.activeSlot] = {
+          streamSrc: trimmed,
+          status: "connecting",
+          sessionId,
+        };
+        return {
+          action: "start_active",
+          targetSlot: this.activeSlot,
+          abortSlot: sbState.status !== "idle" ? sbSlot : activeState.status === "connecting" ? this.activeSlot : null,
+          sessionId,
+        };
+      }
       const hadInFlight = activeState.status === "connecting";
       const sessionId = this.nextSessionId++;
       this.slots[this.activeSlot] = {
@@ -422,7 +452,15 @@ export class StreamPrewarmCoordinator {
     if (prev !== undefined && nowMs - prev < cooldownMs) {
       return false;
     }
+    if (this.lastWarmedAt.has(key)) {
+      this.lastWarmedAt.delete(key);
+    }
     this.lastWarmedAt.set(key, nowMs);
+    while (this.lastWarmedAt.size > 256) {
+      const oldest = this.lastWarmedAt.keys().next().value;
+      if (oldest === undefined) break;
+      this.lastWarmedAt.delete(oldest);
+    }
     return true;
   }
 
