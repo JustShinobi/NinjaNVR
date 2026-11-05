@@ -72,13 +72,23 @@ function round6(v: number): number {
   return Math.round(clamped * 1_000_000) / 1_000_000;
 }
 
+function toSafeCount(val: unknown): number {
+  const n = Number(val ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n);
+}
+
 export function xyxyToYoloNormalized(
   box: [number, number, number, number]
 ): { cx: number; cy: number; w: number; h: number } {
-  const xmin = Math.max(0, Math.min(1, Math.min(box[0], box[2])));
-  const xmax = Math.max(0, Math.min(1, Math.max(box[0], box[2])));
-  const ymin = Math.max(0, Math.min(1, Math.min(box[1], box[3])));
-  const ymax = Math.max(0, Math.min(1, Math.max(box[1], box[3])));
+  const b0 = Number.isFinite(box?.[0]) ? box[0] : 0;
+  const b1 = Number.isFinite(box?.[1]) ? box[1] : 0;
+  const b2 = Number.isFinite(box?.[2]) ? box[2] : 0;
+  const b3 = Number.isFinite(box?.[3]) ? box[3] : 0;
+  const xmin = Math.max(0, Math.min(1, Math.min(b0, b2)));
+  const xmax = Math.max(0, Math.min(1, Math.max(b0, b2)));
+  const ymin = Math.max(0, Math.min(1, Math.min(b1, b3)));
+  const ymax = Math.max(0, Math.min(1, Math.max(b1, b3)));
   const w = Math.max(0.001, Math.min(1, xmax - xmin));
   const h = Math.max(0.001, Math.min(1, ymax - ymin));
   const cx = (xmin + xmax) / 2;
@@ -97,19 +107,31 @@ export function yoloNormalizedToXyxy(box: {
   w: number;
   h: number;
 }): [number, number, number, number] {
-  const x1 = round6(box.cx - box.w / 2);
-  const y1 = round6(box.cy - box.h / 2);
-  const x2 = round6(box.cx + box.w / 2);
-  const y2 = round6(box.cy + box.h / 2);
+  const cx = Number.isFinite(box?.cx) ? box.cx : 0.5;
+  const cy = Number.isFinite(box?.cy) ? box.cy : 0.5;
+  const w = Number.isFinite(box?.w) ? Math.max(0.001, box.w) : 0.001;
+  const h = Number.isFinite(box?.h) ? Math.max(0.001, box.h) : 0.001;
+  const x1 = round6(cx - w / 2);
+  const y1 = round6(cy - h / 2);
+  const x2 = round6(cx + w / 2);
+  const y2 = round6(cy + h / 2);
   return [x1, y1, x2, y2];
 }
 
 export function formatYoloAnnotationLine(ann: DatasetAnnotationBox): string {
+  const rawCid = Number(ann?.class_id);
   const cid = Math.max(
     0,
-    Math.min(NINJANVR_SECURITY_CLASSES.length - 1, Math.trunc(ann.class_id))
+    Math.min(
+      NINJANVR_SECURITY_CLASSES.length - 1,
+      Number.isFinite(rawCid) ? Math.trunc(rawCid) : 0
+    )
   );
-  return `${cid} ${ann.cx.toFixed(6)} ${ann.cy.toFixed(6)} ${ann.w.toFixed(6)} ${ann.h.toFixed(6)}`;
+  const cx = round6(Number(ann?.cx));
+  const cy = round6(Number(ann?.cy));
+  const w = Math.max(0.001, round6(Number(ann?.w)));
+  const h = Math.max(0.001, round6(Number(ann?.h)));
+  return `${cid} ${cx.toFixed(6)} ${cy.toFixed(6)} ${w.toFixed(6)} ${h.toFixed(6)}`;
 }
 
 export interface DatasetReadinessMetrics {
@@ -131,26 +153,38 @@ export interface DatasetReadinessMetrics {
 export function computeDatasetReadinessMetrics(
   summary?: Partial<DatasetSummaryResponse> | null
 ): DatasetReadinessMetrics {
-  const tp = Math.max(0, Number(summary?.true_positive_count ?? 0));
-  const ai = Math.max(0, Number(summary?.ai_annotated_count ?? 0));
-  const hn = Math.max(0, Number(summary?.hard_negative_count ?? 0));
+  const tp = toSafeCount(summary?.true_positive_count);
+  const ai = toSafeCount(summary?.ai_annotated_count);
+  const hn = toSafeCount(summary?.hard_negative_count);
   const positiveCount = tp + ai;
+  const trainCount = toSafeCount(summary?.train_count);
+  const valCount = toSafeCount(summary?.val_count);
+  const verifiedCount = toSafeCount(summary?.verified_count);
+  const rawTotal =
+    summary?.total_samples !== undefined && summary?.total_samples !== null
+      ? toSafeCount(summary.total_samples)
+      : positiveCount + hn;
   const totalSamples = Math.max(
-    0,
-    Number(summary?.total_samples ?? positiveCount + hn)
+    rawTotal,
+    positiveCount + hn,
+    trainCount + valCount,
+    verifiedCount
   );
   const positivePct =
-    totalSamples > 0 ? Math.round((positiveCount / totalSamples) * 100) : 0;
+    totalSamples > 0
+      ? Math.max(0, Math.min(100, Math.round((positiveCount / totalSamples) * 100)))
+      : 0;
   const hardNegativePct =
     totalSamples > 0 ? Math.max(0, 100 - positivePct) : 0;
-  const trainCount = Math.max(0, Number(summary?.train_count ?? 0));
-  const valCount = Math.max(0, Number(summary?.val_count ?? 0));
   const trainPct =
-    totalSamples > 0 ? Math.round((trainCount / totalSamples) * 100) : 0;
+    totalSamples > 0
+      ? Math.max(0, Math.min(100, Math.round((trainCount / totalSamples) * 100)))
+      : 0;
   const valPct = totalSamples > 0 ? Math.max(0, 100 - trainPct) : 0;
-  const verifiedCount = Math.max(0, Number(summary?.verified_count ?? 0));
   const verifiedPct =
-    totalSamples > 0 ? Math.round((verifiedCount / totalSamples) * 100) : 0;
+    totalSamples > 0
+      ? Math.max(0, Math.min(100, Math.round((verifiedCount / totalSamples) * 100)))
+      : 0;
   const deviationFrom80 = Math.abs(positivePct - 80);
   const balanceScorePct =
     totalSamples > 0
@@ -190,15 +224,41 @@ export function buildModelUploadPayload(params: {
   inputTensor?: string;
   inputPixelFormat?: string;
 }): ModelUploadPayload {
-  const cleanName = params.filename.trim() || "custom_yolo11s.onnx";
+  const rawFile = (params.filename || "").trim();
+  const baseSegment =
+    rawFile
+      .split(/[/\\]/)
+      .pop()
+      ?.replace(/\.\.+/g, "")
+      .replace(/[^a-zA-Z0-9._-]/g, "_")
+      .replace(/^[._-]+|[._-]+$/g, "") || "";
+  const hasValidExt = /\.(?:onnx|xml)$/i.test(baseSegment);
+  const cleanName =
+    baseSegment && hasValidExt
+      ? baseSegment
+      : baseSegment
+      ? `${baseSegment}.onnx`
+      : "custom_yolo11s.onnx";
+  const rawB64 = (params.modelBase64 || "").trim();
+  const strippedB64 = rawB64.replace(/^data:[^,]*;base64,/i, "").trim();
+  const rawW = Number(params.width);
+  const rawH = Number(params.height);
+  const safeW =
+    Number.isFinite(rawW) && rawW >= 64 && rawW <= 4096
+      ? Math.round(rawW)
+      : 640;
+  const safeH =
+    Number.isFinite(rawH) && rawH >= 64 && rawH <= 4096
+      ? Math.round(rawH)
+      : 640;
   return {
     filename: cleanName,
-    model_base64: params.modelBase64,
+    model_base64: strippedB64,
     labelmap:
       params.labelmap?.trim() || NINJANVR_SECURITY_CLASSES.join("\n"),
     model_type: params.modelType || "yolo-generic",
-    width: params.width || 640,
-    height: params.height || 640,
+    width: safeW,
+    height: safeH,
     input_tensor: params.inputTensor || "nchw",
     input_pixel_format: params.inputPixelFormat || "rgb",
     activate: true,
@@ -243,18 +303,43 @@ export function buildLocalFinetuneCliCommand(params?: {
   freeze?: number;
   nvrToken?: string;
 }): string {
-  const dataset = (params?.datasetPath || "ninjanvr-dataset.zip").trim();
-  const modelArch = (params?.modelArch || "yolo11s.pt").trim();
+  const rawDataset = (params?.datasetPath || "ninjanvr-dataset.zip")
+    .replace(/[;&|`$><\r\n\0'"\\\s]/g, "")
+    .trim();
+  const dataset = rawDataset || "ninjanvr-dataset.zip";
+  const rawArch = (params?.modelArch || "yolo11s.pt")
+    .replace(/[;&|`$><\r\n\0'"\\\s]/g, "")
+    .trim();
+  const modelArch = rawArch || "yolo11s.pt";
   const imgsz = params?.imgsz === 320 ? 320 : 640;
-  const epochs = Math.max(1, Math.trunc(Number(params?.epochs ?? 30)));
-  const freeze = Math.max(0, Math.trunc(Number(params?.freeze ?? 10)));
-  const rawUrl = (params?.nvrUrl || "http://localhost:5000").trim().replace(/\/+$/, "");
-  const token = (params?.nvrToken || "$NINJANVR_API_TOKEN").trim();
+  const rawEpochs = Number(params?.epochs ?? 30);
+  const epochs =
+    Number.isFinite(rawEpochs) && rawEpochs >= 1
+      ? Math.min(1000, Math.trunc(rawEpochs))
+      : 30;
+  const rawFreeze = Number(params?.freeze ?? 10);
+  const freeze =
+    Number.isFinite(rawFreeze) && rawFreeze >= 0
+      ? Math.min(100, Math.trunc(rawFreeze))
+      : 10;
+  const cleanedUrl = (params?.nvrUrl || "http://localhost:5000")
+    .replace(/[;&|`$><\r\n\0'"\\\s]/g, "")
+    .trim()
+    .replace(/\/+$/, "");
+  const rawUrl = /^https?:\/\/[a-zA-Z0-9._:-]+$/i.test(cleanedUrl)
+    ? cleanedUrl
+    : "http://localhost:5000";
+  const candidateToken = (params?.nvrToken || "$NINJANVR_API_TOKEN").trim();
+  const token = /^(?:\$[A-Za-z_][A-Za-z0-9_]*|[a-zA-Z0-9._-]+)$/.test(
+    candidateToken
+  )
+    ? candidateToken
+    : "$NINJANVR_API_TOKEN";
   return `python3 scripts/ai/train_ninjanvr_model.py --mode finetune --dataset ${dataset} --model ${modelArch} --imgsz ${imgsz} --epochs ${epochs} --freeze ${freeze} --nvr-url ${rawUrl} --nvr-token ${token}`;
 }
 
 export function formatDhash64Hex(dhash?: number | null): string {
-  if (dhash === null || dhash === undefined || Number.isNaN(Number(dhash))) {
+  if (dhash === null || dhash === undefined || !Number.isFinite(Number(dhash))) {
     return "—";
   }
   const big = BigInt.asUintN(64, BigInt(Math.trunc(Number(dhash))));
@@ -265,7 +350,68 @@ export function formatSignatureBbox(
   normBbox?: [number, number, number, number] | null
 ): string {
   if (!normBbox || normBbox.length < 4) return "[0.00, 0.00, 0.00, 0.00]";
-  return `[${normBbox.map((v) => Number(v).toFixed(2)).join(", ")}]`;
+  return `[${normBbox
+    .slice(0, 4)
+    .map((v) => {
+      const n = Number(v);
+      return (Number.isFinite(n) ? n : 0).toFixed(2);
+    })
+    .join(", ")}]`;
+}
+
+export function isSafeGenAiCustomBaseUrl(rawUrl: string): boolean {
+  const trimmed = (rawUrl || "").trim();
+  if (
+    !trimmed ||
+    /[\u0000-\u001f\u007f\\]/.test(trimmed) ||
+    trimmed.includes("..")
+  ) {
+    return false;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return false;
+  }
+  if (parsed.username || parsed.password || trimmed.includes("@")) {
+    return false;
+  }
+  if (parsed.search || parsed.hash) {
+    return false;
+  }
+  const portNum = parsed.port ? Number(parsed.port) : null;
+  if (
+    portNum !== null &&
+    (portNum === 0 ||
+      portNum === 5000 ||
+      portNum === 8971 ||
+      portNum === 1984 ||
+      portNum === 8554)
+  ) {
+    return false;
+  }
+  const hostClean = parsed.hostname
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/, "")
+    .toLowerCase();
+  if (
+    !hostClean ||
+    hostClean === "0.0.0.0" ||
+    hostClean === "::" ||
+    hostClean === "0:0:0:0:0:0:0:0" ||
+    hostClean === "metadata.google.internal" ||
+    /^169\.254(?:\.\d{1,3}){2}$/.test(hostClean) ||
+    /^fe[89ab][0-9a-f]:/i.test(hostClean) ||
+    /^(?:22[4-9]|23\d)(?:\.\d{1,3}){3}$/.test(hostClean) ||
+    /^ff[0-9a-f]{2}:/i.test(hostClean)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export function parseRoiCropInput(
@@ -2339,13 +2485,22 @@ export const AiDetectionObjectsSection: React.FC<{
   }, []);
 
   const handleDeleteFpSignature = async (id: number) => {
-    const res = await fetch(`/api/false_positives/signatures/${id}`, {
-      method: "DELETE",
-      credentials: "include",
-    });
-    if (res.ok) {
-      setFpSignatures((prev) => prev.filter((item) => item.id !== id));
-      notify(`Deleted false-positive memory signature #${id}`);
+    try {
+      const res = await fetch(
+        `/api/false_positives/signatures/${encodeURIComponent(String(id))}`,
+        {
+          method: "DELETE",
+          credentials: "include",
+        }
+      );
+      if (res.ok) {
+        setFpSignatures((prev) => prev.filter((item) => item.id !== id));
+        notify(`Deleted false-positive memory signature #${id}`);
+      } else {
+        notify(`Failed to delete false-positive signature #${id}`);
+      }
+    } catch {
+      notify(`Network error while deleting false-positive signature #${id}`);
     }
   };
 
@@ -2425,8 +2580,12 @@ export const AiDetectionObjectsSection: React.FC<{
         return;
       }
 
-      // Direct browser fallback when user provided an API key or custom endpoint
-      if (directKey || prov === "ollama" || customBase) {
+      // Direct browser fallback when user provided an API key or a safe custom endpoint
+      const canUseDirectFallback =
+        res.status !== 400 &&
+        res.status !== 403 &&
+        (!customBase || isSafeGenAiCustomBaseUrl(customBase));
+      if (canUseDirectFallback && (directKey || prov === "ollama" || customBase)) {
         let directUrl = "";
         const headers: Record<string, string> = {};
         if (prov === "openai") {
@@ -2453,9 +2612,8 @@ export const AiDetectionObjectsSection: React.FC<{
             const endpoint = base.endsWith("/models")
               ? base
               : `${base}/v1beta/models`;
-            directUrl = directKey
-              ? `${endpoint}?pageSize=100&key=${encodeURIComponent(directKey)}`
-              : `${endpoint}?pageSize=100`;
+            directUrl = `${endpoint}?pageSize=100`;
+            if (directKey) headers["x-goog-api-key"] = directKey;
           }
         }
 
@@ -2536,6 +2694,7 @@ export const AiDetectionObjectsSection: React.FC<{
     void fetchDetectedPlates();
   }, []);
 
+  const lprPersistSeqRef = React.useRef(0);
   const lprCfg: LprConfig = draftConfig.lpr || {
     enabled: false,
     min_confidence: 0.75,
@@ -2556,6 +2715,7 @@ export const AiDetectionObjectsSection: React.FC<{
       next.lpr = mergedLpr;
     });
     if (persistImmediately && typeof window !== "undefined") {
+      const seq = ++lprPersistSeqRef.current;
       void fetch("/api/config/structured", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2564,7 +2724,7 @@ export const AiDetectionObjectsSection: React.FC<{
       })
         .then((r) => r.json().catch(() => null))
         .then((res) => {
-          if (res?.config) {
+          if (seq === lprPersistSeqRef.current && res?.config) {
             useNvrStore.getState().setConfig(res.config);
           }
         })
@@ -2677,9 +2837,12 @@ export const AiDetectionObjectsSection: React.FC<{
         setEnrollImageB64("");
         await refreshEnrolledFaces();
         notify(`Enrolled face profile '${cleanName}' into local gallery`);
+      } else {
+        const data = await res.json().catch(() => null);
+        notify(data?.message || `Failed to enroll face profile '${cleanName}'`);
       }
     } catch {
-      // ignore
+      notify(`Network error while enrolling face profile '${cleanName}'`);
     } finally {
       setEnrollBusy(false);
     }
@@ -2704,9 +2867,11 @@ export const AiDetectionObjectsSection: React.FC<{
             ? `Removed face profile '${name}' from gallery and cleared ${clearedCount} event(s)`
             : `Removed face profile '${name}' from gallery`
         );
+      } else {
+        notify(`Failed to delete face profile '${name}'`);
       }
     } catch {
-      // ignore
+      notify(`Network error while deleting face profile '${name}'`);
     }
   };
 
@@ -4278,36 +4443,60 @@ export const AiDetectionObjectsSection: React.FC<{
                 {isPt ? "2. Chave da API (api_key)" : "2. API Key"}
                 {genaiCfg.has_api_key ? " (Saved)" : ""}
               </div>
-              <input
-                type="password"
-                className="nvr-input mono"
-                aria-label="Vision AI Judge API Key"
-                style={{ width: "100%", marginTop: 2 }}
-                placeholder={
-                  genaiCfg.has_api_key
-                    ? "•••••••• (saved key)"
-                    : genaiCfg.provider === "ollama"
-                    ? isPt
-                      ? "Opcional (Ollama local)"
-                      : "Optional (Local Ollama)"
-                    : isPt
-                    ? `Cole a chave ou use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
-                    : `Paste key or use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
-                }
-                value={
-                  genaiCfg.api_key === "***" ? "" : genaiCfg.api_key || ""
-                }
-                onChange={(e) => {
-                  const val = e.target.value;
-                  updateGenAi({
-                    api_key: val || (genaiCfg.has_api_key ? "***" : null),
-                    clear_api_key: false,
-                    model: "",
-                  });
-                  setGenaiModels([]);
-                  setGenaiValidationState({ status: "idle" });
-                }}
-              />
+              <div style={{ display: "flex", gap: 4, marginTop: 2 }}>
+                <input
+                  type="password"
+                  className="nvr-input mono"
+                  aria-label="Vision AI Judge API Key"
+                  style={{ flex: 1, minWidth: 0, width: "100%" }}
+                  placeholder={
+                    genaiCfg.has_api_key
+                      ? "•••••••• (saved key)"
+                      : genaiCfg.provider === "ollama"
+                      ? isPt
+                        ? "Opcional (Ollama local)"
+                        : "Optional (Local Ollama)"
+                      : isPt
+                      ? `Cole a chave ou use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
+                      : `Paste key or use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
+                  }
+                  value={
+                    genaiCfg.api_key === "***" ? "" : genaiCfg.api_key || ""
+                  }
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    updateGenAi({
+                      api_key: val || (genaiCfg.has_api_key ? "***" : null),
+                      clear_api_key: false,
+                      model: "",
+                    });
+                    setGenaiModels([]);
+                    setGenaiValidationState({ status: "idle" });
+                  }}
+                />
+                {(genaiCfg.has_api_key ||
+                  (genaiCfg.api_key && genaiCfg.api_key !== "")) && (
+                  <button
+                    type="button"
+                    className="nvr-btn danger mono"
+                    style={{ padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    title="Clear saved Vision AI Judge API key"
+                    aria-label="Clear Vision AI Judge API Key"
+                    onClick={() => {
+                      updateGenAi({
+                        api_key: null,
+                        has_api_key: false,
+                        clear_api_key: true,
+                        model: "",
+                      });
+                      setGenaiModels([]);
+                      setGenaiValidationState({ status: "idle" });
+                    }}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
             </div>
 
             <div>
@@ -5119,7 +5308,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 style={{ width: "100%", marginTop: 3, fontFamily: "var(--font-mono)" }}
                 placeholder={DEFAULT_LPR_FORMAT_REGEX}
                 value={lprCfg.format_regex ?? ""}
-                onChange={(e) => updateLpr({ format_regex: e.target.value })}
+                onChange={(e) => updateLpr({ format_regex: e.target.value }, false)}
               />
             </div>
 
@@ -5136,9 +5325,12 @@ export const AiDetectionObjectsSection: React.FC<{
                 placeholder="/config/models/lpr_det.onnx"
                 value={lprCfg.detector_model_path ?? ""}
                 onChange={(e) =>
-                  updateLpr({
-                    detector_model_path: e.target.value.trim() || undefined,
-                  })
+                  updateLpr(
+                    {
+                      detector_model_path: e.target.value.trim() || undefined,
+                    },
+                    false
+                  )
                 }
               />
             </div>
@@ -5156,9 +5348,12 @@ export const AiDetectionObjectsSection: React.FC<{
                 placeholder="/config/models/lpr_ocr.onnx"
                 value={lprCfg.ocr_model_path ?? ""}
                 onChange={(e) =>
-                  updateLpr({
-                    ocr_model_path: e.target.value.trim() || undefined,
-                  })
+                  updateLpr(
+                    {
+                      ocr_model_path: e.target.value.trim() || undefined,
+                    },
+                    false
+                  )
                 }
               />
             </div>
@@ -5944,7 +6139,22 @@ export const DatasetStudioSection: React.FC<{
     model_type: "ssd",
   };
 
+  const datasetLoadSeqRef = React.useRef(0);
+  const isMountedRef = React.useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    setDrawStart(null);
+  }, [selectedSampleId, filterKind]);
+
   const loadDatasetState = async () => {
+    const seq = ++datasetLoadSeqRef.current;
     try {
       const [sumRes, listRes] = await Promise.all([
         fetch("/api/dataset/summary", { credentials: "include" }),
@@ -5955,12 +6165,16 @@ export const DatasetStudioSection: React.FC<{
           { credentials: "include" }
         ),
       ]);
+      if (!isMountedRef.current || seq !== datasetLoadSeqRef.current) return;
       if (sumRes.ok) {
-        const sumData = await sumRes.json();
-        setSummary(sumData);
+        const sumData = await sumRes.json().catch(() => null);
+        if (isMountedRef.current && seq === datasetLoadSeqRef.current && sumData) {
+          setSummary(sumData);
+        }
       }
       if (listRes.ok) {
-        const listData = await listRes.json();
+        const listData = await listRes.json().catch(() => null);
+        if (!isMountedRef.current || seq !== datasetLoadSeqRef.current) return;
         const rows: DatasetSampleItem[] = Array.isArray(listData)
           ? listData
           : Array.isArray(listData?.items)
@@ -5992,20 +6206,32 @@ export const DatasetStudioSection: React.FC<{
       split?: string;
     }
   ) => {
-    const res = await fetch(
-      `/api/dataset/samples/${encodeURIComponent(sample.id)}`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify(patch),
+    try {
+      const res = await fetch(
+        `/api/dataset/samples/${encodeURIComponent(sample.id)}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify(patch),
+        }
+      );
+      if (!isMountedRef.current) return;
+      if (res.ok) {
+        const updated = await res.json().catch(() => null);
+        if (isMountedRef.current && updated) {
+          const item: DatasetSampleItem = updated.sample || updated;
+          setSamples((prev) => prev.map((s) => (s.id === item.id ? item : s)));
+          void loadDatasetState();
+        }
+      } else {
+        const err = await res.json().catch(() => null);
+        notify(err?.message || "Failed to update dataset sample");
       }
-    );
-    if (res.ok) {
-      const updated = await res.json();
-      const item: DatasetSampleItem = updated.sample || updated;
-      setSamples((prev) => prev.map((s) => (s.id === item.id ? item : s)));
-      void loadDatasetState();
+    } catch {
+      if (isMountedRef.current) {
+        notify("Network error while updating dataset sample");
+      }
     }
   };
 
@@ -6061,17 +6287,27 @@ export const DatasetStudioSection: React.FC<{
   };
 
   const handleDeleteSample = async (sampleId: string) => {
-    const res = await fetch(
-      `/api/dataset/samples/${encodeURIComponent(sampleId)}`,
-      {
-        method: "DELETE",
-        credentials: "include",
+    try {
+      const res = await fetch(
+        `/api/dataset/samples/${encodeURIComponent(sampleId)}`,
+        {
+          method: "DELETE",
+          credentials: "include",
+        }
+      );
+      if (!isMountedRef.current) return;
+      if (res.ok) {
+        setSamples((prev) => prev.filter((s) => s.id !== sampleId));
+        notify(`Deleted dataset sample ${sampleId}`);
+        void loadDatasetState();
+      } else {
+        const err = await res.json().catch(() => null);
+        notify(err?.message || `Failed to delete dataset sample ${sampleId}`);
       }
-    );
-    if (res.ok) {
-      setSamples((prev) => prev.filter((s) => s.id !== sampleId));
-      notify(`Deleted dataset sample ${sampleId}`);
-      void loadDatasetState();
+    } catch {
+      if (isMountedRef.current) {
+        notify(`Network error while deleting dataset sample ${sampleId}`);
+      }
     }
   };
 

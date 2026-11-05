@@ -15,6 +15,45 @@ import {
 } from "../../utils/format";
 import { TacticalCameraPicker } from "../../components/TacticalCameraPicker";
 
+const RESERVED_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+export function sanitizeConfigEntrySlug(raw: string): string {
+  const slug = (raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "_");
+  if (!slug || RESERVED_OBJECT_KEYS.has(slug)) {
+    return "";
+  }
+  return slug;
+}
+
+export function buildOnvifPasswordPatch(
+  rawInput: string,
+  hasExistingPassword?: boolean,
+  clearRequested?: boolean
+): { password: string; has_password: boolean; clear_password: boolean } {
+  if (clearRequested) {
+    return {
+      password: "",
+      has_password: false,
+      clear_password: true,
+    };
+  }
+  if (rawInput.length > 0) {
+    return {
+      password: rawInput,
+      has_password: Boolean(hasExistingPassword),
+      clear_password: false,
+    };
+  }
+  return {
+    password: hasExistingPassword ? "***" : "",
+    has_password: Boolean(hasExistingPassword),
+    clear_password: false,
+  };
+}
+
 export const ToggleSwitch: React.FC<{
   checked: boolean;
   onChange: (next: boolean) => void;
@@ -273,14 +312,18 @@ export const ConsoleUiSection: React.FC<{
                 className="nvr-btn mono"
                 style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
                 onClick={async () => {
-                  const res = await fetch("/api/notifications/test", {
-                    method: "POST",
-                    credentials: "include",
-                  });
-                  const data = await res.json().catch(() => ({}));
-                  if (res.ok && data.success) {
-                    notify(`Sent test alert notification (${data.camera})`);
-                  } else {
+                  try {
+                    const res = await fetch("/api/notifications/test", {
+                      method: "POST",
+                      credentials: "include",
+                    });
+                    const data = await res.json().catch(() => ({}));
+                    if (res.ok && data.success) {
+                      notify(`Sent test alert notification (${data.camera})`);
+                    } else {
+                      notify("Failed to send test alert notification");
+                    }
+                  } catch {
                     notify("Failed to send test alert notification");
                   }
                 }}
@@ -291,8 +334,13 @@ export const ConsoleUiSection: React.FC<{
                 checked={browserNotifications}
                 onChange={async (v) => {
                   if (v && "Notification" in window && Notification.permission !== "granted") {
-                    const perm = await Notification.requestPermission();
-                    if (perm !== "granted") {
+                    try {
+                      const perm = await Notification.requestPermission();
+                      if (perm !== "granted") {
+                        notify("Browser notification permission was not granted");
+                        return;
+                      }
+                    } catch {
                       notify("Browser notification permission was not granted");
                       return;
                     }
@@ -625,30 +673,78 @@ export const ChannelsStreamsSection: React.FC<{
     }>;
     error?: string | null;
   } | null>(null);
+  const probeSeqRef = React.useRef(0);
+  const probeAbortRef = React.useRef<AbortController | null>(null);
+  const inspectorCamRef = React.useRef(inspectorCam);
+  inspectorCamRef.current = inspectorCam;
+
+  React.useEffect(() => {
+    inspectorCamRef.current = inspectorCam;
+    probeSeqRef.current += 1;
+    if (probeAbortRef.current) {
+      probeAbortRef.current.abort();
+      probeAbortRef.current = null;
+    }
+    setProbeBusy(false);
+    setProbeResult(null);
+  }, [inspectorCam]);
+
+  React.useEffect(() => {
+    return () => {
+      probeSeqRef.current += 1;
+      if (probeAbortRef.current) {
+        probeAbortRef.current.abort();
+        probeAbortRef.current = null;
+      }
+    };
+  }, []);
 
   const handleRunStreamProbe = async (customUrl?: string) => {
+    const targetCam = inspectorCam;
+    if (!targetCam) return;
+    if (probeAbortRef.current) {
+      probeAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    probeAbortRef.current = controller;
+    const seq = ++probeSeqRef.current;
     setProbeBusy(true);
     try {
       const res = await fetch("/api/streams/probe", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
+        signal: controller.signal,
         body: JSON.stringify({
-          camera: inspectorCam,
+          camera: targetCam,
           url: customUrl || undefined,
         }),
       });
-      const data = await res.json();
-      setProbeResult(data);
-      if (data.ok) {
-        notify(`Stream probe succeeded (${data.latency_ms}ms)`);
-      } else {
-        notify(data.error || "Stream probe failed");
+      const data = await res.json().catch(() => null);
+      if (
+        seq !== probeSeqRef.current ||
+        inspectorCamRef.current !== targetCam
+      ) {
+        return;
       }
-    } catch {
-      notify("Failed to reach stream probe endpoint");
+      if (data && typeof data === "object") {
+        setProbeResult(data);
+        if (data.ok) {
+          notify(`Stream probe succeeded (${data.latency_ms}ms)`);
+        } else {
+          notify(data.error || "Stream probe failed");
+        }
+      } else {
+        notify(`Stream probe failed (${res.status})`);
+      }
+    } catch (err) {
+      if ((err as { name?: string })?.name !== "AbortError") {
+        notify("Failed to reach stream probe endpoint");
+      }
     } finally {
-      setProbeBusy(false);
+      if (seq === probeSeqRef.current) {
+        setProbeBusy(false);
+      }
     }
   };
   const [newStreamName, setNewStreamName] = useState("");
@@ -696,10 +792,7 @@ export const ChannelsStreamsSection: React.FC<{
   };
 
   const handleAddCamera = () => {
-    const slug = newCamName
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9_-]/g, "_");
+    const slug = sanitizeConfigEntrySlug(newCamName);
     if (!slug) {
       notify(
         isPt
@@ -1261,36 +1354,68 @@ export const ChannelsStreamsSection: React.FC<{
                       });
                     }}
                   />
-                  <input
-                    type="password"
-                    className="nvr-input mono"
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
-                    placeholder={
-                      activeCamCfg.onvif?.has_password
-                        ? "*** (password saved)"
-                        : "ONVIF Password"
-                    }
-                    aria-label="ONVIF Password"
-                    value={
-                      activeCamCfg.onvif?.password === "***"
-                        ? ""
-                        : activeCamCfg.onvif?.password || ""
-                    }
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      updateDraft((next) => {
-                        const cam = next.cameras[inspectorCam];
-                        if (!cam) return;
-                        cam.onvif = {
-                          port: 80,
-                          timeout_sec: 5,
-                          ...(cam.onvif || {}),
-                          password: val || "***",
-                          clear_password: false,
-                        };
-                      });
-                    }}
-                  />
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <input
+                      type="password"
+                      className="nvr-input mono"
+                      style={{ flex: 1, minWidth: 0, height: 24, fontSize: "var(--text-xs)" }}
+                      placeholder={
+                        activeCamCfg.onvif?.has_password
+                          ? "*** (password saved)"
+                          : "ONVIF Password"
+                      }
+                      aria-label="ONVIF Password"
+                      value={
+                        activeCamCfg.onvif?.password === "***"
+                          ? ""
+                          : activeCamCfg.onvif?.password || ""
+                      }
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        updateDraft((next) => {
+                          const cam = next.cameras[inspectorCam];
+                          if (!cam) return;
+                          const patch = buildOnvifPasswordPatch(
+                            val,
+                            cam.onvif?.has_password,
+                            false
+                          );
+                          cam.onvif = {
+                            port: 80,
+                            timeout_sec: 5,
+                            ...(cam.onvif || {}),
+                            ...patch,
+                          };
+                        });
+                      }}
+                    />
+                    {(activeCamCfg.onvif?.has_password ||
+                      (activeCamCfg.onvif?.password &&
+                        activeCamCfg.onvif.password !== "")) && (
+                      <button
+                        type="button"
+                        className="nvr-btn danger mono"
+                        style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        title="Clear saved ONVIF password"
+                        aria-label="Clear ONVIF Password"
+                        onClick={() => {
+                          updateDraft((next) => {
+                            const cam = next.cameras[inspectorCam];
+                            if (!cam) return;
+                            const patch = buildOnvifPasswordPatch("", false, true);
+                            cam.onvif = {
+                              port: 80,
+                              timeout_sec: 5,
+                              ...(cam.onvif || {}),
+                              ...patch,
+                            };
+                          });
+                        }}
+                      >
+                        ×
+                      </button>
+                    )}
+                  </div>
                   <input
                     className="nvr-input mono"
                     style={{ height: 24, fontSize: "var(--text-xs)" }}
@@ -1594,7 +1719,7 @@ export const ChannelsStreamsSection: React.FC<{
                   type="button"
                   className="nvr-btn primary"
                   onClick={() => {
-                    const k = newStreamName.trim();
+                    const k = sanitizeConfigEntrySlug(newStreamName);
                     const u = newStreamUrl.trim();
                     if (!k || !u) return;
                     updateDraft((next) => {

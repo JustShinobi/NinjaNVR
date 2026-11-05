@@ -17,6 +17,10 @@ import {
   formatSubLabelBadge,
   normalizeLicensePlate,
 } from "./ExploreWorkspace";
+import {
+  MAX_EXPORT_WINDOW_SEC,
+  validateExportTimeWindow,
+} from "./ExportsWorkspace";
 import { normalizeFaceProfileName } from "./settings/VisionAndAiPanels";
 
 export interface SavedReviewFilterPreset {
@@ -39,14 +43,46 @@ export function resolveReviewThumbUrl(
     return fallback;
   }
   const stripped = raw.replace(/^\/media\/[^/]+/, "");
+  let decoded = stripped;
+  try {
+    decoded = decodeURIComponent(stripped);
+  } catch {
+    return fallback;
+  }
   if (
     !stripped.startsWith("/") ||
     stripped.startsWith("//") ||
-    stripped.includes("..")
+    stripped.includes("..") ||
+    decoded.startsWith("//") ||
+    decoded.includes("..") ||
+    /[\u0000-\u001f\u007f\\]/.test(decoded) ||
+    !/^\/(?:clips|previews|exports|api)\//.test(decoded) ||
+    /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
   ) {
     return fallback;
   }
   return stripped;
+}
+
+export function resolveNextBriefingStep(
+  queueIds: ReadonlyArray<string>,
+  currentIdx: number,
+  availableReviews: ReadonlyArray<ReviewItem>
+): { nextIdx: number; nextReview: ReviewItem } | null {
+  if (!Array.isArray(queueIds) || queueIds.length === 0) return null;
+  const startIdx =
+    typeof currentIdx === "number" && Number.isFinite(currentIdx)
+      ? Math.max(0, Math.floor(currentIdx) + 1)
+      : 0;
+  for (let idx = startIdx; idx < queueIds.length; idx++) {
+    const candidateId = queueIds[idx];
+    if (!candidateId) continue;
+    const found = availableReviews.find((r) => r.id === candidateId);
+    if (found) {
+      return { nextIdx: idx, nextReview: found };
+    }
+  }
+  return null;
 }
 
 export function shouldApplyReviewMutationResult(
@@ -103,7 +139,10 @@ export function computeReviewPlaybackWindow(
       ? endTime
       : safeStart + safeFallbackDur;
   const startSec = Math.max(0, safeStart - safePre);
-  const endSec = Math.max(startSec + 1, baseEnd + safePost);
+  const endSec = Math.min(
+    startSec + MAX_EXPORT_WINDOW_SEC,
+    Math.max(startSec + 1, baseEnd + safePost)
+  );
   return { startSec, endSec };
 }
 
@@ -223,6 +262,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [shareFallbackUrl, setShareFallbackUrl] = React.useState<string | null>(null);
   const [shareCreating, setShareCreating] = React.useState(false);
   const shareCopiedTimerRef = React.useRef<number | null>(null);
+  const isMountedRef = React.useRef(true);
+  const reviewMutationSeqRef = React.useRef(0);
   const activeReviewIdRef = React.useRef<string | null>(activeReview?.id ?? null);
   activeReviewIdRef.current = activeReview?.id ?? null;
 
@@ -240,6 +281,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
 
   React.useEffect(() => {
     activeReviewIdRef.current = activeReview?.id ?? null;
+    reviewMutationSeqRef.current += 1;
     if (shareCopiedTimerRef.current !== null) {
       window.clearTimeout(shareCopiedTimerRef.current);
       shareCopiedTimerRef.current = null;
@@ -253,6 +295,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   React.useEffect(() => {
     if (!activeReview || !reviews.some((r) => r.id === activeReview.id)) {
       activeReviewIdRef.current = null;
+      reviewMutationSeqRef.current += 1;
       if (shareCopiedTimerRef.current !== null) {
         window.clearTimeout(shareCopiedTimerRef.current);
         shareCopiedTimerRef.current = null;
@@ -261,11 +304,14 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
       setShareFallbackUrl(null);
       setShareCopied(false);
       setShareCreating(false);
+      setBriefingActive(false);
     }
   }, [reviews, activeReview]);
 
   React.useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       if (shareCopiedTimerRef.current !== null) {
         window.clearTimeout(shareCopiedTimerRef.current);
         shareCopiedTimerRef.current = null;
@@ -294,9 +340,15 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     if (!activeReview) return;
     const targetReview = activeReview;
     const targetId = targetReview.id;
-    const detId = targetReview.data?.detections?.[0] || targetId;
+    const detId = (targetReview.data?.detections?.[0] || targetId).trim();
+    if (!detId) return;
     const raw = overrideName !== undefined ? overrideName : reviewFaceDraft;
-    const clean = raw && raw.trim().length > 0 ? raw.trim() : null;
+    const clean =
+      raw && raw.trim().length > 0
+        ? normalizeFaceProfileName(raw) || null
+        : null;
+    if (raw && raw.trim().length > 0 && !clean) return;
+    const seq = ++reviewMutationSeqRef.current;
     try {
       const res = await fetch(`/api/events/${encodeURIComponent(detId)}/sub_label`, {
         method: "POST",
@@ -305,6 +357,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         body: JSON.stringify({ sub_label: clean }),
       });
       if (
+        isMountedRef.current &&
+        seq === reviewMutationSeqRef.current &&
         shouldApplyReviewMutationResult(
           activeReviewIdRef.current,
           targetId,
@@ -330,7 +384,9 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     if (!cleanName) return;
     const targetReview = activeReview;
     const targetId = targetReview.id;
-    const detId = targetReview.data?.detections?.[0] || targetId;
+    const detId = (targetReview.data?.detections?.[0] || targetId).trim();
+    if (!detId) return;
+    const seq = ++reviewMutationSeqRef.current;
     try {
       const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
         method: "POST",
@@ -339,6 +395,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         body: JSON.stringify({ event_id: detId, assign_sub_label: true }),
       });
       if (
+        isMountedRef.current &&
+        seq === reviewMutationSeqRef.current &&
         shouldApplyReviewMutationResult(
           activeReviewIdRef.current,
           targetId,
@@ -363,7 +421,9 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     const targetReview = activeReview;
     const targetId = targetReview.id;
     const norm = normalizeLicensePlate(reviewPlateDraft);
-    const primaryEventId = targetReview.data?.detections?.[0] || targetId;
+    const primaryEventId = (targetReview.data?.detections?.[0] || targetId).trim();
+    if (!primaryEventId) return;
+    const seq = ++reviewMutationSeqRef.current;
     try {
       const res = await fetch(
         `/api/events/${encodeURIComponent(primaryEventId)}/license_plate`,
@@ -375,6 +435,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         }
       );
       if (
+        isMountedRef.current &&
+        seq === reviewMutationSeqRef.current &&
         shouldApplyReviewMutationResult(
           activeReviewIdRef.current,
           targetId,
@@ -400,6 +462,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     const targetReview = activeReview;
     const targetId = targetReview.id;
     const noteToSave = reviewNoteDraft;
+    const seq = ++reviewMutationSeqRef.current;
     try {
       const res = await fetch(`/api/review/${encodeURIComponent(targetId)}/notes`, {
         method: "PUT",
@@ -408,6 +471,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         body: JSON.stringify({ notes: noteToSave }),
       });
       if (
+        isMountedRef.current &&
+        seq === reviewMutationSeqRef.current &&
         shouldApplyReviewMutationResult(
           activeReviewIdRef.current,
           targetId,
@@ -506,23 +571,17 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
 
   const handleAdvanceBriefing = React.useCallback(() => {
     if (!briefingActive) return;
-    const currentId = briefingQueueIds[briefingIdx] || activeReview?.id;
-    if (briefingAutoMark && currentId) {
+    const currentId = activeReview?.id || briefingQueueIds[briefingIdx];
+    if (briefingAutoMark && currentId && reviews.some((r) => r.id === currentId)) {
       void handleMarkReviews([currentId], true);
     }
-    const nextIdx = briefingIdx + 1;
-    if (nextIdx >= briefingQueueIds.length) {
+    const nextStep = resolveNextBriefingStep(briefingQueueIds, briefingIdx, reviews);
+    if (!nextStep) {
       setBriefingActive(false);
       return;
     }
-    const nextId = briefingQueueIds[nextIdx];
-    const nextItem = reviews.find((r) => r.id === nextId);
-    setBriefingIdx(nextIdx);
-    if (nextItem) {
-      setActiveReview(nextItem);
-    } else {
-      setBriefingActive(false);
-    }
+    setBriefingIdx(nextStep.nextIdx);
+    setActiveReview(nextStep.nextReview);
   }, [
     briefingActive,
     briefingQueueIds,
@@ -1119,7 +1178,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                           }),
                         });
                         const data = await res.json().catch(() => ({}));
-                        if (activeReviewIdRef.current !== requestReviewId) {
+                        if (!isMountedRef.current || activeReviewIdRef.current !== requestReviewId) {
                           return;
                         }
                         if (!res.ok || !(data?.url || data?.token)) {
@@ -1154,13 +1213,13 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                             copiedOk = false;
                           }
                         }
-                        if (activeReviewIdRef.current !== requestReviewId) {
+                        if (!isMountedRef.current || activeReviewIdRef.current !== requestReviewId) {
                           return;
                         }
                         if (copiedOk) {
                           setShareCopied(true);
                           shareCopiedTimerRef.current = window.setTimeout(() => {
-                            if (activeReviewIdRef.current === requestReviewId) {
+                            if (isMountedRef.current && activeReviewIdRef.current === requestReviewId) {
                               setShareCopied(false);
                             }
                             shareCopiedTimerRef.current = null;
@@ -1169,13 +1228,13 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                           setShareCopied(false);
                         }
                       } catch {
-                        if (activeReviewIdRef.current !== requestReviewId) {
+                        if (!isMountedRef.current || activeReviewIdRef.current !== requestReviewId) {
                           return;
                         }
                         setShareError(t.review.shareError);
                         setShareCopied(false);
                       } finally {
-                        if (activeReviewIdRef.current === requestReviewId) {
+                        if (isMountedRef.current && activeReviewIdRef.current === requestReviewId) {
                           setShareCreating(false);
                         }
                       }
@@ -1198,10 +1257,15 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         5,
                         20
                       );
+                      const checked = validateExportTimeWindow(
+                        win.startSec,
+                        win.endSec
+                      );
+                      if (!checked.valid) return;
                       void handleQuickExport(
                         activeReview.camera,
-                        win.startSec,
-                        win.endSec,
+                        checked.startSec,
+                        checked.endSec,
                         `${activeReview.camera}_${activeReview.id}`
                       );
                     }}
@@ -1475,47 +1539,55 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
               )}
 
               <div className="nvr-cam-tile" style={{ flex: 1 }}>
-                {(activeReview.data as Record<string, unknown> | undefined)
-                  ?.mock_video ? (
-                  <video
-                    src={`/clips/mocks/${encodeURIComponent(
-                      String(
-                        (activeReview.data as Record<string, unknown>).mock_video
-                      )
-                    )}`}
-                    controls
-                    autoPlay
-                    loop
-                    muted
-                    playsInline
-                    style={{
-                      width: "100%",
-                      height: "100%",
-                      objectFit: "contain",
-                      background: "var(--video-stage-bg)",
-                    }}
-                  />
-                ) : (
-                  (() => {
-                    const vodWin = computeReviewPlaybackWindow(
-                      activeReview.start_time,
-                      activeReview.end_time,
-                      4,
-                      6,
-                      20
-                    );
+                {(() => {
+                  const rawMock = String(
+                    (activeReview.data as Record<string, unknown> | undefined)
+                      ?.mock_video || ""
+                  ).trim();
+                  const safeMock =
+                    rawMock &&
+                    !rawMock.includes("..") &&
+                    !/[/\\\u0000-\u001f\u007f]/.test(rawMock)
+                      ? rawMock
+                      : "";
+                  if (safeMock) {
                     return (
-                      <VodHlsPlayer
-                        camera={activeReview.camera}
-                        startTime={vodWin.startSec}
-                        endTime={vodWin.endSec}
-                        fallbackPreviewId={activeReview.id}
-                        playbackRate={briefingActive ? briefingSpeed : playbackSpeed}
-                        onEnded={briefingActive ? handleAdvanceBriefing : undefined}
+                      <video
+                        key={activeReview.id}
+                        src={`/clips/mocks/${encodeURIComponent(safeMock)}`}
+                        controls
+                        autoPlay
+                        loop
+                        muted
+                        playsInline
+                        style={{
+                          width: "100%",
+                          height: "100%",
+                          objectFit: "contain",
+                          background: "var(--video-stage-bg)",
+                        }}
                       />
                     );
-                  })()
-                )}
+                  }
+                  const vodWin = computeReviewPlaybackWindow(
+                    activeReview.start_time,
+                    activeReview.end_time,
+                    4,
+                    6,
+                    20
+                  );
+                  return (
+                    <VodHlsPlayer
+                      key={activeReview.id}
+                      camera={activeReview.camera}
+                      startTime={vodWin.startSec}
+                      endTime={vodWin.endSec}
+                      fallbackPreviewId={activeReview.id}
+                      playbackRate={briefingActive ? briefingSpeed : playbackSpeed}
+                      onEnded={briefingActive ? handleAdvanceBriefing : undefined}
+                    />
+                  );
+                })()}
               </div>
 
               <div
@@ -1622,7 +1694,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 reviews={reviews}
                 currentTs={Math.floor(activeReview.start_time)}
                 onSeek={(ts) => {
-                  if (ts !== null) {
+                  if (ts !== null && Number.isFinite(ts)) {
                     setActiveReview({
                       ...activeReview,
                       start_time: ts,
@@ -1630,7 +1702,18 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     });
                   }
                 }}
-                onExportRange={handleQuickExport}
+                onExportRange={async (cam, start, end, label) => {
+                  const cleanCam = (cam || "").trim();
+                  if (!cleanCam) return;
+                  const win = validateExportTimeWindow(start, end);
+                  if (!win.valid) return;
+                  return handleQuickExport(
+                    cleanCam,
+                    win.startSec,
+                    win.endSec,
+                    label
+                  );
+                }}
                 titlePrefix={`REVIEW TIMELINE (${activeReview.camera.toUpperCase()})`}
               />
             </>

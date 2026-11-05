@@ -93,8 +93,20 @@ export function resolveSafeExportVideoUrl(
   exportId?: string
 ): string {
   const cleanId = (exportId || "").trim();
+  let decodedId = cleanId;
+  let idDecodable = true;
+  try {
+    decodedId = decodeURIComponent(cleanId);
+  } catch {
+    idDecodable = false;
+  }
   const fallback =
-    cleanId && !cleanId.includes("..") && !/[/\\]/.test(cleanId)
+    cleanId &&
+    idDecodable &&
+    !cleanId.includes("..") &&
+    !decodedId.includes("..") &&
+    !/[/\\\u0000-\u001f\u007f]/.test(cleanId) &&
+    !/[/\\\u0000-\u001f\u007f]/.test(decodedId)
       ? `/exports/${encodeURIComponent(cleanId)}.mp4`
       : "";
   const raw = (videoPath || "").trim();
@@ -102,10 +114,20 @@ export function resolveSafeExportVideoUrl(
     return fallback;
   }
   const stripped = raw.replace(/^\/media\/[^/]+/, "");
+  let decoded = stripped;
+  try {
+    decoded = decodeURIComponent(stripped);
+  } catch {
+    return fallback;
+  }
   if (
     !stripped.startsWith("/") ||
     stripped.startsWith("//") ||
-    stripped.includes("..")
+    stripped.includes("..") ||
+    decoded.startsWith("//") ||
+    decoded.includes("..") ||
+    /[\u0000-\u001f\u007f\\]/.test(decoded) ||
+    !/^\/(?:exports|clips)\//.test(decoded)
   ) {
     return fallback;
   }
@@ -478,6 +500,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
         body: JSON.stringify(payload),
       });
       const data = await res.json().catch(() => ({}));
+      if (!isMountedRef.current) return;
       if (res.ok && (data.url || data.token)) {
         const fullUrl = buildSharePublicUrl(
           window.location.origin,
@@ -485,20 +508,24 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
         );
         if (!fullUrl) {
           await fetchShareLinks();
-          notify("Failed to generate share link");
+          if (isMountedRef.current) {
+            notify("Failed to generate share link");
+          }
           return;
         }
-        if (data.id) {
+        if (data.id && isMountedRef.current) {
           setShareUrlMap((prev) => ({
             ...prev,
             [String(data.id)]: fullUrl,
           }));
         }
         await fetchShareLinks();
-        await copyUrlToClipboard(
-          fullUrl,
-          formatShareLinkRemainingTtl(Math.floor(Date.now() / 1000) + ttlToUse)
-        );
+        if (isMountedRef.current) {
+          await copyUrlToClipboard(
+            fullUrl,
+            formatShareLinkRemainingTtl(Math.floor(Date.now() / 1000) + ttlToUse)
+          );
+        }
       } else {
         notify(
           (typeof data?.message === "string" && data.message) ||
@@ -506,9 +533,13 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
         );
       }
     } catch {
-      notify("Failed to generate share link");
+      if (isMountedRef.current) {
+        notify("Failed to generate share link");
+      }
     } finally {
-      setCreatingShareId(null);
+      if (isMountedRef.current) {
+        setCreatingShareId(null);
+      }
     }
   };
 
@@ -534,6 +565,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
         method: "DELETE",
         credentials: "include",
       });
+      if (!isMountedRef.current) return;
       if (res.ok) {
         const revokedLink = shareLinks.find((l) => l.id === id);
         const revokedUrl =
@@ -553,18 +585,26 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           setGeneratedShareUrl((prev) => (prev === revokedUrl ? "" : prev));
         }
         await fetchShareLinks();
-        notify(`Revoked share link ${id}`);
+        if (isMountedRef.current) {
+          notify(`Revoked share link ${id}`);
+        }
       } else {
         const data = await res.json().catch(() => ({}));
-        notify(
-          (typeof data?.message === "string" && data.message) ||
-            "Failed to revoke share link"
-        );
+        if (isMountedRef.current) {
+          notify(
+            (typeof data?.message === "string" && data.message) ||
+              "Failed to revoke share link"
+          );
+        }
       }
     } catch {
-      notify("Failed to revoke share link");
+      if (isMountedRef.current) {
+        notify("Failed to revoke share link");
+      }
     } finally {
-      setRevokingShareId(null);
+      if (isMountedRef.current) {
+        setRevokingShareId(null);
+      }
     }
   };
 
@@ -1141,6 +1181,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
           <div className="nvr-cam-tile" style={{ flex: 1 }}>
             {activeExportPreview ? (
               <video
+                key={activeExportPreview.id}
                 src={resolveSafeExportVideoUrl(
                   activeExportPreview.video_path,
                   activeExportPreview.id
@@ -1151,7 +1192,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                 playsInline
                 style={{ width: "100%", height: "100%", objectFit: "contain" }}
               />
-            ) : timeShiftTs === null ? (
+            ) : timeShiftTs === null || !Number.isFinite(timeShiftTs) ? (
               <LiveMsePlayer
                 camera={exportCam}
                 useMainStream={true}

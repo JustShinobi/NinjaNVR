@@ -55,9 +55,12 @@ export function normalizeRtspProducerEndpoint(rawUrl: string): string | null {
       hostOnly = hostOnly.slice(0, colonIdx);
     }
   }
+  hostOnly = hostOnly.replace(/\.+$/, "");
   if (
     !hostOnly ||
     hostOnly === "localhost" ||
+    hostOnly === "0.0.0.0" ||
+    hostOnly === "::" ||
     hostOnly === "::1" ||
     hostOnly === "0:0:0:0:0:0:0:1" ||
     /^127(?:\.\d{1,3}){3}$/.test(hostOnly)
@@ -462,7 +465,8 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
       <div className="nvr-panel">
         <div className="nvr-panel-header">
           <span>
-            HARDWARE & PIPELINE TELEMETRY (UPTIME {formatUptime(stats?.service?.uptime || 0)})
+            HARDWARE & PIPELINE TELEMETRY (UPTIME{" "}
+            {formatUptime(Math.max(0, toFiniteNumber(stats?.service?.uptime, 0)))})
           </span>
           <span className="mono">{stats?.service?.version || "—"}</span>
         </div>
@@ -781,13 +785,13 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   return (
                     <tr key={cam}>
                       <td style={{ fontWeight: 700, textTransform: "uppercase" }}>{cam}</td>
-                      <td>{cs?.camera_fps?.toFixed(1) || "5.0"}</td>
-                      <td>{cs?.process_fps?.toFixed(1) || "5.0"}</td>
+                      <td>{toFiniteNumber(cs?.camera_fps, 5.0).toFixed(1)}</td>
+                      <td>{toFiniteNumber(cs?.process_fps, 5.0).toFixed(1)}</td>
                       <td style={{ color: "var(--signal-accent-text)" }}>
-                        {cs?.detection_fps?.toFixed(1) || "0.0"}
+                        {toFiniteNumber(cs?.detection_fps, 0.0).toFixed(1)}
                       </td>
-                      <td>{cs?.ffmpeg_cpu || "1.2"}%</td>
-                      <td>{cs?.capture_cpu || "1.0"}%</td>
+                      <td>{toFiniteNumber(cs?.ffmpeg_cpu, 1.2).toFixed(1)}%</td>
+                      <td>{toFiniteNumber(cs?.capture_cpu, 1.0).toFixed(1)}%</td>
                     </tr>
                   );
                 })}

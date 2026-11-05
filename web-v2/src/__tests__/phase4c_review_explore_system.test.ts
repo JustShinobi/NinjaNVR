@@ -5,6 +5,7 @@ import {
   computeReviewPlaybackWindow,
   getVisibleReviewPageIds,
   parseSavedReviewPresets,
+  resolveNextBriefingStep,
   resolveReviewThumbUrl,
   ReviewWorkspace,
   shouldApplyReviewMutationResult,
@@ -15,6 +16,7 @@ import {
   formatDetectedAttributePill,
   formatSubLabelBadge,
   parseSavedExplorePresets,
+  resolveFiniteEventScore,
   shouldApplyEventMutationResult,
 } from "../views/ExploreWorkspace";
 import {
@@ -30,6 +32,26 @@ import {
   SystemWorkspace,
   toFiniteNumber,
 } from "../views/SystemWorkspace";
+import {
+  buildOnvifPasswordPatch,
+  sanitizeConfigEntrySlug,
+} from "../views/settings/ConsoleAndStreamsPanels";
+import {
+  normalizeAllowedCamerasScope,
+  resolveEffectiveRecordConfig,
+  validateFederationPeerUrl,
+} from "../views/settings/RecordingAndSecurityPanels";
+import {
+  buildLocalFinetuneCliCommand,
+  buildModelUploadPayload,
+  computeDatasetReadinessMetrics,
+  formatDhash64Hex,
+  formatSignatureBbox,
+  formatYoloAnnotationLine,
+  isSafeGenAiCustomBaseUrl,
+  xyxyToYoloNormalized,
+} from "../views/settings/VisionAndAiPanels";
+import { useNvrStore } from "../store/useNvrStore";
 import type { EventItem, ExportItem, ReviewItem } from "../types/nvr";
 
 describe("Phase 4C — ReviewWorkspace security & regression suite", () => {
@@ -653,20 +675,369 @@ describe("Phase 4C — SystemWorkspace security & regression suite", () => {
   });
 
   test("SystemWorkspace renders telemetry and storage tables without NaN on malformed metrics", () => {
+    const prevStats = useNvrStore.getState().stats;
+    useNvrStore.setState({
+      stats: {
+        cameras: {
+          front_door: {
+            camera_fps: Number.NaN,
+            process_fps: Number.NaN,
+            skipped_fps: Number.NaN,
+            detection_fps: Number.NaN,
+            detection_enabled: true,
+            pid: 101,
+            capture_pid: 102,
+            ffmpeg_pid: 103,
+            ffmpeg_cpu: "NaN",
+            capture_cpu: "NaN",
+          },
+        },
+        detectors: {},
+        camera_fps: Number.NaN,
+        process_fps: Number.NaN,
+        skipped_fps: 0,
+        detection_fps: Number.NaN,
+        cpu_usages: {},
+        processes: {},
+        service: {
+          uptime: Number.NaN,
+          version: "0.9.0",
+          latest_version: "0.9.0",
+          last_updated: 1700000000,
+          storage: {},
+        },
+      },
+    });
+    try {
+      const html = renderToStaticMarkup(
+        React.createElement(SystemWorkspace, {
+          cameraNames: ["front_door"],
+          logService: "ninjanvr",
+          setLogService: () => {},
+          logLines: ["2026-11-05 INFO Engine started"],
+          logSearch: "",
+          setLogSearch: () => {},
+          logPaused: false,
+          setLogPaused: () => {},
+          notify: () => {},
+        })
+      );
+      expect(html).not.toContain("NaN");
+      expect(html).toContain("HARDWARE &amp; PIPELINE TELEMETRY");
+    } finally {
+      useNvrStore.setState({ stats: prevStats });
+    }
+  });
+});
+
+describe("Phase 4C Cycle-2 — Review, Explore, Exports, System & Settings panels hardening suite", () => {
+  test("resolveReviewThumbUrl blocks percent-encoded traversal and sensitive API routes while computeReviewPlaybackWindow caps duration at 24h", () => {
+    expect(
+      resolveReviewThumbUrl({
+        camera: "front_door",
+        thumb_path: "/clips/%2e%2e/%2e%2e/api/logout",
+      })
+    ).toBe("/api/front_door/latest.webp");
+    expect(
+      resolveReviewThumbUrl({
+        camera: "front_door",
+        thumb_path: "/api/auth/logout",
+      })
+    ).toBe("/api/front_door/latest.webp");
+    expect(
+      resolveReviewThumbUrl({
+        camera: "front_door",
+        thumb_path: "/api/users/admin",
+      })
+    ).toBe("/api/front_door/latest.webp");
+
+    // Unbounded end_time is capped to MAX_EXPORT_WINDOW_SEC (86400s)
+    const cappedWin = computeReviewPlaybackWindow(1000, 1000 + 500000, 4, 6, 20);
+    expect(cappedWin.startSec).toBe(996);
+    expect(cappedWin.endSec - cappedWin.startSec).toBe(MAX_EXPORT_WINDOW_SEC);
+  });
+
+  test("resolveNextBriefingStep skips deleted review items in briefingQueueIds instead of aborting early", () => {
+    const rev1: ReviewItem = {
+      id: "rev_1",
+      camera: "cam1",
+      start_time: 100,
+      end_time: 110,
+      severity: "alert",
+      thumb_path: "",
+      has_been_reviewed: false,
+      data: { objects: ["person"] },
+    };
+    const rev3: ReviewItem = {
+      id: "rev_3",
+      camera: "cam1",
+      start_time: 200,
+      end_time: 210,
+      severity: "alert",
+      thumb_path: "",
+      has_been_reviewed: false,
+      data: { objects: ["person"] },
+    };
+    // rev_2 was deleted while briefing was running
+    const step = resolveNextBriefingStep(
+      ["rev_1", "rev_2", "rev_3"],
+      0,
+      [rev1, rev3]
+    );
+    expect(step).toEqual({ nextIdx: 2, nextReview: rev3 });
+    expect(
+      resolveNextBriefingStep(["rev_1", "rev_2", "rev_3"], 2, [rev1, rev3])
+    ).toBeNull();
+  });
+
+  test("resolveFiniteEventScore and ExploreWorkspace prevent NaN% and NaNs when event scores or timestamps are NaN", () => {
+    const nanEvent: EventItem = {
+      id: "ev_nan_1",
+      camera: "front_door",
+      label: "person",
+      sub_label: "Bruno",
+      zones: ["porch"],
+      start_time: Number.NaN,
+      end_time: Number.NaN,
+      top_score: Number.NaN,
+      score: Number.NaN,
+      has_clip: true,
+      has_snapshot: true,
+      retain_indefinitely: false,
+      false_positive: false,
+      box: null,
+      data: {
+        top_score: Number.NaN,
+        detected_attributes: [
+          {
+            label: "face",
+            score: Number.NaN,
+            norm_bbox: [Number.NaN, 0.1, 0.2, 0.3],
+            area_px: Number.NaN,
+          },
+        ],
+      },
+    };
+    expect(resolveFiniteEventScore(nanEvent, 0.85)).toBe(0.85);
+
     const html = renderToStaticMarkup(
-      React.createElement(SystemWorkspace, {
+      React.createElement(ExploreWorkspace, {
         cameraNames: ["front_door"],
-        logService: "ninjanvr",
-        setLogService: () => {},
-        logLines: ["2026-11-05 INFO Engine started"],
-        logSearch: "",
-        setLogSearch: () => {},
-        logPaused: false,
-        setLogPaused: () => {},
+        filteredEvents: [nanEvent],
+        exploreQuery: "",
+        setExploreQuery: () => {},
+        exploreCamera: "all",
+        setExploreCamera: () => {},
+        exploreLabel: "all",
+        setExploreLabel: () => {},
+        exploreRetainedOnly: false,
+        setExploreRetainedOnly: () => {},
+        globalDaysSummary: [],
+        reviewDateFilter: "",
+        setReviewDateFilter: () => {},
+        selectedEvent: nanEvent,
+        setSelectedEvent: () => {},
+        eventViewMode: "snapshot",
+        setEventViewMode: () => {},
+        handleEventRetain: async () => {},
+        handleEventDelete: async () => {},
+        setSyncMasterTs: () => {},
+        switchTab: () => {},
         notify: () => {},
       })
     );
     expect(html).not.toContain("NaN");
-    expect(html).toContain("HARDWARE &amp; PIPELINE TELEMETRY");
+    expect(html).toContain("85%");
+    expect(html).toContain("88%");
+  });
+
+  test("resolveSafeExportVideoUrl rejects percent-encoded traversal and non-export API routes", () => {
+    expect(
+      resolveSafeExportVideoUrl(
+        "/exports/%2e%2e/%2e%2e/api/logout",
+        "exp_1"
+      )
+    ).toBe("/exports/exp_1.mp4");
+    expect(
+      resolveSafeExportVideoUrl("/api/auth/logout", "exp_1")
+    ).toBe("/exports/exp_1.mp4");
+    expect(
+      resolveSafeExportVideoUrl("javascript:alert(1)", "%2e%2e")
+    ).toBe("");
+  });
+
+  test("normalizeRtspProducerEndpoint rejects 0.0.0.0, [::], and trailing-dot localhost", () => {
+    expect(
+      normalizeRtspProducerEndpoint("rtsp://0.0.0.0:8554/front_door")
+    ).toBeNull();
+    expect(
+      normalizeRtspProducerEndpoint("rtsp://[::]:8554/front_door")
+    ).toBeNull();
+    expect(
+      normalizeRtspProducerEndpoint("rtsp://localhost.:8554/front_door")
+    ).toBeNull();
+  });
+
+  test("ConsoleAndStreamsPanels: buildOnvifPasswordPatch and sanitizeConfigEntrySlug preserve secret masks and block prototype pollution", () => {
+    expect(sanitizeConfigEntrySlug("__proto__")).toBe("");
+    expect(sanitizeConfigEntrySlug("constructor")).toBe("");
+    expect(sanitizeConfigEntrySlug("prototype")).toBe("");
+    expect(sanitizeConfigEntrySlug("  Front Gate #1 ")).toBe("front_gate__1");
+
+    // When no password was saved, empty input stays empty instead of falsely setting "***"
+    expect(buildOnvifPasswordPatch("", false, false)).toEqual({
+      password: "",
+      has_password: false,
+      clear_password: false,
+    });
+    // When a password was previously saved, empty input preserves "***"
+    expect(buildOnvifPasswordPatch("", true, false)).toEqual({
+      password: "***",
+      has_password: true,
+      clear_password: false,
+    });
+    // Explicit clear request sets clear_password: true and clears password
+    expect(buildOnvifPasswordPatch("", true, true)).toEqual({
+      password: "",
+      has_password: false,
+      clear_password: true,
+    });
+  });
+
+  test("RecordingAndSecurityPanels: resolveEffectiveRecordConfig deep-merges partial alerts/detections and validateFederationPeerUrl blocks SSRF", () => {
+    const baseRec = {
+      enabled: true,
+      expire_interval: 60,
+      continuous: { days: 14 },
+      motion: { days: 0 },
+      alerts: {
+        pre_capture: 5,
+        post_capture: 5,
+        retain: { days: 14, mode: "motion" },
+      },
+      detections: {
+        pre_capture: 5,
+        post_capture: 5,
+        retain: { days: 14, mode: "motion" },
+      },
+      preview: { quality: "medium" },
+    };
+    const merged = resolveEffectiveRecordConfig(baseRec, {
+      enabled: true,
+      alerts: { pre_capture: 8, post_capture: 10 },
+    });
+    expect(merged.alerts?.pre_capture).toBe(8);
+    expect(merged.alerts?.retain).toEqual({ days: 14, mode: "motion" });
+    expect(merged.detections?.retain).toEqual({ days: 14, mode: "motion" });
+
+    expect(normalizeAllowedCamerasScope(" front_door , garagem , front_door , ../bad ")).toBe(
+      "front_door,garagem"
+    );
+    expect(normalizeAllowedCamerasScope("   ")).toBe("*");
+
+    // Valid remote NVR peer
+    expect(
+      validateFederationPeerUrl("https://nvr-remote.example.test:8971/")
+    ).toEqual({
+      valid: true,
+      normalizedUrl: "https://nvr-remote.example.test:8971",
+    });
+
+    // SSRF / unsafe peer URLs are rejected
+    expect(validateFederationPeerUrl("javascript:alert(1)").valid).toBe(false);
+    expect(
+      validateFederationPeerUrl("http://admin:secret@192.0.2.10:8971").valid
+    ).toBe(false);
+    expect(
+      validateFederationPeerUrl("http://169.254.169.254/latest/meta-data").valid
+    ).toBe(false);
+    expect(
+      validateFederationPeerUrl("http://metadata.google.internal.").valid
+    ).toBe(false);
+    expect(validateFederationPeerUrl("http://127.0.0.1:5000").valid).toBe(false);
+    expect(validateFederationPeerUrl("http://localhost:8971").valid).toBe(false);
+    expect(validateFederationPeerUrl("http://0.0.0.0:5000").valid).toBe(false);
+    expect(validateFederationPeerUrl("http://[::1]:5000").valid).toBe(false);
+    expect(validateFederationPeerUrl("http://[fe80::1]:5000").valid).toBe(false);
+  });
+
+  test("VisionAndAiPanels: formatDhash64Hex, computeDatasetReadinessMetrics, buildModelUploadPayload, buildLocalFinetuneCliCommand, and isSafeGenAiCustomBaseUrl guard against Infinity, NaN, path traversal, shell injection, and SSRF", () => {
+    // Infinity does not throw RangeError in BigInt conversion
+    expect(formatDhash64Hex(Number.POSITIVE_INFINITY)).toBe("—");
+    expect(formatDhash64Hex(Number.NEGATIVE_INFINITY)).toBe("—");
+    expect(formatDhash64Hex(Number.NaN)).toBe("—");
+    expect(formatSignatureBbox([Number.NaN, Number.POSITIVE_INFINITY, 0.5, 0.75])).toBe(
+      "[0.00, 0.00, 0.50, 0.75]"
+    );
+
+    // NaN box / annotation values do not produce "NaN"
+    expect(
+      xyxyToYoloNormalized([Number.NaN, Number.NaN, 0.5, 0.5])
+    ).toEqual({
+      cx: 0.25,
+      cy: 0.25,
+      w: 0.5,
+      h: 0.5,
+    });
+    expect(
+      formatYoloAnnotationLine({
+        class_id: Number.NaN,
+        label: "person",
+        cx: Number.NaN,
+        cy: 0.5,
+        w: Number.NaN,
+        h: 0.4,
+      })
+    ).toBe("0 0.000000 0.500000 0.001000 0.400000");
+
+    // Readiness metrics clamp and sanitize NaN or inconsistent counts
+    const nanMetrics = computeDatasetReadinessMetrics({
+      total_samples: Number.NaN,
+      true_positive_count: Number.NaN,
+      ai_annotated_count: 10,
+      hard_negative_count: 5,
+      train_count: 12,
+      val_count: 3,
+      verified_count: 20, // greater than positive+hn
+    });
+    expect(Number.isFinite(nanMetrics.totalSamples)).toBe(true);
+    expect(nanMetrics.verifiedPct).toBeLessThanOrEqual(100);
+    expect(nanMetrics.positivePct).toBeLessThanOrEqual(100);
+
+    // Model upload sanitizes traversal filenames and strips data:*;base64, prefix
+    const upload = buildModelUploadPayload({
+      filename: "../../etc/cron.d/evil.onnx",
+      modelBase64: "data:application/octet-stream;base64,U1lOVEhFVElDX09OTlg=",
+      width: Number.NaN,
+      height: -100,
+    });
+    expect(upload.filename).toBe("evil.onnx");
+    expect(upload.model_base64).toBe("U1lOVEhFVElDX09OTlg=");
+    expect(upload.width).toBe(640);
+    expect(upload.height).toBe(640);
+
+    // Local finetune CLI command strips shell metacharacters and handles NaN epochs/freeze
+    const safeCmd = buildLocalFinetuneCliCommand({
+      nvrUrl: "https://nvr.example.com:8971; rm -rf /",
+      datasetPath: "data.zip && whoami",
+      modelArch: "yolo11s.pt | cat /etc/passwd",
+      epochs: Number.NaN,
+      freeze: Number.NaN,
+      nvrToken: "bad;token",
+    });
+    expect(safeCmd).not.toContain(";");
+    expect(safeCmd).not.toContain("&&");
+    expect(safeCmd).not.toContain("|");
+    expect(safeCmd).not.toContain("NaN");
+    expect(safeCmd).toContain("--epochs 30 --freeze 10");
+    expect(safeCmd).toContain("--nvr-token $NINJANVR_API_TOKEN");
+
+    // GenAI custom base URL SSRF validation
+    expect(isSafeGenAiCustomBaseUrl("https://openrouter.ai/api/v1")).toBe(true);
+    expect(isSafeGenAiCustomBaseUrl("http://127.0.0.1:11434")).toBe(true);
+    expect(isSafeGenAiCustomBaseUrl("http://127.0.0.1:5000")).toBe(false);
+    expect(isSafeGenAiCustomBaseUrl("http://169.254.169.254/latest")).toBe(false);
+    expect(isSafeGenAiCustomBaseUrl("http://user:pass@openrouter.ai")).toBe(false);
+    expect(isSafeGenAiCustomBaseUrl("javascript:alert(1)")).toBe(false);
   });
 });

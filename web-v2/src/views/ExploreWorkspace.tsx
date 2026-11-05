@@ -54,6 +54,21 @@ export interface SavedExploreFilterPreset {
   retainedOnly: boolean;
 }
 
+export function resolveFiniteEventScore(
+  ev: Pick<EventItem, "top_score" | "score" | "data">,
+  fallback: number = 0.85
+): number {
+  const candidates = [ev.top_score, ev.data?.top_score, ev.score];
+  for (const val of candidates) {
+    if (typeof val === "number" && Number.isFinite(val)) {
+      return Math.max(0, Math.min(1, val));
+    }
+  }
+  return typeof fallback === "number" && Number.isFinite(fallback)
+    ? Math.max(0, Math.min(1, fallback))
+    : 0.85;
+}
+
 export function shouldApplyEventMutationResult(
   selectedEventId: string | null | undefined,
   requestEventId: string,
@@ -316,6 +331,8 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const [aiVerifyBusy, setAiVerifyBusy] = React.useState(false);
   const [datasetAddBusy, setDatasetAddBusy] = React.useState(false);
   const [addedDatasetIds, setAddedDatasetIds] = React.useState<Record<string, boolean>>({});
+  const isMountedRef = React.useRef(true);
+  const eventMutationSeqRef = React.useRef(0);
   const selectedEventIdRef = React.useRef<string | null>(selectedEvent?.id ?? null);
   selectedEventIdRef.current = selectedEvent?.id ?? null;
   const debugReplayAbortRef = React.useRef<AbortController | null>(null);
@@ -325,6 +342,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     if (!selectedEvent || datasetAddBusy) return;
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
+    const seq = ++eventMutationSeqRef.current;
     setDatasetAddBusy(true);
     try {
       const res = await fetch(
@@ -335,6 +353,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         }
       );
       const data = await res.json().catch(() => null);
+      if (!isMountedRef.current) return;
       if (res.ok && data) {
         setAddedDatasetIds((prev) => ({ ...prev, [targetId]: true }));
         const split = data.split || data.sample?.split || "train";
@@ -347,9 +366,13 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         notify(data?.message || "Failed to add event snapshot to training dataset");
       }
     } catch {
-      notify("Network error while adding event snapshot to training dataset");
+      if (isMountedRef.current) {
+        notify("Network error while adding event snapshot to training dataset");
+      }
     } finally {
-      setDatasetAddBusy(false);
+      if (isMountedRef.current && seq === eventMutationSeqRef.current) {
+        setDatasetAddBusy(false);
+      }
     }
   };
 
@@ -358,6 +381,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
     const nextFp = !targetEvent.false_positive;
+    const seq = ++eventMutationSeqRef.current;
     try {
       const res = await fetch(
         `/api/events/${encodeURIComponent(targetId)}/false_positive`,
@@ -368,8 +392,10 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           body: JSON.stringify({ false_positive: nextFp }),
         }
       );
+      if (!isMountedRef.current) return;
       if (res.ok) {
         if (
+          seq === eventMutationSeqRef.current &&
           shouldApplyEventMutationResult(
             selectedEventIdRef.current,
             targetId,
@@ -391,7 +417,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         notify(data?.message || "Failed to update False Positive status");
       }
     } catch {
-      notify("Network error while updating False Positive status");
+      if (isMountedRef.current) {
+        notify("Network error while updating False Positive status");
+      }
     }
   };
 
@@ -399,6 +427,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     if (!selectedEvent || aiVerifyBusy) return;
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
+    const seq = ++eventMutationSeqRef.current;
     setAiVerifyBusy(true);
     try {
       const res = await fetch(
@@ -409,16 +438,19 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         }
       );
       const data = await res.json().catch(() => null);
+      if (!isMountedRef.current) return;
       if (res.ok && data) {
+        const rawConf = Number(data.confidence ?? 0.9);
         const aiVerdict: AiVerificationResult = data.ai_verification || {
           is_true_positive: Boolean(data.is_true_positive),
-          confidence: Number(data.confidence ?? 0.9),
+          confidence: Number.isFinite(rawConf) ? rawConf : 0.9,
           reason: String(data.reason || "Verified by Vision AI Judge"),
           provider: data.provider,
           model: data.model,
           verified_at: data.verified_at,
         };
         if (
+          seq === eventMutationSeqRef.current &&
           shouldApplyEventMutationResult(
             selectedEventIdRef.current,
             targetId,
@@ -444,9 +476,13 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         notify(data?.message || "Vision AI Judge verification failed");
       }
     } catch {
-      notify("Vision AI Judge request failed");
+      if (isMountedRef.current) {
+        notify("Vision AI Judge request failed");
+      }
     } finally {
-      setAiVerifyBusy(false);
+      if (isMountedRef.current && seq === eventMutationSeqRef.current) {
+        setAiVerifyBusy(false);
+      }
     }
   };
   const [faceNameDraft, setFaceNameDraft] = React.useState("");
@@ -474,6 +510,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 
   React.useEffect(() => {
     selectedEventIdRef.current = selectedEvent?.id ?? null;
+    eventMutationSeqRef.current += 1;
+    setAiVerifyBusy(false);
+    setDatasetAddBusy(false);
     if (debugReplayAbortRef.current) {
       debugReplayAbortRef.current.abort();
       debugReplayAbortRef.current = null;
@@ -484,7 +523,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   }, [selectedEvent?.id]);
 
   React.useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       if (debugReplayAbortRef.current) {
         debugReplayAbortRef.current.abort();
         debugReplayAbortRef.current = null;
@@ -540,7 +581,15 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
     const raw = overrideName !== undefined ? overrideName : faceNameDraft;
-    const clean = raw && raw.trim().length > 0 ? raw.trim() : null;
+    const clean =
+      raw && raw.trim().length > 0
+        ? normalizeFaceProfileName(raw) || null
+        : null;
+    if (raw && raw.trim().length > 0 && !clean) {
+      notify("Enter a valid face name (letters, numbers, spaces, _ or -)");
+      return;
+    }
+    const seq = ++eventMutationSeqRef.current;
     try {
       const res = await fetch(
         `/api/events/${encodeURIComponent(targetId)}/sub_label`,
@@ -551,8 +600,10 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           body: JSON.stringify({ sub_label: clean }),
         }
       );
+      if (!isMountedRef.current) return;
       if (res.ok) {
         if (
+          seq === eventMutationSeqRef.current &&
           shouldApplyEventMutationResult(
             selectedEventIdRef.current,
             targetId,
@@ -573,7 +624,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         notify(data?.message || "Failed to update event face sub-label");
       }
     } catch {
-      notify("Network error while updating event face sub-label");
+      if (isMountedRef.current) {
+        notify("Network error while updating event face sub-label");
+      }
     }
   };
 
@@ -586,6 +639,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     }
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
+    const seq = ++eventMutationSeqRef.current;
     try {
       const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
         method: "POST",
@@ -596,8 +650,10 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           assign_sub_label: true,
         }),
       });
+      if (!isMountedRef.current) return;
       if (res.ok) {
         if (
+          seq === eventMutationSeqRef.current &&
           shouldApplyEventMutationResult(
             selectedEventIdRef.current,
             targetId,
@@ -613,20 +669,15 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           setSelectedEvent(updated);
         }
         bumpSubLabelsRefresh();
-        const listRes = await fetch("/api/faces", { credentials: "include" }).catch(
-          () => null
-        );
-        if (listRes && listRes.ok) {
-          const d = await listRes.json().catch(() => null);
-          if (d) setEnrolledFaces(parseFacesApiResponse(d));
-        }
         notify(`Enrolled '${cleanName}' face crop into gallery and assigned sub-label`);
       } else {
         const data = await res.json().catch(() => null);
         notify(data?.message || "Failed to enroll face crop from event");
       }
     } catch {
-      notify("Network error while enrolling face crop from event");
+      if (isMountedRef.current) {
+        notify("Network error while enrolling face crop from event");
+      }
     }
   };
 
@@ -635,6 +686,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
     const normalized = normalizeLicensePlate(eventPlateDraft);
+    const seq = ++eventMutationSeqRef.current;
     try {
       const res = await fetch(
         `/api/events/${encodeURIComponent(targetId)}/license_plate`,
@@ -647,8 +699,10 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           }),
         }
       );
+      if (!isMountedRef.current) return;
       if (res.ok) {
         const payload = await res.json().catch(() => ({}));
+        if (!isMountedRef.current) return;
         const nextPlate =
           payload.recognized_license_plate !== undefined
             ? payload.recognized_license_plate
@@ -658,6 +712,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
             ? payload.sub_label
             : targetEvent.sub_label;
         if (
+          seq === eventMutationSeqRef.current &&
           shouldApplyEventMutationResult(
             selectedEventIdRef.current,
             targetId,
@@ -684,7 +739,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         notify(data?.message || "Failed to save recognized license plate");
       }
     } catch {
-      notify("Network error while saving recognized license plate");
+      if (isMountedRef.current) {
+        notify("Network error while saving recognized license plate");
+      }
     }
   };
 
@@ -693,6 +750,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
     const noteToSave = eventNoteDraft;
+    const seq = ++eventMutationSeqRef.current;
     try {
       const res = await fetch(`/api/events/${encodeURIComponent(targetId)}/notes`, {
         method: "PUT",
@@ -700,8 +758,10 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         credentials: "include",
         body: JSON.stringify({ notes: noteToSave }),
       });
+      if (!isMountedRef.current) return;
       if (res.ok) {
         if (
+          seq === eventMutationSeqRef.current &&
           shouldApplyEventMutationResult(
             selectedEventIdRef.current,
             targetId,
@@ -719,7 +779,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         notify(data?.message || "Failed to save forensic note");
       }
     } catch {
-      notify("Network error while saving forensic note");
+      if (isMountedRef.current) {
+        notify("Network error while saving forensic note");
+      }
     }
   };
   const [showDebugReplay, setShowDebugReplay] = React.useState(false);
@@ -849,7 +911,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         const zList = ev.zones || ev.data?.provenance?.zones || [];
         if (!zList.includes(zoneFilter)) return false;
       }
-      const sc = (ev.top_score ?? ev.data?.top_score ?? ev.score ?? 0.85) as number;
+      const sc = resolveFiniteEventScore(ev, 0.85);
       if (minScoreFilter > 0 && sc * 100 < minScoreFilter) {
         return false;
       }
@@ -1069,9 +1131,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           </div>
           <div className="nvr-scroll-y">
             {visibleEvents.slice(0, 50).map((ev) => {
-              const topScore = Math.round(
-                ((ev.top_score ?? ev.data?.top_score ?? ev.score ?? 0.85) as number) * 100
-              );
+              const topScore = Math.round(resolveFiniteEventScore(ev, 0.85) * 100);
               const isSelected = selectedEvent?.id === ev.id;
               const matchedExport = findMatchingExport(
                 exportsList,
@@ -1172,7 +1232,11 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     >
                       <span>
                         {formatDateTime(ev.start_time)} ·{" "}
-                        {ev.end_time
+                        {typeof ev.end_time === "number" &&
+                        Number.isFinite(ev.end_time) &&
+                        ev.end_time > 0 &&
+                        typeof ev.start_time === "number" &&
+                        Number.isFinite(ev.start_time)
                           ? `${Math.max(1, Math.round(ev.end_time - ev.start_time))}s`
                           : t.explore.inProgress}
                       </span>
@@ -1252,11 +1316,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                       selectedEvent.sub_label,
                       selectedEvent.data?.detected_attributes
                     )}{" "}
-                    {Math.round(
-                      ((selectedEvent.top_score ??
-                        selectedEvent.data?.top_score ??
-                        0.88) as number) * 100
-                    )}
+                    {Math.round(resolveFiniteEventScore(selectedEvent, 0.88) * 100)}
                     %
                   </span>
                   {(() => {
@@ -1586,7 +1646,10 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                                   >
                                     {formatDetectedAttributePill(attr)} [
                                     {(attr.norm_bbox || [0, 0, 0, 0])
-                                      .map((v) => Number(v).toFixed(2))
+                                      .map((v) => {
+                                        const n = Number(v);
+                                        return (Number.isFinite(n) ? n : 0).toFixed(2);
+                                      })
                                       .join(", ")}
                                     ]
                                   </span>
@@ -1684,7 +1747,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                         overflowY: "auto",
                       }}
                     >
-                      {debugTrace.frames.map((f, idx) => (
+                      {(Array.isArray(debugTrace.frames) ? debugTrace.frames : []).map((f, idx) => (
                         <div
                           key={`${f.ts}-${idx}`}
                           style={{
@@ -1696,20 +1759,37 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                             borderTop: "1px solid var(--border-hairline)",
                           }}
                         >
-                          <span>TS: {f.ts.toFixed(1)}s</span>
-                          <span>Motion Boxes: {f.motion_boxes.length}</span>
+                          <span>
+                            TS: {(typeof f.ts === "number" && Number.isFinite(f.ts) ? f.ts : 0).toFixed(1)}s
+                          </span>
+                          <span>Motion Boxes: {(f.motion_boxes || []).length}</span>
                           <span style={{ color: "var(--signal-live-text)" }}>
                             Confirmed Tracks:{" "}
-                            {f.active_tracks
-                              .map((t) => `${t.label} (${Math.round(t.score * 100)}%, ${t.area_px}px²)`)
+                            {(f.active_tracks || [])
+                              .map(
+                                (t) =>
+                                  `${t.label} (${Math.round(
+                                    (typeof t.score === "number" && Number.isFinite(t.score)
+                                      ? t.score
+                                      : 0) * 100
+                                  )}%, ${
+                                    typeof t.area_px === "number" && Number.isFinite(t.area_px)
+                                      ? Math.round(t.area_px)
+                                      : 0
+                                  }px²)`
+                              )
                               .join(", ") || "NONE"}
                           </span>
                           <span style={{ color: "var(--signal-alert-text)" }}>
                             Filtered/Rejected:{" "}
-                            {f.filtered_reasons
+                            {(f.filtered_reasons || [])
                               .map(
                                 (r) =>
-                                  `${r.label} (${Math.round(r.score * 100)}% → ${r.reason})`
+                                  `${r.label} (${Math.round(
+                                    (typeof r.score === "number" && Number.isFinite(r.score)
+                                      ? r.score
+                                      : 0) * 100
+                                  )}% → ${r.reason})`
                               )
                               .join(", ") || "NONE"}
                           </span>
@@ -1732,24 +1812,33 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     }}
                   />
                 ) : (
-                  <video
-                    src={
+                  (() => {
+                    const rawMock = String(
                       (selectedEvent.data as Record<string, unknown> | undefined)
-                        ?.mock_video
-                        ? `/clips/mocks/${encodeURIComponent(
-                            String(
-                              (selectedEvent.data as Record<string, unknown>)
-                                .mock_video
-                            )
-                          )}`
-                        : `/api/events/${encodeURIComponent(selectedEvent.id)}/clip.mp4`
-                    }
-                    controls
-                    autoPlay
-                    muted
-                    playsInline
-                    style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                  />
+                        ?.mock_video || ""
+                    ).trim();
+                    const safeMock =
+                      rawMock &&
+                      !rawMock.includes("..") &&
+                      !/[/\\\u0000-\u001f\u007f]/.test(rawMock)
+                        ? rawMock
+                        : "";
+                    return (
+                      <video
+                        key={selectedEvent.id}
+                        src={
+                          safeMock
+                            ? `/clips/mocks/${encodeURIComponent(safeMock)}`
+                            : `/api/events/${encodeURIComponent(selectedEvent.id)}/clip.mp4`
+                        }
+                        controls
+                        autoPlay
+                        muted
+                        playsInline
+                        style={{ width: "100%", height: "100%", objectFit: "contain" }}
+                      />
+                    );
+                  })()
                 )}
               </div>
 

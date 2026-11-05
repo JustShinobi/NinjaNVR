@@ -11,7 +11,166 @@ import {
   SnapshotsConfig,
   UserAccountItem,
 } from "../../types/nvr";
-import { ToggleSwitch } from "./ConsoleAndStreamsPanels";
+import {
+  buildOnvifPasswordPatch,
+  sanitizeConfigEntrySlug,
+  ToggleSwitch,
+} from "./ConsoleAndStreamsPanels";
+
+export function resolveEffectiveRecordConfig(
+  base: RecordConfig,
+  override?: {
+    enabled?: boolean;
+    expire_interval?: number;
+    continuous?: { days: number };
+    motion?: { days: number };
+    alerts?: {
+      pre_capture?: number;
+      post_capture?: number;
+      retain?: { days?: number; mode?: string };
+    };
+    detections?: {
+      pre_capture?: number;
+      post_capture?: number;
+      retain?: { days?: number; mode?: string };
+    };
+    preview?: { quality: string };
+    continuous_substream?: boolean;
+    max_size_gb?: number | null;
+    min_free_gb?: number | null;
+    cold_compaction?: RecordConfig["cold_compaction"];
+    storage_tiers?: RecordConfig["storage_tiers"];
+    alert_backup?: RecordConfig["alert_backup"];
+  } | null
+): RecordConfig {
+  const src = override || {};
+  return {
+    ...base,
+    ...src,
+    continuous: {
+      days: src.continuous?.days ?? base.continuous?.days ?? 14,
+    },
+    motion: {
+      days: src.motion?.days ?? base.motion?.days ?? 0,
+    },
+    alerts: {
+      pre_capture: src.alerts?.pre_capture ?? base.alerts?.pre_capture ?? 5,
+      post_capture: src.alerts?.post_capture ?? base.alerts?.post_capture ?? 5,
+      retain: {
+        days: src.alerts?.retain?.days ?? base.alerts?.retain?.days ?? 14,
+        mode: src.alerts?.retain?.mode || base.alerts?.retain?.mode || "motion",
+      },
+    },
+    detections: {
+      pre_capture:
+        src.detections?.pre_capture ?? base.detections?.pre_capture ?? 5,
+      post_capture:
+        src.detections?.post_capture ?? base.detections?.post_capture ?? 5,
+      retain: {
+        days:
+          src.detections?.retain?.days ?? base.detections?.retain?.days ?? 14,
+        mode:
+          src.detections?.retain?.mode ||
+          base.detections?.retain?.mode ||
+          "motion",
+      },
+    },
+    preview: {
+      quality: src.preview?.quality || base.preview?.quality || "medium",
+    },
+  };
+}
+
+export function normalizeAllowedCamerasScope(raw: string): string {
+  const trimmed = (raw || "").trim();
+  if (!trimmed || trimmed === "*") return "*";
+  const parts = trimmed
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => /^[a-zA-Z0-9_.-]+$/.test(s) && s !== "..");
+  if (parts.length === 0) return "*";
+  return Array.from(new Set(parts)).join(",");
+}
+
+export function validateFederationPeerUrl(rawUrl: string): {
+  valid: boolean;
+  normalizedUrl: string;
+  error?: string;
+} {
+  const trimmed = (rawUrl || "").trim();
+  if (
+    !trimmed ||
+    /[\u0000-\u001f\u007f\\]/.test(trimmed) ||
+    trimmed.includes("..")
+  ) {
+    return {
+      valid: false,
+      normalizedUrl: "",
+      error: "Invalid peer URL: must be a clean http:// or https:// endpoint",
+    };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return {
+      valid: false,
+      normalizedUrl: "",
+      error: "Invalid peer URL: malformed URL syntax",
+    };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return {
+      valid: false,
+      normalizedUrl: "",
+      error: "Invalid peer URL: only http:// and https:// schemes are allowed",
+    };
+  }
+  if (parsed.username || parsed.password || trimmed.includes("@")) {
+    return {
+      valid: false,
+      normalizedUrl: "",
+      error: "Invalid peer URL: embedded credentials are not allowed",
+    };
+  }
+  if (parsed.search || parsed.hash) {
+    return {
+      valid: false,
+      normalizedUrl: "",
+      error: "Invalid peer URL: query parameters and fragments are not allowed",
+    };
+  }
+  const hostClean = parsed.hostname
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/, "")
+    .toLowerCase();
+  if (
+    !hostClean ||
+    hostClean === "localhost" ||
+    hostClean === "0.0.0.0" ||
+    hostClean === "::" ||
+    hostClean === "::1" ||
+    hostClean === "0:0:0:0:0:0:0:1" ||
+    hostClean === "metadata.google.internal" ||
+    /^127(?:\.\d{1,3}){3}$/.test(hostClean) ||
+    /^169\.254(?:\.\d{1,3}){2}$/.test(hostClean) ||
+    /^fe[89ab][0-9a-f]:/i.test(hostClean) ||
+    /^(?:22[4-9]|23\d)(?:\.\d{1,3}){3}$/.test(hostClean) ||
+    /^ff[0-9a-f]{2}:/i.test(hostClean)
+  ) {
+    return {
+      valid: false,
+      normalizedUrl: "",
+      error:
+        "Disallowed peer URL: loopback, link-local, metadata, and multicast hosts are rejected",
+    };
+  }
+  const cleanPath = parsed.pathname.replace(/\/+$/, "");
+  return {
+    valid: true,
+    normalizedUrl: `${parsed.origin}${cleanPath}`,
+  };
+}
 
 const ALERT_LABEL_CANDIDATES = [
   "person",
@@ -75,8 +234,11 @@ export const RecordingReviewSection: React.FC<{
 
   const activeRec: RecordConfig =
     scope === "global"
-      ? { ...defaultRec, ...(draftConfig.record || {}) }
-      : { ...defaultRec, ...(draftConfig.cameras?.[inspectorCam]?.record || {}) };
+      ? resolveEffectiveRecordConfig(defaultRec, draftConfig.record)
+      : resolveEffectiveRecordConfig(
+          defaultRec,
+          draftConfig.cameras?.[inspectorCam]?.record
+        );
 
   const activeSnap: SnapshotsConfig =
     scope === "global"
@@ -1259,13 +1421,21 @@ export const CommsAuthUsersSection: React.FC<{
   const [newPeerUrl, setNewPeerUrl] = useState("");
   const [newPeerTokenEnv, setNewPeerTokenEnv] = useState("NINJANVR_PEER_TOKEN");
   const [federationStatus, setFederationStatus] = useState<string | null>(null);
+  const isMountedRef = React.useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   const loadTokens = useCallback(async () => {
     try {
       const res = await fetch("/api/tokens", { credentials: "include" });
-      if (res.ok) {
+      if (res.ok && isMountedRef.current) {
         const list = await res.json();
-        if (Array.isArray(list)) setApiTokens(list);
+        if (Array.isArray(list) && isMountedRef.current) setApiTokens(list);
       }
     } catch {
       // ignore
@@ -1273,51 +1443,69 @@ export const CommsAuthUsersSection: React.FC<{
   }, []);
 
   useEffect(() => {
-    loadTokens();
+    void loadTokens();
   }, [loadTokens]);
 
   const handleCreateToken = async () => {
-    if (!newTokenName.trim()) {
+    const cleanTokenName = newTokenName.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+    if (!cleanTokenName) {
       notify("Enter a name for the API token");
       return;
     }
-    const res = await fetch("/api/tokens", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ name: newTokenName.trim(), scope: newTokenScope }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.token) {
-      setNewTokenName("");
-      setCreatedPlaintextToken(data.token);
-      if (Array.isArray(data.tokens)) setApiTokens(data.tokens);
-      else loadTokens();
-      notify("API Bearer token generated — copy it now (shown only once)");
-    } else {
-      notify(data.message || "Failed to generate API token");
+    try {
+      const res = await fetch("/api/tokens", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ name: cleanTokenName, scope: newTokenScope }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!isMountedRef.current) return;
+      if (res.ok && data.token) {
+        setNewTokenName("");
+        setCreatedPlaintextToken(data.token);
+        if (Array.isArray(data.tokens)) setApiTokens(data.tokens);
+        else void loadTokens();
+        notify("API Bearer token generated — copy it now (shown only once)");
+      } else {
+        notify(data.message || "Failed to generate API token");
+      }
+    } catch {
+      if (isMountedRef.current) {
+        notify("Network error while generating API token");
+      }
     }
   };
 
   const handleRevokeToken = async (id: string) => {
-    const res = await fetch(`/api/tokens/${encodeURIComponent(id)}`, {
-      method: "DELETE",
-      credentials: "include",
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) {
-      if (Array.isArray(data.tokens)) setApiTokens(data.tokens);
-      else loadTokens();
-      notify("API token revoked");
+    try {
+      const res = await fetch(`/api/tokens/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!isMountedRef.current) return;
+      if (res.ok) {
+        if (Array.isArray(data.tokens)) setApiTokens(data.tokens);
+        else void loadTokens();
+        setCreatedPlaintextToken(null);
+        notify("API token revoked");
+      } else {
+        notify(data.message || "Failed to revoke API token");
+      }
+    } catch {
+      if (isMountedRef.current) {
+        notify("Network error while revoking API token");
+      }
     }
   };
 
   const loadUsers = useCallback(async () => {
     try {
       const res = await fetch("/api/users", { credentials: "include" });
-      if (res.ok) {
+      if (res.ok && isMountedRef.current) {
         const list = await res.json();
-        if (Array.isArray(list)) setUsers(list);
+        if (Array.isArray(list) && isMountedRef.current) setUsers(list);
       }
     } catch {
       // ignore
@@ -1325,7 +1513,7 @@ export const CommsAuthUsersSection: React.FC<{
   }, []);
 
   useEffect(() => {
-    loadUsers();
+    void loadUsers();
   }, [loadUsers]);
 
   const mqttCfg: MqttConfig = draftConfig.mqtt || {
@@ -1361,99 +1549,136 @@ export const CommsAuthUsersSection: React.FC<{
   };
 
   const handleCreateUser = async () => {
-    if (!newUsername.trim() || !newPassword) {
+    const cleanUser = newUsername.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+    if (!cleanUser || !newPassword) {
       notify("Enter both a username and password");
       return;
     }
-    const res = await fetch("/api/users", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({
-        username: newUsername.trim(),
-        password: newPassword,
-        role: newRole,
-        allowed_cameras: newAllowedCameras.trim() || "*",
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.success !== false) {
-      setNewUsername("");
-      setNewPassword("");
-      setNewAllowedCameras("*");
-      if (Array.isArray(data.users)) setUsers(data.users);
-      else loadUsers();
-      notify(data.message || "User created");
-    } else {
-      notify(data.message || "Failed to create user");
+    try {
+      const res = await fetch("/api/users", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          username: cleanUser,
+          password: newPassword,
+          role: newRole,
+          allowed_cameras: normalizeAllowedCamerasScope(newAllowedCameras),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!isMountedRef.current) return;
+      if (res.ok && data.success !== false) {
+        setNewUsername("");
+        setNewPassword("");
+        setNewAllowedCameras("*");
+        if (Array.isArray(data.users)) setUsers(data.users);
+        else void loadUsers();
+        notify(data.message || "User created");
+      } else {
+        notify(data.message || "Failed to create user");
+      }
+    } catch {
+      if (isMountedRef.current) {
+        notify("Network error while creating user");
+      }
     }
   };
 
   const handleRoleChange = async (username: string, role: string) => {
-    const res = await fetch(`/api/users/${encodeURIComponent(username)}/role`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ role }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.success !== false) {
-      if (Array.isArray(data.users)) setUsers(data.users);
-      else loadUsers();
-      notify(`Updated role for '${username}' to ${role}`);
-    } else {
-      notify(data.message || "Failed to update role");
+    try {
+      const res = await fetch(`/api/users/${encodeURIComponent(username)}/role`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ role }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!isMountedRef.current) return;
+      if (res.ok && data.success !== false) {
+        if (Array.isArray(data.users)) setUsers(data.users);
+        else void loadUsers();
+        notify(`Updated role for '${username}' to ${role}`);
+      } else {
+        notify(data.message || "Failed to update role");
+      }
+    } catch {
+      if (isMountedRef.current) {
+        notify("Network error while updating role");
+      }
     }
   };
 
   const handleCamerasChange = async (username: string, allowed_cameras: string) => {
-    const res = await fetch(`/api/users/${encodeURIComponent(username)}/cameras`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ allowed_cameras: allowed_cameras.trim() || "*" }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.success !== false) {
-      if (Array.isArray(data.users)) setUsers(data.users);
-      else loadUsers();
-      notify(`Updated camera scope for '${username}'`);
-    } else {
-      notify(data.message || "Failed to update camera scope");
+    const normalizedScope = normalizeAllowedCamerasScope(allowed_cameras);
+    try {
+      const res = await fetch(`/api/users/${encodeURIComponent(username)}/cameras`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ allowed_cameras: normalizedScope }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!isMountedRef.current) return;
+      if (res.ok && data.success !== false) {
+        if (Array.isArray(data.users)) setUsers(data.users);
+        else void loadUsers();
+        notify(`Updated camera scope for '${username}'`);
+      } else {
+        notify(data.message || "Failed to update camera scope");
+      }
+    } catch {
+      if (isMountedRef.current) {
+        notify("Network error while updating camera scope");
+      }
     }
   };
 
   const handlePasswordReset = async (username: string) => {
     if (!pwResetValue) return;
-    const res = await fetch(`/api/users/${encodeURIComponent(username)}/password`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify({ password: pwResetValue }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.success !== false) {
-      setPwResetTarget(null);
-      setPwResetValue("");
-      loadUsers();
-      notify(`Updated password for '${username}'`);
-    } else {
-      notify(data.message || "Failed to update password");
+    try {
+      const res = await fetch(`/api/users/${encodeURIComponent(username)}/password`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ password: pwResetValue }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!isMountedRef.current) return;
+      if (res.ok && data.success !== false) {
+        setPwResetTarget(null);
+        setPwResetValue("");
+        void loadUsers();
+        notify(`Updated password for '${username}'`);
+      } else {
+        notify(data.message || "Failed to update password");
+      }
+    } catch {
+      if (isMountedRef.current) {
+        notify("Network error while updating password");
+      }
     }
   };
 
   const handleDeleteUser = async (username: string) => {
-    const res = await fetch(`/api/users/${encodeURIComponent(username)}`, {
-      method: "DELETE",
-      credentials: "include",
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.success !== false) {
-      if (Array.isArray(data.users)) setUsers(data.users);
-      else loadUsers();
-      notify(`Deleted user '${username}'`);
-    } else {
-      notify(data.message || "Cannot delete user");
+    try {
+      const res = await fetch(`/api/users/${encodeURIComponent(username)}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!isMountedRef.current) return;
+      if (res.ok && data.success !== false) {
+        if (Array.isArray(data.users)) setUsers(data.users);
+        else void loadUsers();
+        notify(`Deleted user '${username}'`);
+      } else {
+        notify(data.message || "Cannot delete user");
+      }
+    } catch {
+      if (isMountedRef.current) {
+        notify("Network error while deleting user");
+      }
     }
   };
 
@@ -1561,18 +1786,41 @@ export const CommsAuthUsersSection: React.FC<{
                 {isPt ? "Senha MQTT" : "MQTT Password"}{" "}
                 {mqttCfg.has_password ? "(Preserved)" : ""}
               </div>
-              <input
-                type="password"
-                className="nvr-input mono"
-                style={{ width: "100%", marginTop: 3 }}
-                placeholder={
-                  mqttCfg.has_password ? "•••••••• (preserved)" : "Optional password"
-                }
-                value={mqttCfg.password || ""}
-                onChange={(e) =>
-                  mutateMqtt({ password: e.target.value, clear_password: false })
-                }
-              />
+              <div style={{ display: "flex", gap: 4, marginTop: 3 }}>
+                <input
+                  type="password"
+                  className="nvr-input mono"
+                  style={{ flex: 1, minWidth: 0, width: "100%" }}
+                  placeholder={
+                    mqttCfg.has_password ? "•••••••• (preserved)" : "Optional password"
+                  }
+                  value={mqttCfg.password === "***" ? "" : mqttCfg.password || ""}
+                  onChange={(e) =>
+                    mutateMqtt(
+                      buildOnvifPasswordPatch(
+                        e.target.value,
+                        mqttCfg.has_password,
+                        false
+                      )
+                    )
+                  }
+                />
+                {(mqttCfg.has_password ||
+                  (mqttCfg.password && mqttCfg.password !== "")) && (
+                  <button
+                    type="button"
+                    className="nvr-btn danger mono"
+                    style={{ padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    title="Clear saved MQTT password"
+                    aria-label="Clear MQTT Password"
+                    onClick={() =>
+                      mutateMqtt(buildOnvifPasswordPatch("", false, true))
+                    }
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -1747,12 +1995,21 @@ export const CommsAuthUsersSection: React.FC<{
                   </td>
                   <td>
                     <input
+                      key={`${u.username}-${u.allowed_cameras || "*"}`}
                       className="nvr-input mono"
                       style={{ height: 24, width: 140, fontSize: "var(--text-xs)" }}
                       aria-label={`Allowed cameras for ${u.username}`}
                       defaultValue={u.allowed_cameras || "*"}
                       disabled={u.role === "admin"}
-                      onBlur={(e) => handleCamerasChange(u.username, e.target.value)}
+                      onBlur={(e) => {
+                        const nextScope = normalizeAllowedCamerasScope(e.target.value);
+                        const currScope = normalizeAllowedCamerasScope(
+                          u.allowed_cameras || "*"
+                        );
+                        if (nextScope !== currScope) {
+                          void handleCamerasChange(u.username, nextScope);
+                        }
+                      }}
                     />
                   </td>
                   <td style={{ color: "var(--text-secondary)" }}>
@@ -1913,9 +2170,13 @@ export const CommsAuthUsersSection: React.FC<{
                 type="button"
                 className="nvr-btn success mono"
                 style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                onClick={() => {
-                  navigator.clipboard?.writeText(createdPlaintextToken);
-                  notify("Copied API token to clipboard");
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard?.writeText(createdPlaintextToken);
+                    notify("Copied API token to clipboard");
+                  } catch {
+                    notify("Clipboard access unavailable — copy token manually");
+                  }
                 }}
               >
                 Copy Token
@@ -2327,16 +2588,21 @@ export const CommsAuthUsersSection: React.FC<{
               type="button"
               className="nvr-btn primary"
               onClick={() => {
-                const slug = newPeerId.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+                const slug = sanitizeConfigEntrySlug(newPeerId);
                 if (!slug || !newPeerUrl.trim()) {
                   notify("Enter both a Peer ID and URL");
+                  return;
+                }
+                const peerValidation = validateFederationPeerUrl(newPeerUrl);
+                if (!peerValidation.valid) {
+                  notify(peerValidation.error || "Invalid federation peer URL");
                   return;
                 }
                 updateDraft((next) => {
                   if (!next.peers) next.peers = {};
                   next.peers[slug] = {
                     enabled: true,
-                    url: newPeerUrl.trim(),
+                    url: peerValidation.normalizedUrl,
                     token_env: newPeerTokenEnv.trim() || "NINJANVR_PEER_TOKEN",
                   };
                 });
