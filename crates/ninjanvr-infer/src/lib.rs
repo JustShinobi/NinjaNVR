@@ -55,7 +55,10 @@ pub struct DetectorRuntimeCatalog {
 pub fn expected_yolo_anchors(model_w: u32, model_h: u32) -> usize {
     let w = model_w as usize;
     let h = model_h as usize;
-    (w / 8) * (h / 8) + (w / 16) * (h / 16) + (w / 32) * (h / 32)
+    (w / 8)
+        .saturating_mul(h / 8)
+        .saturating_add((w / 16).saturating_mul(h / 16))
+        .saturating_add((w / 32).saturating_mul(h / 32))
 }
 
 /// Converts a packed `NHWC` `u8` (`[0..255]`) RGB/BGR frame crop into normalized `[0.0..1.0]` `f32`
@@ -67,9 +70,13 @@ pub fn prepare_input_tensor_f32(
     nchw_layout: bool,
     dst_f32: &mut [f32],
 ) {
-    let plane_len = (model_w as usize) * (model_h as usize);
-    let expected_len = plane_len * 3;
-    if nchw_layout && tensor_nhwc.len() >= expected_len && dst_f32.len() >= expected_len {
+    let plane_len = (model_w as usize).saturating_mul(model_h as usize);
+    let expected_len = plane_len.saturating_mul(3);
+    if nchw_layout
+        && plane_len > 0
+        && tensor_nhwc.len() >= expected_len
+        && dst_f32.len() >= expected_len
+    {
         for idx in 0..plane_len {
             dst_f32[idx] = (tensor_nhwc[idx * 3] as f32) / 255.0;
             dst_f32[plane_len + idx] = (tensor_nhwc[idx * 3 + 1] as f32) / 255.0;
@@ -91,9 +98,13 @@ pub fn prepare_input_tensor_u8(
     nchw_layout: bool,
     dst_u8: &mut [u8],
 ) {
-    let plane_len = (model_w as usize) * (model_h as usize);
-    let expected_len = plane_len * 3;
-    if nchw_layout && tensor_nhwc.len() >= expected_len && dst_u8.len() >= expected_len {
+    let plane_len = (model_w as usize).saturating_mul(model_h as usize);
+    let expected_len = plane_len.saturating_mul(3);
+    if nchw_layout
+        && plane_len > 0
+        && tensor_nhwc.len() >= expected_len
+        && dst_u8.len() >= expected_len
+    {
         for idx in 0..plane_len {
             dst_u8[idx] = tensor_nhwc[idx * 3];
             dst_u8[plane_len + idx] = tensor_nhwc[idx * 3 + 1];
@@ -104,6 +115,17 @@ pub fn prepare_input_tensor_u8(
         dst_u8[..copy_len].copy_from_slice(&tensor_nhwc[..copy_len]);
     }
 }
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        warn!("Recovered poisoned mutex in ninjanvr-infer");
+        poisoned.into_inner()
+    })
+}
+
+const MAX_MODEL_DIMENSION: u32 = 4096;
+const MAX_TENSOR_FLOATS: usize = 16 * 1024 * 1024;
+const MAX_TENSOR_BYTES: usize = MAX_TENSOR_FLOATS * std::mem::size_of::<f32>();
 
 type OvCoreCreateFn = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
 type OvCoreCompileModelFn = unsafe extern "C" fn(
@@ -119,6 +141,23 @@ type OvInferReqGetTensorFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_void)
 type OvInferReqInferFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type OvTensorDataFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int;
 type OvTensorGetByteSizeFn = unsafe extern "C" fn(*mut c_void, *mut usize) -> c_int;
+type OvFreeFn = unsafe extern "C" fn(*mut c_void);
+
+#[derive(Clone, Copy)]
+struct OvCFunctionTable {
+    core_create: OvCoreCreateFn,
+    compile_model: OvCoreCompileModelFn,
+    create_infer_req: OvCompiledModelCreateInferReqFn,
+    get_in_tensor: OvInferReqGetTensorFn,
+    get_out_tensor: OvInferReqGetTensorFn,
+    infer_fn: OvInferReqInferFn,
+    tensor_data: OvTensorDataFn,
+    tensor_byte_size: OvTensorGetByteSizeFn,
+    tensor_free: Option<OvFreeFn>,
+    infer_req_free: Option<OvFreeFn>,
+    compiled_model_free: Option<OvFreeFn>,
+    core_free: Option<OvFreeFn>,
+}
 
 #[repr(C)]
 struct OrtApiBase {
@@ -148,6 +187,9 @@ type OrtSessionGetNameFn =
 type OrtCastTypeInfoToTensorInfoFn =
     unsafe extern "C" fn(*const c_void, *mut *const c_void) -> *mut c_void;
 type OrtGetTensorElementTypeFn = unsafe extern "C" fn(*const c_void, *mut c_int) -> *mut c_void;
+type OrtGetDimensionsCountFn = unsafe extern "C" fn(*const c_void, *mut usize) -> *mut c_void;
+type OrtGetDimensionsFn = unsafe extern "C" fn(*const c_void, *mut i64, usize) -> *mut c_void;
+type OrtAllocatorFreeFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
 type OrtGetAllocatorFn = unsafe extern "C" fn(*mut *mut c_void) -> *mut c_void;
 type OrtCreateCpuMemoryInfoFn = unsafe extern "C" fn(c_int, c_int, *mut *mut c_void) -> *mut c_void;
 type OrtCreateTensorWithDataFn = unsafe extern "C" fn(
@@ -179,29 +221,81 @@ const ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT: c_int = 1;
 const ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8: c_int = 2;
 const ORT_GRAPH_OPT_ENABLE_ALL: c_int = 99;
 
+/// OpenVINO C-API runtime context.
+/// Fields are ordered in strict reverse creation order (`output_tensor` -> `input_tensor` ->
+/// `infer_req` -> `compiled_model` -> `core` -> `_lib_handle`), and `Drop` explicitly releases
+/// child handles before parent handles.
 struct OpenVinoCContext {
-    _lib_handle: *mut c_void,
-    _core: *mut c_void,
-    _compiled_model: *mut c_void,
-    infer_req: *mut c_void,
-    input_tensor: *mut c_void,
     output_tensor: *mut c_void,
+    input_tensor: *mut c_void,
+    infer_req: *mut c_void,
+    compiled_model: *mut c_void,
+    core: *mut c_void,
+    _lib_handle: *mut c_void,
     in_ptr: *mut u8,
     in_bytes: usize,
     out_ptr: *const f32,
     out_floats: usize,
     infer_fn: OvInferReqInferFn,
+    tensor_free_fn: Option<OvFreeFn>,
+    infer_req_free_fn: Option<OvFreeFn>,
+    compiled_model_free_fn: Option<OvFreeFn>,
+    core_free_fn: Option<OvFreeFn>,
 }
 
 unsafe impl Send for OpenVinoCContext {}
 
+impl Drop for OpenVinoCContext {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.output_tensor.is_null() {
+                if let Some(free_fn) = self.tensor_free_fn {
+                    free_fn(self.output_tensor);
+                }
+                if self.input_tensor == self.output_tensor {
+                    self.input_tensor = std::ptr::null_mut();
+                }
+                self.output_tensor = std::ptr::null_mut();
+            }
+            if !self.input_tensor.is_null() {
+                if let Some(free_fn) = self.tensor_free_fn {
+                    free_fn(self.input_tensor);
+                }
+                self.input_tensor = std::ptr::null_mut();
+            }
+            if !self.infer_req.is_null() {
+                if let Some(free_fn) = self.infer_req_free_fn {
+                    free_fn(self.infer_req);
+                }
+                self.infer_req = std::ptr::null_mut();
+            }
+            if !self.compiled_model.is_null() {
+                if let Some(free_fn) = self.compiled_model_free_fn {
+                    free_fn(self.compiled_model);
+                }
+                self.compiled_model = std::ptr::null_mut();
+            }
+            if !self.core.is_null() {
+                if let Some(free_fn) = self.core_free_fn {
+                    free_fn(self.core);
+                }
+                self.core = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+/// ONNX Runtime C-API runtime context.
+/// Fields are ordered in strict reverse creation order (`mem_info` -> `session` ->
+/// `session_opts` -> `env` -> `vtable` -> `_lib_handle`), and `Drop` explicitly releases
+/// child handles before parent handles.
 struct OrtCContext {
-    _lib_handle: *mut c_void,
-    vtable: *const *const c_void,
-    env: *mut c_void,
-    session_opts: *mut c_void,
-    session: *mut c_void,
     mem_info: *mut c_void,
+    session: *mut c_void,
+    session_opts: *mut c_void,
+    env: *mut c_void,
+    vtable: *const *const c_void,
+    _lib_handle: *mut c_void,
     input_name: CString,
     output_name: CString,
     input_is_u8: bool,
@@ -220,17 +314,18 @@ impl Drop for OrtCContext {
         }
         unsafe {
             let vt = std::slice::from_raw_parts(self.vtable, 101);
-            let release = |idx: usize, ptr: *mut c_void| {
-                if !ptr.is_null() && !vt[idx].is_null() {
+            let release = |idx: usize, ptr: &mut *mut c_void| {
+                if !(*ptr).is_null() && !vt[idx].is_null() {
                     let f: OrtReleaseFn =
                         std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[idx]);
-                    f(ptr);
+                    f(*ptr);
                 }
+                *ptr = std::ptr::null_mut();
             };
-            release(94, self.mem_info);
-            release(95, self.session);
-            release(100, self.session_opts);
-            release(92, self.env);
+            release(94, &mut self.mem_info);
+            release(95, &mut self.session);
+            release(100, &mut self.session_opts);
+            release(92, &mut self.env);
         }
     }
 }
@@ -271,11 +366,7 @@ pub struct DetectorPool {
 impl DetectorPool {
     pub fn new(config: &NinjaConfig) -> Self {
         let default_detector = Arc::new(AiDetectorEngine::new(config));
-        let detectors = default_detector
-            .pool
-            .lock()
-            .expect("detector pool mutex poisoned")
-            .clone();
+        let detectors = lock_unpoisoned(&default_detector.pool).clone();
         Self {
             default_detector,
             detectors,
@@ -417,33 +508,23 @@ impl AiDetectorEngine {
     /// Hot-reloads the detector model, OpenVINO device, tensor layout, and labelmap when config changes.
     pub fn reload(&self, config: &NinjaConfig) {
         let next_state = Self::build_runtime_state(config, None);
-        *self.inner.lock().expect("detector inner mutex poisoned") = next_state;
+        *lock_unpoisoned(&self.inner) = next_state;
         let mut pool_map = BTreeMap::new();
         for (name, entry) in &config.detectors {
             pool_map.insert(name.clone(), Arc::new(Self::new_for_entry(config, entry)));
         }
-        *self.pool.lock().expect("detector pool mutex poisoned") = pool_map;
+        *lock_unpoisoned(&self.pool) = pool_map;
     }
 
     /// Resolves a named detector from the pool if present, or returns `None` (caller uses `self`).
     pub fn named_detector(&self, name: Option<&str>) -> Option<Arc<AiDetectorEngine>> {
         let n = name?;
-        self.pool
-            .lock()
-            .expect("detector pool mutex poisoned")
-            .get(n)
-            .cloned()
+        lock_unpoisoned(&self.pool).get(n).cloned()
     }
 
     /// Returns the average inference latency (ms) for a specific named detector, falling back to the primary detector.
     pub fn avg_inference_ms_for(&self, name: &str) -> f32 {
-        if let Some(det) = self
-            .pool
-            .lock()
-            .expect("detector pool mutex poisoned")
-            .get(name)
-            .cloned()
-        {
+        if let Some(det) = lock_unpoisoned(&self.pool).get(name).cloned() {
             return det.avg_inference_ms();
         }
         self.avg_inference_ms()
@@ -456,10 +537,7 @@ impl AiDetectorEngine {
 
     /// Synchronizes the in-memory `FaceGallery` with `{faces_dir}/<name>/*.{jpg,webp,png,bin}`.
     pub fn sync_face_gallery_from_dir(&self, faces_dir: &Path) -> Result<()> {
-        let mut guard = self
-            .face_gallery
-            .lock()
-            .expect("face_gallery mutex poisoned");
+        let mut guard = lock_unpoisoned(&self.face_gallery);
         guard.sync_from_dir(faces_dir)
     }
 
@@ -472,30 +550,21 @@ impl AiDetectorEngine {
         sample_id: &str,
         image_bytes: &[u8],
     ) -> Result<(PathBuf, Vec<f32>)> {
-        let mut guard = self
-            .face_gallery
-            .lock()
-            .expect("face_gallery mutex poisoned");
+        let mut guard = lock_unpoisoned(&self.face_gallery);
         let _ = guard.sync_from_dir(faces_dir);
         guard.enroll_to_dir(faces_dir, name, sample_id, "jpg", image_bytes)
     }
 
     /// Removes an enrolled face profile from memory and deletes `{faces_dir}/{name}` if present.
     pub fn delete_face_profile(&self, faces_dir: &Path, name: &str) -> Result<bool> {
-        let mut guard = self
-            .face_gallery
-            .lock()
-            .expect("face_gallery mutex poisoned");
+        let mut guard = lock_unpoisoned(&self.face_gallery);
         let _ = guard.sync_from_dir(faces_dir);
         guard.remove_profile(Some(faces_dir), name)
     }
 
     /// Lists all enrolled face profiles from memory and `{faces_dir}`.
     pub fn list_face_profiles(&self, faces_dir: &Path) -> Vec<EnrolledFaceProfile> {
-        let mut guard = self
-            .face_gallery
-            .lock()
-            .expect("face_gallery mutex poisoned");
+        let mut guard = lock_unpoisoned(&self.face_gallery);
         let _ = guard.sync_from_dir(faces_dir);
         guard.list_profiles(Some(faces_dir))
     }
@@ -509,10 +578,7 @@ impl AiDetectorEngine {
         similarity_threshold: f32,
         unknown_alert: bool,
     ) -> Option<FaceMatchResult> {
-        let mut guard = self
-            .face_gallery
-            .lock()
-            .expect("face_gallery mutex poisoned");
+        let mut guard = lock_unpoisoned(&self.face_gallery);
         let _ = guard.sync_from_dir(faces_dir);
         guard.match_face_bytes(crop_bytes, similarity_threshold, unknown_alert)
     }
@@ -527,12 +593,15 @@ impl AiDetectorEngine {
 
         let mut labelmap = BTreeMap::new();
         if !effective_model.labelmap_path.is_empty()
+            && Path::new(&effective_model.labelmap_path).is_file()
             && let Ok(content) = std::fs::read_to_string(&effective_model.labelmap_path)
         {
-            for (idx, line) in content.lines().enumerate() {
+            for (idx, line) in content.lines().take(10_000).enumerate() {
                 let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    labelmap.insert(idx as i32, trimmed.to_string());
+                if !trimmed.is_empty()
+                    && let Ok(id) = i32::try_from(idx)
+                {
+                    labelmap.insert(id, trimmed.to_string());
                 }
             }
         }
@@ -560,8 +629,8 @@ impl AiDetectorEngine {
             .or_else(|| config.detectors.values().next().map(|d| d.device.as_str()))
             .unwrap_or("CPU");
 
-        let mut model_w = effective_model.width.max(64);
-        let mut model_h = effective_model.height.max(64);
+        let mut model_w = effective_model.width.clamp(64, MAX_MODEL_DIMENSION);
+        let mut model_h = effective_model.height.clamp(64, MAX_MODEL_DIMENSION);
         let mut active_backend = requested_backend.to_string();
         let mut active_device = requested_device.to_string();
 
@@ -629,8 +698,10 @@ impl AiDetectorEngine {
         // Reconcile configured width/height against compiled input tensor byte size
         // so changing width/height in UI without changing the underlying .xml/.onnx model never overflows.
         if let Some(InferenceRuntimeBackend::OpenVino(ref ctx)) = backend {
-            let expected_u8 = (model_w as usize) * (model_h as usize) * 3;
-            let expected_f32 = expected_u8 * 4;
+            let expected_u8 = (model_w as usize)
+                .saturating_mul(model_h as usize)
+                .saturating_mul(3);
+            let expected_f32 = expected_u8.saturating_mul(4);
             if ctx.in_bytes != expected_u8 && ctx.in_bytes != expected_f32 {
                 let pixels = if ctx.in_bytes.is_multiple_of(12) {
                     ctx.in_bytes / 12
@@ -641,7 +712,9 @@ impl AiDetectorEngine {
                 };
                 if pixels > 0 {
                     let side = (pixels as f64).sqrt().round() as usize;
-                    if side * side == pixels && side >= 64 {
+                    if side.saturating_mul(side) == pixels
+                        && (64..=(MAX_MODEL_DIMENSION as usize)).contains(&side)
+                    {
                         info!(
                             "Reconciled model input dimensions from {}x{} to compiled tensor {}x{} (in_bytes={})",
                             model_w, model_h, side, side, ctx.in_bytes
@@ -673,22 +746,22 @@ impl AiDetectorEngine {
     }
 
     pub fn model_dimensions(&self) -> (u32, u32, bool) {
-        let g = self.inner.lock().expect("detector inner mutex poisoned");
+        let g = lock_unpoisoned(&self.inner);
         (g.model_w, g.model_h, g.bgr_order)
     }
 
     pub fn active_backend(&self) -> String {
-        let g = self.inner.lock().expect("detector inner mutex poisoned");
+        let g = lock_unpoisoned(&self.inner);
         g.active_backend.clone()
     }
 
     pub fn active_device(&self) -> String {
-        let g = self.inner.lock().expect("detector inner mutex poisoned");
+        let g = lock_unpoisoned(&self.inner);
         g.active_device.clone()
     }
 
     pub fn avg_inference_ms(&self) -> f32 {
-        *self.last_inference_ms.lock().expect("mutex poisoned")
+        *lock_unpoisoned(&self.last_inference_ms)
     }
 
     pub fn cumulative_infer_us(&self) -> u64 {
@@ -703,10 +776,7 @@ impl AiDetectorEngine {
         read: OcrPlateRead,
         lpr_cfg: &LprConfig,
     ) -> Option<LprConsensusResult> {
-        self.lpr_voter
-            .lock()
-            .expect("lpr_voter mutex poisoned")
-            .record_read(track_id, read, lpr_cfg)
+        lock_unpoisoned(&self.lpr_voter).record_read(track_id, read, lpr_cfg)
     }
 
     /// Returns the current consolidated LPR consensus for `track_id`, if any.
@@ -715,10 +785,7 @@ impl AiDetectorEngine {
         track_id: &str,
         lpr_cfg: &LprConfig,
     ) -> Option<LprConsensusResult> {
-        self.lpr_voter
-            .lock()
-            .expect("lpr_voter mutex poisoned")
-            .consensus_for_track(track_id, lpr_cfg)
+        lock_unpoisoned(&self.lpr_voter).consensus_for_track(track_id, lpr_cfg)
     }
 
     /// Removes buffered LPR reads for a finalized track and returns its final consensus if valid.
@@ -727,7 +794,7 @@ impl AiDetectorEngine {
         track_id: &str,
         lpr_cfg: &LprConfig,
     ) -> Option<LprConsensusResult> {
-        let mut voter = self.lpr_voter.lock().expect("lpr_voter mutex poisoned");
+        let mut voter = lock_unpoisoned(&self.lpr_voter);
         let consensus = voter.consensus_for_track(track_id, lpr_cfg);
         voter.remove_track(track_id);
         consensus
@@ -736,7 +803,7 @@ impl AiDetectorEngine {
     /// Returns hardware plugin availability, discovered model files on disk, and active compiled tensor telemetry.
     pub fn runtime_catalog(&self) -> DetectorRuntimeCatalog {
         let (loaded, active_backend, active_dev, active_path, mw, mh, in_bytes, out_floats) = {
-            let g = self.inner.lock().expect("detector inner mutex poisoned");
+            let g = lock_unpoisoned(&self.inner);
             let (ib, of) = match g.backend.as_ref() {
                 Some(InferenceRuntimeBackend::OpenVino(c)) => (c.in_bytes, c.out_floats),
                 Some(InferenceRuntimeBackend::OnnxRuntime(c)) => (c.in_bytes, c.out_floats),
@@ -877,6 +944,21 @@ impl AiDetectorEngine {
         }
     }
 
+    fn sort_versioned_so_paths(paths: &mut [PathBuf]) {
+        let version_key = |p: &Path| -> Vec<u64> {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| s.split_once(".so."))
+                .map(|(_, ver)| {
+                    ver.split('.')
+                        .map(|part| part.parse::<u64>().unwrap_or(0))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        paths.sort_by(|a, b| version_key(a).cmp(&version_key(b)).then_with(|| a.cmp(b)));
+    }
+
     fn resolve_ort_c_lib() -> Option<PathBuf> {
         let mut dirs = Vec::new();
         if let Ok(env_dir) = std::env::var("NINJANVR_ORT_LIB_DIR") {
@@ -895,7 +977,7 @@ impl AiDetectorEngine {
     fn resolve_ort_c_lib_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
         for dir in dirs {
             let direct = dir.join("libonnxruntime.so");
-            if direct.exists() {
+            if direct.is_file() {
                 return Some(direct);
             }
             if let Ok(entries) = std::fs::read_dir(dir) {
@@ -903,13 +985,14 @@ impl AiDetectorEngine {
                     .flatten()
                     .map(|e| e.path())
                     .filter(|p| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|n| n.starts_with("libonnxruntime.so."))
-                            .unwrap_or(false)
+                        p.is_file()
+                            && p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| n.starts_with("libonnxruntime.so."))
+                                .unwrap_or(false)
                     })
                     .collect();
-                versioned.sort();
+                Self::sort_versioned_so_paths(&mut versioned);
                 if let Some(best) = versioned.pop() {
                     return Some(best);
                 }
@@ -986,8 +1069,28 @@ impl AiDetectorEngine {
         model_w: u32,
         model_h: u32,
     ) -> Result<(OrtCContext, String)> {
+        if vtable.is_null() {
+            bail!("ONNX Runtime vtable pointer is null");
+        }
+        if model_w == 0
+            || model_h == 0
+            || model_w > MAX_MODEL_DIMENSION
+            || model_h > MAX_MODEL_DIMENSION
+        {
+            bail!("invalid ONNX Runtime model dimensions {model_w}x{model_h}");
+        }
         unsafe {
             let vt = std::slice::from_raw_parts(vtable, 101);
+            const REQUIRED_SLOTS: &[usize] = &[
+                3, 7, 9, 10, 23, 24, 25, 33, 36, 37, 49, 51, 55, 60, 64, 65, 69, 78, 92, 93, 94,
+                95, 96, 98, 99, 100,
+            ];
+            for &slot in REQUIRED_SLOTS {
+                if vt[slot].is_null() {
+                    bail!("ONNX Runtime vtable missing required function at slot {slot}");
+                }
+            }
+
             let check_status = |st: *mut c_void, step: &str| -> Result<()> {
                 if st.is_null() {
                     return Ok(());
@@ -1038,23 +1141,56 @@ impl AiDetectorEngine {
                 std::mem::transmute::<*const c_void, OrtCreateCpuMemoryInfoFn>(vt[69]);
             let get_alloc: OrtGetAllocatorFn =
                 std::mem::transmute::<*const c_void, OrtGetAllocatorFn>(vt[78]);
+            let release_status: OrtReleaseFn =
+                std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[93]);
+            let release_type_info: OrtReleaseFn =
+                std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[98]);
 
-            let mut env: *mut c_void = std::ptr::null_mut();
+            // Construct OrtCContext upfront so its Drop implementation automatically releases
+            // any created handles (mem_info -> session -> session_opts -> env) if an early error occurs.
+            let mut ctx = OrtCContext {
+                mem_info: std::ptr::null_mut(),
+                session: std::ptr::null_mut(),
+                session_opts: std::ptr::null_mut(),
+                env: std::ptr::null_mut(),
+                vtable,
+                _lib_handle: handle,
+                input_name: CString::new("images").unwrap(),
+                output_name: CString::new("output0").unwrap(),
+                input_is_u8: false,
+                in_f32_buf: Vec::new(),
+                in_u8_buf: Vec::new(),
+                in_bytes: 0,
+                out_floats: 84 * 8400,
+            };
+
             let log_id = CString::new("ninjanvr").unwrap();
-            check_status(create_env(2, log_id.as_ptr(), &mut env), "CreateEnv")?;
+            check_status(create_env(2, log_id.as_ptr(), &mut ctx.env), "CreateEnv")?;
+            if ctx.env.is_null() {
+                bail!("ONNX Runtime CreateEnv returned null handle");
+            }
 
-            let mut session_opts: *mut c_void = std::ptr::null_mut();
-            check_status(create_opts(&mut session_opts), "CreateSessionOptions")?;
-            check_status(set_intra_threads(session_opts, 1), "SetIntraOpNumThreads")?;
-            check_status(set_inter_threads(session_opts, 1), "SetInterOpNumThreads")?;
+            check_status(create_opts(&mut ctx.session_opts), "CreateSessionOptions")?;
+            if ctx.session_opts.is_null() {
+                bail!("ONNX Runtime CreateSessionOptions returned null handle");
+            }
             check_status(
-                set_opt_level(session_opts, ORT_GRAPH_OPT_ENABLE_ALL),
+                set_intra_threads(ctx.session_opts, 1),
+                "SetIntraOpNumThreads",
+            )?;
+            check_status(
+                set_inter_threads(ctx.session_opts, 1),
+                "SetInterOpNumThreads",
+            )?;
+            check_status(
+                set_opt_level(ctx.session_opts, ORT_GRAPH_OPT_ENABLE_ALL),
                 "SetSessionGraphOptimizationLevel",
             )?;
 
             let mut actual_device = device.to_string();
             let req_upper = device.to_ascii_uppercase();
             if req_upper.starts_with("CUDA") || req_upper == "TENSORRT" || req_upper == "ROCM" {
+                let session_opts = ctx.session_opts;
                 let try_ep = |sym: &str, dev_node_ok: bool| -> bool {
                     if !dev_node_ok || handle.is_null() {
                         return false;
@@ -1072,11 +1208,7 @@ impl AiDetectorEngine {
                     if st.is_null() {
                         true
                     } else {
-                        if !vt[93].is_null() {
-                            let rel: OrtReleaseFn =
-                                std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[93]);
-                            rel(st);
-                        }
+                        release_status(st);
                         false
                     }
                 };
@@ -1111,84 +1243,109 @@ impl AiDetectorEngine {
             }
 
             let c_model = CString::new(model_path.to_string_lossy().as_bytes())?;
-            let mut session: *mut c_void = std::ptr::null_mut();
             check_status(
-                create_session(env, c_model.as_ptr(), session_opts, &mut session),
+                create_session(
+                    ctx.env,
+                    c_model.as_ptr(),
+                    ctx.session_opts,
+                    &mut ctx.session,
+                ),
                 "CreateSession",
             )?;
+            if ctx.session.is_null() {
+                bail!("ONNX Runtime CreateSession returned null handle");
+            }
 
             let mut alloc: *mut c_void = std::ptr::null_mut();
             check_status(get_alloc(&mut alloc), "GetAllocatorWithDefaultOptions")?;
 
+            let free_ort_str = |ptr: *mut c_char| {
+                if !ptr.is_null() && !alloc.is_null() && !vt[76].is_null() {
+                    let alloc_free: OrtAllocatorFreeFn =
+                        std::mem::transmute::<*const c_void, OrtAllocatorFreeFn>(vt[76]);
+                    let st = alloc_free(alloc, ptr as *mut c_void);
+                    if !st.is_null() {
+                        release_status(st);
+                    }
+                }
+            };
+
             let mut in_name_ptr: *mut c_char = std::ptr::null_mut();
             check_status(
-                get_in_name(session, 0, alloc, &mut in_name_ptr),
+                get_in_name(ctx.session, 0, alloc, &mut in_name_ptr),
                 "SessionGetInputName",
             )?;
-            let input_name = if in_name_ptr.is_null() {
+            ctx.input_name = if in_name_ptr.is_null() {
                 CString::new("images").unwrap()
             } else {
-                CStr::from_ptr(in_name_ptr).to_owned()
+                let owned = CStr::from_ptr(in_name_ptr).to_owned();
+                free_ort_str(in_name_ptr);
+                owned
             };
 
             let mut out_name_ptr: *mut c_char = std::ptr::null_mut();
             check_status(
-                get_out_name(session, 0, alloc, &mut out_name_ptr),
+                get_out_name(ctx.session, 0, alloc, &mut out_name_ptr),
                 "SessionGetOutputName",
             )?;
-            let output_name = if out_name_ptr.is_null() {
+            ctx.output_name = if out_name_ptr.is_null() {
                 CString::new("output0").unwrap()
             } else {
-                CStr::from_ptr(out_name_ptr).to_owned()
+                let owned = CStr::from_ptr(out_name_ptr).to_owned();
+                free_ort_str(out_name_ptr);
+                owned
             };
 
-            let mut input_is_u8 = false;
             let mut type_info: *mut c_void = std::ptr::null_mut();
-            if get_in_type(session, 0, &mut type_info).is_null() && !type_info.is_null() {
+            let ti_st = get_in_type(ctx.session, 0, &mut type_info);
+            if ti_st.is_null() && !type_info.is_null() {
                 let mut tensor_info: *const c_void = std::ptr::null();
-                if cast_tensor_info(type_info, &mut tensor_info).is_null() && !tensor_info.is_null()
-                {
+                let cast_st = cast_tensor_info(type_info, &mut tensor_info);
+                if cast_st.is_null() && !tensor_info.is_null() {
                     let mut elem_ty: c_int = ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
-                    if get_elem_type(tensor_info, &mut elem_ty).is_null() {
-                        input_is_u8 = elem_ty == ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+                    let elem_st = get_elem_type(tensor_info, &mut elem_ty);
+                    if elem_st.is_null() {
+                        ctx.input_is_u8 = elem_ty == ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+                    } else {
+                        release_status(elem_st);
                     }
+                } else if !cast_st.is_null() {
+                    release_status(cast_st);
                 }
-                if !vt[98].is_null() {
-                    let rel_ti: OrtReleaseFn =
-                        std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[98]);
-                    rel_ti(type_info);
+                release_type_info(type_info);
+            } else {
+                if !ti_st.is_null() {
+                    release_status(ti_st);
+                }
+                if !type_info.is_null() {
+                    release_type_info(type_info);
                 }
             }
 
-            let mut mem_info: *mut c_void = std::ptr::null_mut();
-            check_status(create_cpu_mem(0, 0, &mut mem_info), "CreateCpuMemoryInfo")?;
+            check_status(
+                create_cpu_mem(0, 0, &mut ctx.mem_info),
+                "CreateCpuMemoryInfo",
+            )?;
+            if ctx.mem_info.is_null() {
+                bail!("ONNX Runtime CreateCpuMemoryInfo returned null handle");
+            }
 
-            let num_elems = (model_w as usize) * (model_h as usize) * 3;
-            let in_bytes = if input_is_u8 {
+            let num_elems = (model_w as usize)
+                .checked_mul(model_h as usize)
+                .and_then(|px| px.checked_mul(3))
+                .ok_or_else(|| anyhow!("model dimensions overflow usize"))?;
+            let in_bytes = if ctx.input_is_u8 {
                 num_elems
             } else {
-                num_elems * 4
+                num_elems
+                    .checked_mul(std::mem::size_of::<f32>())
+                    .ok_or_else(|| anyhow!("input tensor byte size overflows usize"))?
             };
-            let out_floats = 84 * 8400;
+            ctx.in_f32_buf = vec![0.0f32; num_elems];
+            ctx.in_u8_buf = vec![0u8; num_elems];
+            ctx.in_bytes = in_bytes;
 
-            Ok((
-                OrtCContext {
-                    _lib_handle: handle,
-                    vtable,
-                    env,
-                    session_opts,
-                    session,
-                    mem_info,
-                    input_name,
-                    output_name,
-                    input_is_u8,
-                    in_f32_buf: vec![0.0f32; num_elems],
-                    in_u8_buf: vec![0u8; num_elems],
-                    in_bytes,
-                    out_floats,
-                },
-                actual_device,
-            ))
+            Ok((ctx, actual_device))
         }
     }
 
@@ -1209,7 +1366,7 @@ impl AiDetectorEngine {
     fn resolve_openvino_c_lib_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
         for dir in dirs {
             let direct = dir.join("libopenvino_c.so");
-            if direct.exists() {
+            if direct.is_file() {
                 return Some(direct);
             }
             if let Ok(entries) = std::fs::read_dir(dir) {
@@ -1217,13 +1374,14 @@ impl AiDetectorEngine {
                     .flatten()
                     .map(|e| e.path())
                     .filter(|p| {
-                        p.file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|n| n.starts_with("libopenvino_c.so."))
-                            .unwrap_or(false)
+                        p.is_file()
+                            && p.file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| n.starts_with("libopenvino_c.so."))
+                                .unwrap_or(false)
                     })
                     .collect();
-                versioned.sort();
+                Self::sort_versioned_so_paths(&mut versioned);
                 if let Some(best) = versioned.pop() {
                     return Some(best);
                 }
@@ -1244,10 +1402,14 @@ impl AiDetectorEngine {
         let Ok(entries) = std::fs::read_dir(lib_dir) else {
             return out;
         };
-        let files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        let files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
         for prefix in prefixes {
             let exact = lib_dir.join(prefix);
-            if exact.exists() {
+            if exact.is_file() {
                 out.push(exact);
                 continue;
             }
@@ -1265,7 +1427,7 @@ impl AiDetectorEngine {
                 })
                 .cloned()
                 .collect();
-            matches.sort();
+            Self::sort_versioned_so_paths(&mut matches);
             if let Some(best) = matches.pop() {
                 out.push(best);
             }
@@ -1274,12 +1436,163 @@ impl AiDetectorEngine {
     }
 
     fn resolve_model_path(configured: &str) -> Option<PathBuf> {
-        let mut candidates = vec![PathBuf::from(configured)];
-        if let Ok(env_model) = std::env::var("NINJANVR_MODEL_PATH") {
+        let mut candidates = Vec::new();
+        if !configured.trim().is_empty() {
+            candidates.push(PathBuf::from(configured));
+        }
+        if let Ok(env_model) = std::env::var("NINJANVR_MODEL_PATH")
+            && !env_model.trim().is_empty()
+        {
             candidates.push(PathBuf::from(env_model));
         }
         candidates.push(PathBuf::from("/openvino-model/ssdlite_mobilenet_v2.xml"));
-        candidates.into_iter().find(|p| p.exists())
+        candidates.into_iter().find(|p| p.is_file())
+    }
+
+    unsafe fn init_ov_context_from_fns(
+        handle: *mut c_void,
+        fns: OvCFunctionTable,
+        model_path: &Path,
+        device: &str,
+    ) -> Result<(OpenVinoCContext, String)> {
+        unsafe {
+            let mut ctx = OpenVinoCContext {
+                output_tensor: std::ptr::null_mut(),
+                input_tensor: std::ptr::null_mut(),
+                infer_req: std::ptr::null_mut(),
+                compiled_model: std::ptr::null_mut(),
+                core: std::ptr::null_mut(),
+                _lib_handle: handle,
+                in_ptr: std::ptr::null_mut(),
+                in_bytes: 0,
+                out_ptr: std::ptr::null(),
+                out_floats: 0,
+                infer_fn: fns.infer_fn,
+                tensor_free_fn: fns.tensor_free,
+                infer_req_free_fn: fns.infer_req_free,
+                compiled_model_free_fn: fns.compiled_model_free,
+                core_free_fn: fns.core_free,
+            };
+
+            let rc = (fns.core_create)(&mut ctx.core);
+            if rc != 0 || ctx.core.is_null() {
+                ctx.core = std::ptr::null_mut();
+                bail!("ov_core_create returned {rc}");
+            }
+
+            let c_model = CString::new(model_path.to_string_lossy().as_bytes())?;
+            let c_prop_key = CString::new("INFERENCE_NUM_THREADS")?;
+            let c_prop_val = CString::new("1")?;
+            let mut actual_device = device.to_string();
+            let core = ctx.core;
+            let compile_model = fns.compile_model;
+            let compiled_model_free = fns.compiled_model_free;
+
+            let try_compile = |dev_str: &str, out_model: &mut *mut c_void| -> bool {
+                let Ok(c_dev) = CString::new(dev_str) else {
+                    return false;
+                };
+                *out_model = std::ptr::null_mut();
+                let rc1 = compile_model(
+                    core,
+                    c_model.as_ptr(),
+                    c_dev.as_ptr(),
+                    2,
+                    out_model,
+                    c_prop_key.as_ptr(),
+                    c_prop_val.as_ptr(),
+                );
+                if rc1 == 0 && !(*out_model).is_null() {
+                    return true;
+                }
+                if !(*out_model).is_null() {
+                    if let Some(free_fn) = compiled_model_free {
+                        free_fn(*out_model);
+                    }
+                    *out_model = std::ptr::null_mut();
+                }
+                let rc2 = compile_model(core, c_model.as_ptr(), c_dev.as_ptr(), 0, out_model);
+                if rc2 == 0 && !(*out_model).is_null() {
+                    return true;
+                }
+                if !(*out_model).is_null() {
+                    if let Some(free_fn) = compiled_model_free {
+                        free_fn(*out_model);
+                    }
+                    *out_model = std::ptr::null_mut();
+                }
+                false
+            };
+
+            if !try_compile(device, &mut ctx.compiled_model) {
+                if !device.eq_ignore_ascii_case("CPU")
+                    && try_compile("CPU", &mut ctx.compiled_model)
+                {
+                    warn!(
+                        "Requested OpenVINO device '{device}' plugin not available; falling back to CPU"
+                    );
+                    actual_device = "CPU".to_string();
+                } else {
+                    bail!("ov_core_compile_model_from_file failed for device {device}");
+                }
+            }
+
+            let rc = (fns.create_infer_req)(ctx.compiled_model, &mut ctx.infer_req);
+            if rc != 0 || ctx.infer_req.is_null() {
+                ctx.infer_req = std::ptr::null_mut();
+                bail!("ov_compiled_model_create_infer_request returned {rc}");
+            }
+
+            let rc = (fns.get_in_tensor)(ctx.infer_req, &mut ctx.input_tensor);
+            if rc != 0 || ctx.input_tensor.is_null() {
+                ctx.input_tensor = std::ptr::null_mut();
+                bail!("ov_infer_request_get_input_tensor returned {rc}");
+            }
+
+            let mut in_raw: *mut c_void = std::ptr::null_mut();
+            let rc = (fns.tensor_data)(ctx.input_tensor, &mut in_raw);
+            if rc != 0 || in_raw.is_null() {
+                bail!("ov_tensor_data(input) returned {rc}");
+            }
+            let mut in_bytes: usize = 0;
+            let rc = (fns.tensor_byte_size)(ctx.input_tensor, &mut in_bytes);
+            if rc != 0 || in_bytes == 0 || in_bytes > MAX_TENSOR_BYTES {
+                bail!("ov_tensor_get_byte_size(input) returned rc={rc}, bytes={in_bytes}");
+            }
+
+            let rc = (fns.infer_fn)(ctx.infer_req);
+            if rc != 0 {
+                bail!("ov_infer_request_infer warmup returned {rc}");
+            }
+
+            let rc = (fns.get_out_tensor)(ctx.infer_req, &mut ctx.output_tensor);
+            if rc != 0 || ctx.output_tensor.is_null() {
+                ctx.output_tensor = std::ptr::null_mut();
+                bail!("ov_infer_request_get_output_tensor returned {rc}");
+            }
+
+            let mut out_raw: *mut c_void = std::ptr::null_mut();
+            let rc = (fns.tensor_data)(ctx.output_tensor, &mut out_raw);
+            if rc != 0 || out_raw.is_null() {
+                bail!("ov_tensor_data(output) returned {rc}");
+            }
+            let mut out_bytes: usize = 0;
+            let rc = (fns.tensor_byte_size)(ctx.output_tensor, &mut out_bytes);
+            if rc != 0
+                || out_bytes < 6 * std::mem::size_of::<f32>()
+                || out_bytes > MAX_TENSOR_BYTES
+                || !out_bytes.is_multiple_of(std::mem::size_of::<f32>())
+            {
+                bail!("ov_tensor_get_byte_size(output) returned rc={rc}, bytes={out_bytes}");
+            }
+
+            ctx.in_ptr = in_raw as *mut u8;
+            ctx.in_bytes = in_bytes;
+            ctx.out_ptr = out_raw as *const f32;
+            ctx.out_floats = out_bytes / std::mem::size_of::<f32>();
+
+            Ok((ctx, actual_device))
+        }
     }
 
     fn try_init_openvino(
@@ -1323,115 +1636,43 @@ impl AiDetectorEngine {
                 }};
             }
 
-            let core_create = load_sym!("ov_core_create", OvCoreCreateFn);
-            let compile_model = load_sym!("ov_core_compile_model_from_file", OvCoreCompileModelFn);
-            let create_infer_req = load_sym!(
-                "ov_compiled_model_create_infer_request",
-                OvCompiledModelCreateInferReqFn
-            );
-            let get_in_tensor =
-                load_sym!("ov_infer_request_get_input_tensor", OvInferReqGetTensorFn);
-            let get_out_tensor =
-                load_sym!("ov_infer_request_get_output_tensor", OvInferReqGetTensorFn);
-            let infer_fn = load_sym!("ov_infer_request_infer", OvInferReqInferFn);
-            let tensor_data = load_sym!("ov_tensor_data", OvTensorDataFn);
-            let tensor_byte_size = load_sym!("ov_tensor_get_byte_size", OvTensorGetByteSizeFn);
-
-            let mut core: *mut c_void = std::ptr::null_mut();
-            let rc = core_create(&mut core);
-            if rc != 0 || core.is_null() {
-                bail!("ov_core_create returned {rc}");
+            macro_rules! load_opt_sym {
+                ($name:literal, $ty:ty) => {{
+                    let sym_name = CString::new($name).unwrap();
+                    let ptr = libc::dlsym(handle, sym_name.as_ptr());
+                    if ptr.is_null() {
+                        None
+                    } else {
+                        Some(std::mem::transmute::<*mut c_void, $ty>(ptr))
+                    }
+                }};
             }
 
-            let c_model = CString::new(model_path.to_string_lossy().as_bytes())?;
-            let c_prop_key = CString::new("INFERENCE_NUM_THREADS")?;
-            let c_prop_val = CString::new("1")?;
-            let mut compiled_model: *mut c_void = std::ptr::null_mut();
-            let mut actual_device = device.to_string();
-
-            let try_compile = |dev_str: &str, out_model: &mut *mut c_void| -> bool {
-                let Ok(c_dev) = CString::new(dev_str) else {
-                    return false;
-                };
-                let rc1 = compile_model(
-                    core,
-                    c_model.as_ptr(),
-                    c_dev.as_ptr(),
-                    2,
-                    out_model,
-                    c_prop_key.as_ptr(),
-                    c_prop_val.as_ptr(),
-                );
-                if rc1 == 0 && !out_model.is_null() {
-                    return true;
-                }
-                let rc2 = compile_model(core, c_model.as_ptr(), c_dev.as_ptr(), 0, out_model);
-                rc2 == 0 && !out_model.is_null()
+            let fns = OvCFunctionTable {
+                core_create: load_sym!("ov_core_create", OvCoreCreateFn),
+                compile_model: load_sym!("ov_core_compile_model_from_file", OvCoreCompileModelFn),
+                create_infer_req: load_sym!(
+                    "ov_compiled_model_create_infer_request",
+                    OvCompiledModelCreateInferReqFn
+                ),
+                get_in_tensor: load_sym!(
+                    "ov_infer_request_get_input_tensor",
+                    OvInferReqGetTensorFn
+                ),
+                get_out_tensor: load_sym!(
+                    "ov_infer_request_get_output_tensor",
+                    OvInferReqGetTensorFn
+                ),
+                infer_fn: load_sym!("ov_infer_request_infer", OvInferReqInferFn),
+                tensor_data: load_sym!("ov_tensor_data", OvTensorDataFn),
+                tensor_byte_size: load_sym!("ov_tensor_get_byte_size", OvTensorGetByteSizeFn),
+                tensor_free: load_opt_sym!("ov_tensor_free", OvFreeFn),
+                infer_req_free: load_opt_sym!("ov_infer_request_free", OvFreeFn),
+                compiled_model_free: load_opt_sym!("ov_compiled_model_free", OvFreeFn),
+                core_free: load_opt_sym!("ov_core_free", OvFreeFn),
             };
 
-            if !try_compile(device, &mut compiled_model) {
-                if !device.eq_ignore_ascii_case("CPU") && try_compile("CPU", &mut compiled_model) {
-                    warn!(
-                        "Requested OpenVINO device '{device}' plugin not available; falling back to CPU"
-                    );
-                    actual_device = "CPU".to_string();
-                } else {
-                    bail!("ov_core_compile_model_from_file failed for device {device}");
-                }
-            }
-
-            let mut infer_req: *mut c_void = std::ptr::null_mut();
-            let rc = create_infer_req(compiled_model, &mut infer_req);
-            if rc != 0 || infer_req.is_null() {
-                bail!("ov_compiled_model_create_infer_request returned {rc}");
-            }
-
-            let mut input_tensor: *mut c_void = std::ptr::null_mut();
-            let rc = get_in_tensor(infer_req, &mut input_tensor);
-            if rc != 0 || input_tensor.is_null() {
-                bail!("ov_infer_request_get_input_tensor returned {rc}");
-            }
-
-            let mut in_raw: *mut c_void = std::ptr::null_mut();
-            let rc = tensor_data(input_tensor, &mut in_raw);
-            if rc != 0 || in_raw.is_null() {
-                bail!("ov_tensor_data(input) returned {rc}");
-            }
-            let mut in_bytes: usize = 0;
-            tensor_byte_size(input_tensor, &mut in_bytes);
-
-            let _ = infer_fn(infer_req);
-
-            let mut output_tensor: *mut c_void = std::ptr::null_mut();
-            let rc = get_out_tensor(infer_req, &mut output_tensor);
-            if rc != 0 || output_tensor.is_null() {
-                bail!("ov_infer_request_get_output_tensor returned {rc}");
-            }
-
-            let mut out_raw: *mut c_void = std::ptr::null_mut();
-            let rc = tensor_data(output_tensor, &mut out_raw);
-            if rc != 0 || out_raw.is_null() {
-                bail!("ov_tensor_data(output) returned {rc}");
-            }
-            let mut out_bytes: usize = 0;
-            tensor_byte_size(output_tensor, &mut out_bytes);
-
-            Ok((
-                OpenVinoCContext {
-                    _lib_handle: handle,
-                    _core: core,
-                    _compiled_model: compiled_model,
-                    infer_req,
-                    input_tensor,
-                    output_tensor,
-                    in_ptr: in_raw as *mut u8,
-                    in_bytes,
-                    out_ptr: out_raw as *const f32,
-                    out_floats: out_bytes / 4,
-                    infer_fn,
-                },
-                actual_device,
-            ))
+            Self::init_ov_context_from_fns(handle, fns, &model_path, device)
         }
     }
 
@@ -1447,7 +1688,7 @@ impl AiDetectorEngine {
         let mut out_results = Vec::new();
 
         {
-            let mut guard = self.inner.lock().expect("detector inner mutex poisoned");
+            let mut guard = lock_unpoisoned(&self.inner);
             let model_w = guard.model_w;
             let model_h = guard.model_h;
             let nchw_layout = guard.nchw_layout;
@@ -1455,172 +1696,359 @@ impl AiDetectorEngine {
             match guard.backend.as_mut() {
                 Some(InferenceRuntimeBackend::OpenVino(ctx)) => {
                     let _ = (ctx.input_tensor, ctx.output_tensor);
-                    unsafe {
-                        if ctx.in_bytes == tensor_nhwc.len() * 4 {
-                            let dst_f32 = std::slice::from_raw_parts_mut(
-                                ctx.in_ptr as *mut f32,
-                                tensor_nhwc.len(),
-                            );
-                            prepare_input_tensor_f32(
-                                tensor_nhwc,
-                                model_w,
-                                model_h,
-                                nchw_layout,
-                                dst_f32,
-                            );
-                        } else if nchw_layout && ctx.in_bytes == tensor_nhwc.len() {
-                            let dst_u8 =
-                                std::slice::from_raw_parts_mut(ctx.in_ptr, tensor_nhwc.len());
-                            prepare_input_tensor_u8(tensor_nhwc, model_w, model_h, true, dst_u8);
-                        } else {
-                            let copy_len = tensor_nhwc.len().min(ctx.in_bytes);
-                            let dst_u8 = std::slice::from_raw_parts_mut(ctx.in_ptr, copy_len);
-                            prepare_input_tensor_u8(tensor_nhwc, model_w, model_h, false, dst_u8);
-                        }
+                    if !ctx.in_ptr.is_null()
+                        && ctx.in_bytes > 0
+                        && ctx.in_bytes <= MAX_TENSOR_BYTES
+                        && !tensor_nhwc.is_empty()
+                    {
+                        unsafe {
+                            let expected_f32_bytes =
+                                tensor_nhwc.len().checked_mul(std::mem::size_of::<f32>());
+                            if expected_f32_bytes == Some(ctx.in_bytes)
+                                && (ctx.in_ptr as usize).is_multiple_of(std::mem::align_of::<f32>())
+                            {
+                                let dst_f32 = std::slice::from_raw_parts_mut(
+                                    ctx.in_ptr as *mut f32,
+                                    tensor_nhwc.len(),
+                                );
+                                prepare_input_tensor_f32(
+                                    tensor_nhwc,
+                                    model_w,
+                                    model_h,
+                                    nchw_layout,
+                                    dst_f32,
+                                );
+                            } else if expected_f32_bytes == Some(ctx.in_bytes) {
+                                let mut tmp_f32 = vec![0.0f32; tensor_nhwc.len()];
+                                prepare_input_tensor_f32(
+                                    tensor_nhwc,
+                                    model_w,
+                                    model_h,
+                                    nchw_layout,
+                                    &mut tmp_f32,
+                                );
+                                std::ptr::copy_nonoverlapping(
+                                    tmp_f32.as_ptr() as *const u8,
+                                    ctx.in_ptr,
+                                    ctx.in_bytes,
+                                );
+                            } else if nchw_layout && ctx.in_bytes == tensor_nhwc.len() {
+                                let dst_u8 =
+                                    std::slice::from_raw_parts_mut(ctx.in_ptr, tensor_nhwc.len());
+                                prepare_input_tensor_u8(
+                                    tensor_nhwc,
+                                    model_w,
+                                    model_h,
+                                    true,
+                                    dst_u8,
+                                );
+                            } else {
+                                let copy_len = tensor_nhwc.len().min(ctx.in_bytes);
+                                if copy_len > 0 {
+                                    let dst_u8 =
+                                        std::slice::from_raw_parts_mut(ctx.in_ptr, copy_len);
+                                    prepare_input_tensor_u8(
+                                        tensor_nhwc,
+                                        model_w,
+                                        model_h,
+                                        false,
+                                        dst_u8,
+                                    );
+                                }
+                            }
 
-                        let rc = (ctx.infer_fn)(ctx.infer_req);
-                        if rc == 0 && ctx.out_floats >= 6 {
-                            let slice = std::slice::from_raw_parts(ctx.out_ptr, ctx.out_floats);
-                            out_results = Self::decode_output_with_state(
-                                &guard,
-                                slice,
-                                region,
-                                frame_w,
-                                frame_h,
-                                score_threshold,
-                            );
+                            let rc = (ctx.infer_fn)(ctx.infer_req);
+                            if rc == 0
+                                && !ctx.out_ptr.is_null()
+                                && (6..=MAX_TENSOR_FLOATS).contains(&ctx.out_floats)
+                            {
+                                if (ctx.out_ptr as usize)
+                                    .is_multiple_of(std::mem::align_of::<f32>())
+                                {
+                                    let slice =
+                                        std::slice::from_raw_parts(ctx.out_ptr, ctx.out_floats);
+                                    out_results = Self::decode_output_with_state(
+                                        &guard,
+                                        slice,
+                                        region,
+                                        frame_w,
+                                        frame_h,
+                                        score_threshold,
+                                    );
+                                } else {
+                                    let mut aligned_out = vec![0.0f32; ctx.out_floats];
+                                    std::ptr::copy_nonoverlapping(
+                                        ctx.out_ptr as *const u8,
+                                        aligned_out.as_mut_ptr() as *mut u8,
+                                        ctx.out_floats * std::mem::size_of::<f32>(),
+                                    );
+                                    out_results = Self::decode_output_with_state(
+                                        &guard,
+                                        &aligned_out,
+                                        region,
+                                        frame_w,
+                                        frame_h,
+                                        score_threshold,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
                 Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx)) => unsafe {
-                    let vt = std::slice::from_raw_parts(ort_ctx.vtable, 101);
-                    let create_tensor: OrtCreateTensorWithDataFn =
-                        std::mem::transmute::<*const c_void, OrtCreateTensorWithDataFn>(vt[49]);
-                    let run_fn: OrtRunFn = std::mem::transmute::<*const c_void, OrtRunFn>(vt[9]);
-                    let get_mut_data: OrtGetTensorMutableDataFn =
-                        std::mem::transmute::<*const c_void, OrtGetTensorMutableDataFn>(vt[51]);
-                    let get_type_shape: OrtGetTensorTypeAndShapeFn =
-                        std::mem::transmute::<*const c_void, OrtGetTensorTypeAndShapeFn>(vt[65]);
-                    let get_elem_count: OrtGetTensorShapeElementCountFn =
-                        std::mem::transmute::<*const c_void, OrtGetTensorShapeElementCountFn>(
-                            vt[64],
-                        );
-                    let release_val: OrtReleaseFn =
-                        std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[96]);
-                    let release_shape: OrtReleaseFn =
-                        std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[99]);
-                    let release_status: OrtReleaseFn =
-                        std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[93]);
-
-                    let shape: [i64; 4] = if nchw_layout {
-                        [1, 3, model_h as i64, model_w as i64]
-                    } else {
-                        [1, model_h as i64, model_w as i64, 3]
-                    };
-
-                    let mut in_val: *mut c_void = std::ptr::null_mut();
-                    let create_st = if ort_ctx.input_is_u8 {
-                        prepare_input_tensor_u8(
-                            tensor_nhwc,
-                            model_w,
-                            model_h,
-                            nchw_layout,
-                            &mut ort_ctx.in_u8_buf,
-                        );
-                        create_tensor(
-                            ort_ctx.mem_info,
-                            ort_ctx.in_u8_buf.as_mut_ptr() as *mut c_void,
-                            ort_ctx.in_u8_buf.len(),
-                            shape.as_ptr(),
-                            shape.len(),
-                            ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8,
-                            &mut in_val,
-                        )
-                    } else {
-                        prepare_input_tensor_f32(
-                            tensor_nhwc,
-                            model_w,
-                            model_h,
-                            nchw_layout,
-                            &mut ort_ctx.in_f32_buf,
-                        );
-                        create_tensor(
-                            ort_ctx.mem_info,
-                            ort_ctx.in_f32_buf.as_mut_ptr() as *mut c_void,
-                            ort_ctx.in_f32_buf.len() * 4,
-                            shape.as_ptr(),
-                            shape.len(),
-                            ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-                            &mut in_val,
-                        )
-                    };
-
-                    if !create_st.is_null() {
-                        release_status(create_st);
-                    } else if !in_val.is_null() {
-                        let in_names = [ort_ctx.input_name.as_ptr()];
-                        let in_vals = [in_val as *const c_void];
-                        let out_names = [ort_ctx.output_name.as_ptr()];
-                        let mut out_val: *mut c_void = std::ptr::null_mut();
-
-                        let run_st = run_fn(
-                            ort_ctx.session,
-                            std::ptr::null(),
-                            in_names.as_ptr(),
-                            in_vals.as_ptr(),
-                            1,
-                            out_names.as_ptr(),
-                            1,
-                            &mut out_val,
-                        );
-                        if !run_st.is_null() {
-                            release_status(run_st);
-                        } else if !out_val.is_null() {
-                            let mut out_ptr: *mut c_void = std::ptr::null_mut();
-                            let mut shape_info: *mut c_void = std::ptr::null_mut();
-                            let mut elem_count: usize = 0;
-
-                            let st1 = get_mut_data(out_val, &mut out_ptr);
-                            let st2 = get_type_shape(out_val, &mut shape_info);
-                            if st1.is_null() && st2.is_null() && !shape_info.is_null() {
-                                let st3 = get_elem_count(shape_info, &mut elem_count);
-                                if !st3.is_null() {
-                                    release_status(st3);
-                                }
-                            } else {
-                                if !st1.is_null() {
-                                    release_status(st1);
-                                }
-                                if !st2.is_null() {
-                                    release_status(st2);
-                                }
-                            }
-                            if !shape_info.is_null() {
-                                release_shape(shape_info);
-                            }
-
-                            if !out_ptr.is_null() && elem_count >= 6 {
-                                ort_ctx.out_floats = elem_count;
-                                let out_floats = ort_ctx.out_floats;
-                                let slice_vec: Vec<f32> =
-                                    std::slice::from_raw_parts(out_ptr as *const f32, out_floats)
-                                        .to_vec();
-                                release_val(out_val);
-                                release_val(in_val);
-                                out_results = Self::decode_output_with_state(
-                                    &guard,
-                                    &slice_vec,
-                                    region,
-                                    frame_w,
-                                    frame_h,
-                                    score_threshold,
+                    if !ort_ctx.vtable.is_null()
+                        && !ort_ctx.session.is_null()
+                        && !ort_ctx.mem_info.is_null()
+                    {
+                        let vt = std::slice::from_raw_parts(ort_ctx.vtable, 101);
+                        let slots_ok = [9usize, 49, 51, 64, 65, 93, 96, 99]
+                            .iter()
+                            .all(|&idx| !vt[idx].is_null());
+                        if slots_ok {
+                            let create_tensor: OrtCreateTensorWithDataFn =
+                                std::mem::transmute::<*const c_void, OrtCreateTensorWithDataFn>(
+                                    vt[49],
                                 );
+                            let run_fn: OrtRunFn =
+                                std::mem::transmute::<*const c_void, OrtRunFn>(vt[9]);
+                            let get_mut_data: OrtGetTensorMutableDataFn =
+                                std::mem::transmute::<*const c_void, OrtGetTensorMutableDataFn>(
+                                    vt[51],
+                                );
+                            let get_type_shape: OrtGetTensorTypeAndShapeFn =
+                                std::mem::transmute::<*const c_void, OrtGetTensorTypeAndShapeFn>(
+                                    vt[65],
+                                );
+                            let get_elem_count: OrtGetTensorShapeElementCountFn =
+                                std::mem::transmute::<*const c_void, OrtGetTensorShapeElementCountFn>(
+                                    vt[64],
+                                );
+                            let release_val: OrtReleaseFn =
+                                std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[96]);
+                            let release_shape: OrtReleaseFn =
+                                std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[99]);
+                            let release_status: OrtReleaseFn =
+                                std::mem::transmute::<*const c_void, OrtReleaseFn>(vt[93]);
+
+                            let shape: [i64; 4] = if nchw_layout {
+                                [1, 3, model_h as i64, model_w as i64]
                             } else {
-                                release_val(out_val);
-                                release_val(in_val);
+                                [1, model_h as i64, model_w as i64, 3]
+                            };
+
+                            let mut in_val: *mut c_void = std::ptr::null_mut();
+                            let create_st = if ort_ctx.input_is_u8 {
+                                prepare_input_tensor_u8(
+                                    tensor_nhwc,
+                                    model_w,
+                                    model_h,
+                                    nchw_layout,
+                                    &mut ort_ctx.in_u8_buf,
+                                );
+                                create_tensor(
+                                    ort_ctx.mem_info,
+                                    ort_ctx.in_u8_buf.as_mut_ptr() as *mut c_void,
+                                    ort_ctx.in_u8_buf.len(),
+                                    shape.as_ptr(),
+                                    shape.len(),
+                                    ORT_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+                                    &mut in_val,
+                                )
+                            } else {
+                                prepare_input_tensor_f32(
+                                    tensor_nhwc,
+                                    model_w,
+                                    model_h,
+                                    nchw_layout,
+                                    &mut ort_ctx.in_f32_buf,
+                                );
+                                create_tensor(
+                                    ort_ctx.mem_info,
+                                    ort_ctx.in_f32_buf.as_mut_ptr() as *mut c_void,
+                                    ort_ctx
+                                        .in_f32_buf
+                                        .len()
+                                        .saturating_mul(std::mem::size_of::<f32>()),
+                                    shape.as_ptr(),
+                                    shape.len(),
+                                    ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                                    &mut in_val,
+                                )
+                            };
+
+                            if !create_st.is_null() {
+                                release_status(create_st);
+                                if !in_val.is_null() {
+                                    release_val(in_val);
+                                }
+                            } else if !in_val.is_null() {
+                                let in_names = [ort_ctx.input_name.as_ptr()];
+                                let in_vals = [in_val as *const c_void];
+                                let out_names = [ort_ctx.output_name.as_ptr()];
+                                let mut out_val: *mut c_void = std::ptr::null_mut();
+
+                                let run_st = run_fn(
+                                    ort_ctx.session,
+                                    std::ptr::null(),
+                                    in_names.as_ptr(),
+                                    in_vals.as_ptr(),
+                                    1,
+                                    out_names.as_ptr(),
+                                    1,
+                                    &mut out_val,
+                                );
+                                if !run_st.is_null() {
+                                    release_status(run_st);
+                                    if !out_val.is_null() {
+                                        release_val(out_val);
+                                    }
+                                    release_val(in_val);
+                                } else if !out_val.is_null() {
+                                    let mut out_ptr: *mut c_void = std::ptr::null_mut();
+                                    let mut shape_info: *mut c_void = std::ptr::null_mut();
+                                    let mut valid_elem_count: Option<usize> = None;
+
+                                    let st1 = get_mut_data(out_val, &mut out_ptr);
+                                    let st2 = get_type_shape(out_val, &mut shape_info);
+                                    if st1.is_null() && st2.is_null() && !shape_info.is_null() {
+                                        let mut is_float_tensor = true;
+                                        if !vt[60].is_null() {
+                                            let get_elem_type: OrtGetTensorElementTypeFn =
+                                                std::mem::transmute::<
+                                                    *const c_void,
+                                                    OrtGetTensorElementTypeFn,
+                                                >(
+                                                    vt[60]
+                                                );
+                                            let mut out_elem_ty: c_int =
+                                                ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+                                            let st_ty = get_elem_type(shape_info, &mut out_elem_ty);
+                                            if st_ty.is_null() {
+                                                is_float_tensor = out_elem_ty
+                                                    == ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+                                            } else {
+                                                release_status(st_ty);
+                                                is_float_tensor = false;
+                                            }
+                                        }
+
+                                        let mut dims_valid = true;
+                                        let mut dims_product: Option<usize> = None;
+                                        if !vt[61].is_null() && !vt[62].is_null() {
+                                            let get_dims_count: OrtGetDimensionsCountFn =
+                                                std::mem::transmute::<
+                                                    *const c_void,
+                                                    OrtGetDimensionsCountFn,
+                                                >(
+                                                    vt[61]
+                                                );
+                                            let get_dims: OrtGetDimensionsFn = std::mem::transmute::<
+                                                *const c_void,
+                                                OrtGetDimensionsFn,
+                                            >(
+                                                vt[62]
+                                            );
+                                            let mut ndims: usize = 0;
+                                            let st_dc = get_dims_count(shape_info, &mut ndims);
+                                            if st_dc.is_null() && (1..=16).contains(&ndims) {
+                                                let mut raw_dims = vec![0i64; ndims];
+                                                let st_d = get_dims(
+                                                    shape_info,
+                                                    raw_dims.as_mut_ptr(),
+                                                    ndims,
+                                                );
+                                                if st_d.is_null() {
+                                                    dims_product = raw_dims.iter().try_fold(
+                                                        1usize,
+                                                        |acc, &d| {
+                                                            if d <= 0 {
+                                                                None
+                                                            } else {
+                                                                usize::try_from(d).ok().and_then(
+                                                                    |u| acc.checked_mul(u),
+                                                                )
+                                                            }
+                                                        },
+                                                    );
+                                                    dims_valid = dims_product.is_some();
+                                                } else {
+                                                    release_status(st_d);
+                                                    dims_valid = false;
+                                                }
+                                            } else {
+                                                if !st_dc.is_null() {
+                                                    release_status(st_dc);
+                                                }
+                                                dims_valid = false;
+                                            }
+                                        }
+
+                                        if is_float_tensor && dims_valid {
+                                            let mut elem_count: usize = 0;
+                                            let st3 = get_elem_count(shape_info, &mut elem_count);
+                                            if st3.is_null() {
+                                                let count_matches_dims = dims_product
+                                                    .is_none_or(|prod| prod == elem_count);
+                                                if count_matches_dims
+                                                    && (6..=MAX_TENSOR_FLOATS).contains(&elem_count)
+                                                {
+                                                    valid_elem_count = Some(elem_count);
+                                                }
+                                            } else {
+                                                release_status(st3);
+                                            }
+                                        }
+                                    } else {
+                                        if !st1.is_null() {
+                                            release_status(st1);
+                                        }
+                                        if !st2.is_null() {
+                                            release_status(st2);
+                                        }
+                                    }
+                                    if !shape_info.is_null() {
+                                        release_shape(shape_info);
+                                    }
+
+                                    if let Some(out_floats) = valid_elem_count
+                                        && !out_ptr.is_null()
+                                    {
+                                        ort_ctx.out_floats = out_floats;
+                                        let slice_vec: Vec<f32> = if (out_ptr as usize)
+                                            .is_multiple_of(std::mem::align_of::<f32>())
+                                        {
+                                            std::slice::from_raw_parts(
+                                                out_ptr as *const f32,
+                                                out_floats,
+                                            )
+                                            .to_vec()
+                                        } else {
+                                            let mut aligned = vec![0.0f32; out_floats];
+                                            std::ptr::copy_nonoverlapping(
+                                                out_ptr as *const u8,
+                                                aligned.as_mut_ptr() as *mut u8,
+                                                out_floats * std::mem::size_of::<f32>(),
+                                            );
+                                            aligned
+                                        };
+                                        release_val(out_val);
+                                        release_val(in_val);
+                                        out_results = Self::decode_output_with_state(
+                                            &guard,
+                                            &slice_vec,
+                                            region,
+                                            frame_w,
+                                            frame_h,
+                                            score_threshold,
+                                        );
+                                    } else {
+                                        release_val(out_val);
+                                        release_val(in_val);
+                                    }
+                                } else {
+                                    release_val(in_val);
+                                }
                             }
-                        } else {
-                            release_val(in_val);
                         }
                     }
                 },
@@ -1632,7 +2060,7 @@ impl AiDetectorEngine {
         self.cumulative_infer_us
             .fetch_add(elapsed_us, Ordering::Relaxed);
         let elapsed_ms = (elapsed_us as f32) / 1000.0;
-        let mut avg = self.last_inference_ms.lock().expect("mutex poisoned");
+        let mut avg = lock_unpoisoned(&self.last_inference_ms);
         *avg = (*avg * 0.9) + (elapsed_ms.max(0.2) * 0.1);
 
         out_results
@@ -1646,12 +2074,12 @@ impl AiDetectorEngine {
         frame_h: u32,
         score_threshold: f32,
     ) -> Vec<DetectionResult> {
-        let guard = self.inner.lock().expect("detector inner mutex poisoned");
+        let guard = lock_unpoisoned(&self.inner);
         Self::decode_output_with_state(&guard, slice, region, frame_w, frame_h, score_threshold)
     }
 
     pub fn set_labelmap(&self, labelmap: BTreeMap<i32, String>) {
-        let mut guard = self.inner.lock().expect("detector inner mutex poisoned");
+        let mut guard = lock_unpoisoned(&self.inner);
         guard.labelmap = labelmap;
     }
 
@@ -1704,16 +2132,33 @@ impl AiDetectorEngine {
     ) {
         let [nx1, ny1, nx2, ny2] = norm_coords;
         let (frame_w, frame_h) = frame_dims;
+        if frame_w == 0
+            || frame_h == 0
+            || region.width() == 0
+            || region.height() == 0
+            || !score.is_finite()
+            || !(0.0..=1.0001).contains(&score)
+            || !nx1.is_finite()
+            || !ny1.is_finite()
+            || !nx2.is_finite()
+            || !ny2.is_finite()
+            || nx2 <= nx1
+            || ny2 <= ny1
+        {
+            return;
+        }
         let rx = region.x_min as f32;
         let ry = region.y_min as f32;
         let rw = region.width() as f32;
         let rh = region.height() as f32;
-        let x1 = (rx + nx1.clamp(0.0, 1.0) * rw).clamp(0.0, (frame_w - 1) as f32) as u32;
-        let y1 = (ry + ny1.clamp(0.0, 1.0) * rh).clamp(0.0, (frame_h - 1) as f32) as u32;
+        let max_x1 = frame_w.saturating_sub(1) as f32;
+        let max_y1 = frame_h.saturating_sub(1) as f32;
+        let x1 = (rx + nx1.clamp(0.0, 1.0) * rw).clamp(0.0, max_x1) as u32;
+        let y1 = (ry + ny1.clamp(0.0, 1.0) * rh).clamp(0.0, max_y1) as u32;
         let x2 = (rx + nx2.clamp(0.0, 1.0) * rw).clamp(0.0, frame_w as f32) as u32;
         let y2 = (ry + ny2.clamp(0.0, 1.0) * rh).clamp(0.0, frame_h as f32) as u32;
 
-        if x2 > x1 + 4 && y2 > y1 + 4 {
+        if x2 > x1.saturating_add(4) && y2 > y1.saturating_add(4) {
             out.push(DetectionResult {
                 label,
                 score,
@@ -1732,8 +2177,13 @@ impl AiDetectorEngine {
         frame_dims: (u32, u32),
         score_threshold: f32,
     ) -> Vec<DetectionResult> {
-        let rows = 4 + num_classes;
-        if num_classes == 0 || num_anchors == 0 || slice.len() != rows * num_anchors {
+        let Some(rows) = 4usize.checked_add(num_classes) else {
+            return Vec::new();
+        };
+        let Some(expected_len) = rows.checked_mul(num_anchors) else {
+            return Vec::new();
+        };
+        if num_classes == 0 || num_anchors == 0 || slice.len() != expected_len {
             return Vec::new();
         }
         let mw = state.model_w.max(1) as f32;
@@ -1744,12 +2194,16 @@ impl AiDetectorEngine {
             let mut best_score = 0.0f32;
             for c in 0..num_classes {
                 let s = slice[(4 + c) * num_anchors + a];
-                if s > best_score {
+                if s.is_finite() && s > best_score {
                     best_score = s;
-                    best_cls = c as i32;
+                    best_cls = i32::try_from(c).unwrap_or(-1);
                 }
             }
-            if best_score < score_threshold || best_score > 1.0001 || best_cls < 0 {
+            if !best_score.is_finite()
+                || best_score < score_threshold
+                || best_score > 1.0001
+                || best_cls < 0
+            {
                 continue;
             }
             let Some(label) = Self::resolve_yolo_label(state, best_cls) else {
@@ -1759,7 +2213,13 @@ impl AiDetectorEngine {
             let cy = slice[num_anchors + a];
             let bw = slice[2 * num_anchors + a];
             let bh = slice[3 * num_anchors + a];
-            if bw <= 0.0 || bh <= 0.0 {
+            if !cx.is_finite()
+                || !cy.is_finite()
+                || !bw.is_finite()
+                || !bh.is_finite()
+                || bw <= 0.0
+                || bh <= 0.0
+            {
                 continue;
             }
             let scale_w = if bw > 1.5 || cx > 1.5 { mw } else { 1.0 };
@@ -1788,7 +2248,9 @@ impl AiDetectorEngine {
         frame_dims: (u32, u32),
         score_threshold: f32,
     ) -> Vec<DetectionResult> {
-        let stride = 5 + num_classes;
+        let Some(stride) = 5usize.checked_add(num_classes) else {
+            return Vec::new();
+        };
         if num_classes == 0 || !slice.len().is_multiple_of(stride) {
             return Vec::new();
         }
@@ -1797,15 +2259,15 @@ impl AiDetectorEngine {
         let mut out_results = Vec::new();
         for row in slice.chunks_exact(stride) {
             let obj_conf = row[4];
-            if obj_conf < score_threshold || obj_conf > 1.0001 {
+            if !obj_conf.is_finite() || obj_conf < score_threshold || obj_conf > 1.0001 {
                 continue;
             }
             let mut best_cls = -1i32;
             let mut best_cls_prob = 0.0f32;
             for (c, &prob) in row[5..stride].iter().enumerate() {
-                if prob > best_cls_prob {
+                if prob.is_finite() && prob > best_cls_prob {
                     best_cls_prob = prob;
-                    best_cls = c as i32;
+                    best_cls = i32::try_from(c).unwrap_or(-1);
                 }
             }
             let score = if best_cls_prob > 0.0 {
@@ -1813,14 +2275,20 @@ impl AiDetectorEngine {
             } else {
                 obj_conf
             };
-            if score < score_threshold || score > 1.0001 || best_cls < 0 {
+            if !score.is_finite() || score < score_threshold || score > 1.0001 || best_cls < 0 {
                 continue;
             }
             let Some(label) = Self::resolve_yolo_label(state, best_cls) else {
                 continue;
             };
             let (cx, cy, bw, bh) = (row[0], row[1], row[2], row[3]);
-            if bw <= 0.0 || bh <= 0.0 {
+            if !cx.is_finite()
+                || !cy.is_finite()
+                || !bw.is_finite()
+                || !bh.is_finite()
+                || bw <= 0.0
+                || bh <= 0.0
+            {
                 continue;
             }
             let scale_w = if bw > 1.5 || cx > 1.5 { mw } else { 1.0 };
@@ -1849,6 +2317,9 @@ impl AiDetectorEngine {
         frame_h: u32,
         score_threshold: f32,
     ) -> Vec<DetectionResult> {
+        if frame_w == 0 || frame_h == 0 || !score_threshold.is_finite() {
+            return Vec::new();
+        }
         let mut out_results = Vec::new();
         let mw = state.model_w.max(1) as f32;
         let mh = state.model_h.max(1) as f32;
@@ -1873,11 +2344,19 @@ impl AiDetectorEngine {
         if is_ssd_shape {
             for row in slice.as_chunks::<7>().0 {
                 let img_id = row[0];
-                let label_id = row[1] as i32;
+                let raw_label = row[1];
                 let score = row[2];
-                if img_id < 0.0 || score < score_threshold {
+                if !img_id.is_finite()
+                    || img_id < 0.0
+                    || !raw_label.is_finite()
+                    || !(0.0..=(i32::MAX as f32)).contains(&raw_label)
+                    || !score.is_finite()
+                    || score < score_threshold
+                    || score > 1.0001
+                {
                     continue;
                 }
+                let label_id = raw_label as i32;
                 let Some(label) = state.labelmap.get(&label_id) else {
                     continue;
                 };
@@ -1999,10 +2478,20 @@ impl AiDetectorEngine {
         if slice.len().is_multiple_of(6) {
             for row in slice.as_chunks::<6>().0 {
                 let score = row[4];
-                if score < score_threshold {
+                let raw_label = row[5];
+                if !score.is_finite()
+                    || score < score_threshold
+                    || score > 1.0001
+                    || !raw_label.is_finite()
+                    || !(0.0..=(i32::MAX as f32)).contains(&raw_label)
+                    || !row[0].is_finite()
+                    || !row[1].is_finite()
+                    || !row[2].is_finite()
+                    || !row[3].is_finite()
+                {
                     continue;
                 }
-                let label_id = row[5] as i32;
+                let label_id = raw_label as i32;
                 let Some(label) = Self::resolve_yolo_label(state, label_id) else {
                     continue;
                 };
@@ -2031,11 +2520,16 @@ pub const DEFAULT_FACE_SIMILARITY_THRESHOLD: f32 = 0.68;
 /// L2-normalizes an embedding slice in-place so `||vec||_2 == 1.0`.
 /// Leaves zero vectors unchanged without producing `NaN`.
 pub fn l2_normalize_embedding(vec: &mut [f32]) {
+    for v in vec.iter_mut() {
+        if !v.is_finite() {
+            *v = 0.0;
+        }
+    }
     let norm_sq: f64 = vec.iter().map(|&v| (v as f64) * (v as f64)).sum();
-    let norm = norm_sq.sqrt() as f32;
-    if norm > 1e-12 {
+    let norm = norm_sq.sqrt();
+    if norm.is_finite() && norm > 1e-12 {
         for v in vec.iter_mut() {
-            *v /= norm;
+            *v = ((*v as f64) / norm) as f32;
         }
     }
 }
@@ -2056,17 +2550,24 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let mut norm_a = 0.0f64;
     let mut norm_b = 0.0f64;
     for (&x, &y) in a.iter().zip(b.iter()) {
+        if !x.is_finite() || !y.is_finite() {
+            return 0.0;
+        }
         let xf = x as f64;
         let yf = y as f64;
         dot += xf * yf;
         norm_a += xf * xf;
         norm_b += yf * yf;
     }
-    let denom = (norm_a * norm_b).sqrt();
-    if denom <= 1e-12 {
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if !denom.is_finite() || !dot.is_finite() || denom <= 1e-12 {
         return 0.0;
     }
-    ((dot / denom) as f32).clamp(-1.0, 1.0)
+    let ratio = dot / denom;
+    if !ratio.is_finite() {
+        return 0.0;
+    }
+    (ratio as f32).clamp(-1.0, 1.0)
 }
 
 /// Computes a deterministic 512-dimensional L2-normalized face embedding descriptor from either
@@ -2165,13 +2666,15 @@ pub fn resolve_face_crop_bbox(
     frame_h: u32,
     min_face_area: u32,
 ) -> Option<BoundingBox> {
+    if frame_w == 0 || frame_h == 0 {
+        return None;
+    }
     if let Some(fb) = face_attr_bbox {
-        let clamped = BoundingBox::new(
-            fb.x_min.min(frame_w.saturating_sub(1)),
-            fb.y_min.min(frame_h.saturating_sub(1)),
-            fb.x_max.min(frame_w).max(fb.x_min + 1),
-            fb.y_max.min(frame_h).max(fb.y_min + 1),
-        );
+        let x_min = fb.x_min.min(frame_w - 1);
+        let y_min = fb.y_min.min(frame_h - 1);
+        let x_max = fb.x_max.min(frame_w).max(x_min.saturating_add(1));
+        let y_max = fb.y_max.min(frame_h).max(y_min.saturating_add(1));
+        let clamped = BoundingBox::new(x_min, y_min, x_max, y_max);
         if clamped.area() >= min_face_area {
             return Some(clamped);
         }
@@ -2181,18 +2684,20 @@ pub fn resolve_face_crop_bbox(
         let pw = person_bbox.width();
         let ph = person_bbox.height();
         let inset_x = pw / 5;
-        let head_h = (ph * 35) / 100;
-        let x_min = (person_bbox.x_min + inset_x).min(frame_w.saturating_sub(1));
+        let head_h = ((ph as u64 * 35) / 100) as u32;
+        let x_min = person_bbox.x_min.saturating_add(inset_x).min(frame_w - 1);
         let x_max = person_bbox
             .x_max
             .saturating_sub(inset_x)
             .min(frame_w)
-            .max(x_min + 1);
-        let y_min = person_bbox.y_min.min(frame_h.saturating_sub(1));
-        let y_max = (person_bbox.y_min + head_h.max(1))
+            .max(x_min.saturating_add(1));
+        let y_min = person_bbox.y_min.min(frame_h - 1);
+        let y_max = person_bbox
+            .y_min
+            .saturating_add(head_h.max(1))
             .min(person_bbox.y_max)
             .min(frame_h)
-            .max(y_min + 1);
+            .max(y_min.saturating_add(1));
         let fallback_box = BoundingBox::new(x_min, y_min, x_max, y_max);
         if fallback_box.area() >= min_face_area {
             return Some(fallback_box);
@@ -2217,6 +2722,11 @@ pub struct EnrolledFaceProfile {
     pub updated_at: u64,
 }
 
+const MAX_FACE_PROFILE_NAME_LEN: usize = 128;
+const MAX_FACE_PROFILES: usize = 1024;
+const MAX_SAMPLES_PER_FACE_PROFILE: usize = 64;
+const MAX_FACE_SAMPLE_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Default)]
 pub struct FaceGallery {
     profiles: BTreeMap<String, Vec<Vec<f32>>>,
@@ -2227,6 +2737,7 @@ pub struct FaceGallery {
 pub fn sanitize_face_profile_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty()
+        || trimmed.starts_with('.')
         || trimmed.contains("..")
         || trimmed.contains('/')
         || trimmed.contains('\\')
@@ -2237,10 +2748,27 @@ pub fn sanitize_face_profile_name(raw: &str) -> Option<String> {
     let clean: String = trimmed
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == ' ')
+        .take(MAX_FACE_PROFILE_NAME_LEN)
         .collect::<String>()
         .trim()
         .to_string();
-    if clean.is_empty() { None } else { Some(clean) }
+    if clean.is_empty() || clean.eq_ignore_ascii_case("unknown") {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false)
+}
+
+fn is_real_bounded_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_file() && m.len() <= MAX_FACE_SAMPLE_BYTES)
+        .unwrap_or(false)
 }
 
 impl FaceGallery {
@@ -2265,12 +2793,12 @@ impl FaceGallery {
             return existing.clone();
         }
         if let Some(dir) = faces_dir.or(self.loaded_dir.as_deref())
-            && dir.exists()
+            && is_real_directory(dir)
             && let Ok(entries) = std::fs::read_dir(dir)
         {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_dir()
+                if is_real_directory(&path)
                     && let Some(raw_name) = path.file_name().and_then(|s| s.to_str())
                     && let Some(sanitized) = sanitize_face_profile_name(raw_name)
                     && sanitized.eq_ignore_ascii_case(clean_name)
@@ -2286,7 +2814,7 @@ impl FaceGallery {
     /// while preserving any in-memory embeddings already enrolled during the current session.
     pub fn sync_from_dir(&mut self, faces_dir: &Path) -> Result<()> {
         self.loaded_dir = Some(faces_dir.to_path_buf());
-        if !faces_dir.exists() {
+        if !is_real_directory(faces_dir) {
             return Ok(());
         }
         let entries = match std::fs::read_dir(faces_dir) {
@@ -2294,8 +2822,11 @@ impl FaceGallery {
             Err(_) => return Ok(()),
         };
         for entry in entries.flatten() {
+            if self.profiles.len() >= MAX_FACE_PROFILES {
+                break;
+            }
             let path = entry.path();
-            if !path.is_dir() {
+            if !is_real_directory(&path) {
                 continue;
             }
             let Some(raw_name) = path.file_name().and_then(|s| s.to_str()) else {
@@ -2317,7 +2848,7 @@ impl FaceGallery {
                 .flatten()
                 .map(|f| f.path())
                 .filter(|p| {
-                    p.is_file()
+                    is_real_bounded_file(p)
                         && p.extension()
                             .and_then(|ext| ext.to_str())
                             .map(|ext| {
@@ -2330,6 +2861,7 @@ impl FaceGallery {
                 })
                 .collect();
             file_paths.sort();
+            file_paths.truncate(MAX_SAMPLES_PER_FACE_PROFILE);
 
             if !file_paths.is_empty() {
                 let mut embs = Vec::new();
@@ -2361,14 +2893,21 @@ impl FaceGallery {
             return;
         }
         let canonical = self.resolve_canonical_name(&clean_name, None);
+        if !self.profiles.contains_key(&canonical) && self.profiles.len() >= MAX_FACE_PROFILES {
+            return;
+        }
         l2_normalize_embedding(&mut embedding);
         let list = self.profiles.entry(canonical.clone()).or_default();
+        let files = self.sample_files.entry(canonical).or_default();
+        if list.len() >= MAX_SAMPLES_PER_FACE_PROFILE {
+            list.remove(0);
+            if !files.is_empty() {
+                files.remove(0);
+            }
+        }
         list.push(embedding);
         let idx = list.len();
-        self.sample_files
-            .entry(canonical)
-            .or_default()
-            .push(format!("sample_{idx}.bin"));
+        files.push(format!("sample_{idx}.bin"));
     }
 
     pub fn enroll_bytes(&mut self, name: &str, image_bytes: &[u8]) -> Vec<f32> {
@@ -2385,24 +2924,58 @@ impl FaceGallery {
         ext: &str,
         image_bytes: &[u8],
     ) -> Result<(PathBuf, Vec<f32>)> {
+        if image_bytes.len() as u64 > MAX_FACE_SAMPLE_BYTES {
+            bail!("face sample exceeds maximum size of {MAX_FACE_SAMPLE_BYTES} bytes");
+        }
         let clean_name = sanitize_face_profile_name(name)
             .ok_or_else(|| anyhow!("invalid face profile name '{name}'"))?;
         let canonical_name = self.resolve_canonical_name(&clean_name, Some(faces_dir.as_ref()));
-        let person_dir = faces_dir.as_ref().join(&canonical_name);
+        if !self.profiles.contains_key(&canonical_name) && self.profiles.len() >= MAX_FACE_PROFILES
+        {
+            bail!("maximum number of enrolled face profiles ({MAX_FACE_PROFILES}) reached");
+        }
+        let base_dir = faces_dir.as_ref();
+        if let Ok(meta) = std::fs::symlink_metadata(base_dir)
+            && meta.file_type().is_symlink()
+        {
+            bail!("faces_dir must not be a symlink");
+        }
+        let person_dir = base_dir.join(&canonical_name);
+        if let Ok(meta) = std::fs::symlink_metadata(&person_dir)
+            && meta.file_type().is_symlink()
+        {
+            bail!("face profile directory must not be a symlink");
+        }
         std::fs::create_dir_all(&person_dir)?;
 
         let safe_stem: String = file_stem
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(64)
             .collect();
         let stem = if safe_stem.is_empty() {
             "sample".to_string()
         } else {
             safe_stem
         };
-        let clean_ext = ext.trim_start_matches('.');
+        let safe_ext: String = ext
+            .trim_start_matches('.')
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .take(8)
+            .collect();
+        let clean_ext = match safe_ext.as_str() {
+            "jpg" | "jpeg" | "webp" | "png" | "bin" => safe_ext,
+            _ => "jpg".to_string(),
+        };
         let filename = format!("{stem}.{clean_ext}");
         let file_path = person_dir.join(&filename);
+        if let Ok(meta) = std::fs::symlink_metadata(&file_path)
+            && meta.file_type().is_symlink()
+        {
+            bail!("target face sample file must not be a symlink");
+        }
         let payload = if image_bytes.is_empty() {
             format!("face-profile:{canonical_name}:{stem}").into_bytes()
         } else {
@@ -2411,12 +2984,22 @@ impl FaceGallery {
         std::fs::write(&file_path, &payload)?;
 
         let emb = extract_face_embedding(&payload);
-        self.profiles
-            .entry(canonical_name.clone())
-            .or_default()
-            .push(emb.clone());
+        let embs_entry = self.profiles.entry(canonical_name.clone()).or_default();
         let files_entry = self.sample_files.entry(canonical_name).or_default();
-        if !files_entry.contains(&filename) {
+        if let Some(existing_idx) = files_entry.iter().position(|f| f == &filename) {
+            if existing_idx < embs_entry.len() {
+                embs_entry[existing_idx] = emb.clone();
+            } else {
+                embs_entry.push(emb.clone());
+            }
+        } else {
+            if embs_entry.len() >= MAX_SAMPLES_PER_FACE_PROFILE {
+                embs_entry.remove(0);
+                if !files_entry.is_empty() {
+                    files_entry.remove(0);
+                }
+            }
+            embs_entry.push(emb.clone());
             files_entry.push(filename);
         }
         Ok((file_path, emb))
@@ -2444,18 +3027,18 @@ impl FaceGallery {
         }
 
         let mut removed_disk = false;
-        if let Some(dir) = faces_dir.or(self.loaded_dir.as_deref()) {
+        if let Some(dir) = faces_dir.or(self.loaded_dir.as_deref())
+            && is_real_directory(dir)
+        {
             let target = dir.join(&clean_name);
-            if target.exists() {
+            if is_real_directory(&target) {
                 std::fs::remove_dir_all(&target)?;
                 removed_disk = true;
             }
-            if dir.exists()
-                && let Ok(entries) = std::fs::read_dir(dir)
-            {
+            if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_dir()
+                    if is_real_directory(&path)
                         && let Some(raw_name) = path.file_name().and_then(|s| s.to_str())
                         && (raw_name.eq_ignore_ascii_case(&clean_name)
                             || sanitize_face_profile_name(raw_name)
@@ -2476,7 +3059,8 @@ impl FaceGallery {
         for (name, embs) in &self.profiles {
             let files = self.sample_files.get(name).cloned().unwrap_or_default();
             let updated_at = dir_opt
-                .and_then(|d| std::fs::metadata(d.join(name)).ok())
+                .and_then(|d| std::fs::symlink_metadata(d.join(name)).ok())
+                .filter(|m| m.file_type().is_dir())
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
@@ -2501,7 +3085,7 @@ impl FaceGallery {
             return None;
         }
         let norm_query = l2_normalized(query_embedding.to_vec());
-        let thresh = if similarity_threshold > 0.0 {
+        let thresh = if similarity_threshold.is_finite() && similarity_threshold > 0.0 {
             similarity_threshold
         } else {
             DEFAULT_FACE_SIMILARITY_THRESHOLD
@@ -2556,11 +3140,8 @@ pub fn nms_detections(
     mut detections: Vec<DetectionResult>,
     iou_threshold: f32,
 ) -> Vec<DetectionResult> {
-    detections.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    detections.retain(|d| d.score.is_finite());
+    detections.sort_by(|a, b| b.score.total_cmp(&a.score));
     let mut kept: Vec<DetectionResult> = Vec::with_capacity(detections.len());
     for det in detections {
         if !kept.iter().any(|k| {
@@ -2593,10 +3174,15 @@ impl OcrPlateRead {
     pub fn new(text: impl Into<String>, confidence: f32) -> Self {
         let normalized = normalize_license_plate(&text.into());
         let char_count = normalized.chars().count();
+        let safe_conf = if confidence.is_finite() {
+            confidence
+        } else {
+            0.0
+        };
         Self {
             text: normalized,
-            confidence,
-            char_confidences: vec![confidence; char_count],
+            confidence: safe_conf,
+            char_confidences: vec![safe_conf; char_count],
         }
     }
 
@@ -2606,9 +3192,14 @@ impl OcrPlateRead {
         char_confidences: Vec<f32>,
     ) -> Self {
         let normalized = normalize_license_plate(&text.into());
+        let safe_conf = if confidence.is_finite() {
+            confidence
+        } else {
+            0.0
+        };
         Self {
             text: normalized,
-            confidence,
+            confidence: safe_conf,
             char_confidences,
         }
     }
@@ -2624,11 +3215,18 @@ pub struct LprConsensusResult {
     pub votes: usize,
 }
 
+const MAX_NORMALIZED_PLATE_CHARS: usize = 32;
+const MAX_REGEX_PATTERN_CHARS: usize = 512;
+const MAX_REGEX_DEPTH: usize = 16;
+const MAX_REGEX_QUANTIFIER_REP: usize = 32;
+const MAX_ACTIVE_LPR_TRACKS: usize = 512;
+
 /// Normalizes a raw license plate string by keeping ASCII alphanumeric characters and uppercasing.
 pub fn normalize_license_plate(raw: &str) -> String {
     raw.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_uppercase())
+        .take(MAX_NORMALIZED_PLATE_CHARS)
         .collect()
 }
 
@@ -2699,12 +3297,12 @@ impl AtomMatcher {
     }
 }
 
-fn parse_regex_node(chars: &[char], pos: &mut usize) -> RegexNode {
+fn parse_regex_node(chars: &[char], pos: &mut usize, depth: usize) -> RegexNode {
     let mut branches = Vec::new();
-    branches.push(parse_regex_sequence(chars, pos));
+    branches.push(parse_regex_sequence(chars, pos, depth));
     while *pos < chars.len() && chars[*pos] == '|' {
         *pos += 1;
-        branches.push(parse_regex_sequence(chars, pos));
+        branches.push(parse_regex_sequence(chars, pos, depth));
     }
     if branches.len() == 1 {
         branches.pop().unwrap()
@@ -2713,11 +3311,11 @@ fn parse_regex_node(chars: &[char], pos: &mut usize) -> RegexNode {
     }
 }
 
-fn parse_regex_sequence(chars: &[char], pos: &mut usize) -> RegexNode {
+fn parse_regex_sequence(chars: &[char], pos: &mut usize, depth: usize) -> RegexNode {
     let mut atoms = Vec::new();
     while *pos < chars.len() {
         let ch = chars[*pos];
-        if ch == '|' || ch == ')' {
+        if ch == '|' || (depth > 0 && ch == ')') {
             break;
         }
         if ch == '^' || ch == '$' {
@@ -2725,12 +3323,12 @@ fn parse_regex_sequence(chars: &[char], pos: &mut usize) -> RegexNode {
             continue;
         }
         let matcher = match ch {
-            '(' => {
+            '(' if depth < MAX_REGEX_DEPTH => {
                 *pos += 1;
                 if *pos + 1 < chars.len() && chars[*pos] == '?' && chars[*pos + 1] == ':' {
                     *pos += 2;
                 }
-                let inner = parse_regex_node(chars, pos);
+                let inner = parse_regex_node(chars, pos, depth + 1);
                 if *pos < chars.len() && chars[*pos] == ')' {
                     *pos += 1;
                 }
@@ -2841,25 +3439,30 @@ fn parse_quantifier(chars: &[char], pos: &mut usize) -> (usize, usize) {
         }
         '*' => {
             *pos += 1;
-            (0, 32)
+            (0, MAX_REGEX_QUANTIFIER_REP)
         }
         '+' => {
             *pos += 1;
-            (1, 32)
+            (1, MAX_REGEX_QUANTIFIER_REP)
         }
         '{' => {
             let start = *pos;
             *pos += 1;
             let mut min_s = String::new();
             while *pos < chars.len() && chars[*pos].is_ascii_digit() {
-                min_s.push(chars[*pos]);
+                if min_s.len() < 4 {
+                    min_s.push(chars[*pos]);
+                }
                 *pos += 1;
             }
             if min_s.is_empty() {
                 *pos = start;
                 return (1, 1);
             }
-            let min_v = min_s.parse::<usize>().unwrap_or(1);
+            let min_v = min_s
+                .parse::<usize>()
+                .unwrap_or(1)
+                .min(MAX_REGEX_QUANTIFIER_REP);
             if *pos < chars.len() && chars[*pos] == '}' {
                 *pos += 1;
                 return (min_v, min_v);
@@ -2868,15 +3471,20 @@ fn parse_quantifier(chars: &[char], pos: &mut usize) -> (usize, usize) {
                 *pos += 1;
                 let mut max_s = String::new();
                 while *pos < chars.len() && chars[*pos].is_ascii_digit() {
-                    max_s.push(chars[*pos]);
+                    if max_s.len() < 4 {
+                        max_s.push(chars[*pos]);
+                    }
                     *pos += 1;
                 }
                 if *pos < chars.len() && chars[*pos] == '}' {
                     *pos += 1;
                     let max_v = if max_s.is_empty() {
-                        32
+                        MAX_REGEX_QUANTIFIER_REP
                     } else {
-                        max_s.parse::<usize>().unwrap_or(min_v)
+                        max_s
+                            .parse::<usize>()
+                            .unwrap_or(min_v)
+                            .min(MAX_REGEX_QUANTIFIER_REP)
                     };
                     return (min_v, max_v.max(min_v));
                 }
@@ -2901,57 +3509,64 @@ fn eval_node(node: &RegexNode, input: &[char], idx: usize) -> Vec<usize> {
             }
             ends
         }
-        RegexNode::Sequence(atoms) => eval_sequence(atoms, 0, input, idx),
+        RegexNode::Sequence(atoms) => eval_sequence(atoms, input, idx),
     }
 }
 
-fn eval_sequence(atoms: &[RegexAtom], atom_idx: usize, input: &[char], idx: usize) -> Vec<usize> {
-    if atom_idx >= atoms.len() {
-        return vec![idx];
-    }
-    let atom = &atoms[atom_idx];
-    let mut positions_after_k = vec![vec![idx]];
-    for _step in 0..atom.max_rep {
-        let prev_positions = positions_after_k.last().unwrap();
-        let mut next_positions = Vec::new();
-        for &p in prev_positions {
-            match &atom.matcher {
-                AtomMatcher::Group(g) => {
-                    for end_p in eval_node(g, input, p) {
-                        if end_p > p && !next_positions.contains(&end_p) {
-                            next_positions.push(end_p);
+/// Evaluates a sequence of `RegexAtom`s using iterative Thompson-style state-set propagation
+/// over deduplicated input positions (`0..=input.len()`), eliminating exponential backtracking (ReDoS).
+fn eval_sequence(atoms: &[RegexAtom], input: &[char], idx: usize) -> Vec<usize> {
+    let mut current_positions = vec![idx];
+    for atom in atoms {
+        if current_positions.is_empty() || atom.min_rep > input.len() {
+            return Vec::new();
+        }
+        let max_steps = atom.max_rep.min(input.len());
+        let mut next_atom_positions = Vec::new();
+        if atom.min_rep == 0 {
+            for &p in &current_positions {
+                if !next_atom_positions.contains(&p) {
+                    next_atom_positions.push(p);
+                }
+            }
+        }
+        let mut frontier = current_positions;
+        for step in 1..=max_steps {
+            let mut next_frontier = Vec::new();
+            for &p in &frontier {
+                match &atom.matcher {
+                    AtomMatcher::Group(g) => {
+                        for end_p in eval_node(g, input, p) {
+                            if end_p > p && !next_frontier.contains(&end_p) {
+                                next_frontier.push(end_p);
+                            }
                         }
                     }
-                }
-                other => {
-                    if p < input.len() && other.matches_char(input[p]) {
-                        let end_p = p + 1;
-                        if !next_positions.contains(&end_p) {
-                            next_positions.push(end_p);
+                    other => {
+                        if p < input.len() && other.matches_char(input[p]) {
+                            let end_p = p + 1;
+                            if !next_frontier.contains(&end_p) {
+                                next_frontier.push(end_p);
+                            }
                         }
                     }
                 }
             }
-        }
-        if next_positions.is_empty() {
-            break;
-        }
-        positions_after_k.push(next_positions);
-    }
-
-    let mut out = Vec::new();
-    for (rep_count, pos_list) in positions_after_k.iter().enumerate() {
-        if rep_count >= atom.min_rep && rep_count <= atom.max_rep {
-            for &p in pos_list {
-                for final_p in eval_sequence(atoms, atom_idx + 1, input, p) {
-                    if !out.contains(&final_p) {
-                        out.push(final_p);
+            if next_frontier.is_empty() {
+                break;
+            }
+            if step >= atom.min_rep {
+                for &p in &next_frontier {
+                    if !next_atom_positions.contains(&p) {
+                        next_atom_positions.push(p);
                     }
                 }
             }
+            frontier = next_frontier;
         }
+        current_positions = next_atom_positions;
     }
-    out
+    current_positions
 }
 
 /// Validates a license plate string against `format_regex` (or `DEFAULT_LPR_FORMAT_REGEX` when `None`/empty).
@@ -2965,9 +3580,12 @@ pub fn validate_license_plate(plate: &str, format_regex: Option<&str>) -> bool {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_LPR_FORMAT_REGEX);
+    if pattern.len() > MAX_REGEX_PATTERN_CHARS {
+        return false;
+    }
     let pat_chars: Vec<char> = pattern.chars().collect();
     let mut pos = 0usize;
-    let ast = parse_regex_node(&pat_chars, &mut pos);
+    let ast = parse_regex_node(&pat_chars, &mut pos, 0);
     let in_chars: Vec<char> = normalized.chars().collect();
     eval_node(&ast, &in_chars, 0).contains(&in_chars.len())
 }
@@ -2980,7 +3598,8 @@ pub fn decode_lpr_ctc_logits(
     num_classes: usize,
     blank_idx: usize,
 ) -> Option<OcrPlateRead> {
-    if timesteps == 0 || num_classes < 2 || logits.len() < timesteps * num_classes {
+    let required_len = timesteps.checked_mul(num_classes)?;
+    if timesteps == 0 || num_classes < 2 || logits.len() < required_len {
         return None;
     }
     let mut decoded_chars = String::new();
@@ -2989,23 +3608,38 @@ pub fn decode_lpr_ctc_logits(
 
     for t in 0..timesteps {
         let row = &logits[t * num_classes..(t + 1) * num_classes];
-        let mut best_c = 0usize;
+        let mut best_c = blank_idx;
         let mut best_val = f32::NEG_INFINITY;
         for (c, &v) in row.iter().enumerate() {
-            if v > best_val {
+            if v.is_finite() && v > best_val {
                 best_val = v;
                 best_c = c;
             }
         }
+        if !best_val.is_finite() {
+            prev_class = Some(blank_idx);
+            continue;
+        }
         // Convert logit to probability if outside [0.0, 1.0]
-        let prob =
-            if (0.0..=1.0).contains(&best_val) && row.iter().all(|&x| (0.0..=1.001).contains(&x)) {
-                best_val
+        let prob = if (0.0..=1.0).contains(&best_val)
+            && row
+                .iter()
+                .all(|&x| x.is_finite() && (0.0..=1.001).contains(&x))
+        {
+            best_val
+        } else {
+            let max_v = best_val;
+            let sum_exp: f32 = row
+                .iter()
+                .filter(|&&x| x.is_finite())
+                .map(|&x| (x - max_v).exp())
+                .sum();
+            if sum_exp.is_finite() && sum_exp > 0.0 {
+                (1.0 / sum_exp).clamp(0.0, 1.0)
             } else {
-                let max_v = best_val;
-                let sum_exp: f32 = row.iter().map(|&x| (x - max_v).exp()).sum();
-                if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 }
-            };
+                0.0
+            }
+        };
 
         if best_c != blank_idx && prev_class != Some(best_c) {
             let alpha_idx = if best_c > blank_idx {
@@ -3038,20 +3672,35 @@ pub fn vote_license_plate_reads(
     reads: &[OcrPlateRead],
     lpr_cfg: &LprConfig,
 ) -> Option<LprConsensusResult> {
+    let min_conf = if lpr_cfg.min_confidence.is_finite() {
+        lpr_cfg.min_confidence
+    } else {
+        0.0
+    };
     let cleaned: Vec<(Vec<char>, f32, Vec<f32>)> = reads
         .iter()
         .filter_map(|r| {
             let norm = normalize_license_plate(&r.text);
-            if norm.is_empty() || r.confidence <= 0.0 {
+            if norm.is_empty() || !r.confidence.is_finite() || r.confidence <= 0.0 {
                 return None;
             }
+            let read_conf = r.confidence.clamp(0.01, 1.0);
             let chars: Vec<char> = norm.chars().collect();
             let c_confs = if r.char_confidences.len() == chars.len() {
-                r.char_confidences.clone()
+                r.char_confidences
+                    .iter()
+                    .map(|&c| {
+                        if c.is_finite() {
+                            c.clamp(0.01, 1.0)
+                        } else {
+                            read_conf
+                        }
+                    })
+                    .collect()
             } else {
-                vec![r.confidence; chars.len()]
+                vec![read_conf; chars.len()]
             };
-            Some((chars, r.confidence, c_confs))
+            Some((chars, read_conf, c_confs))
         })
         .collect();
 
@@ -3065,18 +3714,14 @@ pub fn vote_license_plate_reads(
         *len_weights.entry(chars.len()).or_default() += *conf;
     }
     let mut ranked_lengths: Vec<(usize, f32)> = len_weights.into_iter().collect();
-    ranked_lengths.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.0.cmp(&a.0))
-    });
+    ranked_lengths.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
 
     for (target_len, _) in ranked_lengths {
         let same_len: Vec<&(Vec<char>, f32, Vec<f32>)> = cleaned
             .iter()
             .filter(|(c, _, _)| c.len() == target_len)
             .collect();
-        if same_len.is_empty() {
+        if same_len.is_empty() || target_len == 0 {
             continue;
         }
 
@@ -3087,26 +3732,26 @@ pub fn vote_license_plate_reads(
             let mut char_votes: BTreeMap<char, (f32, usize)> = BTreeMap::new();
             for (chars, read_conf, c_confs) in &same_len {
                 let ch = chars[pos];
-                let w = c_confs.get(pos).copied().unwrap_or(*read_conf).max(0.01);
+                let w = c_confs
+                    .get(pos)
+                    .copied()
+                    .unwrap_or(*read_conf)
+                    .clamp(0.01, 1.0);
                 let entry = char_votes.entry(ch).or_insert((0.0, 0));
                 entry.0 += w;
                 entry.1 += 1;
             }
             let (best_ch, (best_weight, best_count)) = char_votes
                 .into_iter()
-                .max_by(|a, b| {
-                    a.1.0
-                        .partial_cmp(&b.1.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.1.1.cmp(&b.1.1))
-                })
+                .max_by(|a, b| a.1.0.total_cmp(&b.1.0).then_with(|| a.1.1.cmp(&b.1.1)))
                 .unwrap();
             voted_plate.push(best_ch);
             pos_conf_sum += best_weight / (best_count.max(1) as f32);
         }
 
         let consolidated_conf = pos_conf_sum / (target_len as f32);
-        if consolidated_conf >= lpr_cfg.min_confidence
+        if consolidated_conf.is_finite()
+            && consolidated_conf >= min_conf
             && validate_license_plate(&voted_plate, lpr_cfg.format_regex.as_deref())
         {
             let sub_label = lookup_known_plate(&voted_plate, &lpr_cfg.known_plates);
@@ -3140,6 +3785,7 @@ pub fn vote_license_plate_strings(
 pub struct LprTrackVoter {
     max_window: usize,
     tracks: BTreeMap<String, Vec<OcrPlateRead>>,
+    track_order: std::collections::VecDeque<String>,
 }
 
 impl Default for LprTrackVoter {
@@ -3151,8 +3797,9 @@ impl Default for LprTrackVoter {
 impl LprTrackVoter {
     pub fn new(max_window: usize) -> Self {
         Self {
-            max_window: max_window.max(1),
+            max_window: max_window.clamp(1, 256),
             tracks: BTreeMap::new(),
+            track_order: std::collections::VecDeque::new(),
         }
     }
 
@@ -3162,6 +3809,24 @@ impl LprTrackVoter {
         read: OcrPlateRead,
         lpr_cfg: &LprConfig,
     ) -> Option<LprConsensusResult> {
+        if track_id.is_empty() || track_id.len() > 128 {
+            return None;
+        }
+        if !self.tracks.contains_key(track_id) {
+            while self.tracks.len() >= MAX_ACTIVE_LPR_TRACKS {
+                if let Some(oldest) = self.track_order.pop_front() {
+                    self.tracks.remove(&oldest);
+                } else if let Some(first_key) = self.tracks.keys().next().cloned() {
+                    self.tracks.remove(&first_key);
+                } else {
+                    break;
+                }
+            }
+            self.track_order.push_back(track_id.to_string());
+        } else {
+            self.track_order.retain(|k| k != track_id);
+            self.track_order.push_back(track_id.to_string());
+        }
         let entry = self.tracks.entry(track_id.to_string()).or_default();
         entry.push(read);
         if entry.len() > self.max_window {
@@ -3181,6 +3846,7 @@ impl LprTrackVoter {
     }
 
     pub fn remove_track(&mut self, track_id: &str) -> Option<Vec<OcrPlateRead>> {
+        self.track_order.retain(|k| k != track_id);
         self.tracks.remove(track_id)
     }
 }
@@ -4508,5 +5174,712 @@ detectors:
         let solid_black_rgb = vec![0u8; 112 * 112 * 3];
         let emb_black = extract_face_embedding(&solid_black_rgb);
         assert!((cosine_similarity(&emb_black, &emb_black) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn regression_openvino_ffi_drop_order_and_early_error_cleanup() {
+        static FREE_LOG: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        static FAIL_OUT_TENSOR: AtomicU64 = AtomicU64::new(0);
+        static MOCK_IN_BUF: Mutex<[u8; 64 * 64 * 3]> = Mutex::new([0u8; 64 * 64 * 3]);
+        static MOCK_OUT_BUF: [f32; 7] = [0.0, 1.0, 0.92, 0.1, 0.1, 0.5, 0.8];
+
+        unsafe extern "C" fn mock_core_create(out: *mut *mut c_void) -> c_int {
+            unsafe {
+                *out = 0x11usize as *mut c_void;
+            }
+            0
+        }
+        unsafe extern "C" fn mock_compile_model(
+            _core: *mut c_void,
+            _model: *const c_char,
+            _dev: *const c_char,
+            _nargs: usize,
+            out: *mut *mut c_void,
+            _k: *const c_char,
+            _v: *const c_char,
+        ) -> c_int {
+            unsafe {
+                *out = 0x12usize as *mut c_void;
+            }
+            0
+        }
+        unsafe extern "C" fn mock_create_infer_req(
+            _cm: *mut c_void,
+            out: *mut *mut c_void,
+        ) -> c_int {
+            unsafe {
+                *out = 0x13usize as *mut c_void;
+            }
+            0
+        }
+        unsafe extern "C" fn mock_get_in_tensor(_req: *mut c_void, out: *mut *mut c_void) -> c_int {
+            unsafe {
+                *out = 0x14usize as *mut c_void;
+            }
+            0
+        }
+        unsafe extern "C" fn mock_get_out_tensor(
+            _req: *mut c_void,
+            out: *mut *mut c_void,
+        ) -> c_int {
+            if FAIL_OUT_TENSOR.load(Ordering::SeqCst) != 0 {
+                return -1;
+            }
+            unsafe {
+                *out = 0x15usize as *mut c_void;
+            }
+            0
+        }
+        unsafe extern "C" fn mock_infer(_req: *mut c_void) -> c_int {
+            0
+        }
+        unsafe extern "C" fn mock_tensor_data(t: *mut c_void, out: *mut *mut c_void) -> c_int {
+            unsafe {
+                if t as usize == 0x14 {
+                    *out = MOCK_IN_BUF.lock().unwrap().as_mut_ptr() as *mut c_void;
+                } else {
+                    *out = MOCK_OUT_BUF.as_ptr() as *mut c_void;
+                }
+            }
+            0
+        }
+        unsafe extern "C" fn mock_tensor_byte_size(t: *mut c_void, out: *mut usize) -> c_int {
+            unsafe {
+                if t as usize == 0x14 {
+                    *out = 64 * 64 * 3;
+                } else {
+                    *out = std::mem::size_of_val(&MOCK_OUT_BUF);
+                }
+            }
+            0
+        }
+        unsafe extern "C" fn mock_free(ptr: *mut c_void) {
+            FREE_LOG.lock().unwrap().push(ptr as usize);
+        }
+
+        let fns = OvCFunctionTable {
+            core_create: mock_core_create,
+            compile_model: unsafe {
+                std::mem::transmute::<*const c_void, OvCoreCompileModelFn>(
+                    mock_compile_model as *const c_void,
+                )
+            },
+            create_infer_req: mock_create_infer_req,
+            get_in_tensor: mock_get_in_tensor,
+            get_out_tensor: mock_get_out_tensor,
+            infer_fn: mock_infer,
+            tensor_data: mock_tensor_data,
+            tensor_byte_size: mock_tensor_byte_size,
+            tensor_free: Some(mock_free),
+            infer_req_free: Some(mock_free),
+            compiled_model_free: Some(mock_free),
+            core_free: Some(mock_free),
+        };
+
+        // 1. Early error when get_out_tensor fails must free input_tensor (0x14) -> infer_req (0x13) -> compiled_model (0x12) -> core (0x11)
+        FREE_LOG.lock().unwrap().clear();
+        FAIL_OUT_TENSOR.store(1, Ordering::SeqCst);
+        let err_res = unsafe {
+            AiDetectorEngine::init_ov_context_from_fns(
+                std::ptr::null_mut(),
+                fns,
+                Path::new("/tmp/m.xml"),
+                "CPU",
+            )
+        };
+        assert!(err_res.is_err());
+        assert_eq!(*FREE_LOG.lock().unwrap(), vec![0x14, 0x13, 0x12, 0x11]);
+
+        // 2. Successful init + drop frees output_tensor (0x15) -> input_tensor (0x14) -> infer_req (0x13) -> compiled_model (0x12) -> core (0x11)
+        FREE_LOG.lock().unwrap().clear();
+        FAIL_OUT_TENSOR.store(0, Ordering::SeqCst);
+        let (ov_ctx, dev) = unsafe {
+            AiDetectorEngine::init_ov_context_from_fns(
+                std::ptr::null_mut(),
+                fns,
+                Path::new("/tmp/m.xml"),
+                "CPU",
+            )
+            .unwrap()
+        };
+        assert_eq!(dev, "CPU");
+        drop(ov_ctx);
+        assert_eq!(
+            *FREE_LOG.lock().unwrap(),
+            vec![0x15, 0x14, 0x13, 0x12, 0x11]
+        );
+    }
+
+    #[test]
+    fn regression_ort_ffi_early_error_cleanup_allocator_free_and_negative_i64_dims() {
+        static FREE_EVENTS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        static ALLOC_FREED: AtomicU64 = AtomicU64::new(0);
+        static FAIL_CPU_MEM: AtomicU64 = AtomicU64::new(0);
+        static NEGATIVE_DIM: AtomicU64 = AtomicU64::new(0);
+        static MOCK_OUT_TENSOR: [f32; 7] = [0.0, 1.0, 0.91, 0.1, 0.1, 0.5, 0.8];
+
+        unsafe extern "C" fn mock_rel_env(_p: *mut c_void) {
+            FREE_EVENTS.lock().unwrap().push("env");
+        }
+        unsafe extern "C" fn mock_rel_opts(_p: *mut c_void) {
+            FREE_EVENTS.lock().unwrap().push("opts");
+        }
+        unsafe extern "C" fn mock_rel_sess(_p: *mut c_void) {
+            FREE_EVENTS.lock().unwrap().push("session");
+        }
+        unsafe extern "C" fn mock_rel_mem(_p: *mut c_void) {
+            FREE_EVENTS.lock().unwrap().push("mem_info");
+        }
+        unsafe extern "C" fn mock_rel_noop(_p: *mut c_void) {}
+        unsafe extern "C" fn mock_alloc_free(_alloc: *mut c_void, ptr: *mut c_void) -> *mut c_void {
+            if !ptr.is_null() {
+                ALLOC_FREED.fetch_add(1, Ordering::SeqCst);
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_create_env(
+            _l: c_int,
+            _id: *const c_char,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x101usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_create_opts(out: *mut *mut c_void) -> *mut c_void {
+            unsafe {
+                *out = 0x102usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_set_i32(_o: *mut c_void, _v: c_int) -> *mut c_void {
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_create_session(
+            _e: *const c_void,
+            _m: *const c_char,
+            _o: *const c_void,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x103usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_alloc(out: *mut *mut c_void) -> *mut c_void {
+            unsafe {
+                *out = 0x104usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_name(
+            _s: *const c_void,
+            _i: usize,
+            _a: *mut c_void,
+            out: *mut *mut c_char,
+        ) -> *mut c_void {
+            unsafe {
+                *out = c"tensor0".as_ptr() as *mut c_char;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_in_type(
+            _s: *const c_void,
+            _i: usize,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = std::ptr::null_mut();
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_cast_ti(
+            _ti: *const c_void,
+            out: *mut *const c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = std::ptr::null();
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_elem_ty(
+            _info: *const c_void,
+            out: *mut c_int,
+        ) -> *mut c_void {
+            unsafe {
+                *out = ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_create_cpu_mem(
+            _a: c_int,
+            _m: c_int,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            if FAIL_CPU_MEM.load(Ordering::SeqCst) != 0 {
+                return 0x999usize as *mut c_void;
+            }
+            unsafe {
+                *out = 0x105usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_create_tensor(
+            _mem: *const c_void,
+            _data: *mut c_void,
+            _len: usize,
+            _shape: *const i64,
+            _slen: usize,
+            _ty: c_int,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x201usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_run(
+            _sess: *mut c_void,
+            _ro: *const c_void,
+            _in_n: *const *const c_char,
+            _in_v: *const *const c_void,
+            _in_l: usize,
+            _out_n: *const *const c_char,
+            _out_l: usize,
+            out_v: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out_v = 0x202usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_mut_data(
+            _val: *mut c_void,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = MOCK_OUT_TENSOR.as_ptr() as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_type_shape(
+            _val: *const c_void,
+            out: *mut *mut c_void,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 0x203usize as *mut c_void;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_dims_count(
+            _info: *const c_void,
+            out: *mut usize,
+        ) -> *mut c_void {
+            unsafe {
+                *out = 2;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_dims(
+            _info: *const c_void,
+            out: *mut i64,
+            _len: usize,
+        ) -> *mut c_void {
+            unsafe {
+                *out.add(0) = if NEGATIVE_DIM.load(Ordering::SeqCst) != 0 {
+                    -1
+                } else {
+                    1
+                };
+                *out.add(1) = 7;
+            }
+            std::ptr::null_mut()
+        }
+        unsafe extern "C" fn mock_get_elem_count(
+            _info: *const c_void,
+            out: *mut usize,
+        ) -> *mut c_void {
+            unsafe {
+                *out = if NEGATIVE_DIM.load(Ordering::SeqCst) != 0 {
+                    (-7isize) as usize
+                } else {
+                    7
+                };
+            }
+            std::ptr::null_mut()
+        }
+
+        // Null vtable is rejected without UB
+        assert!(unsafe {
+            AiDetectorEngine::init_ort_session_from_vtable(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                Path::new("/tmp/m.onnx"),
+                "CPU",
+                64,
+                64,
+            )
+            .is_err()
+        });
+
+        let mut vtable: [*const c_void; 101] = [std::ptr::null(); 101];
+        vtable[3] = mock_create_env as *const c_void;
+        vtable[7] = mock_create_session as *const c_void;
+        vtable[9] = mock_run as *const c_void;
+        vtable[10] = mock_create_opts as *const c_void;
+        vtable[23] = mock_set_i32 as *const c_void;
+        vtable[24] = mock_set_i32 as *const c_void;
+        vtable[25] = mock_set_i32 as *const c_void;
+        vtable[33] = mock_get_in_type as *const c_void;
+        vtable[36] = mock_get_name as *const c_void;
+        vtable[37] = mock_get_name as *const c_void;
+        vtable[49] = mock_create_tensor as *const c_void;
+        vtable[51] = mock_get_mut_data as *const c_void;
+        vtable[55] = mock_cast_ti as *const c_void;
+        vtable[60] = mock_get_elem_ty as *const c_void;
+        vtable[61] = mock_get_dims_count as *const c_void;
+        vtable[62] = mock_get_dims as *const c_void;
+        vtable[64] = mock_get_elem_count as *const c_void;
+        vtable[65] = mock_get_type_shape as *const c_void;
+        vtable[69] = mock_create_cpu_mem as *const c_void;
+        vtable[76] = mock_alloc_free as *const c_void;
+        vtable[78] = mock_get_alloc as *const c_void;
+        vtable[92] = mock_rel_env as *const c_void;
+        vtable[93] = mock_rel_noop as *const c_void;
+        vtable[94] = mock_rel_mem as *const c_void;
+        vtable[95] = mock_rel_sess as *const c_void;
+        vtable[96] = mock_rel_noop as *const c_void;
+        vtable[98] = mock_rel_noop as *const c_void;
+        vtable[99] = mock_rel_noop as *const c_void;
+        vtable[100] = mock_rel_opts as *const c_void;
+
+        // Early error in CreateCpuMemoryInfo frees session -> opts -> env and frees both allocator names
+        FREE_EVENTS.lock().unwrap().clear();
+        ALLOC_FREED.store(0, Ordering::SeqCst);
+        FAIL_CPU_MEM.store(1, Ordering::SeqCst);
+        let early_err = unsafe {
+            AiDetectorEngine::init_ort_session_from_vtable(
+                std::ptr::null_mut(),
+                vtable.as_ptr(),
+                Path::new("/tmp/m.onnx"),
+                "CPU",
+                64,
+                64,
+            )
+        };
+        assert!(early_err.is_err());
+        assert_eq!(ALLOC_FREED.load(Ordering::SeqCst), 2);
+        assert_eq!(*FREE_EVENTS.lock().unwrap(), vec!["session", "opts", "env"]);
+
+        // Negative i64 dimension in detect_region is safely rejected without OOB slice creation
+        FAIL_CPU_MEM.store(0, Ordering::SeqCst);
+        NEGATIVE_DIM.store(1, Ordering::SeqCst);
+        let (ort_ctx, _) = unsafe {
+            AiDetectorEngine::init_ort_session_from_vtable(
+                std::ptr::null_mut(),
+                vtable.as_ptr(),
+                Path::new("/tmp/m.onnx"),
+                "CPU",
+                64,
+                64,
+            )
+            .unwrap()
+        };
+        let cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/c.yml")).unwrap();
+        let engine = AiDetectorEngine::new(&cfg);
+        {
+            let mut g = engine.inner.lock().unwrap();
+            g.model_w = 64;
+            g.model_h = 64;
+            g.backend = Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx));
+        }
+        let crop = vec![0u8; 64 * 64 * 3];
+        let region = BoundingBox::new(0, 0, 640, 480);
+        let dets_neg = engine.detect_region(&crop, region, 1280, 720, 0.5);
+        assert!(dets_neg.is_empty());
+
+        NEGATIVE_DIM.store(0, Ordering::SeqCst);
+        let dets_ok = engine.detect_region(&crop, region, 1280, 720, 0.5);
+        assert_eq!(dets_ok.len(), 1);
+    }
+
+    #[test]
+    fn regression_zero_frame_dims_nan_inf_scores_and_face_crop_clamping() {
+        let mut cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/c.yml")).unwrap();
+        cfg.model.model_type = "yolo-generic".to_string();
+        cfg.model.width = 320;
+        cfg.model.height = 320;
+        let engine = AiDetectorEngine::new(&cfg);
+        let region = BoundingBox::new(0, 0, 320, 320);
+
+        // 1. frame_w == 0 or frame_h == 0 must not underflow/panic at (frame_w - 1)
+        let ssd_valid = [0.0f32, 1.0, 0.95, 0.1, 0.1, 0.8, 0.8];
+        assert!(
+            engine
+                .parse_raw_output_slice(&ssd_valid, region, 0, 720, 0.5)
+                .is_empty()
+        );
+        assert!(
+            engine
+                .parse_raw_output_slice(&ssd_valid, region, 1280, 0, 0.5)
+                .is_empty()
+        );
+
+        // 2. NaN and +Inf scores, class IDs, and bbox widths must be rejected across SSD & YOLO
+        let ssd_nan = [
+            0.0f32,
+            1.0,
+            f32::NAN,
+            0.1,
+            0.1,
+            0.8,
+            0.8,
+            0.0,
+            f32::NAN,
+            0.95,
+            0.1,
+            0.1,
+            0.8,
+            0.8,
+            0.0,
+            1.0,
+            f32::INFINITY,
+            0.1,
+            0.1,
+            0.8,
+            0.8,
+        ];
+        assert!(
+            engine
+                .parse_raw_output_slice(&ssd_nan, region, 1280, 720, 0.5)
+                .is_empty()
+        );
+
+        let yolo6_bad = [
+            10.0f32,
+            10.0,
+            100.0,
+            100.0,
+            f32::NAN,
+            0.0,
+            10.0,
+            10.0,
+            f32::INFINITY,
+            100.0,
+            0.95,
+            0.0,
+            10.0,
+            10.0,
+            100.0,
+            100.0,
+            0.95,
+            f32::NAN,
+        ];
+        assert!(
+            engine
+                .parse_raw_output_slice(&yolo6_bad, region, 1280, 720, 0.5)
+                .is_empty()
+        );
+
+        // Transposed YOLO with bw = INFINITY must not clamp to full-frame [0, 0, 1, 1] box
+        let mut yolo84_inf = vec![0.0f32; 84 * 10];
+        yolo84_inf[0] = 160.0;
+        yolo84_inf[10] = 160.0;
+        yolo84_inf[20] = f32::INFINITY;
+        yolo84_inf[30] = f32::INFINITY;
+        yolo84_inf[40] = 0.95;
+        assert!(
+            engine
+                .parse_raw_output_slice(&yolo84_inf, region, 1280, 720, 0.5)
+                .is_empty()
+        );
+
+        // nms_detections drops non-finite scores without panicking
+        let nms_res = nms_detections(
+            vec![
+                DetectionResult {
+                    label: "person".to_string(),
+                    score: f32::NAN,
+                    bbox: BoundingBox::new(10, 10, 100, 100),
+                    region,
+                },
+                DetectionResult {
+                    label: "person".to_string(),
+                    score: 0.85,
+                    bbox: BoundingBox::new(10, 10, 100, 100),
+                    region,
+                },
+            ],
+            0.5,
+        );
+        assert_eq!(nms_res.len(), 1);
+        assert!((nms_res[0].score - 0.85).abs() < 1e-5);
+
+        // 3. resolve_face_crop_bbox with 0 frame dims or out-of-frame / u32::MAX coordinates
+        let person = BoundingBox::new(100, 100, 300, 400);
+        assert!(resolve_face_crop_bbox(person, None, 0, 720, 100).is_none());
+        let oob_face = BoundingBox::new(u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+        if let Some(clamped) = resolve_face_crop_bbox(person, Some(oob_face), 1280, 720, 1) {
+            assert!(clamped.x_max <= 1280 && clamped.y_max <= 720);
+        }
+    }
+
+    #[test]
+    fn regression_face_gallery_ext_traversal_symlink_dotdir_and_bounded_memory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr-face-sec-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let faces_dir = tmp.join("faces");
+        let outside_dir = tmp.join("outside");
+        std::fs::create_dir_all(&faces_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        // 1. Dot-directories (.git, .hidden) must be rejected by sanitize_face_profile_name and never deleted
+        assert_eq!(sanitize_face_profile_name(".git"), None);
+        assert_eq!(sanitize_face_profile_name(".hidden"), None);
+        let dot_git = faces_dir.join(".git");
+        std::fs::create_dir_all(&dot_git).unwrap();
+        std::fs::write(dot_git.join("HEAD"), b"ref: refs/heads/dev").unwrap();
+
+        // 2. Malicious extension traversal in enroll_to_dir must be stripped to a safe extension inside person_dir
+        let mut gallery = FaceGallery::new();
+        let (saved_path, _) = gallery
+            .enroll_to_dir(
+                &faces_dir,
+                "Alice",
+                "crop1",
+                "/../../../outside/pwned.jpg",
+                b"img1",
+            )
+            .unwrap();
+        assert!(saved_path.starts_with(faces_dir.join("Alice")));
+        assert!(!outside_dir.join("pwned.jpg").exists());
+
+        // Overwriting the same stem updates the existing sample slot rather than growing unboundedly
+        let _ = gallery
+            .enroll_to_dir(&faces_dir, "Alice", "crop1", "jpg", b"img2")
+            .unwrap();
+        let profiles = gallery.list_profiles(Some(&faces_dir));
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].sample_count, 1);
+
+        // Removing "git" must NOT delete `.git`
+        let _ = gallery.remove_profile(Some(&faces_dir), "git").unwrap();
+        assert!(dot_git.join("HEAD").exists());
+
+        // 3. Symlinked profile directory inside faces_dir must not be followed on sync or deleted on remove_profile
+        #[cfg(unix)]
+        {
+            let target_file = outside_dir.join("keep.txt");
+            std::fs::write(&target_file, b"keep").unwrap();
+            let symlink_dir = faces_dir.join("Bob");
+            std::os::unix::fs::symlink(&outside_dir, &symlink_dir).unwrap();
+
+            gallery.sync_from_dir(&faces_dir).unwrap();
+            assert!(
+                gallery
+                    .list_profiles(Some(&faces_dir))
+                    .iter()
+                    .all(|p| p.name != "Bob")
+            );
+            assert!(
+                gallery
+                    .enroll_to_dir(&faces_dir, "Bob", "s1", "jpg", b"x")
+                    .is_err()
+            );
+            let _ = gallery.remove_profile(Some(&faces_dir), "Bob").unwrap();
+            assert!(
+                target_file.exists(),
+                "remove_profile must never follow symlink to delete outside_dir contents"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn regression_lpr_redos_nested_quantifiers_nan_voting_and_poisoned_mutex() {
+        // 1. Pathological nested/chained quantifier ReDoS patterns complete in milliseconds
+        let t0 = Instant::now();
+        for pat in [
+            r"^((((((([A-Z0-9]*)*)*)*)*)*)*)*Z$",
+            r"^([A-Z0-9]+)+([A-Z0-9]+)+([A-Z0-9]+)+Z$",
+            r"^(.?){0,32}(.?){0,32}(.?){0,32}(.?){0,32}(.?){0,32}Z$",
+            r"^A{1,9999999999}Z$",
+        ] {
+            assert!(!validate_license_plate("ABC1D23456", Some(pat)));
+        }
+        assert!(
+            t0.elapsed().as_millis() < 200,
+            "LPR regex evaluation must be immune to exponential backtracking"
+        );
+
+        // Deeply nested parentheses beyond MAX_REGEX_DEPTH do not overflow stack
+        let deep_parens = format!("^{}ABC1D23{}$", "(".repeat(64), ")".repeat(64));
+        let _ = validate_license_plate("ABC1D23", Some(&deep_parens));
+
+        // 2. L2 normalization and cosine similarity handle NaN, Infinity, and f32::MAX without producing NaN
+        let mut extreme = vec![f32::MAX, f32::MAX, f32::NAN, f32::INFINITY];
+        l2_normalize_embedding(&mut extreme);
+        assert!(extreme.iter().all(|v| v.is_finite()));
+
+        let max_vec = vec![f32::MAX; 16];
+        let sim_max = cosine_similarity(&max_vec, &max_vec);
+        assert!((sim_max - 1.0).abs() < 1e-5);
+        assert_eq!(cosine_similarity(&[f32::NAN, 1.0], &[1.0, 1.0]), 0.0);
+        assert_eq!(cosine_similarity(&[f32::INFINITY, 1.0], &[1.0, 1.0]), 0.0);
+
+        // 3. decode_lpr_ctc_logits guards against timesteps * num_classes overflow and NaN/-Inf rows
+        assert!(decode_lpr_ctc_logits(&[1.0; 16], usize::MAX / 2 + 1, 4, 0).is_none());
+        let nan_logits = vec![f32::NAN; 2 * 37];
+        assert!(decode_lpr_ctc_logits(&nan_logits, 2, 37, 36).is_none());
+
+        // 4. vote_license_plate_reads rejects NaN confidences and clamps +Inf confidences
+        let lpr_cfg = LprConfig {
+            min_confidence: 0.75,
+            ..Default::default()
+        };
+        let reads = [
+            OcrPlateRead {
+                text: "BAD9999".to_string(),
+                confidence: f32::NAN,
+                char_confidences: vec![f32::NAN; 7],
+            },
+            OcrPlateRead::new("ABC1D23", 0.90),
+        ];
+        let voted = vote_license_plate_reads(&reads, &lpr_cfg).unwrap();
+        assert_eq!(voted.plate, "ABC1D23");
+        assert!(voted.confidence.is_finite() && voted.confidence <= 1.0);
+
+        // 5. LprTrackVoter bounds active tracks at MAX_ACTIVE_LPR_TRACKS
+        let mut voter = LprTrackVoter::new(4);
+        for i in 0..(MAX_ACTIVE_LPR_TRACKS + 20) {
+            let _ = voter.record_read(
+                &format!("trk_{i}"),
+                OcrPlateRead::new("ABC1D23", 0.90),
+                &lpr_cfg,
+            );
+        }
+        assert!(voter.tracks.len() <= MAX_ACTIVE_LPR_TRACKS);
+        assert!(voter.consensus_for_track("trk_0", &lpr_cfg).is_none());
+
+        // 6. Poisoned mutex recovery on AiDetectorEngine does not panic
+        let cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/p.yml")).unwrap();
+        let engine = Arc::new(AiDetectorEngine::new(&cfg));
+        let engine_clone = engine.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = engine_clone.inner.lock().unwrap();
+            panic!("intentional poison test");
+        })
+        .join();
+        assert_eq!(engine.model_dimensions().0, 300);
     }
 }
