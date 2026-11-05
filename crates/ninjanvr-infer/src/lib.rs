@@ -3496,12 +3496,21 @@ fn parse_quantifier(chars: &[char], pos: &mut usize) -> (usize, usize) {
     }
 }
 
-fn eval_node(node: &RegexNode, input: &[char], idx: usize) -> Vec<usize> {
-    match node {
+fn eval_node(
+    node: &RegexNode,
+    input: &[char],
+    idx: usize,
+    memo: &mut BTreeMap<(usize, usize), Vec<usize>>,
+) -> Vec<usize> {
+    let key = (node as *const RegexNode as usize, idx);
+    if let Some(cached) = memo.get(&key) {
+        return cached.clone();
+    }
+    let ends = match node {
         RegexNode::Alternation(branches) => {
             let mut ends = Vec::new();
             for b in branches {
-                for end_idx in eval_node(b, input, idx) {
+                for end_idx in eval_node(b, input, idx, memo) {
                     if !ends.contains(&end_idx) {
                         ends.push(end_idx);
                     }
@@ -3509,13 +3518,21 @@ fn eval_node(node: &RegexNode, input: &[char], idx: usize) -> Vec<usize> {
             }
             ends
         }
-        RegexNode::Sequence(atoms) => eval_sequence(atoms, input, idx),
-    }
+        RegexNode::Sequence(atoms) => eval_sequence(atoms, input, idx, memo),
+    };
+    memo.insert(key, ends.clone());
+    ends
 }
 
 /// Evaluates a sequence of `RegexAtom`s using iterative Thompson-style state-set propagation
-/// over deduplicated input positions (`0..=input.len()`), eliminating exponential backtracking (ReDoS).
-fn eval_sequence(atoms: &[RegexAtom], input: &[char], idx: usize) -> Vec<usize> {
+/// over deduplicated input positions (`0..=input.len()`) with `(node, idx)` memoization,
+/// eliminating exponential backtracking and tree re-evaluation (ReDoS).
+fn eval_sequence(
+    atoms: &[RegexAtom],
+    input: &[char],
+    idx: usize,
+    memo: &mut BTreeMap<(usize, usize), Vec<usize>>,
+) -> Vec<usize> {
     let mut current_positions = vec![idx];
     for atom in atoms {
         if current_positions.is_empty() || atom.min_rep > input.len() {
@@ -3536,7 +3553,7 @@ fn eval_sequence(atoms: &[RegexAtom], input: &[char], idx: usize) -> Vec<usize> 
             for &p in &frontier {
                 match &atom.matcher {
                     AtomMatcher::Group(g) => {
-                        for end_p in eval_node(g, input, p) {
+                        for end_p in eval_node(g, input, p, memo) {
                             if end_p > p && !next_frontier.contains(&end_p) {
                                 next_frontier.push(end_p);
                             }
@@ -3587,7 +3604,8 @@ pub fn validate_license_plate(plate: &str, format_regex: Option<&str>) -> bool {
     let mut pos = 0usize;
     let ast = parse_regex_node(&pat_chars, &mut pos, 0);
     let in_chars: Vec<char> = normalized.chars().collect();
-    eval_node(&ast, &in_chars, 0).contains(&in_chars.len())
+    let mut memo = BTreeMap::new();
+    eval_node(&ast, &in_chars, 0, &mut memo).contains(&in_chars.len())
 }
 
 /// Decodes a `[timesteps, num_classes]` CTC output probability/logit tensor using greedy CTC collapse
@@ -5813,8 +5831,11 @@ detectors:
             r"^([A-Z0-9]+)+([A-Z0-9]+)+([A-Z0-9]+)+Z$",
             r"^(.?){0,32}(.?){0,32}(.?){0,32}(.?){0,32}(.?){0,32}Z$",
             r"^A{1,9999999999}Z$",
+            r"^((((((((((((((((A+)+)+)+)+)+)+)+)+)+)+)+)+)+)+)+)Z$",
+            r"^(((((((((((((([A-Z0-9]+|[A-Z0-9]+)+)+)+)+)+)+)+)+)+)+)+)+)+)Z$",
         ] {
             assert!(!validate_license_plate("ABC1D23456", Some(pat)));
+            assert!(!validate_license_plate("AAAAAAAAAA", Some(pat)));
         }
         assert!(
             t0.elapsed().as_millis() < 200,
