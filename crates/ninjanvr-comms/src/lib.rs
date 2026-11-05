@@ -85,6 +85,61 @@ impl Default for CommsHub {
     }
 }
 
+fn is_valid_mqtt_publish_topic(topic: &str) -> bool {
+    let trimmed = topic.trim_matches('/');
+    !trimmed.is_empty()
+        && trimmed.len() <= 256
+        && !trimmed
+            .chars()
+            .any(|c| c == '+' || c == '#' || c.is_control())
+        && !trimmed.split('/').any(|seg| seg.is_empty() || seg == "..")
+}
+
+fn is_valid_topic_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg.len() <= 128
+        && seg != "."
+        && seg != ".."
+        && !seg.chars().any(|c| {
+            c == '/' || c == '+' || c == '#' || c == '\\' || c.is_control() || c.is_whitespace()
+        })
+}
+
+fn is_valid_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn sanitize_mqtt_prefix(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .trim_matches('/')
+        .chars()
+        .filter(|c| !c.is_control() && *c != '+' && *c != '#')
+        .collect();
+    if cleaned.is_empty() {
+        "ninjanvr".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn sanitize_mqtt_client_id(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() && !c.is_whitespace())
+        .collect();
+    if cleaned.is_empty() {
+        "ninjanvr".to_string()
+    } else {
+        cleaned
+    }
+}
+
 impl CommsHub {
     pub fn new() -> Self {
         let (ws_tx, _) = broadcast::channel(512);
@@ -123,6 +178,9 @@ impl CommsHub {
     }
 
     pub fn publish_ws_only(&self, topic: &str, payload: impl Into<String>) {
+        if !is_valid_mqtt_publish_topic(topic) {
+            return;
+        }
         let msg = json!({
             "topic": topic,
             "payload": payload.into(),
@@ -133,6 +191,9 @@ impl CommsHub {
     }
 
     pub fn publish_topic(&self, topic: &str, payload: impl Into<String>) {
+        if !is_valid_mqtt_publish_topic(topic) {
+            return;
+        }
         let payload_str = payload.into();
         self.publish_ws_only(topic, payload_str.clone());
         let _ = self
@@ -147,6 +208,9 @@ impl CommsHub {
     }
 
     pub fn publish_mqtt_bytes(&self, topic: &str, bytes: Vec<u8>, retain: bool) {
+        if !is_valid_mqtt_publish_topic(topic) {
+            return;
+        }
         let _ = self.mqtt_tx.send((topic.to_string(), bytes, retain));
     }
 
@@ -154,11 +218,14 @@ impl CommsHub {
     /// and `<camera>/status` (`"online"` / `"offline"`) over MQTT and WebSocket when changed.
     /// Returns `true` if the state transitioned.
     pub fn set_camera_availability(&self, camera: &str, online: bool) -> bool {
+        if !is_valid_topic_segment(camera) {
+            return false;
+        }
         let (transitioned, snapshot_str) = {
             let mut map = self
                 .camera_states
                 .write()
-                .expect("camera_states lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             let entry = map
                 .entry(camera.to_string())
                 .or_insert_with(default_camera_activity_entry);
@@ -182,11 +249,14 @@ impl CommsHub {
     /// Updates per-camera tamper / blind-feed state and publishes `<camera>/tamper` (`"ON"` / `"OFF"`)
     /// over MQTT and WebSocket when changed. Returns `true` if the state transitioned.
     pub fn set_camera_tamper(&self, camera: &str, tampered: bool) -> bool {
+        if !is_valid_topic_segment(camera) {
+            return false;
+        }
         let (transitioned, snapshot_str) = {
             let mut map = self
                 .camera_states
                 .write()
-                .expect("camera_states lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             let entry = map
                 .entry(camera.to_string())
                 .or_insert_with(default_camera_activity_entry);
@@ -214,11 +284,14 @@ impl CommsHub {
     /// Publishes `<camera>/audio/dbfs` and `<camera>/audio/active` (`"ON"` / `"OFF"`) over MQTT and WebSocket,
     /// and updates `audio_dbfs` and `audio_active` inside the `camera_activity` snapshot.
     pub fn publish_audio_activity(&self, camera: &str, dbfs: i64, active: bool) {
+        if !is_valid_topic_segment(camera) {
+            return;
+        }
         let snapshot_str = {
             let mut map = self
                 .camera_states
                 .write()
-                .expect("camera_states lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             let entry = map
                 .entry(camera.to_string())
                 .or_insert_with(default_camera_activity_entry);
@@ -239,11 +312,14 @@ impl CommsHub {
     /// Publishes `<camera>/state/<roi_name>` over MQTT (`<prefix>/<camera>/state/<roi_name>`) and `/ws`,
     /// and updates `camera_activity.<camera>.states.<roi_name>` in the real-time activity snapshot.
     pub fn publish_roi_state(&self, camera: &str, roi_name: &str, state: &str) {
+        if !is_valid_topic_segment(camera) || !is_valid_topic_segment(roi_name) {
+            return;
+        }
         let snapshot_str = {
             let mut map = self
                 .camera_states
                 .write()
-                .expect("camera_states lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             let entry = map
                 .entry(camera.to_string())
                 .or_insert_with(default_camera_activity_entry);
@@ -264,10 +340,7 @@ impl CommsHub {
 
     /// Returns a cloned map of the current ROI states (`roi_name -> state`) for `camera`.
     pub fn get_camera_roi_states(&self, camera: &str) -> BTreeMap<String, String> {
-        let map = self
-            .camera_states
-            .read()
-            .expect("camera_states lock poisoned");
+        let map = self.camera_states.read().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = map.get(camera) else {
             return BTreeMap::new();
         };
@@ -285,10 +358,7 @@ impl CommsHub {
 
     /// Returns a cloned JSON snapshot of all current camera activity states.
     pub fn get_camera_activity_snapshot(&self) -> Value {
-        let map = self
-            .camera_states
-            .read()
-            .expect("camera_states lock poisoned");
+        let map = self.camera_states.read().unwrap_or_else(|e| e.into_inner());
         serde_json::to_value(&*map).unwrap_or_else(|_| json!({}))
     }
 
@@ -296,7 +366,7 @@ impl CommsHub {
     pub fn get_active_profile(&self) -> String {
         self.active_profile
             .read()
-            .expect("active_profile lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 
@@ -306,7 +376,7 @@ impl CommsHub {
         let mut map = self
             .camera_states
             .write()
-            .expect("camera_states lock poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         for (cam_name, cam_cfg) in &cfg.cameras {
             let entry = map
                 .entry(cam_name.clone())
@@ -346,10 +416,7 @@ impl CommsHub {
 
     /// Returns the live runtime toggle flags (`enabled`, `detect`, `record`, `alerts`, `snapshots`) for `camera`.
     pub fn get_camera_flags(&self, camera: &str) -> CameraRuntimeFlags {
-        let map = self
-            .camera_states
-            .read()
-            .expect("camera_states lock poisoned");
+        let map = self.camera_states.read().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = map.get(camera) else {
             return CameraRuntimeFlags::default();
         };
@@ -415,14 +482,20 @@ impl CommsHub {
                 } else {
                     trimmed
                 };
-                if let Ok(mut g) = self.active_profile.write() {
+                if is_valid_profile_name(&norm) {
+                    let mut g = self
+                        .active_profile
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
                     *g = norm;
                 }
             }
         }
-        if let Ok(mut g) = self.profile_persist_path.write() {
-            *g = Some(path);
-        }
+        let mut g = self
+            .profile_persist_path
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *g = Some(path);
     }
 
     /// Sets the active operational security profile (`"armed"`, `"home"`, `"disarmed"`, or custom profile)
@@ -432,23 +505,27 @@ impl CommsHub {
         let norm = match trimmed.as_str() {
             "" => "armed".to_string(),
             "off" => "disarmed".to_string(),
-            other => other.to_string(),
+            other if is_valid_profile_name(other) => other.to_string(),
+            _ => return self.get_active_profile(),
         };
         {
             let mut g = self
                 .active_profile
                 .write()
-                .expect("active_profile lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             *g = norm.clone();
         }
-        if let Ok(guard) = self.profile_persist_path.read()
-            && let Some(ref p) = *guard
-        {
+        let guard = self
+            .profile_persist_path
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ref p) = *guard {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             let _ = std::fs::write(p, &norm);
         }
+        drop(guard);
         self.publish_topic("profile/state", norm.clone());
         norm
     }
@@ -472,11 +549,14 @@ impl CommsHub {
         max_area: u32,
         night_mode: bool,
     ) {
+        if !is_valid_topic_segment(camera) {
+            return;
+        }
         let snapshot_str = {
             let mut map = self
                 .camera_states
                 .write()
-                .expect("camera_states lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             let entry = map
                 .entry(camera.to_string())
                 .or_insert_with(default_camera_activity_entry);
@@ -506,7 +586,9 @@ impl CommsHub {
         if parts.len() == 2 {
             let cam = parts[0];
             let feature = parts[1];
-            let is_on = payload.eq_ignore_ascii_case("ON") || payload.eq_ignore_ascii_case("true");
+            if !is_valid_topic_segment(cam) {
+                return;
+            }
             let cfg_key = match feature {
                 "recordings" | "record" => Some("record"),
                 "detect" => Some("detect"),
@@ -517,17 +599,19 @@ impl CommsHub {
                 "detections" | "review_detections" => Some("detections"),
                 _ => None,
             };
+            let Some(key) = cfg_key else {
+                return;
+            };
+            let is_on = payload.eq_ignore_ascii_case("ON") || payload.eq_ignore_ascii_case("true");
             let snapshot_str = {
                 let mut map = self
                     .camera_states
                     .write()
-                    .expect("camera_states lock poisoned");
+                    .unwrap_or_else(|e| e.into_inner());
                 let entry = map
                     .entry(cam.to_string())
                     .or_insert_with(default_camera_activity_entry);
-                if let Some(key) = cfg_key
-                    && let Some(cfg_obj) = entry.get_mut("config").and_then(|c| c.as_object_mut())
-                {
+                if let Some(cfg_obj) = entry.get_mut("config").and_then(|c| c.as_object_mut()) {
                     cfg_obj.insert(key.to_string(), json!(is_on));
                 }
                 if feature == "enabled"
@@ -549,10 +633,12 @@ impl CommsHub {
             let mut map = self
                 .camera_states
                 .write()
-                .expect("camera_states lock poisoned");
+                .unwrap_or_else(|e| e.into_inner());
             for cam in cameras {
-                map.entry(cam.clone())
-                    .or_insert_with(default_camera_activity_entry);
+                if is_valid_topic_segment(cam) {
+                    map.entry(cam.clone())
+                        .or_insert_with(default_camera_activity_entry);
+                }
             }
             for (cam, entry) in map.iter() {
                 let cfg = &entry["config"];
@@ -619,8 +705,14 @@ impl CommsHub {
 /// with either custom `tls_ca_certs` or system Root CAs (`/etc/ssl/certs/ca-certificates.crt`)
 /// and optional client mTLS (`tls_client_cert` / `tls_client_key`).
 pub fn build_mqtt_options(cfg: &MqttConfig) -> MqttOptions {
-    let prefix = cfg.topic_prefix.trim_end_matches('/').to_string();
-    let mut mqtt_opts = MqttOptions::new(&cfg.client_id, &cfg.host, cfg.port);
+    let prefix = sanitize_mqtt_prefix(&cfg.topic_prefix);
+    let client_id = sanitize_mqtt_client_id(&cfg.client_id);
+    let host = if cfg.host.trim().is_empty() {
+        "127.0.0.1"
+    } else {
+        cfg.host.trim()
+    };
+    let mut mqtt_opts = MqttOptions::new(client_id, host, cfg.port);
     mqtt_opts.set_keep_alive(Duration::from_secs(30));
     mqtt_opts.set_last_will(LastWill::new(
         format!("{prefix}/available"),
@@ -665,7 +757,7 @@ async fn run_mqtt_loop(
     mut rx: mpsc::UnboundedReceiver<(String, Vec<u8>, bool)>,
     hub: CommsHub,
 ) {
-    let prefix = cfg.topic_prefix.trim_end_matches('/').to_string();
+    let prefix = sanitize_mqtt_prefix(&cfg.topic_prefix);
     let mut backoff_secs = 2u64;
     loop {
         let mqtt_opts = build_mqtt_options(&cfg);
@@ -673,29 +765,31 @@ async fn run_mqtt_loop(
 
         loop {
             tokio::select! {
-                Some((sub_topic, payload, retain)) = rx.recv() => {
-                    let full_topic = format!("{prefix}/{}", sub_topic.trim_start_matches('/'));
-                    let _ = client.publish(full_topic, QoS::AtMostOnce, retain, payload).await;
+                maybe_msg = rx.recv() => {
+                    let Some((sub_topic, payload, retain)) = maybe_msg else {
+                        return;
+                    };
+                    let clean_sub = sub_topic.trim_matches('/');
+                    if is_valid_mqtt_publish_topic(clean_sub) {
+                        let full_topic = format!("{prefix}/{clean_sub}");
+                        let _ = client.try_publish(full_topic, QoS::AtMostOnce, retain, payload);
+                    }
                 }
                 ev = eventloop.poll() => {
                     match ev {
                         Ok(MqttEvent::Incoming(Packet::ConnAck(_))) => {
                             backoff_secs = 2;
                             info!("Connected to MQTT broker at {}:{}", cfg.host, cfg.port);
+                            let _ = client.try_publish(
+                                format!("{prefix}/available"),
+                                QoS::AtMostOnce,
+                                true,
+                                "online",
+                            );
                             let _ = client
-                                .publish(
-                                    format!("{prefix}/available"),
-                                    QoS::AtMostOnce,
-                                    true,
-                                    "online",
-                                )
-                                .await;
+                                .try_subscribe(format!("{prefix}/+/+/set"), QoS::AtMostOnce);
                             let _ = client
-                                .subscribe(format!("{prefix}/+/+/set"), QoS::AtMostOnce)
-                                .await;
-                            let _ = client
-                                .subscribe(format!("{prefix}/profile/set"), QoS::AtMostOnce)
-                                .await;
+                                .try_subscribe(format!("{prefix}/profile/set"), QoS::AtMostOnce);
                         }
                         Ok(MqttEvent::Incoming(Packet::Publish(pub_pkt))) => {
                             if let Some(rel) = pub_pkt.topic.strip_prefix(&format!("{prefix}/"))
@@ -716,6 +810,11 @@ async fn run_mqtt_loop(
             }
         }
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        // Drain stale messages accumulated while the broker was unreachable to bound memory usage.
+        while rx.try_recv().is_ok() {}
+        if rx.is_closed() {
+            return;
+        }
         backoff_secs = (backoff_secs * 2).min(60);
     }
 }
@@ -779,7 +878,10 @@ impl ActivityLedger {
         regions: u32,
         dbfs: i64,
     ) {
-        let mut guard = self.rings.write().expect("activity_ledger lock poisoned");
+        if !timestamp.is_finite() {
+            return;
+        }
+        let mut guard = self.rings.write().unwrap_or_else(|e| e.into_inner());
         let q = guard.entry(camera.to_string()).or_default();
         q.push_back(ActivitySample {
             timestamp,
@@ -790,7 +892,10 @@ impl ActivityLedger {
         });
         let cutoff = timestamp - ACTIVITY_LEDGER_WINDOW_SECS;
         while let Some(front) = q.front() {
-            if front.timestamp < cutoff || q.len() > self.max_samples {
+            if !front.timestamp.is_finite()
+                || front.timestamp < cutoff
+                || q.len() > self.max_samples
+            {
                 q.pop_front();
             } else {
                 break;
@@ -799,12 +904,12 @@ impl ActivityLedger {
     }
 
     pub fn sample_count(&self, camera: &str) -> usize {
-        let guard = self.rings.read().expect("activity_ledger lock poisoned");
+        let guard = self.rings.read().unwrap_or_else(|e| e.into_inner());
         guard.get(camera).map_or(0, VecDeque::len)
     }
 
     pub fn samples(&self, camera: &str) -> Vec<ActivitySample> {
-        let guard = self.rings.read().expect("activity_ledger lock poisoned");
+        let guard = self.rings.read().unwrap_or_else(|e| e.into_inner());
         guard
             .get(camera)
             .map(|q| q.iter().copied().collect())
@@ -822,7 +927,7 @@ impl ActivityLedger {
         start_time: f64,
         end_time: f64,
     ) -> (i64, i64, i64, i64) {
-        let guard = self.rings.read().expect("activity_ledger lock poisoned");
+        let guard = self.rings.read().unwrap_or_else(|e| e.into_inner());
         let Some(q) = guard.get(camera) else {
             return (0, 0, 0, 0);
         };
@@ -832,9 +937,9 @@ impl ActivityLedger {
         let mut peak_dbfs = 0i64;
         for s in q {
             if s.timestamp >= start_time && s.timestamp <= end_time {
-                motion_sum += s.motion_px as i64;
-                obj_sum += s.active_objects as i64;
-                reg_sum += s.regions as i64;
+                motion_sum = motion_sum.saturating_add(s.motion_px as i64);
+                obj_sum = obj_sum.saturating_add(s.active_objects as i64);
+                reg_sum = reg_sum.saturating_add(s.regions as i64);
                 if s.dbfs != 0 && (peak_dbfs == 0 || s.dbfs > peak_dbfs) {
                     peak_dbfs = s.dbfs;
                 }
@@ -928,16 +1033,24 @@ impl LogBufferHub {
     }
 
     pub fn push_raw(&self, service: &str, line: impl Into<String>) {
-        let line = line.into();
+        let raw_line = line.into();
+        let scrubbed_line = if raw_line.contains("://")
+            || raw_line.contains("password:")
+            || raw_line.contains("api_key:")
         {
-            let mut guard = self.buffers.lock().expect("log mutex poisoned");
+            ninjanvr_config::scrub_yaml_credentials(&raw_line)
+        } else {
+            raw_line
+        };
+        {
+            let mut guard = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
             let q = guard.entry(service.to_string()).or_default();
-            q.push_back(line.clone());
+            q.push_back(scrubbed_line.clone());
             while q.len() > self.max_lines {
                 q.pop_front();
             }
         }
-        let _ = self.stream_tx.send((service.to_string(), line));
+        let _ = self.stream_tx.send((service.to_string(), scrubbed_line));
     }
 
     pub fn get_logs(&self, service: &str) -> Vec<String> {
@@ -950,7 +1063,7 @@ impl LogBufferHub {
         start: Option<i64>,
         end: Option<i64>,
     ) -> (usize, Vec<String>) {
-        let guard = self.buffers.lock().expect("log mutex poisoned");
+        let guard = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let Some(q) = guard.get(service) else {
             return (0, Vec::new());
         };
@@ -959,7 +1072,7 @@ impl LogBufferHub {
             return (0, Vec::new());
         }
         let start_idx = match start {
-            Some(s) if s < 0 => total.saturating_sub((-s) as usize),
+            Some(s) if s < 0 => total.saturating_sub(s.unsigned_abs() as usize),
             Some(s) => (s as usize).min(total),
             None => 0,
         };
@@ -1548,5 +1661,68 @@ cameras:
         assert_eq!(hub.get_active_profile(), "night_perimeter");
 
         assert!(hub.get_camera_roi_states("unknown_camera").is_empty());
+    }
+
+    #[test]
+    fn phase1a_audit_mqtt_wildcard_injection_log_scrubbing_i64_min_and_nan_ledger() {
+        let hub = CommsHub::new();
+
+        // 1. MQTT wildcard (+, #), control char, and unknown feature rejection
+        hub.apply_set_command("+/detect/set", "OFF");
+        hub.apply_set_command("#/detect/set", "OFF");
+        hub.apply_set_command("porch/unknown_feature/set", "OFF");
+        let snap = hub.get_camera_activity_snapshot();
+        assert!(snap.get("+").is_none());
+        assert!(snap.get("#").is_none());
+        assert!(snap.get("porch").is_none());
+
+        assert!(!hub.set_camera_availability("bad+cam", true));
+        assert!(!hub.set_camera_tamper("bad#cam", true));
+
+        // 2. Profile name validation blocks control characters, slashes, wildcards, and oversized payloads
+        assert_eq!(hub.set_active_profile("home"), "home");
+        assert_eq!(hub.set_active_profile("evil\nprofile"), "home");
+        assert_eq!(hub.set_active_profile("../etc/passwd"), "home");
+        assert_eq!(hub.set_active_profile(&"a".repeat(100)), "home");
+
+        // 3. build_mqtt_options handles empty or whitespace-leading client_id and topic_prefix without panicking
+        let edge_mqtt = MqttConfig {
+            client_id: "   ".to_string(),
+            topic_prefix: "///".to_string(),
+            host: "   ".to_string(),
+            ..Default::default()
+        };
+        let opts = build_mqtt_options(&edge_mqtt);
+        assert_eq!(opts.client_id(), "ninjanvr");
+
+        // 4. LogBufferHub scrubs RTSP/HTTP credentials and handles i64::MIN start index without overflow
+        let log_hub = LogBufferHub::with_capacity(10);
+        log_hub.push_go2rtc(
+            "ERR",
+            "rtsp",
+            "dial rtsp://cam_user:super_secret_pw@192.0.2.55:554/main?token=secret_tok failed",
+        );
+        let logs = log_hub.get_logs("go2rtc");
+        assert_eq!(logs.len(), 1);
+        assert!(!logs[0].contains("super_secret_pw"));
+        assert!(!logs[0].contains("secret_tok"));
+        assert!(logs[0].contains("rtsp://*:*@192.0.2.55:554/main?token=***"));
+
+        let (tot, tail) = log_hub.query_lines("go2rtc", Some(i64::MIN), None);
+        assert_eq!(tot, 1);
+        assert_eq!(tail.len(), 1);
+
+        // 5. ActivityLedger ignores NaN/Infinite timestamps so time-window eviction is never poisoned
+        let ledger = ActivityLedger::with_capacity(10);
+        ledger.record_sample("cam1", 1000.0, 10, 1, 1);
+        ledger.record_sample("cam1", f64::NAN, 999, 9, 9);
+        ledger.record_sample("cam1", f64::INFINITY, 999, 9, 9);
+        assert_eq!(ledger.sample_count("cam1"), 1);
+        ledger.record_sample("cam1", 1400.0, 20, 2, 2);
+        assert_eq!(
+            ledger.sample_count("cam1"),
+            1,
+            "stale sample at 1000.0 must be evicted at 1400.0"
+        );
     }
 }
