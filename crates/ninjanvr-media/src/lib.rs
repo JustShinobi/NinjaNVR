@@ -180,6 +180,93 @@ fn random_suffix() -> String {
     format!("{n:06x}")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MediaBoxSlice<'a> {
+    box_type: [u8; 4],
+    payload: &'a [u8],
+}
+
+fn iter_mp4_boxes(mut buf: &[u8]) -> (Vec<MediaBoxSlice<'_>>, bool) {
+    let mut out = Vec::new();
+    let mut malformed = false;
+    while !buf.is_empty() {
+        if buf.len() < 8 {
+            malformed = true;
+            break;
+        }
+        let size32 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let box_type = [buf[4], buf[5], buf[6], buf[7]];
+        let (box_len_u64, hdr_len) = if size32 == 1 {
+            if buf.len() < 16 {
+                malformed = true;
+                break;
+            }
+            let size64 = u64::from_be_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]);
+            (size64, 16usize)
+        } else if size32 == 0 {
+            (buf.len() as u64, 8usize)
+        } else {
+            (size32, 8usize)
+        };
+        let Ok(box_len) = usize::try_from(box_len_u64) else {
+            malformed = true;
+            break;
+        };
+        if box_len < hdr_len || box_len > buf.len() {
+            malformed = true;
+            break;
+        }
+        out.push(MediaBoxSlice {
+            box_type,
+            payload: &buf[hdr_len..box_len],
+        });
+        buf = &buf[box_len..];
+    }
+    (out, malformed)
+}
+
+fn is_safe_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('.')
+        && !s.starts_with('-')
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| !matches!(c, '/' | '\\' | '\0' | '\n' | '\r') && !c.is_control())
+}
+
+fn sanitize_ffmpeg_path_arg(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if path.is_relative()
+        && (raw.starts_with('-')
+            || raw
+                .find(':')
+                .is_some_and(|colon| raw.find('/').is_none_or(|slash| colon < slash)))
+    {
+        format!("./{raw}")
+    } else {
+        raw.into_owned()
+    }
+}
+
+fn format_ffmpeg_concat_file_line(path: &Path) -> Option<String> {
+    let raw = path.to_str()?;
+    if raw.is_empty() || raw.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    let escaped = raw.replace('\'', "'\\''");
+    Some(format!("file '{escaped}'\n"))
+}
+
+struct TempPathGuard(PathBuf);
+
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn parse_duration_box(body: &[u8]) -> Option<f64> {
     if body.is_empty() {
         return None;
@@ -206,7 +293,7 @@ fn parse_duration_box(body: &[u8]) -> Option<f64> {
     } else {
         None
     }?;
-    if secs > 0.0 && secs <= 300.0 {
+    if secs.is_finite() && secs > 0.0 && secs <= 300.0 {
         Some(secs)
     } else {
         None
@@ -221,12 +308,15 @@ pub fn probe_mp4_duration_fast(path: &Path) -> Option<f64> {
     let file_len = file.metadata().ok()?.len();
     let mut pos = 0u64;
     let mut hdr = [0u8; 8];
-    while pos + 8 <= file_len {
+    while pos.checked_add(8).is_some_and(|end| end <= file_len) {
         file.seek(SeekFrom::Start(pos)).ok()?;
         file.read_exact(&mut hdr).ok()?;
         let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
         let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
         let (box_size, hdr_len) = if size32 == 1 {
+            if pos.checked_add(16).is_none_or(|end| end > file_len) {
+                break;
+            }
             let mut ext = [0u8; 8];
             file.read_exact(&mut ext).ok()?;
             (u64::from_be_bytes(ext), 16u64)
@@ -235,127 +325,77 @@ pub fn probe_mp4_duration_fast(path: &Path) -> Option<f64> {
         } else {
             (size32, 8u64)
         };
-        if box_size < hdr_len || pos + box_size > file_len {
+        let Some(next_pos) = pos.checked_add(box_size) else {
+            break;
+        };
+        if box_size < hdr_len || next_pos > file_len {
             break;
         }
         if &btype == b"moov" {
-            let mut moov = vec![0u8; (box_size - hdr_len).min(131_072) as usize];
+            let payload_len = (box_size - hdr_len).min(16 * 1024 * 1024) as usize;
+            let mut moov = vec![0u8; payload_len];
             file.read_exact(&mut moov).ok()?;
             let mut fallback_mvhd = None;
             let mut saw_vide_trak = false;
-            let mut mpos = 0usize;
-            while mpos + 8 <= moov.len() {
-                let msize = u32::from_be_bytes([
-                    moov[mpos],
-                    moov[mpos + 1],
-                    moov[mpos + 2],
-                    moov[mpos + 3],
-                ]) as usize;
-                let mtype = &moov[mpos + 4..mpos + 8];
-                if msize < 8 || mpos + msize > moov.len() {
-                    break;
-                }
-                let mbody = &moov[mpos + 8..mpos + msize];
-                if mtype == b"mvhd" {
-                    fallback_mvhd = parse_duration_box(mbody);
-                } else if mtype == b"trak" {
-                    if let Some(vide_dur) = extract_vide_mdhd_duration(mbody) {
+            let (moov_boxes, _) = iter_mp4_boxes(&moov);
+            for b in moov_boxes {
+                if &b.box_type == b"mvhd" {
+                    fallback_mvhd = parse_duration_box(b.payload);
+                } else if &b.box_type == b"trak" {
+                    if let Some(vide_dur) = extract_vide_mdhd_duration(b.payload) {
                         return Some(vide_dur);
                     }
-                    if trak_has_vide_handler(mbody) {
+                    if trak_has_vide_handler(b.payload) {
                         saw_vide_trak = true;
                     }
                 }
-                mpos += msize;
             }
             return if saw_vide_trak { None } else { fallback_mvhd };
         }
-        pos += box_size;
+        pos = next_pos;
     }
     None
 }
 
 fn trak_has_vide_handler(trak_body: &[u8]) -> bool {
-    let mut tpos = 0usize;
-    while tpos + 8 <= trak_body.len() {
-        let tsize = u32::from_be_bytes([
-            trak_body[tpos],
-            trak_body[tpos + 1],
-            trak_body[tpos + 2],
-            trak_body[tpos + 3],
-        ]) as usize;
-        let ttype = &trak_body[tpos + 4..tpos + 8];
-        if tsize < 8 || tpos + tsize > trak_body.len() {
-            break;
-        }
-        if ttype == b"mdia" {
-            let mdia = &trak_body[tpos + 8..tpos + tsize];
-            let mut dpos = 0usize;
-            while dpos + 8 <= mdia.len() {
-                let dsize = u32::from_be_bytes([
-                    mdia[dpos],
-                    mdia[dpos + 1],
-                    mdia[dpos + 2],
-                    mdia[dpos + 3],
-                ]) as usize;
-                let dtype = &mdia[dpos + 4..dpos + 8];
-                if dsize < 8 || dpos + dsize > mdia.len() {
-                    break;
-                }
-                let dbody = &mdia[dpos + 8..dpos + dsize];
-                if dtype == b"hdlr" && dbody.len() >= 12 && &dbody[8..12] == b"vide" {
+    let (trak_boxes, _) = iter_mp4_boxes(trak_body);
+    for tb in trak_boxes {
+        if &tb.box_type == b"mdia" {
+            let (mdia_boxes, _) = iter_mp4_boxes(tb.payload);
+            for db in mdia_boxes {
+                if &db.box_type == b"hdlr"
+                    && db.payload.len() >= 12
+                    && &db.payload[8..12] == b"vide"
+                {
                     return true;
                 }
-                dpos += dsize;
             }
         }
-        tpos += tsize;
     }
     false
 }
 
 fn extract_vide_mdhd_duration(trak_body: &[u8]) -> Option<f64> {
-    let mut tpos = 0usize;
-    while tpos + 8 <= trak_body.len() {
-        let tsize = u32::from_be_bytes([
-            trak_body[tpos],
-            trak_body[tpos + 1],
-            trak_body[tpos + 2],
-            trak_body[tpos + 3],
-        ]) as usize;
-        let ttype = &trak_body[tpos + 4..tpos + 8];
-        if tsize < 8 || tpos + tsize > trak_body.len() {
-            break;
-        }
-        if ttype == b"mdia" {
-            let mdia = &trak_body[tpos + 8..tpos + tsize];
+    let (trak_boxes, _) = iter_mp4_boxes(trak_body);
+    for tb in trak_boxes {
+        if &tb.box_type == b"mdia" {
             let mut mdhd_dur = None;
             let mut is_vide = false;
-            let mut dpos = 0usize;
-            while dpos + 8 <= mdia.len() {
-                let dsize = u32::from_be_bytes([
-                    mdia[dpos],
-                    mdia[dpos + 1],
-                    mdia[dpos + 2],
-                    mdia[dpos + 3],
-                ]) as usize;
-                let dtype = &mdia[dpos + 4..dpos + 8];
-                if dsize < 8 || dpos + dsize > mdia.len() {
-                    break;
-                }
-                let dbody = &mdia[dpos + 8..dpos + dsize];
-                if dtype == b"mdhd" {
-                    mdhd_dur = parse_duration_box(dbody);
-                } else if dtype == b"hdlr" && dbody.len() >= 12 && &dbody[8..12] == b"vide" {
+            let (mdia_boxes, _) = iter_mp4_boxes(tb.payload);
+            for db in mdia_boxes {
+                if &db.box_type == b"mdhd" {
+                    mdhd_dur = parse_duration_box(db.payload);
+                } else if &db.box_type == b"hdlr"
+                    && db.payload.len() >= 12
+                    && &db.payload[8..12] == b"vide"
+                {
                     is_vide = true;
                 }
-                dpos += dsize;
             }
             if is_vide && mdhd_dur.is_some() {
                 return mdhd_dur;
             }
         }
-        tpos += tsize;
     }
     None
 }
@@ -400,10 +440,13 @@ pub fn check_acoustic_event_trigger(dbfs: i64, cfg: &AudioConfig) -> Option<Stri
 }
 
 fn decode_audio_dbfs_via_ffmpeg(path: &Path) -> i64 {
+    let safe_input = sanitize_ffmpeg_path_arg(path);
     let output = std::process::Command::new(resolve_ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
-        .arg(path)
-        .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1"])
+        .arg(safe_input)
+        .args([
+            "-t", "15", "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "pipe:1",
+        ])
         .output();
     let Ok(out) = output else {
         return 0;
@@ -443,13 +486,16 @@ pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
     let file_len = meta.len();
     let mut pos = 0u64;
     let mut hdr = [0u8; 8];
-    while pos + 8 <= file_len {
+    while pos.checked_add(8).is_some_and(|end| end <= file_len) {
         if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut hdr).is_err() {
             break;
         }
         let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
         let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
         let (box_size, hdr_len) = if size32 == 1 {
+            if pos.checked_add(16).is_none_or(|end| end > file_len) {
+                break;
+            }
             let mut ext = [0u8; 8];
             if file.read_exact(&mut ext).is_err() {
                 break;
@@ -460,7 +506,10 @@ pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
         } else {
             (size32, 8u64)
         };
-        if box_size < hdr_len || pos + box_size > file_len {
+        let Some(next_pos) = pos.checked_add(box_size) else {
+            break;
+        };
+        if box_size < hdr_len || next_pos > file_len {
             break;
         }
         if &btype == b"moov" {
@@ -509,7 +558,7 @@ pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
             }
             return 0;
         }
-        pos += box_size;
+        pos = next_pos;
     }
     0
 }
@@ -527,16 +576,19 @@ pub fn mp4_file_has_audio_track(path: &Path) -> bool {
     let file_len = meta.len();
     let mut pos = 0u64;
     let mut hdr = [0u8; 8];
-    while pos + 8 <= file_len {
+    while pos.checked_add(8).is_some_and(|end| end <= file_len) {
         if file.seek(SeekFrom::Start(pos)).is_err() || file.read_exact(&mut hdr).is_err() {
             break;
         }
         let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
         let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
         let (box_size, hdr_len) = if size32 == 1 {
+            if pos.checked_add(16).is_none_or(|end| end > file_len) {
+                return true;
+            }
             let mut ext = [0u8; 8];
             if file.read_exact(&mut ext).is_err() {
-                break;
+                return true;
             }
             (u64::from_be_bytes(ext), 16u64)
         } else if size32 == 0 {
@@ -544,170 +596,176 @@ pub fn mp4_file_has_audio_track(path: &Path) -> bool {
         } else {
             (size32, 8u64)
         };
+        let Some(next_pos) = pos.checked_add(box_size) else {
+            return true;
+        };
         if box_size < hdr_len {
+            if &btype == b"moov" {
+                return true;
+            }
             break;
         }
         if &btype == b"moov" {
-            if box_size - hdr_len > 16 * 1024 * 1024 {
+            if box_size - hdr_len > 16 * 1024 * 1024 || next_pos > file_len {
                 return true;
             }
             let mut moov = vec![0u8; (box_size - hdr_len) as usize];
             if file.read_exact(&mut moov).is_err() {
                 return true;
             }
-            if let Some((_, total_audio_bytes, sample_count, _)) = extract_soun_sample_stats(&moov)
-            {
-                return sample_count > 0 && total_audio_bytes > 0;
-            }
             return moov_has_soun_trak(&moov);
         }
-        if pos + box_size > file_len {
+        if next_pos > file_len {
             break;
         }
-        pos += box_size;
+        pos = next_pos;
     }
     false
 }
 
 fn moov_has_soun_trak(moov: &[u8]) -> bool {
-    let mut mpos = 0usize;
-    while mpos + 8 <= moov.len() {
-        let msize = u32::from_be_bytes([moov[mpos], moov[mpos + 1], moov[mpos + 2], moov[mpos + 3]])
-            as usize;
-        let mtype = &moov[mpos + 4..mpos + 8];
-        if msize < 8 || mpos + msize > moov.len() {
-            break;
-        }
-        if mtype == b"trak" {
-            let trak = &moov[mpos + 8..mpos + msize];
-            let mut tpos = 0usize;
-            while tpos + 8 <= trak.len() {
-                let tsize = u32::from_be_bytes([
-                    trak[tpos],
-                    trak[tpos + 1],
-                    trak[tpos + 2],
-                    trak[tpos + 3],
-                ]) as usize;
-                let ttype = &trak[tpos + 4..tpos + 8];
-                if tsize < 8 || tpos + tsize > trak.len() {
-                    break;
-                }
-                if ttype == b"mdia" {
-                    let mdia = &trak[tpos + 8..tpos + tsize];
-                    let mut dpos = 0usize;
-                    while dpos + 8 <= mdia.len() {
-                        let dsize = u32::from_be_bytes([
-                            mdia[dpos],
-                            mdia[dpos + 1],
-                            mdia[dpos + 2],
-                            mdia[dpos + 3],
-                        ]) as usize;
-                        let dtype = &mdia[dpos + 4..dpos + 8];
-                        if dsize < 8 || dpos + dsize > mdia.len() {
-                            break;
+    let (moov_boxes, malformed_moov) = iter_mp4_boxes(moov);
+    if malformed_moov {
+        return true;
+    }
+    let has_mvex = moov_boxes.iter().any(|b| &b.box_type == b"mvex");
+    for mb in moov_boxes {
+        if &mb.box_type == b"trak" {
+            let (trak_boxes, malformed_trak) = iter_mp4_boxes(mb.payload);
+            if malformed_trak {
+                return true;
+            }
+            for tb in trak_boxes {
+                if &tb.box_type == b"mdia" {
+                    let (mdia_boxes, malformed_mdia) = iter_mp4_boxes(tb.payload);
+                    if malformed_mdia {
+                        return true;
+                    }
+                    let mut is_soun = false;
+                    let mut minf_payload: Option<&[u8]> = None;
+                    for db in mdia_boxes {
+                        if &db.box_type == b"hdlr"
+                            && db.payload.len() >= 12
+                            && &db.payload[8..12] == b"soun"
+                        {
+                            is_soun = true;
+                        } else if &db.box_type == b"minf" {
+                            minf_payload = Some(db.payload);
                         }
-                        let dbody = &mdia[dpos + 8..dpos + dsize];
-                        if dtype == b"hdlr" && dbody.len() >= 12 && &dbody[8..12] == b"soun" {
-                            return true;
-                        }
-                        dpos += dsize;
+                    }
+                    if !is_soun {
+                        continue;
+                    }
+                    if has_mvex {
+                        return true;
+                    }
+                    let Some(minf) = minf_payload else {
+                        return true;
+                    };
+                    let (minf_boxes, malformed_minf) = iter_mp4_boxes(minf);
+                    if malformed_minf {
+                        return true;
+                    }
+                    let Some(stbl) = minf_boxes
+                        .iter()
+                        .find(|b| &b.box_type == b"stbl")
+                        .map(|b| b.payload)
+                    else {
+                        return true;
+                    };
+                    let (stbl_boxes, malformed_stbl) = iter_mp4_boxes(stbl);
+                    if malformed_stbl || stbl_boxes.iter().any(|b| &b.box_type == b"stz2") {
+                        return true;
+                    }
+                    let Some(stsz) = stbl_boxes
+                        .iter()
+                        .find(|b| &b.box_type == b"stsz")
+                        .map(|b| b.payload)
+                    else {
+                        return true;
+                    };
+                    if stsz.len() < 12 {
+                        return true;
+                    }
+                    let default_size = u32::from_be_bytes([stsz[4], stsz[5], stsz[6], stsz[7]]);
+                    let count = u32::from_be_bytes([stsz[8], stsz[9], stsz[10], stsz[11]]);
+                    if count == 0 {
+                        continue;
+                    }
+                    if default_size > 0 {
+                        return true;
+                    }
+                    let needed = 12usize.saturating_add((count as usize).saturating_mul(4));
+                    if stsz.len() < needed {
+                        return true;
+                    }
+                    let mut total_bytes = 0u64;
+                    for i in 0..(count as usize) {
+                        let p = 12 + i * 4;
+                        let sz =
+                            u32::from_be_bytes([stsz[p], stsz[p + 1], stsz[p + 2], stsz[p + 3]])
+                                as u64;
+                        total_bytes = total_bytes.saturating_add(sz);
+                    }
+                    if total_bytes > 0 {
+                        return true;
                     }
                 }
-                tpos += tsize;
             }
         }
-        mpos += msize;
     }
     false
 }
 
 fn extract_soun_sample_stats(moov: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
-    let mut mpos = 0usize;
-    while mpos + 8 <= moov.len() {
-        let msize = u32::from_be_bytes([moov[mpos], moov[mpos + 1], moov[mpos + 2], moov[mpos + 3]])
-            as usize;
-        let mtype = &moov[mpos + 4..mpos + 8];
-        if msize < 8 || mpos + msize > moov.len() {
-            break;
-        }
-        if mtype == b"trak" {
-            let trak = &moov[mpos + 8..mpos + msize];
-            if let Some(stats) = parse_soun_trak(trak) {
+    let (moov_boxes, _) = iter_mp4_boxes(moov);
+    let mut fallback_empty = None;
+    for mb in moov_boxes {
+        if &mb.box_type == b"trak"
+            && let Some(stats) = parse_soun_trak(mb.payload)
+        {
+            if stats.1 > 0 && stats.2 > 0 {
                 return Some(stats);
             }
+            if fallback_empty.is_none() {
+                fallback_empty = Some(stats);
+            }
         }
-        mpos += msize;
     }
-    None
+    fallback_empty
 }
 
 fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
-    let mut tpos = 0usize;
-    while tpos + 8 <= trak.len() {
-        let tsize = u32::from_be_bytes([trak[tpos], trak[tpos + 1], trak[tpos + 2], trak[tpos + 3]])
-            as usize;
-        let ttype = &trak[tpos + 4..tpos + 8];
-        if tsize < 8 || tpos + tsize > trak.len() {
-            break;
-        }
-        if ttype == b"mdia" {
-            let mdia = &trak[tpos + 8..tpos + tsize];
+    let (trak_boxes, _) = iter_mp4_boxes(trak);
+    for tb in trak_boxes {
+        if &tb.box_type == b"mdia" {
             let mut is_soun = false;
             let mut stbl_slice: Option<&[u8]> = None;
-            let mut dpos = 0usize;
-            while dpos + 8 <= mdia.len() {
-                let dsize = u32::from_be_bytes([
-                    mdia[dpos],
-                    mdia[dpos + 1],
-                    mdia[dpos + 2],
-                    mdia[dpos + 3],
-                ]) as usize;
-                let dtype = &mdia[dpos + 4..dpos + 8];
-                if dsize < 8 || dpos + dsize > mdia.len() {
-                    break;
-                }
-                let dbody = &mdia[dpos + 8..dpos + dsize];
-                if dtype == b"hdlr" && dbody.len() >= 12 && &dbody[8..12] == b"soun" {
+            let (mdia_boxes, _) = iter_mp4_boxes(tb.payload);
+            for db in mdia_boxes {
+                if &db.box_type == b"hdlr"
+                    && db.payload.len() >= 12
+                    && &db.payload[8..12] == b"soun"
+                {
                     is_soun = true;
-                } else if dtype == b"minf" {
-                    let mut ipos = 0usize;
-                    while ipos + 8 <= dbody.len() {
-                        let isize = u32::from_be_bytes([
-                            dbody[ipos],
-                            dbody[ipos + 1],
-                            dbody[ipos + 2],
-                            dbody[ipos + 3],
-                        ]) as usize;
-                        let itype = &dbody[ipos + 4..ipos + 8];
-                        if isize < 8 || ipos + isize > dbody.len() {
-                            break;
+                } else if &db.box_type == b"minf" {
+                    let (minf_boxes, _) = iter_mp4_boxes(db.payload);
+                    for ib in minf_boxes {
+                        if &ib.box_type == b"stbl" {
+                            stbl_slice = Some(ib.payload);
                         }
-                        if itype == b"stbl" {
-                            stbl_slice = Some(&dbody[ipos + 8..ipos + isize]);
-                        }
-                        ipos += isize;
                     }
                 }
-                dpos += dsize;
             }
             if is_soun && let Some(stbl) = stbl_slice {
                 let mut offsets = Vec::new();
                 let mut total_bytes = 0u64;
                 let mut sample_count = 0u32;
                 let mut is_compressed = false;
-                let mut spos = 0usize;
-                while spos + 8 <= stbl.len() {
-                    let ssize = u32::from_be_bytes([
-                        stbl[spos],
-                        stbl[spos + 1],
-                        stbl[spos + 2],
-                        stbl[spos + 3],
-                    ]) as usize;
-                    let stype = &stbl[spos + 4..spos + 8];
-                    if ssize < 8 || spos + ssize > stbl.len() {
-                        break;
-                    }
-                    let sbody = &stbl[spos + 8..spos + ssize];
+                let (stbl_boxes, _) = iter_mp4_boxes(stbl);
+                for sb in stbl_boxes {
+                    let stype = &sb.box_type;
+                    let sbody = sb.payload;
                     if stype == b"stsd" && sbody.len() >= 16 {
                         let fourcc = &sbody[12..16];
                         is_compressed =
@@ -718,17 +776,20 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
                         let count = u32::from_be_bytes([sbody[8], sbody[9], sbody[10], sbody[11]]);
                         sample_count = count;
                         if default_size > 0 {
-                            total_bytes = (default_size as u64) * (count as u64);
+                            total_bytes = (default_size as u64).saturating_mul(count as u64);
                         } else {
                             let mut bpos = 12usize;
-                            while bpos + 4 <= sbody.len() {
+                            for _ in 0..count {
+                                if bpos + 4 > sbody.len() {
+                                    break;
+                                }
                                 let sz = u32::from_be_bytes([
                                     sbody[bpos],
                                     sbody[bpos + 1],
                                     sbody[bpos + 2],
                                     sbody[bpos + 3],
                                 ]) as u64;
-                                total_bytes += sz;
+                                total_bytes = total_bytes.saturating_add(sz);
                                 bpos += 4;
                             }
                         }
@@ -769,12 +830,10 @@ fn parse_soun_trak(trak: &[u8]) -> Option<(Vec<u64>, u64, u32, bool)> {
                             bpos += 8;
                         }
                     }
-                    spos += ssize;
                 }
                 return Some((offsets, total_bytes, sample_count, is_compressed));
             }
         }
-        tpos += tsize;
     }
     None
 }
@@ -957,6 +1016,7 @@ pub fn build_recorder_ffmpeg_args(
         ]);
     }
 
+    let safe_out_pattern = sanitize_ffmpeg_path_arg(Path::new(out_pattern));
     args.extend([
         "-f".to_string(),
         "segment".to_string(),
@@ -976,7 +1036,7 @@ pub fn build_recorder_ffmpeg_args(
         "copy".to_string(),
         "-c:a".to_string(),
         "aac".to_string(),
-        out_pattern.to_string(),
+        safe_out_pattern,
     ]);
     args
 }
@@ -998,6 +1058,8 @@ pub fn build_cold_compaction_ffmpeg_args(
         _ => "veryfast",
     };
     let crf_str = crf.clamp(18, 36).to_string();
+    let safe_src = sanitize_ffmpeg_path_arg(src_path);
+    let safe_dst = sanitize_ffmpeg_path_arg(dst_path);
     let mut args = vec![
         "-y".to_string(),
         "-hide_banner".to_string(),
@@ -1015,7 +1077,7 @@ pub fn build_cold_compaction_ffmpeg_args(
                 "-hwaccel_output_format".to_string(),
                 "vaapi".to_string(),
                 "-i".to_string(),
-                src_path.to_string_lossy().to_string(),
+                safe_src,
                 "-c:v".to_string(),
                 if is_hevc {
                     "hevc_vaapi".to_string()
@@ -1031,7 +1093,7 @@ pub fn build_cold_compaction_ffmpeg_args(
                 "-hwaccel".to_string(),
                 "qsv".to_string(),
                 "-i".to_string(),
-                src_path.to_string_lossy().to_string(),
+                safe_src,
                 "-c:v".to_string(),
                 if is_hevc {
                     "hevc_qsv".to_string()
@@ -1057,7 +1119,7 @@ pub fn build_cold_compaction_ffmpeg_args(
                 "-hwaccel".to_string(),
                 "cuda".to_string(),
                 "-i".to_string(),
-                src_path.to_string_lossy().to_string(),
+                safe_src,
                 "-c:v".to_string(),
                 if is_hevc {
                     "hevc_nvenc".to_string()
@@ -1075,7 +1137,7 @@ pub fn build_cold_compaction_ffmpeg_args(
                 "-threads".to_string(),
                 "1".to_string(),
                 "-i".to_string(),
-                src_path.to_string_lossy().to_string(),
+                safe_src,
                 "-c:v".to_string(),
                 if is_hevc {
                     "libx265".to_string()
@@ -1100,7 +1162,7 @@ pub fn build_cold_compaction_ffmpeg_args(
         "copy".to_string(),
         "-movflags".to_string(),
         "+faststart".to_string(),
-        dst_path.to_string_lossy().to_string(),
+        safe_dst,
     ]);
     args
 }
@@ -1333,6 +1395,10 @@ impl RecordingEngine {
         rtsp_url: String,
         policy: CameraRecordPolicy,
     ) {
+        if !is_safe_identifier(&camera) {
+            warn!("Refusing to start recorder for unsafe camera identifier: {camera}");
+            return;
+        }
         let staging_dir = self
             .media_dir
             .join("recordings")
@@ -1367,6 +1433,7 @@ impl RecordingEngine {
             let mut cmd = Command::new(&ffmpeg_bin);
             cmd.env("TZ", "UTC")
                 .args(&ff_args)
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
@@ -1387,6 +1454,12 @@ impl RecordingEngine {
                     let parts: Vec<&str> = line.trim().split(',').collect();
                     if parts.len() >= 3 {
                         let seg_filename = parts[0];
+                        if !is_safe_identifier(seg_filename) {
+                            warn!(
+                                "Ignoring unsafe staged segment filename for {camera}: {seg_filename}"
+                            );
+                            continue;
+                        }
                         let seg_dur = parts[2].parse::<f64>().unwrap_or(10.0)
                             - parts[1].parse::<f64>().unwrap_or(0.0);
                         let staged_path = staging_dir.join(seg_filename);
@@ -1418,8 +1491,17 @@ impl RecordingEngine {
         csv_duration: f64,
         policy: &CameraRecordPolicy,
     ) -> Result<()> {
-        let meta = std::fs::metadata(staged_path)
+        if !is_safe_identifier(camera) {
+            anyhow::bail!("unsafe camera identifier: {camera}");
+        }
+        let meta = std::fs::symlink_metadata(staged_path)
             .with_context(|| format!("missing staged segment {}", staged_path.display()))?;
+        if !meta.file_type().is_file() {
+            anyhow::bail!(
+                "staged segment {} is not a regular file",
+                staged_path.display()
+            );
+        }
         let size_bytes = meta.len();
         if size_bytes < 1024 {
             let _ = std::fs::remove_file(staged_path);
@@ -1713,6 +1795,12 @@ impl RecordingEngine {
                 (interval, cams, global_quota, global_min_free)
             };
 
+            let tier_cfg = {
+                let cfg = self.config.read().await;
+                cfg.record.storage_tiers.clone()
+            };
+            let configured_cold_dir = tier_cfg.cold_dir.as_deref();
+
             let now = unix_now_f64();
             for CameraRetentionEntry {
                 camera,
@@ -1740,14 +1828,11 @@ impl RecordingEngine {
                         .delete_expired_idle_main_recordings(&camera, idle_main_cutoff)
                     {
                         for db_path in &idle_paths {
-                            let disk_path = if let Some(rel) = strip_media_root(db_path) {
-                                self.media_dir.join(rel)
-                            } else {
-                                PathBuf::from(db_path)
-                            };
-                            if std::fs::remove_file(&disk_path).is_ok() {
-                                prune_empty_parent_dirs(&disk_path, &recordings_root);
-                            }
+                            let _ = self.remove_contained_recording_file(
+                                db_path,
+                                configured_cold_dir,
+                                &recordings_root,
+                            );
                         }
                     }
                 }
@@ -1779,18 +1864,12 @@ impl RecordingEngine {
                     let batch_len = expired_paths.len();
                     let mut removed_files = 0usize;
                     for db_path in &expired_paths {
-                        let disk_path = if let Some(rel) = strip_media_root(db_path) {
-                            self.media_dir.join(rel)
-                        } else {
-                            PathBuf::from(db_path)
-                        };
-                        if std::fs::remove_file(&disk_path).is_ok() {
+                        if self.remove_contained_recording_file(
+                            db_path,
+                            configured_cold_dir,
+                            &recordings_root,
+                        ) {
                             removed_files += 1;
-                            if disk_path.starts_with(&recordings_root) {
-                                prune_empty_parent_dirs(&disk_path, &recordings_root);
-                            } else if let Some(parent_root) = disk_path.ancestors().nth(4) {
-                                prune_empty_parent_dirs(&disk_path, parent_root);
-                            }
                         }
                     }
                     info!(
@@ -1809,14 +1888,11 @@ impl RecordingEngine {
                         .delete_recordings_over_quota_mb(&camera, max_gb * 1024.0)
                 {
                     for db_path in &quota_paths {
-                        let disk_path = if let Some(rel) = strip_media_root(db_path) {
-                            self.media_dir.join(rel)
-                        } else {
-                            PathBuf::from(db_path)
-                        };
-                        if std::fs::remove_file(&disk_path).is_ok() {
-                            prune_empty_parent_dirs(&disk_path, &recordings_root);
-                        }
+                        let _ = self.remove_contained_recording_file(
+                            db_path,
+                            configured_cold_dir,
+                            &recordings_root,
+                        );
                     }
                 }
 
@@ -1847,15 +1923,20 @@ impl RecordingEngine {
                         12,
                     ) {
                         for (seg_id, db_path) in candidates {
-                            let disk_path = if let Some(rel) = strip_media_root(&db_path) {
-                                self.media_dir.join(rel)
-                            } else {
-                                PathBuf::from(&db_path)
-                            };
-                            let Ok(orig_meta) = std::fs::metadata(&disk_path) else {
+                            let Some(disk_path) = self
+                                .resolve_contained_recording_file(&db_path, configured_cold_dir)
+                            else {
                                 let _ = self.db.update_recording_compacted(&seg_id, 0.0);
                                 continue;
                             };
+                            let Ok(orig_meta) = std::fs::symlink_metadata(&disk_path) else {
+                                let _ = self.db.update_recording_compacted(&seg_id, 0.0);
+                                continue;
+                            };
+                            if !orig_meta.file_type().is_file() {
+                                let _ = self.db.update_recording_compacted(&seg_id, 0.0);
+                                continue;
+                            }
                             let orig_len = orig_meta.len();
                             if orig_len < 65_536 {
                                 let mb =
@@ -1864,6 +1945,7 @@ impl RecordingEngine {
                                 continue;
                             }
                             let tmp_out = disk_path.with_extension("compact.mp4");
+                            let _tmp_compact_guard = TempPathGuard(tmp_out.clone());
                             let primary_args = build_cold_compaction_ffmpeg_args(
                                 &disk_path,
                                 &tmp_out,
@@ -1872,8 +1954,13 @@ impl RecordingEngine {
                                 &compact_hwaccel,
                                 compact_crf,
                             );
-                            let mut status =
-                                Command::new(&ffmpeg_bin).args(&primary_args).status().await;
+                            let mut cmd = Command::new(&ffmpeg_bin);
+                            cmd.args(&primary_args)
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .kill_on_drop(true);
+                            let mut status = cmd.status().await;
                             if !status.as_ref().map(|s| s.success()).unwrap_or(false)
                                 && compact_hwaccel != "none"
                             {
@@ -1885,10 +1972,14 @@ impl RecordingEngine {
                                     "none",
                                     compact_crf,
                                 );
-                                status = Command::new(&ffmpeg_bin)
+                                let mut fb_cmd = Command::new(&ffmpeg_bin);
+                                fb_cmd
                                     .args(&fallback_args)
-                                    .status()
-                                    .await;
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .kill_on_drop(true);
+                                status = fb_cmd.status().await;
                             }
                             let mut final_mb =
                                 ((orig_len as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
@@ -1945,22 +2036,15 @@ impl RecordingEngine {
                 && let Ok(evicted_paths) = self.db.delete_global_recordings_over_quota_mb(max_mb)
             {
                 for db_path in &evicted_paths {
-                    let disk_path = if let Some(rel) = strip_media_root(db_path) {
-                        self.media_dir.join(rel)
-                    } else {
-                        PathBuf::from(db_path)
-                    };
-                    if std::fs::remove_file(&disk_path).is_ok() {
-                        prune_empty_parent_dirs(&disk_path, &recordings_root);
-                    }
+                    let _ = self.remove_contained_recording_file(
+                        db_path,
+                        configured_cold_dir,
+                        &recordings_root,
+                    );
                 }
             }
 
             // Hot-to-Cold tiered storage migration pass
-            let tier_cfg = {
-                let cfg = self.config.read().await;
-                cfg.record.storage_tiers.clone()
-            };
             if tier_cfg.enabled
                 && let Some(ref cold_dir) = tier_cfg.cold_dir
             {
@@ -1986,18 +2070,83 @@ impl RecordingEngine {
         }
     }
 
+    fn resolve_contained_recording_file(
+        &self,
+        db_path: &str,
+        cold_dir: Option<&Path>,
+    ) -> Option<PathBuf> {
+        let disk_path = if let Some(rel) = strip_media_root(db_path) {
+            self.media_dir.join(rel)
+        } else {
+            PathBuf::from(db_path)
+        };
+        let lmeta = std::fs::symlink_metadata(&disk_path).ok()?;
+        if !lmeta.file_type().is_file() {
+            return None;
+        }
+        let canon_file = std::fs::canonicalize(&disk_path).ok()?;
+        let rec_root = self.media_dir.join("recordings");
+        let in_hot = std::fs::canonicalize(&rec_root)
+            .map(|r| canon_file.starts_with(r))
+            .unwrap_or(false);
+        let in_cold = cold_dir
+            .and_then(|c| std::fs::canonicalize(c).ok())
+            .map(|c| canon_file.starts_with(c))
+            .unwrap_or(false);
+        if in_hot || in_cold {
+            Some(canon_file)
+        } else {
+            None
+        }
+    }
+
+    fn remove_contained_recording_file(
+        &self,
+        db_path: &str,
+        cold_dir: Option<&Path>,
+        recordings_root: &Path,
+    ) -> bool {
+        let Some(canon_file) = self.resolve_contained_recording_file(db_path, cold_dir) else {
+            return false;
+        };
+        if std::fs::remove_file(&canon_file).is_ok() {
+            if let Ok(canon_rec_root) = std::fs::canonicalize(recordings_root)
+                && canon_file.starts_with(&canon_rec_root)
+            {
+                prune_empty_parent_dirs(&canon_file, &canon_rec_root);
+            } else if let Some(Ok(canon_cold_root)) = cold_dir.map(std::fs::canonicalize)
+                && canon_file.starts_with(&canon_cold_root)
+            {
+                prune_empty_parent_dirs(&canon_file, &canon_cold_root);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     fn remove_contained_media_file(&self, cp: &str) -> bool {
         let disk_path = if let Some(rel) = strip_media_root(cp) {
             self.media_dir.join(rel)
         } else {
             PathBuf::from(cp)
         };
+        let Ok(lmeta) = std::fs::symlink_metadata(&disk_path) else {
+            return false;
+        };
+        if !lmeta.file_type().is_file() {
+            return false;
+        }
         if let Ok(canon_media_dir) = std::fs::canonicalize(&self.media_dir)
             && let Ok(canon_file) = std::fs::canonicalize(&disk_path)
             && canon_file.starts_with(&canon_media_dir)
             && canon_file.is_file()
+            && !matches!(
+                canon_file.extension().and_then(|e| e.to_str()),
+                Some("db" | "db-wal" | "db-shm" | "yml" | "yaml")
+            )
         {
-            std::fs::remove_file(disk_path).is_ok()
+            std::fs::remove_file(&canon_file).is_ok()
         } else {
             false
         }
@@ -2035,7 +2184,12 @@ impl RecordingEngine {
                     clips_dir.join(format!("share_redacted_{safe_id}.webp")),
                     clips_dir.join(format!("share_clip_{safe_id}.webp")),
                 ] {
-                    let _ = std::fs::remove_file(path);
+                    if std::fs::symlink_metadata(&path)
+                        .map(|m| m.file_type().is_file())
+                        .unwrap_or(false)
+                    {
+                        let _ = std::fs::remove_file(path);
+                    }
                 }
             }
         }
@@ -2058,8 +2212,12 @@ impl RecordingEngine {
             let now = unix_now_f64();
             let current_hour_start = ((now as i64) / 3600) * 3600;
             let prev_hour_start = current_hour_start - 3600;
+            let canon_media_dir = std::fs::canonicalize(&self.media_dir).ok();
 
             for (camera, preview_quality) in cameras {
+                if !is_safe_identifier(&camera) {
+                    continue;
+                }
                 let (vf_filter, crf_val) = match preview_quality.as_str() {
                     "very_high" => ("fps=2,scale=-2:480", "23"),
                     "high" => ("fps=1,scale=-2:360", "26"),
@@ -2108,6 +2266,7 @@ impl RecordingEngine {
                     }
                     let list_file = std::env::temp_dir()
                         .join(format!("ninjanvr-prev-{camera}-{hour_start_i64}.txt"));
+                    let _list_guard = TempPathGuard(list_file.clone());
 
                     let mut list_content = String::new();
                     for seg in &segs {
@@ -2116,9 +2275,13 @@ impl RecordingEngine {
                         } else {
                             PathBuf::from(&seg.path)
                         };
-                        if local_path.exists() {
-                            let escaped = local_path.to_string_lossy().replace('\'', "'\\''");
-                            list_content.push_str(&format!("file '{escaped}'\n"));
+                        if let (Some(root_canon), Ok(seg_canon)) =
+                            (&canon_media_dir, std::fs::canonicalize(&local_path))
+                            && seg_canon.starts_with(root_canon)
+                            && seg_canon.is_file()
+                            && let Some(line) = format_ffmpeg_concat_file_line(&seg_canon)
+                        {
+                            list_content.push_str(&line);
                         }
                     }
                     if list_content.is_empty() || std::fs::write(&list_file, &list_content).is_err()
@@ -2126,37 +2289,41 @@ impl RecordingEngine {
                         continue;
                     }
 
-                    let status = Command::new(&ffmpeg_bin)
-                        .args([
-                            "-y",
-                            "-hide_banner",
-                            "-loglevel",
-                            "error",
-                            "-skip_frame",
-                            "nokey",
-                            "-f",
-                            "concat",
-                            "-safe",
-                            "0",
-                            "-i",
-                        ])
-                        .arg(&list_file)
-                        .args([
-                            "-vf",
-                            vf_filter,
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "ultrafast",
-                            "-crf",
-                            crf_val,
-                            "-an",
-                            "-movflags",
-                            "+faststart",
-                        ])
-                        .arg(&out_file)
-                        .status()
-                        .await;
+                    let mut cmd = Command::new(&ffmpeg_bin);
+                    cmd.args([
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-nostdin",
+                        "-skip_frame",
+                        "nokey",
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                    ])
+                    .arg(&list_file)
+                    .args([
+                        "-vf",
+                        vf_filter,
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-crf",
+                        crf_val,
+                        "-an",
+                        "-movflags",
+                        "+faststart",
+                    ])
+                    .arg(sanitize_ffmpeg_path_arg(&out_file))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+                    let status = cmd.status().await;
                     let _ = std::fs::remove_file(&list_file);
 
                     if status.map(|s| s.success()).unwrap_or(false) && out_file.exists() {
@@ -2190,6 +2357,7 @@ pub fn migrate_hot_segments_to_cold(
         );
     }
     let hot_rec_root = hot_media_dir.join("recordings");
+    let canon_hot_root = std::fs::canonicalize(&hot_rec_root).ok();
     let mut migrated = 0usize;
 
     for _ in 0..5 {
@@ -2205,12 +2373,37 @@ pub fn migrate_hot_segments_to_cold(
             else {
                 continue;
             };
-            let src_path = hot_rec_root.join(rel_under_rec);
-            if !src_path.exists() {
-                let _ = db.delete_recording_by_id(&id);
+            let rel_path = Path::new(rel_under_rec);
+            if rel_under_rec.is_empty()
+                || rel_path
+                    .components()
+                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                warn!("Skipping tier migration for unsafe recording path: {db_path}");
                 continue;
             }
-            let dst_path = cold_dir.join(rel_under_rec);
+            let src_path = hot_rec_root.join(rel_path);
+            let Ok(src_meta) = std::fs::symlink_metadata(&src_path) else {
+                let _ = db.delete_recording_by_id(&id);
+                continue;
+            };
+            if !src_meta.file_type().is_file() {
+                warn!(
+                    "Skipping tier migration for non-regular file {}",
+                    src_path.display()
+                );
+                continue;
+            }
+            if let (Some(root_c), Ok(src_c)) = (&canon_hot_root, std::fs::canonicalize(&src_path))
+                && !src_c.starts_with(root_c)
+            {
+                warn!(
+                    "Skipping tier migration for path outside hot root: {}",
+                    src_path.display()
+                );
+                continue;
+            }
+            let dst_path = cold_dir.join(rel_path);
             let Some(dst_parent) = dst_path.parent() else {
                 continue;
             };
@@ -2272,6 +2465,9 @@ pub async fn backup_alert_clip(
     thumb_rel: Option<&str>,
     include_snapshot: bool,
 ) -> Result<PathBuf> {
+    if !is_safe_identifier(camera) {
+        anyhow::bail!("unsafe camera identifier for alert backup: {camera}");
+    }
     let dt = Utc
         .timestamp_opt(start_time as i64, 0)
         .single()
@@ -2281,27 +2477,48 @@ pub async fn backup_alert_clip(
     std::fs::create_dir_all(&day_dir)
         .with_context(|| format!("failed to create alert backup dir {}", day_dir.display()))?;
 
+    let safe_camera: String = camera
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     let safe_label: String = label
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let stem = format!("{camera}_{}_{safe_label}", start_time as u64);
+    let stem = format!("{safe_camera}_{}_{safe_label}", start_time.max(0.0) as u64);
     let out_mp4 = day_dir.join(format!("{stem}.mp4"));
 
     let mut segments = db.query_recordings(camera, start_time, end_time)?;
     if segments.is_empty() {
         segments = db.query_recordings(camera, start_time - 15.0, end_time + 15.0)?;
     }
+    let canon_media_dir = std::fs::canonicalize(media_dir).ok();
     let existing_paths: Vec<PathBuf> = segments
         .iter()
-        .map(|s| {
-            if let Some(rel) = strip_media_root(&s.path) {
+        .filter_map(|s| {
+            let local = if let Some(rel) = strip_media_root(&s.path) {
                 media_dir.join(rel)
             } else {
                 PathBuf::from(&s.path)
+            };
+            let lmeta = std::fs::symlink_metadata(&local).ok()?;
+            if !lmeta.file_type().is_file() {
+                return None;
             }
+            let canon = std::fs::canonicalize(&local).ok()?;
+            if let Some(ref root_c) = canon_media_dir
+                && !canon.starts_with(root_c)
+            {
+                return None;
+            }
+            Some(canon)
         })
-        .filter(|p| p.exists())
         .collect();
 
     let Some(first_src) = existing_paths.first() else {
@@ -2313,23 +2530,28 @@ pub async fn backup_alert_clip(
             .with_context(|| format!("failed to copy alert clip to {}", out_mp4.display()))?;
     } else {
         let list_path = day_dir.join(format!(".{stem}_concat.txt"));
+        let _list_guard = TempPathGuard(list_path.clone());
         let mut list_content = String::new();
         for p in &existing_paths {
-            let escaped = p.to_string_lossy().replace('\'', "'\\''");
-            list_content.push_str(&format!("file '{escaped}'\n"));
+            if let Some(line) = format_ffmpeg_concat_file_line(p) {
+                list_content.push_str(&line);
+            }
         }
         let _ = std::fs::write(&list_path, &list_content);
-        let dur = (end_time - start_time).max(10.0);
+        let dur = if (end_time - start_time).is_finite() {
+            (end_time - start_time).clamp(10.0, 3600.0)
+        } else {
+            10.0
+        };
         let ff_args = build_mp4_export_ffmpeg_args(&list_path, 0.0, dur, true, &out_mp4);
         let ffmpeg_bin = resolve_ffmpeg_bin();
-        let remux_ok = Command::new(&ffmpeg_bin)
-            .args(&ff_args)
+        let mut cmd = Command::new(&ffmpeg_bin);
+        cmd.args(&ff_args)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .await
-            .map(|st| st.success())
-            .unwrap_or(false);
+            .kill_on_drop(true);
+        let remux_ok = cmd.status().await.map(|st| st.success()).unwrap_or(false);
         let _ = std::fs::remove_file(&list_path);
         if !remux_ok || !out_mp4.exists() {
             std::fs::copy(first_src, &out_mp4)
@@ -2343,16 +2565,25 @@ pub async fn backup_alert_clip(
         } else {
             PathBuf::from(t_rel)
         };
-        if thumb_disk.exists() {
-            let ext = thumb_disk
+        if let Ok(lmeta) = std::fs::symlink_metadata(&thumb_disk)
+            && lmeta.file_type().is_file()
+            && let (Some(root_c), Ok(canon_thumb)) =
+                (&canon_media_dir, std::fs::canonicalize(&thumb_disk))
+            && canon_thumb.starts_with(root_c)
+        {
+            let ext: String = canon_thumb
                 .extension()
                 .and_then(|e| e.to_str())
-                .unwrap_or("webp");
-            let snap_dst = day_dir.join(format!("{stem}.{ext}"));
-            if let Err(err) = std::fs::copy(&thumb_disk, &snap_dst) {
+                .unwrap_or("webp")
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect();
+            let safe_ext = if ext.is_empty() { "webp" } else { &ext };
+            let snap_dst = day_dir.join(format!("{stem}.{safe_ext}"));
+            if let Err(err) = std::fs::copy(&canon_thumb, &snap_dst) {
                 warn!(
                     "Failed to copy alert snapshot {} to {}: {err}",
-                    thumb_disk.display(),
+                    canon_thumb.display(),
                     snap_dst.display()
                 );
             }
@@ -2391,15 +2622,25 @@ pub fn build_mp4_export_ffmpeg_args_with_privacy(
     privacy_mask: Option<&serde_json::Value>,
     out_file: &Path,
 ) -> Vec<String> {
+    let safe_trim = if trim_offset.is_finite() && trim_offset > 0.0 {
+        trim_offset
+    } else {
+        0.0
+    };
+    let safe_dur = if target_dur.is_finite() && target_dur > 0.0 {
+        target_dur.clamp(0.1, 86_400.0)
+    } else {
+        3.0
+    };
     let mut args = vec![
         "-y".to_string(),
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
     ];
-    if trim_offset > 0.05 {
+    if safe_trim > 0.05 {
         args.push("-ss".to_string());
-        args.push(format!("{trim_offset:.2}"));
+        args.push(format!("{safe_trim:.2}"));
     }
     args.extend([
         "-f".to_string(),
@@ -2407,9 +2648,9 @@ pub fn build_mp4_export_ffmpeg_args_with_privacy(
         "-safe".to_string(),
         "0".to_string(),
         "-i".to_string(),
-        list_file.to_string_lossy().to_string(),
+        sanitize_ffmpeg_path_arg(list_file),
         "-t".to_string(),
-        format!("{target_dur:.2}"),
+        format!("{safe_dur:.2}"),
         "-fflags".to_string(),
         "+genpts+igndts".to_string(),
         "-avoid_negative_ts".to_string(),
@@ -2436,7 +2677,7 @@ pub fn build_mp4_export_ffmpeg_args_with_privacy(
     args.extend([
         "-movflags".to_string(),
         "+faststart".to_string(),
-        out_file.to_string_lossy().to_string(),
+        sanitize_ffmpeg_path_arg(out_file),
     ]);
     args
 }
@@ -2444,10 +2685,12 @@ pub fn build_mp4_export_ffmpeg_args_with_privacy(
 /// Returns `true` when `mask` contains a non-empty privacy mask configuration.
 pub fn privacy_mask_is_configured(mask: Option<&serde_json::Value>) -> bool {
     match mask {
+        None | Some(serde_json::Value::Null) => false,
         Some(serde_json::Value::Array(arr)) => !arr.is_empty(),
         Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
         Some(serde_json::Value::Object(map)) => !map.is_empty(),
-        _ => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(_)) => true,
     }
 }
 
@@ -2458,25 +2701,44 @@ pub fn privacy_mask_is_configured(mask: Option<&serde_json::Value>) -> bool {
 pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<String> {
     let privacy_mask = mask?;
 
-    fn collect_polygons(val: &serde_json::Value, out: &mut Vec<Vec<f32>>) {
+    fn collect_polygons(val: &serde_json::Value, out: &mut Vec<Vec<f32>>, invalid: &mut bool) {
         match val {
-            serde_json::Value::String(s) if !s.trim().is_empty() => {
-                let nums: Vec<f32> = s
-                    .split(',')
-                    .filter_map(|p| p.trim().parse::<f32>().ok())
-                    .collect();
-                if !nums.is_empty() {
+            serde_json::Value::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                let mut nums = Vec::new();
+                for part in trimmed.split(',') {
+                    if let Ok(n) = part.trim().parse::<f32>()
+                        && n.is_finite()
+                    {
+                        nums.push(n);
+                    } else {
+                        *invalid = true;
+                        return;
+                    }
+                }
+                if nums.len() >= 4 && nums.len().is_multiple_of(2) {
                     out.push(nums);
+                } else {
+                    *invalid = true;
                 }
             }
-            serde_json::Value::Array(arr) if !arr.is_empty() => {
+            serde_json::Value::Array(arr) => {
+                if arr.is_empty() {
+                    return;
+                }
                 if arr.iter().all(|v| v.is_number()) {
                     let nums: Vec<f32> = arr
                         .iter()
                         .filter_map(|v| v.as_f64().map(|n| n as f32))
+                        .filter(|n| n.is_finite())
                         .collect();
-                    if !nums.is_empty() {
+                    if nums.len() == arr.len() && nums.len() >= 4 && nums.len().is_multiple_of(2) {
                         out.push(nums);
+                    } else {
+                        *invalid = true;
                     }
                 } else if arr.iter().all(|v| {
                     v.as_array()
@@ -2485,70 +2747,110 @@ pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<
                     let mut nums = Vec::with_capacity(arr.len() * 2);
                     for pair in arr.iter().filter_map(|v| v.as_array()) {
                         if let (Some(x), Some(y)) = (pair[0].as_f64(), pair[1].as_f64()) {
-                            nums.push(x as f32);
-                            nums.push(y as f32);
+                            let xf = x as f32;
+                            let yf = y as f32;
+                            if xf.is_finite() && yf.is_finite() {
+                                nums.push(xf);
+                                nums.push(yf);
+                            } else {
+                                *invalid = true;
+                                return;
+                            }
+                        } else {
+                            *invalid = true;
+                            return;
                         }
                     }
-                    if !nums.is_empty() {
+                    if nums.len() >= 4 && nums.len().is_multiple_of(2) {
                         out.push(nums);
+                    } else {
+                        *invalid = true;
                     }
                 } else {
                     for item in arr {
-                        collect_polygons(item, out);
+                        let before = out.len();
+                        collect_polygons(item, out, invalid);
+                        if out.len() == before {
+                            *invalid = true;
+                        }
                     }
                 }
             }
             serde_json::Value::Object(map) => {
+                if map.is_empty() {
+                    return;
+                }
                 let mut matched_known = false;
                 for key in ["coordinates", "points", "zones"] {
                     if let Some(coords) = map.get(key) {
-                        collect_polygons(coords, out);
+                        collect_polygons(coords, out, invalid);
                         matched_known = true;
                     }
                 }
                 if !matched_known {
                     for nested in map.values() {
-                        collect_polygons(nested, out);
+                        collect_polygons(nested, out, invalid);
                     }
                 }
             }
-            _ => {}
+            serde_json::Value::Null => {}
+            _ => {
+                *invalid = true;
+            }
         }
     }
 
     let mut polys: Vec<Vec<f32>> = Vec::new();
-    collect_polygons(privacy_mask, &mut polys);
-    let mut filters = Vec::new();
+    let mut invalid = false;
+    collect_polygons(privacy_mask, &mut polys, &mut invalid);
+    if invalid || polys.is_empty() {
+        return None;
+    }
+
+    let mut filters = Vec::with_capacity(polys.len());
     for nums in polys {
-        if nums.len() < 4 || !nums.len().is_multiple_of(2) {
-            continue;
+        if nums.len() < 4 || !nums.len().is_multiple_of(2) || nums.iter().any(|n| !n.is_finite()) {
+            return None;
         }
-        let mut x_min = f32::MAX;
-        let mut y_min = f32::MAX;
-        let mut x_max = f32::MIN;
-        let mut y_max = f32::MIN;
+        let mut raw_x_min = f32::MAX;
+        let mut raw_y_min = f32::MAX;
+        let mut raw_x_max = f32::MIN;
+        let mut raw_y_max = f32::MIN;
         for &[px, py] in nums.as_chunks::<2>().0 {
-            x_min = x_min.min(px);
-            y_min = y_min.min(py);
-            x_max = x_max.max(px);
-            y_max = y_max.max(py);
+            raw_x_min = raw_x_min.min(px);
+            raw_y_min = raw_y_min.min(py);
+            raw_x_max = raw_x_max.max(px);
+            raw_y_max = raw_y_max.max(py);
         }
-        if x_max > x_min && y_max > y_min {
-            if x_min >= 0.0 && y_min >= 0.0 && x_max <= 1.0 && y_max <= 1.0 {
-                filters.push(format!(
-                    "drawbox=x=iw*{x_min:.3}:y=ih*{y_min:.3}:w=iw*{:.3}:h=ih*{:.3}:color=#0c0e12@1.0:t=fill",
-                    x_max - x_min,
-                    y_max - y_min
-                ));
-            } else {
-                filters.push(format!(
-                    "drawbox=x={}:y={}:w={}:h={}:color=#0c0e12@1.0:t=fill",
-                    x_min as u32,
-                    y_min as u32,
-                    (x_max - x_min) as u32,
-                    (y_max - y_min) as u32
-                ));
+        if raw_x_max <= raw_x_min || raw_y_max <= raw_y_min {
+            return None;
+        }
+        if raw_x_min >= -1.0 && raw_y_min >= -1.0 && raw_x_max <= 2.0 && raw_y_max <= 2.0 {
+            let x_min = raw_x_min.clamp(0.0, 1.0);
+            let y_min = raw_y_min.clamp(0.0, 1.0);
+            let x_max = raw_x_max.clamp(0.0, 1.0);
+            let y_max = raw_y_max.clamp(0.0, 1.0);
+            let w = x_max - x_min;
+            let h = y_max - y_min;
+            if w < 0.001 || h < 0.001 {
+                return None;
             }
+            filters.push(format!(
+                "drawbox=x=iw*{x_min:.3}:y=ih*{y_min:.3}:w=iw*{w:.3}:h=ih*{h:.3}:color=#0c0e12@1.0:t=fill"
+            ));
+        } else {
+            let x_min = raw_x_min.clamp(0.0, 65535.0).floor() as u32;
+            let y_min = raw_y_min.clamp(0.0, 65535.0).floor() as u32;
+            let x_max = raw_x_max.clamp(0.0, 65535.0).ceil() as u32;
+            let y_max = raw_y_max.clamp(0.0, 65535.0).ceil() as u32;
+            if x_max <= x_min || y_max <= y_min {
+                return None;
+            }
+            filters.push(format!(
+                "drawbox=x={x_min}:y={y_min}:w={}:h={}:color=#0c0e12@1.0:t=fill",
+                x_max - x_min,
+                y_max - y_min
+            ));
         }
     }
     if filters.is_empty() {
@@ -2627,7 +2929,7 @@ pub async fn build_mp4_export_with_privacy(
         privacy_mask,
     )
     .await;
-    if res.is_err() {
+    if res.is_err() && is_safe_identifier(export_id) {
         let _ = db.delete_export(export_id);
     }
     res
@@ -2638,9 +2940,20 @@ pub fn build_export_temp_paths(
     export_id: &str,
     nonce: u64,
 ) -> (PathBuf, PathBuf) {
-    let tmp_out_file = exports_dir.join(format!(".{export_id}.{nonce:016x}.tmp.mp4"));
+    let safe_id: String = export_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_id = safe_id.replace("..", "_");
+    let tmp_out_file = exports_dir.join(format!(".{safe_id}.{nonce:016x}.tmp.mp4"));
     let list_file =
-        std::env::temp_dir().join(format!("ninjanvr-export-{export_id}-{nonce:016x}.txt"));
+        std::env::temp_dir().join(format!("ninjanvr-export-{safe_id}-{nonce:016x}.txt"));
     (tmp_out_file, list_file)
 }
 
@@ -2665,6 +2978,16 @@ async fn build_mp4_export_inner(
             let _ = std::fs::remove_file(&self.list_file);
             let _ = std::fs::remove_file(&self.tmp_out_file);
         }
+    }
+
+    if !is_safe_identifier(export_id) {
+        anyhow::bail!("unsafe export_id: {export_id}");
+    }
+    if !is_safe_identifier(camera) {
+        anyhow::bail!("unsafe camera identifier: {camera}");
+    }
+    if !start_time.is_finite() || !end_time.is_finite() || end_time < start_time {
+        anyhow::bail!("invalid export time range [{start_time}, {end_time}]");
     }
 
     let mut segments = db.query_recordings(camera, start_time, end_time)?;
@@ -2699,16 +3022,19 @@ async fn build_mp4_export_inner(
         } else {
             PathBuf::from(&seg.path)
         };
-        if let (Some(root_canon), Ok(seg_canon)) =
-            (&canon_media_dir, std::fs::canonicalize(&local_path))
+        if std::fs::symlink_metadata(&local_path)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false)
+            && let (Some(root_canon), Ok(seg_canon)) =
+                (&canon_media_dir, std::fs::canonicalize(&local_path))
             && seg_canon.starts_with(root_canon)
             && seg_canon.is_file()
+            && let Some(line) = format_ffmpeg_concat_file_line(&seg_canon)
         {
             if first_seg_start.is_none() {
                 first_seg_start = Some(seg.start_time);
             }
-            let escaped = seg_canon.to_string_lossy().replace('\'', "'\\''");
-            list_content.push_str(&format!("file '{escaped}'\n"));
+            list_content.push_str(&line);
             existing_paths.push(seg_canon);
         }
     }
@@ -2723,7 +3049,7 @@ async fn build_mp4_export_inner(
     let trim_offset = first_seg_start
         .map(|s0| (start_time - s0).max(0.0))
         .unwrap_or(0.0);
-    let target_dur = (end_time - start_time).max(3.0);
+    let target_dur = (end_time - start_time).clamp(3.0, 86_400.0);
 
     if privacy_mask_is_configured(privacy_mask)
         && build_privacy_drawbox_filter(privacy_mask).is_none()
@@ -2744,7 +3070,10 @@ async fn build_mp4_export_inner(
         &tmp_out_file,
     );
     let mut cmd = Command::new(&ffmpeg_bin);
-    cmd.kill_on_drop(true);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     let status = cmd.args(&ffmpeg_args).status().await;
 
     let _ = std::fs::remove_file(&list_file);
@@ -2781,12 +3110,16 @@ async fn build_mp4_export_inner(
         "scale=320:-1".to_string()
     };
     let mut thumb_cmd = Command::new(&ffmpeg_bin);
-    thumb_cmd.kill_on_drop(true);
+    thumb_cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     let thumb_status = thumb_cmd
-        .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
-        .arg(&out_file)
+        .args(["-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+        .arg(sanitize_ffmpeg_path_arg(&out_file))
         .args(["-frames:v", "1", "-vf", &thumb_vf])
-        .arg(&thumb_file)
+        .arg(sanitize_ffmpeg_path_arg(&thumb_file))
         .status()
         .await;
 
@@ -4264,6 +4597,224 @@ cameras:
         assert!(
             !stale_artifact.exists(),
             "stale exhausted share link artifact must be removed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn largesize_u64_overflow_and_extended_boxes_do_not_panic_or_bypass_audio_detection() {
+        fn make_box32(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let sz = (8 + body.len()) as u32;
+            let mut out = Vec::with_capacity(sz as usize);
+            out.extend_from_slice(&sz.to_be_bytes());
+            out.extend_from_slice(btype);
+            out.extend_from_slice(body);
+            out
+        }
+
+        fn make_box64(btype: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let sz = (16 + body.len()) as u64;
+            let mut out = Vec::with_capacity(sz as usize);
+            out.extend_from_slice(&1u32.to_be_bytes());
+            out.extend_from_slice(btype);
+            out.extend_from_slice(&sz.to_be_bytes());
+            out.extend_from_slice(body);
+            out
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("ninjanvr-largesize-test-{}", random_suffix()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 1. Crafted MP4 with ftyp (24 bytes) followed by a 64-bit largesize box with size = u64::MAX - 23
+        //    (which previously panicked with integer overflow in debug or wrapped pos to 0 in release)
+        let ftyp = make_box32(b"ftyp", b"isom\x00\x00\x02\x00isom");
+        let mut wrap_mp4 = ftyp.clone();
+        wrap_mp4.extend_from_slice(&1u32.to_be_bytes());
+        wrap_mp4.extend_from_slice(b"free");
+        wrap_mp4.extend_from_slice(&(u64::MAX - (ftyp.len() as u64) + 1).to_be_bytes());
+        wrap_mp4.extend_from_slice(&[0u8; 16]);
+        let wrap_path = root.join("wrap_overflow.mp4");
+        std::fs::write(&wrap_path, &wrap_mp4).unwrap();
+
+        assert_eq!(probe_mp4_duration_fast(&wrap_path), None);
+        assert_eq!(probe_mp4_audio_dbfs_fast(&wrap_path), 0);
+        assert!(
+            mp4_file_has_audio_track(&wrap_path),
+            "corrupted u64 overflow box header must fail closed in mp4_file_has_audio_track"
+        );
+
+        // 2. MP4 where inner trak/mdia/hdlr boxes use valid 64-bit extended size headers (size32 == 1)
+        let mut hdlr_soun = vec![0u8; 24];
+        hdlr_soun[8..12].copy_from_slice(b"soun");
+        let soun_trak_64 = make_box64(
+            b"trak",
+            &make_box64(b"mdia", &make_box64(b"hdlr", &hdlr_soun)),
+        );
+        let mut mp4_64_soun = ftyp.clone();
+        mp4_64_soun.extend_from_slice(&make_box64(b"moov", &soun_trak_64));
+        let soun64_path = root.join("soun_64bit_boxes.mp4");
+        std::fs::write(&soun64_path, &mp4_64_soun).unwrap();
+        assert!(
+            mp4_file_has_audio_track(&soun64_path),
+            "64-bit extended inner boxes must not bypass audio track detection"
+        );
+
+        // 3. Multi-soun-track MP4 where first soun track has sample_count = 0 and second soun track has active audio
+        let build_soun_trak_with_samples = |count: u32, sz: u32| -> Vec<u8> {
+            let mut stsz_body = Vec::new();
+            stsz_body.extend_from_slice(&0u32.to_be_bytes());
+            stsz_body.extend_from_slice(&sz.to_be_bytes());
+            stsz_body.extend_from_slice(&count.to_be_bytes());
+            let stbl = make_box32(b"stbl", &make_box32(b"stsz", &stsz_body));
+            let minf = make_box32(b"minf", &stbl);
+            let mut mdia_children = make_box32(b"hdlr", &hdlr_soun);
+            mdia_children.extend_from_slice(&minf);
+            make_box32(b"trak", &make_box32(b"mdia", &mdia_children))
+        };
+        let mut dual_soun_moov = build_soun_trak_with_samples(0, 0);
+        dual_soun_moov.extend_from_slice(&build_soun_trak_with_samples(128, 4));
+        let mut dual_soun_mp4 = ftyp;
+        dual_soun_mp4.extend_from_slice(&make_box32(b"moov", &dual_soun_moov));
+        let dual_soun_path = root.join("dual_soun.mp4");
+        std::fs::write(&dual_soun_path, &dual_soun_mp4).unwrap();
+        assert!(
+            mp4_file_has_audio_track(&dual_soun_path),
+            "empty first soun track must not mask active second soun track"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn security_regressions_for_privacy_clamping_concat_injection_and_path_containment() {
+        // 1. Overhanging normalized privacy mask coordinates must clamp to [0.0, 1.0] instead of emitting 0x0 pixel drawbox
+        let overhang_norm = json!(["-0.02,0.20,1.02,0.20,1.02,0.80,-0.02,0.80"]);
+        let vf_overhang = build_privacy_drawbox_filter(Some(&overhang_norm))
+            .expect("overhanging normalized polygon must clamp cleanly");
+        assert_eq!(
+            vf_overhang,
+            "drawbox=x=iw*0.000:y=ih*0.200:w=iw*1.000:h=ih*0.600:color=#0c0e12@1.0:t=fill"
+        );
+
+        // 2. Negative pixel overhang must clamp x_min/y_min to 0 before computing width/height
+        let neg_pixel = json!("-50,100,300,100,300,400,-50,400");
+        let vf_neg_px = build_privacy_drawbox_filter(Some(&neg_pixel))
+            .expect("negative pixel overhang must clamp cleanly");
+        assert_eq!(
+            vf_neg_px,
+            "drawbox=x=0:y=100:w=300:h=300:color=#0c0e12@1.0:t=fill"
+        );
+
+        // 3. Multi-polygon array with one valid and one malformed polygon must fail closed (return None)
+        let partial_corrupt = json!(["0.1,0.1,0.5,0.5", "corrupt_zone"]);
+        assert_eq!(build_privacy_drawbox_filter(Some(&partial_corrupt)), None);
+        assert!(privacy_mask_is_configured(Some(&json!(true))));
+        assert_eq!(build_privacy_drawbox_filter(Some(&json!(true))), None);
+
+        // 4. FFmpeg concat line helper rejects newline / carriage-return / nul directive injection
+        assert!(format_ffmpeg_concat_file_line(Path::new("/tmp/safe_seg.mp4")).is_some());
+        assert_eq!(
+            format_ffmpeg_concat_file_line(Path::new("/tmp/evil\nfile '/etc/passwd'.mp4")),
+            None
+        );
+        assert_eq!(
+            format_ffmpeg_concat_file_line(Path::new("/tmp/evil\roption.mp4")),
+            None
+        );
+
+        // 5. Relative path starting with '-' or protocol ':' is prefixed with './' for FFmpeg CLI safety
+        let dash_args = build_mp4_export_ffmpeg_args(
+            Path::new("-list.txt"),
+            0.0,
+            10.0,
+            true,
+            Path::new("-out.mp4"),
+        );
+        assert!(dash_args.iter().any(|a| a == "./-list.txt"));
+        assert_eq!(dash_args.last().unwrap(), "./-out.mp4");
+
+        // 6. Export, cold migration, and recording retention reject path traversal and symlinks
+        let root =
+            std::env::temp_dir().join(format!("ninjanvr-sec-containment-{}", random_suffix()));
+        let media_dir = root.join("media");
+        let cold_dir = root.join("cold");
+        let outside_dir = root.join("outside");
+        std::fs::create_dir_all(media_dir.join("recordings/2026-11-01/12/front_door")).unwrap();
+        std::fs::create_dir_all(media_dir.join("exports")).unwrap();
+        std::fs::create_dir_all(media_dir.join("clips")).unwrap();
+        std::fs::create_dir_all(&cold_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+
+        let outside_victim = outside_dir.join("victim.mp4");
+        std::fs::write(&outside_victim, b"DO_NOT_DELETE_OR_MIGRATE").unwrap();
+
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+        db.insert_recording(&RecordingRow {
+            id: "rec_trav_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/../../outside/victim.mp4".to_string(),
+            start_time: 100.0,
+            end_time: 110.0,
+            duration: 10.0,
+            motion: 0,
+            objects: 0,
+            dbfs: 0,
+            segment_size: 0.1,
+            regions: 0,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        // Hot-to-cold migration must refuse '..' traversal and preserve outside_victim
+        let migrated = migrate_hot_segments_to_cold(&db, &media_dir, &cold_dir, 5000.0).unwrap();
+        assert_eq!(migrated, 0);
+        assert!(outside_victim.exists());
+
+        // RecordingEngine::remove_contained_recording_file must refuse '..' traversal and symlinks
+        let cfg = Arc::new(RwLock::new(
+            NinjaConfig::from_yaml_str("cameras: {}\n", root.join("config.yml")).unwrap(),
+        ));
+        let engine =
+            RecordingEngine::new(cfg, db.clone(), media_dir.clone(), new_activity_ledger());
+        assert!(!engine.remove_contained_recording_file(
+            "/media/ninjanvr/recordings/../../outside/victim.mp4",
+            Some(&cold_dir),
+            &media_dir.join("recordings"),
+        ));
+        assert!(outside_victim.exists());
+
+        // build_mp4_export_with_privacy must reject traversal in export_id or camera
+        assert!(
+            build_mp4_export_with_privacy(
+                &db,
+                &media_dir,
+                "../outside/pwn",
+                "front_door",
+                "Bad Export",
+                100.0,
+                110.0,
+                true,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            backup_alert_clip(
+                &db,
+                &media_dir,
+                &outside_dir,
+                "../evil_cam",
+                "person",
+                100.0,
+                110.0,
+                None,
+                false,
+            )
+            .await
+            .is_err()
         );
 
         let _ = std::fs::remove_dir_all(&root);
