@@ -14,6 +14,7 @@ pub const MAX_GOP_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_INIT_SEGMENT_BYTES: usize = 512 * 1024;
 pub const MAX_CODEC_MSG_BYTES: usize = 4096;
 pub const MAX_CACHED_STREAMS: usize = 64;
+pub const MAX_FMP4_BOXES_PER_LEVEL: usize = 256;
 pub const MAX_GOP_CACHE_AGE: Duration = Duration::from_secs(10);
 pub const PREWARM_KEEPALIVE_TTL: Duration = Duration::from_secs(45);
 pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -29,6 +30,108 @@ pub fn is_valid_stream_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn parse_exact_iso_boxes(mut buf: &[u8]) -> Option<Vec<([u8; 4], &[u8])>> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let mut out = Vec::new();
+    while !buf.is_empty() {
+        if buf.len() < 8 || out.len() >= MAX_FMP4_BOXES_PER_LEVEL {
+            return None;
+        }
+        let size32 = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let box_type = [buf[4], buf[5], buf[6], buf[7]];
+        let (box_len, hdr_len) = if size32 == 1 {
+            if buf.len() < 16 {
+                return None;
+            }
+            let size64 = u64::from_be_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]);
+            if size64 < 16 {
+                return None;
+            }
+            (usize::try_from(size64).ok()?, 16usize)
+        } else if size32 == 0 {
+            return None;
+        } else {
+            if size32 < 8 {
+                return None;
+            }
+            (size32 as usize, 8usize)
+        };
+        if box_len > buf.len() {
+            return None;
+        }
+        out.push((box_type, &buf[hdr_len..box_len]));
+        buf = &buf[box_len..];
+    }
+    Some(out)
+}
+
+/// Validates that `buf` is a structurally complete ISO-BMFF fMP4 initialization segment
+/// containing both `ftyp` and non-empty `moov` boxes, no `moof` box, and zero truncated/trailing bytes.
+pub fn is_complete_fmp4_init_segment(buf: &[u8]) -> bool {
+    if buf.is_empty() || buf.len() > MAX_INIT_SEGMENT_BYTES {
+        return false;
+    }
+    let Some(boxes) = parse_exact_iso_boxes(buf) else {
+        return false;
+    };
+    let has_ftyp = boxes
+        .iter()
+        .any(|(t, body)| t == b"ftyp" && body.len() >= 8);
+    let has_moov = boxes
+        .iter()
+        .any(|(t, body)| t == b"moov" && !body.is_empty());
+    let has_moof = boxes.iter().any(|(t, _)| t == b"moof");
+    has_ftyp && has_moov && !has_moof && ninjanvr_vod::is_fmp4_init_segment(buf)
+}
+
+/// Validates that `buf` is a structurally complete ISO-BMFF fMP4 media fragment (`moof` + `mdat`)
+/// with exact box boundaries and at least one valid `traf` (`tfhd` + `trun`).
+pub fn is_complete_fmp4_media_fragment(buf: &[u8]) -> bool {
+    if buf.is_empty() || buf.len() > MAX_GOP_BYTES {
+        return false;
+    }
+    let Some(top_boxes) = parse_exact_iso_boxes(buf) else {
+        return false;
+    };
+    let has_ftyp_or_moov = top_boxes.iter().any(|(t, _)| t == b"ftyp" || t == b"moov");
+    if has_ftyp_or_moov {
+        return false;
+    }
+    let has_mdat = top_boxes.iter().any(|(t, _)| t == b"mdat");
+    let Some((_, moof_body)) = top_boxes.iter().find(|(t, _)| t == b"moof") else {
+        return false;
+    };
+    if !has_mdat {
+        return false;
+    }
+    let Some(moof_boxes) = parse_exact_iso_boxes(moof_body) else {
+        return false;
+    };
+    let mut valid_traf = false;
+    for (btype, bbody) in &moof_boxes {
+        if btype != b"traf" {
+            continue;
+        }
+        let Some(traf_boxes) = parse_exact_iso_boxes(bbody) else {
+            return false;
+        };
+        let has_tfhd = traf_boxes
+            .iter()
+            .any(|(t, body)| t == b"tfhd" && body.len() >= 8);
+        let has_trun = traf_boxes
+            .iter()
+            .any(|(t, body)| t == b"trun" && body.len() >= 8);
+        if has_tfhd && has_trun {
+            valid_traf = true;
+        }
+    }
+    valid_traf
 }
 
 #[derive(Debug, Clone)]
@@ -75,15 +178,34 @@ impl MseGopCache {
     }
 
     pub fn ingest_text(&mut self, text: &str) -> bool {
-        if text.is_empty() || text.len() > MAX_CODEC_MSG_BYTES {
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.len() > MAX_CODEC_MSG_BYTES {
             return false;
         }
-        if text.contains("\"type\"") && text.contains("\"mse\"") {
-            self.codec_msg = Some(text.to_string());
-            self.updated_at = Instant::now();
-            return true;
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            return false;
+        };
+        if parsed.get("type").and_then(|v| v.as_str()) != Some("mse") {
+            return false;
         }
-        false
+        let Some(codec_val) = parsed.get("value").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        if codec_val.trim().is_empty() {
+            return false;
+        }
+        if self
+            .codec_msg
+            .as_deref()
+            .is_some_and(|prev| prev != trimmed)
+        {
+            self.init_segment = None;
+            self.gop_fragments.clear();
+            self.gop_bytes = 0;
+        }
+        self.codec_msg = Some(trimmed.to_string());
+        self.updated_at = Instant::now();
+        true
     }
 
     pub fn ingest_binary(&mut self, bytes: Bytes) -> bool {
@@ -94,15 +216,15 @@ impl MseGopCache {
         if bytes.is_empty() || bytes.len() > MAX_GOP_BYTES {
             return (false, None);
         }
-        if ninjanvr_vod::is_fmp4_init_segment(&bytes) {
-            if bytes.len() > MAX_INIT_SEGMENT_BYTES {
-                return (false, None);
-            }
+        if is_complete_fmp4_init_segment(&bytes) {
             self.init_segment = Some(bytes.clone());
             self.gop_fragments.clear();
             self.gop_bytes = 0;
             self.updated_at = Instant::now();
             return (false, Some(MseLivePacket::Init(bytes)));
+        }
+        if !is_complete_fmp4_media_fragment(&bytes) {
+            return (false, None);
         }
         self.last_seq = self.last_seq.wrapping_add(1);
         let seq = self.last_seq;
@@ -159,6 +281,7 @@ struct UpstreamSession {
 pub struct MseClientSubscription {
     pub burst: Option<MseGopBurst>,
     pub rx: broadcast::Receiver<MseLivePacket>,
+    pub last_seq: u64,
     active_clients: Arc<AtomicUsize>,
 }
 
@@ -171,14 +294,31 @@ impl MseClientSubscription {
         hub: &MseStreamHub,
         stream: &str,
     ) -> Result<MseLivePacket, Option<MseGopBurst>> {
-        match self.rx.recv().await {
-            Ok(pkt) => Ok(pkt),
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                let fresh = hub.get_fresh_burst(stream).await;
-                self.burst = fresh.clone();
-                Err(fresh)
+        loop {
+            match self.rx.recv().await {
+                Ok(MseLivePacket::Fragment { seq, bytes }) => {
+                    if seq <= self.last_seq {
+                        continue;
+                    }
+                    self.last_seq = seq;
+                    return Ok(MseLivePacket::Fragment { seq, bytes });
+                }
+                Ok(pkt) => return Ok(pkt),
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let (fresh, fresh_rx) = hub.resync_after_lag(stream).await;
+                    if let Some(rx) = fresh_rx {
+                        self.rx = rx;
+                    } else {
+                        while self.rx.try_recv().is_ok() {}
+                    }
+                    if let Some(ref b) = fresh {
+                        self.last_seq = self.last_seq.max(b.last_seq);
+                    }
+                    self.burst = fresh.clone();
+                    return Err(fresh);
+                }
+                Err(broadcast::error::RecvError::Closed) => return Err(None),
             }
-            Err(broadcast::error::RecvError::Closed) => Err(None),
         }
     }
 }
@@ -200,11 +340,21 @@ impl MseStreamHub {
         Self::default()
     }
 
-    fn prune_stale_caches_locked(caches: &mut HashMap<String, MseGopCache>) {
-        if caches.len() < MAX_CACHED_STREAMS {
+    fn prune_stale_caches_locked(caches: &mut HashMap<String, MseGopCache>, incoming_stream: &str) {
+        if caches.len() < MAX_CACHED_STREAMS || caches.contains_key(incoming_stream) {
             return;
         }
         caches.retain(|_, c| c.updated_at.elapsed() <= MAX_GOP_CACHE_AGE);
+        while caches.len() >= MAX_CACHED_STREAMS {
+            let Some(oldest_key) = caches
+                .iter()
+                .min_by_key(|(_, c)| c.updated_at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            caches.remove(&oldest_key);
+        }
     }
 
     pub async fn ingest_upstream_text(&self, stream: &str, text: &str) {
@@ -214,14 +364,14 @@ impl MseStreamHub {
         }
         let updated = {
             let mut guard = self.caches.write().await;
-            Self::prune_stale_caches_locked(&mut guard);
+            Self::prune_stale_caches_locked(&mut guard, stream_key);
             guard
                 .entry(stream_key.to_string())
                 .or_default()
                 .ingest_text(text)
         };
         if updated && let Some(sess) = self.sessions.read().await.get(stream_key) {
-            let _ = sess.tx.send(MseLivePacket::Codec(text.to_string()));
+            let _ = sess.tx.send(MseLivePacket::Codec(text.trim().to_string()));
         }
     }
 
@@ -232,7 +382,7 @@ impl MseStreamHub {
         }
         let (is_sync, burst_ready, pkt_opt) = {
             let mut guard = self.caches.write().await;
-            Self::prune_stale_caches_locked(&mut guard);
+            Self::prune_stale_caches_locked(&mut guard, stream_key);
             let cache = guard.entry(stream_key.to_string()).or_default();
             let (is_sync, pkt_opt) = cache.ingest_binary_with_seq(bytes);
             (is_sync, cache.has_ready_burst(), pkt_opt)
@@ -259,6 +409,26 @@ impl MseStreamHub {
             .and_then(|c| c.snapshot_fresh_burst(MAX_GOP_CACHE_AGE))
     }
 
+    async fn resync_after_lag(
+        &self,
+        stream: &str,
+    ) -> (
+        Option<MseGopBurst>,
+        Option<broadcast::Receiver<MseLivePacket>>,
+    ) {
+        let stream_key = stream.trim();
+        if !is_valid_stream_name(stream_key) {
+            return (None, None);
+        }
+        let caches = self.caches.read().await;
+        let sessions = self.sessions.read().await;
+        let burst = caches
+            .get(stream_key)
+            .and_then(|c| c.snapshot_fresh_burst(MAX_GOP_CACHE_AGE));
+        let rx = sessions.get(stream_key).map(|s| s.tx.subscribe());
+        (burst, rx)
+    }
+
     async fn ensure_upstream_session(
         &self,
         go2rtc_ws_base: &str,
@@ -283,6 +453,23 @@ impl MseStreamHub {
                 sess.tx.subscribe(),
                 sess.active_clients.clone(),
             );
+        }
+
+        if sessions.len() >= MAX_CACHED_STREAMS {
+            sessions.retain(|_, s| {
+                s.persistent || s.active_clients.load(Ordering::SeqCst) > 0 || now < s.expires_at
+            });
+            while !persistent && sessions.len() >= MAX_CACHED_STREAMS {
+                let Some(evict_key) = sessions
+                    .iter()
+                    .filter(|(_, s)| !s.persistent && s.active_clients.load(Ordering::SeqCst) == 0)
+                    .min_by_key(|(_, s)| s.expires_at)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                sessions.remove(&evict_key);
+            }
         }
 
         let notify = Arc::new(Notify::new());
@@ -379,6 +566,7 @@ impl MseStreamHub {
         let mut sub = MseClientSubscription {
             burst: None,
             rx: initial_rx,
+            last_seq: 0,
             active_clients,
         };
 
@@ -390,20 +578,18 @@ impl MseStreamHub {
             let _ = tokio::time::timeout(Duration::from_millis(120), notified).await;
         }
 
-        // Subscribe and snapshot under the locks so `last_seq` aligns with `rx`
-        let rx_opt = {
-            let sessions = self.sessions.read().await;
-            sessions.get(stream_key).map(|s| s.tx.subscribe())
-        };
-        if let Some(fresh_rx) = rx_opt {
-            sub.rx = fresh_rx;
-        }
-        sub.burst = {
+        // Subscribe and snapshot under both read locks so `last_seq` aligns atomically with `rx`
+        {
             let caches = self.caches.read().await;
-            caches
+            let sessions = self.sessions.read().await;
+            if let Some(fresh_rx) = sessions.get(stream_key).map(|s| s.tx.subscribe()) {
+                sub.rx = fresh_rx;
+            }
+            sub.burst = caches
                 .get(stream_key)
-                .and_then(|c| c.snapshot_fresh_burst(MAX_GOP_CACHE_AGE))
-        };
+                .and_then(|c| c.snapshot_fresh_burst(MAX_GOP_CACHE_AGE));
+            sub.last_seq = sub.burst.as_ref().map(|b| b.last_seq).unwrap_or(0);
+        }
 
         Some(sub)
     }
@@ -834,5 +1020,124 @@ mod tests {
         let active_ref = sub.active_clients.clone();
         drop(sub);
         assert_eq!(active_ref.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cycle2_mse_rejects_malformed_boxes_error_json_skips_stale_post_lag_seq_and_bounds_cache_map()
+     {
+        // 1. MSE-C2-01a: Non-MSE or error JSON containing "mse" must be rejected without clobbering codec_msg
+        let mut cache = MseGopCache::new();
+        let valid_codec = r#"{"type":"mse","value":"video/mp4; codecs=\"avc1.640029\""}"#;
+        assert!(cache.ingest_text(valid_codec));
+        assert!(!cache.ingest_text(r#"{"type":"error","value":"mse codec unsupported"}"#));
+        assert!(!cache.ingest_text(r#"{"type":"mse","value":"   "}"#));
+        assert!(!cache.ingest_text(r#"not json with "type" and "mse""#));
+        assert_eq!(cache.codec_msg.as_deref(), Some(valid_codec));
+
+        // 2. MSE-C2-01b: Truncated init segment (ftyp without moov or truncated moov) & malformed fragments
+        //    must be rejected without incrementing last_seq or polluting gop_fragments
+        let init = build_test_init_segment();
+        assert!(cache.ingest_binary_with_seq(init.clone()).1.is_some());
+        let keyframe = build_test_fragment(true, &[0x55; 64]);
+        let (is_sync, pkt) = cache.ingest_binary_with_seq(keyframe.clone());
+        assert!(is_sync);
+        assert!(pkt.is_some());
+        assert_eq!(cache.last_seq, 1);
+        assert_eq!(cache.gop_fragments.len(), 1);
+
+        // ftyp alone (missing moov) must not replace init_segment or wipe gop_fragments
+        let ftyp_only = Bytes::from(make_box(b"ftyp", b"isom\x00\x00\x02\x00isomiso6dashmp41"));
+        assert!(cache.ingest_binary_with_seq(ftyp_only).1.is_none());
+        assert_eq!(cache.init_segment, Some(init.clone()));
+        assert_eq!(cache.gop_fragments.len(), 1);
+
+        // Truncated moov appended to ftyp must be rejected
+        let mut truncated_init = init.to_vec();
+        truncated_init.truncate(truncated_init.len() - 4);
+        assert!(
+            cache
+                .ingest_binary_with_seq(Bytes::from(truncated_init))
+                .1
+                .is_none()
+        );
+        assert_eq!(cache.gop_fragments.len(), 1);
+
+        // Garbage binary / truncated moof+mdat fragment must NOT be accepted as a delta frame
+        assert!(
+            cache
+                .ingest_binary_with_seq(Bytes::from_static(b"garbage_non_mp4_bytes"))
+                .1
+                .is_none()
+        );
+        let mut truncated_frag = build_test_fragment(false, &[0x66; 64]).to_vec();
+        truncated_frag.truncate(truncated_frag.len() - 5);
+        assert!(
+            cache
+                .ingest_binary_with_seq(Bytes::from(truncated_frag))
+                .1
+                .is_none()
+        );
+        assert_eq!(
+            cache.last_seq, 1,
+            "malformed fragments must not advance last_seq"
+        );
+        assert_eq!(
+            cache.gop_fragments.len(),
+            1,
+            "malformed fragments must not be appended to gop_fragments"
+        );
+
+        // 3. MSE-C2-02a: After RecvError::Lagged resync, next recv_or_resync must skip stale ring buffer
+        //    entries (seq <= refreshed_burst.last_seq) and deliver only the next new fragment (seq = 302)
+        let hub = MseStreamHub::new();
+        let stream = "driveway_sub";
+        hub.ingest_upstream_text(stream, valid_codec).await;
+        hub.ingest_upstream_binary(stream, build_test_init_segment())
+            .await;
+        hub.ingest_upstream_binary(stream, build_test_fragment(true, &[0x01; 48]))
+            .await;
+
+        let mut sub = hub
+            .subscribe_client("ws://127.0.0.1:9", stream)
+            .await
+            .unwrap();
+        for i in 0..300u16 {
+            let is_key = i == 290;
+            let payload = [(i & 0xFF) as u8; 32];
+            hub.ingest_upstream_binary(stream, build_test_fragment(is_key, &payload))
+                .await;
+        }
+        let lag_burst = sub
+            .recv_or_resync(&hub, stream)
+            .await
+            .err()
+            .flatten()
+            .expect("must resync to latest GOP burst");
+        assert_eq!(lag_burst.last_seq, 301);
+
+        // Now ingest fragment seq=302; recv_or_resync must skip stale seq 46..=301 in broadcast ring and return 302
+        hub.ingest_upstream_binary(stream, build_test_fragment(false, &[0xFE; 32]))
+            .await;
+        match sub.recv_or_resync(&hub, stream).await {
+            Ok(MseLivePacket::Fragment { seq, .. }) => {
+                assert_eq!(
+                    seq, 302,
+                    "recv_or_resync must skip stale pre-burst fragments in ring buffer"
+                );
+            }
+            other => panic!("expected Fragment seq=302, got {other:?}"),
+        }
+
+        // 4. MSE-C2-02b: Ingesting > MAX_CACHED_STREAMS fresh streams within MAX_GOP_CACHE_AGE
+        //    must strictly bound caches.len() <= MAX_CACHED_STREAMS via LRU eviction
+        for idx in 0..(MAX_CACHED_STREAMS + 20) {
+            let s_name = format!("cam_burst_{idx:03}");
+            hub.ingest_upstream_text(&s_name, valid_codec).await;
+        }
+        let cache_count = hub.caches.read().await.len();
+        assert!(
+            cache_count <= MAX_CACHED_STREAMS,
+            "caches map len ({cache_count}) must never exceed MAX_CACHED_STREAMS ({MAX_CACHED_STREAMS})"
+        );
     }
 }

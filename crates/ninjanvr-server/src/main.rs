@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,13 +7,13 @@ use anyhow::{Context, Result};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
-use ninjanvr_config::DEFAULT_CONFIG_PATH;
+use ninjanvr_config::{DEFAULT_CONFIG_PATH, DEFAULT_GO2RTC_SHM_PATH};
 use ninjanvr_server::{
     build_router_with_auth, generate_self_signed_tls_config,
     generate_self_signed_tls_config_with_sans, new_app_state,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tracing::{error, info, warn};
@@ -22,13 +22,16 @@ pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HTTP1_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+pub const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 128;
+pub const HTTP2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+pub const MAX_PRIVATE_KEY_FILE_BYTES: u64 = 256 * 1024;
 
 /// Strips any client-supplied `x-peer-ip` headers (plus spoofing variants) and injects the
-/// verified TCP socket peer IP so downstream rate limiters, proxy auth, and audit logs
-/// never trust a client-controlled `x-peer-ip` header on either HTTP (`:5000`) or HTTPS (`:8971`).
+/// verified TCP socket peer IP (canonicalizing IPv4-mapped IPv6 addresses) so downstream rate limiters,
+/// proxy auth, and audit logs never trust a client-controlled `x-peer-ip` header on either HTTP (`:5000`) or HTTPS (`:8971`).
 pub fn sanitize_peer_ip_and_host_headers<B>(req: &mut Request<B>, remote_addr: SocketAddr) {
     while req.headers_mut().remove("x-peer-ip").is_some() {}
-    let peer_ip_str = remote_addr.ip().to_string();
+    let peer_ip_str = remote_addr.ip().to_canonical().to_string();
     if let Ok(val) = hyper::header::HeaderValue::from_str(&peer_ip_str) {
         req.headers_mut().insert("x-peer-ip", val);
     }
@@ -52,40 +55,82 @@ pub async fn accept_tls_with_timeout(
     }
 }
 
+fn is_valid_san_dns_name(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    let body = if let Some(rest) = s.strip_prefix("*.") {
+        if rest.is_empty() || !rest.contains('.') {
+            return false;
+        }
+        rest
+    } else {
+        s
+    };
+    if body.contains('*') || body.starts_with('.') || body.ends_with('.') {
+        return false;
+    }
+    for label in body.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Normalizes and filters configured `tls.san_hosts` entries so malformed URLs, ports,
-/// or control characters in `config.yml` cannot crash TLS startup.
+/// or control characters in `config.yml` cannot crash TLS startup or poison valid SAN entries.
 pub fn sanitize_san_hosts(raw_sans: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for raw in raw_sans {
         let mut s = raw.trim();
-        if let Some(rest) = s
-            .strip_prefix("https://")
-            .or_else(|| s.strip_prefix("http://"))
-        {
-            s = rest;
+        if s.len() >= 8 && s[..8].eq_ignore_ascii_case("https://") {
+            s = &s[8..];
+        } else if s.len() >= 7 && s[..7].eq_ignore_ascii_case("http://") {
+            s = &s[7..];
         }
-        if let Some((host_port, _)) = s.split_once('/') {
-            s = host_port;
+        if let Some((before_delim, _)) = s.split_once(['/', '?', '#']) {
+            s = before_delim;
+        }
+        if s.contains('@') || s.contains('\\') {
+            continue;
         }
         // Strip `:port` for bracketed IPv6 `[::1]:8971` or unbracketed IPv4/DNS `host:8971`
         if let Some(stripped_v6) = s.strip_prefix('[') {
-            if let Some((v6_host, _)) = stripped_v6.split_once(']') {
-                s = v6_host;
+            let Some((v6_host, port_rest)) = stripped_v6.split_once(']') else {
+                continue;
+            };
+            if !port_rest.is_empty() {
+                let Some(port_str) = port_rest.strip_prefix(':') else {
+                    continue;
+                };
+                if !port_str.parse::<u16>().is_ok_and(|p| p > 0) {
+                    continue;
+                }
             }
-        } else if s.matches(':').count() == 1
-            && let Some((host, port)) = s.split_once(':')
-            && port.chars().all(|c| c.is_ascii_digit())
-        {
+            s = v6_host;
+        } else if s.matches(':').count() == 1 {
+            let Some((host, port)) = s.split_once(':') else {
+                continue;
+            };
+            if !port.parse::<u16>().is_ok_and(|p| p > 0) {
+                continue;
+            }
             s = host;
         }
         let s = s.trim();
         if s.is_empty() || s.len() > 253 {
             continue;
         }
-        let valid_chars = s
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':' || c == '*');
-        if valid_chars
+        let is_valid = s.parse::<IpAddr>().is_ok() || is_valid_san_dns_name(s);
+        if is_valid
             && !out
                 .iter()
                 .any(|existing: &String| existing.eq_ignore_ascii_case(s))
@@ -96,9 +141,16 @@ pub fn sanitize_san_hosts(raw_sans: &[String]) -> Vec<String> {
     out
 }
 
-/// Validates that a TLS private key file on disk is a regular file (not a symlink) and
-/// enforces `0600` owner-only permissions on Unix platforms.
+/// Validates that a TLS private key file on disk is a non-empty regular file (not a symlink or parent traversal)
+/// and enforces `0600` owner-only permissions on Unix platforms.
 pub fn ensure_private_key_permissions(key_path: &Path) -> Result<()> {
+    if key_path.as_os_str().is_empty()
+        || key_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+    {
+        anyhow::bail!("unsafe TLS private key path {}", key_path.display());
+    }
     let meta = std::fs::symlink_metadata(key_path)
         .with_context(|| format!("failed to stat TLS private key {}", key_path.display()))?;
     if meta.file_type().is_symlink() {
@@ -111,6 +163,13 @@ pub fn ensure_private_key_permissions(key_path: &Path) -> Result<()> {
         anyhow::bail!(
             "TLS private key path {} is not a regular file",
             key_path.display()
+        );
+    }
+    if meta.len() == 0 || meta.len() > MAX_PRIVATE_KEY_FILE_BYTES {
+        anyhow::bail!(
+            "TLS private key {} has invalid file size ({} bytes)",
+            key_path.display(),
+            meta.len()
         );
     }
     #[cfg(unix)]
@@ -131,10 +190,19 @@ pub fn ensure_private_key_permissions(key_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Validates that a configuration path is not a directory or dangling/unsafe path.
+/// Validates that a configuration path is not empty, does not traverse `..`, and is a regular file when present.
 pub fn validate_config_file_path(config_path: &Path) -> Result<()> {
     if config_path.as_os_str().is_empty() {
         anyhow::bail!("configuration file path must not be empty");
+    }
+    if config_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        anyhow::bail!(
+            "refusing configuration path with parent directory traversal: {}",
+            config_path.display()
+        );
     }
     if let Ok(meta) = std::fs::symlink_metadata(config_path) {
         if meta.file_type().is_symlink() {
@@ -149,63 +217,62 @@ pub fn validate_config_file_path(config_path: &Path) -> Result<()> {
                 config_path.display()
             );
         }
+        if !meta.file_type().is_file() {
+            anyhow::bail!(
+                "configuration path {} is not a regular file",
+                config_path.display()
+            );
+        }
     }
     Ok(())
 }
 
-#[tokio::main(worker_threads = 4)]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCliArgs {
+    pub config_path: PathBuf,
+    pub web_dir: PathBuf,
+    pub media_dir: PathBuf,
+    pub http_port: u16,
+    pub https_port: u16,
+    pub validate_only: bool,
+}
 
-    let mut config_path = PathBuf::from(
-        std::env::var("CONFIG_FILE").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string()),
-    );
-    let mut web_dir = PathBuf::from(
-        std::env::var("NINJANVR_WEB_V2_DIR")
-            .or_else(|_| std::env::var("NINJANVR_WEB_DIR"))
-            .unwrap_or_else(|_| "/opt/ninjanvr/web-v2".to_string()),
-    );
-    let mut media_dir = PathBuf::from(
-        std::env::var("NINJANVR_MEDIA_DIR").unwrap_or_else(|_| "/media/ninjanvr".to_string()),
-    );
-    let mut http_port: u16 = std::env::var("NINJANVR_HTTP_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .filter(|&p| p > 0)
-        .unwrap_or(5000);
-    let mut https_port: u16 = std::env::var("NINJANVR_HTTPS_PORT")
-        .ok()
-        .and_then(|s| s.parse::<u16>().ok())
-        .filter(|&p| p > 0)
-        .unwrap_or(8971);
-
-    let mut args = std::env::args().skip(1);
+/// Parses CLI flags (`--config`, `--web-dir`, `--media-dir`, `--http-port`, `--https-port`, `--validate-config`)
+/// independently of argument ordering so `--validate-config --config <path>` always validates `<path>`.
+pub fn parse_cli_args<I>(
+    raw_args: I,
+    mut config_path: PathBuf,
+    mut web_dir: PathBuf,
+    mut media_dir: PathBuf,
+    mut http_port: u16,
+    mut https_port: u16,
+) -> ParsedCliArgs
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut validate_only = false;
+    let mut args = raw_args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {
                 if let Some(v) = args.next()
                     && !v.trim().is_empty()
                 {
-                    config_path = PathBuf::from(v);
+                    config_path = PathBuf::from(v.trim());
                 }
             }
             "--web-dir" => {
                 if let Some(v) = args.next()
                     && !v.trim().is_empty()
                 {
-                    web_dir = PathBuf::from(v);
+                    web_dir = PathBuf::from(v.trim());
                 }
             }
             "--media-dir" => {
                 if let Some(v) = args.next()
                     && !v.trim().is_empty()
                 {
-                    media_dir = PathBuf::from(v);
+                    media_dir = PathBuf::from(v.trim());
                 }
             }
             "--http-port" => {
@@ -225,19 +292,129 @@ async fn main() -> Result<()> {
                 }
             }
             "--validate-config" => {
-                validate_config_file_path(&config_path)?;
-                ninjanvr_config::NinjaConfig::load(&config_path)?;
-                println!("Config is valid: {}", config_path.display());
-                return Ok(());
+                validate_only = true;
             }
             _ => {}
         }
+    }
+    ParsedCliArgs {
+        config_path,
+        web_dir,
+        media_dir,
+        http_port,
+        https_port,
+        validate_only,
+    }
+}
+
+/// Terminates supervised child processes (`go2rtc` and camera decoder `ffmpeg` PIDs) and removes
+/// the ephemeral `/dev/shm/go2rtc.yaml` file containing unredacted camera credentials on shutdown.
+pub fn cleanup_supervised_processes_and_shm(
+    go2rtc_pid: u32,
+    camera_pids: &[u32],
+    shm_config_path: &Path,
+) {
+    let self_pid = std::process::id();
+    for &pid in std::iter::once(&go2rtc_pid).chain(camera_pids.iter()) {
+        if pid > 1 && pid != self_pid {
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    if std::fs::symlink_metadata(shm_config_path)
+        .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink())
+    {
+        let _ = std::fs::write(shm_config_path, b"");
+        let _ = std::fs::remove_file(shm_config_path);
+    }
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, initiating graceful shutdown");
+            }
+            _ = async {
+                if let Some(ref mut s) = sigterm {
+                    s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                info!("Received SIGTERM, initiating graceful shutdown");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Received SIGINT, initiating graceful shutdown");
+    }
+}
+
+#[tokio::main(worker_threads = 4)]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let default_config_path = PathBuf::from(
+        std::env::var("CONFIG_FILE").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string()),
+    );
+    let default_web_dir = PathBuf::from(
+        std::env::var("NINJANVR_WEB_V2_DIR")
+            .or_else(|_| std::env::var("NINJANVR_WEB_DIR"))
+            .unwrap_or_else(|_| "/opt/ninjanvr/web-v2".to_string()),
+    );
+    let default_media_dir = PathBuf::from(
+        std::env::var("NINJANVR_MEDIA_DIR").unwrap_or_else(|_| "/media/ninjanvr".to_string()),
+    );
+    let default_http_port: u16 = std::env::var("NINJANVR_HTTP_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|&p| p > 0)
+        .unwrap_or(5000);
+    let default_https_port: u16 = std::env::var("NINJANVR_HTTPS_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|&p| p > 0)
+        .unwrap_or(8971);
+
+    let parsed = parse_cli_args(
+        std::env::args().skip(1),
+        default_config_path,
+        default_web_dir,
+        default_media_dir,
+        default_http_port,
+        default_https_port,
+    );
+    let config_path = parsed.config_path;
+    let mut web_dir = parsed.web_dir;
+    let media_dir = parsed.media_dir;
+    let http_port = parsed.http_port;
+    let https_port = parsed.https_port;
+
+    validate_config_file_path(&config_path)?;
+    if parsed.validate_only {
+        ninjanvr_config::NinjaConfig::load(&config_path)?;
+        println!("Config is valid: {}", config_path.display());
+        return Ok(());
     }
 
     if http_port == https_port {
         anyhow::bail!("HTTP port ({http_port}) and HTTPS port ({https_port}) must be distinct");
     }
-    validate_config_file_path(&config_path)?;
 
     if !web_dir.exists() {
         let fallback_dist = PathBuf::from("web-v2/dist");
@@ -261,24 +438,40 @@ async fn main() -> Result<()> {
     );
 
     let state = new_app_state(&config_path, web_dir, media_dir, spawn_go2rtc).await?;
-    let raw_san_hosts = state.config.read().await.tls.san_hosts.clone();
+    let (raw_san_hosts, mqtt_client_key) = {
+        let cfg = state.config.read().await;
+        (cfg.tls.san_hosts.clone(), cfg.mqtt.tls_client_key.clone())
+    };
+    if let Some(ref key_path) = mqtt_client_key
+        && key_path.exists()
+        && let Err(err) = ensure_private_key_permissions(key_path)
+    {
+        warn!("MQTT TLS private key permission check warning: {err:#}");
+    }
     let san_hosts = sanitize_san_hosts(&raw_san_hosts);
+    let go2rtc_supervisor = state.go2rtc_supervisor.clone();
+    let camera_metrics = state.camera_metrics.clone();
     let app_http = build_router_with_auth(state.clone(), false);
     let app_https = build_router_with_auth(state, true);
+    let shutdown_notify = Arc::new(Notify::new());
 
     // 1. Spawn HTTP server on :5000 (internal / healthcheck port) with strict x-peer-ip sanitization
     let http_addr = SocketAddr::from(([0, 0, 0, 0], http_port));
     let http_listener = TcpListener::bind(http_addr).await?;
     let http_conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let http_shutdown = shutdown_notify.clone();
     info!("Listening on HTTP http://{http_addr}");
     tokio::spawn(async move {
         loop {
-            let (tcp_stream, remote_addr) = match http_listener.accept().await {
-                Ok(conn) => conn,
-                Err(err) => {
-                    error!("HTTP accept error: {err:#}");
-                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                    continue;
+            let (tcp_stream, remote_addr) = tokio::select! {
+                _ = http_shutdown.notified() => break,
+                res = http_listener.accept() => match res {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        error!("HTTP accept error: {err:#}");
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    }
                 }
             };
             let Ok(permit) = http_conn_sem.clone().try_acquire_owned() else {
@@ -300,6 +493,11 @@ async fn main() -> Result<()> {
                     .http1()
                     .timer(TokioTimer::new())
                     .header_read_timeout(HTTP1_HEADER_READ_TIMEOUT);
+                builder
+                    .http2()
+                    .timer(TokioTimer::new())
+                    .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS)
+                    .max_header_list_size(HTTP2_MAX_HEADER_LIST_SIZE);
                 let _ = builder
                     .serve_connection_with_upgrades(io, hyper_service)
                     .await;
@@ -323,13 +521,22 @@ async fn main() -> Result<()> {
     let https_conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     info!("Listening on HTTPS https://{https_addr}");
 
+    let shutdown_signal = wait_for_shutdown_signal();
+    tokio::pin!(shutdown_signal);
+
     loop {
-        let (tcp_stream, remote_addr) = match https_listener.accept().await {
-            Ok(conn) => conn,
-            Err(err) => {
-                error!("HTTPS accept error: {err:#}");
-                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                continue;
+        let (tcp_stream, remote_addr) = tokio::select! {
+            _ = &mut shutdown_signal => {
+                shutdown_notify.notify_waiters();
+                break;
+            }
+            res = https_listener.accept() => match res {
+                Ok(conn) => conn,
+                Err(err) => {
+                    error!("HTTPS accept error: {err:#}");
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    continue;
+                }
             }
         };
 
@@ -358,11 +565,29 @@ async fn main() -> Result<()> {
                 .http1()
                 .timer(TokioTimer::new())
                 .header_read_timeout(HTTP1_HEADER_READ_TIMEOUT);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS)
+                .max_header_list_size(HTTP2_MAX_HEADER_LIST_SIZE);
             let _ = builder
                 .serve_connection_with_upgrades(io, hyper_service)
                 .await;
         });
     }
+
+    let cam_pids: Vec<u32> = camera_metrics
+        .read()
+        .await
+        .values()
+        .map(|m| m.pid)
+        .collect();
+    cleanup_supervised_processes_and_shm(
+        go2rtc_supervisor.pid(),
+        &cam_pids,
+        Path::new(DEFAULT_GO2RTC_SHM_PATH),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -461,6 +686,99 @@ mod tests {
                 "symlinked private key must be rejected"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn cycle2_main_sanitizes_malformed_sans_validates_cli_order_and_cleans_up_shm() {
+        // 1. MAIN-C2-02a: Uppercase schemes, query/fragment suffixes, and wildcard SANs are normalized,
+        //    while poisoned entries ("host:badport", "-bad.host", "bad..host", "*.*.example.com", "user@host")
+        //    are filtered out so rcgen never fails on the remaining valid SAN list
+        let raw_sans = vec![
+            "HTTPS://cam.example.com:8971?foo=1#bar".to_string(),
+            "*.sub.example.com".to_string(),
+            "host:badport".to_string(),
+            "-leading-hyphen.local".to_string(),
+            "double..dot.local".to_string(),
+            "*.*.example.com".to_string(),
+            "*.tldonly".to_string(),
+            "admin:pass@nvr.local".to_string(),
+            "[2001:db8::5]:0".to_string(),
+            "[2001:db8::5]:8971".to_string(),
+        ];
+        let cleaned = sanitize_san_hosts(&raw_sans);
+        assert_eq!(
+            cleaned,
+            vec![
+                "cam.example.com".to_string(),
+                "*.sub.example.com".to_string(),
+                "2001:db8::5".to_string(),
+            ]
+        );
+        assert!(
+            generate_self_signed_tls_config_with_sans(&cleaned).is_ok(),
+            "cleaned SANs must always succeed in rcgen certificate generation"
+        );
+
+        // 2. MAIN-C2-01a: IPv4-mapped IPv6 peer addresses (::ffff:198.51.100.7) are canonicalized to IPv4
+        let mut req = Request::builder().uri("/api/stats").body(()).unwrap();
+        let mapped_peer: SocketAddr = "[::ffff:198.51.100.7]:44321".parse().unwrap();
+        sanitize_peer_ip_and_host_headers(&mut req, mapped_peer);
+        assert_eq!(
+            req.headers().get("x-peer-ip").and_then(|v| v.to_str().ok()),
+            Some("198.51.100.7")
+        );
+
+        // 3. MAIN-C2-02b: --validate-config before --config <path> must still honor the custom --config path
+        let cli = parse_cli_args(
+            vec![
+                "--validate-config".to_string(),
+                "--config".to_string(),
+                "/custom/ninjanvr.yml".to_string(),
+                "--http-port".to_string(),
+                "5080".to_string(),
+                "--https-port".to_string(),
+                "8443".to_string(),
+            ],
+            PathBuf::from("/config/config.yml"),
+            PathBuf::from("/opt/ninjanvr/web-v2"),
+            PathBuf::from("/media/ninjanvr"),
+            5000,
+            8971,
+        );
+        assert!(cli.validate_only);
+        assert_eq!(cli.config_path, PathBuf::from("/custom/ninjanvr.yml"));
+        assert_eq!(cli.http_port, 5080);
+        assert_eq!(cli.https_port, 8443);
+
+        // 4. MAIN-C2-02c: Empty private key file and parent-traversal paths must be rejected
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-main-c2-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let empty_key = tmp_dir.join("empty.key");
+        std::fs::write(&empty_key, b"").unwrap();
+        assert!(
+            ensure_private_key_permissions(&empty_key).is_err(),
+            "0-byte TLS private key must be rejected"
+        );
+        assert!(
+            validate_config_file_path(Path::new("/config/../etc/passwd")).is_err(),
+            "parent traversal in config path must be rejected"
+        );
+
+        // 5. MAIN-C2-01b: cleanup_supervised_processes_and_shm wipes and removes /dev/shm/go2rtc.yaml
+        let shm_file = tmp_dir.join("go2rtc.yaml");
+        std::fs::write(
+            &shm_file,
+            b"streams:\n  cam: rtsp://admin:secret@192.0.2.1/main\n",
+        )
+        .unwrap();
+        cleanup_supervised_processes_and_shm(0, &[], &shm_file);
+        assert!(
+            !shm_file.exists(),
+            "ephemeral go2rtc shm config must be removed on supervisor shutdown"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
