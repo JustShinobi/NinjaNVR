@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ninjanvr_config::MqttConfig;
+use ninjanvr_config::{MqttConfig, is_safe_tls_path};
 use rumqttc::{
     AsyncClient, Event as MqttEvent, LastWill, MqttOptions, Packet, QoS, TlsConfiguration,
     Transport,
@@ -11,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info};
+
+const MAX_TRACKED_CAMERAS: usize = 256;
+const MAX_ROI_STATES_PER_CAMERA: usize = 64;
+const MAX_LOG_SERVICES: usize = 16;
+const MQTT_QUEUE_CAPACITY: usize = 512;
+const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsMessage {
@@ -73,8 +80,9 @@ fn default_camera_activity_entry() -> Value {
 #[derive(Clone)]
 pub struct CommsHub {
     ws_tx: broadcast::Sender<String>,
-    mqtt_tx: mpsc::UnboundedSender<(String, Vec<u8>, bool)>,
+    mqtt_tx: mpsc::Sender<(String, Vec<u8>, bool)>,
     camera_states: Arc<RwLock<BTreeMap<String, Value>>>,
+    initialized_from_config: Arc<AtomicBool>,
     active_profile: Arc<RwLock<String>>,
     profile_persist_path: Arc<RwLock<Option<std::path::PathBuf>>>,
 }
@@ -92,7 +100,9 @@ fn is_valid_mqtt_publish_topic(topic: &str) -> bool {
         && !trimmed
             .chars()
             .any(|c| c == '+' || c == '#' || c.is_control())
-        && !trimmed.split('/').any(|seg| seg.is_empty() || seg == "..")
+        && !trimmed
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
 }
 
 fn is_valid_topic_segment(seg: &str) -> bool {
@@ -114,16 +124,17 @@ fn is_valid_profile_name(name: &str) -> bool {
 }
 
 fn sanitize_mqtt_prefix(raw: &str) -> String {
-    let cleaned: String = raw
+    let cleaned_segs: Vec<&str> = raw
         .trim()
         .trim_matches('/')
-        .chars()
-        .filter(|c| !c.is_control() && *c != '+' && *c != '#')
+        .split('/')
+        .map(str::trim)
+        .filter(|seg| is_valid_topic_segment(seg))
         .collect();
-    if cleaned.is_empty() {
+    if cleaned_segs.is_empty() {
         "ninjanvr".to_string()
     } else {
-        cleaned
+        cleaned_segs.join("/")
     }
 }
 
@@ -143,11 +154,12 @@ fn sanitize_mqtt_client_id(raw: &str) -> String {
 impl CommsHub {
     pub fn new() -> Self {
         let (ws_tx, _) = broadcast::channel(512);
-        let (mqtt_tx, _rx) = mpsc::unbounded_channel();
+        let (mqtt_tx, _rx) = mpsc::channel(MQTT_QUEUE_CAPACITY);
         Self {
             ws_tx,
             mqtt_tx,
             camera_states: Arc::new(RwLock::new(BTreeMap::new())),
+            initialized_from_config: Arc::new(AtomicBool::new(false)),
             active_profile: Arc::new(RwLock::new("armed".to_string())),
             profile_persist_path: Arc::new(RwLock::new(None)),
         }
@@ -155,11 +167,12 @@ impl CommsHub {
 
     pub fn with_mqtt(mqtt_cfg: &MqttConfig) -> Self {
         let (ws_tx, _) = broadcast::channel(512);
-        let (mqtt_tx, mqtt_rx) = mpsc::unbounded_channel();
+        let (mqtt_tx, mqtt_rx) = mpsc::channel(MQTT_QUEUE_CAPACITY);
         let hub = Self {
             ws_tx,
             mqtt_tx,
             camera_states: Arc::new(RwLock::new(BTreeMap::new())),
+            initialized_from_config: Arc::new(AtomicBool::new(false)),
             active_profile: Arc::new(RwLock::new("armed".to_string())),
             profile_persist_path: Arc::new(RwLock::new(None)),
         };
@@ -198,7 +211,7 @@ impl CommsHub {
         self.publish_ws_only(topic, payload_str.clone());
         let _ = self
             .mqtt_tx
-            .send((topic.to_string(), payload_str.into_bytes(), false));
+            .try_send((topic.to_string(), payload_str.into_bytes(), false));
     }
 
     pub fn publish_json(&self, topic: &str, value: &Value) {
@@ -211,7 +224,7 @@ impl CommsHub {
         if !is_valid_mqtt_publish_topic(topic) {
             return;
         }
-        let _ = self.mqtt_tx.send((topic.to_string(), bytes, retain));
+        let _ = self.mqtt_tx.try_send((topic.to_string(), bytes, retain));
     }
 
     /// Updates per-camera online/offline connectivity state and publishes `<camera>/available`
@@ -226,6 +239,9 @@ impl CommsHub {
                 .camera_states
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
+            if !map.contains_key(camera) && map.len() >= MAX_TRACKED_CAMERAS {
+                return false;
+            }
             let entry = map
                 .entry(camera.to_string())
                 .or_insert_with(default_camera_activity_entry);
@@ -257,6 +273,9 @@ impl CommsHub {
                 .camera_states
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
+            if !map.contains_key(camera) && map.len() >= MAX_TRACKED_CAMERAS {
+                return false;
+            }
             let entry = map
                 .entry(camera.to_string())
                 .or_insert_with(default_camera_activity_entry);
@@ -292,6 +311,9 @@ impl CommsHub {
                 .camera_states
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
+            if !map.contains_key(camera) && map.len() >= MAX_TRACKED_CAMERAS {
+                return;
+            }
             let entry = map
                 .entry(camera.to_string())
                 .or_insert_with(default_camera_activity_entry);
@@ -320,6 +342,9 @@ impl CommsHub {
                 .camera_states
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
+            if !map.contains_key(camera) && map.len() >= MAX_TRACKED_CAMERAS {
+                return;
+            }
             let entry = map
                 .entry(camera.to_string())
                 .or_insert_with(default_camera_activity_entry);
@@ -328,7 +353,10 @@ impl CommsHub {
                 if !states_entry.is_object() {
                     *states_entry = json!({});
                 }
-                if let Some(states_obj) = states_entry.as_object_mut() {
+                if let Some(states_obj) = states_entry.as_object_mut()
+                    && (states_obj.contains_key(roi_name)
+                        || states_obj.len() < MAX_ROI_STATES_PER_CAMERA)
+                {
                     states_obj.insert(roi_name.to_string(), json!(state));
                 }
             }
@@ -377,7 +405,14 @@ impl CommsHub {
             .camera_states
             .write()
             .unwrap_or_else(|e| e.into_inner());
+        map.retain(|k, _| cfg.cameras.contains_key(k) && is_valid_topic_segment(k));
         for (cam_name, cam_cfg) in &cfg.cameras {
+            if !is_valid_topic_segment(cam_name) {
+                continue;
+            }
+            if !map.contains_key(cam_name) && map.len() >= MAX_TRACKED_CAMERAS {
+                break;
+            }
             let entry = map
                 .entry(cam_name.clone())
                 .or_insert_with(default_camera_activity_entry);
@@ -387,6 +422,14 @@ impl CommsHub {
                     let states_entry = obj.entry("states".to_string()).or_insert_with(|| json!({}));
                     if let Some(states_obj) = states_entry.as_object_mut() {
                         for (roi_name, roi_cfg) in &cam_cfg.state_rois {
+                            if !is_valid_topic_segment(roi_name) {
+                                continue;
+                            }
+                            if !states_obj.contains_key(roi_name)
+                                && states_obj.len() >= MAX_ROI_STATES_PER_CAMERA
+                            {
+                                break;
+                            }
                             let initial_state = roi_cfg
                                 .classes
                                 .first()
@@ -412,6 +455,7 @@ impl CommsHub {
                 cfg_obj.insert("audio".to_string(), json!(cam_cfg.audio.enabled));
             }
         }
+        self.initialized_from_config.store(true, Ordering::SeqCst);
     }
 
     /// Returns the live runtime toggle flags (`enabled`, `detect`, `record`, `alerts`, `snapshots`) for `camera`.
@@ -474,7 +518,12 @@ impl CommsHub {
     }
 
     pub fn set_profile_persist_path(&self, path: std::path::PathBuf) {
-        if let Ok(saved) = std::fs::read_to_string(&path) {
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
+            && !meta.file_type().is_symlink()
+            && meta.is_file()
+            && meta.len() <= 256
+            && let Ok(saved) = std::fs::read_to_string(&path)
+        {
             let trimmed = saved.trim().to_ascii_lowercase();
             if !trimmed.is_empty() {
                 let norm = if trimmed == "off" {
@@ -520,10 +569,33 @@ impl CommsHub {
             .read()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(ref p) = *guard {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
+            let is_symlink = std::fs::symlink_metadata(p)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if !is_symlink {
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(p)
+                    {
+                        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+                        let _ = file.write_all(norm.as_bytes());
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = std::fs::write(p, &norm);
+                }
             }
-            let _ = std::fs::write(p, &norm);
         }
         drop(guard);
         self.publish_topic("profile/state", norm.clone());
@@ -557,6 +629,9 @@ impl CommsHub {
                 .camera_states
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
+            if !map.contains_key(camera) && map.len() >= MAX_TRACKED_CAMERAS {
+                return;
+            }
             let entry = map
                 .entry(camera.to_string())
                 .or_insert_with(default_camera_activity_entry);
@@ -602,12 +677,31 @@ impl CommsHub {
             let Some(key) = cfg_key else {
                 return;
             };
-            let is_on = payload.eq_ignore_ascii_case("ON") || payload.eq_ignore_ascii_case("true");
+            let p_trimmed = payload.trim();
+            let is_on = if p_trimmed.eq_ignore_ascii_case("ON")
+                || p_trimmed.eq_ignore_ascii_case("true")
+                || p_trimmed == "1"
+            {
+                true
+            } else if p_trimmed.eq_ignore_ascii_case("OFF")
+                || p_trimmed.eq_ignore_ascii_case("false")
+                || p_trimmed == "0"
+            {
+                false
+            } else {
+                return;
+            };
             let snapshot_str = {
                 let mut map = self
                     .camera_states
                     .write()
                     .unwrap_or_else(|e| e.into_inner());
+                if !map.contains_key(cam)
+                    && (self.initialized_from_config.load(Ordering::Relaxed)
+                        || map.len() >= MAX_TRACKED_CAMERAS)
+                {
+                    return;
+                }
                 let entry = map
                     .entry(cam.to_string())
                     .or_insert_with(default_camera_activity_entry);
@@ -635,12 +729,17 @@ impl CommsHub {
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
             for cam in cameras {
-                if is_valid_topic_segment(cam) {
+                if is_valid_topic_segment(cam)
+                    && (map.contains_key(cam) || map.len() < MAX_TRACKED_CAMERAS)
+                {
                     map.entry(cam.clone())
                         .or_insert_with(default_camera_activity_entry);
                 }
             }
             for (cam, entry) in map.iter() {
+                if !is_valid_topic_segment(cam) {
+                    continue;
+                }
                 let cfg = &entry["config"];
                 let motion_on = entry["motion"].as_bool().unwrap_or(false);
                 for (sub, key) in [
@@ -669,7 +768,9 @@ impl CommsHub {
                 );
                 if let Some(states_obj) = entry.get("states").and_then(|v| v.as_object()) {
                     for (roi_name, state_val) in states_obj {
-                        if let Some(state_str) = state_val.as_str() {
+                        if is_valid_topic_segment(roi_name)
+                            && let Some(state_str) = state_val.as_str()
+                        {
                             msgs.push(
                                 json!({
                                     "topic": format!("{cam}/state/{roi_name}"),
@@ -701,6 +802,17 @@ impl CommsHub {
     }
 }
 
+fn read_bounded_tls_file(path: &std::path::Path) -> Option<Vec<u8>> {
+    if !is_safe_tls_path(path) {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_TLS_FILE_BYTES {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
 /// Builds `MqttOptions` from `MqttConfig`, automatically configuring MQTTS (`Transport::Tls`)
 /// with either custom `tls_ca_certs` or system Root CAs (`/etc/ssl/certs/ca-certificates.crt`)
 /// and optional client mTLS (`tls_client_cert` / `tls_client_key`).
@@ -726,16 +838,21 @@ pub fn build_mqtt_options(cfg: &MqttConfig) -> MqttOptions {
     if cfg.should_use_tls() {
         let ca = cfg
             .tls_ca_certs
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .or_else(|| std::fs::read("/etc/ssl/certs/ca-certificates.crt").ok())
-            .or_else(|| std::fs::read("/etc/pki/tls/certs/ca-bundle.crt").ok())
+            .as_deref()
+            .and_then(read_bounded_tls_file)
+            .or_else(|| {
+                read_bounded_tls_file(std::path::Path::new("/etc/ssl/certs/ca-certificates.crt"))
+            })
+            .or_else(|| {
+                read_bounded_tls_file(std::path::Path::new("/etc/pki/tls/certs/ca-bundle.crt"))
+            })
             .unwrap_or_default();
         let client_auth = match (&cfg.tls_client_cert, &cfg.tls_client_key) {
             (Some(cert_path), Some(key_path)) => {
-                if let (Ok(cert_bytes), Ok(key_bytes)) =
-                    (std::fs::read(cert_path), std::fs::read(key_path))
-                {
+                if let (Some(cert_bytes), Some(key_bytes)) = (
+                    read_bounded_tls_file(cert_path),
+                    read_bounded_tls_file(key_path),
+                ) {
                     Some((cert_bytes, key_bytes))
                 } else {
                     None
@@ -754,7 +871,7 @@ pub fn build_mqtt_options(cfg: &MqttConfig) -> MqttOptions {
 
 async fn run_mqtt_loop(
     cfg: MqttConfig,
-    mut rx: mpsc::UnboundedReceiver<(String, Vec<u8>, bool)>,
+    mut rx: mpsc::Receiver<(String, Vec<u8>, bool)>,
     hub: CommsHub,
 ) {
     let prefix = sanitize_mqtt_prefix(&cfg.topic_prefix);
@@ -762,6 +879,7 @@ async fn run_mqtt_loop(
     loop {
         let mqtt_opts = build_mqtt_options(&cfg);
         let (client, mut eventloop) = AsyncClient::new(mqtt_opts, 256);
+        let mut connected_at: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -772,13 +890,15 @@ async fn run_mqtt_loop(
                     let clean_sub = sub_topic.trim_matches('/');
                     if is_valid_mqtt_publish_topic(clean_sub) {
                         let full_topic = format!("{prefix}/{clean_sub}");
-                        let _ = client.try_publish(full_topic, QoS::AtMostOnce, retain, payload);
+                        if is_valid_mqtt_publish_topic(&full_topic) {
+                            let _ = client.try_publish(full_topic, QoS::AtMostOnce, retain, payload);
+                        }
                     }
                 }
                 ev = eventloop.poll() => {
                     match ev {
                         Ok(MqttEvent::Incoming(Packet::ConnAck(_))) => {
-                            backoff_secs = 2;
+                            connected_at = Some(tokio::time::Instant::now());
                             info!("Connected to MQTT broker at {}:{}", cfg.host, cfg.port);
                             let _ = client.try_publish(
                                 format!("{prefix}/available"),
@@ -802,6 +922,9 @@ async fn run_mqtt_loop(
                         }
                         Ok(_) => {}
                         Err(err) => {
+                            if connected_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(10)) {
+                                backoff_secs = 2;
+                            }
                             debug!("MQTT broker unreachable ({err}); retrying in {backoff_secs}s");
                             break;
                         }
@@ -878,10 +1001,13 @@ impl ActivityLedger {
         regions: u32,
         dbfs: i64,
     ) {
-        if !timestamp.is_finite() {
+        if !timestamp.is_finite() || !is_valid_topic_segment(camera) {
             return;
         }
         let mut guard = self.rings.write().unwrap_or_else(|e| e.into_inner());
+        if !guard.contains_key(camera) && guard.len() >= MAX_TRACKED_CAMERAS {
+            return;
+        }
         let q = guard.entry(camera.to_string()).or_default();
         q.push_back(ActivitySample {
             timestamp,
@@ -1033,17 +1159,24 @@ impl LogBufferHub {
     }
 
     pub fn push_raw(&self, service: &str, line: impl Into<String>) {
-        let raw_line = line.into();
-        let scrubbed_line = if raw_line.contains("://")
-            || raw_line.contains("password:")
-            || raw_line.contains("api_key:")
-        {
+        if !is_valid_topic_segment(service) {
+            return;
+        }
+        let raw_line: String = line
+            .into()
+            .chars()
+            .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+            .collect();
+        let scrubbed_line = if raw_line.contains(':') {
             ninjanvr_config::scrub_yaml_credentials(&raw_line)
         } else {
             raw_line
         };
         {
             let mut guard = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            if !guard.contains_key(service) && guard.len() >= MAX_LOG_SERVICES {
+                return;
+            }
             let q = guard.entry(service.to_string()).or_default();
             q.push_back(scrubbed_line.clone());
             while q.len() > self.max_lines {
@@ -1724,5 +1857,54 @@ cameras:
             1,
             "stale sample at 1000.0 must be evicted at 1400.0"
         );
+    }
+
+    #[test]
+    fn r2_phase1a_comms_unconfigured_camera_flood_strict_set_payload_and_crlf_log_scrubbing() {
+        let yaml = r#"
+cameras:
+  porch:
+    enabled: true
+"#;
+        let cfg = NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/r2_comms.yml")).unwrap();
+        let hub = CommsHub::new();
+        hub.init_from_config(&cfg);
+
+        // 1. Once initialized from config, apply_set_command rejects unknown cameras (preventing MQTT state-table flood)
+        for i in 0..50 {
+            hub.apply_set_command(&format!("phantom_cam_{i}/detect/set"), "OFF");
+        }
+        let snap = hub.get_camera_activity_snapshot();
+        let snap_obj = snap.as_object().unwrap();
+        assert_eq!(snap_obj.len(), 1);
+        assert!(snap_obj.contains_key("porch"));
+
+        // 2. apply_set_command trims whitespace (" ON \n") and ignores invalid non-boolean payloads instead of disarming
+        hub.apply_set_command("porch/detect/set", "  OFF\n");
+        assert!(!hub.get_camera_flags("porch").detect);
+        hub.apply_set_command("porch/detect/set", " ON\r\n");
+        assert!(hub.get_camera_flags("porch").detect);
+        hub.apply_set_command("porch/detect/set", "corrupted_payload");
+        assert!(
+            hub.get_camera_flags("porch").detect,
+            "unrecognized set payload must be ignored rather than disabling detection"
+        );
+
+        // 3. sanitize_mqtt_prefix strips wildcards, empty segments, and '..' traversal segments cleanly
+        assert_eq!(sanitize_mqtt_prefix("+/foo//bar/../baz/#"), "foo/bar/baz");
+        assert_eq!(sanitize_mqtt_prefix("/+//../"), "ninjanvr");
+
+        // 4. LogBufferHub strips CR/LF to prevent log line spoofing and scrubs client_secret / token / uppercase PASSWORD
+        let log_hub = LogBufferHub::with_capacity(10);
+        log_hub.push_ninjanvr(
+            "warn",
+            "auth",
+            "PASSWORD: secret_upper_pw\r\n2026-11-05 FAKE_INJECTED_LOG_LINE",
+        );
+        let lines = log_hub.get_logs("ninjanvr");
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains('\r'));
+        assert!(!lines[0].contains('\n'));
+        assert!(!lines[0].contains("secret_upper_pw"));
     }
 }
