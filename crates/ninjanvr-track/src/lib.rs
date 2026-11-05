@@ -69,6 +69,8 @@ struct ZonePresenceState {
     first_entered_ts: f64,
 }
 
+const MAX_ACTIVE_TRACKS: usize = 256;
+
 /// Multi-Object Tracker implementing 2-stage **ByteTrack** association
 /// (high-confidence pass + low-confidence occlusion recovery pass),
 /// constant-velocity Kalman state estimation, Stationary object classification,
@@ -88,6 +90,7 @@ pub struct ByteTracker {
     label_masks: BTreeMap<String, PolygonMask>,
     zones: BTreeMap<String, (PolygonMask, Vec<String>, Option<String>)>,
     zone_presence: BTreeMap<String, BTreeMap<String, ZonePresenceState>>,
+    unscanned_stationary_frames: BTreeMap<String, u32>,
     tracks: BTreeMap<String, TrackedObject>,
     frame_seq: u64,
 }
@@ -99,6 +102,8 @@ impl ByteTracker {
         frame_h: u32,
         cfg: &CameraConfig,
     ) -> Self {
+        let frame_w = frame_w.max(1);
+        let frame_h = frame_h.max(1);
         let global_object_mask =
             PolygonMask::from_config_value(&cfg.objects.mask, frame_w, frame_h);
         let mut label_masks = BTreeMap::new();
@@ -127,7 +132,7 @@ impl ByteTracker {
         let min_init_night = cfg
             .detect
             .min_initialized_night
-            .unwrap_or(min_init + 2)
+            .unwrap_or(min_init.saturating_add(2))
             .max(min_init);
         let initial_preset = cfg
             .onvif
@@ -139,8 +144,8 @@ impl ByteTracker {
 
         Self {
             camera_name: camera_name.into(),
-            frame_w: frame_w.max(1),
-            frame_h: frame_h.max(1),
+            frame_w,
+            frame_h,
             min_initialized: min_init,
             min_initialized_night: min_init_night,
             night_mode: false,
@@ -152,6 +157,7 @@ impl ByteTracker {
             label_masks,
             zones,
             zone_presence: BTreeMap::new(),
+            unscanned_stationary_frames: BTreeMap::new(),
             tracks: BTreeMap::new(),
             frame_seq: 0,
         }
@@ -209,6 +215,13 @@ impl ByteTracker {
     }
 
     fn is_attribute_masked_or_filtered(&self, det: &DetectionResult, cfg: &CameraConfig) -> bool {
+        if !det.score.is_finite()
+            || det.score < 0.0
+            || det.bbox.width() == 0
+            || det.bbox.height() == 0
+        {
+            return true;
+        }
         let (bx, by) = det.bbox.bottom_center();
         if self.global_object_mask.contains_point(bx, by) {
             return true;
@@ -224,7 +237,7 @@ impl ByteTracker {
             if area < min_area_px || area > max_area_px {
                 return true;
             }
-            if det.score < f.min_score {
+            if f.min_score.is_finite() && det.score < f.min_score {
                 return true;
             }
         }
@@ -232,6 +245,13 @@ impl ByteTracker {
     }
 
     fn is_detection_masked_or_filtered(&self, det: &DetectionResult, cfg: &CameraConfig) -> bool {
+        if !det.score.is_finite()
+            || det.score < 0.0
+            || det.bbox.width() == 0
+            || det.bbox.height() == 0
+        {
+            return true;
+        }
         if !cfg.objects.track.iter().any(|l| l == &det.label) {
             return true;
         }
@@ -251,10 +271,12 @@ impl ByteTracker {
                 return true;
             }
             let ratio = (det.bbox.width() as f32) / (det.bbox.height().max(1) as f32);
-            if ratio < f.min_ratio || ratio > f.max_ratio {
+            if (f.min_ratio.is_finite() && ratio < f.min_ratio)
+                || (f.max_ratio.is_finite() && ratio > f.max_ratio)
+            {
                 return true;
             }
-            if det.score < f.min_score {
+            if f.min_score.is_finite() && det.score < f.min_score {
                 return true;
             }
         }
@@ -268,6 +290,9 @@ impl ByteTracker {
         score: f32,
         cfg: &CameraConfig,
     ) -> Vec<String> {
+        if !score.is_finite() {
+            return Vec::new();
+        }
         let (bx, by) = bbox.bottom_center();
         let area = bbox.area();
         let frame_area = (self.frame_w as f64) * (self.frame_h as f64);
@@ -291,11 +316,14 @@ impl ByteTracker {
             }
             if let Some(zcfg) = zcfg_opt {
                 if let Some(min_sc) = zcfg.min_score
+                    && min_sc.is_finite()
                     && score < min_sc
                 {
                     continue;
                 }
-                if let Some(min_a) = zcfg.min_area {
+                if let Some(min_a) = zcfg.min_area
+                    && min_a.is_finite()
+                {
                     let min_px = if min_a > 0.0 && min_a <= 1.0 {
                         (min_a * frame_area).round() as u32
                     } else {
@@ -305,7 +333,9 @@ impl ByteTracker {
                         continue;
                     }
                 }
-                if let Some(max_a) = zcfg.max_area {
+                if let Some(max_a) = zcfg.max_area
+                    && max_a.is_finite()
+                {
                     let max_px = if max_a > 0.0 && max_a <= 1.0 {
                         (max_a * frame_area).round() as u32
                     } else {
@@ -328,6 +358,14 @@ impl ByteTracker {
         raw_zones: &[String],
         cfg: &CameraConfig,
     ) -> Vec<String> {
+        if self.zones.is_empty() {
+            return Vec::new();
+        }
+        let safe_time = if frame_time.is_finite() {
+            frame_time
+        } else {
+            0.0
+        };
         let track_zone_map = self.zone_presence.entry(tid.to_string()).or_default();
         let mut confirmed = Vec::new();
         for zname in self.zones.keys() {
@@ -339,13 +377,16 @@ impl ByteTracker {
                 .unwrap_or((1, 0.0));
             if in_raw {
                 let st = track_zone_map.entry(zname.clone()).or_default();
-                if st.consecutive_in_frames == 0 {
-                    st.first_entered_ts = frame_time;
+                if st.consecutive_in_frames == 0
+                    || !st.first_entered_ts.is_finite()
+                    || safe_time < st.first_entered_ts
+                {
+                    st.first_entered_ts = safe_time;
                 }
                 st.consecutive_in_frames = st.consecutive_in_frames.saturating_add(1);
                 let inertia_ok = st.consecutive_in_frames >= req_inertia;
                 let loiter_ok =
-                    req_loiter <= 0.0 || (frame_time - st.first_entered_ts) >= req_loiter;
+                    req_loiter <= 0.0 || (safe_time - st.first_entered_ts) >= req_loiter;
                 if inertia_ok && loiter_ok {
                     confirmed.push(zname.clone());
                 }
@@ -365,12 +406,33 @@ impl ByteTracker {
         scanned_regions: &[BoundingBox],
         cfg: &CameraConfig,
     ) -> (Vec<TrackedObject>, Vec<TrackedObject>) {
-        self.frame_seq += 1;
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        let frame_time = if frame_time.is_finite() {
+            frame_time
+        } else {
+            0.0
+        };
 
-        let deduplicated = nms_detections(raw_detections.to_vec(), 0.55);
+        let sanitized_raw: Vec<DetectionResult> = raw_detections
+            .iter()
+            .filter(|d| {
+                d.score.is_finite()
+                    && d.score >= 0.0
+                    && d.bbox.x_max > d.bbox.x_min
+                    && d.bbox.y_max > d.bbox.y_min
+            })
+            .cloned()
+            .collect();
+        let deduplicated = nms_detections(sanitized_raw, 0.55);
 
         // 1. Predict next state for existing tracks using constant-velocity model
         for trk in self.tracks.values_mut() {
+            if !trk.vx.is_finite() {
+                trk.vx = 0.0;
+            }
+            if !trk.vy.is_finite() {
+                trk.vy = 0.0;
+            }
             if trk.disappeared_frames > 0 && (trk.vx.abs() > 0.5 || trk.vy.abs() > 0.5) {
                 let w = trk.bbox.width().min(self.frame_w);
                 let h = trk.bbox.height().min(self.frame_h);
@@ -401,7 +463,7 @@ impl ByteTracker {
             if self.is_detection_masked_or_filtered(&det, cfg) {
                 continue;
             }
-            let high_thresh = cfg
+            let raw_high_thresh = cfg
                 .objects
                 .filters
                 .get(&det.label)
@@ -413,6 +475,11 @@ impl ByteTracker {
                     }
                 })
                 .unwrap_or(0.7);
+            let high_thresh = if raw_high_thresh.is_finite() {
+                raw_high_thresh
+            } else {
+                0.7
+            };
             if det.score >= high_thresh {
                 high_dets.push(det);
             } else {
@@ -424,36 +491,39 @@ impl ByteTracker {
         let mut matched_tracks = vec![false; track_ids.len()];
         let mut matched_high = vec![false; high_dets.len()];
 
-        // Stage 1: Associate High-Confidence detections with existing tracks
+        // Stage 1: Globally rank and associate High-Confidence detections with existing tracks
+        let mut stage1_pairs: Vec<(f32, usize, usize)> = Vec::new();
         for (d_idx, det) in high_dets.iter().enumerate() {
-            let mut best_t: Option<usize> = None;
-            let mut best_score = 0.15f32;
             for (t_idx, tid) in track_ids.iter().enumerate() {
-                if matched_tracks[t_idx] {
-                    continue;
-                }
                 let trk = &self.tracks[tid];
                 if trk.label != det.label {
                     continue;
                 }
                 let sim = association_similarity(&trk.bbox, &det.bbox);
-                if sim > best_score {
-                    best_score = sim;
-                    best_t = Some(t_idx);
+                if sim > 0.15 {
+                    stage1_pairs.push((sim, d_idx, t_idx));
                 }
             }
-            if let Some(t_idx) = best_t {
-                matched_tracks[t_idx] = true;
+        }
+        stage1_pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut stage1_matches: Vec<(usize, usize)> = Vec::new();
+        for (_, d_idx, t_idx) in stage1_pairs {
+            if !matched_high[d_idx] && !matched_tracks[t_idx] {
                 matched_high[d_idx] = true;
-                let tid = &track_ids[t_idx];
-                self.apply_match(tid, det, frame_time, cfg);
+                matched_tracks[t_idx] = true;
+                stage1_matches.push((d_idx, t_idx));
             }
         }
+        for (d_idx, t_idx) in stage1_matches {
+            let tid = &track_ids[t_idx];
+            self.unscanned_stationary_frames.remove(tid);
+            self.apply_match(tid, &high_dets[d_idx], frame_time, cfg);
+        }
 
-        // Stage 2 (ByteTrack): Associate Low-Confidence detections with remaining unmatched tracks
-        for det in &low_dets {
-            let mut best_t: Option<usize> = None;
-            let mut best_iou = 0.30f32;
+        // Stage 2 (ByteTrack): Globally rank and associate Low-Confidence detections with remaining unmatched tracks
+        let mut matched_low = vec![false; low_dets.len()];
+        let mut stage2_pairs: Vec<(f32, usize, usize)> = Vec::new();
+        for (d_idx, det) in low_dets.iter().enumerate() {
             for (t_idx, tid) in track_ids.iter().enumerate() {
                 if matched_tracks[t_idx] {
                     continue;
@@ -463,21 +533,34 @@ impl ByteTracker {
                     continue;
                 }
                 let iou = trk.bbox.iou(&det.bbox);
-                if iou > best_iou {
-                    best_iou = iou;
-                    best_t = Some(t_idx);
+                if iou > 0.30 {
+                    stage2_pairs.push((iou, d_idx, t_idx));
                 }
             }
-            if let Some(t_idx) = best_t {
+        }
+        stage2_pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut stage2_matches: Vec<(usize, usize)> = Vec::new();
+        for (_, d_idx, t_idx) in stage2_pairs {
+            if !matched_low[d_idx] && !matched_tracks[t_idx] {
+                matched_low[d_idx] = true;
                 matched_tracks[t_idx] = true;
-                let tid = &track_ids[t_idx];
-                self.apply_match(tid, det, frame_time, cfg);
+                stage2_matches.push((d_idx, t_idx));
             }
+        }
+        for (d_idx, t_idx) in stage2_matches {
+            let tid = &track_ids[t_idx];
+            self.unscanned_stationary_frames.remove(tid);
+            self.apply_match(tid, &low_dets[d_idx], frame_time, cfg);
         }
 
         // 3. Handle unmatched tracks (preserving stationary tracks that were not in any scanned region,
-        // and immediately dropping unconfirmed tentative tracks that missed their second frame)
+        // bounding unscanned stationary retention, and immediately dropping unconfirmed tentative tracks)
         let req_init = self.effective_min_initialized();
+        let max_stationary_unscanned = self
+            .stationary_interval
+            .saturating_mul(12)
+            .max(self.max_disappeared.saturating_mul(10))
+            .max(120);
         let mut ended_tracks = Vec::new();
         for (t_idx, tid) in track_ids.iter().enumerate() {
             if !matched_tracks[t_idx] {
@@ -488,9 +571,20 @@ impl ByteTracker {
                     } else {
                         let was_scanned = scanned_regions.iter().any(|r| r.intersects(&trk.bbox));
                         if !trk.stationary || was_scanned {
-                            trk.disappeared_frames += 1;
+                            self.unscanned_stationary_frames.remove(tid);
+                            trk.disappeared_frames = trk.disappeared_frames.saturating_add(1);
                             if trk.stationary && trk.disappeared_frames >= 3 {
                                 trk.stationary = false;
+                            }
+                        } else {
+                            let unscanned = self
+                                .unscanned_stationary_frames
+                                .entry(tid.clone())
+                                .or_insert(0);
+                            *unscanned = unscanned.saturating_add(1);
+                            if *unscanned > max_stationary_unscanned {
+                                trk.stationary = false;
+                                trk.disappeared_frames = self.max_disappeared.saturating_add(1);
                             }
                         }
                     }
@@ -498,10 +592,15 @@ impl ByteTracker {
                 if drop_unconfirmed {
                     self.tracks.remove(tid);
                     self.zone_presence.remove(tid);
-                } else if self.tracks[tid].disappeared_frames > self.max_disappeared
+                    self.unscanned_stationary_frames.remove(tid);
+                } else if self
+                    .tracks
+                    .get(tid)
+                    .is_some_and(|t| t.disappeared_frames > self.max_disappeared)
                     && let Some(removed) = self.tracks.remove(tid)
                 {
                     self.zone_presence.remove(tid);
+                    self.unscanned_stationary_frames.remove(tid);
                     if removed.frames_tracked >= req_init {
                         ended_tracks.push(removed);
                     }
@@ -521,6 +620,28 @@ impl ByteTracker {
                         || t.bbox.intersection_over_min(&det.bbox) > 0.78)
             }) {
                 continue;
+            }
+            while self.tracks.len() >= MAX_ACTIVE_TRACKS {
+                let Some(evict_id) = self
+                    .tracks
+                    .iter()
+                    .min_by(|(_, a), (_, b)| {
+                        (a.frames_tracked >= req_init)
+                            .cmp(&(b.frames_tracked >= req_init))
+                            .then_with(|| b.disappeared_frames.cmp(&a.disappeared_frames))
+                            .then_with(|| a.last_seen_time.total_cmp(&b.last_seen_time))
+                    })
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                if let Some(removed) = self.tracks.remove(&evict_id) {
+                    self.zone_presence.remove(&evict_id);
+                    self.unscanned_stationary_frames.remove(&evict_id);
+                    if removed.frames_tracked >= req_init {
+                        ended_tracks.push(removed);
+                    }
+                }
             }
             let suffix = format!(
                 "{:06x}",
@@ -594,6 +715,10 @@ impl ByteTracker {
 
         // 5. Associate child attribute detections (face, license_plate, delivery logos) to parent tracks
         self.associate_attributes_to_tracks(&attribute_dets);
+        self.zone_presence
+            .retain(|k, _| self.tracks.contains_key(k));
+        self.unscanned_stationary_frames
+            .retain(|k, _| self.tracks.contains_key(k));
 
         let active: Vec<TrackedObject> = self.active_tracks().cloned().collect();
         (active, ended_tracks)
@@ -611,6 +736,10 @@ impl ByteTracker {
         let frame_w = self.frame_w;
         let frame_h = self.frame_h;
         for attr_det in attribute_dets {
+            let attr_area = attr_det.bbox.area();
+            if attr_area == 0 {
+                continue;
+            }
             let is_face = attr_det.label.eq_ignore_ascii_case("face");
             let is_plate = attr_det.label.eq_ignore_ascii_case("license_plate");
             let mut best_tid: Option<String> = None;
@@ -618,7 +747,7 @@ impl ByteTracker {
             let mut best_parent_score = -1.0f32;
 
             for (tid, trk) in &self.tracks {
-                if trk.disappeared_frames > 0 {
+                if trk.disappeared_frames > 0 || attr_area > trk.bbox.area() {
                     continue;
                 }
                 let parent_eligible = if is_face {
@@ -703,7 +832,7 @@ impl ByteTracker {
             let iou = trk.bbox.iou(&det.bbox);
             let max_jitter = ((frame_w.max(frame_h) as f32) * 0.02).max(6.0);
             if iou > 0.72 && dx.hypot(dy) < max_jitter {
-                trk.motionless_count += 1;
+                trk.motionless_count = trk.motionless_count.saturating_add(1);
                 if trk.motionless_count >= stationary_thresh {
                     trk.stationary = true;
                 }
@@ -726,7 +855,7 @@ impl ByteTracker {
                 trk.top_score = det.score;
             }
             trk.last_seen_time = frame_time;
-            trk.frames_tracked += 1;
+            trk.frames_tracked = trk.frames_tracked.saturating_add(1);
             trk.disappeared_frames = 0;
             trk.zones = zones.clone();
             for z in zones {
@@ -796,7 +925,11 @@ fn resolve_line_endpoints(
     frame_h: u32,
 ) -> ((f32, f32), (f32, f32)) {
     let [mut x1, mut y1, mut x2, mut y2] = line_cfg.points;
-    if x1 <= 1.0 && y1 <= 1.0 && x2 <= 1.0 && y2 <= 1.0 {
+    if (0.0..=1.0).contains(&x1)
+        && (0.0..=1.0).contains(&y1)
+        && (0.0..=1.0).contains(&x2)
+        && (0.0..=1.0).contains(&y2)
+    {
         x1 *= frame_w as f32;
         y1 *= frame_h as f32;
         x2 *= frame_w as f32;
@@ -817,13 +950,32 @@ pub fn classify_segment_crossing(
     p_prev: (f32, f32),
     p_curr: (f32, f32),
 ) -> Option<LineDirection> {
+    if !l_start.0.is_finite()
+        || !l_start.1.is_finite()
+        || !l_end.0.is_finite()
+        || !l_end.1.is_finite()
+        || !p_prev.0.is_finite()
+        || !p_prev.1.is_finite()
+        || !p_curr.0.is_finite()
+        || !p_curr.1.is_finite()
+    {
+        return None;
+    }
     let lx = l_end.0 - l_start.0;
     let ly = l_end.1 - l_start.1;
     let px = p_curr.0 - p_prev.0;
     let py = p_curr.1 - p_prev.1;
+    let l_len_sq = lx * lx + ly * ly;
+    let p_len_sq = px * px + py * py;
+    if !l_len_sq.is_finite() || !p_len_sq.is_finite() || l_len_sq < 1e-4 || p_len_sq < 1e-4 {
+        return None;
+    }
 
     let denom = cross_2d(lx, ly, px, py);
-    if denom.abs() < 1e-5 {
+    if !denom.is_finite()
+        || denom.abs() < 1e-5
+        || (denom as f64 * denom as f64) < 1e-10 * (l_len_sq as f64) * (p_len_sq as f64)
+    {
         return None;
     }
 
@@ -833,7 +985,7 @@ pub fn classify_segment_crossing(
     let t = cross_2d(dx, dy, px, py) / denom;
     let u = cross_2d(dx, dy, lx, ly) / denom;
 
-    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+    if t.is_finite() && u.is_finite() && (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
         if denom > 0.0 {
             Some(LineDirection::AToB)
         } else {
@@ -852,12 +1004,16 @@ fn association_similarity(a: &BoundingBox, b: &BoundingBox) -> f32 {
     let norm_dy = (ay - by).abs() / (a.height().max(16) as f32);
     let dist = norm_dx.hypot(norm_dy);
     let dist_sim = (1.0 - dist * 0.4).max(0.0);
-    iou.max(dist_sim * 0.65)
+    let sim = iou.max(dist_sim * 0.65);
+    if sim.is_finite() { sim } else { 0.0 }
 }
 
 /// Computes attribute quality score `attr.score * sqrt(attr.area_px / (frame_w * frame_h))`
 /// used to select the frame where a `face` or `license_plate` is largest and sharpest.
 pub fn compute_attribute_quality(score: f32, area_px: u32, frame_w: u32, frame_h: u32) -> f32 {
+    if !score.is_finite() || score <= 0.0 {
+        return 0.0;
+    }
     let frame_area = (frame_w.saturating_mul(frame_h)).max(1) as f32;
     score * ((area_px as f32) / frame_area).sqrt()
 }
@@ -1908,5 +2064,183 @@ mod tests {
             "moving track re-matched at predicted position must not increment motionless_count"
         );
         assert_eq!(a4[0].inferred_sub_label.as_deref(), Some("correios"));
+    }
+
+    #[test]
+    fn regression_nan_scores_degenerate_boxes_and_non_finite_tripwires_are_rejected() {
+        // 1. Non-finite and overflowing tripwire coordinates must never return a false crossing
+        assert_eq!(
+            classify_segment_crossing(
+                (100.0, 200.0),
+                (f32::INFINITY, 200.0),
+                (300.0, 150.0),
+                (300.0, 250.0)
+            ),
+            None
+        );
+        assert_eq!(
+            classify_segment_crossing(
+                (100.0, 200.0),
+                (500.0, 200.0),
+                (300.0, f32::NAN),
+                (300.0, 250.0)
+            ),
+            None
+        );
+        // Zero-length degenerate tripwire segment must return None
+        assert_eq!(
+            classify_segment_crossing(
+                (300.0, 200.0),
+                (300.0001, 200.0),
+                (300.0, 100.0),
+                (300.0, 300.0)
+            ),
+            None
+        );
+
+        // 2. NaN-score detections and oversized false-positive attribute boxes must not poison tracks
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 1;
+        cam_cfg.objects.track = vec!["person".to_string()];
+
+        let mut tracker = ByteTracker::new("cam", 1000, 1000, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1000, 1000);
+        let valid_person = DetectionResult {
+            label: "person".to_string(),
+            score: 0.90,
+            bbox: BoundingBox::new(200, 200, 300, 400),
+            region: reg,
+        };
+        let (a1, _) = tracker.update(10.0, &[valid_person], &[reg], &cam_cfg);
+        assert_eq!(a1.len(), 1);
+
+        let nan_person = DetectionResult {
+            label: "person".to_string(),
+            score: f32::NAN,
+            bbox: BoundingBox::new(200, 200, 300, 400),
+            region: reg,
+        };
+        let oversized_face = DetectionResult {
+            label: "face".to_string(),
+            score: 0.95,
+            bbox: BoundingBox::new(50, 50, 800, 800), // larger than parent person bbox!
+            region: reg,
+        };
+        let (a2, _) = tracker.update(11.0, &[nan_person, oversized_face], &[], &cam_cfg);
+        for trk in &a2 {
+            assert!(trk.score.is_finite());
+            assert!(
+                trk.attributes.is_empty(),
+                "oversized attribute must not bind to smaller parent"
+            );
+        }
+    }
+
+    #[test]
+    fn regression_global_stage1_similarity_ranking_prevents_track_hijacking() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 1;
+        cam_cfg.objects.track = vec!["person".to_string()];
+
+        let mut tracker = ByteTracker::new("cam", 1000, 1000, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1000, 1000);
+
+        // Initialize Track A at x=100..200 and Track B at x=190..290
+        let init_a = DetectionResult {
+            label: "person".to_string(),
+            score: 0.90,
+            bbox: BoundingBox::new(100, 100, 200, 300),
+            region: reg,
+        };
+        let init_b = DetectionResult {
+            label: "person".to_string(),
+            score: 0.90,
+            bbox: BoundingBox::new(190, 100, 290, 300),
+            region: reg,
+        };
+        let (active_init, _) = tracker.update(1.0, &[init_a, init_b], &[reg], &cam_cfg);
+        assert_eq!(active_init.len(), 2);
+        let id_a = active_init
+            .iter()
+            .find(|t| t.bbox.x_min == 100)
+            .unwrap()
+            .id
+            .clone();
+        let id_b = active_init
+            .iter()
+            .find(|t| t.bbox.x_min == 190)
+            .unwrap()
+            .id
+            .clone();
+
+        // Next frame: Det 0 (higher score, at x=135..235) is slightly closer to A than B,
+        // while Det 1 (slightly lower score, at x=100..200) is an exact 1.0 IoU match for A.
+        // Global similarity ranking must pair Det 1 -> Track A and Det 0 -> Track B!
+        let det_shifted = DetectionResult {
+            label: "person".to_string(),
+            score: 0.95,
+            bbox: BoundingBox::new(135, 100, 235, 300),
+            region: reg,
+        };
+        let det_exact_a = DetectionResult {
+            label: "person".to_string(),
+            score: 0.88,
+            bbox: BoundingBox::new(100, 100, 200, 300),
+            region: reg,
+        };
+        let (active_next, _) = tracker.update(2.0, &[det_shifted, det_exact_a], &[reg], &cam_cfg);
+        assert_eq!(active_next.len(), 2);
+        let trk_a = active_next
+            .iter()
+            .find(|t| t.id == id_a)
+            .expect("Track A preserved");
+        let trk_b = active_next
+            .iter()
+            .find(|t| t.id == id_b)
+            .expect("Track B preserved");
+        assert_eq!(trk_a.bbox, BoundingBox::new(100, 100, 200, 300));
+        assert_eq!(trk_b.bbox, BoundingBox::new(135, 100, 235, 300));
+    }
+
+    #[test]
+    fn regression_unscanned_stationary_track_eventually_expires_and_prevents_memory_leak() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 2;
+        cam_cfg.detect.max_disappeared = 5;
+        cam_cfg.detect.stationary.threshold = 10;
+        cam_cfg.detect.stationary.interval = 10;
+
+        let mut tracker = ByteTracker::new("cam", 640, 360, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 640, 360);
+        let det = DetectionResult {
+            label: "person".to_string(),
+            score: 0.90,
+            bbox: BoundingBox::new(100, 100, 200, 250),
+            region: reg,
+        };
+        for i in 0..11 {
+            let _ = tracker.update(
+                10.0 + i as f64,
+                std::slice::from_ref(&det),
+                &[reg],
+                &cam_cfg,
+            );
+        }
+        assert_eq!(tracker.active_tracks().count(), 1);
+
+        // Feed > 120 unscanned frames: stationary track must eventually expire instead of leaking forever
+        let mut expired = false;
+        for i in 0..130 {
+            let (_, ended) = tracker.update(100.0 + i as f64, &[], &[], &cam_cfg);
+            if !ended.is_empty() {
+                expired = true;
+                break;
+            }
+        }
+        assert!(
+            expired,
+            "unscanned stationary track must expire after bounded interval"
+        );
+        assert_eq!(tracker.active_tracks().count(), 0);
     }
 }
