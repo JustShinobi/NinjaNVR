@@ -13020,7 +13020,8 @@ fn resolve_share_target_metadata(
                 .as_str()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_string());
+                .map(|s| s.to_string())
+                .or_else(|| infer_camera_prefix_from_id(state, target_id));
             let name = exp["name"]
                 .as_str()
                 .filter(|s| !s.is_empty())
@@ -13043,7 +13044,8 @@ fn resolve_share_target_metadata(
                 .rsplitn(3, '_')
                 .nth(2)
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_string());
+                .map(|s| s.to_string())
+                .or_else(|| infer_camera_prefix_from_id(state, target_id));
             return (cam_prefix, target_id.to_string(), None, true);
         }
         return (None, target_id.to_string(), None, false);
@@ -13130,20 +13132,56 @@ fn resolve_share_target_metadata(
     (None, target_id.to_string(), None, false)
 }
 
+async fn verify_caller_can_mutate(
+    state: &AppState,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let auth_cfg = state.config.read().await.auth.clone();
+    if auth_cfg.enabled
+        && let Some((_, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &auth_cfg)
+    {
+        let role_lc = role.trim().to_ascii_lowercase();
+        if matches!(role_lc.as_str(), "viewer" | "read_only" | "metrics") {
+            return Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "success": false,
+                        "message": "Insufficient role for mutation"
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
 async fn api_share_list(
     State(state): State<AppState>,
     jar: CookieJar,
     headers: HeaderMap,
 ) -> Json<Value> {
     let mut links = state.db.list_share_links().unwrap_or_default();
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
         links.retain(|item| {
             item["camera"]
                 .as_str()
+                .map(str::trim)
                 .is_some_and(|c| allowed.iter().any(|a| a == c))
         });
     }
     Json(Value::Array(links))
+}
+
+fn is_valid_host_header_token(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains(['/', '?', '#', '\\', '@'])
+        && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 fn extract_url_scheme_and_host(raw: &str) -> Option<(&str, &str)> {
@@ -13153,15 +13191,19 @@ fn extract_url_scheme_and_host(raw: &str) -> Option<(&str, &str)> {
     }
     let (scheme_raw, after_scheme) = trimmed.split_once("://")?;
     let scheme = scheme_raw.trim();
-    if scheme.is_empty() {
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return None;
     }
-    let host = after_scheme
-        .split(['/', '?', '#'])
+    let raw_authority = after_scheme
+        .split(['/', '?', '#', '\\'])
         .next()
         .unwrap_or("")
         .trim();
-    if host.is_empty() {
+    let host = raw_authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp.trim())
+        .unwrap_or(raw_authority);
+    if !is_valid_host_header_token(host) {
         return None;
     }
     Some((scheme, host))
@@ -13220,16 +13262,16 @@ fn request_host_matches(headers: &HeaderMap, uri: &Uri, scheme: &str, source_hos
         .get("x-forwarded-host")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').next().unwrap_or(s).trim())
-        .filter(|s| !s.is_empty());
+        .filter(|s| is_valid_host_header_token(s));
     let host_header = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.split(',').next().unwrap_or(s).trim())
-        .filter(|s| !s.is_empty());
+        .filter(|s| is_valid_host_header_token(s));
     let uri_authority = uri
         .authority()
         .map(|a| a.as_str().trim())
-        .filter(|s| !s.is_empty());
+        .filter(|s| is_valid_host_header_token(s));
     let is_same_origin_fetch = headers
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
@@ -13366,6 +13408,9 @@ async fn api_share_revoke(
         )
             .into_response();
     }
+    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
+        return err_resp;
+    }
     let Some(link) = state.db.get_share_link(&id).ok().flatten() else {
         return (
             StatusCode::NOT_FOUND,
@@ -13373,9 +13418,12 @@ async fn api_share_revoke(
         )
             .into_response();
     };
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
         let cam_ok = link["camera"]
             .as_str()
+            .map(str::trim)
             .is_some_and(|c| allowed.iter().any(|a| a == c));
         if !cam_ok {
             return (
@@ -13502,6 +13550,9 @@ async fn api_share_create(
         )
             .into_response();
     }
+    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
+        return err_resp;
+    }
     let kind = if body.kind.eq_ignore_ascii_case("review") {
         "review".to_string()
     } else if body.kind.eq_ignore_ascii_case("event") {
@@ -13510,9 +13561,11 @@ async fn api_share_create(
         "export".to_string()
     };
     let (target_cam, _, _, exists) = resolve_share_target_metadata(&state, &kind, &body.target_id);
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
         match target_cam {
-            Some(ref cam) if allowed.contains(cam) => {}
+            Some(ref cam) if allowed.iter().any(|a| a == cam.trim()) => {}
             _ => {
                 return (
                     StatusCode::FORBIDDEN,
@@ -13731,9 +13784,11 @@ fn verify_share_jti_with_view_mode(
                             .map(str::trim)
                             .filter(|s| !s.is_empty())
                             .collect();
-                        let cam_ok = link["camera"]
-                            .as_str()
-                            .is_some_and(|c| allowed.contains(&c));
+                        let cam_ok = allowed.contains(&"*")
+                            || link["camera"]
+                                .as_str()
+                                .map(str::trim)
+                                .is_some_and(|c| allowed.contains(&c));
                         if !cam_ok {
                             return Err((
                                 StatusCode::FORBIDDEN,
@@ -13746,9 +13801,9 @@ fn verify_share_jti_with_view_mode(
         }
         return Err((StatusCode::GONE, "Share link has been revoked"));
     }
-    if link["expires_at"]
+    if !link["expires_at"]
         .as_f64()
-        .is_some_and(|exp| (exp as u64) <= now_ts)
+        .is_some_and(|exp| exp.is_finite() && exp > 0.0 && (exp as u64) > now_ts)
     {
         if let Ok(mut map) = state.share_page_video_credits.lock() {
             map.remove(jti);
@@ -13814,7 +13869,7 @@ fn verify_share_jti_with_view_mode(
     }
     if link["kind"].as_str() != Some(payload.k.as_str())
         || link["target_id"].as_str() != Some(payload.id.as_str())
-        || link["camera"].as_str() != payload.cam.as_deref()
+        || link["camera"].as_str().map(str::trim) != payload.cam.as_deref().map(str::trim)
     {
         return Err((StatusCode::FORBIDDEN, "Share link payload mismatch"));
     }
@@ -13863,12 +13918,16 @@ fn verify_share_jti_with_view_mode(
                 return Err((StatusCode::FORBIDDEN, reason));
             }
             if let Ok(Some(db_u)) = state.db.get_user(trimmed_ext) {
-                if db_u.role.trim().eq_ignore_ascii_case("viewer") {
+                let role_trimmed = db_u.role.trim();
+                if role_trimmed.eq_ignore_ascii_case("viewer")
+                    || role_trimmed.eq_ignore_ascii_case("read_only")
+                    || role_trimmed.eq_ignore_ascii_case("metrics")
+                {
                     let reason = "Share link creator role is not permitted to share";
                     revoke_invalid_creator_jti(reason);
                     return Err((StatusCode::FORBIDDEN, reason));
                 }
-                if !db_u.role.trim().eq_ignore_ascii_case("admin") {
+                if !role_trimmed.eq_ignore_ascii_case("admin") {
                     let raw_cams = db_u.allowed_cameras.trim();
                     if !raw_cams.is_empty() && raw_cams != "*" {
                         let allowed: Vec<&str> = raw_cams
@@ -13876,9 +13935,11 @@ fn verify_share_jti_with_view_mode(
                             .map(str::trim)
                             .filter(|s| !s.is_empty())
                             .collect();
-                        let cam_ok = link["camera"]
-                            .as_str()
-                            .is_some_and(|c| allowed.contains(&c));
+                        let cam_ok = allowed.contains(&"*")
+                            || link["camera"]
+                                .as_str()
+                                .map(str::trim)
+                                .is_some_and(|c| allowed.contains(&c));
                         if !cam_ok {
                             let reason = "Share link creator camera access revoked";
                             revoke_invalid_creator_jti(reason);
@@ -13890,12 +13951,16 @@ fn verify_share_jti_with_view_mode(
         } else {
             match state.db.get_user(created_by) {
                 Ok(Some(db_u)) => {
-                    if db_u.role.trim().eq_ignore_ascii_case("viewer") {
+                    let role_trimmed = db_u.role.trim();
+                    if role_trimmed.eq_ignore_ascii_case("viewer")
+                        || role_trimmed.eq_ignore_ascii_case("read_only")
+                        || role_trimmed.eq_ignore_ascii_case("metrics")
+                    {
                         let reason = "Share link creator role is not permitted to share";
                         revoke_invalid_creator_jti(reason);
                         return Err((StatusCode::FORBIDDEN, reason));
                     }
-                    if !db_u.role.trim().eq_ignore_ascii_case("admin") {
+                    if !role_trimmed.eq_ignore_ascii_case("admin") {
                         let raw_cams = db_u.allowed_cameras.trim();
                         if !raw_cams.is_empty() && raw_cams != "*" {
                             let allowed: Vec<&str> = raw_cams
@@ -13903,9 +13968,11 @@ fn verify_share_jti_with_view_mode(
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty())
                                 .collect();
-                            let cam_ok = link["camera"]
-                                .as_str()
-                                .is_some_and(|c| allowed.contains(&c));
+                            let cam_ok = allowed.contains(&"*")
+                                || link["camera"]
+                                    .as_str()
+                                    .map(str::trim)
+                                    .is_some_and(|c| allowed.contains(&c));
                             if !cam_ok {
                                 let reason = "Share link creator camera access revoked";
                                 revoke_invalid_creator_jti(reason);
@@ -14316,7 +14383,7 @@ async fn share_player_page(
         resolve_share_target_metadata(&state, &payload.k, &payload.id);
     if let Some(ref token_cam) = payload.cam
         && let Some(ref actual_cam) = resolved_cam
-        && token_cam != actual_cam
+        && token_cam.trim() != actual_cam.trim()
     {
         return (
             StatusCode::FORBIDDEN,
@@ -14328,6 +14395,15 @@ async fn share_player_page(
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Shared clip not found" })),
+        )
+            .into_response();
+    }
+    if let Some(ref token_cam) = payload.cam
+        && resolved_cam.as_deref().map(str::trim) != Some(token_cam.trim())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Share link camera mismatch" })),
         )
             .into_response();
     }
@@ -14668,11 +14744,93 @@ async fn acquire_share_clip_lock(state: &AppState, clip_key: &str) -> Arc<tokio:
         .clone()
 }
 
+fn is_regular_non_symlink_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file() && m.len() > 0)
+}
+
+fn ensure_safe_media_subdir(media_dir: &Path, subdir: &str) -> Option<PathBuf> {
+    if subdir.is_empty() || subdir.contains("..") || subdir.contains(['/', '\\']) {
+        return None;
+    }
+    if std::fs::symlink_metadata(media_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return None;
+    }
+    let dir_path = media_dir.join(subdir);
+    if !dir_path.exists() {
+        std::fs::create_dir_all(&dir_path).ok()?;
+    }
+    let meta = std::fs::symlink_metadata(&dir_path).ok()?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return None;
+    }
+    let media_canon = std::fs::canonicalize(media_dir).ok()?;
+    let dir_canon = std::fs::canonicalize(&dir_path).ok()?;
+    if !dir_canon.starts_with(&media_canon) || dir_canon == media_canon {
+        return None;
+    }
+    Some(dir_canon)
+}
+
+fn read_non_symlink_string(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > 4096 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+fn write_atomic_non_symlink_file(dir: &Path, filename: &str, contents: &[u8]) -> bool {
+    if filename.is_empty() || filename.contains("..") || filename.contains(['/', '\\']) {
+        return false;
+    }
+    let Ok(dir_meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if dir_meta.file_type().is_symlink() || !dir_meta.file_type().is_dir() {
+        return false;
+    }
+    let target_path = dir.join(filename);
+    if let Ok(target_meta) = std::fs::symlink_metadata(&target_path)
+        && (target_meta.file_type().is_symlink() || target_meta.file_type().is_dir())
+    {
+        let _ = std::fs::remove_file(&target_path);
+        if std::fs::symlink_metadata(&target_path).is_ok() {
+            return false;
+        }
+    }
+    let nonce: u64 = rand::random();
+    let tmp_path = dir.join(format!(".{filename}.{nonce:016x}.tmp"));
+    if std::fs::symlink_metadata(&tmp_path).is_ok() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    if std::fs::write(&tmp_path, contents).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return false;
+    }
+    let ok = std::fs::rename(&tmp_path, &target_path).is_ok();
+    let _ = std::fs::remove_file(&tmp_path);
+    ok
+}
+
+fn remove_non_symlink_dir_child(dir: &Path, filename: &str) {
+    if filename.is_empty() || filename.contains("..") || filename.contains(['/', '\\']) {
+        return;
+    }
+    if std::fs::symlink_metadata(dir)
+        .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+    {
+        let p = dir.join(filename);
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| !m.file_type().is_dir()) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn is_cached_share_artifact_stale(artifact_path: &Path, source_paths: &[PathBuf]) -> bool {
-    let Ok(art_meta) = std::fs::metadata(artifact_path) else {
+    let Ok(art_meta) = std::fs::symlink_metadata(artifact_path) else {
         return true;
     };
-    if !art_meta.is_file() || art_meta.len() == 0 {
+    if !art_meta.file_type().is_file() || art_meta.len() == 0 {
         return true;
     }
     let Ok(art_mtime) = art_meta.modified() else {
@@ -14693,17 +14851,19 @@ fn cleanup_share_clip_artifacts(media_dir: &Path, target_id: &str) {
     if safe_id.is_empty() || safe_id != target_id || target_id.contains("..") {
         return;
     }
+    if std::fs::symlink_metadata(media_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return;
+    }
     let exports_dir = media_dir.join("exports");
     let clips_dir = media_dir.join("clips");
-    for path in [
-        exports_dir.join(format!("share_redacted_{safe_id}.mp4")),
-        exports_dir.join(format!(".share_redacted_{safe_id}.mask_hash")),
-        exports_dir.join(format!("share_clip_{safe_id}.mp4")),
-        clips_dir.join(format!("share_redacted_{safe_id}.webp")),
-        clips_dir.join(format!("share_clip_{safe_id}.webp")),
-    ] {
-        let _ = std::fs::remove_file(path);
-    }
+    remove_non_symlink_dir_child(&exports_dir, &format!("share_redacted_{safe_id}.mp4"));
+    remove_non_symlink_dir_child(
+        &exports_dir,
+        &format!(".share_redacted_{safe_id}.mask_hash"),
+    );
+    remove_non_symlink_dir_child(&exports_dir, &format!("share_clip_{safe_id}.mp4"));
+    remove_non_symlink_dir_child(&clips_dir, &format!("share_redacted_{safe_id}.webp"));
+    remove_non_symlink_dir_child(&clips_dir, &format!("share_clip_{safe_id}.webp"));
 }
 
 fn cleanup_camera_share_clip_artifacts_in_range(
@@ -14712,10 +14872,11 @@ fn cleanup_camera_share_clip_artifacts_in_range(
     after: f64,
     before: f64,
 ) {
+    let cam_trimmed = camera.trim();
     let query_after = (after - 15.0).max(0.0);
     let query_before = before + 15.0;
     if let Ok(events) = state.db.query_events(&EventFilter {
-        cameras: Some(vec![camera.to_string()]),
+        cameras: Some(vec![cam_trimmed.to_string()]),
         after: Some(query_after),
         before: Some(query_before),
         limit: Some(2000),
@@ -14726,14 +14887,14 @@ fn cleanup_camera_share_clip_artifacts_in_range(
                 cleanup_share_clip_artifacts(&state.media_dir, id);
                 let ev_start = ev["start_time"].as_f64().unwrap_or(0.0);
                 let ev_end = ev["end_time"].as_f64().unwrap_or(ev_start + 15.0);
-                if !has_valid_recording_segments_for_window(state, camera, ev_start, ev_end) {
+                if !has_valid_recording_segments_for_window(state, cam_trimmed, ev_start, ev_end) {
                     let _ = state.db.revoke_share_links_for_target(None, id);
                 }
             }
         }
     }
     if let Ok(reviews) = state.db.query_reviews(&ReviewFilter {
-        cameras: Some(vec![camera.to_string()]),
+        cameras: Some(vec![cam_trimmed.to_string()]),
         after: Some(query_after),
         before: Some(query_before),
         limit: Some(2000),
@@ -14742,8 +14903,32 @@ fn cleanup_camera_share_clip_artifacts_in_range(
         for rev in reviews {
             cleanup_share_clip_artifacts(&state.media_dir, &rev.id);
             let rev_end = rev.end_time.unwrap_or(rev.start_time + 15.0);
-            if !has_valid_recording_segments_for_window(state, camera, rev.start_time, rev_end) {
+            if !has_valid_recording_segments_for_window(state, cam_trimmed, rev.start_time, rev_end)
+            {
                 let _ = state.db.revoke_share_links_for_target(None, &rev.id);
+            }
+        }
+    }
+    if let Ok(links) = state.db.list_share_links() {
+        for link in links {
+            if link["revoked"].as_bool().unwrap_or(false) {
+                continue;
+            }
+            let kind = link["kind"].as_str().unwrap_or("");
+            if kind != "event" && kind != "review" {
+                continue;
+            }
+            let link_cam = link["camera"].as_str().map(str::trim).unwrap_or("");
+            if !link_cam.is_empty() && link_cam != cam_trimmed {
+                continue;
+            }
+            let Some(tid) = link["target_id"].as_str() else {
+                continue;
+            };
+            let (resolved_cam, _, _, has_recs) = resolve_share_target_metadata(state, kind, tid);
+            if resolved_cam.as_deref() == Some(cam_trimmed) && !has_recs {
+                let _ = state.db.revoke_share_links_for_target(None, tid);
+                cleanup_share_clip_artifacts(&state.media_dir, tid);
             }
         }
     }
@@ -14773,11 +14958,12 @@ fn cleanup_camera_share_clip_artifacts_in_range(
             };
             let mut should_clean = false;
             if let Ok(Some(ev)) = state.db.get_event(tid)
-                && ev["camera"].as_str() == Some(camera)
+                && ev["camera"].as_str().map(str::trim) == Some(cam_trimmed)
             {
                 let start = ev["start_time"].as_f64().unwrap_or(0.0);
                 let end = ev["end_time"].as_f64().unwrap_or(start + 15.0);
-                let no_recs = !has_valid_recording_segments_for_window(state, camera, start, end);
+                let no_recs =
+                    !has_valid_recording_segments_for_window(state, cam_trimmed, start, end);
                 if no_recs {
                     let _ = state.db.revoke_share_links_for_target(None, tid);
                 }
@@ -14787,11 +14973,12 @@ fn cleanup_camera_share_clip_artifacts_in_range(
             }
             if !should_clean
                 && let Ok(Some(rev)) = state.db.get_review_by_id(tid)
-                && rev.camera == camera
+                && rev.camera.trim() == cam_trimmed
             {
                 let start = rev.start_time;
                 let end = rev.end_time.unwrap_or(start + 15.0);
-                let no_recs = !has_valid_recording_segments_for_window(state, camera, start, end);
+                let no_recs =
+                    !has_valid_recording_segments_for_window(state, cam_trimmed, start, end);
                 if no_recs {
                     let _ = state.db.revoke_share_links_for_target(None, tid);
                 }
@@ -14807,6 +14994,32 @@ fn cleanup_camera_share_clip_artifacts_in_range(
     purge_revoked_share_credits(state);
 }
 
+const MAX_SERVER_PRIVACY_MASK_DEPTH: usize = 16;
+
+fn collect_normalized_polygon_strings(val: &Value, out: &mut Vec<String>, depth: usize) {
+    if depth > MAX_SERVER_PRIVACY_MASK_DEPTH {
+        return;
+    }
+    match val {
+        Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+        Value::Array(items) => {
+            for item in items {
+                collect_normalized_polygon_strings(item, out, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            for (k, v) in map {
+                if !matches!(k.as_str(), "mode" | "style" | "pixelate" | "block_size")
+                    && !k.starts_with("_norm_poly_")
+                {
+                    collect_normalized_polygon_strings(v, out, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Normalizes pixel-space `privacy_mask` coordinates (strings `"x1,y1,x2,y2"`, flat numeric arrays
 /// `[x1, y1, ...]`, `[x, y]` coordinate pair arrays, and nested objects) into `[0.0..1.0]` normalized
 /// polygon coordinate strings (`>= 6` numbers, expanding 2-point bounding boxes to 4-vertex rectangles)
@@ -14817,11 +15030,26 @@ pub fn normalize_privacy_mask_value_for_resolution(
     src_w: u32,
     src_h: u32,
 ) -> Value {
+    normalize_privacy_mask_value_inner(mask_val, src_w, src_h, 0)
+}
+
+fn normalize_privacy_mask_value_inner(
+    mask_val: &Value,
+    src_w: u32,
+    src_h: u32,
+    depth: usize,
+) -> Value {
+    if depth > MAX_SERVER_PRIVACY_MASK_DEPTH {
+        return Value::String("invalid_depth_overflow".to_string());
+    }
     let fw = src_w.max(1) as f64;
     let fh = src_h.max(1) as f64;
 
-    let format_normalized_coords = |nums: &[f64]| -> String {
-        let is_already_norm = nums.iter().all(|&v| (-1.0..=2.0).contains(&v));
+    let format_normalized_coords = |nums: &[f64]| -> Option<String> {
+        if nums.iter().any(|&v| !v.is_finite() || v < 0.0) {
+            return None;
+        }
+        let is_already_norm = nums.iter().all(|&v| (0.0..=1.0).contains(&v));
         let mut norm_pts: Vec<(f64, f64)> = Vec::with_capacity(nums.len() / 2);
         for &[rx, ry] in nums.as_chunks::<2>().0 {
             let nx = if is_already_norm {
@@ -14848,7 +15076,7 @@ pub fn normalize_privacy_mask_value_for_resolution(
             parts.push(format!("{x:.6}"));
             parts.push(format!("{y:.6}"));
         }
-        parts.join(",")
+        Some(parts.join(","))
     };
 
     match mask_val {
@@ -14862,6 +15090,7 @@ pub fn normalize_privacy_mask_value_for_resolution(
             for p in trimmed.split(',') {
                 if let Ok(v) = p.trim().parse::<f64>()
                     && v.is_finite()
+                    && v >= 0.0
                 {
                     nums.push(v);
                 } else {
@@ -14871,17 +15100,22 @@ pub fn normalize_privacy_mask_value_for_resolution(
             if nums.len() < 4 || !nums.len().is_multiple_of(2) {
                 return Value::String(s.clone());
             }
-            Value::String(format_normalized_coords(&nums))
+            match format_normalized_coords(&nums) {
+                Some(norm_s) => Value::String(norm_s),
+                None => Value::String(s.clone()),
+            }
         }
         Value::Array(arr) => {
             if arr.len() >= 4 && arr.len().is_multiple_of(2) && arr.iter().all(|v| v.is_number()) {
                 let nums: Vec<f64> = arr
                     .iter()
                     .filter_map(|v| v.as_f64())
-                    .filter(|v| v.is_finite())
+                    .filter(|&v| v.is_finite() && v >= 0.0)
                     .collect();
-                if nums.len() == arr.len() {
-                    return Value::String(format_normalized_coords(&nums));
+                if nums.len() == arr.len()
+                    && let Some(norm_s) = format_normalized_coords(&nums)
+                {
+                    return Value::String(norm_s);
                 }
                 return Value::Array(arr.clone());
             }
@@ -14897,6 +15131,8 @@ pub fn normalize_privacy_mask_value_for_resolution(
                         && let (Some(x), Some(y)) = (pair[0].as_f64(), pair[1].as_f64())
                         && x.is_finite()
                         && y.is_finite()
+                        && x >= 0.0
+                        && y >= 0.0
                     {
                         nums.push(x);
                         nums.push(y);
@@ -14904,31 +15140,40 @@ pub fn normalize_privacy_mask_value_for_resolution(
                         return Value::Array(arr.clone());
                     }
                 }
-                return Value::String(format_normalized_coords(&nums));
+                if let Some(norm_s) = format_normalized_coords(&nums) {
+                    return Value::String(norm_s);
+                }
+                return Value::Array(arr.clone());
             }
             Value::Array(
                 arr.iter()
-                    .map(|v| normalize_privacy_mask_value_for_resolution(v, src_w, src_h))
+                    .map(|v| normalize_privacy_mask_value_inner(v, src_w, src_h, depth + 1))
                     .collect(),
             )
         }
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             let mut extra_polys: Vec<String> = Vec::new();
+            let mut has_meta_key = false;
+            let mut has_known_poly_key = false;
             for (k, v) in map {
                 if matches!(k.as_str(), "mode" | "style" | "pixelate" | "block_size") {
+                    has_meta_key = true;
                     out.insert(k.clone(), v.clone());
                 } else {
-                    let norm_v = normalize_privacy_mask_value_for_resolution(v, src_w, src_h);
-                    if let Value::Array(ref items) = norm_v {
-                        for item in items {
-                            if let Some(s) = item.as_str() {
-                                extra_polys.push(s.to_string());
-                            }
-                        }
+                    if matches!(k.as_str(), "coordinates" | "points" | "zones") {
+                        has_known_poly_key = true;
                     }
+                    let norm_v = normalize_privacy_mask_value_inner(v, src_w, src_h, depth + 1);
+                    collect_normalized_polygon_strings(&norm_v, &mut extra_polys, depth + 1);
                     out.insert(k.clone(), norm_v);
                 }
+            }
+            if has_meta_key && !has_known_poly_key && !extra_polys.is_empty() {
+                out.insert(
+                    "zones".to_string(),
+                    Value::Array(extra_polys.iter().cloned().map(Value::String).collect()),
+                );
             }
             for (idx, poly_s) in extra_polys.into_iter().enumerate() {
                 out.entry(format!("_norm_poly_{idx}"))
@@ -14962,6 +15207,19 @@ async fn redact_mp4_file_with_privacy(
     if std::fs::create_dir_all(exports_dir).is_err() {
         return false;
     }
+    if !std::fs::symlink_metadata(exports_dir)
+        .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+    {
+        return false;
+    }
+    if let Ok(out_meta) = std::fs::symlink_metadata(out_file)
+        && (out_meta.file_type().is_symlink() || out_meta.file_type().is_dir())
+    {
+        let _ = std::fs::remove_file(out_file);
+        if std::fs::symlink_metadata(out_file).is_ok() {
+            return false;
+        }
+    }
     let nonce: u64 = rand::random();
     let tmp_out_file = exports_dir.join(format!(".{redacted_id}.{nonce:016x}.tmp.mp4"));
     struct TempFileGuard(PathBuf);
@@ -14987,9 +15245,7 @@ async fn redact_mp4_file_with_privacy(
     if !matches!(status_res, Ok(Ok(s)) if s.success()) {
         return false;
     }
-    if std::fs::metadata(&tmp_out_file)
-        .map(|m| m.len() == 0)
-        .unwrap_or(true)
+    if !is_regular_non_symlink_file(&tmp_out_file)
         || ninjanvr_media::mp4_file_has_audio_track(&tmp_out_file)
     {
         return false;
@@ -15005,6 +15261,19 @@ async fn strip_mp4_audio_to_file(
 ) -> bool {
     if std::fs::create_dir_all(exports_dir).is_err() {
         return false;
+    }
+    if !std::fs::symlink_metadata(exports_dir)
+        .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+    {
+        return false;
+    }
+    if let Ok(out_meta) = std::fs::symlink_metadata(out_file)
+        && (out_meta.file_type().is_symlink() || out_meta.file_type().is_dir())
+    {
+        let _ = std::fs::remove_file(out_file);
+        if std::fs::symlink_metadata(out_file).is_ok() {
+            return false;
+        }
     }
     let nonce: u64 = rand::random();
     let tmp_out_file = exports_dir.join(format!(".{clip_id}.{nonce:016x}.tmp.mp4"));
@@ -15031,9 +15300,7 @@ async fn strip_mp4_audio_to_file(
     if !matches!(status_res, Ok(Ok(s)) if s.success()) {
         return false;
     }
-    if std::fs::metadata(&tmp_out_file)
-        .map(|m| m.len() == 0)
-        .unwrap_or(true)
+    if !is_regular_non_symlink_file(&tmp_out_file)
         || ninjanvr_media::mp4_file_has_audio_track(&tmp_out_file)
     {
         return false;
@@ -15232,12 +15499,14 @@ async fn share_video_mp4(
         if payload.k == "export" {
             let mut resolved_export: Option<(PathBuf, Option<String>)> = None;
             if let Ok(Some(exp)) = state.db.get_export_by_id(&payload.id) {
+                let db_exp_cam = exp["camera"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| infer_camera_prefix_from_id(&state, &payload.id));
                 if let Some(ref token_cam) = payload.cam
-                    && let Some(exp_cam) = exp["camera"]
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                    && token_cam != exp_cam
+                    && db_exp_cam.as_deref() != Some(token_cam.trim())
                 {
                     return (
                         StatusCode::FORBIDDEN,
@@ -15255,12 +15524,7 @@ async fn share_video_mp4(
                         ensure_path_within_media_dir(&state.media_dir, &disk_path)
                         && safe_path.is_file()
                     {
-                        let cam = exp["camera"]
-                            .as_str()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .or_else(|| payload.cam.clone());
+                        let cam = db_exp_cam.or_else(|| payload.cam.clone());
                         resolved_export = Some((safe_path, cam));
                     }
                 }
@@ -15269,10 +15533,16 @@ async fn share_video_mp4(
                     return StatusCode::NOT_FOUND.into_response();
                 }
             } else if !is_disallowed_export_fallback_id(&payload.id) && payload.id == safe_id {
+                let fallback_cam = payload
+                    .id
+                    .rsplitn(3, '_')
+                    .nth(2)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| infer_camera_prefix_from_id(&state, &payload.id));
                 if let Some(ref token_cam) = payload.cam
-                    && let Some(cam_prefix) =
-                        payload.id.rsplitn(3, '_').nth(2).filter(|s| !s.is_empty())
-                    && token_cam != cam_prefix
+                    && let Some(ref cam_prefix) = fallback_cam
+                    && token_cam.trim() != cam_prefix.trim()
                 {
                     return (
                         StatusCode::FORBIDDEN,
@@ -15287,14 +15557,16 @@ async fn share_video_mp4(
                 if let Some(safe_path) = ensure_path_within_media_dir(&state.media_dir, &file_path)
                     && safe_path.is_file()
                 {
-                    let cam = payload.cam.clone().or_else(|| {
-                        payload
-                            .id
-                            .rsplitn(3, '_')
-                            .nth(2)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                    });
+                    if let Some(ref token_cam) = payload.cam
+                        && fallback_cam.as_deref() != Some(token_cam.trim())
+                    {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "error": "Share link camera mismatch" })),
+                        )
+                            .into_response();
+                    }
+                    let cam = payload.cam.clone().or(fallback_cam);
                     resolved_export = Some((safe_path, cam));
                 }
             }
@@ -15327,17 +15599,22 @@ async fn share_video_mp4(
                     {
                         return StatusCode::NOT_FOUND.into_response();
                     }
+                    let Some(exports_dir) = ensure_safe_media_subdir(&state.media_dir, "exports")
+                    else {
+                        return StatusCode::NOT_FOUND.into_response();
+                    };
                     let redacted_id = format!("share_redacted_{safe_id}");
-                    let exports_dir = state.media_dir.join("exports");
-                    let redacted_path = exports_dir.join(format!("{redacted_id}.mp4"));
-                    let mask_hash_path = exports_dir.join(format!(".{redacted_id}.mask_hash"));
+                    let redacted_fname = format!("{redacted_id}.mp4");
+                    let mask_hash_fname = format!(".{redacted_id}.mask_hash");
+                    let redacted_path = exports_dir.join(&redacted_fname);
+                    let mask_hash_path = exports_dir.join(&mask_hash_fname);
                     let current_mask_hash = compute_privacy_mask_hash(privacy_mask.as_ref());
 
                     let clip_lock = acquire_share_clip_lock(&state, &redacted_id).await;
                     let _clip_guard = clip_lock.lock().await;
 
-                    if redacted_path.is_file() {
-                        let hash_matches = std::fs::read_to_string(&mask_hash_path)
+                    if is_regular_non_symlink_file(&redacted_path) {
+                        let hash_matches = read_non_symlink_string(&mask_hash_path)
                             .map(|existing_hash| existing_hash.trim() == current_mask_hash)
                             .unwrap_or(false);
                         if !hash_matches
@@ -15347,12 +15624,15 @@ async fn share_video_mp4(
                             )
                             || ninjanvr_media::mp4_file_has_audio_track(&redacted_path)
                         {
-                            let _ = std::fs::remove_file(&redacted_path);
-                            let _ = std::fs::remove_file(&mask_hash_path);
+                            remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
+                            remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
                         }
+                    } else if std::fs::symlink_metadata(&redacted_path).is_ok() {
+                        remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
+                        remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
                     }
 
-                    if !redacted_path.is_file() {
+                    if !is_regular_non_symlink_file(&redacted_path) {
                         if method == axum::http::Method::HEAD {
                             drop(_clip_guard);
                             if let Some(err_resp) = verify_post_build_share_target_and_jti(
@@ -15379,11 +15659,18 @@ async fn share_video_mp4(
                             normalized_privacy_mask.as_ref(),
                         )
                         .await;
-                        if build_ok && !ninjanvr_media::mp4_file_has_audio_track(&redacted_path) {
-                            let _ = std::fs::write(&mask_hash_path, &current_mask_hash);
+                        if build_ok
+                            && is_regular_non_symlink_file(&redacted_path)
+                            && !ninjanvr_media::mp4_file_has_audio_track(&redacted_path)
+                        {
+                            let _ = write_atomic_non_symlink_file(
+                                &exports_dir,
+                                &mask_hash_fname,
+                                current_mask_hash.as_bytes(),
+                            );
                         } else {
-                            let _ = std::fs::remove_file(&redacted_path);
-                            let _ = std::fs::remove_file(&mask_hash_path);
+                            remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
+                            remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
                             return StatusCode::NOT_FOUND.into_response();
                         }
                     }
@@ -15411,24 +15698,30 @@ async fn share_video_mp4(
                     if safe_id.is_empty() || payload.id != safe_id || payload.id.contains("..") {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
+                    let Some(exports_dir) = ensure_safe_media_subdir(&state.media_dir, "exports")
+                    else {
+                        return StatusCode::NOT_FOUND.into_response();
+                    };
                     let clip_id = format!("share_clip_{safe_id}");
-                    let exports_dir = state.media_dir.join("exports");
-                    let clip_path = exports_dir.join(format!("{clip_id}.mp4"));
+                    let clip_fname = format!("{clip_id}.mp4");
+                    let clip_path = exports_dir.join(&clip_fname);
 
                     let clip_lock = acquire_share_clip_lock(&state, &clip_id).await;
                     let _clip_guard = clip_lock.lock().await;
 
-                    if clip_path.is_file()
+                    if (is_regular_non_symlink_file(&clip_path)
                         && (ninjanvr_media::mp4_file_has_audio_track(&clip_path)
                             || is_cached_share_artifact_stale(
                                 &clip_path,
                                 std::slice::from_ref(&source_path),
-                            ))
+                            )))
+                        || (std::fs::symlink_metadata(&clip_path).is_ok()
+                            && !is_regular_non_symlink_file(&clip_path))
                     {
-                        let _ = std::fs::remove_file(&clip_path);
+                        remove_non_symlink_dir_child(&exports_dir, &clip_fname);
                     }
 
-                    if !clip_path.is_file() {
+                    if !is_regular_non_symlink_file(&clip_path) {
                         if method == axum::http::Method::HEAD {
                             drop(_clip_guard);
                             if let Some(err_resp) = verify_post_build_share_target_and_jti(
@@ -15454,8 +15747,11 @@ async fn share_video_mp4(
                             &clip_path,
                         )
                         .await;
-                        if !build_ok || ninjanvr_media::mp4_file_has_audio_track(&clip_path) {
-                            let _ = std::fs::remove_file(&clip_path);
+                        if !build_ok
+                            || !is_regular_non_symlink_file(&clip_path)
+                            || ninjanvr_media::mp4_file_has_audio_track(&clip_path)
+                        {
+                            remove_non_symlink_dir_child(&exports_dir, &clip_fname);
                             return StatusCode::NOT_FOUND.into_response();
                         }
                     }
@@ -15504,7 +15800,7 @@ async fn share_video_mp4(
                     let rev_cam = rev.camera.trim();
                     if !rev_cam.is_empty() {
                         if let Some(ref token_cam) = payload.cam
-                            && token_cam != rev_cam
+                            && token_cam.trim() != rev_cam
                         {
                             return (
                                 StatusCode::FORBIDDEN,
@@ -15522,7 +15818,7 @@ async fn share_video_mp4(
                         .filter(|s| !s.is_empty())
                 {
                     if let Some(ref token_cam) = payload.cam
-                        && token_cam != cam
+                        && token_cam.trim() != cam
                     {
                         return (
                             StatusCode::FORBIDDEN,
@@ -15541,7 +15837,7 @@ async fn share_video_mp4(
                     .filter(|s| !s.is_empty())
                 {
                     if let Some(ref token_cam) = payload.cam
-                        && token_cam != cam
+                        && token_cam.trim() != cam
                     {
                         return (
                             StatusCode::FORBIDDEN,
@@ -15558,7 +15854,7 @@ async fn share_video_mp4(
             {
                 let rev_cam = rev.camera.trim();
                 if let Some(ref token_cam) = payload.cam
-                    && token_cam != rev_cam
+                    && token_cam.trim() != rev_cam
                 {
                     return (
                         StatusCode::FORBIDDEN,
@@ -15631,29 +15927,37 @@ async fn share_video_mp4(
                     {
                         return StatusCode::NOT_FOUND.into_response();
                     }
+                    let Some(exports_dir) = ensure_safe_media_subdir(&state.media_dir, "exports")
+                    else {
+                        return StatusCode::NOT_FOUND.into_response();
+                    };
                     let redacted_id = format!("share_redacted_{safe_id}");
-                    let exports_dir = state.media_dir.join("exports");
-                    let redacted_path = exports_dir.join(format!("{redacted_id}.mp4"));
-                    let mask_hash_path = exports_dir.join(format!(".{redacted_id}.mask_hash"));
+                    let redacted_fname = format!("{redacted_id}.mp4");
+                    let mask_hash_fname = format!(".{redacted_id}.mask_hash");
+                    let redacted_path = exports_dir.join(&redacted_fname);
+                    let mask_hash_path = exports_dir.join(&mask_hash_fname);
                     let current_mask_hash = compute_privacy_mask_hash(privacy_mask.as_ref());
 
                     let clip_lock = acquire_share_clip_lock(&state, &redacted_id).await;
                     let _clip_guard = clip_lock.lock().await;
 
-                    if redacted_path.is_file() {
-                        let hash_matches = std::fs::read_to_string(&mask_hash_path)
+                    if is_regular_non_symlink_file(&redacted_path) {
+                        let hash_matches = read_non_symlink_string(&mask_hash_path)
                             .map(|existing_hash| existing_hash.trim() == current_mask_hash)
                             .unwrap_or(false);
                         if !hash_matches
                             || is_cached_share_artifact_stale(&redacted_path, &recs)
                             || ninjanvr_media::mp4_file_has_audio_track(&redacted_path)
                         {
-                            let _ = std::fs::remove_file(&redacted_path);
-                            let _ = std::fs::remove_file(&mask_hash_path);
+                            remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
+                            remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
                         }
+                    } else if std::fs::symlink_metadata(&redacted_path).is_ok() {
+                        remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
+                        remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
                     }
 
-                    if !redacted_path.is_file() {
+                    if !is_regular_non_symlink_file(&redacted_path) {
                         if method == axum::http::Method::HEAD {
                             drop(_clip_guard);
                             if let Some(err_resp) = verify_post_build_share_target_and_jti(
@@ -15688,21 +15992,26 @@ async fn share_video_mp4(
                         )
                         .await;
                         let _ = state.db.delete_export(&redacted_id);
-                        let _ = std::fs::remove_file(
-                            state
-                                .media_dir
-                                .join("clips")
-                                .join(format!("{redacted_id}.webp")),
+                        remove_non_symlink_dir_child(
+                            &state.media_dir.join("clips"),
+                            &format!("{redacted_id}.webp"),
                         );
                         match build_res {
                             Ok(Ok(()))
-                                if !ninjanvr_media::mp4_file_has_audio_track(&redacted_path) =>
+                                if is_regular_non_symlink_file(&redacted_path)
+                                    && !ninjanvr_media::mp4_file_has_audio_track(
+                                        &redacted_path,
+                                    ) =>
                             {
-                                let _ = std::fs::write(&mask_hash_path, &current_mask_hash);
+                                let _ = write_atomic_non_symlink_file(
+                                    &exports_dir,
+                                    &mask_hash_fname,
+                                    current_mask_hash.as_bytes(),
+                                );
                             }
                             _ => {
-                                let _ = std::fs::remove_file(&redacted_path);
-                                let _ = std::fs::remove_file(&mask_hash_path);
+                                remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
+                                remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
                                 return StatusCode::NOT_FOUND.into_response();
                             }
                         }
@@ -15730,20 +16039,24 @@ async fn share_video_mp4(
                 if safe_id.is_empty() || payload.id != safe_id || payload.id.contains("..") {
                     return StatusCode::BAD_REQUEST.into_response();
                 }
+                let Some(exports_dir) = ensure_safe_media_subdir(&state.media_dir, "exports")
+                else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
                 let clip_id = format!("share_clip_{safe_id}");
-                let clip_path = state
-                    .media_dir
-                    .join("exports")
-                    .join(format!("{clip_id}.mp4"));
+                let clip_fname = format!("{clip_id}.mp4");
+                let clip_path = exports_dir.join(&clip_fname);
                 let clip_lock = acquire_share_clip_lock(&state, &clip_id).await;
                 let _clip_guard = clip_lock.lock().await;
-                if clip_path.is_file()
+                if (is_regular_non_symlink_file(&clip_path)
                     && (is_cached_share_artifact_stale(&clip_path, &recs)
-                        || ninjanvr_media::mp4_file_has_audio_track(&clip_path))
+                        || ninjanvr_media::mp4_file_has_audio_track(&clip_path)))
+                    || (std::fs::symlink_metadata(&clip_path).is_ok()
+                        && !is_regular_non_symlink_file(&clip_path))
                 {
-                    let _ = std::fs::remove_file(&clip_path);
+                    remove_non_symlink_dir_child(&exports_dir, &clip_fname);
                 }
-                if !clip_path.is_file() {
+                if !is_regular_non_symlink_file(&clip_path) {
                     if method == axum::http::Method::HEAD {
                         drop(_clip_guard);
                         if let Some(err_resp) = verify_post_build_share_target_and_jti(
@@ -15778,16 +16091,15 @@ async fn share_video_mp4(
                     )
                     .await;
                     let _ = state.db.delete_export(&clip_id);
-                    let _ = std::fs::remove_file(
-                        state
-                            .media_dir
-                            .join("clips")
-                            .join(format!("{clip_id}.webp")),
+                    remove_non_symlink_dir_child(
+                        &state.media_dir.join("clips"),
+                        &format!("{clip_id}.webp"),
                     );
                     if !matches!(build_res, Ok(Ok(())))
+                        || !is_regular_non_symlink_file(&clip_path)
                         || ninjanvr_media::mp4_file_has_audio_track(&clip_path)
                     {
-                        let _ = std::fs::remove_file(&clip_path);
+                        remove_non_symlink_dir_child(&exports_dir, &clip_fname);
                         return StatusCode::NOT_FOUND.into_response();
                     }
                 }
@@ -15826,10 +16138,13 @@ async fn api_exports(
     headers: HeaderMap,
 ) -> Json<Value> {
     let mut exports = state.db.query_exports().unwrap_or_default();
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
         exports.retain(|exp| {
             exp["camera"]
                 .as_str()
+                .map(str::trim)
                 .is_some_and(|c| allowed.iter().any(|a| a == c))
         });
     }
@@ -15839,14 +16154,26 @@ async fn api_exports(
 fn infer_camera_prefix_from_id(state: &AppState, raw_id: &str) -> Option<String> {
     let trimmed = raw_id.trim();
     if let Ok(cfg) = state.config.try_read() {
+        let mut candidates = vec![trimmed];
+        for pfx in [
+            "rev_", "rev-", "ev_", "ev-", "exp_", "exp-", "thumb-", "preview_",
+        ] {
+            if let Some(rest) = trimmed.strip_prefix(pfx).filter(|s| !s.is_empty()) {
+                candidates.push(rest);
+            }
+        }
         let mut matched: Option<&str> = None;
-        for cam in cfg.cameras.keys() {
-            let dash_prefix = format!("{cam}-");
-            let under_prefix = format!("{cam}_");
-            if (trimmed.starts_with(&dash_prefix) || trimmed.starts_with(&under_prefix))
-                && matched.is_none_or(|prev| cam.len() > prev.len())
-            {
-                matched = Some(cam.as_str());
+        for cand in candidates {
+            for cam in cfg.cameras.keys() {
+                let dash_prefix = format!("{cam}-");
+                let under_prefix = format!("{cam}_");
+                if (cand == cam.as_str()
+                    || cand.starts_with(&dash_prefix)
+                    || cand.starts_with(&under_prefix))
+                    && matched.is_none_or(|prev| cam.len() > prev.len())
+                {
+                    matched = Some(cam.as_str());
+                }
             }
         }
         if let Some(cam) = matched {
@@ -15939,6 +16266,9 @@ fn case_value_is_permitted_for_allowed_cameras(
                 .collect()
         })
         .unwrap_or_default();
+    if !allowed.iter().any(|a| a == "*") && event_ids.is_empty() && export_ids.is_empty() {
+        return false;
+    }
     case_is_permitted_for_allowed_cameras(state, &event_ids, &export_ids, allowed)
 }
 
@@ -15982,8 +16312,21 @@ async fn api_case_create(
         )
             .into_response();
     }
+    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
+        return err_resp;
+    }
     if body.is_empty() {
         return Json(json!({ "success": true })).into_response();
+    }
+    if body.len() > 256 * 1024 {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "success": false,
+                "message": "Case payload exceeds maximum allowed size"
+            })),
+        )
+            .into_response();
     }
     let parsed: CreateCaseBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
@@ -16017,17 +16360,56 @@ async fn api_case_create(
                 rand::random::<u32>()
             )
         });
-    if !is_safe_id(&case_id) || case_id.len() > 128 {
+    if !is_safe_id(&case_id)
+        || case_id.len() > 128
+        || name.len() > 512
+        || parsed.description.as_ref().is_some_and(|d| d.len() > 16384)
+        || parsed.event_ids.len() > 1024
+        || parsed.export_ids.len() > 1024
+        || parsed
+            .event_ids
+            .iter()
+            .any(|id| !is_safe_id(id) || id.len() > 128)
+        || parsed
+            .export_ids
+            .iter()
+            .any(|id| !is_safe_id(id) || id.len() > 128)
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "success": false,
-                "message": "Invalid case identifier"
+                "message": "Invalid case identifier or attachment list"
             })),
         )
             .into_response();
     }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+        match state.db.get_case(&case_id) {
+            Ok(Some(existing)) => {
+                if !case_value_is_permitted_for_allowed_cameras(&state, &existing, &allowed) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "success": false,
+                            "message": "Cannot overwrite a case belonging to non-permitted cameras"
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "success": false,
+                        "message": "Failed to verify existing case ownership"
+                    })),
+                )
+                    .into_response();
+            }
+        }
         if !case_is_permitted_for_allowed_cameras(
             &state,
             &parsed.event_ids,
@@ -16039,21 +16421,6 @@ async fn api_case_create(
                 Json(json!({
                     "success": false,
                     "message": "Case references events or exports outside permitted cameras"
-                })),
-            )
-                .into_response();
-        }
-        if let Ok(existing_cases) = state.db.query_cases()
-            && let Some(existing) = existing_cases
-                .iter()
-                .find(|c| c["id"].as_str() == Some(case_id.as_str()))
-            && !case_value_is_permitted_for_allowed_cameras(&state, existing, &allowed)
-        {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "success": false,
-                    "message": "Cannot overwrite a case belonging to non-permitted cameras"
                 })),
             )
                 .into_response();
@@ -16121,8 +16488,11 @@ async fn api_export_create(
         )
             .into_response();
     }
+    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
+        return err_resp;
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && !allowed.iter().any(|a| a == &camera)
+        && !allowed.iter().any(|a| a == &camera || a == "*")
     {
         return (
             StatusCode::FORBIDDEN,
@@ -16300,7 +16670,12 @@ async fn api_export_rename(
         )
             .into_response();
     }
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
+        return err_resp;
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
         let permitted = state
             .db
             .get_export_by_id(&id)
@@ -16309,6 +16684,7 @@ async fn api_export_rename(
             .and_then(|exp| {
                 exp["camera"]
                     .as_str()
+                    .map(str::trim)
                     .map(|c| allowed.iter().any(|a| a == c))
             })
             .unwrap_or(false);
@@ -16325,6 +16701,43 @@ async fn api_export_rename(
     }
     let _ = state.db.rename_export(&id, &body.name);
     Json(json!({ "success": true })).into_response()
+}
+
+fn resolve_safe_export_unlink_paths(
+    media_dir: &Path,
+    vpath: &str,
+    tpath: &str,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    let raw_vpath = resolve_recording_disk_path(media_dir, vpath);
+    let safe_vpath = if std::fs::symlink_metadata(&raw_vpath).is_ok_and(|m| m.file_type().is_file())
+    {
+        ensure_path_within_media_dir(media_dir, &raw_vpath).filter(|canon_v| {
+            std::fs::canonicalize(media_dir.join("exports"))
+                .ok()
+                .is_some_and(|exports_canon| canon_v.parent() == Some(exports_canon.as_path()))
+        })
+    } else {
+        None
+    };
+
+    let raw_tpath = resolve_recording_disk_path(media_dir, tpath);
+    let safe_tpath = if std::fs::symlink_metadata(&raw_tpath).is_ok_and(|m| m.file_type().is_file())
+    {
+        ensure_path_within_media_dir(media_dir, &raw_tpath).filter(|canon_t| {
+            let not_latest = !canon_t
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("latest_"));
+            not_latest
+                && std::fs::canonicalize(media_dir.join("clips"))
+                    .ok()
+                    .is_some_and(|clips_canon| canon_t.parent() == Some(clips_canon.as_path()))
+        })
+    } else {
+        None
+    };
+
+    (safe_vpath, safe_tpath)
 }
 
 async fn api_export_delete(
@@ -16344,7 +16757,12 @@ async fn api_export_delete(
         )
             .into_response();
     }
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
+        return err_resp;
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
         let permitted = state
             .db
             .get_export_by_id(&id)
@@ -16353,6 +16771,7 @@ async fn api_export_delete(
             .and_then(|exp| {
                 exp["camera"]
                     .as_str()
+                    .map(str::trim)
                     .map(|c| allowed.iter().any(|a| a == c))
             })
             .unwrap_or(false);
@@ -16371,17 +16790,13 @@ async fn api_export_delete(
     purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
     if let Ok(Some((vpath, tpath))) = state.db.delete_export(&id) {
-        if let Some(safe_vpath) = ensure_path_within_media_dir(
-            &state.media_dir,
-            &resolve_recording_disk_path(&state.media_dir, &vpath),
-        ) {
-            let _ = tokio::fs::remove_file(safe_vpath).await;
+        let (safe_vpath, safe_tpath) =
+            resolve_safe_export_unlink_paths(&state.media_dir, &vpath, &tpath);
+        if let Some(vp) = safe_vpath {
+            let _ = tokio::fs::remove_file(vp).await;
         }
-        if let Some(safe_tpath) = ensure_path_within_media_dir(
-            &state.media_dir,
-            &resolve_recording_disk_path(&state.media_dir, &tpath),
-        ) {
-            let _ = tokio::fs::remove_file(safe_tpath).await;
+        if let Some(tp) = safe_tpath {
+            let _ = tokio::fs::remove_file(tp).await;
         }
     }
     Json(json!({ "success": true })).into_response()
@@ -16404,7 +16819,22 @@ async fn api_exports_bulk_delete(
         )
             .into_response();
     }
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await {
+    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
+        return err_resp;
+    }
+    if body.ids.len() > 1000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Bulk delete request exceeds maximum of 1000 export IDs"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
         for id in &body.ids {
             let permitted = state
                 .db
@@ -16414,6 +16844,7 @@ async fn api_exports_bulk_delete(
                 .and_then(|exp| {
                     exp["camera"]
                         .as_str()
+                        .map(str::trim)
                         .map(|c| allowed.iter().any(|a| a == c))
                 })
                 .unwrap_or(false);
@@ -16433,17 +16864,13 @@ async fn api_exports_bulk_delete(
         let _ = state.db.revoke_share_links_for_target(Some("export"), &id);
         cleanup_share_clip_artifacts(&state.media_dir, &id);
         if let Ok(Some((vpath, tpath))) = state.db.delete_export(&id) {
-            if let Some(safe_vpath) = ensure_path_within_media_dir(
-                &state.media_dir,
-                &resolve_recording_disk_path(&state.media_dir, &vpath),
-            ) {
-                let _ = tokio::fs::remove_file(safe_vpath).await;
+            let (safe_vpath, safe_tpath) =
+                resolve_safe_export_unlink_paths(&state.media_dir, &vpath, &tpath);
+            if let Some(vp) = safe_vpath {
+                let _ = tokio::fs::remove_file(vp).await;
             }
-            if let Some(safe_tpath) = ensure_path_within_media_dir(
-                &state.media_dir,
-                &resolve_recording_disk_path(&state.media_dir, &tpath),
-            ) {
-                let _ = tokio::fs::remove_file(safe_tpath).await;
+            if let Some(tp) = safe_tpath {
+                let _ = tokio::fs::remove_file(tp).await;
             }
         }
     }
@@ -16457,6 +16884,18 @@ async fn api_previews(
     headers: HeaderMap,
     AxumPath((camera, start, end)): AxumPath<(String, f64, f64)>,
 ) -> Response {
+    if (camera != "all" && (camera.is_empty() || !is_safe_id(&camera)))
+        || !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end < start
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Invalid preview query parameters" })),
+        )
+            .into_response();
+    }
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     if let Some(ref allow_list) = allowed
         && camera != "all"
@@ -16479,6 +16918,7 @@ async fn api_previews(
         previews.retain(|p| {
             p["camera"]
                 .as_str()
+                .map(str::trim)
                 .is_some_and(|cam| allow_list.iter().any(|a| a == cam))
         });
     }
@@ -16601,6 +17041,7 @@ fn xml_escape_simple(input: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            c if c.is_control() && !matches!(c, '\t' | '\n' | '\r') => {}
             _ => out.push(ch),
         }
     }
@@ -16609,6 +17050,18 @@ fn xml_escape_simple(input: &str) -> String {
 
 const MAX_ONVIF_SOAP_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_ONVIF_PRESETS: usize = 256;
+
+fn sanitize_onvif_token(raw: Option<&str>, default_val: &str) -> Option<String> {
+    let token = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_val);
+    if token.is_empty() || token.len() > 128 || token.chars().any(|c| c.is_control()) {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
 
 pub fn is_safe_onvif_endpoint_url(raw: &str) -> bool {
     let trimmed = raw.trim();
@@ -16636,6 +17089,7 @@ pub fn is_safe_onvif_endpoint_url(raw: &str) -> bool {
     if authority.is_empty() || authority.contains('@') {
         return false;
     }
+    let is_bracketed = authority.starts_with('[');
     let (host, port) = if let Some(after_bracket) = authority.strip_prefix('[') {
         let Some((ipv6_part, rest)) = after_bracket.split_once(']') else {
             return false;
@@ -16671,12 +17125,20 @@ pub fn is_safe_onvif_endpoint_url(raw: &str) -> bool {
     if matches!(port, Some(0 | 5000 | 8971 | 1984 | 8554 | 8555)) {
         return false;
     }
-    let host_lc = host.to_ascii_lowercase();
+    if host.ends_with("..") {
+        return false;
+    }
+    let host_lc = host.trim_end_matches('.').to_ascii_lowercase();
     if host_lc.is_empty()
         || host_lc == "metadata"
         || host_lc == "metadata.google.internal"
         || host_lc.ends_with(".metadata.google.internal")
+        || host_lc == "100.100.100.200"
         || host_lc.starts_with("169.254.")
+        || host_lc == "kubernetes"
+        || host_lc == "kubernetes.default"
+        || host_lc.ends_with(".svc")
+        || host_lc.ends_with(".cluster.local")
     {
         return false;
     }
@@ -16687,20 +17149,43 @@ pub fn is_safe_onvif_endpoint_url(raw: &str) -> bool {
                     || v4.is_broadcast()
                     || v4.is_multicast()
                     || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
+                    || v4.octets() == [100, 100, 100, 200]
             }
             std::net::IpAddr::V6(v6) => {
                 v6.is_unspecified()
                     || v6.is_multicast()
                     || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
                     || v6.to_ipv4_mapped().is_some_and(|v4| {
                         v4.is_unspecified()
                             || v4.is_broadcast()
                             || v4.is_multicast()
                             || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
+                            || v4.octets() == [100, 100, 100, 200]
                     })
             }
         };
         if disallowed {
+            return false;
+        }
+    } else {
+        if is_bracketed {
+            return false;
+        }
+        let labels: Vec<&str> = host_lc.split('.').collect();
+        if labels.iter().any(|l| l.is_empty()) {
+            return false;
+        }
+        let is_numeric_or_hex_label = |l: &str| -> bool {
+            l.chars().all(|c| c.is_ascii_digit())
+                || l.strip_prefix("0x")
+                    .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+        };
+        if labels.iter().all(|l| is_numeric_or_hex_label(l))
+            || labels
+                .last()
+                .is_some_and(|last| is_numeric_or_hex_label(last))
+        {
             return false;
         }
     }
@@ -16720,6 +17205,11 @@ pub fn resolve_onvif_ptz_endpoint(onvif: &ninjanvr_config::OnvifCameraConfig) ->
         } else {
             format!("{trimmed}/onvif/ptz_service")
         }
+    } else if host_raw.matches(':').count() > 1 && !host_raw.starts_with('[') {
+        if onvif.port == 0 {
+            return None;
+        }
+        format!("http://[{host_raw}]:{}/onvif/ptz_service", onvif.port)
     } else if host_raw.contains(':') && !host_raw.ends_with(']') {
         format!("http://{host_raw}/onvif/ptz_service")
     } else {
@@ -16864,39 +17354,83 @@ pub fn build_onvif_get_status_soap(
 }
 
 fn extract_xml_attr<'a>(tag_fragment: &'a str, attr_name: &str) -> Option<&'a str> {
-    for quote in ['"', '\''] {
-        let pattern = format!("{attr_name}={quote}");
-        if let Some(start_idx) = tag_fragment.find(&pattern) {
-            let val_start = start_idx + pattern.len();
-            if let Some(end_rel) = tag_fragment[val_start..].find(quote) {
-                return Some(&tag_fragment[val_start..val_start + end_rel]);
+    if attr_name.is_empty() {
+        return None;
+    }
+    let bytes = tag_fragment.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = tag_fragment[search_from..].find(attr_name) {
+        let idx = search_from + rel;
+        let boundary_ok = idx == 0 || {
+            let prev = bytes[idx - 1];
+            prev.is_ascii_whitespace() || matches!(prev, b'"' | b'\'')
+        };
+        let after_name = idx + attr_name.len();
+        if boundary_ok && after_name < tag_fragment.len() {
+            let rest = tag_fragment[after_name..].trim_start();
+            if let Some(after_eq) = rest.strip_prefix('=') {
+                let after_eq_trimmed = after_eq.trim_start();
+                for quote in ['"', '\''] {
+                    if let Some(val_rest) = after_eq_trimmed.strip_prefix(quote)
+                        && let Some(end_rel) = val_rest.find(quote)
+                    {
+                        return Some(&val_rest[..end_rel]);
+                    }
+                }
             }
         }
+        search_from = idx + 1;
     }
     None
 }
 
 fn find_closing_xml_tag_offset(xml_after_open: &str, local_name: &str) -> Option<(usize, usize)> {
     let mut cursor = 0usize;
-    while let Some(rel) = xml_after_open[cursor..].find("</") {
-        let close_start = cursor + rel;
-        let after_slash = close_start + 2;
-        let Some(gt_rel) = xml_after_open[after_slash..].find('>') else {
+    let mut depth = 1usize;
+    while let Some(rel) = xml_after_open[cursor..].find('<') {
+        let tag_start = cursor + rel;
+        if xml_after_open[tag_start..].starts_with("<!--") {
+            if let Some(end_comment) = xml_after_open[tag_start + 4..].find("-->") {
+                cursor = tag_start + 4 + end_comment + 3;
+                continue;
+            } else {
+                break;
+            }
+        }
+        let Some(gt_rel) = xml_after_open[tag_start..].find('>') else {
             break;
         };
-        let close_end = after_slash + gt_rel + 1;
-        let raw_tag = xml_after_open[after_slash..after_slash + gt_rel].trim();
-        let candidate_local = raw_tag
-            .rsplit_once(':')
-            .map(|(_, l)| l.trim())
-            .unwrap_or(raw_tag);
-        if candidate_local.eq_ignore_ascii_case(local_name)
-            && !raw_tag.contains('<')
-            && !raw_tag.contains('/')
+        let tag_end = tag_start + gt_rel + 1;
+        let inner_tag = xml_after_open[tag_start + 1..tag_start + gt_rel].trim();
+        if let Some(after_slash) = inner_tag.strip_prefix('/') {
+            let raw_tag = after_slash.trim();
+            let candidate_local = raw_tag
+                .rsplit_once(':')
+                .map(|(_, l)| l.trim())
+                .unwrap_or(raw_tag);
+            if candidate_local.eq_ignore_ascii_case(local_name)
+                && !raw_tag.contains('<')
+                && !raw_tag.contains('/')
+            {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((tag_start, tag_end));
+                }
+            }
+        } else if !inner_tag.starts_with('?')
+            && !inner_tag.starts_with('!')
+            && !inner_tag.ends_with('/')
         {
-            return Some((close_start, close_end));
+            let tag_token = inner_tag.split_whitespace().next().unwrap_or("");
+            let candidate_local = tag_token
+                .rsplit_once(':')
+                .map(|(_, l)| l)
+                .unwrap_or(tag_token);
+            if candidate_local.eq_ignore_ascii_case(local_name) {
+                depth = depth.saturating_add(1);
+            }
         }
-        cursor = close_end;
+        cursor = tag_end;
     }
     None
 }
@@ -17053,7 +17587,7 @@ pub fn parse_onvif_status_xml(xml: &str) -> OnvifPtzStatus {
         .to_ascii_uppercase();
     let error = extract_xml_element_text(xml, "Error")
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("NoError"))
-        .map(str::to_string);
+        .map(|s| scrub_rtsp_credentials(s).chars().take(512).collect());
 
     OnvifPtzStatus {
         pan,
@@ -17355,12 +17889,18 @@ async fn api_camera_ptz_info(
         Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
         None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 30)),
     };
-    let profile_token = q.profile_token.as_deref().unwrap_or("Profile_1");
+    let Some(profile_token) = sanitize_onvif_token(q.profile_token.as_deref(), "Profile_1") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Invalid ONVIF profile token" })),
+        )
+            .into_response();
+    };
     let user = cam_cfg.onvif.user.as_deref();
     let pass = cam_cfg.onvif.password.as_deref();
 
-    let presets_soap = build_onvif_get_presets_soap(profile_token, user, pass);
-    let status_soap = build_onvif_get_status_soap(profile_token, user, pass);
+    let presets_soap = build_onvif_get_presets_soap(&profile_token, user, pass);
+    let status_soap = build_onvif_get_status_soap(&profile_token, user, pass);
 
     let presets_res = send_onvif_soap_request(
         &state.http_client,
@@ -17532,6 +18072,15 @@ async fn api_camera_ptz_move(
             .into_response();
     };
 
+    let Some(profile_token) = sanitize_onvif_token(body.profile_token.as_deref(), "Profile_1")
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid ONVIF profile token" })),
+        )
+            .into_response();
+    };
+
     // Moving the camera via ContinuousMove or RelativeMove clears active_preset until GotoPreset completes
     state
         .ptz_active_presets
@@ -17546,14 +18095,13 @@ async fn api_camera_ptz_move(
     } else {
         "ContinuousMove"
     };
-    let profile_token = body.profile_token.as_deref().unwrap_or("Profile_1");
     let user = cam_cfg.onvif.user.as_deref();
     let pass = cam_cfg.onvif.password.as_deref();
     let soap_xml = if is_rel {
-        build_onvif_relative_move_soap(profile_token, pan, tilt, zoom, body.speed, user, pass)
+        build_onvif_relative_move_soap(&profile_token, pan, tilt, zoom, body.speed, user, pass)
     } else {
         let move_timeout = body.timeout_sec.unwrap_or(cam_cfg.onvif.timeout_sec);
-        build_onvif_continuous_move_soap(profile_token, pan, tilt, zoom, move_timeout, user, pass)
+        build_onvif_continuous_move_soap(&profile_token, pan, tilt, zoom, move_timeout, user, pass)
     };
     let timeout = match body.timeout_ms {
         Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
@@ -17634,10 +18182,17 @@ async fn api_camera_ptz_stop(
             .into_response();
     };
 
-    let profile_token = body.profile_token.as_deref().unwrap_or("Profile_1");
+    let Some(profile_token) = sanitize_onvif_token(body.profile_token.as_deref(), "Profile_1")
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid ONVIF profile token" })),
+        )
+            .into_response();
+    };
     let user = cam_cfg.onvif.user.as_deref();
     let pass = cam_cfg.onvif.password.as_deref();
-    let soap_xml = build_onvif_stop_soap(profile_token, body.pan_tilt, body.zoom, user, pass);
+    let soap_xml = build_onvif_stop_soap(&profile_token, body.pan_tilt, body.zoom, user, pass);
     let timeout = match body.timeout_ms {
         Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
         None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 30)),
@@ -17698,13 +18253,24 @@ async fn api_camera_ptz_preset(
         return err_resp;
     }
     let preset_token = body.preset.trim();
-    if preset_token.is_empty() {
+    if preset_token.is_empty()
+        || preset_token.len() > 128
+        || preset_token.chars().any(|c| c.is_control())
+    {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "message": "Preset token/name is required" })),
+            Json(json!({ "success": false, "message": "Preset token/name is required and must be valid" })),
         )
             .into_response();
     }
+    let Some(profile_token) = sanitize_onvif_token(body.profile_token.as_deref(), "Profile_1")
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid ONVIF profile token" })),
+        )
+            .into_response();
+    };
 
     let cam_opt = { state.config.read().await.cameras.get(&camera).cloned() };
     let Some(cam_cfg) = cam_opt else {
@@ -17722,11 +18288,10 @@ async fn api_camera_ptz_preset(
             .into_response();
     };
 
-    let profile_token = body.profile_token.as_deref().unwrap_or("Profile_1");
     let user = cam_cfg.onvif.user.as_deref();
     let pass = cam_cfg.onvif.password.as_deref();
     let soap_xml =
-        build_onvif_goto_preset_soap(profile_token, preset_token, body.speed, user, pass);
+        build_onvif_goto_preset_soap(&profile_token, preset_token, body.speed, user, pass);
     let timeout = match body.timeout_ms {
         Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
         None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 30)),
@@ -17868,6 +18433,35 @@ pub struct LatestFrameQuery {
 
 const MAX_LAZY_SNAPSHOT_CACHE_ENTRIES: usize = 128;
 const MAX_SNAPSHOT_FRAME_BYTES: usize = 10 * 1024 * 1024;
+const MAX_SNAPSHOT_DIMENSION: u32 = 8192;
+const MAX_SNAPSHOT_DECODE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_GO2RTC_STREAMS_JSON_BYTES: usize = 1024 * 1024;
+
+fn decode_bounded_snapshot_rgb(bytes: &[u8]) -> Option<image::RgbImage> {
+    if bytes.is_empty() || bytes.len() > MAX_SNAPSHOT_FRAME_BYTES {
+        return None;
+    }
+    let dim_reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (w, h) = dim_reader.into_dimensions().ok()?;
+    if w == 0 || h == 0 || w > MAX_SNAPSHOT_DIMENSION || h > MAX_SNAPSHOT_DIMENSION {
+        return None;
+    }
+    let rgba_bytes = (w as u64).saturating_mul(h as u64).saturating_mul(4);
+    if rgba_bytes > MAX_SNAPSHOT_DECODE_ALLOC_BYTES {
+        return None;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_SNAPSHOT_DIMENSION);
+    limits.max_image_height = Some(MAX_SNAPSHOT_DIMENSION);
+    limits.max_alloc = Some(MAX_SNAPSHOT_DECODE_ALLOC_BYTES);
+    reader.limits(limits);
+    Some(reader.decode().ok()?.to_rgb8())
+}
 
 fn apply_camera_privacy_mask_or_fail_closed(
     rgb: &mut image::RgbImage,
@@ -17875,6 +18469,9 @@ fn apply_camera_privacy_mask_or_fail_closed(
     detect_w: u32,
     detect_h: u32,
 ) -> bool {
+    if rgb.width() == 0 || rgb.height() == 0 {
+        return false;
+    }
     let src_w = if detect_w > 0 {
         detect_w
     } else {
@@ -18070,8 +18667,7 @@ async fn api_camera_latest_frame(
         if let Some(ref mask) = priv_mask
             && mask_active
         {
-            if let Ok(dyn_img) = image::load_from_memory(&frame_bytes) {
-                let mut rgb = dyn_img.to_rgb8();
+            if let Some(mut rgb) = decode_bounded_snapshot_rgb(&frame_bytes) {
                 if !apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, detect_w, detect_h) {
                     return placeholder_jpeg_response();
                 }
@@ -18108,6 +18704,9 @@ async fn api_camera_latest_frame(
         .join("clips")
         .join(format!("latest_{camera}.jpg"));
     if let Some(safe_disk_latest) = ensure_path_within_media_dir(&state.media_dir, &disk_latest)
+        && std::fs::symlink_metadata(&safe_disk_latest).is_ok_and(|m| {
+            m.file_type().is_file() && m.len() > 0 && m.len() <= MAX_SNAPSHOT_FRAME_BYTES as u64
+        })
         && let Ok(disk_bytes) = tokio::fs::read(&safe_disk_latest).await
         && !disk_bytes.is_empty()
     {
@@ -18124,8 +18723,7 @@ async fn api_camera_latest_frame(
         if let Some(ref mask) = priv_mask
             && mask_active
         {
-            if let Ok(dyn_img) = image::load_from_memory(&disk_bytes) {
-                let mut rgb = dyn_img.to_rgb8();
+            if let Some(mut rgb) = decode_bounded_snapshot_rgb(&disk_bytes) {
                 if !apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, detect_w, detect_h) {
                     return placeholder_jpeg_response();
                 }
@@ -18174,8 +18772,7 @@ async fn api_camera_latest_frame(
         if let Some(ref mask) = priv_mask
             && mask_active
         {
-            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
-                let mut rgb = dyn_img.to_rgb8();
+            if let Some(mut rgb) = decode_bounded_snapshot_rgb(&bytes) {
                 if !apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, detect_w, detect_h) {
                     return placeholder_jpeg_response();
                 }
@@ -18213,9 +18810,23 @@ async fn api_camera_latest_frame(
 async fn api_go2rtc_stream_prewarm(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
     AxumPath(stream): AxumPath<String>,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
+        return err_resp;
+    }
     if !is_safe_go2rtc_stream_name(&stream) {
         return (
             StatusCode::BAD_REQUEST,
@@ -18262,10 +18873,19 @@ async fn api_go2rtc_streams(
 ) -> Response {
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     let url = format!("{}/api/streams", state.go2rtc_http_base);
-    match state.http_client.get(&url).send().await {
+    match state
+        .http_client
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-            if let Ok(json_val) = resp.json::<Value>().await {
+            if let Some(bytes) =
+                read_bounded_response_bytes(resp, MAX_GO2RTC_STREAMS_JSON_BYTES).await
+                && let Ok(json_val) = serde_json::from_slice::<Value>(&bytes)
+            {
                 let mut scrubbed = scrub_json_value(&json_val);
                 if let Some(ref allow_list) = allowed
                     && let Some(obj) = scrubbed.as_object_mut()
@@ -18311,10 +18931,19 @@ async fn api_go2rtc_stream_one(
         "{}/api/streams?src={encoded_stream}&video=all&audio=all&microphone=",
         state.go2rtc_http_base
     );
-    match state.http_client.get(&url).send().await {
+    match state
+        .http_client
+        .get(&url)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-            if let Ok(json_val) = resp.json::<Value>().await {
+            if let Some(bytes) =
+                read_bounded_response_bytes(resp, MAX_GO2RTC_STREAMS_JSON_BYTES).await
+                && let Ok(json_val) = serde_json::from_slice::<Value>(&bytes)
+            {
                 return (status, Json(scrub_json_value(&json_val))).into_response();
             }
             Json(json!({})).into_response()
@@ -18459,7 +19088,7 @@ pub fn filter_ws_message_for_allowed_cameras(
             _ => return None,
         };
         let mut map = payload_val.as_object()?.clone();
-        map.retain(|cam, _| allow_list.iter().any(|a| a == cam));
+        map.retain(|cam, _| allow_list.iter().any(|a| a == cam.trim()));
         let filtered_payload =
             serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| "{}".to_string());
         return Some(
@@ -18476,22 +19105,34 @@ pub fn filter_ws_message_for_allowed_cameras(
             Some(v @ Value::Object(_)) => v.clone(),
             _ => return None,
         };
-        let cam = payload_val
+        let after_cam = payload_val
             .pointer("/after/camera")
             .and_then(|v| v.as_str())
-            .or_else(|| {
-                payload_val
-                    .pointer("/before/camera")
-                    .and_then(|v| v.as_str())
-            })
-            .or_else(|| payload_val.get("camera").and_then(|v| v.as_str()))?;
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let before_cam = payload_val
+            .pointer("/before/camera")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let top_cam = payload_val
+            .get("camera")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(bc) = before_cam
+            && !allow_list.iter().any(|a| a == bc)
+        {
+            return None;
+        }
+        let cam = after_cam.or(before_cam).or(top_cam)?;
         return if allow_list.iter().any(|a| a == cam) {
             Some(msg.to_string())
         } else {
             None
         };
     }
-    let first_seg = clean_topic.split('/').next().unwrap_or("");
+    let first_seg = clean_topic.split('/').next().unwrap_or("").trim();
     if !first_seg.is_empty() && allow_list.iter().any(|a| a == first_seg) {
         Some(msg.to_string())
     } else {
@@ -18502,9 +19143,27 @@ pub fn filter_ws_message_for_allowed_cameras(
 async fn ws_state_handler(
     State(state): State<AppState>,
     jar: CookieJar,
+    uri: Uri,
     headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+    ws_res: std::result::Result<
+        WebSocketUpgrade,
+        axum::extract::ws::rejection::WebSocketUpgradeRejection,
+    >,
+) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Cross-origin cookie WebSocket request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    let ws = match ws_res {
+        Ok(ws) => ws,
+        Err(rej) => return rej.into_response(),
+    };
     let (caller_role, allowed_cameras) = {
         let cfg = state.config.read().await;
         if let Some((user, role)) =
@@ -18520,6 +19179,7 @@ async fn ws_state_handler(
     ws.max_message_size(MAX_STATE_WS_MESSAGE_BYTES)
         .max_frame_size(MAX_STATE_WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| handle_state_ws(socket, state, caller_role, allowed_cameras))
+        .into_response()
 }
 
 async fn handle_state_ws(
@@ -18544,7 +19204,12 @@ async fn handle_state_ws(
     for init_msg in state.comms.initial_ws_snapshots(&cameras) {
         if let Some(filtered) =
             filter_ws_message_for_allowed_cameras(&init_msg, allowed_cameras.as_deref())
-            && socket.send(AxumWsMsg::Text(filtered.into())).await.is_err()
+            && tokio::time::timeout(
+                Duration::from_secs(5),
+                socket.send(AxumWsMsg::Text(filtered.into())),
+            )
+            .await
+            .is_err_and(|_| true)
         {
             return;
         }
@@ -18557,7 +19222,12 @@ async fn handle_state_ws(
             Ok(msg) = rx.recv() => {
                 if let Some(filtered) =
                     filter_ws_message_for_allowed_cameras(&msg, allowed_cameras.as_deref())
-                    && socket.send(AxumWsMsg::Text(filtered.into())).await.is_err()
+                    && tokio::time::timeout(
+                        Duration::from_secs(5),
+                        socket.send(AxumWsMsg::Text(filtered.into())),
+                    )
+                    .await
+                    .is_err_and(|_| true)
                 {
                     break;
                 }
@@ -18573,7 +19243,12 @@ async fn handle_state_ws(
                                 if let Some(filtered) = filter_ws_message_for_allowed_cameras(
                                     &init_msg,
                                     allowed_cameras.as_deref(),
-                                ) && socket.send(AxumWsMsg::Text(filtered.into())).await.is_err()
+                                ) && tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    socket.send(AxumWsMsg::Text(filtered.into())),
+                                )
+                                .await
+                                .is_err_and(|_| true)
                                 {
                                     return;
                                 }
@@ -18634,8 +19309,20 @@ async fn ws_go2rtc_proxy(
     jar: CookieJar,
     headers: HeaderMap,
     uri: Uri,
-    ws: WebSocketUpgrade,
+    ws_res: std::result::Result<
+        WebSocketUpgrade,
+        axum::extract::ws::rejection::WebSocketUpgradeRejection,
+    >,
 ) -> Response {
+    if !verify_cookie_csrf_origin(&headers, &uri) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "message": "Cross-origin cookie WebSocket request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     if let Err(msg) = validate_go2rtc_query_streams(uri.query(), allowed.as_deref()) {
         let status = if msg == "Stream camera is not permitted for this user"
@@ -18647,6 +19334,10 @@ async fn ws_go2rtc_proxy(
         };
         return (status, Json(json!({ "message": msg }))).into_response();
     }
+    let ws = match ws_res {
+        Ok(ws) => ws,
+        Err(rej) => return rej.into_response(),
+    };
     let is_webrtc_ws = uri.path().starts_with("/live/webrtc");
     let query = uri.query().unwrap_or("").to_string();
     ws.max_message_size(MAX_GO2RTC_WS_MESSAGE_BYTES)
@@ -18660,6 +19351,37 @@ async fn ws_go2rtc_proxy(
 #[allow(dead_code)]
 async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) {
     bridge_go2rtc_ws_with_mode(client_ws, state, query, false).await;
+}
+
+async fn send_client_ws_bounded(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, AxumWsMsg>,
+    msg: AxumWsMsg,
+) -> bool {
+    matches!(
+        tokio::time::timeout(Duration::from_secs(5), sink.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
+async fn send_mse_burst_bounded(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, AxumWsMsg>,
+    burst: mse_hub::MseGopBurst,
+    send_headers: bool,
+) -> Option<u64> {
+    if send_headers {
+        if !send_client_ws_bounded(sink, AxumWsMsg::Text(burst.codec_msg.into())).await {
+            return None;
+        }
+        if !send_client_ws_bounded(sink, AxumWsMsg::Binary(burst.init_segment)).await {
+            return None;
+        }
+    }
+    for frag in burst.gop_fragments {
+        if !send_client_ws_bounded(sink, AxumWsMsg::Binary(frag)).await {
+            return None;
+        }
+    }
+    Some(burst.last_seq)
 }
 
 async fn bridge_go2rtc_ws_with_mode(
@@ -18696,26 +19418,11 @@ async fn bridge_go2rtc_ws_with_mode(
         let mut last_sent_seq = 0u64;
         let mut sent_init = false;
         if let Some(burst) = sub.burst.take() {
-            if client_sink
-                .send(AxumWsMsg::Text(burst.codec_msg.into()))
-                .await
-                .is_err()
-            {
+            let Some(seq) = send_mse_burst_bounded(&mut client_sink, burst, true).await else {
                 return;
-            }
-            if client_sink
-                .send(AxumWsMsg::Binary(burst.init_segment))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            for frag in burst.gop_fragments {
-                if client_sink.send(AxumWsMsg::Binary(frag)).await.is_err() {
-                    return;
-                }
-            }
-            last_sent_seq = burst.last_seq;
+            };
+            last_sent_seq = seq;
+            sub.last_seq = sub.last_seq.max(seq);
             sent_init = true;
         }
 
@@ -18724,7 +19431,7 @@ async fn bridge_go2rtc_ws_with_mode(
                 client_msg = client_stream.next() => {
                     match client_msg {
                         Some(Ok(AxumWsMsg::Ping(p))) => {
-                            if client_sink.send(AxumWsMsg::Pong(p)).await.is_err() {
+                            if !send_client_ws_bounded(&mut client_sink, AxumWsMsg::Pong(p)).await {
                                 break;
                             }
                         }
@@ -18734,24 +19441,17 @@ async fn bridge_go2rtc_ws_with_mode(
                         _ => {}
                     }
                 }
-                live_pkt = sub.rx.recv() => {
+                live_pkt = sub.recv_or_resync(&state.mse_hub, src) => {
                     match live_pkt {
                         Ok(mse_hub::MseLivePacket::Codec(_)) | Ok(mse_hub::MseLivePacket::Init(_)) => {
                             if !sent_init
                                 && let Some(burst) = state.mse_hub.get_fresh_burst(src).await
                             {
-                                if client_sink.send(AxumWsMsg::Text(burst.codec_msg.into())).await.is_err() {
+                                let Some(seq) = send_mse_burst_bounded(&mut client_sink, burst, true).await else {
                                     break;
-                                }
-                                if client_sink.send(AxumWsMsg::Binary(burst.init_segment)).await.is_err() {
-                                    break;
-                                }
-                                for frag in burst.gop_fragments {
-                                    if client_sink.send(AxumWsMsg::Binary(frag)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                last_sent_seq = burst.last_seq;
+                                };
+                                last_sent_seq = seq;
+                                sub.last_seq = sub.last_seq.max(seq);
                                 sent_init = true;
                             } else if sent_init {
                                 // Upstream go2rtc session reconnected and emitted a new codec/init header
@@ -18763,18 +19463,11 @@ async fn bridge_go2rtc_ws_with_mode(
                         Ok(mse_hub::MseLivePacket::Fragment { seq, bytes }) => {
                             if !sent_init {
                                 if let Some(burst) = state.mse_hub.get_fresh_burst(src).await {
-                                    if client_sink.send(AxumWsMsg::Text(burst.codec_msg.into())).await.is_err() {
+                                    let Some(b_seq) = send_mse_burst_bounded(&mut client_sink, burst, true).await else {
                                         break;
-                                    }
-                                    if client_sink.send(AxumWsMsg::Binary(burst.init_segment)).await.is_err() {
-                                        break;
-                                    }
-                                    for frag in burst.gop_fragments {
-                                        if client_sink.send(AxumWsMsg::Binary(frag)).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                    last_sent_seq = burst.last_seq;
+                                    };
+                                    last_sent_seq = b_seq;
+                                    sub.last_seq = sub.last_seq.max(b_seq);
                                     sent_init = true;
                                 }
                                 continue;
@@ -18783,30 +19476,24 @@ async fn bridge_go2rtc_ws_with_mode(
                                 continue;
                             }
                             last_sent_seq = seq;
-                            if client_sink.send(AxumWsMsg::Binary(bytes)).await.is_err() {
+                            if !send_client_ws_bounded(&mut client_sink, AxumWsMsg::Binary(bytes)).await {
                                 break;
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            if let Some(burst) = state.mse_hub.get_fresh_burst(src).await {
-                                if !sent_init {
-                                    if client_sink.send(AxumWsMsg::Text(burst.codec_msg.into())).await.is_err() {
-                                        break;
-                                    }
-                                    if client_sink.send(AxumWsMsg::Binary(burst.init_segment)).await.is_err() {
-                                        break;
-                                    }
-                                    sent_init = true;
-                                }
-                                for frag in burst.gop_fragments {
-                                    if client_sink.send(AxumWsMsg::Binary(frag)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                last_sent_seq = burst.last_seq;
+                        Err(Some(burst)) => {
+                            let send_headers = !sent_init;
+                            let Some(b_seq) = send_mse_burst_bounded(&mut client_sink, burst, send_headers).await else {
+                                break;
+                            };
+                            sent_init = true;
+                            last_sent_seq = b_seq;
+                            sub.last_seq = sub.last_seq.max(b_seq);
+                        }
+                        Err(None) => {
+                            if state.mse_hub.get_fresh_burst(src).await.is_none() {
+                                break;
                             }
                         }
-                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
@@ -18968,7 +19655,13 @@ async fn vod_index_m3u8(
     headers: HeaderMap,
     AxumPath((camera, start, end)): AxumPath<(String, f64, f64)>,
 ) -> Response {
-    if camera.is_empty() || !is_safe_id(&camera) {
+    if camera.is_empty()
+        || !is_safe_id(&camera)
+        || !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end < start
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
@@ -18976,23 +19669,33 @@ async fn vod_index_m3u8(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let recs = existing_recordings_for_vod(&state, &camera, start, end);
+    let media_dir = state.media_dir.clone();
+    let state_for_vod = state.clone();
+    let cam_for_vod = camera.clone();
+    let Ok((recs, resolutions)) = tokio::task::spawn_blocking(move || {
+        let recs = existing_recordings_for_vod(&state_for_vod, &cam_for_vod, start, end);
+        let resolutions: Vec<(u32, u32)> = recs
+            .iter()
+            .map(|r| {
+                let disk_path = resolve_recording_disk_path(&media_dir, &r.path);
+                ensure_path_within_media_dir(&media_dir, &disk_path)
+                    .and_then(|safe_p| ninjanvr_vod::probe_mp4_resolution(&safe_p))
+                    .unwrap_or(if r.objects > 0 {
+                        (1920, 1080)
+                    } else {
+                        (640, 360)
+                    })
+            })
+            .collect();
+        (recs, resolutions)
+    })
+    .await
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     if recs.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let resolutions: Vec<(u32, u32)> = recs
-        .iter()
-        .map(|r| {
-            let disk_path = resolve_recording_disk_path(&state.media_dir, &r.path);
-            ensure_path_within_media_dir(&state.media_dir, &disk_path)
-                .and_then(|safe_p| ninjanvr_vod::probe_mp4_resolution(&safe_p))
-                .unwrap_or(if r.objects > 0 {
-                    (1920, 1080)
-                } else {
-                    (640, 360)
-                })
-        })
-        .collect();
     match ninjanvr_vod::build_media_playlist_with_resolutions(&recs, Some(&resolutions)) {
         Ok(m3u8) => (
             [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
@@ -19015,7 +19718,13 @@ async fn vod_init_mp4(
     AxumPath((camera, start, end)): AxumPath<(String, f64, f64)>,
     Query(q): Query<VodInitQuery>,
 ) -> Response {
-    if camera.is_empty() || !is_safe_id(&camera) {
+    if camera.is_empty()
+        || !is_safe_id(&camera)
+        || !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end < start
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
@@ -19047,7 +19756,13 @@ async fn vod_segment_m4s(
     headers: HeaderMap,
     AxumPath((camera, start, end, segment)): AxumPath<(String, f64, f64, String)>,
 ) -> Response {
-    if camera.is_empty() || !is_safe_id(&camera) {
+    if camera.is_empty()
+        || !is_safe_id(&camera)
+        || !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end < start
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
@@ -19125,9 +19840,35 @@ pub fn generate_self_signed_tls_config_with_sans(
         "::1".to_string(),
     ];
     for host in extra_sans {
-        let h = host.trim();
-        if !h.is_empty() && !subject_alt_names.iter().any(|s| s == h) {
-            subject_alt_names.push(h.to_string());
+        let raw = host.trim();
+        let after_scheme = raw
+            .split_once("://")
+            .map(|(_, r)| r)
+            .unwrap_or(raw)
+            .split(['/', '?', '#', '\\'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        let cleaned = if let Some(bracketed) = after_scheme.strip_prefix('[') {
+            bracketed.split_once(']').map(|(ip, _)| ip).unwrap_or("")
+        } else if let Some((h, p)) = after_scheme.rsplit_once(':')
+            && !h.contains(':')
+            && p.chars().all(|c| c.is_ascii_digit())
+        {
+            h
+        } else {
+            after_scheme
+        }
+        .trim()
+        .trim_end_matches('.');
+        if !cleaned.is_empty()
+            && !cleaned.contains('@')
+            && !subject_alt_names
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(cleaned))
+            && rcgen::CertificateParams::new(vec![cleaned.to_string()]).is_ok()
+        {
+            subject_alt_names.push(cleaned.to_string());
         }
     }
     let mut params = rcgen::CertificateParams::new(subject_alt_names)?;
@@ -19192,8 +19933,10 @@ pub async fn new_app_state(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&fallback_db, std::fs::Permissions::from_mode(0o600));
+                for suffix in ["", "-wal", "-shm"] {
+                    let p = PathBuf::from(format!("{}{suffix}", fallback_db.display()));
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                }
             }
             opened
         }
@@ -19213,10 +19956,14 @@ pub async fn new_app_state(
     comms.init_from_config(&cfg);
     let profile_file = config_dir.join(".active_profile");
     comms.set_profile_persist_path(profile_file.clone());
-    if let Ok(saved_prof) = std::fs::read_to_string(&profile_file)
-        && !saved_prof.trim().is_empty()
+    if std::fs::symlink_metadata(&profile_file)
+        .is_ok_and(|m| m.file_type().is_file() && m.len() <= 256)
+        && let Ok(saved_prof) = std::fs::read_to_string(&profile_file)
     {
-        comms.set_active_profile(saved_prof.trim());
+        let trimmed_prof = saved_prof.trim();
+        if is_safe_id(trimmed_prof) {
+            comms.set_active_profile(trimmed_prof);
+        }
     }
     let log_hub = LogBufferHub::new();
     log_hub.push_ninjanvr(

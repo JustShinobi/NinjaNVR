@@ -884,3 +884,464 @@ cameras:
     go2rtc_handle.abort();
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[tokio::test]
+async fn cycle2_share_export_onvif_ws_cswsh_and_vod_regression() {
+    let tmp_dir =
+        std::env::temp_dir().join(format!("ninjanvr-p3c-cycle2-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let media_dir = tmp_dir.join("media");
+    let exports_dir = media_dir.join("exports");
+    let clips_dir = media_dir.join("clips");
+    let review_clips_dir = clips_dir.join("review");
+    let rec_dir = media_dir.join("recordings/2026-11-05/12/front_door");
+    std::fs::create_dir_all(&exports_dir).unwrap();
+    std::fs::create_dir_all(&review_clips_dir).unwrap();
+    std::fs::create_dir_all(&rec_dir).unwrap();
+
+    let db_path = tmp_dir.join("ninjanvr.db");
+    let cfg_path = tmp_dir.join("config.yml");
+    let web_dir = tmp_dir.join("web-v2");
+    std::fs::create_dir_all(&web_dir).unwrap();
+    std::fs::write(web_dir.join("index.html"), "<html></html>").unwrap();
+
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+version: 0.18-0
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+cameras:
+  front_door:
+    enabled: true
+    detect:
+      width: 640
+      height: 480
+      fps: 5
+  backyard:
+    enabled: true
+    detect:
+      width: 640
+      height: 480
+      fps: 5
+"#,
+            db_path.display()
+        ),
+    )
+    .unwrap();
+
+    let state = new_app_state(&cfg_path, web_dir, media_dir.clone(), false)
+        .await
+        .unwrap();
+    state
+        .db
+        .create_user_with_cameras("scoped_fd", "pass1234", "operator", "front_door", 1000)
+        .unwrap();
+    let app = build_router_with_auth(state.clone(), true);
+
+    let admin_jwt = mint_test_jwt(&state.jwt_secret, "admin", "admin", "*");
+    let admin_bearer = format!("Bearer {admin_jwt}");
+    let admin_cookie = format!("ninjanvr_token={admin_jwt}");
+    let fd_jwt = mint_test_jwt(&state.jwt_secret, "scoped_fd", "operator", "front_door");
+    let fd_bearer = format!("Bearer {fd_jwt}");
+    let viewer_bearer = format!(
+        "Bearer {}",
+        mint_test_jwt(&state.jwt_secret, "viewer_u", "viewer", "*")
+    );
+
+    // 1. [P3C-C2-01] Cases: empty admin case shell & deleted `rev_backyard_*` / `exp_backyard_*` cases
+    //    are hidden from scoped user and cannot be overwritten by scoped user
+    state
+        .db
+        .create_case(
+            "case_admin_empty_shell",
+            "Confidential Shell",
+            Some("Executive notes before attaching clips"),
+            &[],
+            &[],
+        )
+        .unwrap();
+    state
+        .db
+        .create_case(
+            "case_deleted_rev_by",
+            "Deleted Backyard Review",
+            None,
+            &["rev_backyard_999".to_string()],
+            &[],
+        )
+        .unwrap();
+    state
+        .db
+        .create_case(
+            "case_deleted_exp_by",
+            "Deleted Backyard Export",
+            None,
+            &[],
+            &["exp_backyard_999".to_string()],
+        )
+        .unwrap();
+
+    let cases_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/cases")
+                .header(header::AUTHORIZATION, &fd_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cases_resp.status(), StatusCode::OK);
+    let visible_cases: Vec<Value> =
+        serde_json::from_slice(&to_bytes(cases_resp.into_body(), 16384).await.unwrap()).unwrap();
+    assert!(
+        visible_cases.iter().all(|c| {
+            c["id"] != "case_admin_empty_shell"
+                && c["id"] != "case_deleted_rev_by"
+                && c["id"] != "case_deleted_exp_by"
+        }),
+        "scoped user must not see empty admin case shells or deleted backyard cases: {visible_cases:?}"
+    );
+
+    // Scoped operator cannot overwrite `case_admin_empty_shell` or attach `rev_backyard_999`
+    for forbidden_case in [
+        json!({
+            "id": "case_admin_empty_shell",
+            "name": "Clobber Admin Shell",
+            "event_ids": ["front_door_ev_1"]
+        }),
+        json!({
+            "id": "case_try_del_rev_by",
+            "name": "Try Deleted Backyard Review",
+            "event_ids": ["rev_backyard_999"]
+        }),
+    ] {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/cases")
+                    .header(header::AUTHORIZATION, &fd_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(forbidden_case.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    // Unsafe event_ids element in POST /api/cases is rejected with 400 BAD_REQUEST
+    let bad_ev_id_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/cases")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "id": "case_bad_ev_elem",
+                        "name": "Bad Event ID",
+                        "event_ids": ["../outside"]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad_ev_id_resp.status(), StatusCode::BAD_REQUEST);
+
+    // 2. [P3C-C2-02] Privacy mask normalization for custom object keys + deep recursion bound + disk export fallback
+    let custom_obj_mask = json!({
+        "mode": "pixelate",
+        "block_size": 8,
+        "door_zone": "0,0,320,240"
+    });
+    let norm_custom = normalize_privacy_mask_value_for_resolution(&custom_obj_mask, 640, 480);
+    let vf_custom = ninjanvr_media::build_privacy_drawbox_filter(Some(&norm_custom)).unwrap();
+    assert!(vf_custom.contains("iw*0.500") && vf_custom.contains("ih*0.500"));
+    let poly_custom = ninjanvr_vision::PolygonMask::from_config_value(&norm_custom, 640, 480);
+    assert!(!poly_custom.is_empty());
+
+    let mut deep_mask = json!("0,0,320,240");
+    for _ in 0..24 {
+        deep_mask = json!([deep_mask]);
+    }
+    let norm_deep = normalize_privacy_mask_value_for_resolution(&deep_mask, 640, 480);
+    assert!(
+        ninjanvr_media::build_privacy_drawbox_filter(Some(&norm_deep)).is_none(),
+        "excessively nested privacy mask (> 16 levels) must fail closed"
+    );
+
+    // Disk-only export with single-underscore camera prefix (`backyard_manual.mp4`) resolves to `backyard`
+    // and rejects a share token claiming `cam: Some("front_door")`
+    std::fs::write(
+        exports_dir.join("backyard_manual.mp4"),
+        b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isom",
+    )
+    .unwrap();
+    let now = 1900000000u64;
+    state
+        .db
+        .insert_share_link_with_options(
+            "shr_c2_disk_mismatch",
+            "export",
+            "backyard_manual",
+            Some("front_door"),
+            "admin",
+            1700000000.0,
+            now as f64,
+            None,
+        )
+        .unwrap();
+    let mismatch_tok = sign_share_token(
+        &state.jwt_secret,
+        &ShareTokenPayload {
+            k: "export".to_string(),
+            id: "backyard_manual".to_string(),
+            exp: now,
+            cam: Some("front_door".to_string()),
+            jti: Some("shr_c2_disk_mismatch".to_string()),
+        },
+    );
+    for uri in [
+        format!("/share/{mismatch_tok}"),
+        format!("/share/{mismatch_tok}/video.mp4"),
+    ] {
+        let r = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    // 3. [P3C-C2-03] DELETE /api/export/{id} & POST /api/exports/delete never unlink recordings/ or clips/review/
+    let keep_recording = rec_dir.join("00.00.mp4");
+    let keep_rev_thumb = review_clips_dir.join("thumb-front_door-rev1.webp");
+    let keep_latest = clips_dir.join("latest_front_door.jpg");
+    std::fs::write(&keep_recording, b"RAW_RECORDING_EVIDENCE").unwrap();
+    std::fs::write(&keep_rev_thumb, b"REVIEW_THUMB_EVIDENCE").unwrap();
+    std::fs::write(&keep_latest, b"LATEST_SNAPSHOT").unwrap();
+
+    state
+        .db
+        .insert_export(&ninjanvr_db::ExportRow {
+            id: "exp_cross_dir_1".to_string(),
+            camera: "front_door".to_string(),
+            name: "Cross Dir 1".to_string(),
+            date: 1700000000.0,
+            video_path: "/media/ninjanvr/recordings/2026-11-05/12/front_door/00.00.mp4".to_string(),
+            thumb_path: "/media/ninjanvr/clips/review/thumb-front_door-rev1.webp".to_string(),
+            in_progress: false,
+        })
+        .unwrap();
+    state
+        .db
+        .insert_export(&ninjanvr_db::ExportRow {
+            id: "exp_cross_dir_2".to_string(),
+            camera: "front_door".to_string(),
+            name: "Cross Dir 2".to_string(),
+            date: 1700000000.0,
+            video_path: "/media/ninjanvr/recordings/2026-11-05/12/front_door/00.00.mp4".to_string(),
+            thumb_path: "/media/ninjanvr/clips/latest_front_door.jpg".to_string(),
+            in_progress: false,
+        })
+        .unwrap();
+
+    let del_single = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/export/exp_cross_dir_1")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del_single.status(), StatusCode::OK);
+
+    let del_bulk = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/exports/delete")
+                .header(header::AUTHORIZATION, &fd_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"ids":["exp_cross_dir_2"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del_bulk.status(), StatusCode::OK);
+    assert!(
+        keep_recording.is_file() && keep_rev_thumb.is_file() && keep_latest.is_file(),
+        "export deletion must never unlink files in recordings/, clips/review/, or latest_*.jpg"
+    );
+
+    // 4. [P3C-C2-04] ONVIF non-canonical IPv4, trailing-dot metadata, IPv6 IMDS, nested <Preset>, & attr boundaries
+    for blocked_onvif in [
+        "http://0xa9fea9fe/onvif/ptz_service",
+        "http://2852039166/onvif/ptz_service",
+        "http://0251.0376.0251.0376/onvif/ptz_service",
+        "http://127.1:8080/onvif/ptz_service",
+        "http://169.254.43518/onvif/ptz_service",
+        "http://metadata.google.internal./computeMetadata/v1/",
+        "http://[fd00:ec2::254]/latest/meta-data/",
+        "http://100.100.100.200/latest/meta-data/",
+        "http://kubernetes.default.svc/onvif/ptz_service",
+    ] {
+        assert!(
+            !is_safe_onvif_endpoint_url(blocked_onvif),
+            "expected Cycle-2 ONVIF SSRF URL to be blocked: {blocked_onvif}"
+        );
+    }
+    let ipv6_onvif = ninjanvr_config::OnvifCameraConfig {
+        host: Some("2001:db8::25".to_string()),
+        port: 8080,
+        ..Default::default()
+    };
+    assert_eq!(
+        resolve_onvif_ptz_endpoint(&ipv6_onvif).as_deref(),
+        Some("http://[2001:db8::25]:8080/onvif/ptz_service")
+    );
+
+    // Nested <ext:Preset> BEFORE <tt:Name> + attribute suffix `sub_token="wrong"` before `token="gate_1"`
+    let nested_before_name_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+  <s:Body>
+    <tptz:GetPresetsResponse>
+      <tptz:Preset sub_token="wrong_tok" token="gate_1">
+        <tt:Extension><ext:Preset>nested_before</ext:Preset></tt:Extension>
+        <tt:Name>Front Gate</tt:Name>
+      </tptz:Preset>
+    </tptz:GetPresetsResponse>
+  </s:Body>
+</s:Envelope>"#;
+    let presets = parse_onvif_presets_xml(nested_before_name_xml);
+    assert_eq!(presets.len(), 1);
+    assert_eq!(presets[0].token, "gate_1");
+    assert_eq!(presets[0].name, "Front Gate");
+
+    // `max_x="1.0"` before `x="0.25"` + `<tt:Error>` RTSP credential scrubbing
+    let status_attr_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+  <s:Body>
+    <tptz:GetStatusResponse>
+      <tptz:PTZStatus>
+        <tt:Position>
+          <tt:PanTilt max_x="1.0" max_y="1.0" x="0.25" y="-0.50"/>
+          <tt:Zoom min_x="0.0" x="0.75"/>
+        </tt:Position>
+        <tt:MoveStatus><tt:PanTilt>IDLE</tt:PanTilt></tt:MoveStatus>
+        <tt:Error>Upstream rtsp://admin:ptzsecret99@192.0.2.10:554/stream</tt:Error>
+      </tptz:PTZStatus>
+    </tptz:GetStatusResponse>
+  </s:Body>
+</s:Envelope>"#;
+    let st = parse_onvif_status_xml(status_attr_xml);
+    assert!((st.pan - 0.25).abs() < 1e-4);
+    assert!((st.tilt - (-0.50)).abs() < 1e-4);
+    assert!((st.zoom - 0.75).abs() < 1e-4);
+    let st_err = st.error.unwrap();
+    assert!(!st_err.contains("ptzsecret99"));
+    assert!(st_err.contains("rtsp://*:*@192.0.2.10:554/stream"));
+
+    // 5. [P3C-C2-05] CSWSH blocking on /ws & /live/mse/api/ws, WS `/before/camera` filtering, VOD bounds, & TLS SANs
+    for ws_uri in ["/ws", "/live/mse/api/ws?src=front_door"] {
+        let cswsh_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(ws_uri)
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, "https://evil.example")
+                    .header(header::HOST, "nvr.local:5000")
+                    .header(header::CONNECTION, "Upgrade")
+                    .header(header::UPGRADE, "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cswsh_resp.status(),
+            StatusCode::FORBIDDEN,
+            "cross-origin cookie WebSocket upgrade on {ws_uri} must be rejected with 403"
+        );
+    }
+
+    let viewer_prewarm = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/go2rtc/streams/front_door/prewarm")
+                .header(header::AUTHORIZATION, &viewer_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(viewer_prewarm.status(), StatusCode::FORBIDDEN);
+
+    let mixed_event_ws = json!({
+        "topic": "events",
+        "payload": {
+            "before": { "camera": "backyard" },
+            "after": { "camera": "front_door" }
+        }
+    })
+    .to_string();
+    assert!(
+        filter_ws_message_for_allowed_cameras(&mixed_event_ws, Some(&["front_door".to_string()]))
+            .is_none(),
+        "WS event with forbidden /before/camera must be filtered out"
+    );
+
+    for bad_vod_uri in [
+        "/vod/front_door/start/200/end/100/index-v1-a1.m3u8",
+        "/vod/front_door/start/-10/end/100/init-v1-a1.mp4",
+        "/vod/front_door/start/200/end/100/seg-1-v1-a1.m4s",
+    ] {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(bad_vod_uri)
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    assert!(
+        ninjanvr_server::generate_self_signed_tls_config_with_sans(&[
+            "https://nvr.example.com:8971/path".to_string(),
+            "[::1]:8971".to_string(),
+            "invalid..hostname..bad".to_string(),
+        ])
+        .is_ok(),
+        "generate_self_signed_tls_config_with_sans must sanitize URLs/ports and skip malformed SANs"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
