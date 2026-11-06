@@ -7950,6 +7950,54 @@ pub const REVIEW_FRAME_COUNT: usize = 8;
 const REVIEW_FRAME_MAX_WINDOW_SEC: f64 = 60.0;
 /// Width the flipbook frames are scaled to (height keeps the aspect ratio).
 const REVIEW_FRAME_WIDTH_PX: u32 = 320;
+/// Concurrent ffmpeg frame extractions. Every Live client asks for up to 80
+/// frames at once; unbounded, each request spawned its own 1080p decoder and
+/// pushed the pod past its memory limit.
+pub const REVIEW_FRAME_MAX_CONCURRENT_EXTRACTIONS: usize = 2;
+/// How long a frame request waits for an extraction slot before answering 503.
+const REVIEW_FRAME_QUEUE_WAIT_SECS: u64 = 20;
+
+static REVIEW_FRAME_EXTRACT_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| {
+        tokio::sync::Semaphore::new(REVIEW_FRAME_MAX_CONCURRENT_EXTRACTIONS)
+    });
+
+/// ffmpeg arguments for one flipbook still: single-threaded, keyframes only
+/// (cheap to decode, plenty for a flipbook), scaled down, one JPEG out.
+/// `-noaccurate_seek` keeps the keyframe at or before the offset, so a seek
+/// near the end of a segment still yields a frame.
+pub fn build_review_frame_ffmpeg_args(offset_sec: f64, input: &str, output: &str) -> Vec<String> {
+    let offset = if offset_sec.is_finite() {
+        offset_sec.max(0.0)
+    } else {
+        0.0
+    };
+    [
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-threads",
+        "1",
+        "-skip_frame",
+        "nokey",
+        "-noaccurate_seek",
+        "-ss",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .chain([format!("{offset:.3}"), "-i".to_string(), input.to_string()])
+    .chain(
+        ["-frames:v", "1", "-an", "-threads", "1", "-vf"]
+            .iter()
+            .map(|a| a.to_string()),
+    )
+    .chain([format!("scale={REVIEW_FRAME_WIDTH_PX}:-2")])
+    .chain(["-q:v", "6", "-f", "image2"].iter().map(|a| a.to_string()))
+    .chain([output.to_string()])
+    .collect()
+}
 
 /// Evenly spaced capture timestamps across a review item, for the event-strip flipbook.
 ///
@@ -8163,36 +8211,37 @@ async fn api_review_frame(
     }
     let _guard = TempFileGuard(tmp_file.clone());
 
+    // Bound concurrent extractions so a burst of Live clients cannot OOM the pod.
+    let Ok(Ok(_permit)) = tokio::time::timeout(
+        Duration::from_secs(REVIEW_FRAME_QUEUE_WAIT_SECS),
+        REVIEW_FRAME_EXTRACT_SEMAPHORE.acquire(),
+    )
+    .await
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "5")],
+        )
+            .into_response();
+    };
+    // Another request may have produced this frame while we waited for a slot.
+    if is_regular_non_symlink_file(&out_file)
+        && let Ok(bytes) = tokio::fs::read(&out_file).await
+    {
+        return serve(bytes);
+    }
+
     let ffmpeg_bin = ninjanvr_media::resolve_ffmpeg_bin();
-    let scale = format!("scale={REVIEW_FRAME_WIDTH_PX}:-2");
     let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
-        .args([
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-ss",
-        ])
-        .arg(format!("{offset:.3}"))
-        .arg("-i")
-        .arg(sanitize_local_ffmpeg_path_arg(&segment))
-        .args([
-            "-frames:v",
-            "1",
-            "-an",
-            "-vf",
-            &scale,
-            "-q:v",
-            "6",
-            "-f",
-            "image2",
-        ])
-        .arg(sanitize_local_ffmpeg_path_arg(&tmp_file));
+        .args(build_review_frame_ffmpeg_args(
+            offset,
+            &sanitize_local_ffmpeg_path_arg(&segment),
+            &sanitize_local_ffmpeg_path_arg(&tmp_file),
+        ));
     let status_res = tokio::time::timeout(Duration::from_secs(15), cmd.status()).await;
     if !matches!(status_res, Ok(Ok(s)) if s.success()) || !is_regular_non_symlink_file(&tmp_file) {
         return StatusCode::NOT_FOUND.into_response();
@@ -23108,6 +23157,33 @@ mod tests {
         );
         assert_eq!(locate_recording_offset(&spans, f64::NAN), None);
         assert_eq!(locate_recording_offset(&[(f64::NAN, 5.0)], 1.0), None);
+    }
+
+    #[test]
+    fn review_frame_ffmpeg_args_stay_single_threaded_and_keyframe_only() {
+        let args = build_review_frame_ffmpeg_args(4.5, "file:/in.mp4", "/out.jpg");
+        let input_at = args.iter().position(|a| a == "-i").unwrap();
+        let before_input = &args[..input_at];
+        // Decoder options must come before -i to apply to the input.
+        for opt in ["-skip_frame", "-noaccurate_seek", "-ss"] {
+            assert!(
+                before_input.iter().any(|a| a == opt),
+                "{opt} must precede -i"
+            );
+        }
+        assert_eq!(args.iter().filter(|a| *a == "-threads").count(), 2);
+        assert_eq!(args[input_at + 1], "file:/in.mp4");
+        assert!(args.windows(2).any(|w| w[0] == "-ss" && w[1] == "4.500"));
+        assert!(args.windows(2).any(|w| w[0] == "-frames:v" && w[1] == "1"));
+        assert!(args.iter().any(|a| a == "scale=320:-2"));
+        assert_eq!(args.last().map(String::as_str), Some("/out.jpg"));
+        let negative = build_review_frame_ffmpeg_args(f64::NAN, "a", "b");
+        assert!(
+            negative
+                .windows(2)
+                .any(|w| w[0] == "-ss" && w[1] == "0.000")
+        );
+        assert_eq!(REVIEW_FRAME_MAX_CONCURRENT_EXTRACTIONS, 2);
     }
 
     #[test]
