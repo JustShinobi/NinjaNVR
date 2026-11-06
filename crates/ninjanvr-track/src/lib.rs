@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ninjanvr_config::{CameraConfig, LineConfig, LineDirection, SnapshotSelectionPolicy};
 use ninjanvr_infer::{DetectionResult, nms_detections};
@@ -67,6 +67,7 @@ pub struct TrackedObject {
 struct ZonePresenceState {
     consecutive_in_frames: u32,
     first_entered_ts: f64,
+    has_finite_ts: bool,
 }
 
 const MAX_ACTIVE_TRACKS: usize = 256;
@@ -91,8 +92,12 @@ pub struct ByteTracker {
     zones: BTreeMap<String, (PolygonMask, Vec<String>, Option<String>)>,
     zone_presence: BTreeMap<String, BTreeMap<String, ZonePresenceState>>,
     unscanned_stationary_frames: BTreeMap<String, u32>,
+    confirmed_tracks: BTreeSet<String>,
     tracks: BTreeMap<String, TrackedObject>,
     frame_seq: u64,
+    next_track_seq: u32,
+    last_frame_time: f64,
+    has_finite_frame_time: bool,
 }
 
 impl ByteTracker {
@@ -158,8 +163,12 @@ impl ByteTracker {
             zones,
             zone_presence: BTreeMap::new(),
             unscanned_stationary_frames: BTreeMap::new(),
+            confirmed_tracks: BTreeSet::new(),
             tracks: BTreeMap::new(),
             frame_seq: 0,
+            next_track_seq: 0,
+            last_frame_time: 0.0,
+            has_finite_frame_time: false,
         }
     }
 
@@ -192,9 +201,11 @@ impl ByteTracker {
 
     pub fn active_tracks(&self) -> impl Iterator<Item = &TrackedObject> {
         let req_frames = self.effective_min_initialized();
-        self.tracks
-            .values()
-            .filter(move |t| t.frames_tracked >= req_frames && t.disappeared_frames == 0)
+        let confirmed = &self.confirmed_tracks;
+        self.tracks.values().filter(move |t| {
+            (confirmed.contains(&t.id) || t.frames_tracked >= req_frames)
+                && t.disappeared_frames == 0
+        })
     }
 
     pub fn non_stationary_boxes(&self, motion_boxes: &[BoundingBox]) -> Vec<BoundingBox> {
@@ -233,15 +244,31 @@ impl ByteTracker {
         if self.global_object_mask.contains_point(bx, by) {
             return true;
         }
-        if let Some(lm) = self.label_masks.get(&det.label)
-            && lm.contains_point(bx, by)
+        if let Some(lm) = self.label_masks.get(&det.label).or_else(|| {
+            self.label_masks
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&det.label))
+                .map(|(_, v)| v)
+        }) && lm.contains_point(bx, by)
         {
             return true;
         }
-        if let Some(f) = cfg.objects.filters.get(&det.label) {
+        if let Some(f) = cfg.objects.filters.get(&det.label).or_else(|| {
+            cfg.objects
+                .filters
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(&det.label))
+                .map(|(_, v)| v)
+        }) {
             let area = det.bbox.area();
             let (min_area_px, max_area_px) = f.resolve_area_bounds_px(self.frame_w, self.frame_h);
             if area < min_area_px || area > max_area_px {
+                return true;
+            }
+            let ratio = (det.bbox.width() as f32) / (det.bbox.height().max(1) as f32);
+            if (f.min_ratio.is_finite() && ratio < f.min_ratio)
+                || (f.max_ratio.is_finite() && ratio > f.max_ratio)
+            {
                 return true;
             }
             if f.min_score.is_finite() && det.score < f.min_score {
@@ -342,8 +369,9 @@ impl ByteTracker {
                 }
                 if let Some(max_a) = zcfg.max_area
                     && max_a.is_finite()
+                    && max_a > 0.0
                 {
-                    let max_px = if max_a > 0.0 && max_a <= 1.0 {
+                    let max_px = if max_a <= 1.0 {
                         (max_a * frame_area).round() as u32
                     } else {
                         max_a.max(1.0).round() as u32
@@ -368,8 +396,11 @@ impl ByteTracker {
         if self.zones.is_empty() {
             return Vec::new();
         }
-        let safe_time = if frame_time.is_finite() {
+        let time_is_finite = frame_time.is_finite();
+        let safe_time = if time_is_finite {
             frame_time
+        } else if self.has_finite_frame_time {
+            self.last_frame_time
         } else {
             0.0
         };
@@ -386,19 +417,23 @@ impl ByteTracker {
                 let st = track_zone_map.entry(zname.clone()).or_default();
                 if st.consecutive_in_frames == 0
                     || !st.first_entered_ts.is_finite()
-                    || safe_time < st.first_entered_ts
+                    || (time_is_finite && (!st.has_finite_ts || safe_time < st.first_entered_ts))
                 {
                     st.first_entered_ts = safe_time;
+                    if time_is_finite {
+                        st.has_finite_ts = true;
+                    }
                 }
                 st.consecutive_in_frames = st.consecutive_in_frames.saturating_add(1);
                 let inertia_ok = st.consecutive_in_frames >= req_inertia;
-                let loiter_ok =
-                    req_loiter <= 0.0 || (safe_time - st.first_entered_ts) >= req_loiter;
+                let loiter_ok = req_loiter <= 0.0
+                    || (st.has_finite_ts && (safe_time - st.first_entered_ts) >= req_loiter);
                 if inertia_ok && loiter_ok {
                     confirmed.push(zname.clone());
                 }
             } else if let Some(st) = track_zone_map.get_mut(zname) {
                 st.consecutive_in_frames = 0;
+                st.has_finite_ts = false;
             }
         }
         confirmed
@@ -414,8 +449,18 @@ impl ByteTracker {
         cfg: &CameraConfig,
     ) -> (Vec<TrackedObject>, Vec<TrackedObject>) {
         self.frame_seq = self.frame_seq.wrapping_add(1);
-        let frame_time = if frame_time.is_finite() {
+        let raw_time_finite = frame_time.is_finite();
+        let eval_time = if raw_time_finite {
+            self.last_frame_time = frame_time;
+            self.has_finite_frame_time = true;
             frame_time
+        } else {
+            f64::NAN
+        };
+        let frame_time = if raw_time_finite {
+            frame_time
+        } else if self.has_finite_frame_time {
+            self.last_frame_time
         } else {
             0.0
         };
@@ -435,6 +480,18 @@ impl ByteTracker {
                 }
                 let mut clean = d.clone();
                 clean.bbox = BoundingBox::new(x_min, y_min, x_max, y_max);
+                let is_attr = cfg
+                    .objects
+                    .attribute_labels
+                    .iter()
+                    .any(|attr_lbl| attr_lbl.eq_ignore_ascii_case(&clean.label));
+                if is_attr {
+                    if self.is_attribute_masked_or_filtered(&clean, cfg) {
+                        return None;
+                    }
+                } else if self.is_detection_masked_or_filtered(&clean, cfg) {
+                    return None;
+                }
                 Some(clean)
             })
             .collect();
@@ -442,13 +499,16 @@ impl ByteTracker {
 
         // 1. Predict next state for existing tracks using constant-velocity model
         for trk in self.tracks.values_mut() {
-            if !trk.vx.is_finite() {
+            if !trk.vx.is_finite() || trk.stationary {
                 trk.vx = 0.0;
             }
-            if !trk.vy.is_finite() {
+            if !trk.vy.is_finite() || trk.stationary {
                 trk.vy = 0.0;
             }
-            if trk.disappeared_frames > 0 && (trk.vx.abs() > 0.5 || trk.vy.abs() > 0.5) {
+            if !trk.stationary
+                && trk.disappeared_frames > 0
+                && (trk.vx.abs() > 0.5 || trk.vy.abs() > 0.5)
+            {
                 let w = trk.bbox.width().min(self.frame_w);
                 let h = trk.bbox.height().min(self.frame_h);
                 let max_x = self.frame_w.saturating_sub(w) as f32;
@@ -532,7 +592,7 @@ impl ByteTracker {
         for (d_idx, t_idx) in stage1_matches {
             let tid = &track_ids[t_idx];
             self.unscanned_stationary_frames.remove(tid);
-            self.apply_match(tid, &high_dets[d_idx], frame_time, cfg);
+            self.apply_match(tid, &high_dets[d_idx], eval_time, frame_time, cfg);
         }
 
         // Stage 2 (ByteTrack): Globally rank and associate Low-Confidence detections with remaining unmatched tracks
@@ -565,7 +625,7 @@ impl ByteTracker {
         for (d_idx, t_idx) in stage2_matches {
             let tid = &track_ids[t_idx];
             self.unscanned_stationary_frames.remove(tid);
-            self.apply_match(tid, &low_dets[d_idx], frame_time, cfg);
+            self.apply_match(tid, &low_dets[d_idx], eval_time, frame_time, cfg);
         }
 
         // 3. Handle unmatched tracks (preserving stationary tracks that were not in any scanned region,
@@ -579,9 +639,14 @@ impl ByteTracker {
         let mut ended_tracks = Vec::new();
         for (t_idx, tid) in track_ids.iter().enumerate() {
             if !matched_tracks[t_idx] {
+                let is_confirmed = self.confirmed_tracks.contains(tid)
+                    || self
+                        .tracks
+                        .get(tid)
+                        .is_some_and(|t| t.frames_tracked >= req_init);
                 let mut drop_unconfirmed = false;
                 if let Some(trk) = self.tracks.get_mut(tid) {
-                    if trk.frames_tracked < req_init {
+                    if !is_confirmed {
                         drop_unconfirmed = true;
                     } else {
                         let was_scanned = scanned_regions.iter().any(|r| r.intersects(&trk.bbox));
@@ -606,6 +671,7 @@ impl ByteTracker {
                 }
                 if drop_unconfirmed {
                     self.tracks.remove(tid);
+                    self.confirmed_tracks.remove(tid);
                     self.zone_presence.remove(tid);
                     self.unscanned_stationary_frames.remove(tid);
                 } else if self
@@ -614,9 +680,11 @@ impl ByteTracker {
                     .is_some_and(|t| t.disappeared_frames > self.max_disappeared)
                     && let Some(removed) = self.tracks.remove(tid)
                 {
+                    let was_confirmed =
+                        self.confirmed_tracks.remove(tid) || removed.frames_tracked >= req_init;
                     self.zone_presence.remove(tid);
                     self.unscanned_stationary_frames.remove(tid);
-                    if removed.frames_tracked >= req_init {
+                    if was_confirmed {
                         ended_tracks.push(removed);
                     }
                 }
@@ -636,41 +704,74 @@ impl ByteTracker {
             }) {
                 continue;
             }
-            while self.tracks.len() >= MAX_ACTIVE_TRACKS {
+            if self.tracks.len() >= MAX_ACTIVE_TRACKS {
+                let confirmed_set = &self.confirmed_tracks;
                 let Some(evict_id) = self
                     .tracks
                     .iter()
-                    .min_by(|(_, a), (_, b)| {
-                        (a.frames_tracked >= req_init)
-                            .cmp(&(b.frames_tracked >= req_init))
+                    .filter(|(k, t)| {
+                        let is_conf = confirmed_set.contains(*k) || t.frames_tracked >= req_init;
+                        !is_conf || t.disappeared_frames > 0
+                    })
+                    .min_by(|(ka, a), (kb, b)| {
+                        let a_conf = confirmed_set.contains(*ka) || a.frames_tracked >= req_init;
+                        let b_conf = confirmed_set.contains(*kb) || b.frames_tracked >= req_init;
+                        a_conf
+                            .cmp(&b_conf)
                             .then_with(|| b.disappeared_frames.cmp(&a.disappeared_frames))
                             .then_with(|| a.last_seen_time.total_cmp(&b.last_seen_time))
+                            .then_with(|| a.frames_tracked.cmp(&b.frames_tracked))
+                            .then_with(|| a.top_score.total_cmp(&b.top_score))
                     })
                     .map(|(k, _)| k.clone())
                 else {
                     break;
                 };
                 if let Some(removed) = self.tracks.remove(&evict_id) {
+                    let was_confirmed = self.confirmed_tracks.remove(&evict_id)
+                        || removed.frames_tracked >= req_init;
                     self.zone_presence.remove(&evict_id);
                     self.unscanned_stationary_frames.remove(&evict_id);
-                    if removed.frames_tracked >= req_init {
+                    if was_confirmed {
                         ended_tracks.push(removed);
                     }
                 }
             }
-            let suffix = format!(
-                "{:06x}",
+            let mut id = format!(
+                "{frame_time:.6}-{:06x}",
                 (self.frame_seq as u32).wrapping_mul(0x9E37_79B9) ^ (d_idx as u32)
             );
-            let id = format!("{frame_time:.6}-{suffix}");
+            while self.tracks.contains_key(&id) {
+                self.next_track_seq = self.next_track_seq.wrapping_add(1);
+                id = format!(
+                    "{frame_time:.6}-{:06x}",
+                    (self.frame_seq as u32)
+                        .wrapping_mul(0x9E37_79B9)
+                        .wrapping_add(self.next_track_seq.wrapping_mul(0x85EB_CA6B))
+                        ^ (d_idx as u32)
+                );
+            }
+            if req_init <= 1 {
+                self.confirmed_tracks.insert(id.clone());
+            }
             let raw_zones = self.evaluate_zones(&det.label, &det.bbox, det.score, cfg);
-            let zones = self.resolve_zones_with_hysteresis(&id, frame_time, &raw_zones, cfg);
-            let (min_score_cfg, threshold_cfg) = cfg
+            let zones = self.resolve_zones_with_hysteresis(&id, eval_time, &raw_zones, cfg);
+            let (raw_min_score_cfg, raw_threshold_cfg) = cfg
                 .objects
                 .filters
                 .get(&det.label)
                 .map(|f| (f.min_score, f.threshold))
                 .unwrap_or((0.5, 0.7));
+            let min_score_cfg = if raw_min_score_cfg.is_finite() {
+                raw_min_score_cfg
+            } else {
+                0.5
+            };
+            let threshold_cfg = if raw_threshold_cfg.is_finite() {
+                raw_threshold_cfg
+            } else {
+                0.7
+            };
             let frame_area = (self.frame_w.saturating_mul(self.frame_h)).max(1) as f32;
             let area_px = det.bbox.area();
             let area_pct = ((area_px as f32 / frame_area) * 10000.0).round() / 100.0;
@@ -730,6 +831,8 @@ impl ByteTracker {
 
         // 5. Associate child attribute detections (face, license_plate, delivery logos) to parent tracks
         self.associate_attributes_to_tracks(&attribute_dets);
+        self.confirmed_tracks
+            .retain(|k| self.tracks.contains_key(k));
         self.zone_presence
             .retain(|k, _| self.tracks.contains_key(k));
         self.unscanned_stationary_frames
@@ -799,7 +902,13 @@ impl ByteTracker {
                         trk.best_attribute_score = attr_q;
                     }
                 } else if is_delivery_logo_label(&attr_det.label) {
-                    trk.inferred_sub_label = Some(attr_det.label.clone());
+                    let has_higher_logo = trk
+                        .attributes
+                        .iter()
+                        .any(|a| is_delivery_logo_label(&a.label) && a.score >= attr_det.score);
+                    if !has_higher_logo {
+                        trk.inferred_sub_label = Some(attr_det.label.clone());
+                    }
                 }
                 trk.attributes.push(TrackedAttribute {
                     label: attr_det.label.clone(),
@@ -816,26 +925,40 @@ impl ByteTracker {
         &mut self,
         tid: &str,
         det: &DetectionResult,
+        eval_time: f64,
         frame_time: f64,
         cfg: &CameraConfig,
     ) {
         let raw_zones = self.evaluate_zones(&det.label, &det.bbox, det.score, cfg);
-        let zones = self.resolve_zones_with_hysteresis(tid, frame_time, &raw_zones, cfg);
+        let zones = self.resolve_zones_with_hysteresis(tid, eval_time, &raw_zones, cfg);
         let stationary_thresh = self.stationary_threshold;
         let frame_w = self.frame_w;
         let frame_h = self.frame_h;
         let eff_min_init = self.effective_min_initialized();
-        let (min_score_cfg, threshold_cfg) = cfg
+        let was_confirmed = self.confirmed_tracks.contains(tid);
+        let (raw_min_score_cfg, raw_threshold_cfg) = cfg
             .objects
             .filters
             .get(&det.label)
             .map(|f| (f.min_score, f.threshold))
             .unwrap_or((0.5, 0.7));
+        let min_score_cfg = if raw_min_score_cfg.is_finite() {
+            raw_min_score_cfg
+        } else {
+            0.5
+        };
+        let threshold_cfg = if raw_threshold_cfg.is_finite() {
+            raw_threshold_cfg
+        } else {
+            0.7
+        };
+        let mut newly_confirmed = false;
         if let Some(trk) = self.tracks.get_mut(tid) {
             let (old_cx, old_cy) = trk.bbox.center();
             let (new_cx, new_cy) = det.bbox.center();
-            let was_predicted =
-                trk.disappeared_frames > 0 && (trk.vx.abs() > 0.5 || trk.vy.abs() > 0.5);
+            let was_predicted = !trk.stationary
+                && trk.disappeared_frames > 0
+                && (trk.vx.abs() > 0.5 || trk.vy.abs() > 0.5);
             let (dx, dy) = if was_predicted {
                 ((new_cx - old_cx) + trk.vx, (new_cy - old_cy) + trk.vy)
             } else {
@@ -850,6 +973,8 @@ impl ByteTracker {
                 trk.motionless_count = trk.motionless_count.saturating_add(1);
                 if trk.motionless_count >= stationary_thresh {
                     trk.stationary = true;
+                    trk.vx = 0.0;
+                    trk.vy = 0.0;
                 }
             } else if iou < 0.55 || dx.hypot(dy) > max_jitter * 2.5 {
                 trk.motionless_count = 0;
@@ -871,6 +996,9 @@ impl ByteTracker {
             }
             trk.last_seen_time = frame_time;
             trk.frames_tracked = trk.frames_tracked.saturating_add(1);
+            if trk.frames_tracked >= eff_min_init {
+                newly_confirmed = !was_confirmed;
+            }
             trk.disappeared_frames = 0;
             trk.zones = zones.clone();
             for z in zones {
@@ -897,6 +1025,9 @@ impl ByteTracker {
                         if !trk.crossed_lines.contains(line_name) {
                             trk.crossed_lines.push(line_name.clone());
                         }
+                        if !trk.zones.contains(line_name) {
+                            trk.zones.push(line_name.clone());
+                        }
                         if !trk.entered_zones.contains(line_name) {
                             trk.entered_zones.push(line_name.clone());
                         }
@@ -904,7 +1035,7 @@ impl ByteTracker {
                 }
             }
 
-            if is_new_top || trk.frames_tracked == eff_min_init {
+            if is_new_top || newly_confirmed {
                 let frame_area = (frame_w.saturating_mul(frame_h)).max(1) as f32;
                 let area_px = det.bbox.area();
                 let area_pct = ((area_px as f32 / frame_area) * 10000.0).round() / 100.0;
@@ -930,6 +1061,15 @@ impl ByteTracker {
             trk.provenance.zones = trk.entered_zones.clone();
             trk.provenance.frames_tracked = trk.frames_tracked;
             trk.provenance.stationary = trk.stationary;
+        }
+        if was_confirmed
+            || newly_confirmed
+            || self
+                .tracks
+                .get(tid)
+                .is_some_and(|t| t.frames_tracked >= eff_min_init)
+        {
+            self.confirmed_tracks.insert(tid.to_string());
         }
     }
 }
@@ -2361,5 +2501,174 @@ mod tests {
             &z,
             &z,
         ));
+    }
+
+    #[test]
+    fn regression_pre_nms_filtering_eviction_protection_day_to_night_confirmation_and_nan_loiter() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 2;
+        cam_cfg.detect.min_initialized_night = Some(4);
+        cam_cfg.detect.max_disappeared = 5;
+        cam_cfg.objects.track = vec!["person".to_string(), "car".to_string()];
+        // Global mask in top-left [0..500, 0..500]
+        cam_cfg.objects.mask = "0.0,0.0,0.5,0.0,0.5,0.5,0.0,0.5".into();
+        let person_filter = ninjanvr_config::ObjectFilterConfig {
+            max_area: 100_000.0,
+            ..Default::default()
+        };
+        cam_cfg
+            .objects
+            .filters
+            .insert("person".to_string(), person_filter);
+        cam_cfg.zones.insert(
+            "yard_loiter".to_string(),
+            ninjanvr_config::ZoneConfig {
+                coordinates: "0.0,0.5,1.0,0.5,1.0,1.0,0.0,1.0".into(),
+                objects: vec!["person".to_string()],
+                inertia: 1,
+                loitering_time: 10,
+                min_area: None,
+                max_area: Some(0.0), // 0.0 must be treated as unset, not 1px max
+                min_score: None,
+                preset: None,
+            },
+        );
+
+        let mut tracker = ByteTracker::new("cam", 1000, 1000, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1000, 1000);
+
+        // 1. Oversized false-positive detection (800x800 = 640k > max_area 100k, higher score 0.99)
+        // must be filtered BEFORE NMS so it cannot suppress a valid overlapping person (100x200 = 20k, score 0.85)!
+        let oversized_fp = DetectionResult {
+            label: "person".to_string(),
+            score: 0.99,
+            bbox: BoundingBox::new(100, 500, 900, 990),
+            region: reg,
+        };
+        let valid_person = DetectionResult {
+            label: "person".to_string(),
+            score: 0.85,
+            bbox: BoundingBox::new(200, 600, 300, 800),
+            region: reg,
+        };
+        let _ = tracker.update(
+            100.0,
+            &[oversized_fp.clone(), valid_person.clone()],
+            &[reg],
+            &cam_cfg,
+        );
+        let (active_f2, _) = tracker.update(
+            101.0,
+            &[oversized_fp, valid_person.clone()],
+            &[reg],
+            &cam_cfg,
+        );
+        assert_eq!(
+            active_f2.len(),
+            1,
+            "oversized filtered-out box must not suppress valid overlapping detection during NMS"
+        );
+
+        // 2. NaN frame_time mid-loiter must not reset first_entered_ts to 0.0 and prematurely trigger loitering zone
+        let (active_nan, _) = tracker.update(
+            f64::NAN,
+            std::slice::from_ref(&valid_person),
+            &[reg],
+            &cam_cfg,
+        );
+        assert_eq!(active_nan.len(), 1);
+        assert!(active_nan[0].zones.is_empty());
+
+        let (active_before_loiter, _) =
+            tracker.update(104.0, std::slice::from_ref(&valid_person), &[reg], &cam_cfg);
+        assert!(
+            active_before_loiter[0].zones.is_empty(),
+            "elapsed 4s < 10s loitering_time must not trigger zone after intervening NaN timestamp"
+        );
+
+        let (active_after_loiter, _) =
+            tracker.update(111.0, std::slice::from_ref(&valid_person), &[reg], &cam_cfg);
+        assert!(
+            active_after_loiter[0]
+                .zones
+                .contains(&"yard_loiter".to_string()),
+            "zone with max_area=Some(0.0) must trigger once 10s loitering_time elapses"
+        );
+
+        // 3. Track confirmed in daytime (frames_tracked == 2 >= min_initialized 2, < min_initialized_night 4)
+        // must remain confirmed and emit into ended_tracks even if camera switches to night mode!
+        let mut dn_tracker = ByteTracker::new("cam_dn", 1000, 1000, &cam_cfg);
+        let _ = dn_tracker.update(10.0, std::slice::from_ref(&valid_person), &[reg], &cam_cfg);
+        let (dn_active, _) =
+            dn_tracker.update(11.0, std::slice::from_ref(&valid_person), &[reg], &cam_cfg);
+        assert_eq!(dn_active.len(), 1);
+        dn_tracker.set_night_mode(true);
+        let mut dn_ended = Vec::new();
+        for i in 0..7 {
+            let (_, ended) = dn_tracker.update(20.0 + i as f64, &[], &[reg], &cam_cfg);
+            dn_ended.extend(ended);
+        }
+        assert_eq!(
+            dn_ended.len(),
+            1,
+            "daytime-confirmed track must emit into ended_tracks after switching to night mode"
+        );
+
+        // 4. Highest-scoring delivery logo wins in same frame, and active confirmed tracks resist MAX_ACTIVE_TRACKS eviction
+        let mut logo_cfg = CameraConfig::default();
+        logo_cfg.detect.min_initialized = 1;
+        logo_cfg.objects.track = vec!["car".to_string(), "person".to_string()];
+        let mut logo_tracker = ByteTracker::new("cam_logo", 2000, 2000, &logo_cfg);
+        let car_det = DetectionResult {
+            label: "car".to_string(),
+            score: 0.95,
+            bbox: BoundingBox::new(100, 100, 500, 400),
+            region: reg,
+        };
+        let logo_high = DetectionResult {
+            label: "correios".to_string(),
+            score: 0.94,
+            bbox: BoundingBox::new(150, 150, 250, 220),
+            region: reg,
+        };
+        let logo_low = DetectionResult {
+            label: "dhl".to_string(),
+            score: 0.55,
+            bbox: BoundingBox::new(300, 150, 400, 220),
+            region: reg,
+        };
+        let (logo_active, _) = logo_tracker.update(
+            1.0,
+            &[car_det.clone(), logo_high, logo_low],
+            &[reg],
+            &logo_cfg,
+        );
+        assert_eq!(logo_active.len(), 1);
+        assert_eq!(
+            logo_active[0].inferred_sub_label.as_deref(),
+            Some("correios"),
+            "higher-scoring delivery logo must not be overwritten by lower-scoring logo in same frame"
+        );
+        let car_id = logo_active[0].id.clone();
+
+        // Flood 260 non-overlapping tentative detections on frame 2 while keeping car_det matched:
+        // car_id must not be evicted!
+        let mut flood = vec![car_det];
+        for i in 0..260u32 {
+            let gx = (i % 20) * 80 + 10;
+            let gy = (i / 20) * 80 + 500;
+            flood.push(DetectionResult {
+                label: "person".to_string(),
+                score: 0.80,
+                bbox: BoundingBox::new(gx, gy, gx + 30, gy + 60),
+                region: reg,
+            });
+        }
+        let (flood_active, flood_ended) = logo_tracker.update(2.0, &flood, &[reg], &logo_cfg);
+        assert!(
+            flood_active.iter().any(|t| t.id == car_id),
+            "currently-matched confirmed track must not be evicted by flood of new detections"
+        );
+        assert!(!flood_ended.iter().any(|t| t.id == car_id));
     }
 }

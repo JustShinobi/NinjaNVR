@@ -54,25 +54,36 @@ impl BoundingBox {
     }
 
     pub fn intersects(&self, other: &Self) -> bool {
-        self.x_min < other.x_max
+        self.x_min < self.x_max
+            && self.y_min < self.y_max
+            && other.x_min < other.x_max
+            && other.y_min < other.y_max
+            && self.x_min < other.x_max
             && self.x_max > other.x_min
             && self.y_min < other.y_max
             && self.y_max > other.y_min
     }
 
     pub fn inside(&self, container: &Self) -> bool {
-        self.x_min >= container.x_min
-            && self.y_min >= container.y_min
-            && self.x_max <= container.x_max
-            && self.y_max <= container.y_max
+        let s_xmin = self.x_min.min(self.x_max);
+        let s_ymin = self.y_min.min(self.y_max);
+        let s_xmax = self.x_max.max(self.x_min);
+        let s_ymax = self.y_max.max(self.y_min);
+        let c_xmin = container.x_min.min(container.x_max);
+        let c_ymin = container.y_min.min(container.y_max);
+        let c_xmax = container.x_max.max(container.x_min);
+        let c_ymax = container.y_max.max(container.y_min);
+        s_xmin >= c_xmin && s_ymin >= c_ymin && s_xmax <= c_xmax && s_ymax <= c_ymax
     }
 
     pub fn union(&self, other: &Self) -> Self {
+        let a = Self::new(self.x_min, self.y_min, self.x_max, self.y_max);
+        let b = Self::new(other.x_min, other.y_min, other.x_max, other.y_max);
         Self {
-            x_min: self.x_min.min(other.x_min),
-            y_min: self.y_min.min(other.y_min),
-            x_max: self.x_max.max(other.x_max),
-            y_max: self.y_max.max(other.y_max),
+            x_min: a.x_min.min(b.x_min),
+            y_min: a.y_min.min(b.y_min),
+            x_max: a.x_max.max(b.x_max),
+            y_max: a.y_max.max(b.y_max),
         }
     }
 
@@ -370,7 +381,8 @@ impl SimdMotionDetector {
     }
 
     pub fn detect(&mut self, frame: &YuvFrame) -> Vec<BoundingBox> {
-        if self.frame_w == 0
+        if !self.config.enabled
+            || self.frame_w == 0
             || self.frame_h == 0
             || frame.width < self.frame_w
             || frame.height < self.frame_h
@@ -428,56 +440,57 @@ impl SimdMotionDetector {
             }
             let masked_len = self.masked_indices.len() as u32;
             hist[255] = hist[255].saturating_sub(masked_len);
-            let total = (self.work_blurred.len() as u32)
-                .saturating_sub(masked_len)
-                .max(1);
-            let p4_target = (total * 4) / 100;
-            let p96_target = (total * 96) / 100;
+            let unmasked_total = (self.work_blurred.len() as u32).saturating_sub(masked_len);
+            if unmasked_total > 0 {
+                let total = unmasked_total.max(1);
+                let p4_target = ((total * 4) / 100).max(1);
+                let p96_target = ((total * 96) / 100).max(1);
 
-            let mut acc = 0u32;
-            let mut raw_min = 0u8;
-            let mut raw_max = 255u8;
-            for (val, &cnt) in hist.iter().enumerate() {
-                acc += cnt;
-                if acc >= p4_target {
-                    raw_min = val as u8;
-                    break;
+                let mut acc = 0u32;
+                let mut raw_min = 0u8;
+                let mut raw_max = 255u8;
+                for (val, &cnt) in hist.iter().enumerate() {
+                    acc += cnt;
+                    if acc >= p4_target {
+                        raw_min = val as u8;
+                        break;
+                    }
                 }
-            }
-            acc = 0;
-            for (val, &cnt) in hist.iter().enumerate() {
-                acc += cnt;
-                if acc >= p96_target {
-                    raw_max = val as u8;
-                    break;
+                acc = 0;
+                for (val, &cnt) in hist.iter().enumerate() {
+                    acc += cnt;
+                    if acc >= p96_target {
+                        raw_max = val as u8;
+                        break;
+                    }
                 }
-            }
 
-            if self.frame_counter == 0 {
-                self.smooth_min_v = raw_min as f32;
-                self.smooth_max_v = raw_max as f32;
-            } else {
-                let raw_fa = if self.config.frame_alpha.is_finite() {
-                    self.config.frame_alpha
+                if self.frame_counter == 0 {
+                    self.smooth_min_v = raw_min as f32;
+                    self.smooth_max_v = raw_max as f32;
                 } else {
-                    0.02
-                };
-                let c_alpha = raw_fa.clamp(0.005, 0.25);
-                self.smooth_min_v =
-                    (1.0 - c_alpha) * self.smooth_min_v + c_alpha * (raw_min as f32);
-                self.smooth_max_v =
-                    (1.0 - c_alpha) * self.smooth_max_v + c_alpha * (raw_max as f32);
-            }
+                    let raw_fa = if self.config.frame_alpha.is_finite() {
+                        self.config.frame_alpha
+                    } else {
+                        0.02
+                    };
+                    let c_alpha = raw_fa.clamp(0.005, 0.25);
+                    self.smooth_min_v =
+                        (1.0 - c_alpha) * self.smooth_min_v + c_alpha * (raw_min as f32);
+                    self.smooth_max_v =
+                        (1.0 - c_alpha) * self.smooth_max_v + c_alpha * (raw_max as f32);
+                }
 
-            let min_v = self.smooth_min_v.round().clamp(0.0, 170.0) as u8;
-            // Enforce a minimum span of 85 (~3x max gain) so dark/bright/uniform rooms never amplify compression noise
-            let max_v =
-                (self.smooth_max_v.round().clamp(85.0, 255.0) as u8).max(min_v.saturating_add(85));
-            if min_v < max_v {
-                let span = (max_v - min_v) as u32;
-                for px in &mut self.work_blurred {
-                    let clamped = (*px).clamp(min_v, max_v);
-                    *px = (((clamped - min_v) as u32 * 255) / span) as u8;
+                let min_v = self.smooth_min_v.round().clamp(0.0, 170.0) as u8;
+                // Enforce a minimum span of 85 (~3x max gain) so dark/bright/uniform rooms never amplify compression noise
+                let max_v = (self.smooth_max_v.round().clamp(85.0, 255.0) as u8)
+                    .max(min_v.saturating_add(85));
+                if min_v < max_v {
+                    let span = (max_v - min_v) as u32;
+                    for px in &mut self.work_blurred {
+                        let clamped = (*px).clamp(min_v, max_v);
+                        *px = (((clamped - min_v) as u32 * 255) / span) as u8;
+                    }
                 }
             }
             for &idx in &self.masked_indices {
@@ -532,8 +545,16 @@ impl SimdMotionDetector {
             }
         }
 
-        // Lightning / IR cut-filter switch rejection
-        let active_fraction = (active_pixels as f32) / (self.work_blurred.len().max(1) as f32);
+        // Lightning / IR cut-filter switch rejection (computed over unmasked motion cells)
+        let unmasked_len = self
+            .work_blurred
+            .len()
+            .saturating_sub(self.masked_indices.len());
+        let active_fraction = if unmasked_len > 0 {
+            (active_pixels as f32) / (unmasked_len as f32)
+        } else {
+            0.0
+        };
         let lightning_thresh = if self.config.lightning_threshold.is_finite() {
             self.config.lightning_threshold.clamp(0.05, 1.0)
         } else {
@@ -555,8 +576,17 @@ impl SimdMotionDetector {
 
         // 9. Update background model (`delta_alpha` = 0.2 default, so static changes settle in ~1.5s)
         let bg_alpha = raw_da.clamp(0.05, 0.5);
-        for (avg, &px) in self.avg_frame.iter_mut().zip(self.work_blurred.iter()) {
-            *avg = (1.0 - bg_alpha) * (*avg) + bg_alpha * (px as f32);
+        for (i, (avg, &px)) in self
+            .avg_frame
+            .iter_mut()
+            .zip(self.work_blurred.iter())
+            .enumerate()
+        {
+            if self.masked_bitmap[i] {
+                *avg = 255.0;
+            } else {
+                *avg = (1.0 - bg_alpha) * (*avg) + bg_alpha * (px as f32);
+            }
         }
         if !motion_boxes.is_empty() {
             self.motion_frame_count += 1;
@@ -728,11 +758,12 @@ impl SimdMotionDetector {
                     let b = BoundingBox::new(fx1, fy1, fx2, fy2);
                     // Suppress isolated 1-second camera OSD clock digit ticks in top/bottom margins
                     // and automatically promote repetitive OSD cells into the active motion mask.
-                    let in_osd_band =
-                        fy2 <= (self.frame_h * 12) / 100 || fy1 >= (self.frame_h * 86) / 100;
+                    let osd_top_limit = ((self.frame_h as u64 * 12) / 100) as u32;
+                    let osd_bot_limit = ((self.frame_h as u64 * 86) / 100) as u32;
+                    let in_osd_band = fy2 <= osd_top_limit || fy1 >= osd_bot_limit;
                     let is_osd_clock_tick = in_osd_band
-                        && b.height() <= (self.frame_h * 12) / 100
-                        && b.area().saturating_mul(160) <= frame_area;
+                        && b.height() <= osd_top_limit
+                        && (b.area() as u64).saturating_mul(160) <= (frame_area as u64);
                     if is_osd_clock_tick {
                         for cy in st.y_min..st.y_max.min(self.motion_h) {
                             for cx in st.x_min..st.x_max.min(self.motion_w) {
@@ -769,12 +800,29 @@ pub fn compute_inference_regions(
     if frame_w == 0 || frame_h == 0 {
         return Vec::new();
     }
+    let clamp_box = |b: &BoundingBox| -> Option<BoundingBox> {
+        let x1 = b.x_min.min(b.x_max).min(frame_w);
+        let y1 = b.y_min.min(b.y_max).min(frame_h);
+        let x2 = b.x_max.max(b.x_min).min(frame_w);
+        let y2 = b.y_max.max(b.y_min).min(frame_h);
+        if x2 > x1 && y2 > y1 {
+            Some(BoundingBox::new(x1, y1, x2, y2))
+        } else {
+            None
+        }
+    };
     let mut candidates: Vec<BoundingBox> =
         Vec::with_capacity(motion_boxes.len() + tracked_boxes.len());
-    candidates.extend_from_slice(tracked_boxes);
+    for tb in tracked_boxes {
+        if let Some(cb) = clamp_box(tb) {
+            candidates.push(cb);
+        }
+    }
     for mb in motion_boxes {
-        if !candidates.iter().any(|c| mb.inside(c)) {
-            candidates.push(*mb);
+        if let Some(cb) = clamp_box(mb)
+            && !candidates.iter().any(|c| cb.inside(c))
+        {
+            candidates.push(cb);
         }
     }
     if candidates.is_empty() {
@@ -1009,7 +1057,13 @@ pub fn yuv420p_to_rgb_image_scaled(
     }
 
     // Draw 2px bounding boxes scaled to (out_w, out_h)
-    for (bbox, color) in boxes {
+    for (raw_bbox, color) in boxes {
+        let bbox = BoundingBox::new(
+            raw_bbox.x_min,
+            raw_bbox.y_min,
+            raw_bbox.x_max,
+            raw_bbox.y_max,
+        );
         if !bbox.intersects(&region) {
             continue;
         }
@@ -1201,10 +1255,10 @@ pub fn classify_dominant_color_tag(
     let u_plane = &yuv_data[y_size..y_size + uv_size];
     let v_plane = &yuv_data[y_size + uv_size..y_size + uv_size * 2];
 
-    let x1 = (bbox.x_min as usize).min(fw - 1);
-    let y1 = (bbox.y_min as usize).min(fh - 1);
-    let x2 = (bbox.x_max as usize).clamp(x1 + 1, fw);
-    let y2 = (bbox.y_max as usize).clamp(y1 + 1, fh);
+    let x1 = (bbox.x_min.min(bbox.x_max) as usize).min(fw - 1);
+    let y1 = (bbox.y_min.min(bbox.y_max) as usize).min(fh - 1);
+    let x2 = (bbox.x_max.max(bbox.x_min) as usize).clamp(x1 + 1, fw);
+    let y2 = (bbox.y_max.max(bbox.y_min) as usize).clamp(y1 + 1, fh);
 
     let mut r_sum = 0u64;
     let mut g_sum = 0u64;
@@ -1377,10 +1431,10 @@ pub fn compute_crop_dhash64(yuv: &[u8], width: u32, height: u32, bbox: BoundingB
     }
     let y_plane = &yuv[..y_size];
 
-    let x1 = (bbox.x_min as usize).min(fw - 1);
-    let y1 = (bbox.y_min as usize).min(fh - 1);
-    let x2 = (bbox.x_max as usize).clamp(x1 + 1, fw);
-    let y2 = (bbox.y_max as usize).clamp(y1 + 1, fh);
+    let x1 = (bbox.x_min.min(bbox.x_max) as usize).min(fw - 1);
+    let y1 = (bbox.y_min.min(bbox.y_max) as usize).min(fh - 1);
+    let x2 = (bbox.x_max.max(bbox.x_min) as usize).clamp(x1 + 1, fw);
+    let y2 = (bbox.y_max.max(bbox.y_min) as usize).clamp(y1 + 1, fh);
     let bw = (x2 - x1).max(1);
     let bh = (y2 - y1).max(1);
 
@@ -1741,6 +1795,7 @@ impl RoiStateTracker {
         confidence: f32,
         now: f64,
     ) -> RoiStateTransition {
+        let has_prev_finite_ts = self.last_eval_ts.is_some_and(|t| t.is_finite());
         let safe_now = if now.is_finite() {
             now
         } else {
@@ -1751,8 +1806,11 @@ impl RoiStateTracker {
         } else {
             0.0
         };
-        self.last_eval_ts = Some(safe_now);
-        if !self.state_since_ts.is_finite() || (self.initialized && safe_now < self.state_since_ts)
+        if now.is_finite() {
+            self.last_eval_ts = Some(now);
+        }
+        if !self.state_since_ts.is_finite()
+            || (self.initialized && (!has_prev_finite_ts || safe_now < self.state_since_ts))
         {
             self.state_since_ts = safe_now;
         }
@@ -1901,8 +1959,22 @@ impl CameraRoiStateMonitor {
 /// (such as `112x112x3`) into a `16 x 16` area-averaged `[R, G, B]` grid (`256` cells in `0.0..=1.0`).
 /// Returns `None` if `data` is neither a decodable image nor a valid square RGB pixel buffer.
 pub fn decode_or_extract_rgb_grid_16x16(data: &[u8]) -> Option<[[f32; 3]; 256]> {
+    if data.is_empty() || data.len() > 32 * 1024 * 1024 {
+        return None;
+    }
+    let decoded_img = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()
+        .and_then(|mut reader| {
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(4096);
+            limits.max_image_height = Some(4096);
+            limits.max_alloc = Some(64 * 1024 * 1024);
+            reader.limits(limits);
+            reader.decode().ok()
+        });
     let (raw_rgb, w, h): (std::borrow::Cow<'_, [u8]>, usize, usize) =
-        if let Ok(dyn_img) = image::load_from_memory(data) {
+        if let Some(dyn_img) = decoded_img {
             let rgb = dyn_img.to_rgb8();
             let (iw, ih) = (rgb.width() as usize, rgb.height() as usize);
             if iw < 8 || ih < 8 {
@@ -2885,5 +2957,94 @@ mod tests {
         };
         let _ = det.detect(&ripple_frame);
         assert!(det.detect(&ripple_frame).is_empty());
+    }
+
+    #[test]
+    fn regression_disabled_motion_masked_lightning_flash_inverted_boxes_and_nan_roi_init() {
+        let w = 320u32;
+        let h = 180u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        let dark_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 1.0,
+            width: w,
+            height: h,
+            data: Arc::new(vec![30u8; y_len + uv_len * 2]),
+        };
+        let flash_frame = YuvFrame {
+            camera: Arc::from("cam"),
+            timestamp: 2.0,
+            width: w,
+            height: h,
+            data: Arc::new(vec![230u8; y_len + uv_len * 2]),
+        };
+
+        // 1. MotionConfig { enabled: false } suppresses motion detection completely
+        let disabled_cfg = MotionConfig {
+            enabled: false,
+            delta_alpha: 1.0,
+            ..MotionConfig::default()
+        };
+        let mut disabled_det = SimdMotionDetector::new(w, h, disabled_cfg);
+        for _ in 0..35 {
+            assert!(disabled_det.detect(&dark_frame).is_empty());
+        }
+        assert!(disabled_det.detect(&flash_frame).is_empty());
+
+        // 2. Lightning flash rejection works even when 50% of the frame is covered by a motion mask
+        let masked_flash_cfg = MotionConfig {
+            enabled: true,
+            lightning_threshold: 0.80,
+            improve_contrast: false,
+            delta_alpha: 1.0,
+            mask: serde_json::json!("0.0,0.0,1.0,0.0,1.0,0.5,0.0,0.5"),
+            ..MotionConfig::default()
+        };
+        let mut masked_det = SimdMotionDetector::new(w, h, masked_flash_cfg);
+        for _ in 0..31 {
+            assert!(masked_det.detect(&dark_frame).is_empty());
+        }
+        assert!(
+            masked_det.detect(&flash_frame).is_empty(),
+            "full-frame flash across unmasked region must still be rejected when 50% of frame is masked"
+        );
+
+        // 3. Inverted or zero-area BoundingBox never falsely intersects, and out-of-bounds inference boxes clamp safely
+        let inverted = BoundingBox {
+            x_min: 300,
+            y_min: 200,
+            x_max: 100,
+            y_max: 50,
+        };
+        let zero_box = BoundingBox::new(150, 100, 150, 100);
+        let container = BoundingBox::new(0, 0, 640, 360);
+        assert!(!inverted.intersects(&container));
+        assert!(!zero_box.intersects(&container));
+        assert!(inverted.inside(&container));
+
+        let oob_motion = [BoundingBox::new(5000, 5000, 6000, 6000)];
+        assert!(compute_inference_regions(640, 360, 320, &oob_motion, &[]).is_empty());
+
+        // 4. RoiStateTracker initialized with a NaN timestamp does not falsely trigger timeout on first finite timestamp
+        let roi_cfg = StateRoiConfig {
+            crop: [0.2, 0.2, 0.8, 0.8],
+            classes: vec!["closed".to_string(), "open".to_string()],
+            interval_sec: 10,
+            hysteresis: 1,
+            anomaly_state: Some("open".to_string()),
+            anomaly_timeout_sec: 30,
+        };
+        let mut roi_tracker = RoiStateTracker::new("garage", roi_cfg);
+        let tr_nan = roi_tracker.observe_state("open", 0.95, f64::NAN);
+        assert!(!tr_nan.anomaly_triggered);
+        let tr_first_valid = roi_tracker.observe_state("open", 0.95, 1_700_000_000.0);
+        assert!(
+            !tr_first_valid.anomaly_triggered,
+            "first finite timestamp after NaN must anchor state_since_ts instead of triggering immediately"
+        );
+        assert_eq!(tr_first_valid.anomaly_elapsed_sec, 0.0);
+        let tr_after_timeout = roi_tracker.observe_state("open", 0.95, 1_700_000_031.0);
+        assert!(tr_after_timeout.anomaly_triggered);
     }
 }
