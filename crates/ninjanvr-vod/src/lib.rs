@@ -13,16 +13,67 @@ const MAX_BOXES_PER_LEVEL: usize = 4_096;
 const MAX_TRAK_BOXES: usize = 16;
 const MAX_TRACKS: usize = 8;
 
-fn validate_segment_path(path: &Path) -> Result<u64> {
+#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
+const O_NOFOLLOW_FLAG: i32 = 0o100000;
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "arm", target_arch = "aarch64"))
+))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
+const O_NOFOLLOW_FLAG: i32 = 0;
+
+fn open_validated_segment_file(path: &Path) -> Result<(std::fs::File, u64)> {
     if path.as_os_str().is_empty() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         bail!("unsafe segment path {}", path.display());
     }
-    let meta = std::fs::symlink_metadata(path)
+    let lmeta = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat MP4 segment {}", path.display()))?;
-    if !meta.file_type().is_file() {
+    if !lmeta.file_type().is_file() {
         bail!("MP4 segment {} is not a regular file", path.display());
     }
-    let len = meta.len();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW_FLAG);
+    }
+    let file = opts
+        .open(path)
+        .with_context(|| format!("failed to open MP4 segment {}", path.display()))?;
+    let fd_meta = file
+        .metadata()
+        .with_context(|| format!("failed to fstat MP4 segment {}", path.display()))?;
+    if !fd_meta.file_type().is_file() {
+        bail!("MP4 segment {} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if fd_meta.dev() != lmeta.dev() || fd_meta.ino() != lmeta.ino() {
+            bail!("MP4 segment {} inode changed during open", path.display());
+        }
+    }
+    let len = fd_meta.len();
     if len > MAX_SEGMENT_FILE_BYTES {
         bail!(
             "MP4 segment {} exceeds maximum allowed size ({} bytes)",
@@ -30,7 +81,7 @@ fn validate_segment_path(path: &Path) -> Result<u64> {
             len
         );
     }
-    Ok(len)
+    Ok((file, len))
 }
 
 /// Probes the `(width, height)` video dimensions from an MP4 file's `vide` `tkhd` box in pure Rust.
@@ -312,9 +363,7 @@ struct ParsedTrack {
 
 fn read_moov_from_file(path: &Path) -> Result<(Vec<u8>, usize)> {
     use std::io::{Read, Seek, SeekFrom};
-    let file_len = validate_segment_path(path)?;
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("failed to open MP4 segment {}", path.display()))?;
+    let (mut file, file_len) = open_validated_segment_file(path)?;
     let mut pos = 0u64;
     let mut hdr = [0u8; 8];
     let mut boxes_seen = 0usize;
@@ -837,8 +886,12 @@ pub fn build_media_segment_m4s(
     sequence_number: u32,
     base_time_seconds: f64,
 ) -> Result<Vec<u8>> {
-    validate_segment_path(segment_path)?;
-    let file_bytes = std::fs::read(segment_path)
+    use std::io::Read;
+    let (file, expected_len) = open_validated_segment_file(segment_path)?;
+    let cap = usize::try_from(expected_len.min(MAX_SEGMENT_FILE_BYTES)).unwrap_or(0);
+    let mut file_bytes = Vec::with_capacity(cap);
+    file.take(MAX_SEGMENT_FILE_BYTES + 1)
+        .read_to_end(&mut file_bytes)
         .with_context(|| format!("failed to read MP4 file {}", segment_path.display()))?;
     if file_bytes.len() as u64 > MAX_SEGMENT_FILE_BYTES {
         bail!(
@@ -2192,6 +2245,20 @@ mod tests {
         let m4s_sf = build_media_segment_m4s(&tmp_soun_first, 1, 0.0)
             .expect("soun-first track pushing total payload over file_len must be stripped");
         assert!(m4s_sf.ends_with(&vec![0x65u8; 320]));
+
+        // 6. TOCTOU-009: Symlink segments and non-regular paths are rejected by open_validated_segment_file (O_NOFOLLOW + fstat)
+        #[cfg(unix)]
+        {
+            let symlink_seg = std::env::temp_dir().join("ninjanvr-vod-symlink-seg-test.mp4");
+            let _ = std::fs::remove_file(&symlink_seg);
+            std::os::unix::fs::symlink(&tmp_soun_first, &symlink_seg).unwrap();
+            assert!(open_validated_segment_file(&symlink_seg).is_err());
+            assert!(build_init_mp4(&symlink_seg).is_err());
+            assert!(build_media_segment_m4s(&symlink_seg, 1, 0.0).is_err());
+            assert_eq!(probe_mp4_resolution(&symlink_seg), None);
+            let _ = std::fs::remove_file(&symlink_seg);
+        }
+
         let _ = std::fs::remove_file(&tmp_soun_first);
     }
 }

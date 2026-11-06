@@ -17,6 +17,100 @@ use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
+const O_NOFOLLOW_FLAG: i32 = 0o100000;
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "arm", target_arch = "aarch64"))
+))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
+const O_NOFOLLOW_FLAG: i32 = 0;
+
+fn open_regular_file_nofollow(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let lmeta = std::fs::symlink_metadata(path)?;
+    if !lmeta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW_FLAG);
+    }
+    let file = opts.open(path)?;
+    let fd_meta = file.metadata()?;
+    if !fd_meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "opened descriptor is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if fd_meta.dev() != lmeta.dev() || fd_meta.ino() != lmeta.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file inode changed during open",
+            ));
+        }
+    }
+    Ok((file, fd_meta))
+}
+
+fn create_new_file_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW_FLAG);
+    }
+    opts.open(path)
+}
+
+fn copy_file_via_nofollow(src: &Path, dst_new: &Path) -> std::io::Result<u64> {
+    let (mut src_file, _) = open_regular_file_nofollow(src)?;
+    let mut dst_file = create_new_file_nofollow(dst_new)?;
+    let bytes = std::io::copy(&mut src_file, &mut dst_file)?;
+    dst_file.sync_all()?;
+    Ok(bytes)
+}
+
+fn is_allowed_media_artifact_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    ext.eq_ignore_ascii_case("jpg")
+        || ext.eq_ignore_ascii_case("jpeg")
+        || ext.eq_ignore_ascii_case("webp")
+        || ext.eq_ignore_ascii_case("mp4")
+        || ext.eq_ignore_ascii_case("mask_hash")
+}
+
 /// Probes whether `media_dir` (`recordings/`, `clips/`, `exports/`) can be created and written to.
 /// Returns `Ok(())` if writable, or `Err(reason)` if the mount is missing, read-only, or permission-denied.
 pub fn probe_storage_writable(media_dir: &Path) -> std::result::Result<(), String> {
@@ -26,8 +120,17 @@ pub fn probe_storage_writable(media_dir: &Path) -> std::result::Result<(), Strin
             return Err(format!("failed to initialize {}: {err}", dir.display()));
         }
     }
-    let probe_file = media_dir.join("recordings").join(".ninjanvr_write_probe");
-    if let Err(err) = std::fs::write(&probe_file, b"ok") {
+    let nonce: u64 = rand::random();
+    let probe_file = media_dir
+        .join("recordings")
+        .join(format!(".ninjanvr_write_probe.{nonce:016x}"));
+    let _probe_guard = TempPathGuard(probe_file.clone());
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = create_new_file_nofollow(&probe_file)?;
+        std::io::Write::write_all(&mut f, b"ok")?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
         return Err(format!(
             "recordings mount {} is not writable: {err}",
             media_dir.display()
@@ -396,12 +499,8 @@ fn parse_duration_box(body: &[u8]) -> Option<f64> {
 /// (falling back to `mvhd` if no `vide` track is present) in pure Rust without spawning `ffprobe`.
 pub fn probe_mp4_duration_fast(path: &Path) -> Option<f64> {
     use std::io::{Read, Seek, SeekFrom};
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() {
-        return None;
-    }
+    let (mut file, meta) = open_regular_file_nofollow(path).ok()?;
     let file_len = meta.len();
-    let mut file = std::fs::File::open(path).ok()?;
     let mut pos = 0u64;
     let mut hdr = [0u8; 8];
     let mut boxes_seen = 0usize;
@@ -581,16 +680,10 @@ fn decode_audio_dbfs_via_ffmpeg(path: &Path) -> i64 {
 ///   directly from the `mdat` chunk offsets.
 pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+    let Ok((mut file, meta)) = open_regular_file_nofollow(path) else {
         return 0;
     };
-    if !meta.file_type().is_file() {
-        return 0;
-    }
     let file_len = meta.len();
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return 0;
-    };
     let mut pos = 0u64;
     let mut hdr = [0u8; 8];
     let mut boxes_seen = 0usize;
@@ -704,19 +797,26 @@ fn is_known_iso_top_level_box(btype: &[u8; 4]) -> bool {
 /// carries an audio (`soun`) track with non-empty samples (or a `soun` `trak` box).
 pub fn mp4_file_has_audio_track(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+    let Ok(lmeta) = std::fs::symlink_metadata(path) else {
         return false;
     };
-    if !meta.file_type().is_file() {
+    if !lmeta.file_type().is_file() {
         return true;
     }
-    let file_len = meta.len();
+    let Ok((mut file, fd_meta)) = open_regular_file_nofollow(path) else {
+        return true;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if fd_meta.dev() != lmeta.dev() || fd_meta.ino() != lmeta.ino() {
+            return true;
+        }
+    }
+    let file_len = fd_meta.len();
     if file_len < 8 {
         return false;
     }
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return true;
-    };
     let mut pos = 0u64;
     let mut hdr = [0u8; 8];
     let mut boxes_seen = 0usize;
@@ -2275,7 +2375,9 @@ impl RecordingEngine {
                             continue;
                         };
 
-                        let tmp_out = disk_path.with_extension("compact.mp4");
+                        let compact_nonce: u64 = rand::random();
+                        let tmp_out =
+                            disk_path.with_extension(format!("{compact_nonce:016x}.compact.mp4"));
                         let _tmp_compact_guard = TempPathGuard(tmp_out.clone());
                         let primary_args = build_cold_compaction_ffmpeg_args(
                             &disk_path,
@@ -2319,10 +2421,14 @@ impl RecordingEngine {
                             let mut final_mb =
                                 ((orig_len as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
                             if ff_success
-                                && let Ok(new_meta) = std::fs::metadata(&tmp_out_fin)
+                                && let Ok(new_meta) = std::fs::symlink_metadata(&tmp_out_fin)
+                                && new_meta.file_type().is_file()
                                 && new_meta.len() > 4096
                                 && new_meta.len() < orig_len
                                 && probe_mp4_duration_fast(&tmp_out_fin).is_some()
+                                && std::fs::symlink_metadata(&disk_path)
+                                    .map(|m| m.file_type().is_file())
+                                    .unwrap_or(false)
                             {
                                 if std::fs::rename(&tmp_out_fin, &disk_path).is_ok() {
                                     final_mb = ((new_meta.len() as f64) / (1024.0 * 1024.0)
@@ -2434,23 +2540,52 @@ impl RecordingEngine {
         db_path: &str,
         cold_dir: Option<&Path>,
     ) -> Option<PathBuf> {
+        if db_path.is_empty()
+            || Path::new(db_path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return None;
+        }
         let disk_path = if let Some(rel) = strip_media_root(db_path) {
             self.media_dir.join(rel)
         } else {
             PathBuf::from(db_path)
         };
+        if !disk_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+        {
+            return None;
+        }
         let lmeta = std::fs::symlink_metadata(&disk_path).ok()?;
         if !lmeta.file_type().is_file() {
             return None;
         }
+        let canon_parent = std::fs::canonicalize(disk_path.parent()?).ok()?;
         let canon_file = std::fs::canonicalize(&disk_path).ok()?;
+        if canon_file.parent() != Some(canon_parent.as_path()) {
+            return None;
+        }
+        let cmeta = std::fs::symlink_metadata(&canon_file).ok()?;
+        if !cmeta.file_type().is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if cmeta.dev() != lmeta.dev() || cmeta.ino() != lmeta.ino() {
+                return None;
+            }
+        }
         let rec_root = self.media_dir.join("recordings");
         let in_hot = std::fs::canonicalize(&rec_root)
-            .map(|r| canon_file.starts_with(r))
+            .map(|r| canon_parent.starts_with(&r) && canon_file.starts_with(&r))
             .unwrap_or(false);
         let in_cold = cold_dir
             .and_then(|c| std::fs::canonicalize(c).ok())
-            .map(|c| canon_file.starts_with(c))
+            .map(|c| canon_parent.starts_with(&c) && canon_file.starts_with(&c))
             .unwrap_or(false);
         if in_hot || in_cold {
             Some(canon_file)
@@ -2468,6 +2603,12 @@ impl RecordingEngine {
         let Some(canon_file) = self.resolve_contained_recording_file(db_path, cold_dir) else {
             return false;
         };
+        let Ok(cmeta) = std::fs::symlink_metadata(&canon_file) else {
+            return false;
+        };
+        if !cmeta.file_type().is_file() {
+            return false;
+        }
         if std::fs::remove_file(&canon_file).is_ok() {
             if let Ok(canon_rec_root) = std::fs::canonicalize(recordings_root)
                 && canon_file.starts_with(&canon_rec_root)
@@ -2485,38 +2626,77 @@ impl RecordingEngine {
     }
 
     fn remove_contained_media_file(&self, cp: &str) -> bool {
+        if cp.is_empty()
+            || Path::new(cp)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return false;
+        }
         let disk_path = if let Some(rel) = strip_media_root(cp) {
             self.media_dir.join(rel)
         } else {
             PathBuf::from(cp)
         };
+        if !is_allowed_media_artifact_extension(&disk_path) {
+            return false;
+        }
         let Ok(lmeta) = std::fs::symlink_metadata(&disk_path) else {
             return false;
         };
         if !lmeta.file_type().is_file() {
             return false;
         }
-        if let Ok(canon_media_dir) = std::fs::canonicalize(&self.media_dir)
-            && let Ok(canon_file) = std::fs::canonicalize(&disk_path)
-            && canon_file.starts_with(&canon_media_dir)
-            && canon_file.is_file()
-            && !matches!(
-                canon_file.extension().and_then(|e| e.to_str()),
-                Some("db" | "db-wal" | "db-shm" | "yml" | "yaml")
-            )
-        {
-            std::fs::remove_file(&canon_file).is_ok()
-        } else {
-            false
+        let Some(parent) = disk_path.parent() else {
+            return false;
+        };
+        let Ok(canon_parent) = std::fs::canonicalize(parent) else {
+            return false;
+        };
+        let in_allowed_subdir = ["clips", "exports", "previews"].into_iter().any(|sub| {
+            std::fs::canonicalize(self.media_dir.join(sub))
+                .map(|canon_sub| canon_parent.starts_with(&canon_sub))
+                .unwrap_or(false)
+        });
+        if !in_allowed_subdir {
+            return false;
         }
+        let Ok(canon_file) = std::fs::canonicalize(&disk_path) else {
+            return false;
+        };
+        if canon_file.parent() != Some(canon_parent.as_path())
+            || !is_allowed_media_artifact_extension(&canon_file)
+        {
+            return false;
+        }
+        let Ok(cmeta) = std::fs::symlink_metadata(&canon_file) else {
+            return false;
+        };
+        if !cmeta.file_type().is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if cmeta.dev() != lmeta.dev() || cmeta.ino() != lmeta.ino() {
+                return false;
+            }
+        }
+        std::fs::remove_file(&disk_path).is_ok()
     }
 
     fn prune_expired_share_link_artifacts(&self, now: f64) {
-        let expired_or_revoked_targets = self
-            .db
-            .list_expired_or_revoked_share_link_targets(now)
-            .unwrap_or_default();
-        let _ = self.db.prune_expired_share_links(now);
+        let expired_or_revoked_targets =
+            match self.db.list_expired_or_revoked_share_link_targets(now) {
+                Ok(targets) => targets,
+                Err(err) => {
+                    warn!("Failed to query expired or revoked share link targets: {err:#}");
+                    Vec::new()
+                }
+            };
+        if let Err(err) = self.db.prune_expired_share_links(now) {
+            warn!("Failed to prune expired share links: {err:#}");
+        }
         let exports_dir = self.media_dir.join("exports");
         let clips_dir = self.media_dir.join("clips");
         for target_id in expired_or_revoked_targets {
@@ -2586,12 +2766,19 @@ impl RecordingEngine {
                     let hour_start = hour_start_i64 as f64;
                     let hour_end = (hour_start_i64 + 3600) as f64;
                     let file_name = format!("{hour_start_i64}-{}.mp4", hour_start_i64 + 3600);
-                    let list_file = std::env::temp_dir()
-                        .join(format!("ninjanvr-prev-{camera}-{hour_start_i64}.txt"));
+                    let prev_nonce: u64 = rand::random();
+                    let preview_dir = self.media_dir.join("clips").join("previews").join(&camera);
+                    let list_file = preview_dir.join(format!(
+                        ".prev_{camera}_{hour_start_i64}_{prev_nonce:016x}_concat.txt"
+                    ));
+                    let tmp_out_file =
+                        preview_dir.join(format!(".{file_name}.{prev_nonce:016x}.tmp.mp4"));
                     let _list_guard = TempPathGuard(list_file.clone());
+                    let _tmp_out_guard = TempPathGuard(tmp_out_file.clone());
 
                     let db_prep = self.db.clone();
                     let media_dir_prep = self.media_dir.clone();
+                    let preview_dir_prep = preview_dir.clone();
                     let cam_prep = camera.clone();
                     let file_name_prep = file_name.clone();
                     let list_file_prep = list_file.clone();
@@ -2613,15 +2800,12 @@ impl RecordingEngine {
                                 .unwrap_or(hour_end.min(now));
                             let duration = (end_ts - start_ts).max(1.0);
 
-                            let preview_dir = media_dir_prep
-                                .join("clips")
-                                .join("previews")
-                                .join(&cam_prep);
-                            if std::fs::create_dir_all(&preview_dir).is_err() {
+                            if std::fs::create_dir_all(&preview_dir_prep).is_err() {
                                 return None;
                             }
-                            let out_file = preview_dir.join(&file_name_prep);
-                            if let Ok(meta) = std::fs::metadata(&out_file)
+                            let out_file = preview_dir_prep.join(&file_name_prep);
+                            if let Ok(meta) = std::fs::symlink_metadata(&out_file)
+                                && meta.file_type().is_file()
                                 && meta.len() > 1024
                             {
                                 if hour_start_i64 == prev_hour_start {
@@ -2641,8 +2825,11 @@ impl RecordingEngine {
                                 } else {
                                     PathBuf::from(&seg.path)
                                 };
-                                if let (Some(root_canon), Ok(seg_canon)) =
-                                    (&canon_media_dir, std::fs::canonicalize(&local_path))
+                                if std::fs::symlink_metadata(&local_path)
+                                    .map(|m| m.file_type().is_file())
+                                    .unwrap_or(false)
+                                    && let (Some(root_canon), Ok(seg_canon)) =
+                                        (&canon_media_dir, std::fs::canonicalize(&local_path))
                                     && seg_canon.starts_with(root_canon)
                                     && seg_canon.is_file()
                                     && let Some(line) = format_ffmpeg_concat_file_line(&seg_canon)
@@ -2650,8 +2837,11 @@ impl RecordingEngine {
                                     list_content.push_str(&line);
                                 }
                             }
-                            if list_content.is_empty()
-                                || std::fs::write(&list_file_prep, &list_content).is_err()
+                            if list_content.is_empty() {
+                                return None;
+                            }
+                            let mut lf = create_new_file_nofollow(&list_file_prep).ok()?;
+                            if std::io::Write::write_all(&mut lf, list_content.as_bytes()).is_err()
                             {
                                 return None;
                             }
@@ -2691,10 +2881,12 @@ impl RecordingEngine {
                         "-crf",
                         crf_val,
                         "-an",
+                        "-f",
+                        "mp4",
                         "-movflags",
                         "+faststart",
                     ])
-                    .arg(sanitize_ffmpeg_path_arg(&out_file))
+                    .arg(sanitize_ffmpeg_path_arg(&tmp_out_file))
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -2704,15 +2896,23 @@ impl RecordingEngine {
                     let db_fin = self.db.clone();
                     let cam_fin = camera.clone();
                     let list_fin = list_file.clone();
+                    let tmp_out_fin = tmp_out_file.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         let _ = std::fs::remove_file(&list_fin);
-                        if ff_ok && out_file.exists() {
+                        if ff_ok
+                            && std::fs::symlink_metadata(&tmp_out_fin)
+                                .map(|m| m.file_type().is_file() && m.len() > 0)
+                                .unwrap_or(false)
+                            && std::fs::rename(&tmp_out_fin, &out_file).is_ok()
+                        {
                             let id = format!("{cam_fin}_{hour_start_i64}");
                             let db_path =
                                 format!("/media/ninjanvr/clips/previews/{cam_fin}/{file_name}");
                             let _ = db_fin.insert_preview(
                                 &id, &cam_fin, &db_path, start_ts, end_ts, duration,
                             );
+                        } else {
+                            let _ = std::fs::remove_file(&tmp_out_fin);
                         }
                     })
                     .await;
@@ -2732,6 +2932,9 @@ pub fn migrate_hot_segments_to_cold(
     cold_dir: &Path,
     before_ts: f64,
 ) -> Result<usize> {
+    if cold_dir.to_str().is_none() {
+        anyhow::bail!("cold tier directory path is not valid UTF-8");
+    }
     if let Err(err) = std::fs::create_dir_all(cold_dir) {
         anyhow::bail!(
             "cold tier directory {} unreachable: {err}",
@@ -2791,7 +2994,48 @@ pub fn migrate_hot_segments_to_cold(
                 );
                 continue;
             }
+            let mut src_opts = std::fs::OpenOptions::new();
+            src_opts.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                src_opts.custom_flags(O_NOFOLLOW_FLAG);
+            }
+            let mut src_file = match src_opts.open(&src_path) {
+                Ok(f) => f,
+                Err(err) => {
+                    warn!(
+                        "Skipping tier migration for unreadable or symlink source {}: {err}",
+                        src_path.display()
+                    );
+                    continue;
+                }
+            };
+            let Ok(src_fd_meta) = src_file.metadata() else {
+                continue;
+            };
+            if !src_fd_meta.file_type().is_file() {
+                warn!(
+                    "Skipping tier migration for non-regular source descriptor {}",
+                    src_path.display()
+                );
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if src_fd_meta.dev() != src_meta.dev() || src_fd_meta.ino() != src_meta.ino() {
+                    warn!(
+                        "Skipping tier migration due to source inode mismatch on {}",
+                        src_path.display()
+                    );
+                    continue;
+                }
+            }
             let dst_path = cold_dir.join(rel_path);
+            let Some(new_db_path) = dst_path.to_str().map(str::to_string) else {
+                anyhow::bail!("cold tier destination path is not valid UTF-8");
+            };
             let Some(dst_parent) = dst_path.parent() else {
                 continue;
             };
@@ -2822,15 +3066,20 @@ pub fn migrate_hot_segments_to_cold(
                 );
                 continue;
             }
-            let tmp_dst = dst_parent.join(format!(
-                ".{}.tmp",
-                dst_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("seg.mp4")
-            ));
-            let _ = std::fs::remove_file(&tmp_dst);
-            if let Err(err) = std::fs::copy(&src_path, &tmp_dst) {
+            let nonce: u64 = rand::random();
+            let file_name = dst_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("seg.mp4");
+            let tmp_dst = dst_parent.join(format!(".{file_name}.{nonce:016x}.tmp"));
+            let _tmp_guard = TempPathGuard(tmp_dst.clone());
+            let copy_res = (|| -> std::io::Result<()> {
+                let mut dst_file = create_new_file_nofollow(&tmp_dst)?;
+                std::io::copy(&mut src_file, &mut dst_file)?;
+                dst_file.sync_all()?;
+                Ok(())
+            })();
+            if let Err(err) = copy_res {
                 let _ = std::fs::remove_file(&tmp_dst);
                 warn!(
                     "Failed to copy segment {} to cold tier: {err}",
@@ -2846,10 +3095,26 @@ pub fn migrate_hot_segments_to_cold(
                 );
                 return Ok(migrated);
             }
-            let new_db_path = dst_path.to_string_lossy().to_string();
             if db.update_recording_path(&id, &new_db_path)? {
-                let _ = std::fs::remove_file(&src_path);
-                prune_empty_parent_dirs(&src_path, &hot_rec_root);
+                if std::fs::symlink_metadata(&src_path)
+                    .map(|m| {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            m.file_type().is_file()
+                                && m.dev() == src_meta.dev()
+                                && m.ino() == src_meta.ino()
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            m.file_type().is_file()
+                        }
+                    })
+                    .unwrap_or(false)
+                {
+                    let _ = std::fs::remove_file(&src_path);
+                    prune_empty_parent_dirs(&src_path, &hot_rec_root);
+                }
                 migrated += 1;
             }
         }
@@ -2860,8 +3125,43 @@ pub fn migrate_hot_segments_to_cold(
     Ok(migrated)
 }
 
+/// Builds the millisecond-precision stem and nonce-suffixed temporary paths for `backup_alert_clip`.
+pub fn build_alert_backup_paths(
+    day_dir: &Path,
+    camera: &str,
+    label: &str,
+    start_time: f64,
+    nonce: u64,
+) -> (String, PathBuf, PathBuf, PathBuf) {
+    let safe_camera: String = camera
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_label: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let safe_start = if start_time.is_finite() {
+        start_time.clamp(0.0, 4_102_444_800.0)
+    } else {
+        0.0
+    };
+    let start_ms = (safe_start * 1000.0).round() as u64;
+    let stem = format!("{safe_camera}_{start_ms}_{safe_label}");
+    let out_mp4 = day_dir.join(format!("{stem}.mp4"));
+    let list_path = day_dir.join(format!(".{stem}_{nonce:016x}_concat.txt"));
+    let tmp_mp4 = day_dir.join(format!(".{stem}_{nonce:016x}.mp4.tmp"));
+    (stem, out_mp4, list_path, tmp_mp4)
+}
+
 /// Automatically exports/copies a high-severity Alert clip and its best snapshot
-/// into a secondary/offsite directory `target_dir/<YYYY-MM-DD>/<camera>_<ts>_<label>.mp4`.
+/// into a secondary/offsite directory `target_dir/<YYYY-MM-DD>/<camera>_<ts_ms>_<label>.mp4`.
 #[allow(clippy::too_many_arguments)]
 pub async fn backup_alert_clip(
     db: &NinjaDatabase,
@@ -2877,37 +3177,30 @@ pub async fn backup_alert_clip(
     if !is_safe_identifier(camera) {
         anyhow::bail!("unsafe camera identifier for alert backup: {camera}");
     }
+    let safe_start = if start_time.is_finite() {
+        start_time.clamp(0.0, 4_102_444_800.0)
+    } else {
+        0.0
+    };
     let dt = Utc
-        .timestamp_opt(start_time as i64, 0)
+        .timestamp_opt(safe_start as i64, 0)
         .single()
         .unwrap_or_else(Utc::now);
     let date_dir = dt.format("%Y-%m-%d").to_string();
     let day_dir = target_dir.join(&date_dir);
 
-    let safe_camera: String = camera
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let safe_label: String = label
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let stem = format!("{safe_camera}_{}_{safe_label}", start_time.max(0.0) as u64);
-    let out_mp4 = day_dir.join(format!("{stem}.mp4"));
-    let list_path = day_dir.join(format!(".{stem}_concat.txt"));
+    let nonce: u64 = rand::random();
+    let (stem, out_mp4, list_path, tmp_mp4) =
+        build_alert_backup_paths(&day_dir, camera, label, start_time, nonce);
     let _list_guard = TempPathGuard(list_path.clone());
+    let _tmp_mp4_guard = TempPathGuard(tmp_mp4.clone());
 
     let db_prep = db.clone();
     let media_dir_prep = media_dir.to_path_buf();
     let day_dir_prep = day_dir.clone();
     let cam_prep = camera.to_string();
     let out_mp4_prep = out_mp4.clone();
+    let tmp_mp4_prep = tmp_mp4.clone();
     let list_path_prep = list_path.clone();
     let existing_paths = tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
         std::fs::create_dir_all(&day_dir_prep).with_context(|| {
@@ -2948,7 +3241,10 @@ pub async fn backup_alert_clip(
         };
 
         if existing_paths.len() == 1 {
-            std::fs::copy(first_src, &out_mp4_prep).with_context(|| {
+            copy_file_via_nofollow(first_src, &tmp_mp4_prep).with_context(|| {
+                format!("failed to copy alert clip to {}", tmp_mp4_prep.display())
+            })?;
+            std::fs::rename(&tmp_mp4_prep, &out_mp4_prep).with_context(|| {
                 format!("failed to copy alert clip to {}", out_mp4_prep.display())
             })?;
         } else {
@@ -2958,7 +3254,10 @@ pub async fn backup_alert_clip(
                     list_content.push_str(&line);
                 }
             }
-            std::fs::write(&list_path_prep, &list_content).with_context(|| {
+            let mut lf = create_new_file_nofollow(&list_path_prep).with_context(|| {
+                format!("failed to write concat list {}", list_path_prep.display())
+            })?;
+            std::io::Write::write_all(&mut lf, list_content.as_bytes()).with_context(|| {
                 format!("failed to write concat list {}", list_path_prep.display())
             })?;
         }
@@ -2973,7 +3272,7 @@ pub async fn backup_alert_clip(
         } else {
             10.0
         };
-        let ff_args = build_mp4_export_ffmpeg_args(&list_path, 0.0, dur, true, &out_mp4);
+        let ff_args = build_mp4_export_ffmpeg_args(&list_path, 0.0, dur, true, &tmp_mp4);
         let ffmpeg_bin = resolve_ffmpeg_bin();
         let mut cmd = Command::new(&ffmpeg_bin);
         cmd.args(&ff_args)
@@ -2990,14 +3289,32 @@ pub async fn backup_alert_clip(
     let media_dir_fin = media_dir.to_path_buf();
     let day_dir_fin = day_dir.clone();
     let out_mp4_fin = out_mp4.clone();
+    let tmp_mp4_fin = tmp_mp4.clone();
     let list_path_fin = list_path.clone();
     let thumb_rel_owned = thumb_rel.map(|s| s.to_string());
     tokio::task::spawn_blocking(move || -> Result<PathBuf> {
         let _ = std::fs::remove_file(&list_path_fin);
-        if existing_paths.len() > 1 && (remux_needed_fallback || !out_mp4_fin.exists()) {
-            std::fs::copy(&existing_paths[0], &out_mp4_fin).with_context(|| {
-                format!("failed to copy alert clip to {}", out_mp4_fin.display())
-            })?;
+        if existing_paths.len() > 1 {
+            let valid_tmp = !remux_needed_fallback
+                && std::fs::symlink_metadata(&tmp_mp4_fin)
+                    .map(|m| m.file_type().is_file() && m.len() > 0)
+                    .unwrap_or(false);
+            if valid_tmp {
+                std::fs::rename(&tmp_mp4_fin, &out_mp4_fin).with_context(|| {
+                    format!(
+                        "failed to publish alert backup clip to {}",
+                        out_mp4_fin.display()
+                    )
+                })?;
+            } else {
+                let _ = std::fs::remove_file(&tmp_mp4_fin);
+                copy_file_via_nofollow(&existing_paths[0], &tmp_mp4_fin).with_context(|| {
+                    format!("failed to copy alert clip to {}", tmp_mp4_fin.display())
+                })?;
+                std::fs::rename(&tmp_mp4_fin, &out_mp4_fin).with_context(|| {
+                    format!("failed to copy alert clip to {}", out_mp4_fin.display())
+                })?;
+            }
         }
 
         if include_snapshot && let Some(ref t_rel) = thumb_rel_owned {
@@ -3022,7 +3339,11 @@ pub async fn backup_alert_clip(
                     .collect();
                 let safe_ext = if ext.is_empty() { "webp" } else { &ext };
                 let snap_dst = day_dir_fin.join(format!("{stem}.{safe_ext}"));
-                if let Err(err) = std::fs::copy(&canon_thumb, &snap_dst) {
+                let tmp_snap = day_dir_fin.join(format!(".{stem}_{nonce:016x}.{safe_ext}.tmp"));
+                let _tmp_snap_guard = TempPathGuard(tmp_snap.clone());
+                let snap_res = copy_file_via_nofollow(&canon_thumb, &tmp_snap)
+                    .and_then(|_| std::fs::rename(&tmp_snap, &snap_dst));
+                if let Err(err) = snap_res {
                     warn!(
                         "Failed to copy alert snapshot {} to {}: {err}",
                         canon_thumb.display(),
@@ -3119,6 +3440,8 @@ pub fn build_mp4_export_ffmpeg_args_with_privacy(
         args.push("-an".to_string());
     }
     args.extend([
+        "-f".to_string(),
+        "mp4".to_string(),
         "-movflags".to_string(),
         "+faststart".to_string(),
         sanitize_ffmpeg_path_arg(out_file),
@@ -3576,7 +3899,8 @@ async fn build_mp4_export_inner(
             if cancel_prep.load(Ordering::SeqCst) {
                 anyhow::bail!("export {exp_id_prep} cancelled");
             }
-            std::fs::write(&list_file_prep, &list_content)?;
+            let mut lf = create_new_file_nofollow(&list_file_prep)?;
+            std::io::Write::write_all(&mut lf, list_content.as_bytes())?;
             if cancel_prep.load(Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&list_file_prep);
                 anyhow::bail!("export {exp_id_prep} cancelled");
@@ -3623,23 +3947,22 @@ async fn build_mp4_export_inner(
             anyhow::bail!("export {exp_id_v} cancelled");
         }
         let valid_tmp = ff_ok
-            && std::fs::metadata(&tmp_out_v)
-                .map(|m| m.len() >= 1024)
+            && std::fs::symlink_metadata(&tmp_out_v)
+                .map(|m| m.file_type().is_file() && m.len() >= 1024)
                 .unwrap_or(false);
         if !valid_tmp {
+            let _ = std::fs::remove_file(&tmp_out_v);
             if mask_configured {
-                let _ = std::fs::remove_file(&tmp_out_v);
                 anyhow::bail!(
                     "failed to redact export {exp_id_v} with privacy mask for camera {cam_v}"
                 );
             }
             if !include_audio && existing_paths.iter().any(|p| mp4_file_has_audio_track(p)) {
-                let _ = std::fs::remove_file(&tmp_out_v);
                 anyhow::bail!(
                     "failed to strip audio track for export {exp_id_v} on camera {cam_v}"
                 );
             }
-            std::fs::copy(&existing_paths[0], &tmp_out_v)?;
+            copy_file_via_nofollow(&existing_paths[0], &tmp_out_v)?;
             if cancel_v.load(Ordering::SeqCst) {
                 let _ = std::fs::remove_file(&tmp_out_v);
                 anyhow::bail!("export {exp_id_v} cancelled");
@@ -3715,7 +4038,15 @@ async fn build_mp4_export_inner(
             for p in img.pixels_mut() {
                 *p = image::Rgb([24, 30, 38]);
             }
-            let _ = img.save_with_format(&tmp_thumb_fin, image::ImageFormat::WebP);
+            if let Err(err) = img.save_with_format(&tmp_thumb_fin, image::ImageFormat::WebP) {
+                warn!(
+                    "Failed to save fallback export thumbnail {}: {err}",
+                    tmp_thumb_fin.display()
+                );
+                let _ = std::fs::remove_file(&tmp_out_fin);
+                let _ = std::fs::remove_file(&tmp_thumb_fin);
+                return Err(err.into());
+            }
         }
         if cancel_fin.load(Ordering::SeqCst) {
             let _ = std::fs::remove_file(&tmp_out_fin);
@@ -3723,7 +4054,15 @@ async fn build_mp4_export_inner(
             anyhow::bail!("export {exp_id_fin} cancelled");
         }
 
-        let _ = std::fs::rename(&tmp_thumb_fin, &thumb_fin);
+        if let Err(err) = std::fs::rename(&tmp_thumb_fin, &thumb_fin) {
+            warn!(
+                "Failed to publish export thumbnail {}: {err}",
+                thumb_fin.display()
+            );
+            let _ = std::fs::remove_file(&tmp_out_fin);
+            let _ = std::fs::remove_file(&tmp_thumb_fin);
+            return Err(err.into());
+        }
         if let Err(err) = std::fs::rename(&tmp_out_fin, &out_fin) {
             let _ = std::fs::remove_file(&thumb_fin);
             return Err(err.into());
@@ -5931,16 +6270,16 @@ cameras:
         let backup_dir = root.join("backup_target");
         let dt = Utc.timestamp_opt(1730808000, 0).single().unwrap();
         let day_dir = backup_dir.join(dt.format("%Y-%m-%d").to_string());
-        // Pre-create the concat list path as a directory so `std::fs::write(&list_path, ...)` fails deterministically
-        let blocked_list_dir = day_dir.join(".front_door_1730808000_person_concat.txt");
-        std::fs::create_dir_all(&blocked_list_dir).unwrap();
+        std::fs::create_dir_all(&day_dir).unwrap();
+        // Use a 250-char label so `.{stem}_{nonce:016x}_concat.txt` exceeds 255 bytes (ENAMETOOLONG on all filesystems)
+        let long_label = "p".repeat(250);
 
         let backup_err = backup_alert_clip(
             &db,
             &root,
             &backup_dir,
             "front_door",
-            "person",
+            &long_label,
             1730808000.0,
             1730808020.0,
             None,
@@ -5955,8 +6294,336 @@ cameras:
             "unexpected backup error: {backup_err:#}"
         );
         assert!(
-            !day_dir.join("front_door_1730808000_person.mp4").exists(),
+            !day_dir
+                .join(format!("front_door_1730808000000_{long_label}.mp4"))
+                .exists(),
             "truncated single-segment fallback must not be written when concat list write fails"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn phase2_alert_backup_millisecond_stems_media_allowlist_and_cold_migration_hardening() {
+        let root =
+            std::env::temp_dir().join(format!("ninjanvr-phase2-media-sec-{}", random_suffix()));
+        let media_dir = root.join("media");
+        let cold_dir = root.join("cold");
+        let backup_dir = root.join("backup");
+        let rec_dir = media_dir.join("recordings/2026-11-06/12/front_door");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+        std::fs::create_dir_all(media_dir.join("clips/review")).unwrap();
+        std::fs::create_dir_all(media_dir.join("exports")).unwrap();
+        std::fs::create_dir_all(media_dir.join("previews")).unwrap();
+        std::fs::create_dir_all(media_dir.join("models")).unwrap();
+        std::fs::create_dir_all(media_dir.join("faces/alice")).unwrap();
+        std::fs::create_dir_all(&cold_dir).unwrap();
+
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+
+        // 1. LOSSYFROM-002 & CANCELSAFETY-003: Sub-second start_time disambiguation and temp file cleanup in backup_alert_clip
+        let (stem1, out1, list1, tmp1) = build_alert_backup_paths(
+            &backup_dir.join("2024-11-05"),
+            "front_door",
+            "person",
+            1_730_808_000.125,
+            0x1111_2222_3333_4444,
+        );
+        let (stem2, out2, list2, tmp2) = build_alert_backup_paths(
+            &backup_dir.join("2024-11-05"),
+            "front_door",
+            "person",
+            1_730_808_000.875,
+            0x5555_6666_7777_8888,
+        );
+        assert_eq!(stem1, "front_door_1730808000125_person");
+        assert_eq!(stem2, "front_door_1730808000875_person");
+        assert_ne!(out1, out2);
+        assert_eq!(
+            list1.file_name().unwrap().to_str().unwrap(),
+            ".front_door_1730808000125_person_1111222233334444_concat.txt"
+        );
+        assert_eq!(
+            tmp1.file_name().unwrap().to_str().unwrap(),
+            ".front_door_1730808000125_person_1111222233334444.mp4.tmp"
+        );
+        assert_ne!(list1, list2);
+        assert_ne!(tmp1, tmp2);
+
+        let seg1_path = rec_dir.join("00.00.mp4");
+        let seg2_path = rec_dir.join("00.10.mp4");
+        std::fs::write(&seg1_path, b"seg_1_payload_bytes").unwrap();
+        std::fs::write(&seg2_path, b"seg_2_payload_bytes").unwrap();
+        let snap1_path = media_dir.join("clips/review/snap1.webp");
+        let snap2_path = media_dir.join("clips/review/snap2.webp");
+        std::fs::write(&snap1_path, b"snap_1_webp").unwrap();
+        std::fs::write(&snap2_path, b"snap_2_webp").unwrap();
+
+        db.insert_recording(&RecordingRow {
+            id: "rec_p2_1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-06/12/front_door/00.00.mp4".to_string(),
+            start_time: 1_730_808_000.0,
+            end_time: 1_730_808_010.0,
+            duration: 10.0,
+            motion: 10,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 0.01,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+        db.insert_recording(&RecordingRow {
+            id: "rec_p2_2".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-06/12/front_door/00.10.mp4".to_string(),
+            start_time: 1_730_808_010.0,
+            end_time: 1_730_808_020.0,
+            duration: 10.0,
+            motion: 10,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 0.01,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        let bak_a = backup_alert_clip(
+            &db,
+            &media_dir,
+            &backup_dir,
+            "front_door",
+            "person",
+            1_730_808_000.125,
+            1_730_808_018.0,
+            Some("/media/ninjanvr/clips/review/snap1.webp"),
+            true,
+        )
+        .await
+        .unwrap();
+        let bak_b = backup_alert_clip(
+            &db,
+            &media_dir,
+            &backup_dir,
+            "front_door",
+            "person",
+            1_730_808_000.875,
+            1_730_808_018.0,
+            Some("/media/ninjanvr/clips/review/snap2.webp"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            bak_a, bak_b,
+            "same-second sub-second alerts must not overwrite each other"
+        );
+        assert!(bak_a.exists());
+        assert!(bak_b.exists());
+        assert_eq!(
+            std::fs::read(bak_a.with_extension("webp")).unwrap(),
+            b"snap_1_webp"
+        );
+        assert_eq!(
+            std::fs::read(bak_b.with_extension("webp")).unwrap(),
+            b"snap_2_webp"
+        );
+        // Verify no leftover .tmp or _concat.txt files remain in day_dir
+        let day_entries: Vec<String> = std::fs::read_dir(bak_a.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !day_entries
+                .iter()
+                .any(|n| n.ends_with(".tmp") || n.ends_with("_concat.txt")),
+            "all temporary backup files must be cleaned up: {day_entries:?}"
+        );
+
+        // 2. STRCMP-002 & TOCTOU-005: remove_contained_media_file allowlist & subdirectory containment
+        let cfg = Arc::new(RwLock::new(
+            NinjaConfig::from_yaml_str("cameras: {}\n", root.join("config.yml")).unwrap(),
+        ));
+        let engine =
+            RecordingEngine::new(cfg, db.clone(), media_dir.clone(), new_activity_ledger());
+
+        let upper_db = media_dir.join("ninjanvr.DB");
+        let upper_yml = media_dir.join("CONFIG.YML");
+        let dot_jwt = media_dir.join(".jwt_secret");
+        let dot_profile = media_dir.join(".active_profile");
+        let model_onnx = media_dir.join("models/model.onnx");
+        let face_jpg = media_dir.join("faces/alice/1.jpg");
+        for protected in [
+            &upper_db,
+            &upper_yml,
+            &dot_jwt,
+            &dot_profile,
+            &model_onnx,
+            &face_jpg,
+        ] {
+            std::fs::write(protected, b"PROTECTED_DATA").unwrap();
+        }
+
+        // All protected files (uppercase DB/YML, dotfiles, models/, faces/, recordings/) must be refused
+        for forbidden_arg in [
+            "/media/ninjanvr/ninjanvr.DB",
+            "/media/ninjanvr/CONFIG.YML",
+            "/media/ninjanvr/.jwt_secret",
+            "/media/ninjanvr/.active_profile",
+            "/media/ninjanvr/models/model.onnx",
+            "/media/ninjanvr/faces/alice/1.jpg",
+            "/media/ninjanvr/recordings/2026-11-06/12/front_door/00.00.mp4",
+        ] {
+            assert!(
+                !engine.remove_contained_media_file(forbidden_arg),
+                "remove_contained_media_file must refuse {forbidden_arg}"
+            );
+        }
+        for protected in [
+            &upper_db,
+            &upper_yml,
+            &dot_jwt,
+            &dot_profile,
+            &model_onnx,
+            &face_jpg,
+            &seg1_path,
+        ] {
+            assert!(
+                protected.exists(),
+                "protected file {} must remain intact",
+                protected.display()
+            );
+        }
+
+        // Disallowed extension inside clips/ (e.g. clips/evil.onnx or clips/.dotfile) must also be refused
+        let clip_onnx = media_dir.join("clips/evil.onnx");
+        let clip_dotfile = media_dir.join("clips/.hidden");
+        std::fs::write(&clip_onnx, b"onnx").unwrap();
+        std::fs::write(&clip_dotfile, b"hidden").unwrap();
+        assert!(!engine.remove_contained_media_file("/media/ninjanvr/clips/evil.onnx"));
+        assert!(!engine.remove_contained_media_file("/media/ninjanvr/clips/.hidden"));
+        assert!(clip_onnx.exists());
+        assert!(clip_dotfile.exists());
+
+        // Valid media artifacts in clips/, exports/, and previews/ (including uppercase extensions and .mask_hash) are removed
+        let valid_clip = media_dir.join("clips/review/ev_1.WEBP");
+        let valid_export = media_dir.join("exports/exp_1.MP4");
+        let valid_mask_hash = media_dir.join("exports/.share_redacted_1.mask_hash");
+        let valid_preview = media_dir.join("previews/prev_1.mp4");
+        for artifact in [&valid_clip, &valid_export, &valid_mask_hash, &valid_preview] {
+            std::fs::write(artifact, b"valid_artifact").unwrap();
+        }
+        assert!(engine.remove_contained_media_file("/media/ninjanvr/clips/review/ev_1.WEBP"));
+        assert!(engine.remove_contained_media_file("/media/ninjanvr/exports/exp_1.MP4"));
+        assert!(
+            engine
+                .remove_contained_media_file("/media/ninjanvr/exports/.share_redacted_1.mask_hash")
+        );
+        assert!(engine.remove_contained_media_file("/media/ninjanvr/previews/prev_1.mp4"));
+        for artifact in [&valid_clip, &valid_export, &valid_mask_hash, &valid_preview] {
+            assert!(
+                !artifact.exists(),
+                "valid artifact {} must be unlinked",
+                artifact.display()
+            );
+        }
+
+        // 3. TOCTOU-004 & LOSSYSTR-002: migrate_hot_segments_to_cold rejects symlinks and non-UTF-8 cold_dir
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8_cold = root.join(OsStr::from_bytes(b"cold_bad_\xff"));
+            let err_utf8 = migrate_hot_segments_to_cold(&db, &media_dir, &non_utf8_cold, 2e9)
+                .expect_err("non-UTF-8 cold_dir must return an error without deleting hot files");
+            assert!(err_utf8.to_string().contains("UTF-8"));
+            assert!(
+                seg1_path.exists(),
+                "hot segment must remain intact when cold_dir is non-UTF-8"
+            );
+
+            // Symlink in hot recordings dir pointing to protected file must be skipped by migrate_hot_segments_to_cold
+            let symlink_seg = rec_dir.join("00.20.mp4");
+            std::os::unix::fs::symlink(&upper_db, &symlink_seg).unwrap();
+            db.insert_recording(&RecordingRow {
+                id: "rec_p2_symlink".to_string(),
+                camera: "front_door".to_string(),
+                path: "/media/ninjanvr/recordings/2026-11-06/12/front_door/00.20.mp4".to_string(),
+                start_time: 1_730_808_020.0,
+                end_time: 1_730_808_030.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 0.01,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+
+            let migrated =
+                migrate_hot_segments_to_cold(&db, &media_dir, &cold_dir, 2_000_000_000.0).unwrap();
+            assert_eq!(
+                migrated, 2,
+                "only the 2 regular segments should migrate; symlink segment must be skipped"
+            );
+            assert!(
+                !cold_dir.join("2026-11-06/12/front_door/00.20.mp4").exists(),
+                "symlink segment must not be copied to cold tier"
+            );
+            assert!(upper_db.exists());
+        }
+
+        // 4. RESDISC-007: build_mp4_export_inner propagates thumbnail rename error and cleans up staging MP4
+        let seg3_path = rec_dir.join("00.30.mp4");
+        let mut fake_mp4 = vec![0u8; 2048];
+        fake_mp4[0..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p']);
+        std::fs::write(&seg3_path, &fake_mp4).unwrap();
+        db.insert_recording(&RecordingRow {
+            id: "rec_p2_3".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-06/12/front_door/00.30.mp4".to_string(),
+            start_time: 1_730_808_030.0,
+            end_time: 1_730_808_040.0,
+            duration: 10.0,
+            motion: 5,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 0.002,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        // Pre-create `clips/exp_thumb_fail.webp` as a non-empty directory so renaming `tmp_thumb_fin` to `thumb_fin` fails
+        let blocked_thumb_dir = media_dir.join("clips/exp_thumb_fail.webp");
+        std::fs::create_dir_all(&blocked_thumb_dir).unwrap();
+        std::fs::write(blocked_thumb_dir.join("keep"), b"x").unwrap();
+
+        let thumb_err = build_mp4_export(
+            &db,
+            &media_dir,
+            "exp_thumb_fail",
+            "front_door",
+            "Thumb Fail Export",
+            1_730_808_030.0,
+            1_730_808_040.0,
+        )
+        .await;
+        assert!(
+            thumb_err.is_err(),
+            "thumbnail rename failure must propagate as Err"
+        );
+        assert!(
+            !media_dir.join("exports/exp_thumb_fail.mp4").exists(),
+            "MP4 must not be published when thumbnail rename fails"
+        );
+        assert!(
+            db.get_export_by_id("exp_thumb_fail").unwrap().is_none(),
+            "export DB row must not be committed when thumbnail rename fails"
         );
 
         let _ = std::fs::remove_dir_all(&root);
