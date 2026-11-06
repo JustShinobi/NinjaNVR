@@ -100,6 +100,10 @@ export function resolveEventClipRange(
   padSec = 5
 ): { start: number; end: number } | null {
   if (!Array.isArray(reviews) || !Number.isFinite(anchorTs)) return null;
+  const safePad =
+    typeof padSec === "number" && Number.isFinite(padSec) && padSec >= 0
+      ? padSec
+      : 5;
   const own = reviews.filter(
     (r) => r && r.camera === camera && Number.isFinite(r.start_time)
   );
@@ -115,8 +119,8 @@ export function resolveEventClipRange(
         .sort((a, b) => b.start_time - a.start_time)[0] || null;
   }
   if (!pick) return null;
-  const start = Math.floor(pick.start_time - padSec);
-  const end = Math.ceil(Math.min(Number.isFinite(nowSec) ? nowSec : Infinity, endOf(pick) + padSec));
+  const start = Math.floor(pick.start_time - safePad);
+  const end = Math.ceil(Math.min(Number.isFinite(nowSec) ? nowSec : Infinity, endOf(pick) + safePad));
   return end > start ? { start, end } : null;
 }
 
@@ -240,9 +244,12 @@ export function sanitizeTimelineThumbUrl(
   rawThumbPath: string | undefined | null,
   fallbackCamera: string
 ): string {
-  const safeCam = encodeURIComponent(
-    (fallbackCamera || "camera").trim() || "camera"
-  );
+  const rawCam = (fallbackCamera || "camera").trim();
+  const cleanCam =
+    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
+      ? "camera"
+      : rawCam;
+  const safeCam = encodeURIComponent(cleanCam);
   const fallbackUrl = `/api/${safeCam}/latest.webp`;
   if (!rawThumbPath || typeof rawThumbPath !== "string") {
     return fallbackUrl;
@@ -250,13 +257,30 @@ export function sanitizeTimelineThumbUrl(
   const stripped = rawThumbPath.trim().replace(/^\/media\/[^/]+/, "");
   if (
     !stripped ||
-    /[\u0000-\u0020\u007f\\]/.test(stripped) ||
+    /[\u0000-\u0020\u007f\\?#]/.test(stripped) ||
     stripped.startsWith("//") ||
     stripped.includes("..") ||
     /%2e/i.test(stripped) ||
     /%2f/i.test(stripped) ||
     /%5c/i.test(stripped) ||
     /%00/i.test(stripped)
+  ) {
+    return fallbackUrl;
+  }
+  let decoded = stripped;
+  try {
+    decoded = decodeURIComponent(stripped);
+  } catch {
+    return fallbackUrl;
+  }
+  const segments = decoded.split("/");
+  if (
+    decoded.startsWith("//") ||
+    decoded.includes("..") ||
+    decoded.includes("%") ||
+    segments.some((seg) => seg === "." || seg === "..") ||
+    /[\u0000-\u0020\u007f\\?#]/.test(decoded) ||
+    /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
   ) {
     return fallbackUrl;
   }
@@ -1336,11 +1360,22 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       }
       if (res && res.videoUrl) {
         const candidate = res.videoUrl.trim();
+        let decoded = candidate;
+        let decodable = true;
+        try {
+          decoded = decodeURIComponent(candidate);
+        } catch {
+          decodable = false;
+        }
         if (
           candidate &&
-          !/[\u0000-\u0020\u007f\\]/.test(candidate) &&
+          decodable &&
+          !/[\u0000-\u0020\u007f\\?#]/.test(candidate) &&
           !candidate.startsWith("//") &&
           !candidate.includes("..") &&
+          !decoded.includes("..") &&
+          !decoded.includes("%") &&
+          !/^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded) &&
           !/%2e/i.test(candidate) &&
           !/%2f/i.test(candidate) &&
           !/%5c/i.test(candidate) &&
@@ -1692,12 +1727,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                               e.stopPropagation();
                               const ts = Math.floor(rev.start_time);
                               onSeek(ts);
-                              setRangeStart(Math.max(0, ts - 5));
-                              setRangeEnd(
+                              openClipMode(
+                                Math.max(0, ts - 5),
                                 Math.min(nowSec, Math.ceil((rev.end_time || ts + 20) + 5))
                               );
-                              setReadyDownloadUrl(null);
-                              setRangeMode(true);
                             }}
                           >
                             <Scissors size={10} />
@@ -2154,7 +2187,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         >
           {ticks.map((tk) => (
             <span
-              key={tk.label}
+              key={`${tk.label}-${tk.pct.toFixed(2)}`}
               className="mono"
               style={{
                 position: "absolute",

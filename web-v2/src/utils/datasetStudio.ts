@@ -26,13 +26,14 @@ export interface DatasetQueueCounts {
 }
 
 export function isBackgroundSample(s: Pick<DatasetSampleItem, "sample_kind">): boolean {
-  return s.sample_kind === "hard_negative";
+  return Boolean(s && s.sample_kind === "hard_negative");
 }
 
 /** Where a sample sits in the queue: background, still pending, or verified by AI / an operator. */
 export function datasetQueueStatus(
   s: Pick<DatasetSampleItem, "sample_kind" | "verified" | "verified_by">
 ): DatasetQueueStatus {
+  if (!s) return "pending";
   if (isBackgroundSample(s)) return "background";
   if (!s.verified) return "pending";
   return s.verified_by === "ai" ? "ai" : "manual";
@@ -46,15 +47,17 @@ export function datasetQueueStatus(
 export function canConfirmSample(
   s: Pick<DatasetSampleItem, "sample_kind" | "annotations">
 ): boolean {
-  return isBackgroundSample(s) || (Array.isArray(s.annotations) && s.annotations.length > 0);
+  return Boolean(
+    s && (isBackgroundSample(s) || (Array.isArray(s.annotations) && s.annotations.length > 0))
+  );
 }
 
 /** Lowest box confidence of a sample, or null when it has no scored boxes. */
 export function minAnnotationScore(s: Pick<DatasetSampleItem, "annotations">): number | null {
   let min: number | null = null;
-  for (const ann of Array.isArray(s.annotations) ? s.annotations : []) {
-    const score = Number(ann?.score);
-    if (!Number.isFinite(score)) continue;
+  for (const ann of Array.isArray(s?.annotations) ? s.annotations : []) {
+    const score = ann?.score;
+    if (typeof score !== "number" || !Number.isFinite(score)) continue;
     if (min === null || score < min) min = score;
   }
   return min;
@@ -70,6 +73,7 @@ export function computeDatasetQueueCounts(samples: DatasetSampleItem[]): Dataset
     all: 0,
   };
   for (const s of Array.isArray(samples) ? samples : []) {
+    if (!s) continue;
     counts.all += 1;
     const status = datasetQueueStatus(s);
     counts[status] += 1;
@@ -82,9 +86,16 @@ export function computeDatasetQueueCounts(samples: DatasetSampleItem[]): Dataset
 export function datasetCameraCounts(samples: DatasetSampleItem[]): Array<[string, number]> {
   const map = new Map<string, number>();
   for (const s of Array.isArray(samples) ? samples : []) {
+    if (!s || typeof s.camera !== "string" || !s.camera) continue;
     map.set(s.camera, (map.get(s.camera) ?? 0) + 1);
   }
   return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+function safeSampleCreatedAt(s: DatasetSampleItem): number {
+  return typeof s?.created_at === "number" && Number.isFinite(s.created_at)
+    ? s.created_at
+    : 0;
 }
 
 /**
@@ -97,6 +108,7 @@ export function filterDatasetQueue(
   filter: DatasetQueueFilter
 ): DatasetSampleItem[] {
   const rows = (Array.isArray(samples) ? samples : []).filter((s) => {
+    if (!s) return false;
     const status = datasetQueueStatus(s);
     if (filter.tab !== "all" && status !== filter.tab) return false;
     if (filter.camera !== "all" && s.camera !== filter.camera) return false;
@@ -108,13 +120,18 @@ export function filterDatasetQueue(
     return rows.sort((a, b) => {
       const sa = minAnnotationScore(a);
       const sb = minAnnotationScore(b);
-      if (sa === null && sb === null) return b.created_at - a.created_at;
+      const dt = safeSampleCreatedAt(b) - safeSampleCreatedAt(a);
+      if (sa === null && sb === null) return dt || String(a.id ?? "").localeCompare(String(b.id ?? ""));
       if (sa === null) return 1;
       if (sb === null) return -1;
-      return sa - sb || b.created_at - a.created_at;
+      return sa - sb || dt || String(a.id ?? "").localeCompare(String(b.id ?? ""));
     });
   }
-  return rows.sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id));
+  return rows.sort(
+    (a, b) =>
+      safeSampleCreatedAt(b) - safeSampleCreatedAt(a) ||
+      String(a.id ?? "").localeCompare(String(b.id ?? ""))
+  );
 }
 
 /** Next/previous id in the visible queue; clamps at both ends. */
@@ -126,7 +143,8 @@ export function stepDatasetQueue(
   if (!Array.isArray(list) || list.length === 0) return null;
   const idx = list.findIndex((s) => s.id === currentId);
   if (idx < 0) return list[0].id;
-  const next = Math.max(0, Math.min(list.length - 1, idx + direction));
+  const step = direction === -1 ? -1 : 1;
+  const next = Math.max(0, Math.min(list.length - 1, idx + step));
   return list[next].id;
 }
 
@@ -143,7 +161,11 @@ export function stepStickyDatasetQueue(
 ): string | null {
   if (!Array.isArray(list) || list.length === 0) return null;
   if (list.some((s) => s.id === currentId)) return stepDatasetQueue(list, currentId, direction);
-  const target = direction === 1 ? lastIndex : lastIndex - 1;
+  const safeLast =
+    typeof lastIndex === "number" && Number.isFinite(lastIndex)
+      ? Math.max(0, Math.floor(lastIndex))
+      : 0;
+  const target = direction === 1 ? safeLast : safeLast - 1;
   return list[Math.max(0, Math.min(list.length - 1, target))].id;
 }
 
@@ -156,12 +178,21 @@ export function normalizeDragBox(
   end: [number, number],
   minSize = 0.01
 ): [number, number, number, number] | null {
+  if (!Array.isArray(start) || !Array.isArray(end)) return null;
+  const safeMin =
+    typeof minSize === "number" && Number.isFinite(minSize) && minSize >= 0
+      ? minSize
+      : 0.01;
   const clamp = (v: number) => Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
-  const x1 = clamp(Math.min(start[0], end[0]));
-  const y1 = clamp(Math.min(start[1], end[1]));
-  const x2 = clamp(Math.max(start[0], end[0]));
-  const y2 = clamp(Math.max(start[1], end[1]));
-  if (x2 - x1 < minSize || y2 - y1 < minSize) return null;
+  const sx = clamp(start[0]);
+  const sy = clamp(start[1]);
+  const ex = clamp(end[0]);
+  const ey = clamp(end[1]);
+  const x1 = Math.min(sx, ex);
+  const y1 = Math.min(sy, ey);
+  const x2 = Math.max(sx, ex);
+  const y2 = Math.max(sy, ey);
+  if (x2 - x1 < safeMin || y2 - y1 < safeMin) return null;
   return [x1, y1, x2, y2];
 }
 

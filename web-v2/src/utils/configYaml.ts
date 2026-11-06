@@ -86,6 +86,12 @@ function extractOriginalUrls(rawYaml: string): string[] {
   return Array.from(new Set(cleaned));
 }
 
+const YAML_UNSAFE_OBJECT_KEYS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
 function parseYamlMapKey(rawKeySegment: string): string {
   const trimmed = rawKeySegment.trim();
   if (!trimmed) return "";
@@ -126,7 +132,8 @@ function extractOriginalOnvifPasswords(rawYaml: string): Record<string, string> 
       const m = trimmed.match(/^((?:"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[a-zA-Z0-9_.-]+))\s*:/);
       if (m) {
         camIndent = indent;
-        currentCam = parseYamlMapKey(m[1]);
+        const parsedKey = parseYamlMapKey(m[1]);
+        currentCam = YAML_UNSAFE_OBJECT_KEYS.has(parsedKey) ? "" : parsedKey;
         inOnvif = false;
         onvifIndent = null;
       }
@@ -619,7 +626,7 @@ function toYamlLines(val: unknown, indent = 0): string[] {
         lines.push(`${pad}- [${item.map((x) => yamlScalar(x)).join(", ")}]`);
       } else if (item !== null && typeof item === "object") {
         const entries = Object.entries(item as Record<string, unknown>).filter(
-          ([, v]) => v !== undefined && v !== null
+          ([k, v]) => !YAML_UNSAFE_OBJECT_KEYS.has(k) && v !== undefined && v !== null
         );
         if (entries.length === 0) {
           lines.push(`${pad}- {}`);
@@ -663,7 +670,7 @@ function toYamlLines(val: unknown, indent = 0): string[] {
   }
 
   const entries = Object.entries(val as Record<string, unknown>).filter(
-    ([, v]) => v !== undefined && v !== null
+    ([k, v]) => !YAML_UNSAFE_OBJECT_KEYS.has(k) && v !== undefined && v !== null
   );
   if (entries.length === 0) return [`${pad}{}`];
   const lines: string[] = [];
@@ -715,6 +722,7 @@ export function buildCleanYamlFromDraft(
 
   const streamsOut: Record<string, unknown> = {};
   for (const [sName, sVal] of Object.entries(draft.go2rtc?.streams || {})) {
+    if (YAML_UNSAFE_OBJECT_KEYS.has(sName)) continue;
     if (Array.isArray(sVal)) {
       streamsOut[sName] = sVal.map((u) =>
         typeof u === "string" ? restoreUrl(u, originals) : u
@@ -728,6 +736,9 @@ export function buildCleanYamlFromDraft(
 
   const camerasOut: Record<string, unknown> = {};
   for (const [camName, cam] of Object.entries(draft.cameras || {})) {
+    if (YAML_UNSAFE_OBJECT_KEYS.has(camName) || !cam || typeof cam !== "object") {
+      continue;
+    }
     const inputs = (cam.ffmpeg?.inputs || []).map((inp) => ({
       path: restoreUrl(inp.path, originals),
       input_args: inp.input_args || "preset-rtsp-restream",
@@ -941,13 +952,19 @@ export function buildCleanYamlFromDraft(
         Boolean(cam.onvif.autotracking) ||
         (cam.onvif.return_preset && cam.onvif.return_preset.trim().length > 0))
         ? (() => {
+            const origCamOnvifPass = Object.prototype.hasOwnProperty.call(
+              originalOnvifPasswords,
+              camName
+            )
+              ? originalOnvifPasswords[camName]
+              : undefined;
             const rawPass = cam.onvif.clear_password
               ? undefined
               : cam.onvif.password &&
                 cam.onvif.password !== "***" &&
                 cam.onvif.password !== "*"
               ? cam.onvif.password
-              : originalOnvifPasswords[camName] ||
+              : origCamOnvifPass ||
                 (cam.onvif.has_password ||
                 cam.onvif.password === "***" ||
                 cam.onvif.password === "*"

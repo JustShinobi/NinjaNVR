@@ -231,13 +231,24 @@ export interface BatchAutoAnnotateProgress {
   cancelled: boolean;
 }
 
+export function isSafeDatasetSampleId(id: unknown): id is string {
+  return (
+    typeof id === "string" &&
+    id.length > 0 &&
+    id.length <= 128 &&
+    id !== "." &&
+    !id.includes("..") &&
+    /^[A-Za-z0-9_.-]+$/.test(id)
+  );
+}
+
 export function selectBatchAutoAnnotateCandidates(
   samples: DatasetSampleItem[],
   mode: "pending" | "all_positives" = "pending"
 ): DatasetSampleItem[] {
   if (!Array.isArray(samples)) return [];
   const positives = samples.filter(
-    (s) => s && typeof s.id === "string" && s.sample_kind !== "hard_negative"
+    (s) => s && isSafeDatasetSampleId(s.id) && s.sample_kind !== "hard_negative"
   );
   if (mode === "all_positives") {
     // Re-running the Teacher never overwrites a sample an operator checked by hand.
@@ -257,18 +268,33 @@ export function computeBatchProgressMetrics(
   elapsedSec: number;
   etaSec: number | null;
 } {
-  if (!progress || progress.total <= 0) {
+  if (
+    !progress ||
+    typeof progress.total !== "number" ||
+    !Number.isFinite(progress.total) ||
+    progress.total <= 0
+  ) {
     return { pct: 0, remaining: 0, elapsedSec: 0, etaSec: null };
   }
   const total = Math.max(1, toSafeCount(progress.total));
   const completed = Math.min(total, toSafeCount(progress.completed));
   const pct = Math.max(0, Math.min(100, Math.round((completed / total) * 100)));
   const remaining = Math.max(0, total - completed);
+  const safeNowMs =
+    typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
   const endRef =
     typeof progress.finishedAtMs === "number" && Number.isFinite(progress.finishedAtMs)
       ? progress.finishedAtMs
-      : nowMs;
-  const elapsedMs = Math.max(0, endRef - (progress.startedAtMs || endRef));
+      : safeNowMs;
+  const startRef =
+    typeof progress.startedAtMs === "number" &&
+    Number.isFinite(progress.startedAtMs) &&
+    progress.startedAtMs > 0
+      ? progress.startedAtMs
+      : endRef;
+  const rawElapsedMs = endRef - startRef;
+  const elapsedMs =
+    Number.isFinite(rawElapsedMs) && rawElapsedMs > 0 ? rawElapsedMs : 0;
   const elapsedSec = Math.round(elapsedMs / 1000);
   const etaSec =
     progress.active && completed > 0 && remaining > 0
@@ -2720,16 +2746,19 @@ export const AiDetectionObjectsSection: React.FC<{
       const res = await fetch("/api/false_positives/signatures", {
         credentials: "include",
       });
+      if (!aiSectionMountedRef.current) return;
       if (res.ok) {
         const rows = await res.json();
-        if (Array.isArray(rows)) {
+        if (aiSectionMountedRef.current && Array.isArray(rows)) {
           setFpSignatures(rows);
         }
       }
     } catch {
       // ignore
     } finally {
-      setFpLoading(false);
+      if (aiSectionMountedRef.current) {
+        setFpLoading(false);
+      }
     }
   };
 
@@ -2746,6 +2775,7 @@ export const AiDetectionObjectsSection: React.FC<{
           credentials: "include",
         }
       );
+      if (!aiSectionMountedRef.current) return;
       if (res.ok) {
         setFpSignatures((prev) => prev.filter((item) => item.id !== id));
         notify(`Deleted false-positive memory signature #${id}`);
@@ -2753,7 +2783,9 @@ export const AiDetectionObjectsSection: React.FC<{
         notify(`Failed to delete false-positive signature #${id}`);
       }
     } catch {
-      notify(`Network error while deleting false-positive signature #${id}`);
+      if (aiSectionMountedRef.current) {
+        notify(`Network error while deleting false-positive signature #${id}`);
+      }
     }
   };
 
@@ -2780,12 +2812,21 @@ export const AiDetectionObjectsSection: React.FC<{
   }>({ status: "idle" });
   const aiSectionMountedRef = React.useRef(true);
   const genaiValidateSeqRef = React.useRef(0);
+  const enrollFileReaderRef = React.useRef<FileReader | null>(null);
 
   useEffect(() => {
     aiSectionMountedRef.current = true;
     return () => {
       aiSectionMountedRef.current = false;
       genaiValidateSeqRef.current += 1;
+      if (enrollFileReaderRef.current) {
+        try {
+          enrollFileReaderRef.current.abort();
+        } catch {
+          // ignore
+        }
+        enrollFileReaderRef.current = null;
+      }
     };
   }, []);
 
@@ -2957,9 +2998,10 @@ export const AiDetectionObjectsSection: React.FC<{
       const r = await fetch("/api/recognized_license_plates", {
         credentials: "include",
       });
+      if (!aiSectionMountedRef.current) return;
       if (r.ok) {
         const list = await r.json();
-        if (Array.isArray(list)) {
+        if (aiSectionMountedRef.current && Array.isArray(list)) {
           setDetectedPlates(
             list.map((p) => normalizeLicensePlate(String(p))).filter(Boolean)
           );
@@ -3083,9 +3125,12 @@ export const AiDetectionObjectsSection: React.FC<{
   const refreshEnrolledFaces = async () => {
     try {
       const res = await fetch("/api/faces", { credentials: "include" });
+      if (!aiSectionMountedRef.current) return;
       if (res.ok) {
         const data = await res.json();
-        setEnrolledProfiles(parseFacesApiResponse(data));
+        if (aiSectionMountedRef.current) {
+          setEnrolledProfiles(parseFacesApiResponse(data));
+        }
       }
     } catch {
       // ignore offline/unit environment
@@ -3112,20 +3157,29 @@ export const AiDetectionObjectsSection: React.FC<{
           enrollImageB64 ? { image_base64: enrollImageB64 } : {}
         ),
       });
+      if (!aiSectionMountedRef.current) return;
       if (res.ok) {
         setEnrollNameInput("");
         setEnrollImageB64("");
         setEnrollFileName("");
         await refreshEnrolledFaces();
-        notify(`Enrolled face profile '${cleanName}' into local gallery`);
+        if (aiSectionMountedRef.current) {
+          notify(`Enrolled face profile '${cleanName}' into local gallery`);
+        }
       } else {
         const data = await res.json().catch(() => null);
-        notify(data?.message || `Failed to enroll face profile '${cleanName}'`);
+        if (aiSectionMountedRef.current) {
+          notify(data?.message || `Failed to enroll face profile '${cleanName}'`);
+        }
       }
     } catch {
-      notify(`Network error while enrolling face profile '${cleanName}'`);
+      if (aiSectionMountedRef.current) {
+        notify(`Network error while enrolling face profile '${cleanName}'`);
+      }
     } finally {
-      setEnrollBusy(false);
+      if (aiSectionMountedRef.current) {
+        setEnrollBusy(false);
+      }
     }
   };
 
@@ -3135,13 +3189,16 @@ export const AiDetectionObjectsSection: React.FC<{
         method: "DELETE",
         credentials: "include",
       });
+      if (!aiSectionMountedRef.current) return;
       if (res.ok) {
         const data = await res.json().catch(() => ({}));
+        if (!aiSectionMountedRef.current) return;
         setEnrolledProfiles((prev) =>
           prev.filter((p) => p.name.trim().toLowerCase() !== name.trim().toLowerCase())
         );
         useNvrStore.getState().recordDeletedFaceProfile(name);
         await refreshEnrolledFaces();
+        if (!aiSectionMountedRef.current) return;
         const clearedCount = Number(data?.cleared_events || 0);
         notify(
           clearedCount > 0
@@ -3152,7 +3209,9 @@ export const AiDetectionObjectsSection: React.FC<{
         notify(`Failed to delete face profile '${name}'`);
       }
     } catch {
-      notify(`Network error while deleting face profile '${name}'`);
+      if (aiSectionMountedRef.current) {
+        notify(`Network error while deleting face profile '${name}'`);
+      }
     }
   };
 
@@ -3209,6 +3268,7 @@ export const AiDetectionObjectsSection: React.FC<{
         }),
       });
       const data = await res.json().catch(() => null);
+      if (!aiSectionMountedRef.current) return;
       if (res.ok && data?.success) {
         const subLabel =
           data.sub_label ||
@@ -3235,9 +3295,13 @@ export const AiDetectionObjectsSection: React.FC<{
         notify(data?.message || "Failed to simulate LPR vehicle pass");
       }
     } catch {
-      notify("Failed to simulate LPR vehicle pass");
+      if (aiSectionMountedRef.current) {
+        notify("Failed to simulate LPR vehicle pass");
+      }
     } finally {
-      setSimLprBusy(false);
+      if (aiSectionMountedRef.current) {
+        setSimLprBusy(false);
+      }
     }
   };
 
@@ -5668,6 +5732,14 @@ export const AiDetectionObjectsSection: React.FC<{
                     style={{ display: "none" }}
                     onChange={(e) => {
                       const file = e.target.files?.[0];
+                      if (enrollFileReaderRef.current) {
+                        try {
+                          enrollFileReaderRef.current.abort();
+                        } catch {
+                          // ignore
+                        }
+                        enrollFileReaderRef.current = null;
+                      }
                       if (!file) {
                         setEnrollImageB64("");
                         setEnrollFileName("");
@@ -5675,8 +5747,10 @@ export const AiDetectionObjectsSection: React.FC<{
                       }
                       setEnrollFileName(file.name);
                       const reader = new FileReader();
+                      enrollFileReaderRef.current = reader;
                       reader.onload = () => {
-                        if (typeof reader.result === "string") {
+                        enrollFileReaderRef.current = null;
+                        if (aiSectionMountedRef.current && typeof reader.result === "string") {
                           setEnrollImageB64(reader.result);
                         }
                       };

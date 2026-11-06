@@ -21,6 +21,7 @@ import {
 } from "../utils/configYaml";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import {
+  isSafeDatasetSampleId,
   normalizeFaceProfileName,
   parseFacesApiResponse,
 } from "./settings/VisionAndAiPanels";
@@ -356,10 +357,17 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       const data = await res.json().catch(() => null);
       if (!isMountedRef.current) return;
       if (res.ok && data) {
-        const sampleId = String(data.id || data.sample?.id || `ds_${targetId}`);
-        if (sampleId) {
+        const rawSampleId = String(
+          data.id || data.sample?.id || `ds_${targetId}`
+        ).trim();
+        const sampleKind = String(
+          data.sample_kind || data.sample?.sample_kind || ""
+        )
+          .trim()
+          .toLowerCase();
+        if (isSafeDatasetSampleId(rawSampleId) && sampleKind !== "hard_negative") {
           void fetch(
-            `/api/dataset/samples/${encodeURIComponent(sampleId)}/auto-annotate`,
+            `/api/dataset/samples/${encodeURIComponent(rawSampleId)}/auto-annotate`,
             {
               method: "POST",
               credentials: "include",

@@ -49,12 +49,16 @@ export function resolveSafeSyncThumbSrc(
   thumbPath: string | null | undefined,
   camera: string
 ): string {
-  const cleanCam = (camera || "").trim() || "camera";
+  const rawCam = (camera || "").trim();
+  const cleanCam =
+    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
+      ? "camera"
+      : rawCam;
   const encodedCam = encodeURIComponent(cleanCam);
   const fallback = `/api/${encodedCam}/latest.webp`;
   if (typeof thumbPath !== "string") return fallback;
   const trimmed = thumbPath.trim();
-  if (!trimmed || /[\u0000-\u001F\u007F\\]/.test(trimmed)) return fallback;
+  if (!trimmed || /[\u0000-\u001F\u007F\\?#]/.test(trimmed)) return fallback;
   const stripped = trimmed.replace(/^\/media\/[^/]+/, "").trim();
   if (
     !stripped ||
@@ -68,12 +72,16 @@ export function resolveSafeSyncThumbSrc(
   }
   try {
     const decoded = decodeURIComponent(stripped);
+    const segments = decoded.split("/");
     if (
       !decoded.startsWith("/") ||
       decoded.startsWith("//") ||
       decoded.includes("\\") ||
       decoded.includes("..") ||
-      /[\u0000-\u001F\u007F]/.test(decoded)
+      decoded.includes("%") ||
+      segments.some((seg) => seg === "." || seg === "..") ||
+      /[\u0000-\u001F\u007F?#]/.test(decoded) ||
+      /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
     ) {
       return fallback;
     }

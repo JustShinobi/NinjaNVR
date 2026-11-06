@@ -63,6 +63,9 @@ function collectChangedPaths(
   if (isPlainObject(base) && isPlainObject(draft)) {
     const keys = new Set([...Object.keys(base), ...Object.keys(draft)]);
     for (const key of keys) {
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
+        continue;
+      }
       collectChangedPaths(base[key], draft[key], [...path, key], out, depth + 1);
     }
     return;

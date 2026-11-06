@@ -104,13 +104,18 @@ export function sanitizeExportVideoUrl(
   startSec: number,
   endSec: number
 ): string {
-  const safeCam = encodeURIComponent((fallbackCamera || "camera").trim() || "camera");
+  const rawCam = (fallbackCamera || "camera").trim();
+  const cleanCam =
+    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
+      ? "camera"
+      : rawCam;
+  const safeCam = encodeURIComponent(cleanCam);
   const s = Number.isFinite(startSec) ? Math.floor(startSec) : 0;
   const e = Number.isFinite(endSec) ? Math.ceil(Math.max(endSec, s + 5)) : s + 5;
   const fallbackPath = `/exports/${safeCam}_${s}_${e}.mp4`;
 
   const candidate = (rawUrl || "").trim();
-  if (!candidate || /[\u0000-\u0020\u007f\\]/.test(candidate)) {
+  if (!candidate || /[\u0000-\u0020\u007f\\?#]/.test(candidate)) {
     return fallbackPath;
   }
   if (
@@ -120,6 +125,23 @@ export function sanitizeExportVideoUrl(
     /%2f/i.test(candidate) ||
     /%5c/i.test(candidate) ||
     /%00/i.test(candidate)
+  ) {
+    return fallbackPath;
+  }
+  let decoded = candidate;
+  try {
+    decoded = decodeURIComponent(candidate);
+  } catch {
+    return fallbackPath;
+  }
+  const segments = decoded.split("/");
+  if (
+    decoded.startsWith("//") ||
+    decoded.includes("..") ||
+    decoded.includes("%") ||
+    segments.some((seg) => seg === "." || seg === "..") ||
+    /[\u0000-\u0020\u007f\\?#]/.test(decoded) ||
+    /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
   ) {
     return fallbackPath;
   }
@@ -639,11 +661,16 @@ export const App: React.FC = () => {
                 const objList =
                   Array.isArray(rawObjs) && rawObjs.length > 0 ? rawObjs : ["person"];
                 const objs = objList.join(", ").toUpperCase();
+                const rawCam = (alertItem.camera || "camera").trim();
+                const safeCam =
+                  !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
+                    ? "camera"
+                    : rawCam;
                 const n = new Notification(
-                  `NinjaNVR Alert // ${alertItem.camera.toUpperCase()}`,
+                  `NinjaNVR Alert // ${safeCam.toUpperCase()}`,
                   {
                     body: `Detected ${objs}`,
-                    icon: `/api/${encodeURIComponent(alertItem.camera)}/latest.jpg`,
+                    icon: `/api/${encodeURIComponent(safeCam)}/latest.jpg`,
                   }
                 );
                 n.onclick = () => {
@@ -876,16 +903,23 @@ export const App: React.FC = () => {
   const handleMarkReviews = useCallback(
     async (ids: string[], reviewed = true) => {
       if (ids.length === 0) return;
-      await fetch("/api/reviews/viewed", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ ids, reviewed }),
-      });
-      setReviews((prev) =>
-        prev.map((r) => (ids.includes(r.id) ? { ...r, has_been_reviewed: reviewed } : r))
-      );
-      notify(`Marked ${ids.length} review item(s) as reviewed`);
+      try {
+        await fetch("/api/reviews/viewed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ ids, reviewed }),
+        });
+        setReviews((prev) =>
+          prev.map((r) => (ids.includes(r.id) ? { ...r, has_been_reviewed: reviewed } : r))
+        );
+        setActiveReview((curr) =>
+          curr && ids.includes(curr.id) ? { ...curr, has_been_reviewed: reviewed } : curr
+        );
+        notify(`Marked ${ids.length} review item(s) as reviewed`);
+      } catch {
+        notify("Network error while marking review items");
+      }
     },
     [notify]
   );
@@ -893,15 +927,19 @@ export const App: React.FC = () => {
   const handleDeleteReviews = useCallback(
     async (ids: string[]) => {
       if (ids.length === 0) return;
-      await fetch("/api/reviews/delete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ ids }),
-      });
-      setReviews((prev) => prev.filter((r) => !ids.includes(r.id)));
-      setActiveReview((curr) => (curr && ids.includes(curr.id) ? null : curr));
-      notify(`Deleted ${ids.length} review segment(s)`);
+      try {
+        await fetch("/api/reviews/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ ids }),
+        });
+        setReviews((prev) => prev.filter((r) => !ids.includes(r.id)));
+        setActiveReview((curr) => (curr && ids.includes(curr.id) ? null : curr));
+        notify(`Deleted ${ids.length} review segment(s)`);
+      } catch {
+        notify("Network error while deleting review segments");
+      }
     },
     [notify]
   );
@@ -923,33 +961,41 @@ export const App: React.FC = () => {
         typeof endSec === "number" && Number.isFinite(endSec)
           ? Math.ceil(Math.max(endSec, s + 5))
           : s + 30;
-      const res = await fetch(`/api/export/${encodeURIComponent(camera)}/start/${s}/end/${e}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({
-          name: label || `${camera} ${formatTs(s)}-${formatTs(e)}`,
-          include_audio: includeAudio,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok && data.success !== false) {
-        notify(`MP4 clip ready for ${camera} (${formatTs(s)} - ${formatTs(e)})`);
-        const listRes = await fetch("/api/exports", { credentials: "include" });
-        if (listRes.ok) {
-          const arr: ExportItem[] = await listRes.json();
-          setExportsList(arr);
-          const created = arr.find((x) => x.id === data.export_id);
-          if (created) {
-            setActiveExportPreview(created);
+      try {
+        const res = await fetch(`/api/export/${encodeURIComponent(camera)}/start/${s}/end/${e}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            name: label || `${camera} ${formatTs(s)}-${formatTs(e)}`,
+            include_audio: includeAudio,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.success !== false) {
+          notify(`MP4 clip ready for ${camera} (${formatTs(s)} - ${formatTs(e)})`);
+          const listRes = await fetch("/api/exports", { credentials: "include" }).catch(
+            () => null
+          );
+          if (listRes && listRes.ok) {
+            const arr: ExportItem[] = await listRes.json().catch(() => []);
+            if (Array.isArray(arr)) {
+              setExportsList(arr);
+              const created = arr.find((x) => x.id === data.export_id);
+              if (created) {
+                setActiveExportPreview(created);
+              }
+            }
           }
+          return {
+            exportId: data.export_id,
+            videoUrl: sanitizeExportVideoUrl(data.video_url, camera, s, e),
+          };
+        } else {
+          notify(data.message || `Export failed (${res.status})`);
         }
-        return {
-          exportId: data.export_id,
-          videoUrl: sanitizeExportVideoUrl(data.video_url, camera, s, e),
-        };
-      } else {
-        notify(data.message || `Export failed (${res.status})`);
+      } catch {
+        notify("Network error while exporting MP4 clip");
       }
     },
     [notify]
@@ -957,52 +1003,66 @@ export const App: React.FC = () => {
 
   const handleEventRetain = async (ev: EventItem) => {
     const next = !ev.retain_indefinitely;
-    await fetch(`/api/events/${encodeURIComponent(ev.id)}/retain`, {
-      method: next ? "POST" : "DELETE",
-      credentials: "include",
-    });
-    setEvents((prev) =>
-      prev.map((x) => (x.id === ev.id ? { ...x, retain_indefinitely: next } : x))
-    );
-    setSelectedEvent((curr) =>
-      curr && curr.id === ev.id ? { ...curr, retain_indefinitely: next } : curr
-    );
-    notify(next ? "Event retained indefinitely" : "Event retention lock removed");
+    try {
+      await fetch(`/api/events/${encodeURIComponent(ev.id)}/retain`, {
+        method: next ? "POST" : "DELETE",
+        credentials: "include",
+      });
+      setEvents((prev) =>
+        prev.map((x) => (x.id === ev.id ? { ...x, retain_indefinitely: next } : x))
+      );
+      setSelectedEvent((curr) =>
+        curr && curr.id === ev.id ? { ...curr, retain_indefinitely: next } : curr
+      );
+      notify(next ? "Event retained indefinitely" : "Event retention lock removed");
+    } catch {
+      notify("Network error while updating event retention");
+    }
   };
 
   const handleEventDelete = async (id: string) => {
-    await fetch(`/api/events/${encodeURIComponent(id)}`, {
-      method: "DELETE",
-      credentials: "include",
-    });
-    setEvents((prev) => prev.filter((x) => x.id !== id));
-    if (selectedEvent?.id === id) setSelectedEvent(null);
-    notify("Deleted event record");
+    try {
+      await fetch(`/api/events/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      setEvents((prev) => prev.filter((x) => x.id !== id));
+      if (selectedEvent?.id === id) setSelectedEvent(null);
+      notify("Deleted event record");
+    } catch {
+      notify("Network error while deleting event record");
+    }
   };
 
   const handleSaveConfig = async (saveOption: "saveonly" | "restart") => {
-    const res = await fetch(
-      `/api/config/save?save_option=${encodeURIComponent(saveOption)}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "text/plain" },
-        credentials: "include",
-        body: rawYaml,
-      }
-    );
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.success !== false) {
-      if (saveOption === "restart") {
-        await fetch("/api/restart", { method: "POST", credentials: "include" });
-      }
-      notify(
-        saveOption === "restart"
-          ? "Configuration saved and NinjaNVR restarted"
-          : "Configuration saved to disk"
+    try {
+      const res = await fetch(
+        `/api/config/save?save_option=${encodeURIComponent(saveOption)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          credentials: "include",
+          body: rawYaml,
+        }
       );
-      await fetchCoreData();
-    } else {
-      notify(data.message || "Failed to validate/save YAML configuration");
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success !== false) {
+        if (saveOption === "restart") {
+          await fetch("/api/restart", { method: "POST", credentials: "include" }).catch(
+            () => null
+          );
+        }
+        notify(
+          saveOption === "restart"
+            ? "Configuration saved and NinjaNVR restarted"
+            : "Configuration saved to disk"
+        );
+        await fetchCoreData();
+      } else {
+        notify(data.message || "Failed to validate/save YAML configuration");
+      }
+    } catch {
+      notify("Network error while saving YAML configuration");
     }
   };
 

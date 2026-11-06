@@ -216,10 +216,13 @@ export function sliceMatrixPage(
   totalPages: number;
   safePage: number;
 } {
+  const safeCams = Array.isArray(cameras) ? cameras : [];
   const pageSize = getMatrixPageSize(density);
-  const totalPages = Math.max(1, Math.ceil(cameras.length / pageSize));
-  const safePage = Math.max(0, Math.min(page, totalPages - 1));
-  const visibleMatrixCams = cameras.slice(
+  const totalPages = Math.max(1, Math.ceil(safeCams.length / pageSize));
+  const normalizedPage =
+    typeof page === "number" && Number.isFinite(page) ? Math.floor(page) : 0;
+  const safePage = Math.max(0, Math.min(normalizedPage, totalPages - 1));
+  const visibleMatrixCams = safeCams.slice(
     safePage * pageSize,
     (safePage + 1) * pageSize
   );
@@ -230,8 +233,16 @@ export function nextMatrixTourPage(
   currentPage: number,
   totalPages: number
 ): number {
-  if (totalPages <= 1) return 0;
-  return (Math.max(0, currentPage) + 1) % totalPages;
+  const safeTotal =
+    typeof totalPages === "number" && Number.isFinite(totalPages)
+      ? Math.floor(totalPages)
+      : 1;
+  if (safeTotal <= 1) return 0;
+  const safeCurrent =
+    typeof currentPage === "number" && Number.isFinite(currentPage)
+      ? Math.max(0, Math.floor(currentPage))
+      : 0;
+  return (safeCurrent + 1) % safeTotal;
 }
 
 export function resolveDockTileMode(
@@ -771,6 +782,7 @@ export function sanitizeFloorplanUrl(
     if (
       trimmed.includes("\\") ||
       trimmed.includes("..") ||
+      /[?#]/.test(trimmed) ||
       /^\/%2f/i.test(trimmed) ||
       /%2e%2e|%5c|%252e|%255c|%00/i.test(trimmed)
     ) {
@@ -778,12 +790,16 @@ export function sanitizeFloorplanUrl(
     }
     try {
       const decoded = decodeURIComponent(trimmed);
+      const segments = decoded.split("/");
       if (
         !decoded.startsWith("/") ||
         decoded.startsWith("//") ||
         decoded.includes("\\") ||
         decoded.includes("..") ||
-        /[\u0000-\u001F\u007F]/.test(decoded)
+        decoded.includes("%") ||
+        segments.some((seg) => seg === "." || seg === "..") ||
+        /[\u0000-\u001F\u007F?#]/.test(decoded) ||
+        /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
       ) {
         return "";
       }
@@ -816,7 +832,8 @@ export function sanitizeFloorplanUrl(
     try {
       const decoded = globalThis.atob(b64);
       if (
-        /<script|<iframe|<object|<embed|<use\b|<foreignobject|<set\b|<animate|<handler\b|<listener\b|<link\b|<meta\b|<base\b|<style|@import|<!entity|<!doctype|j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:|v\s*b\s*s\s*c\s*r\s*i\s*p\s*t\s*:|data:\s*text\/html|(?:xlink:)?href\s*=\s*["']?\s*(?:javascript|vbscript|data)\s*:|\bon[a-z]+\s*=|&#/i.test(
+        /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(decoded) ||
+        /<script|<iframe|<object|<embed|<audio\b|<video\b|<portal\b|<feimage\b|<use\b|<foreignobject|<set\b|<animate|<handler\b|<listener\b|<link\b|<meta\b|<base\b|<style|@import|<!entity|<!doctype|j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:|v\s*b\s*s\s*c\s*r\s*i\s*p\s*t\s*:|data:\s*text\/html|(?:xlink:)?href\s*=\s*["']?\s*(?:javascript:|vbscript:|data:|https?:|\/\/)|\bon[a-z]+\s*=|&#/i.test(
           decoded
         )
       ) {
@@ -1015,12 +1032,16 @@ export function resolveSafeAlertThumbSrc(
   thumbPath: string | null | undefined,
   camera: string
 ): string {
-  const cleanCam = (camera || "").trim() || "camera";
+  const rawCam = (camera || "").trim();
+  const cleanCam =
+    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
+      ? "camera"
+      : rawCam;
   const encodedCam = encodeURIComponent(cleanCam);
   const fallback = `/api/${encodedCam}/latest.webp`;
   if (typeof thumbPath !== "string") return fallback;
   const trimmed = thumbPath.trim();
-  if (!trimmed || /[\u0000-\u001F\u007F\\]/.test(trimmed)) return fallback;
+  if (!trimmed || /[\u0000-\u001F\u007F\\?#]/.test(trimmed)) return fallback;
   const stripped = trimmed.replace(/^\/media\/[^/]+/, "").trim();
   if (
     !stripped ||
@@ -1034,12 +1055,16 @@ export function resolveSafeAlertThumbSrc(
   }
   try {
     const decoded = decodeURIComponent(stripped);
+    const segments = decoded.split("/");
     if (
       !decoded.startsWith("/") ||
       decoded.startsWith("//") ||
       decoded.includes("\\") ||
       decoded.includes("..") ||
-      /[\u0000-\u001F\u007F]/.test(decoded)
+      decoded.includes("%") ||
+      segments.some((seg) => seg === "." || seg === "..") ||
+      /[\u0000-\u001F\u007F?#]/.test(decoded) ||
+      /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
     ) {
       return fallback;
     }
@@ -1757,6 +1782,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
   useEffect(() => {
     const releaseActivePtt = () => {
+      setHoveredAlertId(null);
+      setHoveredDockCam(null);
       if (activePttCamerasRef.current.size > 0) {
         activePttCamerasRef.current.clear();
         setPttResetEpoch((n) => n + 1);
@@ -2680,6 +2707,12 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 onPointerLeave={() =>
                   setHoveredAlertId((curr) => (curr === item.id ? null : curr))
                 }
+                onPointerCancel={() =>
+                  setHoveredAlertId((curr) => (curr === item.id ? null : curr))
+                }
+                onBlur={() =>
+                  setHoveredAlertId((curr) => (curr === item.id ? null : curr))
+                }
                 onClick={timeShiftToEvent}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
@@ -2695,6 +2728,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     muted
                     loop
                     playsInline
+                    onError={() =>
+                      setHoveredAlertId((curr) => (curr === item.id ? null : curr))
+                    }
                   />
                 ) : (
                   <ReviewFlipbook

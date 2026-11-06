@@ -560,15 +560,17 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
 
   const clampPan = useCallback(
     (nextScale: number, rawX: number, rawY: number) => {
-      if (nextScale <= 1.0) return { x: 0, y: 0 };
+      if (!Number.isFinite(nextScale) || nextScale <= 1.0) return { x: 0, y: 0 };
+      const safeX = Number.isFinite(rawX) ? rawX : 0;
+      const safeY = Number.isFinite(rawY) ? rawY : 0;
       const el = stageRef.current;
       const w = el?.clientWidth || 640;
       const h = el?.clientHeight || 360;
       const maxX = ((nextScale - 1) * w) / 2;
       const maxY = ((nextScale - 1) * h) / 2;
       return {
-        x: Math.max(-maxX, Math.min(maxX, rawX)),
-        y: Math.max(-maxY, Math.min(maxY, rawY)),
+        x: Math.max(-maxX, Math.min(maxX, safeX)),
+        y: Math.max(-maxY, Math.min(maxY, safeY)),
       };
     },
     []
@@ -576,7 +578,8 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
 
   const applyZoom = useCallback(
     (nextRawScale: number, anchorX?: number, anchorY?: number) => {
-      const nextScale = Math.round(Math.max(1.0, Math.min(5.0, nextRawScale)) * 100) / 100;
+      const safeRaw = Number.isFinite(nextRawScale) ? nextRawScale : 1.0;
+      const nextScale = Math.round(Math.max(1.0, Math.min(5.0, safeRaw)) * 100) / 100;
       setScale((prevScale) => {
         if (nextScale <= 1.0) {
           setPan({ x: 0, y: 0 });
@@ -923,26 +926,43 @@ export function computeContainedBox(
   mediaW: number,
   mediaH: number
 ): ContainedBox {
-  if (containerW <= 0 || containerH <= 0 || mediaW <= 0 || mediaH <= 0) {
-    return { left: 0, top: 0, width: containerW, height: containerH };
+  const safeCW =
+    typeof containerW === "number" && Number.isFinite(containerW) && containerW > 0
+      ? containerW
+      : 0;
+  const safeCH =
+    typeof containerH === "number" && Number.isFinite(containerH) && containerH > 0
+      ? containerH
+      : 0;
+  if (
+    safeCW <= 0 ||
+    safeCH <= 0 ||
+    typeof mediaW !== "number" ||
+    typeof mediaH !== "number" ||
+    !Number.isFinite(mediaW) ||
+    !Number.isFinite(mediaH) ||
+    mediaW <= 0 ||
+    mediaH <= 0
+  ) {
+    return { left: 0, top: 0, width: safeCW, height: safeCH };
   }
-  const containerRatio = containerW / containerH;
+  const containerRatio = safeCW / safeCH;
   const mediaRatio = mediaW / mediaH;
   if (containerRatio > mediaRatio) {
-    const height = containerH;
-    const width = containerH * mediaRatio;
+    const height = safeCH;
+    const width = safeCH * mediaRatio;
     return {
-      left: (containerW - width) / 2,
+      left: (safeCW - width) / 2,
       top: 0,
       width,
       height,
     };
   }
-  const width = containerW;
-  const height = containerW / mediaRatio;
+  const width = safeCW;
+  const height = safeCW / mediaRatio;
   return {
     left: 0,
-    top: (containerH - height) / 2,
+    top: (safeCH - height) / 2,
     width,
     height,
   };
@@ -1615,7 +1635,9 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const objectMasks = extractMaskPolygons(cameraConfig?.objects?.mask);
   const privacyMasks = extractMaskPolygons(cameraConfig?.privacy_mask);
   const zones = cameraConfig?.zones || {};
-  const rotateDeg = cameraConfig?.live?.rotate || 0;
+  const rawRotate = cameraConfig?.live?.rotate;
+  const rotateDeg =
+    rawRotate === 90 || rawRotate === 180 || rawRotate === 270 ? rawRotate : 0;
   const isCorridorRot = rotateDeg === 90 || rotateDeg === 270;
   const rotateTransform = rotateDeg
     ? `rotate(${rotateDeg}deg)${isCorridorRot ? " scale(0.5625)" : ""}`
@@ -2000,12 +2022,16 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
   const endedFiredRef = useRef(false);
   const configuredCameras = useNvrStore((s) => s.config?.cameras);
   const realCamera = resolveRealCameraSource(camera, configuredCameras);
-  const vodRotateDeg = useNvrStore(
+  const rawVodRotateDeg = useNvrStore(
     (s) =>
       s.config?.cameras?.[camera]?.live?.rotate ||
       s.config?.cameras?.[realCamera]?.live?.rotate ||
       0
   );
+  const vodRotateDeg =
+    rawVodRotateDeg === 90 || rawVodRotateDeg === 180 || rawVodRotateDeg === 270
+      ? rawVodRotateDeg
+      : 0;
   const vodIsCorridorRot = vodRotateDeg === 90 || vodRotateDeg === 270;
   const vodRotateTransform = vodRotateDeg
     ? `rotate(${vodRotateDeg}deg)${vodIsCorridorRot ? " scale(0.5625)" : ""}`

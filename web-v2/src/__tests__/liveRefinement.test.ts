@@ -11,6 +11,7 @@ import {
 } from "../utils/liveStageLayout";
 import {
   ReviewFlipbook,
+  isSafeReviewFlipbookId,
   nextFlipbookIndex,
   sanitizeReviewFrameUrls,
 } from "../components/ReviewFlipbook";
@@ -19,7 +20,17 @@ import {
   resolveClipZoom,
   resolveEventClipRange,
   resolveReviewLane,
+  sanitizeTimelineThumbUrl,
 } from "../components/TimelineScrubber";
+import { sanitizeExportVideoUrl } from "../App";
+import { computeContainedBox } from "../components/VideoPlayers";
+import {
+  nextMatrixTourPage,
+  resolveSafeAlertThumbSrc,
+  sanitizeFloorplanUrl,
+  sliceMatrixPage,
+} from "../views/LiveWorkspace";
+import { resolveSafeSyncThumbSrc } from "../views/SyncWorkspace";
 import type { ReviewItem } from "../types/nvr";
 
 describe("resolveMatrixDensityOptions", () => {
@@ -215,5 +226,80 @@ describe("Export clip helpers", () => {
     const alert = resolveReviewLane("alert");
     const detection = resolveReviewLane("detection");
     expect(alert.y + alert.h).toBeLessThanOrEqual(detection.y);
+  });
+
+  test("hardens URL sanitizers, SVG floorplan decoder, and geometry/pagination helpers against NaN and traversal", () => {
+    // 1. ReviewFlipbook ID validation
+    expect(isSafeReviewFlipbookId("rev_1")).toBe(true);
+    expect(isSafeReviewFlipbookId(".")).toBe(false);
+    expect(isSafeReviewFlipbookId("..")).toBe(false);
+    expect(sanitizeReviewFrameUrls(".", { frames: [{ url: "/api/review/./frames/1.jpg" }] })).toEqual([]);
+
+    // 2. Double-encoded traversal, query/fragment injection, dot camera, and sensitive /api/* blocks
+    expect(
+      sanitizeExportVideoUrl("/exports/%252e%252e/config.yml", "..", 100, 120)
+    ).toBe("/exports/camera_100_120.mp4");
+    expect(
+      sanitizeExportVideoUrl("/api/auth/logout", "cam1", 100, 120)
+    ).toBe("/exports/cam1_100_120.mp4");
+    expect(
+      sanitizeExportVideoUrl("/exports/clip.mp4?token=secret", "cam1", 100, 120)
+    ).toBe("/exports/cam1_100_120.mp4");
+
+    expect(
+      sanitizeTimelineThumbUrl("/clips/%252e%252e/secret.webp", "..")
+    ).toBe("/api/camera/latest.webp");
+    expect(
+      sanitizeTimelineThumbUrl("/api/config/raw", "cam1")
+    ).toBe("/api/cam1/latest.webp");
+    expect(
+      sanitizeTimelineThumbUrl("/clips/thumb.webp?x=1", "cam1")
+    ).toBe("/api/cam1/latest.webp");
+
+    expect(resolveSafeAlertThumbSrc("/api/logout", "..")).toBe(
+      "/api/camera/latest.webp"
+    );
+    expect(resolveSafeAlertThumbSrc("/clips/a.webp?evil=1", "cam1")).toBe(
+      "/api/cam1/latest.webp"
+    );
+    expect(resolveSafeSyncThumbSrc("/api/tokens", ".")).toBe(
+      "/api/camera/latest.webp"
+    );
+
+    // 3. Floorplan SVG null-byte / external href / sensitive API route blocking
+    const nullByteSvgB64 = globalThis.btoa(
+      "<svg xmlns=\"http://www.w3.org/2000/svg\">\u0000<script>alert(1)</script></svg>"
+    );
+    expect(sanitizeFloorplanUrl(`data:image/svg+xml;base64,${nullByteSvgB64}`)).toBe("");
+    const extHrefSvgB64 = globalThis.btoa(
+      '<svg xmlns="http://www.w3.org/2000/svg"><image href="https://evil.example/track.png"/></svg>'
+    );
+    expect(sanitizeFloorplanUrl(`data:image/svg+xml;base64,${extHrefSvgB64}`)).toBe("");
+    expect(sanitizeFloorplanUrl("/api/config/raw")).toBe("");
+
+    // 4. NaN / Infinity guards in computeContainedBox, sliceMatrixPage, nextMatrixTourPage, resolveEventClipRange
+    expect(computeContainedBox(Number.NaN, 360, 1280, 720)).toEqual({
+      left: 0,
+      top: 0,
+      width: 0,
+      height: 360,
+    });
+    expect(computeContainedBox(640, 360, Number.NaN, 720)).toEqual({
+      left: 0,
+      top: 0,
+      width: 640,
+      height: 360,
+    });
+    expect(sliceMatrixPage(["c1", "c2", "c3"], Number.NaN, "2x2").safePage).toBe(0);
+    expect(sliceMatrixPage(["c1", "c2", "c3"], Number.NaN, "2x2").visibleMatrixCams).toEqual([
+      "c1",
+      "c2",
+      "c3",
+    ]);
+    expect(nextMatrixTourPage(Number.NaN, 3)).toBe(1);
+    expect(nextMatrixTourPage(0, Number.NaN)).toBe(0);
+    expect(
+      resolveEventClipRange([review("a", "sala", 1000, 1020)], "sala", 1010, 5000, Number.NaN)
+    ).toEqual({ start: 995, end: 1025 });
   });
 });

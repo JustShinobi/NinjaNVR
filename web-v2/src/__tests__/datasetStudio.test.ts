@@ -7,12 +7,15 @@ import {
   computeBatchProgressMetrics,
   computeDatasetReadinessMetrics,
   formatYoloAnnotationLine,
+  isSafeDatasetSampleId,
   NINJANVR_SECURITY_15CL_LABELMAP_PATH,
   NINJANVR_SECURITY_CLASSES,
   selectBatchAutoAnnotateCandidates,
   xyxyToYoloNormalized,
   yoloNormalizedToXyxy,
 } from "../views/settings/VisionAndAiPanels";
+import { buildCleanYamlFromDraft } from "../utils/configYaml";
+import { countChangedSections } from "../utils/settingsUx";
 
 describe("Dataset Studio YOLO Normalization & Readiness Gauges", () => {
   test("defines the canonical 15-class NinjaNVR Security taxonomy", () => {
@@ -154,5 +157,209 @@ describe("Dataset Studio YOLO Normalization & Readiness Gauges", () => {
       "python3 scripts/ai/train_ninjanvr_model.py --mode finetune --dataset ninjanvr-dataset.zip --model yolo11s.pt --imgsz 640 --epochs 30 --freeze 10 --nvr-url https://nvr.example.com:8971 --nvr-token $NINJANVR_API_TOKEN"
     );
     expect(COLAB_MODEL_FACTORY_URL).toContain("notebooks/NinjaNVR_Model_Factory.ipynb");
+  });
+});
+
+describe("Dataset Studio batch progress, sample ID validation, and YAML prototype guards", () => {
+  test("selectBatchAutoAnnotateCandidates and computeBatchProgressMetrics track batch AI annotation progress and ETA", () => {
+    const mockSamples = [
+      {
+        id: "ds_1",
+        camera: "escritorio",
+        split: "train" as const,
+        sample_kind: "true_positive" as const,
+        image_path: "/media/ninjanvr/dataset/ds_1.webp",
+        width: 1920,
+        height: 1080,
+        annotations: [
+          {
+            class_id: 0,
+            label: "person",
+            cx: 0.5,
+            cy: 0.5,
+            w: 0.2,
+            h: 0.4,
+            score: 0.9,
+            source: "event",
+          },
+        ],
+        verified: false,
+        night_mode: false,
+        created_at: 1000,
+      },
+      {
+        id: "ds_2",
+        camera: "sala",
+        split: "train" as const,
+        sample_kind: "ai_annotated" as const,
+        image_path: "/media/ninjanvr/dataset/ds_2.webp",
+        width: 1920,
+        height: 1080,
+        annotations: [
+          {
+            class_id: 0,
+            label: "person",
+            cx: 0.5,
+            cy: 0.5,
+            w: 0.2,
+            h: 0.4,
+            score: 0.95,
+            source: "ai_teacher",
+          },
+        ],
+        verified: true,
+        verified_by: "ai" as const,
+        night_mode: false,
+        created_at: 1001,
+      },
+      {
+        id: "ds_3",
+        camera: "sala",
+        split: "val" as const,
+        sample_kind: "hard_negative" as const,
+        image_path: "/media/ninjanvr/dataset/ds_3.webp",
+        width: 1920,
+        height: 1080,
+        annotations: [],
+        verified: true,
+        night_mode: false,
+        created_at: 1002,
+      },
+    ];
+
+    const pending = selectBatchAutoAnnotateCandidates(mockSamples, "pending");
+    expect(pending.map((s) => s.id)).toEqual(["ds_1"]);
+
+    const allPos = selectBatchAutoAnnotateCandidates(mockSamples, "all_positives");
+    expect(allPos.map((s) => s.id)).toEqual(["ds_1", "ds_2"]);
+
+    const metricsRunning = computeBatchProgressMetrics(
+      {
+        active: true,
+        mode: "all_positives",
+        total: 10,
+        completed: 4,
+        succeeded: 4,
+        failed: 0,
+        boxesGenerated: 16,
+        currentSampleId: "ds_5",
+        currentCamera: "escritorio",
+        startedAtMs: 10_000,
+        finishedAtMs: null,
+        cancelled: false,
+      },
+      18_000
+    );
+    expect(metricsRunning.pct).toBe(40);
+    expect(metricsRunning.remaining).toBe(6);
+    expect(metricsRunning.elapsedSec).toBe(8);
+    expect(metricsRunning.etaSec).toBe(12);
+
+    // Guard against NaN / Infinity in total, nowMs, and startedAtMs
+    expect(
+      computeBatchProgressMetrics({
+        active: true,
+        mode: "pending",
+        total: Number.NaN,
+        completed: 1,
+        succeeded: 1,
+        failed: 0,
+        boxesGenerated: 2,
+        currentSampleId: "ds_1",
+        currentCamera: "sala",
+        startedAtMs: 1000,
+        finishedAtMs: null,
+        cancelled: false,
+      })
+    ).toEqual({ pct: 0, remaining: 0, elapsedSec: 0, etaSec: null });
+
+    expect(
+      computeBatchProgressMetrics({
+        active: true,
+        mode: "pending",
+        total: Number.POSITIVE_INFINITY,
+        completed: 1,
+        succeeded: 1,
+        failed: 0,
+        boxesGenerated: 2,
+        currentSampleId: "ds_1",
+        currentCamera: "sala",
+        startedAtMs: 1000,
+        finishedAtMs: null,
+        cancelled: false,
+      })
+    ).toEqual({ pct: 0, remaining: 0, elapsedSec: 0, etaSec: null });
+
+    const nanTimeMetrics = computeBatchProgressMetrics(
+      {
+        active: true,
+        mode: "pending",
+        total: 4,
+        completed: 2,
+        succeeded: 2,
+        failed: 0,
+        boxesGenerated: 4,
+        currentSampleId: "ds_2",
+        currentCamera: "sala",
+        startedAtMs: Number.NaN,
+        finishedAtMs: null,
+        cancelled: false,
+      },
+      Number.NaN
+    );
+    expect(Number.isFinite(nanTimeMetrics.elapsedSec)).toBe(true);
+    expect(nanTimeMetrics.etaSec).toBe(1);
+
+    // Validate isSafeDatasetSampleId and path traversal filtering in selectBatchAutoAnnotateCandidates
+    expect(isSafeDatasetSampleId("ds_1793984364")).toBe(true);
+    expect(isSafeDatasetSampleId(".")).toBe(false);
+    expect(isSafeDatasetSampleId("..")).toBe(false);
+    expect(isSafeDatasetSampleId("../auto-annotate")).toBe(false);
+    expect(isSafeDatasetSampleId("ds/1")).toBe(false);
+    expect(isSafeDatasetSampleId("")).toBe(false);
+
+    const traversalFiltered = selectBatchAutoAnnotateCandidates(
+      [
+        ...mockSamples,
+        {
+          ...mockSamples[0],
+          id: "..",
+        },
+        {
+          ...mockSamples[0],
+          id: "../auto-annotate",
+        },
+      ],
+      "all_positives"
+    );
+    expect(traversalFiltered.map((s) => s.id)).toEqual(["ds_1", "ds_2"]);
+  });
+
+  test("buildCleanYamlFromDraft and countChangedSections guard against prototype key leakage", () => {
+    const yamlOut = buildCleanYamlFromDraft(
+      {
+        version: "0.18-0",
+        safe_mode: false,
+        cameras: {
+          toString: {
+            enabled: true,
+            detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+            motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+            record: { enabled: true },
+            snapshots: { enabled: true },
+            zones: {},
+            onvif: {
+              host: "192.0.2.55",
+              port: 80,
+              user: "admin",
+              has_password: false,
+            },
+          },
+        },
+      },
+      ""
+    );
+    expect(yamlOut).not.toContain("function toString");
+    expect(countChangedSections({ a: 1 }, { a: 1 })).toBe(0);
   });
 });

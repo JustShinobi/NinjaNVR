@@ -39,6 +39,7 @@ import {
   buildModelUploadPayload,
   COLAB_MODEL_FACTORY_URL,
   computeBatchProgressMetrics,
+  isSafeDatasetSampleId,
   NINJANVR_SECURITY_15CL_LABELMAP_PATH,
   NINJANVR_SECURITY_CLASSES,
   selectBatchAutoAnnotateCandidates,
@@ -67,9 +68,14 @@ function formatBytes(n: number): string {
 
 async function readSampleList(res: Response): Promise<DatasetSampleItem[]> {
   const data = await res.json().catch(() => null);
-  if (Array.isArray(data)) return data;
-  if (Array.isArray(data?.items)) return data.items;
-  return [];
+  const raw: unknown[] = Array.isArray(data)
+    ? data
+    : Array.isArray(data?.items)
+    ? data.items
+    : [];
+  return raw.filter((item: unknown): item is DatasetSampleItem =>
+    Boolean(item && typeof item === "object" && isSafeDatasetSampleId((item as { id?: unknown }).id))
+  );
 }
 
 export const DatasetStudioSection: React.FC<{
@@ -97,6 +103,9 @@ export const DatasetStudioSection: React.FC<{
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [batchProgress, setBatchProgress] = useState<BatchAutoAnnotateProgress | null>(null);
   const batchCancelRef = useRef(false);
+  const batchRunningRef = useRef(false);
+  const batchAbortRef = useRef<AbortController | null>(null);
+  const uploadFileReaderRef = useRef<FileReader | null>(null);
   const [trainTarget, setTrainTarget] = useState<"colab" | "local">("colab");
   const [upload, setUpload] = useState<{ name: string; size: number; base64: string } | null>(null);
   const [uploadFilename, setUploadFilename] = useState("ninjanvr_yolo11s.onnx");
@@ -123,6 +132,23 @@ export const DatasetStudioSection: React.FC<{
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
+      batchCancelRef.current = true;
+      if (batchAbortRef.current) {
+        try {
+          batchAbortRef.current.abort();
+        } catch {
+          // ignore
+        }
+        batchAbortRef.current = null;
+      }
+      if (uploadFileReaderRef.current) {
+        try {
+          uploadFileReaderRef.current.abort();
+        } catch {
+          // ignore
+        }
+        uploadFileReaderRef.current = null;
+      }
     };
   }, []);
 
@@ -232,6 +258,7 @@ export const DatasetStudioSection: React.FC<{
       sample_kind?: string;
     }
   ): Promise<boolean> => {
+    if (!isSafeDatasetSampleId(sample?.id)) return false;
     try {
       const res = await fetch(`/api/dataset/samples/${encodeURIComponent(sample.id)}`, {
         method: "PUT",
@@ -254,6 +281,7 @@ export const DatasetStudioSection: React.FC<{
   };
 
   const runAutoAnnotate = async (sampleId: string) => {
+    if (!isSafeDatasetSampleId(sampleId)) return;
     setBusyAction(`auto-${sampleId}`);
     try {
       const res = await fetch(`/api/dataset/samples/${encodeURIComponent(sampleId)}/auto-annotate`, {
@@ -282,84 +310,129 @@ export const DatasetStudioSection: React.FC<{
     }
   };
 
+  const stopBatch = () => {
+    batchCancelRef.current = true;
+    if (batchAbortRef.current) {
+      try {
+        batchAbortRef.current.abort();
+      } catch {
+        // ignore
+      }
+      batchAbortRef.current = null;
+    }
+  };
+
   const runBatch = async (mode: "pending" | "all_positives") => {
+    if (batchRunningRef.current) return;
+    batchRunningRef.current = true;
     setBusyAction("batch-auto");
     batchCancelRef.current = false;
-    let currentList = samples;
     try {
-      const listRes = await fetch("/api/dataset/samples", { credentials: "include" });
-      if (listRes.ok) {
-        const rows = await readSampleList(listRes);
-        if (rows.length > 0) currentList = rows;
-      }
-    } catch {
-      // fall back to the in-memory list
-    }
-    const candidates = selectBatchAutoAnnotateCandidates(currentList, mode);
-    if (candidates.length === 0) {
-      if (isMountedRef.current) {
-        setBusyAction(null);
-        notify(t("Nada para anotar com IA", "Nothing for the AI to annotate"));
-      }
-      return;
-    }
-    const startedAtMs = Date.now();
-    let completed = 0;
-    let succeeded = 0;
-    let failed = 0;
-    let boxesGenerated = 0;
-    const snapshot = (active: boolean, current: DatasetSampleItem | null): BatchAutoAnnotateProgress => ({
-      active,
-      mode,
-      total: candidates.length,
-      completed,
-      succeeded,
-      failed,
-      boxesGenerated,
-      currentSampleId: current?.id ?? null,
-      currentCamera: current?.camera ?? null,
-      startedAtMs,
-      finishedAtMs: active ? null : Date.now(),
-      cancelled: batchCancelRef.current,
-    });
-    setBatchProgress(snapshot(true, candidates[0]));
-    for (const cand of candidates) {
-      if (!isMountedRef.current || batchCancelRef.current) break;
-      setBatchProgress(snapshot(true, cand));
+      let currentList = samples;
       try {
-        const res = await fetch(`/api/dataset/samples/${encodeURIComponent(cand.id)}/auto-annotate`, {
-          method: "POST",
+        const listController = typeof AbortController !== "undefined" ? new AbortController() : null;
+        batchAbortRef.current = listController;
+        const listRes = await fetch("/api/dataset/samples", {
           credentials: "include",
+          ...(listController ? { signal: listController.signal } : {}),
         });
-        const data = await res.json().catch(() => null);
-        if (res.ok && data) {
-          const item: DatasetSampleItem = data.sample || data;
-          boxesGenerated += Array.isArray(item.annotations) ? item.annotations.length : 0;
-          succeeded += 1;
-          if (isMountedRef.current) replaceSample(item);
-        } else {
-          failed += 1;
+        if (listRes.ok) {
+          const rows = await readSampleList(listRes);
+          if (rows.length > 0) currentList = rows;
         }
       } catch {
-        failed += 1;
+        // fall back to the in-memory list
+      } finally {
+        batchAbortRef.current = null;
       }
-      completed += 1;
+      if (!isMountedRef.current || batchCancelRef.current) return;
+      const candidates = selectBatchAutoAnnotateCandidates(currentList, mode);
+      if (candidates.length === 0) {
+        if (isMountedRef.current) {
+          notify(t("Nada para anotar com IA", "Nothing for the AI to annotate"));
+        }
+        return;
+      }
+      const startedAtMs = Date.now();
+      let completed = 0;
+      let succeeded = 0;
+      let failed = 0;
+      let boxesGenerated = 0;
+      const snapshot = (active: boolean, current: DatasetSampleItem | null): BatchAutoAnnotateProgress => ({
+        active,
+        mode,
+        total: candidates.length,
+        completed,
+        succeeded,
+        failed,
+        boxesGenerated,
+        currentSampleId: current?.id ?? null,
+        currentCamera: current?.camera ?? null,
+        startedAtMs,
+        finishedAtMs: active ? null : Date.now(),
+        cancelled: batchCancelRef.current,
+      });
+      setBatchProgress(snapshot(true, candidates[0]));
+      for (const cand of candidates) {
+        if (!isMountedRef.current || batchCancelRef.current) break;
+        if (!isSafeDatasetSampleId(cand.id)) {
+          failed += 1;
+          completed += 1;
+          continue;
+        }
+        setBatchProgress(snapshot(true, cand));
+        try {
+          const itemController = typeof AbortController !== "undefined" ? new AbortController() : null;
+          batchAbortRef.current = itemController;
+          const res = await fetch(`/api/dataset/samples/${encodeURIComponent(cand.id)}/auto-annotate`, {
+            method: "POST",
+            credentials: "include",
+            ...(itemController ? { signal: itemController.signal } : {}),
+          });
+          batchAbortRef.current = null;
+          if (!isMountedRef.current || batchCancelRef.current) break;
+          const data = await res.json().catch(() => null);
+          if (!isMountedRef.current || batchCancelRef.current) break;
+          if (res.ok && data) {
+            const item: DatasetSampleItem = data.sample || data;
+            boxesGenerated += Array.isArray(item.annotations) ? item.annotations.length : 0;
+            succeeded += 1;
+            if (isMountedRef.current) replaceSample(item);
+          } else {
+            failed += 1;
+          }
+        } catch (err) {
+          batchAbortRef.current = null;
+          if (
+            !isMountedRef.current ||
+            batchCancelRef.current ||
+            (err as { name?: string })?.name === "AbortError"
+          ) {
+            break;
+          }
+          failed += 1;
+        }
+        completed += 1;
+      }
+      if (!isMountedRef.current) return;
+      setBatchProgress(snapshot(false, null));
+      notify(
+        batchCancelRef.current
+          ? t(
+              `Lote interrompido em ${completed}/${candidates.length} (${succeeded} verificadas pela IA)`,
+              `Batch stopped at ${completed}/${candidates.length} (${succeeded} verified by AI)`
+            )
+          : t(
+              `IA verificou ${succeeded}/${candidates.length} amostras (+${boxesGenerated} boxes)`,
+              `AI verified ${succeeded}/${candidates.length} samples (+${boxesGenerated} boxes)`
+            )
+      );
+      void loadDatasetState();
+    } finally {
+      batchRunningRef.current = false;
+      batchAbortRef.current = null;
+      if (isMountedRef.current) setBusyAction(null);
     }
-    if (!isMountedRef.current) return;
-    setBatchProgress(snapshot(false, null));
-    setBusyAction(null);
-    notify(
-      batchCancelRef.current
-        ? t(
-            `Lote interrompido em ${completed}/${candidates.length} (${succeeded} verificadas pela IA)`,
-            `Batch stopped at ${completed}/${candidates.length} (${succeeded} verified by AI)`
-          )
-        : t(
-            `IA verificou ${succeeded}/${candidates.length} amostras (+${boxesGenerated} boxes)`,
-            `AI verified ${succeeded}/${candidates.length} samples (+${boxesGenerated} boxes)`
-          )
-    );
-    void loadDatasetState();
   };
 
   const confirmManual = async (sample: DatasetSampleItem) => {
@@ -381,6 +454,7 @@ export const DatasetStudioSection: React.FC<{
   };
 
   const discardSample = async (sample: DatasetSampleItem) => {
+    if (!isSafeDatasetSampleId(sample?.id)) return;
     if (!window.confirm(t("Descartar esta amostra do dataset?", "Discard this sample from the dataset?"))) return;
     const next = neighbourAfter(sample.id);
     try {
@@ -414,11 +488,15 @@ export const DatasetStudioSection: React.FC<{
   };
 
   const relabelBox = (sample: DatasetSampleItem, idx: number, classId: number) => {
-    const label = NINJANVR_SECURITY_CLASSES[classId] ?? "person";
+    const safeClassId =
+      Number.isInteger(classId) && classId >= 0 && classId < NINJANVR_SECURITY_CLASSES.length
+        ? classId
+        : 0;
+    const label = NINJANVR_SECURITY_CLASSES[safeClassId] ?? "person";
     setBoxes(
       sample,
       (sample.annotations || []).map((ann, i) =>
-        i === idx ? { ...ann, class_id: classId, label, source: "manual" } : ann
+        i === idx ? { ...ann, class_id: safeClassId, label, source: "manual" } : ann
       )
     );
   };
@@ -500,7 +578,17 @@ export const DatasetStudioSection: React.FC<{
   // ---- drawing -----------------------------------------------------------
   const pointFromEvent = (e: React.PointerEvent<HTMLDivElement>): Point => {
     const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return [0, 0];
+    if (
+      !rect ||
+      !Number.isFinite(rect.width) ||
+      !Number.isFinite(rect.height) ||
+      rect.width <= 0 ||
+      rect.height <= 0 ||
+      !Number.isFinite(e.clientX) ||
+      !Number.isFinite(e.clientY)
+    ) {
+      return [0, 0];
+    }
     return [
       Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
       Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
@@ -509,7 +597,11 @@ export const DatasetStudioSection: React.FC<{
 
   const onFramePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!selected || e.button !== 0) return;
-    e.currentTarget.setPointerCapture(e.pointerId);
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore synthetic or released pointer events
+    }
     const p = pointFromEvent(e);
     setSelectedBox(null);
     setDraft({ start: p, end: p });
@@ -538,17 +630,33 @@ export const DatasetStudioSection: React.FC<{
 
   // ---- upload --------------------------------------------------------------
   const stageFile = (file: File | undefined) => {
+    if (uploadFileReaderRef.current) {
+      try {
+        uploadFileReaderRef.current.abort();
+      } catch {
+        // ignore
+      }
+      uploadFileReaderRef.current = null;
+    }
     if (!file) return;
     if (!/\.(onnx|xml|bin)$/i.test(file.name)) {
       notify(t("Use um arquivo .onnx ou .xml", "Use an .onnx or .xml file"));
       return;
     }
     const reader = new FileReader();
+    uploadFileReaderRef.current = reader;
     reader.onload = () => {
+      uploadFileReaderRef.current = null;
       if (typeof reader.result === "string" && isMountedRef.current) {
         setUpload({ name: file.name, size: file.size, base64: reader.result });
         setUploadFilename(file.name);
       }
+    };
+    reader.onerror = () => {
+      uploadFileReaderRef.current = null;
+    };
+    reader.onabort = () => {
+      uploadFileReaderRef.current = null;
     };
     reader.readAsDataURL(file);
   };
@@ -724,7 +832,7 @@ export const DatasetStudioSection: React.FC<{
           )}
         </span>
         {batchProgress?.active ? (
-          <button type="button" className="nvr-btn danger mono sm" onClick={() => (batchCancelRef.current = true)}>
+          <button type="button" className="nvr-btn danger mono sm" onClick={stopBatch}>
             {t("Parar", "Stop")}
           </button>
         ) : batchProgress ? (
@@ -840,12 +948,14 @@ export const DatasetStudioSection: React.FC<{
                   aria-current={selected?.id === s.id ? "true" : undefined}
                   onClick={() => setSelectedId(s.id)}
                 >
-                  <img
-                    className="nvr-ds-thumb"
-                    src={`/api/dataset/samples/${encodeURIComponent(s.id)}/image.webp`}
-                    alt=""
-                    loading="lazy"
-                  />
+                  {isSafeDatasetSampleId(s.id) && (
+                    <img
+                      className="nvr-ds-thumb"
+                      src={`/api/dataset/samples/${encodeURIComponent(s.id)}/image.webp`}
+                      alt=""
+                      loading="lazy"
+                    />
+                  )}
                   <span className="nvr-ds-qmeta">
                     <span className="nvr-ds-qtitle">
                       {s.camera.toUpperCase()} · {formatTs(s.created_at)}
@@ -921,7 +1031,7 @@ export const DatasetStudioSection: React.FC<{
         </div>
 
         <div className="nvr-ds-stage" ref={stageRef}>
-          {selected ? (
+          {selected && isSafeDatasetSampleId(selected.id) ? (
             <div
               className="nvr-ds-frame"
               style={{ left: frame.left, top: frame.top, width: frame.width, height: frame.height }}
@@ -940,7 +1050,9 @@ export const DatasetStudioSection: React.FC<{
               />
               {(selected.annotations || []).map((ann, i) => {
                 const [x1, y1, x2, y2] = yoloNormalizedToXyxy(ann);
-                const low = ann.source !== "manual" && Number(ann.score) < LOW_CONFIDENCE;
+                const scoreVal =
+                  typeof ann.score === "number" && Number.isFinite(ann.score) ? ann.score : null;
+                const low = ann.source !== "manual" && scoreVal !== null && scoreVal < LOW_CONFIDENCE;
                 const label = NINJANVR_SECURITY_CLASSES[ann.class_id] ?? ann.label;
                 return (
                   <div
@@ -955,8 +1067,8 @@ export const DatasetStudioSection: React.FC<{
                   >
                     <span className="nvr-ds-box-label">
                       {label}
-                      {ann.source !== "manual" && Number.isFinite(Number(ann.score))
-                        ? ` ${Number(ann.score).toFixed(2)}`
+                      {ann.source !== "manual" && scoreVal !== null
+                        ? ` ${scoreVal.toFixed(2)}`
                         : ""}
                     </span>
                   </div>
@@ -1022,7 +1134,13 @@ export const DatasetStudioSection: React.FC<{
     }
     const status = datasetQueueStatus(selected);
     const anns = selected.annotations || [];
-    const hasLow = anns.some((a) => a.source !== "manual" && Number(a.score) < LOW_CONFIDENCE);
+    const hasLow = anns.some(
+      (a) =>
+        a.source !== "manual" &&
+        typeof a.score === "number" &&
+        Number.isFinite(a.score) &&
+        a.score < LOW_CONFIDENCE
+    );
     const busy = Boolean(busyAction);
     const canConfirm = canConfirmSample(selected);
     return (
@@ -1067,7 +1185,9 @@ export const DatasetStudioSection: React.FC<{
               <ul className="nvr-ds-boxes">
                 {anns.map((ann, i) => {
                   const manual = ann.source === "manual";
-                  const low = !manual && Number(ann.score) < LOW_CONFIDENCE;
+                  const scoreVal =
+                    typeof ann.score === "number" && Number.isFinite(ann.score) ? ann.score : null;
+                  const low = !manual && scoreVal !== null && scoreVal < LOW_CONFIDENCE;
                   return (
                     <li
                       key={`${ann.class_id}-${i}`}
@@ -1089,7 +1209,7 @@ export const DatasetStudioSection: React.FC<{
                         ))}
                       </select>
                       <span className={`nvr-ds-score ${low ? "is-low" : ""} ${manual ? "is-manual" : ""}`}>
-                        {manual ? t("manual", "manual") : `IA ${Number(ann.score).toFixed(2)}`}
+                        {manual ? t("manual", "manual") : `IA ${scoreVal !== null ? scoreVal.toFixed(2) : "—"}`}
                       </span>
                       <button
                         type="button"
@@ -1169,7 +1289,15 @@ export const DatasetStudioSection: React.FC<{
     c.severity === "ok" ? "✓" : c.severity === "warn" ? "!" : c.severity === "block" ? "×" : "i";
 
   const renderReadiness = () => {
-    const camRows = Object.entries(summary?.by_camera ?? {}).sort((a, b) => b[1] - a[1]);
+    const camRows = Object.entries(summary?.by_camera ?? {})
+      .map(
+        ([cam, rawN]) =>
+          [
+            cam,
+            Number.isFinite(Number(rawN)) && Number(rawN) > 0 ? Math.floor(Number(rawN)) : 0,
+          ] as [string, number]
+      )
+      .sort((a, b) => b[1] - a[1]);
     const camMax = camRows.reduce((m, [, n]) => Math.max(m, n), 0);
     const classRows = datasetClassCoverage(summary);
     const learned = classRows.filter((r) => r.count >= DATASET_MIN_BOXES_PER_CLASS);
@@ -1451,7 +1579,21 @@ export const DatasetStudioSection: React.FC<{
                       {upload.name} · {formatBytes(upload.size)}
                     </span>
                   </div>
-                  <button type="button" className="nvr-btn mono sm" onClick={() => setUpload(null)}>
+                  <button
+                    type="button"
+                    className="nvr-btn mono sm"
+                    onClick={() => {
+                      if (uploadFileReaderRef.current) {
+                        try {
+                          uploadFileReaderRef.current.abort();
+                        } catch {
+                          // ignore
+                        }
+                        uploadFileReaderRef.current = null;
+                      }
+                      setUpload(null);
+                    }}
+                  >
                     {t("Trocar arquivo", "Change file")}
                   </button>
                 </div>

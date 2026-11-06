@@ -7,12 +7,23 @@ interface ReviewFramesResponse {
   frames?: Array<{ url?: unknown }>;
 }
 
+export function isSafeReviewFlipbookId(reviewId: string): boolean {
+  return (
+    typeof reviewId === "string" &&
+    reviewId.length > 0 &&
+    reviewId.length <= 128 &&
+    reviewId !== "." &&
+    !reviewId.includes("..") &&
+    /^[A-Za-z0-9_.-]+$/.test(reviewId)
+  );
+}
+
 /**
  * Keeps only same-origin review frame URLs for the given review id, so a
  * tampered API response can never point an <img> at another origin or path.
  */
 export function sanitizeReviewFrameUrls(reviewId: string, payload: unknown): string[] {
-  if (!reviewId || !/^[A-Za-z0-9_.-]+$/.test(reviewId) || reviewId.includes("..")) return [];
+  if (!isSafeReviewFlipbookId(reviewId)) return [];
   const frames = (payload as ReviewFramesResponse | null)?.frames;
   if (!Array.isArray(frames)) return [];
   const prefix = `/api/review/${reviewId}/frames/`;
@@ -65,24 +76,45 @@ export const ReviewFlipbook: React.FC<ReviewFlipbookProps> = ({ reviewId, fallba
   useEffect(() => {
     let cancelled = false;
     let pending: HTMLImageElement | null = null;
+    const controller =
+      typeof AbortController !== "undefined" ? new AbortController() : null;
     setReady([]);
     setIndex(0);
 
+    if (!isSafeReviewFlipbookId(reviewId)) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
     const preloadSequentially = (urls: string[], at: number) => {
-      if (cancelled || at >= urls.length || typeof Image === "undefined") return;
+      if (cancelled || at >= urls.length || typeof Image === "undefined") {
+        pending = null;
+        return;
+      }
       const img = new Image();
       pending = img;
       img.onload = () => {
+        img.onload = null;
+        img.onerror = null;
         if (cancelled) return;
         setReady((prev) => [...prev, urls[at]]);
         preloadSequentially(urls, at + 1);
       };
       // A missing or throttled frame is skipped; the loop keeps the ones that loaded.
-      img.onerror = () => preloadSequentially(urls, at + 1);
+      img.onerror = () => {
+        img.onload = null;
+        img.onerror = null;
+        if (cancelled) return;
+        preloadSequentially(urls, at + 1);
+      };
       img.src = urls[at];
     };
 
-    fetch(`/api/review/${encodeURIComponent(reviewId)}/frames`, { credentials: "include" })
+    fetch(`/api/review/${encodeURIComponent(reviewId)}/frames`, {
+      credentials: "include",
+      ...(controller ? { signal: controller.signal } : {}),
+    })
       .then((res) => (res.ok ? res.json() : null))
       .then((payload) => {
         if (!cancelled) preloadSequentially(sanitizeReviewFrameUrls(reviewId, payload), 0);
@@ -90,10 +122,12 @@ export const ReviewFlipbook: React.FC<ReviewFlipbookProps> = ({ reviewId, fallba
       .catch(() => undefined);
     return () => {
       cancelled = true;
+      controller?.abort();
       if (pending) {
         pending.onload = null;
         pending.onerror = null;
         pending.src = "";
+        pending = null;
       }
     };
   }, [reviewId]);

@@ -239,4 +239,26 @@ describe("Dataset Studio pipeline rail and next action", () => {
     expect(activeModelDisplayName("C:\\models\\ninjanvr_yolo11s.onnx")).toBe("ninjanvr_yolo11s");
     expect(activeModelDisplayName("")).toBe("—");
   });
+
+  test("guards against null scores, NaN indices, NaN drag coordinates, and NaN timestamps", () => {
+    const nullScoreSample = sample("null_score", {
+      annotations: [{ ...box(0.5), score: null as unknown as number }],
+    });
+    expect(minAnnotationScore(nullScoreSample)).toBeNull();
+
+    const list = QUEUE.slice(0, 3);
+    expect(stepStickyDatasetQueue(list, "missing", Number.NaN, 1)).toBe("ai_high");
+    expect(stepStickyDatasetQueue(list, "missing", -5, -1)).toBe("ai_high");
+
+    expect(normalizeDragBox([Number.NaN, 0.2], [0.5, 0.8])).toEqual([0, 0.2, 0.5, 0.8]);
+    expect(normalizeDragBox([0.5, 0.5], [0.5, 0.5], Number.NaN)).toBeNull();
+
+    const nanTimeSamples = [
+      sample("a", { created_at: Number.NaN }),
+      sample("b", { created_at: 100 }),
+    ];
+    expect(
+      filterDatasetQueue(nanTimeSamples, { tab: "all", camera: "all", kind: "all" }).map((s) => s.id)
+    ).toEqual(["b", "a"]);
+  });
 });
