@@ -161,8 +161,8 @@ struct OvCFunctionTable {
 
 #[repr(C)]
 struct OrtApiBase {
-    get_api: unsafe extern "C" fn(u32) -> *const c_void,
-    get_version_string: unsafe extern "C" fn() -> *const c_char,
+    get_api: Option<unsafe extern "C" fn(u32) -> *const c_void>,
+    get_version_string: Option<unsafe extern "C" fn() -> *const c_char>,
 }
 
 type OrtGetApiBaseFn = unsafe extern "C" fn() -> *const OrtApiBase;
@@ -245,10 +245,14 @@ struct OpenVinoCContext {
     core_free_fn: Option<OvFreeFn>,
 }
 
+// SAFETY: OpenVinoCContext owns its OpenVINO C-API handles and raw tensor pointers exclusively,
+// and all access across threads is serialized through `AiDetectorEngine::inner: Mutex<DetectorRuntimeState>`.
 unsafe impl Send for OpenVinoCContext {}
 
 impl Drop for OpenVinoCContext {
     fn drop(&mut self) {
+        // SAFETY: Each non-null handle was allocated by the loaded OpenVINO C library and is
+        // released at most once in reverse creation order (tensors -> infer_req -> compiled_model -> core).
         unsafe {
             if !self.output_tensor.is_null() {
                 if let Some(free_fn) = self.tensor_free_fn {
@@ -307,6 +311,8 @@ struct OrtCContext {
     out_floats: usize,
 }
 
+// SAFETY: OrtCContext owns its ONNX Runtime C-API handles and buffers exclusively,
+// and all access across threads is serialized through `AiDetectorEngine::inner: Mutex<DetectorRuntimeState>`.
 unsafe impl Send for OrtCContext {}
 
 impl Drop for OrtCContext {
@@ -314,6 +320,8 @@ impl Drop for OrtCContext {
         if self.vtable.is_null() {
             return;
         }
+        // SAFETY: `self.vtable` was validated at construction to point to a live `OrtApi` table
+        // of at least 101 pointer slots, and each non-null handle is released in reverse creation order.
         unsafe {
             let vt = std::slice::from_raw_parts(self.vtable, 101);
             let release = |idx: usize, ptr: &mut *mut c_void| {
@@ -391,6 +399,55 @@ impl DetectorPool {
     pub fn detector_names(&self) -> Vec<String> {
         self.detectors.keys().cloned().collect()
     }
+}
+
+const MAX_LABELMAP_FILE_BYTES: u64 = 256 * 1024;
+
+fn read_bounded_labelmap_file(path: &Path) -> Result<String> {
+    if !ninjanvr_config::is_safe_labelmap_path(path) {
+        bail!("unsafe labelmap path: {}", path.display());
+    }
+    let sym_meta = std::fs::symlink_metadata(path)?;
+    if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
+        bail!("labelmap path must be a regular file and not a symlink");
+    }
+    if sym_meta.len() > MAX_LABELMAP_FILE_BYTES {
+        bail!("labelmap file exceeds maximum size of {MAX_LABELMAP_FILE_BYTES} bytes");
+    }
+    let canon = std::fs::canonicalize(path)?;
+    if !ninjanvr_config::is_safe_labelmap_path(&canon) {
+        bail!("canonical labelmap path is unsafe: {}", canon.display());
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(&canon)?;
+    let fd_meta = file.metadata()?;
+    if fd_meta.file_type().is_symlink() || !fd_meta.file_type().is_file() {
+        bail!("opened labelmap descriptor is not a regular file");
+    }
+    if fd_meta.len() > MAX_LABELMAP_FILE_BYTES {
+        bail!("opened labelmap descriptor exceeds maximum size of {MAX_LABELMAP_FILE_BYTES} bytes");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if sym_meta.dev() != fd_meta.dev() || sym_meta.ino() != fd_meta.ino() {
+            bail!("labelmap file inode changed during open");
+        }
+    }
+    let mut buf =
+        Vec::with_capacity((fd_meta.len() as usize).min(MAX_LABELMAP_FILE_BYTES as usize));
+    let mut limited = std::io::Read::take(file, MAX_LABELMAP_FILE_BYTES + 1);
+    std::io::Read::read_to_end(&mut limited, &mut buf)?;
+    if buf.len() as u64 > MAX_LABELMAP_FILE_BYTES {
+        bail!("labelmap content exceeds maximum size of {MAX_LABELMAP_FILE_BYTES} bytes");
+    }
+    Ok(String::from_utf8(buf)?)
 }
 
 /// Standard 80-class COCO index to label mapping used by YOLOv5/v8/v11/YOLOX models when
@@ -553,21 +610,26 @@ impl AiDetectorEngine {
         image_bytes: &[u8],
     ) -> Result<(PathBuf, Vec<f32>)> {
         let mut guard = lock_unpoisoned(&self.face_gallery);
-        let _ = guard.sync_from_dir(faces_dir);
+        guard.sync_from_dir(faces_dir)?;
         guard.enroll_to_dir(faces_dir, name, sample_id, "jpg", image_bytes)
     }
 
     /// Removes an enrolled face profile from memory and deletes `{faces_dir}/{name}` if present.
     pub fn delete_face_profile(&self, faces_dir: &Path, name: &str) -> Result<bool> {
         let mut guard = lock_unpoisoned(&self.face_gallery);
-        let _ = guard.sync_from_dir(faces_dir);
+        guard.sync_from_dir(faces_dir)?;
         guard.remove_profile(Some(faces_dir), name)
     }
 
     /// Lists all enrolled face profiles from memory and `{faces_dir}`.
     pub fn list_face_profiles(&self, faces_dir: &Path) -> Vec<EnrolledFaceProfile> {
         let mut guard = lock_unpoisoned(&self.face_gallery);
-        let _ = guard.sync_from_dir(faces_dir);
+        if let Err(e) = guard.sync_from_dir(faces_dir) {
+            warn!(
+                "Failed to sync face gallery from {}: {e:#}",
+                faces_dir.display()
+            );
+        }
         guard.list_profiles(Some(faces_dir))
     }
 
@@ -581,7 +643,12 @@ impl AiDetectorEngine {
         unknown_alert: bool,
     ) -> Option<FaceMatchResult> {
         let mut guard = lock_unpoisoned(&self.face_gallery);
-        let _ = guard.sync_from_dir(faces_dir);
+        if let Err(e) = guard.sync_from_dir(faces_dir) {
+            warn!(
+                "Failed to sync face gallery from {}: {e:#}",
+                faces_dir.display()
+            );
+        }
         guard.match_face_bytes(crop_bytes, similarity_threshold, unknown_alert)
     }
 
@@ -596,9 +663,7 @@ impl AiDetectorEngine {
         let mut labelmap = BTreeMap::new();
         let labelmap_candidate = Path::new(&effective_model.labelmap_path);
         if !effective_model.labelmap_path.is_empty()
-            && ninjanvr_config::is_safe_labelmap_path(labelmap_candidate)
-            && labelmap_candidate.is_file()
-            && let Ok(content) = std::fs::read_to_string(labelmap_candidate)
+            && let Ok(content) = read_bounded_labelmap_file(labelmap_candidate)
         {
             for (idx, line) in content.lines().enumerate() {
                 if labelmap.len() >= 256 {
@@ -1078,6 +1143,40 @@ impl AiDetectorEngine {
         None
     }
 
+    /// # Safety
+    ///
+    /// `base_ptr` must either be null or point to a valid `OrtApiBase` instance whose non-null
+    /// function pointers follow the ONNX Runtime C ABI (`GetVersionString` and `GetApi`).
+    unsafe fn resolve_ort_api_from_base(base_ptr: *const OrtApiBase) -> Result<*const c_void> {
+        if base_ptr.is_null() {
+            bail!("OrtGetApiBase returned null");
+        }
+        // SAFETY: `base_ptr` is non-null and points to an `OrtApiBase` structure with nullable
+        // `Option<unsafe extern "C" fn(...)>` fields, avoiding niche-validity UB on null slots.
+        unsafe {
+            let get_version_string = (*base_ptr)
+                .get_version_string
+                .ok_or_else(|| anyhow!("OrtApiBase function pointer is null"))?;
+            let get_api = (*base_ptr)
+                .get_api
+                .ok_or_else(|| anyhow!("OrtApiBase function pointer is null"))?;
+            let _ver = get_version_string();
+
+            let mut api_ptr = std::ptr::null();
+            for ver in [14u32, 10, 1] {
+                let p = get_api(ver);
+                if !p.is_null() {
+                    api_ptr = p;
+                    break;
+                }
+            }
+            if api_ptr.is_null() {
+                bail!("OrtApiBase::GetApi returned null");
+            }
+            Ok(api_ptr)
+        }
+    }
+
     fn try_init_onnxruntime(
         configured_model: &str,
         device: &str,
@@ -1089,6 +1188,8 @@ impl AiDetectorEngine {
         let model_path = Self::resolve_model_path(configured_model)
             .ok_or_else(|| anyhow!("model file {configured_model} not found"))?;
 
+        // SAFETY: `lib_path` and `model_path` are validated local paths; `dlopen`/`dlsym` symbols
+        // are checked for null before transmuting and invoking `OrtGetApiBase`.
         unsafe {
             let c_lib = CString::new(lib_path.to_string_lossy().as_bytes())?;
             let handle = libc::dlopen(c_lib.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
@@ -1110,22 +1211,7 @@ impl AiDetectorEngine {
             let get_api_base: OrtGetApiBaseFn =
                 std::mem::transmute::<*mut c_void, OrtGetApiBaseFn>(ptr);
             let base_ptr = get_api_base();
-            if base_ptr.is_null() {
-                bail!("OrtGetApiBase returned null");
-            }
-            let _ver = ((*base_ptr).get_version_string)();
-
-            let mut api_ptr = std::ptr::null();
-            for ver in [14u32, 10, 1] {
-                let p = ((*base_ptr).get_api)(ver);
-                if !p.is_null() {
-                    api_ptr = p;
-                    break;
-                }
-            }
-            if api_ptr.is_null() {
-                bail!("OrtApiBase::GetApi returned null");
-            }
+            let api_ptr = Self::resolve_ort_api_from_base(base_ptr)?;
 
             Self::init_ort_session_from_vtable(
                 handle,
@@ -1138,6 +1224,12 @@ impl AiDetectorEngine {
         }
     }
 
+    /// # Safety
+    ///
+    /// `vtable` must either be null or point to a contiguous array of at least 101 `*const c_void`
+    /// function pointer slots matching the ONNX Runtime `OrtApi` C ABI that remains valid for the
+    /// lifetime of the returned `OrtCContext`. If `handle` is non-null, it must be a valid `dlopen`
+    /// handle for `libonnxruntime`.
     unsafe fn init_ort_session_from_vtable(
         handle: *mut c_void,
         vtable: *const *const c_void,
@@ -1156,6 +1248,8 @@ impl AiDetectorEngine {
         {
             bail!("invalid ONNX Runtime model dimensions {model_w}x{model_h}");
         }
+        // SAFETY: `vtable` is non-null and guaranteed by the caller to reference at least 101
+        // `OrtApi` slots; every required slot is checked for null before transmuting and calling.
         unsafe {
             let vt = std::slice::from_raw_parts(vtable, 101);
             const REQUIRED_SLOTS: &[usize] = &[
@@ -1548,12 +1642,18 @@ impl AiDetectorEngine {
             .find(|p| ninjanvr_config::is_safe_model_path(p) && p.is_file())
     }
 
+    /// # Safety
+    ///
+    /// `fns` must contain valid OpenVINO C-API function pointers matching the `Ov*Fn` C ABI
+    /// signatures that remain valid for the lifetime of the returned `OpenVinoCContext`.
     unsafe fn init_ov_context_from_fns(
         handle: *mut c_void,
         fns: OvCFunctionTable,
         model_path: &Path,
         device: &str,
     ) -> Result<(OpenVinoCContext, String)> {
+        // SAFETY: Caller guarantees `fns` entries follow the OpenVINO C ABI; all output pointers
+        // and tensor byte sizes are checked for null, alignment, and bounds before use.
         unsafe {
             let mut ctx = OpenVinoCContext {
                 output_tensor: std::ptr::null_mut(),
@@ -1707,6 +1807,8 @@ impl AiDetectorEngine {
 
         let lib_dir = lib_path.parent().unwrap_or_else(|| Path::new("/"));
 
+        // SAFETY: `lib_path` and preload dependencies are resolved from trusted library directories;
+        // every required `dlsym` symbol is checked for null before transmuting to its C ABI fn type.
         unsafe {
             for dep_path in Self::discover_openvino_preload_deps(lib_dir) {
                 if let Ok(c_dep) = CString::new(dep_path.to_string_lossy().as_bytes()) {
@@ -1807,6 +1909,9 @@ impl AiDetectorEngine {
                     Some(InferenceRuntimeBackend::OpenVino(ctx)) => {
                         let expected_f32_bytes =
                             expected_elems.checked_mul(std::mem::size_of::<f32>());
+                        // SAFETY: `ctx` holds live OpenVINO C-API tensor/infer handles protected by
+                        // `self.inner` mutex; input/output pointers, alignments, and byte lengths
+                        // are re-queried and bounds-checked before constructing slices or copying.
                         unsafe {
                             if !ctx.input_tensor.is_null() {
                                 let mut in_raw: *mut c_void = std::ptr::null_mut();
@@ -1939,6 +2044,9 @@ impl AiDetectorEngine {
                             }
                         }
                     }
+                    // SAFETY: `ort_ctx` holds live ONNX Runtime C-API handles and a 101-slot vtable
+                    // protected by `self.inner` mutex; required vtable slots, tensor pointers, and
+                    // element counts are validated before creating slices or releasing values.
                     Some(InferenceRuntimeBackend::OnnxRuntime(ort_ctx)) => unsafe {
                         if !ort_ctx.vtable.is_null()
                             && !ort_ctx.session.is_null()
@@ -3072,13 +3180,16 @@ impl FaceGallery {
     /// while preserving any in-memory embeddings already enrolled during the current session.
     pub fn sync_from_dir(&mut self, faces_dir: &Path) -> Result<()> {
         self.loaded_dir = Some(faces_dir.to_path_buf());
-        if !is_real_directory(faces_dir) {
-            return Ok(());
+        match std::fs::symlink_metadata(faces_dir) {
+            Ok(meta) => {
+                if !meta.file_type().is_dir() {
+                    bail!("faces_dir must be a real directory and not a symlink");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
         }
-        let entries = match std::fs::read_dir(faces_dir) {
-            Ok(e) => e,
-            Err(_) => return Ok(()),
-        };
+        let entries = std::fs::read_dir(faces_dir)?;
         let mut dir_paths: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
@@ -3239,6 +3350,19 @@ impl FaceGallery {
             bail!("face profile directory must be a real directory and not a symlink");
         }
         std::fs::create_dir_all(&person_dir)?;
+        let base_meta = std::fs::symlink_metadata(base_dir)?;
+        if !base_meta.file_type().is_dir() {
+            bail!("faces_dir must be a real directory and not a symlink");
+        }
+        let person_meta = std::fs::symlink_metadata(&person_dir)?;
+        if !person_meta.file_type().is_dir() {
+            bail!("face profile directory must be a real directory and not a symlink");
+        }
+        let canon_base = std::fs::canonicalize(base_dir)?;
+        let canon_person = std::fs::canonicalize(&person_dir)?;
+        if !canon_person.starts_with(&canon_base) || canon_person == canon_base {
+            bail!("face profile directory escapes faces_dir containment");
+        }
 
         let safe_stem: String = file_stem
             .chars()
@@ -3273,7 +3397,41 @@ impl FaceGallery {
         } else {
             image_bytes.to_vec()
         };
-        std::fs::write(&file_path, &payload)?;
+
+        static NEXT_FACE_TMP_ID: AtomicU64 = AtomicU64::new(1);
+        let seq = NEXT_FACE_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_path = person_dir.join(format!(".{filename}.tmp.{pid}.{nanos}.{seq}"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut tmp_file = opts.open(&tmp_path)?;
+        if let Err(e) =
+            std::io::Write::write_all(&mut tmp_file, &payload).and_then(|()| tmp_file.sync_all())
+        {
+            drop(tmp_file);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
+        drop(tmp_file);
+        if let Ok(meta) = std::fs::symlink_metadata(&file_path)
+            && !meta.file_type().is_file()
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            bail!("target face sample file must be a regular file and not a symlink or FIFO");
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &file_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
 
         let emb = extract_face_embedding(&payload);
         if let Ok(meta) = std::fs::symlink_metadata(&file_path) {
@@ -4457,12 +4615,14 @@ version: 0.18-0
             _id: *const c_char,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes a sentinel handle to caller-provided `out`.
             unsafe {
                 *out = 0x1001usize as *mut c_void;
             }
             std::ptr::null_mut()
         }
         unsafe extern "C" fn mock_create_opts(out: *mut *mut c_void) -> *mut c_void {
+            // SAFETY: Test mock writes a sentinel handle to caller-provided `out`.
             unsafe {
                 *out = 0x1002usize as *mut c_void;
             }
@@ -4485,12 +4645,14 @@ version: 0.18-0
             _opts: *const c_void,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes a sentinel handle to caller-provided `out`.
             unsafe {
                 *out = 0x1003usize as *mut c_void;
             }
             std::ptr::null_mut()
         }
         unsafe extern "C" fn mock_get_alloc(out: *mut *mut c_void) -> *mut c_void {
+            // SAFETY: Test mock writes a sentinel handle to caller-provided `out`.
             unsafe {
                 *out = 0x1004usize as *mut c_void;
             }
@@ -4502,6 +4664,7 @@ version: 0.18-0
             _alloc: *mut c_void,
             out: *mut *mut c_char,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes a static C string pointer to caller-provided `out`.
             unsafe {
                 *out = c"images".as_ptr() as *mut c_char;
             }
@@ -4513,6 +4676,7 @@ version: 0.18-0
             _alloc: *mut c_void,
             out: *mut *mut c_char,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes a static C string pointer to caller-provided `out`.
             unsafe {
                 *out = c"output0".as_ptr() as *mut c_char;
             }
@@ -4523,6 +4687,7 @@ version: 0.18-0
             _idx: usize,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes a sentinel handle to caller-provided `out`.
             unsafe {
                 *out = 0x1005usize as *mut c_void;
             }
@@ -4532,6 +4697,7 @@ version: 0.18-0
             _ti: *const c_void,
             out: *mut *const c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes a sentinel handle to caller-provided `out`.
             unsafe {
                 *out = 0x1006usize as *const c_void;
             }
@@ -4541,6 +4707,7 @@ version: 0.18-0
             _info: *const c_void,
             out: *mut c_int,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes element type constant to caller-provided `out`.
             unsafe {
                 *out = ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
             }
@@ -4551,6 +4718,7 @@ version: 0.18-0
             _m: c_int,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes a sentinel handle to caller-provided `out`.
             unsafe {
                 *out = 0x1007usize as *mut c_void;
             }
@@ -4565,6 +4733,7 @@ version: 0.18-0
             _ty: c_int,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes a sentinel handle to caller-provided `out`.
             unsafe {
                 *out = 0x2001usize as *mut c_void;
             }
@@ -4580,6 +4749,7 @@ version: 0.18-0
             _out_len: usize,
             out_vals: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes a sentinel handle to caller-provided `out_vals`.
             unsafe {
                 *out_vals = 0x2002usize as *mut c_void;
             }
@@ -4589,6 +4759,7 @@ version: 0.18-0
             _val: *mut c_void,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes static tensor buffer pointer to caller-provided `out`.
             unsafe {
                 *out = MOCK_OUT_TENSOR.as_ptr() as *mut c_void;
             }
@@ -4598,6 +4769,7 @@ version: 0.18-0
             _val: *const c_void,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes a sentinel handle to caller-provided `out`.
             unsafe {
                 *out = 0x2003usize as *mut c_void;
             }
@@ -4607,6 +4779,7 @@ version: 0.18-0
             _info: *const c_void,
             out: *mut usize,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes static tensor element count to caller-provided `out`.
             unsafe {
                 *out = MOCK_OUT_TENSOR.len();
             }
@@ -4636,6 +4809,7 @@ version: 0.18-0
             vtable[idx] = mock_release as *const c_void;
         }
 
+        // SAFETY: `vtable` is a stack-allocated 101-entry table populated with matching mock C functions.
         let (ort_ctx, actual_dev) = unsafe {
             AiDetectorEngine::init_ort_session_from_vtable(
                 std::ptr::null_mut(),
@@ -5528,6 +5702,7 @@ detectors:
         static MOCK_OUT_BUF: [f32; 7] = [0.0, 1.0, 0.92, 0.1, 0.1, 0.5, 0.8];
 
         unsafe extern "C" fn mock_core_create(out: *mut *mut c_void) -> c_int {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x11usize as *mut c_void;
             }
@@ -5542,6 +5717,7 @@ detectors:
             _k: *const c_char,
             _v: *const c_char,
         ) -> c_int {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x12usize as *mut c_void;
             }
@@ -5551,12 +5727,14 @@ detectors:
             _cm: *mut c_void,
             out: *mut *mut c_void,
         ) -> c_int {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x13usize as *mut c_void;
             }
             0
         }
         unsafe extern "C" fn mock_get_in_tensor(_req: *mut c_void, out: *mut *mut c_void) -> c_int {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x14usize as *mut c_void;
             }
@@ -5569,6 +5747,7 @@ detectors:
             if FAIL_OUT_TENSOR.load(Ordering::SeqCst) != 0 {
                 return -1;
             }
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x15usize as *mut c_void;
             }
@@ -5578,6 +5757,7 @@ detectors:
             0
         }
         unsafe extern "C" fn mock_tensor_data(t: *mut c_void, out: *mut *mut c_void) -> c_int {
+            // SAFETY: Test mock writes static buffer pointer to `out`.
             unsafe {
                 if t as usize == 0x14 {
                     *out = MOCK_IN_BUF.lock().unwrap().as_mut_ptr() as *mut c_void;
@@ -5588,6 +5768,7 @@ detectors:
             0
         }
         unsafe extern "C" fn mock_tensor_byte_size(t: *mut c_void, out: *mut usize) -> c_int {
+            // SAFETY: Test mock writes byte size to `out`.
             unsafe {
                 if t as usize == 0x14 {
                     *out = 64 * 64 * 3;
@@ -5603,6 +5784,7 @@ detectors:
 
         let fns = OvCFunctionTable {
             core_create: mock_core_create,
+            // SAFETY: `mock_compile_model` uses the C ABI compatible with `OvCoreCompileModelFn`.
             compile_model: unsafe {
                 std::mem::transmute::<*const c_void, OvCoreCompileModelFn>(
                     mock_compile_model as *const c_void,
@@ -5623,6 +5805,7 @@ detectors:
         // 1. Early error when get_out_tensor fails must free input_tensor (0x14) -> infer_req (0x13) -> compiled_model (0x12) -> core (0x11)
         FREE_LOG.lock().unwrap().clear();
         FAIL_OUT_TENSOR.store(1, Ordering::SeqCst);
+        // SAFETY: `fns` contains valid mock OpenVINO C-API functions for testing.
         let err_res = unsafe {
             AiDetectorEngine::init_ov_context_from_fns(
                 std::ptr::null_mut(),
@@ -5637,6 +5820,7 @@ detectors:
         // 2. Successful init + drop frees output_tensor (0x15) -> input_tensor (0x14) -> infer_req (0x13) -> compiled_model (0x12) -> core (0x11)
         FREE_LOG.lock().unwrap().clear();
         FAIL_OUT_TENSOR.store(0, Ordering::SeqCst);
+        // SAFETY: `fns` contains valid mock OpenVINO C-API functions for testing.
         let (ov_ctx, dev) = unsafe {
             AiDetectorEngine::init_ov_context_from_fns(
                 std::ptr::null_mut(),
@@ -5686,12 +5870,14 @@ detectors:
             _id: *const c_char,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x101usize as *mut c_void;
             }
             std::ptr::null_mut()
         }
         unsafe extern "C" fn mock_create_opts(out: *mut *mut c_void) -> *mut c_void {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x102usize as *mut c_void;
             }
@@ -5706,12 +5892,14 @@ detectors:
             _o: *const c_void,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x103usize as *mut c_void;
             }
             std::ptr::null_mut()
         }
         unsafe extern "C" fn mock_get_alloc(out: *mut *mut c_void) -> *mut c_void {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x104usize as *mut c_void;
             }
@@ -5723,6 +5911,7 @@ detectors:
             _a: *mut c_void,
             out: *mut *mut c_char,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes static C string pointer to `out`.
             unsafe {
                 *out = c"tensor0".as_ptr() as *mut c_char;
             }
@@ -5733,6 +5922,7 @@ detectors:
             _i: usize,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock initializes `out` to null.
             unsafe {
                 *out = std::ptr::null_mut();
             }
@@ -5742,6 +5932,7 @@ detectors:
             _ti: *const c_void,
             out: *mut *const c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock initializes `out` to null.
             unsafe {
                 *out = std::ptr::null();
             }
@@ -5751,6 +5942,7 @@ detectors:
             _info: *const c_void,
             out: *mut c_int,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes element type constant to `out`.
             unsafe {
                 *out = ORT_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
             }
@@ -5764,6 +5956,7 @@ detectors:
             if FAIL_CPU_MEM.load(Ordering::SeqCst) != 0 {
                 return 0x999usize as *mut c_void;
             }
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x105usize as *mut c_void;
             }
@@ -5778,6 +5971,7 @@ detectors:
             _ty: c_int,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x201usize as *mut c_void;
             }
@@ -5793,6 +5987,7 @@ detectors:
             _out_l: usize,
             out_v: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes sentinel handle to `out_v`.
             unsafe {
                 *out_v = 0x202usize as *mut c_void;
             }
@@ -5802,6 +5997,7 @@ detectors:
             _val: *mut c_void,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes static tensor pointer to `out`.
             unsafe {
                 *out = MOCK_OUT_TENSOR.as_ptr() as *mut c_void;
             }
@@ -5811,6 +6007,7 @@ detectors:
             _val: *const c_void,
             out: *mut *mut c_void,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x203usize as *mut c_void;
             }
@@ -5820,6 +6017,7 @@ detectors:
             _info: *const c_void,
             out: *mut usize,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes dimension count to `out`.
             unsafe {
                 *out = 2;
             }
@@ -5830,6 +6028,7 @@ detectors:
             out: *mut i64,
             _len: usize,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes 2 dimensions to `out`.
             unsafe {
                 *out.add(0) = if NEGATIVE_DIM.load(Ordering::SeqCst) != 0 {
                     -1
@@ -5844,6 +6043,7 @@ detectors:
             _info: *const c_void,
             out: *mut usize,
         ) -> *mut c_void {
+            // SAFETY: Test mock writes element count to `out`.
             unsafe {
                 *out = if NEGATIVE_DIM.load(Ordering::SeqCst) != 0 {
                     (-7isize) as usize
@@ -5855,6 +6055,7 @@ detectors:
         }
 
         // Null vtable is rejected without UB
+        // SAFETY: Passing a null `vtable` tests the null-check guard at the entry of `init_ort_session_from_vtable`.
         assert!(unsafe {
             AiDetectorEngine::init_ort_session_from_vtable(
                 std::ptr::null_mut(),
@@ -5902,6 +6103,7 @@ detectors:
         FREE_EVENTS.lock().unwrap().clear();
         ALLOC_FREED.store(0, Ordering::SeqCst);
         FAIL_CPU_MEM.store(1, Ordering::SeqCst);
+        // SAFETY: `vtable` is a valid 101-slot mock table.
         let early_err = unsafe {
             AiDetectorEngine::init_ort_session_from_vtable(
                 std::ptr::null_mut(),
@@ -5919,6 +6121,7 @@ detectors:
         // Negative i64 dimension in detect_region is safely rejected without OOB slice creation
         FAIL_CPU_MEM.store(0, Ordering::SeqCst);
         NEGATIVE_DIM.store(1, Ordering::SeqCst);
+        // SAFETY: `vtable` is a valid 101-slot mock table.
         let (ort_ctx, _) = unsafe {
             AiDetectorEngine::init_ort_session_from_vtable(
                 std::ptr::null_mut(),
@@ -6367,6 +6570,7 @@ detectors:
         ];
 
         unsafe extern "C" fn ov_core_create(out: *mut *mut c_void) -> c_int {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x31usize as *mut c_void;
             }
@@ -6381,24 +6585,28 @@ detectors:
             _k: *const c_char,
             _v: *const c_char,
         ) -> c_int {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x32usize as *mut c_void;
             }
             0
         }
         unsafe extern "C" fn ov_create_req(_cm: *mut c_void, out: *mut *mut c_void) -> c_int {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x33usize as *mut c_void;
             }
             0
         }
         unsafe extern "C" fn ov_in_tensor(_r: *mut c_void, out: *mut *mut c_void) -> c_int {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x34usize as *mut c_void;
             }
             0
         }
         unsafe extern "C" fn ov_out_tensor(_r: *mut c_void, out: *mut *mut c_void) -> c_int {
+            // SAFETY: Test mock writes sentinel handle to `out`.
             unsafe {
                 *out = 0x35usize as *mut c_void;
             }
@@ -6409,6 +6617,7 @@ detectors:
             0
         }
         unsafe extern "C" fn ov_tensor_data(t: *mut c_void, out: *mut *mut c_void) -> c_int {
+            // SAFETY: Test mock writes static buffer pointer to `out`.
             unsafe {
                 if t as usize == 0x34 {
                     *out = MOCK_OV_IN.lock().unwrap().as_mut_ptr() as *mut c_void;
@@ -6424,6 +6633,7 @@ detectors:
             0
         }
         unsafe extern "C" fn ov_tensor_size(t: *mut c_void, out: *mut usize) -> c_int {
+            // SAFETY: Test mock writes byte size to `out`.
             unsafe {
                 if t as usize == 0x34 {
                     *out = 64 * 64 * 3;
@@ -6442,6 +6652,7 @@ detectors:
         INFER_STEP.store(0, Ordering::SeqCst);
         let ov_fns = OvCFunctionTable {
             core_create: ov_core_create,
+            // SAFETY: `ov_compile` uses the C ABI compatible with `OvCoreCompileModelFn`.
             compile_model: unsafe {
                 std::mem::transmute::<*const c_void, OvCoreCompileModelFn>(
                     ov_compile as *const c_void,
@@ -6458,6 +6669,7 @@ detectors:
             compiled_model_free: None,
             core_free: None,
         };
+        // SAFETY: `ov_fns` contains valid mock OpenVINO C-API functions for testing.
         let (ov_ctx, _) = unsafe {
             AiDetectorEngine::init_ov_context_from_fns(
                 std::ptr::null_mut(),
@@ -6586,5 +6798,126 @@ detectors:
             "non-profile directory '!important' must not be deleted when removing 'important'"
         );
         let _ = std::fs::remove_dir_all(&tmp_faces);
+    }
+
+    #[test]
+    fn sec_p1b_nullable_ort_api_base_atomic_face_enroll_and_bounded_labelmap_fd_read() {
+        unsafe extern "C" fn mock_ver() -> *const c_char {
+            c"1.20.0".as_ptr()
+        }
+        unsafe extern "C" fn mock_get_api(ver: u32) -> *const c_void {
+            if ver == 14 {
+                0xCAFEusize as *const c_void
+            } else {
+                std::ptr::null()
+            }
+        }
+
+        // 1. ENUMUB-001: Null base pointer or null OrtApiBase function pointers return Err without UB
+        // SAFETY: Testing `resolve_ort_api_from_base` with null and stack-allocated `OrtApiBase` structs.
+        unsafe {
+            assert!(
+                AiDetectorEngine::resolve_ort_api_from_base(std::ptr::null()).is_err(),
+                "null OrtApiBase pointer must be rejected"
+            );
+            let base_missing_ver = OrtApiBase {
+                get_api: Some(mock_get_api),
+                get_version_string: None,
+            };
+            assert!(
+                AiDetectorEngine::resolve_ort_api_from_base(&base_missing_ver).is_err(),
+                "null get_version_string in OrtApiBase must be rejected"
+            );
+            let base_missing_api = OrtApiBase {
+                get_api: None,
+                get_version_string: Some(mock_ver),
+            };
+            assert!(
+                AiDetectorEngine::resolve_ort_api_from_base(&base_missing_api).is_err(),
+                "null get_api in OrtApiBase must be rejected"
+            );
+            let base_ok = OrtApiBase {
+                get_api: Some(mock_get_api),
+                get_version_string: Some(mock_ver),
+            };
+            let resolved_api = AiDetectorEngine::resolve_ort_api_from_base(&base_ok).unwrap();
+            assert_eq!(resolved_api as usize, 0xCAFE);
+        }
+
+        // 2. RESDISC-010 & TOCTOU-003: enroll_face_profile / delete_face_profile propagate sync_from_dir errors
+        //    and enroll_to_dir writes atomically via temp file + rename while rejecting symlinks
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr-sec-p1b-infer-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let cfg =
+            NinjaConfig::from_yaml_str("version: 0.18-0\n", PathBuf::from("/tmp/c.yml")).unwrap();
+        let engine = AiDetectorEngine::new(&cfg);
+
+        // When faces_dir is a regular file (not a directory), enroll_face_profile and delete_face_profile propagate Err
+        let file_as_faces_dir = tmp.join("not_a_dir");
+        std::fs::write(&file_as_faces_dir, b"file").unwrap();
+        assert!(
+            engine
+                .enroll_face_profile(&file_as_faces_dir, "Alice", "s1", b"img")
+                .is_err()
+        );
+        assert!(
+            engine
+                .delete_face_profile(&file_as_faces_dir, "Alice")
+                .is_err()
+        );
+
+        let faces_dir = tmp.join("faces");
+        let (saved_path, emb) = engine
+            .enroll_face_profile(&faces_dir, "Alice", "s1", b"alice-sample-payload")
+            .unwrap();
+        assert_eq!(emb.len(), 512);
+        assert_eq!(std::fs::read(&saved_path).unwrap(), b"alice-sample-payload");
+
+        #[cfg(unix)]
+        {
+            let outside_secret = tmp.join("outside_secret.txt");
+            std::fs::write(&outside_secret, b"keep-intact").unwrap();
+            let symlink_sample = faces_dir.join("Alice").join("sym_sample.jpg");
+            std::os::unix::fs::symlink(&outside_secret, &symlink_sample).unwrap();
+            assert!(
+                engine
+                    .enroll_face_profile(&faces_dir, "Alice", "sym_sample", b"overwrite-attempt")
+                    .is_err(),
+                "enroll_to_dir must reject symlink target sample file"
+            );
+            assert_eq!(std::fs::read(&outside_secret).unwrap(), b"keep-intact");
+        }
+
+        // 3. TOCTOU-004: read_bounded_labelmap_file enforces regular file, no symlink, and <= 256 KiB
+        let valid_labelmap = tmp.join("labels.txt");
+        std::fs::write(&valid_labelmap, "person\ncar\n").unwrap();
+        let content = read_bounded_labelmap_file(&valid_labelmap).unwrap();
+        assert_eq!(content, "person\ncar\n");
+
+        let oversized_labelmap = tmp.join("huge_labels.txt");
+        std::fs::write(&oversized_labelmap, vec![b'a'; 256 * 1024 + 16]).unwrap();
+        assert!(
+            read_bounded_labelmap_file(&oversized_labelmap).is_err(),
+            "labelmap exceeding 256 KiB must be rejected"
+        );
+
+        #[cfg(unix)]
+        {
+            let symlink_labelmap = tmp.join("symlink_labels.txt");
+            std::os::unix::fs::symlink(&valid_labelmap, &symlink_labelmap).unwrap();
+            assert!(
+                read_bounded_labelmap_file(&symlink_labelmap).is_err(),
+                "symlinked labelmap must be rejected"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

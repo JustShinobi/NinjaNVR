@@ -495,6 +495,9 @@ pub fn compute_norm_box_iou(a: [f64; 4], b: [f64; 4]) -> f64 {
     }
 }
 
+const MAX_SQL_FILTER_ITEMS: usize = 64;
+const MAX_DB_SCAN_ROWS: usize = 5_000;
+
 fn normalize_allowed_cameras_str(raw: &str) -> &str {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -919,7 +922,7 @@ impl NinjaDatabase {
             let conn = self.lock_conn();
             let existing: Option<(String, String)> = conn
                 .query_row(
-                    "SELECT username, password_hash FROM user WHERE username = 'admin'",
+                    "SELECT username, password_hash FROM user WHERE username = 'admin' COLLATE NOCASE",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -941,7 +944,7 @@ impl NinjaDatabase {
         let tx = conn.transaction()?;
         let existing: Option<(String, String)> = tx
             .query_row(
-                "SELECT username, password_hash FROM user WHERE username = 'admin'",
+                "SELECT username, password_hash FROM user WHERE username = 'admin' COLLATE NOCASE",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -952,17 +955,24 @@ impl NinjaDatabase {
             return Ok(None);
         }
 
-        tx.execute(
-            r#"
-            INSERT INTO user (username, role, allowed_cameras, password_hash, notification_tokens)
-            VALUES ('admin', 'admin', '*', ?1, '[]')
-            ON CONFLICT(username) DO UPDATE SET
-                role = 'admin',
-                allowed_cameras = '*',
-                password_hash = excluded.password_hash
-            "#,
-            params![pw_hash],
-        )?;
+        if let Some((existing_username, _)) = existing {
+            tx.execute(
+                "UPDATE user SET role = 'admin', allowed_cameras = '*', password_hash = ?1 WHERE username = ?2 COLLATE NOCASE",
+                params![pw_hash, existing_username],
+            )?;
+        } else {
+            tx.execute(
+                r#"
+                INSERT INTO user (username, role, allowed_cameras, password_hash, notification_tokens)
+                VALUES ('admin', 'admin', '*', ?1, '[]')
+                ON CONFLICT(username) DO UPDATE SET
+                    role = 'admin',
+                    allowed_cameras = '*',
+                    password_hash = excluded.password_hash
+                "#,
+                params![pw_hash],
+            )?;
+        }
         tx.commit()?;
         info!("Created default admin user in SQLite database");
         Ok(Some(password))
@@ -973,7 +983,7 @@ impl NinjaDatabase {
         let conn = self.lock_conn();
         let row = conn
             .query_row(
-                "SELECT username, password_hash, role, notification_tokens, COALESCE(allowed_cameras, '*') FROM user WHERE username = ?1",
+                "SELECT username, password_hash, role, notification_tokens, COALESCE(allowed_cameras, '*') FROM user WHERE username = ?1 COLLATE NOCASE",
                 params![target],
                 |r| {
                     let tokens_raw: Option<String> = r.get(3).ok();
@@ -1054,7 +1064,7 @@ impl NinjaDatabase {
             let conn = self.lock_conn();
             let exists: Option<String> = conn
                 .query_row(
-                    "SELECT username FROM user WHERE username = ?1",
+                    "SELECT username FROM user WHERE username = ?1 COLLATE NOCASE",
                     params![trimmed],
                     |r| r.get(0),
                 )
@@ -1070,7 +1080,7 @@ impl NinjaDatabase {
         let tx = conn.transaction()?;
         let exists: Option<String> = tx
             .query_row(
-                "SELECT username FROM user WHERE username = ?1",
+                "SELECT username FROM user WHERE username = ?1 COLLATE NOCASE",
                 params![trimmed],
                 |r| r.get(0),
             )
@@ -1102,7 +1112,7 @@ impl NinjaDatabase {
         let now_str = Utc::now().to_rfc3339();
         let conn = self.lock_conn();
         let updated = conn.execute(
-            "UPDATE user SET password_hash = ?1, password_changed_at = ?2 WHERE username = ?3",
+            "UPDATE user SET password_hash = ?1, password_changed_at = ?2 WHERE username = ?3 COLLATE NOCASE",
             params![pw_hash, now_str, username.trim()],
         )?;
         Ok(updated > 0)
@@ -1127,7 +1137,7 @@ impl NinjaDatabase {
         }
         let ext_target = format!("ext:{target}");
         let mut stmt = tx.prepare(
-            "SELECT id, camera FROM share_link WHERE revoked = 0 AND (created_by = ?1 OR created_by = ?2)",
+            "SELECT id, camera FROM share_link WHERE revoked = 0 AND (created_by = ?1 COLLATE NOCASE OR created_by = ?2 COLLATE NOCASE)",
         )?;
         let rows = stmt.query_map(params![target, ext_target], |r| {
             Ok((
@@ -1153,6 +1163,15 @@ impl NinjaDatabase {
     }
 
     pub fn update_user_role(&self, username: &str, role: &str) -> Result<bool> {
+        self.update_user_role_with_cameras(username, role, None)
+    }
+
+    pub fn update_user_role_with_cameras(
+        &self,
+        username: &str,
+        role: &str,
+        allowed_cameras: Option<&str>,
+    ) -> Result<bool> {
         let norm_role = match role.trim().to_ascii_lowercase().as_str() {
             "viewer" => "viewer",
             "operator" => "operator",
@@ -1162,19 +1181,19 @@ impl NinjaDatabase {
         let target = username.trim();
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
-        let current_role: Option<String> = tx
+        let current_row: Option<(String, String)> = tx
             .query_row(
-                "SELECT COALESCE(role, 'admin') FROM user WHERE username = ?1",
+                "SELECT COALESCE(role, 'admin'), COALESCE(allowed_cameras, '*') FROM user WHERE username = ?1 COLLATE NOCASE",
                 params![target],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some(existing_role) = current_role else {
+        let Some((existing_role, existing_allowed_cams)) = current_row else {
             return Ok(false);
         };
         if norm_role != "admin" && existing_role.trim().eq_ignore_ascii_case("admin") {
             let other_admins: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM user WHERE LOWER(TRIM(COALESCE(role, 'admin'))) = 'admin' AND username != ?1",
+                "SELECT COUNT(*) FROM user WHERE LOWER(TRIM(COALESCE(role, 'admin'))) = 'admin' AND username != ?1 COLLATE NOCASE",
                 params![target],
                 |r| r.get(0),
             )?;
@@ -1182,28 +1201,31 @@ impl NinjaDatabase {
                 anyhow::bail!("Cannot demote the last admin account");
             }
         }
-        let updated = tx.execute(
-            "UPDATE user SET role = ?1 WHERE username = ?2",
-            params![norm_role, target],
-        )?;
+        let (updated, effective_cams) = if let Some(cams) = allowed_cameras {
+            let norm_cams = normalize_allowed_cameras_str(cams);
+            let rows = tx.execute(
+                "UPDATE user SET role = ?1, allowed_cameras = ?2 WHERE username = ?3 COLLATE NOCASE",
+                params![norm_role, norm_cams, target],
+            )?;
+            (rows, norm_cams)
+        } else {
+            let rows = tx.execute(
+                "UPDATE user SET role = ?1 WHERE username = ?2 COLLATE NOCASE",
+                params![norm_role, target],
+            )?;
+            (rows, normalize_allowed_cameras_str(&existing_allowed_cams))
+        };
         if updated > 0 {
             if norm_role == "viewer" {
                 let ext_target = format!("ext:{target}");
                 tx.execute(
-                    "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 OR created_by = ?2",
+                    "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 COLLATE NOCASE OR created_by = ?2 COLLATE NOCASE",
                     params![target, ext_target],
                 )?;
-            } else if norm_role == "operator" {
-                let allowed_cams: String = tx
-                    .query_row(
-                        "SELECT COALESCE(allowed_cameras, '*') FROM user WHERE username = ?1",
-                        params![target],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                    .unwrap_or_else(|| "*".to_string());
-                let norm_cams = normalize_allowed_cameras_str(&allowed_cams);
-                Self::revoke_disallowed_camera_share_links_in_tx(&tx, target, norm_cams)?;
+            } else if norm_role == "operator"
+                || (allowed_cameras.is_some() && effective_cams != "*")
+            {
+                Self::revoke_disallowed_camera_share_links_in_tx(&tx, target, effective_cams)?;
             }
         }
         tx.commit()?;
@@ -1220,7 +1242,7 @@ impl NinjaDatabase {
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         let updated = tx.execute(
-            "UPDATE user SET allowed_cameras = ?1 WHERE username = ?2",
+            "UPDATE user SET allowed_cameras = ?1 WHERE username = ?2 COLLATE NOCASE",
             params![norm, target],
         )?;
         if updated > 0 && norm != "*" {
@@ -1462,7 +1484,7 @@ impl NinjaDatabase {
         let tx = conn.transaction()?;
         let target_role: Option<String> = tx
             .query_row(
-                "SELECT COALESCE(role, 'admin') FROM user WHERE username = ?1",
+                "SELECT COALESCE(role, 'admin') FROM user WHERE username = ?1 COLLATE NOCASE",
                 params![target],
                 |r| r.get(0),
             )
@@ -1472,7 +1494,7 @@ impl NinjaDatabase {
         };
         if role.trim().eq_ignore_ascii_case("admin") {
             let other_admins: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM user WHERE LOWER(TRIM(COALESCE(role, 'admin'))) = 'admin' AND username != ?1",
+                "SELECT COUNT(*) FROM user WHERE LOWER(TRIM(COALESCE(role, 'admin'))) = 'admin' AND username != ?1 COLLATE NOCASE",
                 params![target],
                 |r| r.get(0),
             )?;
@@ -1481,15 +1503,18 @@ impl NinjaDatabase {
             }
         }
         tx.execute(
-            "DELETE FROM userreviewstatus WHERE user_id = ?1",
+            "DELETE FROM userreviewstatus WHERE user_id = ?1 COLLATE NOCASE",
             params![target],
         )?;
         let ext_target = format!("ext:{target}");
         tx.execute(
-            "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 OR created_by = ?2",
+            "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 COLLATE NOCASE OR created_by = ?2 COLLATE NOCASE",
             params![target, ext_target],
         )?;
-        let deleted = tx.execute("DELETE FROM user WHERE username = ?1", params![target])?;
+        let deleted = tx.execute(
+            "DELETE FROM user WHERE username = ?1 COLLATE NOCASE",
+            params![target],
+        )?;
         tx.commit()?;
         Ok(deleted > 0)
     }
@@ -1505,6 +1530,22 @@ impl NinjaDatabase {
         {
             return Ok(Vec::new());
         }
+
+        let capped_labels: Option<Vec<String>> = filter
+            .labels
+            .as_ref()
+            .filter(|l| !l.is_empty() && !l.iter().any(|x| x == "all"))
+            .map(|l| l.iter().take(MAX_SQL_FILTER_ITEMS).cloned().collect());
+        let capped_ex_labels: Option<Vec<String>> = filter
+            .exclude_labels
+            .as_ref()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.iter().take(MAX_SQL_FILTER_ITEMS).cloned().collect());
+        let capped_zones: Option<Vec<String>> = filter
+            .zones
+            .as_ref()
+            .filter(|z| !z.is_empty() && !z.iter().any(|x| x == "all"))
+            .map(|z| z.iter().take(MAX_SQL_FILTER_ITEMS).cloned().collect());
 
         let conn = self.lock_conn();
         let mut sql = String::from(
@@ -1547,13 +1588,51 @@ impl NinjaDatabase {
             && !cams.is_empty()
             && !cams.iter().any(|c| c == "all")
         {
-            let mut placeholders = Vec::with_capacity(cams.len());
-            for c in cams {
+            let mut placeholders = Vec::with_capacity(cams.len().min(MAX_SQL_FILTER_ITEMS));
+            for c in cams.iter().take(MAX_SQL_FILTER_ITEMS) {
                 bind_vals.push(rusqlite::types::Value::Text(c.clone()));
                 placeholders.push(format!("?{}", bind_vals.len()));
             }
             sql.push_str(&format!(" AND r.camera IN ({})", placeholders.join(",")));
         }
+        if let Some(ref labels) = capped_labels
+            && labels.iter().all(|l| !l.contains('"') && !l.contains('\\'))
+        {
+            let mut clauses = Vec::with_capacity(labels.len());
+            for l in labels {
+                let pat = format!("%\"{}%", escape_sql_like(l));
+                bind_vals.push(rusqlite::types::Value::Text(pat));
+                clauses.push(format!("r.data LIKE ?{} ESCAPE '\\'", bind_vals.len()));
+            }
+            sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+        }
+        if let Some(ref zones) = capped_zones
+            && zones.iter().all(|z| !z.contains('"') && !z.contains('\\'))
+        {
+            let mut clauses = Vec::with_capacity(zones.len());
+            for z in zones {
+                let pat = format!("%\"{}\"%", escape_sql_like(z));
+                bind_vals.push(rusqlite::types::Value::Text(pat));
+                clauses.push(format!("r.data LIKE ?{} ESCAPE '\\'", bind_vals.len()));
+            }
+            sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+        }
+        if filter.stationary == Some(true) {
+            sql.push_str(" AND r.data LIKE '%\"stationary\"%true%'");
+        }
+
+        let has_post_filter = capped_labels.is_some()
+            || capped_ex_labels.is_some()
+            || capped_zones.is_some()
+            || filter.min_score.is_some()
+            || filter.stationary.is_some();
+        let sql_scan_limit = if has_post_filter {
+            requested_limit
+                .saturating_mul(10)
+                .clamp(1_000, MAX_DB_SCAN_ROWS)
+        } else {
+            requested_limit.min(MAX_DB_SCAN_ROWS)
+        };
 
         sql.push_str(" GROUP BY r.id");
         if let Some(want_reviewed) = filter.reviewed {
@@ -1561,7 +1640,11 @@ impl NinjaDatabase {
             bind_vals.push(rusqlite::types::Value::Integer(rv));
             sql.push_str(&format!(" HAVING reviewed = ?{}", bind_vals.len()));
         }
-        sql.push_str(" ORDER BY r.start_time DESC");
+        bind_vals.push(rusqlite::types::Value::Integer(sql_scan_limit as i64));
+        sql.push_str(&format!(
+            " ORDER BY r.start_time DESC LIMIT ?{}",
+            bind_vals.len()
+        ));
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |row| {
@@ -1592,32 +1675,36 @@ impl NinjaDatabase {
         })?;
 
         let mut items = Vec::new();
+        let mut scanned_rows = 0usize;
         for r in rows {
+            scanned_rows += 1;
             let item = r?;
-            if let Some(ref labels) = filter.labels
-                && !labels.is_empty()
-                && !labels.iter().any(|l| l == "all")
-            {
+            if let Some(ref labels) = capped_labels {
                 let obj_match = json_array_matches_any(&item.data["objects"], labels, true);
                 let audio_match = json_array_matches_any(&item.data["audio"], labels, false);
                 if !obj_match && !audio_match {
+                    if scanned_rows >= MAX_DB_SCAN_ROWS {
+                        break;
+                    }
                     continue;
                 }
             }
-            if let Some(ref ex_labels) = filter.exclude_labels
-                && !ex_labels.is_empty()
-            {
+            if let Some(ref ex_labels) = capped_ex_labels {
                 let obj_excluded = json_array_matches_any(&item.data["objects"], ex_labels, true);
                 let audio_excluded = json_array_matches_any(&item.data["audio"], ex_labels, false);
                 if obj_excluded || audio_excluded {
+                    if scanned_rows >= MAX_DB_SCAN_ROWS {
+                        break;
+                    }
                     continue;
                 }
             }
-            if let Some(ref zones) = filter.zones
-                && !zones.is_empty()
-                && !zones.iter().any(|z| z == "all")
+            if let Some(ref zones) = capped_zones
                 && !json_array_matches_any(&item.data["zones"], zones, false)
             {
+                if scanned_rows >= MAX_DB_SCAN_ROWS {
+                    break;
+                }
                 continue;
             }
             if let Some(min_sc) = filter.min_score {
@@ -1626,6 +1713,9 @@ impl NinjaDatabase {
                     .or_else(|| item.data["top_score"].as_f64())
                     .unwrap_or(0.85);
                 if sc < min_sc {
+                    if scanned_rows >= MAX_DB_SCAN_ROWS {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -1634,11 +1724,14 @@ impl NinjaDatabase {
                     .as_bool()
                     .unwrap_or(false);
                 if is_stat != req_stat {
+                    if scanned_rows >= MAX_DB_SCAN_ROWS {
+                        break;
+                    }
                     continue;
                 }
             }
             items.push(item);
-            if items.len() >= requested_limit {
+            if items.len() >= requested_limit || scanned_rows >= MAX_DB_SCAN_ROWS {
                 break;
             }
         }
@@ -1970,7 +2063,7 @@ impl NinjaDatabase {
         let mut req_plates: Vec<String> = Vec::new();
         let mut had_non_all_plate_token = false;
         if let Some(ref p) = filter.plate {
-            for tok in p.split(',') {
+            for tok in p.split(',').take(MAX_SQL_FILTER_ITEMS) {
                 let trimmed = tok.trim();
                 if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("all") {
                     had_non_all_plate_token = true;
@@ -1980,13 +2073,16 @@ impl NinjaDatabase {
                     .filter(|c| c.is_ascii_alphanumeric())
                     .map(|c| c.to_ascii_uppercase())
                     .collect();
-                if !norm.is_empty() && !norm.eq_ignore_ascii_case("all") {
+                if !norm.is_empty()
+                    && !norm.eq_ignore_ascii_case("all")
+                    && req_plates.len() < MAX_SQL_FILTER_ITEMS
+                {
                     req_plates.push(norm);
                 }
             }
         }
         if let Some(ref list) = filter.recognized_license_plates {
-            for tok in list {
+            for tok in list.iter().take(MAX_SQL_FILTER_ITEMS) {
                 let trimmed = tok.trim();
                 if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("all") {
                     had_non_all_plate_token = true;
@@ -1996,7 +2092,10 @@ impl NinjaDatabase {
                     .filter(|c| c.is_ascii_alphanumeric())
                     .map(|c| c.to_ascii_uppercase())
                     .collect();
-                if !norm.is_empty() && !norm.eq_ignore_ascii_case("all") {
+                if !norm.is_empty()
+                    && !norm.eq_ignore_ascii_case("all")
+                    && req_plates.len() < MAX_SQL_FILTER_ITEMS
+                {
                     req_plates.push(norm);
                 }
             }
@@ -2004,6 +2103,12 @@ impl NinjaDatabase {
         if had_non_all_plate_token && req_plates.is_empty() {
             return Ok(Vec::new());
         }
+
+        let capped_zones: Option<Vec<String>> = filter
+            .zones
+            .as_ref()
+            .filter(|z| !z.is_empty() && !z.iter().any(|x| x == "all"))
+            .map(|z| z.iter().take(MAX_SQL_FILTER_ITEMS).cloned().collect());
 
         let conn = self.lock_conn();
         let mut sql = String::from(
@@ -2040,8 +2145,8 @@ impl NinjaDatabase {
             && !cams.is_empty()
             && !cams.iter().any(|c| c == "all")
         {
-            let mut placeholders = Vec::with_capacity(cams.len());
-            for c in cams {
+            let mut placeholders = Vec::with_capacity(cams.len().min(MAX_SQL_FILTER_ITEMS));
+            for c in cams.iter().take(MAX_SQL_FILTER_ITEMS) {
                 bind_vals.push(rusqlite::types::Value::Text(c.clone()));
                 placeholders.push(format!("?{}", bind_vals.len()));
             }
@@ -2051,8 +2156,8 @@ impl NinjaDatabase {
             && !labels.is_empty()
             && !labels.iter().any(|l| l == "all")
         {
-            let mut placeholders = Vec::with_capacity(labels.len());
-            for l in labels {
+            let mut placeholders = Vec::with_capacity(labels.len().min(MAX_SQL_FILTER_ITEMS));
+            for l in labels.iter().take(MAX_SQL_FILTER_ITEMS) {
                 bind_vals.push(rusqlite::types::Value::Text(l.clone()));
                 placeholders.push(format!("?{}", bind_vals.len()));
             }
@@ -2061,8 +2166,8 @@ impl NinjaDatabase {
         if let Some(ref ex_labels) = filter.exclude_labels
             && !ex_labels.is_empty()
         {
-            let mut placeholders = Vec::with_capacity(ex_labels.len());
-            for l in ex_labels {
+            let mut placeholders = Vec::with_capacity(ex_labels.len().min(MAX_SQL_FILTER_ITEMS));
+            for l in ex_labels.iter().take(MAX_SQL_FILTER_ITEMS) {
                 bind_vals.push(rusqlite::types::Value::Text(l.clone()));
                 placeholders.push(format!("?{}", bind_vals.len()));
             }
@@ -2079,15 +2184,45 @@ impl NinjaDatabase {
             && !subs.is_empty()
             && !subs.iter().any(|s| s == "all")
         {
-            let mut placeholders = Vec::with_capacity(subs.len());
-            for s in subs {
+            let mut placeholders = Vec::with_capacity(subs.len().min(MAX_SQL_FILTER_ITEMS));
+            for s in subs.iter().take(MAX_SQL_FILTER_ITEMS) {
                 bind_vals.push(rusqlite::types::Value::Text(s.clone()));
                 placeholders.push(format!("?{}", bind_vals.len()));
             }
             sql.push_str(&format!(" AND sub_label IN ({})", placeholders.join(",")));
         }
+        if let Some(ref zones) = capped_zones
+            && zones.iter().all(|z| !z.contains('"') && !z.contains('\\'))
+        {
+            let mut clauses = Vec::with_capacity(zones.len());
+            for z in zones {
+                let pat = format!("%\"{}\"%", escape_sql_like(z));
+                bind_vals.push(rusqlite::types::Value::Text(pat));
+                clauses.push(format!("zones LIKE ?{} ESCAPE '\\'", bind_vals.len()));
+            }
+            sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+        }
+        if filter.stationary == Some(true) {
+            sql.push_str(" AND data LIKE '%\"stationary\"%true%'");
+        }
+        if !req_plates.is_empty() {
+            sql.push_str(" AND data LIKE '%recognized_license_plate%'");
+        }
 
-        sql.push_str(" ORDER BY start_time DESC");
+        let has_post_filter =
+            capped_zones.is_some() || filter.stationary.is_some() || !req_plates.is_empty();
+        let sql_scan_limit = if has_post_filter {
+            requested_limit
+                .saturating_mul(10)
+                .clamp(1_000, MAX_DB_SCAN_ROWS)
+        } else {
+            requested_limit.min(MAX_DB_SCAN_ROWS)
+        };
+        bind_vals.push(rusqlite::types::Value::Integer(sql_scan_limit as i64));
+        sql.push_str(&format!(
+            " ORDER BY start_time DESC LIMIT ?{}",
+            bind_vals.len()
+        ));
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |row| {
@@ -2138,18 +2273,24 @@ impl NinjaDatabase {
         })?;
 
         let mut out = Vec::new();
+        let mut scanned_rows = 0usize;
         for r in rows {
+            scanned_rows += 1;
             let item = r?;
-            if let Some(ref zones) = filter.zones
-                && !zones.is_empty()
-                && !zones.iter().any(|z| z == "all")
+            if let Some(ref zones) = capped_zones
                 && !json_array_matches_any(&item["zones"], zones, false)
             {
+                if scanned_rows >= MAX_DB_SCAN_ROWS {
+                    break;
+                }
                 continue;
             }
             if let Some(req_stat) = filter.stationary {
                 let is_stat = item["stationary"].as_bool().unwrap_or(false);
                 if is_stat != req_stat {
+                    if scanned_rows >= MAX_DB_SCAN_ROWS {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -2166,11 +2307,14 @@ impl NinjaDatabase {
                         .iter()
                         .any(|rp| ev_plate_norm == *rp || ev_plate_norm.contains(rp))
                 {
+                    if scanned_rows >= MAX_DB_SCAN_ROWS {
+                        break;
+                    }
                     continue;
                 }
             }
             out.push(item);
-            if out.len() >= requested_limit {
+            if out.len() >= requested_limit || scanned_rows >= MAX_DB_SCAN_ROWS {
                 break;
             }
         }
@@ -4727,11 +4871,15 @@ impl NinjaDatabase {
 
     pub fn revoke_share_links_by_creator(&self, created_by: &str) -> Result<usize> {
         let trimmed = created_by.trim();
-        let base = trimmed.strip_prefix("ext:").unwrap_or(trimmed).trim();
+        let base = if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("ext:") {
+            trimmed[4..].trim()
+        } else {
+            trimmed
+        };
         let ext_creator = format!("ext:{base}");
         let conn = self.lock_conn();
         let updated = conn.execute(
-            "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 OR created_by = ?2",
+            "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 COLLATE NOCASE OR created_by = ?2 COLLATE NOCASE",
             params![base, ext_creator],
         )?;
         Ok(updated)
@@ -10299,6 +10447,229 @@ mod tests {
                 "/media/ninjanvr/recordings/front_door/rec_real_1.mp4",
             ]
         );
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn sec_p1b_case_insensitive_user_rbac_and_atomic_role_with_cameras_revocation() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_sec_p1b_user_rbac_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+        let _ = db.ensure_default_admin(10_000).unwrap();
+
+        // 1. Case-insensitive get_user and duplicate username prevention on create_user_with_cameras
+        assert!(db.get_user("ADMIN").unwrap().is_some());
+        assert!(db.get_user("Admin").unwrap().is_some());
+        assert!(
+            db.create_user_with_cameras("Admin", "secret123", "admin", "*", 10_000)
+                .is_err(),
+            "creating 'Admin' must fail when 'admin' already exists"
+        );
+
+        db.create_user_with_cameras("alice", "pw1", "admin", "*", 10_000)
+            .unwrap();
+        assert!(
+            db.create_user_with_cameras("ALICE", "pw2", "viewer", "*", 10_000)
+                .is_err(),
+            "creating 'ALICE' must fail when 'alice' already exists"
+        );
+        let alice_upper = db.get_user("ALICE").unwrap().unwrap();
+        assert_eq!(alice_upper.username, "alice");
+        assert_eq!(alice_upper.role, "admin");
+
+        // 2. Case-insensitive update_user_password
+        assert!(
+            db.update_user_password("AlIcE", "new_pw_2", 10_000)
+                .unwrap()
+        );
+        let alice_after_pw = db.get_user("alice").unwrap().unwrap();
+        assert!(verify_password("new_pw_2", &alice_after_pw.password_hash));
+
+        // 3. Atomic update_user_role_with_cameras demotes role, restricts allowed_cameras, and revokes disallowed share links
+        for (id, cam, creator) in [
+            ("sl_alice_front", "front_door", "Alice"),
+            ("sl_alice_back", "backyard", "ALICE"),
+            ("sl_alice_ext_back", "backyard", "ext:Alice"),
+        ] {
+            db.insert_share_link_with_options(
+                id,
+                "event",
+                &format!("ev_{id}"),
+                Some(cam),
+                creator,
+                1000.0,
+                5000.0,
+                None,
+            )
+            .unwrap();
+        }
+        assert!(
+            db.update_user_role_with_cameras("ALICE", "operator", Some("front_door"))
+                .unwrap()
+        );
+        let alice_op = db.get_user("alice").unwrap().unwrap();
+        assert_eq!(alice_op.role, "operator");
+        assert_eq!(alice_op.allowed_cameras, "front_door");
+        assert!(
+            !db.is_share_link_revoked("sl_alice_front").unwrap(),
+            "allowed camera share link must remain active"
+        );
+        assert!(
+            db.is_share_link_revoked("sl_alice_back").unwrap(),
+            "disallowed camera share link with uppercase creator must be revoked"
+        );
+        assert!(
+            db.is_share_link_revoked("sl_alice_ext_back").unwrap(),
+            "disallowed camera share link with ext: creator must be revoked"
+        );
+
+        // 4. Demoting to viewer via update_user_role_with_cameras revokes remaining share links case-insensitively
+        assert!(
+            db.update_user_role_with_cameras("aLiCe", "viewer", Some("front_door"))
+                .unwrap()
+        );
+        assert!(db.is_share_link_revoked("sl_alice_front").unwrap());
+
+        // 5. Last-admin guard and delete_user / revoke_share_links_by_creator work case-insensitively
+        assert!(
+            db.update_user_role_with_cameras("ADMIN", "viewer", None)
+                .is_err(),
+            "cannot demote the last admin via uppercase 'ADMIN'"
+        );
+        assert!(
+            db.delete_user("ADMIN").is_err(),
+            "cannot delete the last admin via uppercase 'ADMIN'"
+        );
+
+        db.insert_share_link_with_options(
+            "sl_alice_new",
+            "event",
+            "ev_new",
+            Some("front_door"),
+            "ext:ALICE",
+            1000.0,
+            5000.0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.revoke_share_links_by_creator("alice").unwrap(), 4);
+        assert!(db.is_share_link_revoked("sl_alice_new").unwrap());
+
+        db.insert_share_link_with_options(
+            "sl_alice_del",
+            "event",
+            "ev_del",
+            Some("front_door"),
+            "Alice",
+            1000.0,
+            5000.0,
+            None,
+        )
+        .unwrap();
+        assert!(db.delete_user("ALICE").unwrap());
+        assert!(db.get_user("alice").unwrap().is_none());
+        assert!(db.is_share_link_revoked("sl_alice_del").unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn sec_p1b_bounded_scan_and_filter_cap_in_query_events_and_query_reviews() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_sec_p1b_bounded_scan_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        for i in 0..8 {
+            db.upsert_event(&EventDto {
+                id: format!("ev_scan_{i}"),
+                camera: "front_door".to_string(),
+                label: "car".to_string(),
+                zones: json!(["driveway"]),
+                start_time: 1000.0 + (i as f64),
+                end_time: Some(1005.0 + (i as f64)),
+                has_clip: false,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.91),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({
+                    "recognized_license_plate": format!("ABC100{i}"),
+                    "provenance": { "stationary": i % 2 == 0 }
+                }),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.91),
+                stationary: i % 2 == 0,
+            })
+            .unwrap();
+
+            db.insert_review_segment(&ReviewItemDto {
+                id: format!("rev_scan_{i}"),
+                camera: "front_door".to_string(),
+                start_time: 1000.0 + (i as f64),
+                end_time: Some(1005.0 + (i as f64)),
+                severity: "alert".to_string(),
+                thumb_path: format!("/clips/rev_{i}.webp"),
+                data: json!({
+                    "detections": [format!("ev_scan_{i}")],
+                    "objects": ["car-verified"],
+                    "zones": ["driveway"],
+                    "audio": [],
+                    "provenance": {
+                        "top_score": 0.91,
+                        "stationary": i % 2 == 0
+                    }
+                }),
+                has_been_reviewed: false,
+            })
+            .unwrap();
+        }
+
+        // Large (> 64) filter token lists are safely capped and still match valid entries within the first 64
+        let mut huge_cams: Vec<String> = (0..200).map(|i| format!("cam_{i}")).collect();
+        huge_cams[0] = "front_door".to_string();
+        let mut huge_zones: Vec<String> = (0..200).map(|i| format!("zone_{i}")).collect();
+        huge_zones[0] = "driveway".to_string();
+        let mut huge_labels: Vec<String> = (0..200).map(|i| format!("lbl_{i}")).collect();
+        huge_labels[0] = "car".to_string();
+
+        let evs = db
+            .query_events(&EventFilter {
+                cameras: Some(huge_cams.clone()),
+                labels: Some(huge_labels.clone()),
+                zones: Some(huge_zones.clone()),
+                stationary: Some(true),
+                plate: Some("ABC1000,NONEXISTENT".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0]["id"], "ev_scan_0");
+
+        let revs = db
+            .query_reviews(&ReviewFilter {
+                cameras: Some(huge_cams),
+                labels: Some(huge_labels),
+                zones: Some(huge_zones),
+                stationary: Some(true),
+                min_score: Some(0.90),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(revs.len(), 4);
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);
