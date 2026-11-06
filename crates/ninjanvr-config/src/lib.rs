@@ -1,4 +1,5 @@
 #![recursion_limit = "512"]
+#![cfg_attr(not(test), forbid(unsafe_code))]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -7963,6 +7964,7 @@ version: 0.18-0
         genai.api_key_env = env_name.clone();
         assert_eq!(genai.resolve_api_key(), "sk-from-env-456");
 
+        // SAFETY: Removing the test-scoped unique environment variable after assertions complete.
         unsafe {
             std::env::remove_var(&env_name);
         }
@@ -9262,6 +9264,7 @@ flow_test: { "password": "part_a,part_b}", 'token': 'flow_tok_secret' }
 
         // GenAiConfig::resolve_api_key supports braced ${ENV_VAR} syntax
         let brace_env = format!("NINJANVR_TEST_BRACE_KEY_{}", std::process::id());
+        // SAFETY: Test-scoped unique environment variable name not read concurrently by other threads.
         unsafe {
             std::env::set_var(&brace_env, "braced_secret_val");
         }
@@ -9270,6 +9273,7 @@ flow_test: { "password": "part_a,part_b}", 'token': 'flow_tok_secret' }
             ..Default::default()
         };
         assert_eq!(g.resolve_api_key(), "braced_secret_val");
+        // SAFETY: Removing the test-scoped unique environment variable after assertions complete.
         unsafe {
             std::env::remove_var(&brace_env);
         }

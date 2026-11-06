@@ -15,9 +15,17 @@ members = [
 [workspace.package]
 version = "2.1.9"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/JustShinobi/NinjaNVR"
 authors = ["NinjaNVR Contributors"]
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
 
 [workspace.dependencies]
 anyhow = "1.0"

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use ninjanvr_config::{CameraConfig, LineConfig, LineDirection, SnapshotSelectionPolicy};

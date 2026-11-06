@@ -371,6 +371,7 @@ async fn p3b_03_04_05_genai_ssrf_nonstandard_ips_key_exfiltration_bounded_body_a
 
     // 2a. Changing base_url while passing api_key: "$NINJANVR_TEST_GENAI_SECRET" must NOT exfiltrate the env var
     //     and must NOT clobber state.config.read().await.genai.api_key!
+    // SAFETY: Test-scoped synthetic environment variable used only by this test binary.
     unsafe {
         std::env::set_var("NINJANVR_TEST_GENAI_SECRET", "env-super-secret-value-123");
     }
@@ -1265,6 +1266,7 @@ async fn r2_p3b_cycle2_snapshot_privacy_genai_env_ssrf_symlink_zip_and_timeline_
         let _ = axum::serve(listener, mock_router).await;
     });
 
+    // SAFETY: Test-scoped synthetic environment variable used only by this test binary.
     unsafe {
         std::env::set_var("NINJANVR_FORBIDDEN_INTERNAL_SECRET", "top-secret-jwt-key");
     }
@@ -1811,6 +1813,7 @@ async fn r3_p3b_cycle3_json_thumbnail_privacy_rbac_genai_two_step_zip_and_subdir
 
     // 3a. When saved.base_url is ALREADY set to a custom URL (so base_url_changed == false),
     //     passing api_key: "$NINJANVR_TEST_GENAI_SECRET" or api_key_env must NOT exfiltrate the env var!
+    // SAFETY: Test-scoped synthetic environment variable used only by this test binary.
     unsafe {
         std::env::set_var("NINJANVR_TEST_GENAI_SECRET", "env-two-step-secret-999");
     }

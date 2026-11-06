@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, anyhow, bail};
