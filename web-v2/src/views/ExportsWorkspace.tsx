@@ -103,14 +103,17 @@ export function resolveSafeExportVideoUrl(
   const fallback =
     cleanId &&
     idDecodable &&
+    cleanId !== "." &&
+    decodedId !== "." &&
     !cleanId.includes("..") &&
     !decodedId.includes("..") &&
-    !/[/\\\u0000-\u001f\u007f]/.test(cleanId) &&
-    !/[/\\\u0000-\u001f\u007f]/.test(decodedId)
+    !decodedId.includes("%") &&
+    !/[/\\?#\u0000-\u001f\u007f]/.test(cleanId) &&
+    !/[/\\?#\u0000-\u001f\u007f]/.test(decodedId)
       ? `/exports/${encodeURIComponent(cleanId)}.mp4`
       : "";
   const raw = (videoPath || "").trim();
-  if (!raw || /[\u0000-\u001f\u007f\\]/.test(raw)) {
+  if (!raw || /[\u0000-\u001f\u007f\\?#]/.test(raw)) {
     return fallback;
   }
   const stripped = raw.replace(/^\/media\/[^/]+/, "");
@@ -120,13 +123,16 @@ export function resolveSafeExportVideoUrl(
   } catch {
     return fallback;
   }
+  const segments = decoded.split("/");
   if (
     !stripped.startsWith("/") ||
     stripped.startsWith("//") ||
     stripped.includes("..") ||
     decoded.startsWith("//") ||
     decoded.includes("..") ||
-    /[\u0000-\u001f\u007f\\]/.test(decoded) ||
+    decoded.includes("%") ||
+    segments.some((seg) => seg === "." || seg === "..") ||
+    /[\u0000-\u001f\u007f\\?#]/.test(decoded) ||
     !/^\/(?:exports|clips)\//.test(decoded)
   ) {
     return fallback;
@@ -395,6 +401,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
+      shareFetchSeqRef.current += 1;
       if (shareFetchAbortRef.current) {
         shareFetchAbortRef.current.abort();
         shareFetchAbortRef.current = null;
@@ -905,6 +912,7 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                             credentials: "include",
                           }
                         );
+                        if (!isMountedRef.current) return;
                         if (res.ok) {
                           setExportsList((prev) =>
                             prev.filter((i) => i.id !== ex.id)
@@ -967,14 +975,18 @@ export const ExportsWorkspace: React.FC<ExportsWorkspaceProps> = ({
                           notify("Export deleted");
                         } else {
                           const data = await res.json().catch(() => ({}));
-                          notify(
-                            (typeof data?.message === "string" &&
-                              data.message) ||
-                              "Failed to delete export"
-                          );
+                          if (isMountedRef.current) {
+                            notify(
+                              (typeof data?.message === "string" &&
+                                data.message) ||
+                                "Failed to delete export"
+                            );
+                          }
                         }
                       } catch {
-                        notify("Failed to delete export");
+                        if (isMountedRef.current) {
+                          notify("Failed to delete export");
+                        }
                       } finally {
                         if (isMountedRef.current) {
                           setDeletingExportId(null);

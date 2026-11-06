@@ -36,10 +36,15 @@ export interface SavedReviewFilterPreset {
 export function resolveReviewThumbUrl(
   item: Pick<ReviewItem, "camera" | "thumb_path">
 ): string {
-  const safeCamera = encodeURIComponent((item.camera || "unknown").trim() || "unknown");
+  const rawCam = (item.camera || "unknown").trim();
+  const cleanCam =
+    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
+      ? "unknown"
+      : rawCam;
+  const safeCamera = encodeURIComponent(cleanCam);
   const fallback = `/api/${safeCamera}/latest.webp`;
   const raw = (item.thumb_path || "").trim();
-  if (!raw || /[\u0000-\u001f\u007f\\]/.test(raw)) {
+  if (!raw || /[\u0000-\u001f\u007f\\?#]/.test(raw)) {
     return fallback;
   }
   const stripped = raw.replace(/^\/media\/[^/]+/, "");
@@ -49,15 +54,22 @@ export function resolveReviewThumbUrl(
   } catch {
     return fallback;
   }
+  const segments = decoded.split("/");
+  const isAllowedMediaPath = /^\/(?:clips|previews|exports)\//.test(decoded);
+  const isAllowedApiThumbPath =
+    /^\/api\/(?:events\/[^/]+\/(?:thumbnail\.webp|snapshot\.jpg)|preview\/[^/]+\/thumbnail\.jpg|[^/]+\/latest\.(?:webp|jpg))$/i.test(
+      decoded
+    ) && !/^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded);
   if (
     !stripped.startsWith("/") ||
     stripped.startsWith("//") ||
     stripped.includes("..") ||
     decoded.startsWith("//") ||
     decoded.includes("..") ||
-    /[\u0000-\u001f\u007f\\]/.test(decoded) ||
-    !/^\/(?:clips|previews|exports|api)\//.test(decoded) ||
-    /^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded)
+    decoded.includes("%") ||
+    segments.some((seg) => seg === "." || seg === "..") ||
+    /[\u0000-\u001f\u007f\\?#]/.test(decoded) ||
+    (!isAllowedMediaPath && !isAllowedApiThumbPath)
   ) {
     return fallback;
   }
@@ -67,13 +79,21 @@ export function resolveReviewThumbUrl(
 export function resolveNextBriefingStep(
   queueIds: ReadonlyArray<string>,
   currentIdx: number,
-  availableReviews: ReadonlyArray<ReviewItem>
+  availableReviews: ReadonlyArray<ReviewItem>,
+  activeReviewId?: string | null
 ): { nextIdx: number; nextReview: ReviewItem } | null {
   if (!Array.isArray(queueIds) || queueIds.length === 0) return null;
-  const startIdx =
-    typeof currentIdx === "number" && Number.isFinite(currentIdx)
-      ? Math.max(0, Math.floor(currentIdx) + 1)
-      : 0;
+  const activeIdx =
+    typeof activeReviewId === "string" && activeReviewId.length > 0
+      ? queueIds.indexOf(activeReviewId)
+      : -1;
+  const baseIdx =
+    activeIdx >= 0
+      ? activeIdx
+      : typeof currentIdx === "number" && Number.isFinite(currentIdx)
+      ? Math.floor(currentIdx)
+      : -1;
+  const startIdx = Math.max(0, baseIdx + 1);
   for (let idx = startIdx; idx < queueIds.length; idx++) {
     const candidateId = queueIds[idx];
     if (!candidateId) continue;
@@ -575,7 +595,12 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     if (briefingAutoMark && currentId && reviews.some((r) => r.id === currentId)) {
       void handleMarkReviews([currentId], true);
     }
-    const nextStep = resolveNextBriefingStep(briefingQueueIds, briefingIdx, reviews);
+    const nextStep = resolveNextBriefingStep(
+      briefingQueueIds,
+      briefingIdx,
+      reviews,
+      activeReview?.id
+    );
     if (!nextStep) {
       setBriefingActive(false);
       return;
@@ -830,10 +855,20 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   role="button"
                   tabIndex={0}
                   className={`nvr-list-row ${isSelected ? "is-selected" : ""}`}
-                  onClick={() => setActiveReview(item)}
+                  onClick={() => {
+                    if (briefingActive) {
+                      const qIdx = briefingQueueIds.indexOf(item.id);
+                      if (qIdx >= 0) setBriefingIdx(qIdx);
+                    }
+                    setActiveReview(item);
+                  }}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
+                      if (briefingActive) {
+                        const qIdx = briefingQueueIds.indexOf(item.id);
+                        if (qIdx >= 0) setBriefingIdx(qIdx);
+                      }
                       setActiveReview(item);
                     }
                   }}
@@ -1121,7 +1156,13 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   <button
                     className="nvr-btn"
                     onClick={() => {
-                      setSyncMasterTs(Math.floor(activeReview.start_time));
+                      const safeTs =
+                        typeof activeReview.start_time === "number" &&
+                        Number.isFinite(activeReview.start_time) &&
+                        activeReview.start_time > 0
+                          ? Math.floor(activeReview.start_time)
+                          : Math.floor(Date.now() / 1000) - 20;
+                      setSyncMasterTs(safeTs);
                       switchTab("sync");
                     }}
                   >
@@ -1385,10 +1426,18 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     const anchorY = Math.round(bbox[3]);
                     const zones =
                       (p?.zones && p.zones.length > 0 ? p.zones : activeReview.data?.zones) || [];
+                    const fallbackStart =
+                      typeof activeReview.start_time === "number" &&
+                      Number.isFinite(activeReview.start_time) &&
+                      activeReview.start_time > 0
+                        ? activeReview.start_time
+                        : Math.floor(Date.now() / 1000) - 20;
                     const triggerTs =
-                      typeof p?.trigger_ts === "number" && Number.isFinite(p.trigger_ts)
+                      typeof p?.trigger_ts === "number" &&
+                      Number.isFinite(p.trigger_ts) &&
+                      p.trigger_ts > 0
                         ? p.trigger_ts
-                        : activeReview.start_time;
+                        : fallbackStart;
                     return (
                       <>
                         <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
@@ -1546,8 +1595,9 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   ).trim();
                   const safeMock =
                     rawMock &&
+                    rawMock !== "." &&
                     !rawMock.includes("..") &&
-                    !/[/\\\u0000-\u001f\u007f]/.test(rawMock)
+                    !/[/\\%\u0000-\u001f\u007f]/.test(rawMock)
                       ? rawMock
                       : "";
                   if (safeMock) {
@@ -1692,7 +1742,13 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 camera={activeReview.camera}
                 segments={focusSegments}
                 reviews={reviews}
-                currentTs={Math.floor(activeReview.start_time)}
+                currentTs={
+                  typeof activeReview.start_time === "number" &&
+                  Number.isFinite(activeReview.start_time) &&
+                  activeReview.start_time > 0
+                    ? Math.floor(activeReview.start_time)
+                    : Math.floor(Date.now() / 1000) - 20
+                }
                 onSeek={(ts) => {
                   if (ts !== null && Number.isFinite(ts)) {
                     setActiveReview({

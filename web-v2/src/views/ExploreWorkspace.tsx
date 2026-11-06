@@ -103,7 +103,8 @@ export function parseSavedExplorePresets(
       const minScore =
         typeof rec.minScore === "number" &&
         Number.isFinite(rec.minScore) &&
-        rec.minScore >= 0
+        rec.minScore >= 0 &&
+        rec.minScore <= 100
           ? rec.minScore
           : 0;
       out.push({
@@ -526,6 +527,8 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
+      eventMutationSeqRef.current += 1;
+      debugReplaySeqRef.current += 1;
       if (debugReplayAbortRef.current) {
         debugReplayAbortRef.current.abort();
         debugReplayAbortRef.current = null;
@@ -813,15 +816,25 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     try {
       const safeStart =
         typeof targetEvent.start_time === "number" &&
-        Number.isFinite(targetEvent.start_time)
-          ? targetEvent.start_time - 2
+        Number.isFinite(targetEvent.start_time) &&
+        targetEvent.start_time > 0
+          ? Math.max(0, targetEvent.start_time - 2)
           : 0;
-      const safeEnd =
+      const rawEnd =
         typeof targetEvent.end_time === "number" &&
         Number.isFinite(targetEvent.end_time) &&
         targetEvent.end_time > targetEvent.start_time
           ? targetEvent.end_time + 2
           : safeStart + 19;
+      const safeEnd = Math.min(safeStart + 300, Math.max(safeStart + 1, rawEnd));
+      const safeMinScore =
+        typeof debugMinScore === "number" && Number.isFinite(debugMinScore)
+          ? Math.max(0.05, Math.min(0.99, debugMinScore))
+          : 0.5;
+      const safeMinArea =
+        typeof debugMinArea === "number" && Number.isFinite(debugMinArea)
+          ? Math.max(0, Math.min(24000000, Math.round(debugMinArea)))
+          : 0;
       const res = await fetch("/api/debug/reprocess", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -832,12 +845,13 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           start_time: safeStart,
           end_time: safeEnd,
           override_config: {
-            min_score: debugMinScore,
-            min_area: debugMinArea,
+            min_score: safeMinScore,
+            min_area: safeMinArea,
           },
         }),
       });
       if (
+        !isMountedRef.current ||
         seq !== debugReplaySeqRef.current ||
         !shouldApplyEventMutationResult(
           selectedEventIdRef.current,
@@ -850,6 +864,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       if (res.ok) {
         const data = await res.json();
         if (
+          isMountedRef.current &&
           seq === debugReplaySeqRef.current &&
           shouldApplyEventMutationResult(
             selectedEventIdRef.current,
@@ -862,14 +877,19 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         }
       } else {
         const err = await res.json().catch(() => null);
-        notify(err?.message || "Retroactive detection debug replay failed");
+        if (isMountedRef.current) {
+          notify(err?.message || "Retroactive detection debug replay failed");
+        }
       }
     } catch (err) {
-      if ((err as { name?: string })?.name !== "AbortError") {
+      if (
+        isMountedRef.current &&
+        (err as { name?: string })?.name !== "AbortError"
+      ) {
         notify("Network error during retroactive detection debug replay");
       }
     } finally {
-      if (seq === debugReplaySeqRef.current) {
+      if (isMountedRef.current && seq === debugReplaySeqRef.current) {
         setDebugBusy(false);
       }
     }
@@ -1433,7 +1453,13 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   <button
                     className="nvr-btn"
                     onClick={() => {
-                      setSyncMasterTs(Math.floor(selectedEvent.start_time));
+                      const safeTs =
+                        typeof selectedEvent.start_time === "number" &&
+                        Number.isFinite(selectedEvent.start_time) &&
+                        selectedEvent.start_time > 0
+                          ? Math.floor(selectedEvent.start_time)
+                          : Math.floor(Date.now() / 1000) - 20;
+                      setSyncMasterTs(safeTs);
                       switchTab("sync");
                     }}
                   >
@@ -1542,35 +1568,35 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 >
                   {(() => {
                     const p = selectedEvent.data?.provenance;
-                    const rawTopScore =
-                      p?.top_score ??
-                      selectedEvent.top_score ??
-                      selectedEvent.data?.top_score ??
-                      0.85;
                     const topScore =
-                      typeof rawTopScore === "number" && Number.isFinite(rawTopScore)
-                        ? rawTopScore
-                        : 0.85;
+                      typeof p?.top_score === "number" && Number.isFinite(p.top_score)
+                        ? p.top_score
+                        : resolveFiniteEventScore(selectedEvent, 0.85);
                     const thresh =
                       typeof p?.threshold_cfg === "number" &&
                       Number.isFinite(p.threshold_cfg)
                         ? p.threshold_cfg
                         : 0.7;
-                    const rawAreaPx = p?.area_px ?? selectedEvent.area ?? 0;
-                    const areaPx =
-                      typeof rawAreaPx === "number" && Number.isFinite(rawAreaPx)
-                        ? Math.max(0, Math.round(rawAreaPx))
+                    const rawAreaPx =
+                      typeof p?.area_px === "number" && Number.isFinite(p.area_px)
+                        ? p.area_px
+                        : typeof selectedEvent.area === "number" &&
+                          Number.isFinite(selectedEvent.area)
+                        ? selectedEvent.area
                         : 0;
+                    const areaPx = Math.max(0, Math.round(rawAreaPx));
                     const areaPct =
                       typeof p?.area_pct === "number" && Number.isFinite(p.area_pct)
                         ? Math.max(0, p.area_pct)
                         : 0;
-                    const rawRatio =
-                      p?.aspect_ratio ??
-                      (selectedEvent.ratio ? Math.round(selectedEvent.ratio * 100) / 100 : 0.5);
                     const ratio =
-                      typeof rawRatio === "number" && Number.isFinite(rawRatio)
-                        ? rawRatio
+                      typeof p?.aspect_ratio === "number" &&
+                      Number.isFinite(p.aspect_ratio)
+                        ? p.aspect_ratio
+                        : typeof selectedEvent.ratio === "number" &&
+                          Number.isFinite(selectedEvent.ratio) &&
+                          selectedEvent.ratio > 0
+                        ? Math.round(selectedEvent.ratio * 100) / 100
                         : 0.5;
                     const bbox =
                       Array.isArray(p?.bbox) && p.bbox.length >= 4
@@ -1582,10 +1608,18 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     const anchorY = Math.round(bbox[3]);
                     const zones =
                       (p?.zones && p.zones.length > 0 ? p.zones : selectedEvent.zones) || [];
+                    const fallbackStart =
+                      typeof selectedEvent.start_time === "number" &&
+                      Number.isFinite(selectedEvent.start_time) &&
+                      selectedEvent.start_time > 0
+                        ? selectedEvent.start_time
+                        : Math.floor(Date.now() / 1000) - 20;
                     const triggerTs =
-                      typeof p?.trigger_ts === "number" && Number.isFinite(p.trigger_ts)
+                      typeof p?.trigger_ts === "number" &&
+                      Number.isFinite(p.trigger_ts) &&
+                      p.trigger_ts > 0
                         ? p.trigger_ts
-                        : selectedEvent.start_time;
+                        : fallbackStart;
                     return (
                       <>
                         <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
@@ -1819,8 +1853,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     ).trim();
                     const safeMock =
                       rawMock &&
+                      rawMock !== "." &&
                       !rawMock.includes("..") &&
-                      !/[/\\\u0000-\u001f\u007f]/.test(rawMock)
+                      !/[/\\%\u0000-\u001f\u007f]/.test(rawMock)
                         ? rawMock
                         : "";
                     return (

@@ -214,6 +214,28 @@ export function computeDatasetReadinessMetrics(
   };
 }
 
+const VISION_RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+function extractEmbeddedIpv4Vision(hostClean: string): string | null {
+  const hexMatch =
+    /^(?:::ffff:|0:0:0:0:0:ffff:|64:ff9b::|::)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(
+      hostClean
+    );
+  if (hexMatch) {
+    const hi = parseInt(hexMatch[1], 16);
+    const lo = parseInt(hexMatch[2], 16);
+    return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+  }
+  const dottedMatch =
+    /^(?:::ffff:|0:0:0:0:0:ffff:|64:ff9b::|::)(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(
+      hostClean
+    );
+  if (dottedMatch) {
+    return dottedMatch[1];
+  }
+  return null;
+}
+
 export function buildModelUploadPayload(params: {
   filename: string;
   modelBase64: string;
@@ -225,18 +247,26 @@ export function buildModelUploadPayload(params: {
   inputPixelFormat?: string;
 }): ModelUploadPayload {
   const rawFile = (params.filename || "").trim();
+  let decodedFile = rawFile;
+  try {
+    decodedFile = decodeURIComponent(rawFile);
+  } catch {
+    decodedFile = rawFile;
+  }
   const baseSegment =
-    rawFile
+    decodedFile
       .split(/[/\\]/)
       .pop()
       ?.replace(/\.\.+/g, "")
       .replace(/[^a-zA-Z0-9._-]/g, "_")
       .replace(/^[._-]+|[._-]+$/g, "") || "";
+  const stemPart = baseSegment.replace(/\.(?:onnx|xml)$/i, "");
+  const hasValidStem = Boolean(stemPart && /[a-zA-Z0-9]/.test(stemPart));
   const hasValidExt = /\.(?:onnx|xml)$/i.test(baseSegment);
   const cleanName =
-    baseSegment && hasValidExt
+    hasValidStem && hasValidExt
       ? baseSegment
-      : baseSegment
+      : hasValidStem
       ? `${baseSegment}.onnx`
       : "custom_yolo11s.onnx";
   const rawB64 = (params.modelBase64 || "").trim();
@@ -251,16 +281,30 @@ export function buildModelUploadPayload(params: {
     Number.isFinite(rawH) && rawH >= 64 && rawH <= 4096
       ? Math.round(rawH)
       : 640;
+  const safeModelType =
+    params.modelType === "yolo-generic" ||
+    params.modelType === "yolox" ||
+    params.modelType === "ssd"
+      ? params.modelType
+      : "yolo-generic";
+  const safeTensor =
+    params.inputTensor === "nchw" || params.inputTensor === "nhwc"
+      ? params.inputTensor
+      : "nchw";
+  const safePixelFormat =
+    params.inputPixelFormat === "rgb" || params.inputPixelFormat === "bgr"
+      ? params.inputPixelFormat
+      : "rgb";
   return {
     filename: cleanName,
     model_base64: strippedB64,
     labelmap:
       params.labelmap?.trim() || NINJANVR_SECURITY_CLASSES.join("\n"),
-    model_type: params.modelType || "yolo-generic",
+    model_type: safeModelType,
     width: safeW,
     height: safeH,
-    input_tensor: params.inputTensor || "nchw",
-    input_pixel_format: params.inputPixelFormat || "rgb",
+    input_tensor: safeTensor,
+    input_pixel_format: safePixelFormat,
     activate: true,
   };
 }
@@ -304,13 +348,21 @@ export function buildLocalFinetuneCliCommand(params?: {
   nvrToken?: string;
 }): string {
   const rawDataset = (params?.datasetPath || "ninjanvr-dataset.zip")
-    .replace(/[;&|`$><\r\n\0'"\\\s]/g, "")
+    .replace(/[^a-zA-Z0-9._/-]/g, "")
+    .replace(/\.\.+/g, "")
+    .replace(/^[-./]+/, "")
     .trim();
-  const dataset = rawDataset || "ninjanvr-dataset.zip";
+  const dataset =
+    rawDataset && /[a-zA-Z0-9]/.test(rawDataset)
+      ? rawDataset
+      : "ninjanvr-dataset.zip";
   const rawArch = (params?.modelArch || "yolo11s.pt")
-    .replace(/[;&|`$><\r\n\0'"\\\s]/g, "")
+    .replace(/[^a-zA-Z0-9._/-]/g, "")
+    .replace(/\.\.+/g, "")
+    .replace(/^[-./]+/, "")
     .trim();
-  const modelArch = rawArch || "yolo11s.pt";
+  const modelArch =
+    rawArch && /[a-zA-Z0-9]/.test(rawArch) ? rawArch : "yolo11s.pt";
   const imgsz = params?.imgsz === 320 ? 320 : 640;
   const rawEpochs = Number(params?.epochs ?? 30);
   const epochs =
@@ -323,18 +375,19 @@ export function buildLocalFinetuneCliCommand(params?: {
       ? Math.min(100, Math.trunc(rawFreeze))
       : 10;
   const cleanedUrl = (params?.nvrUrl || "http://localhost:5000")
-    .replace(/[;&|`$><\r\n\0'"\\\s]/g, "")
+    .replace(/[;&|`$><\r\n\0'"\\\s()#*?[\]{}~!]/g, "")
     .trim()
     .replace(/\/+$/, "");
   const rawUrl = /^https?:\/\/[a-zA-Z0-9._:-]+$/i.test(cleanedUrl)
     ? cleanedUrl
     : "http://localhost:5000";
   const candidateToken = (params?.nvrToken || "$NINJANVR_API_TOKEN").trim();
-  const token = /^(?:\$[A-Za-z_][A-Za-z0-9_]*|[a-zA-Z0-9._-]+)$/.test(
-    candidateToken
-  )
-    ? candidateToken
-    : "$NINJANVR_API_TOKEN";
+  const token =
+    /^(?:\$[A-Za-z_][A-Za-z0-9_]*|[a-zA-Z0-9_][a-zA-Z0-9._-]*)$/.test(
+      candidateToken
+    )
+      ? candidateToken
+      : "$NINJANVR_API_TOKEN";
   return `python3 scripts/ai/train_ninjanvr_model.py --mode finetune --dataset ${dataset} --model ${modelArch} --imgsz ${imgsz} --epochs ${epochs} --freeze ${freeze} --nvr-url ${rawUrl} --nvr-token ${token}`;
 }
 
@@ -398,17 +451,32 @@ export function isSafeGenAiCustomBaseUrl(rawUrl: string): boolean {
     .replace(/^\[|\]$/g, "")
     .replace(/\.+$/, "")
     .toLowerCase();
+  const effectiveIpv4 = extractEmbeddedIpv4Vision(hostClean) || hostClean;
   if (
     !hostClean ||
     hostClean === "0.0.0.0" ||
     hostClean === "::" ||
     hostClean === "0:0:0:0:0:0:0:0" ||
+    hostClean === "fd00:ec2::254" ||
     hostClean === "metadata.google.internal" ||
-    /^169\.254(?:\.\d{1,3}){2}$/.test(hostClean) ||
+    hostClean.endsWith(".metadata.google.internal") ||
+    effectiveIpv4 === "0.0.0.0" ||
+    effectiveIpv4 === "100.100.100.200" ||
+    /^0(?:\.\d{1,3}){3}$/.test(effectiveIpv4) ||
+    /^169\.254(?:\.\d{1,3}){2}$/.test(effectiveIpv4) ||
     /^fe[89ab][0-9a-f]:/i.test(hostClean) ||
-    /^(?:22[4-9]|23\d)(?:\.\d{1,3}){3}$/.test(hostClean) ||
+    /^(?:22[4-9]|23\d)(?:\.\d{1,3}){3}$/.test(effectiveIpv4) ||
     /^ff[0-9a-f]{2}:/i.test(hostClean)
   ) {
+    return false;
+  }
+  const isLoopback =
+    hostClean === "localhost" ||
+    hostClean.endsWith(".localhost") ||
+    hostClean === "::1" ||
+    hostClean === "0:0:0:0:0:0:0:1" ||
+    /^127(?:\.\d{1,3}){3}$/.test(effectiveIpv4);
+  if (isLoopback && portNum !== 11434) {
     return false;
   }
   return true;
@@ -458,13 +526,19 @@ export function parseRoiClassesInput(rawClasses: string): string[] {
 }
 
 export function slugifyRoiLocationName(raw: string): string {
-  return (raw || "")
+  const trimmedLower = (raw || "").trim().toLowerCase();
+  if (!trimmedLower || VISION_RESERVED_KEYS.has(trimmedLower)) {
+    return "";
+  }
+  const slug = trimmedLower
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
-    .trim()
-    .toLowerCase()
     .replace(/[^a-z0-9_]+/g, "_")
     .replace(/^_+|_+$/g, "");
+  if (!slug || !/[a-z0-9]/.test(slug) || VISION_RESERVED_KEYS.has(slug)) {
+    return "";
+  }
+  return slug;
 }
 
 export type StateRoiPresetId =
@@ -658,7 +732,12 @@ export function normalizeFaceProfileName(raw: string): string {
     return "";
   }
   const cleaned = trimmed.replace(/[^a-zA-Z0-9_\- ]/g, "").trim();
-  if (!cleaned || cleaned.toLowerCase() === "unknown") {
+  if (
+    !cleaned ||
+    !/[a-zA-Z0-9]/.test(cleaned) ||
+    cleaned.toLowerCase() === "unknown" ||
+    VISION_RESERVED_KEYS.has(cleaned.toLowerCase())
+  ) {
     return "";
   }
   return cleaned;
@@ -989,10 +1068,7 @@ export const VisionZonesMotionSection: React.FC<{
         notify("Plot at least 2 points on the camera preview for a directional tripwire");
         return;
       }
-      const lSlug = zoneNameInput
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9_]/g, "_");
+      const lSlug = slugifyRoiLocationName(zoneNameInput);
       if (!lSlug || lSlug.length < 2) {
         notify("Enter a tripwire ID with at least 2 characters");
         return;
@@ -1031,10 +1107,7 @@ export const VisionZonesMotionSection: React.FC<{
       .join(",");
 
     if (polyType === "zone") {
-      const zSlug = zoneNameInput
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9_]/g, "_");
+      const zSlug = slugifyRoiLocationName(zoneNameInput);
       if (!zSlug || zSlug.length < 2) {
         notify("Enter a zone name with at least 2 characters");
         return;
@@ -2666,6 +2739,16 @@ export const AiDetectionObjectsSection: React.FC<{
     status: "idle" | "valid" | "invalid";
     message?: string;
   }>({ status: "idle" });
+  const aiSectionMountedRef = React.useRef(true);
+  const genaiValidateSeqRef = React.useRef(0);
+
+  useEffect(() => {
+    aiSectionMountedRef.current = true;
+    return () => {
+      aiSectionMountedRef.current = false;
+      genaiValidateSeqRef.current += 1;
+    };
+  }, []);
 
   const updateGenAi = (patch: Partial<GenAiConfig>) => {
     updateDraft((next) => {
@@ -2678,6 +2761,8 @@ export const AiDetectionObjectsSection: React.FC<{
   };
 
   const handleValidateGenAiApi = async () => {
+    if (genaiValidating) return;
+    const seq = ++genaiValidateSeqRef.current;
     setGenaiValidating(true);
     setGenaiValidationState({ status: "idle" });
     const prov = (genaiCfg.provider || "gemini").trim().toLowerCase();
@@ -2688,6 +2773,9 @@ export const AiDetectionObjectsSection: React.FC<{
     const customBase = (genaiCfg.base_url || "").trim().replace(/\/+$/, "");
 
     const applyValidModels = (models: string[], customMsg?: string) => {
+      if (!aiSectionMountedRef.current || seq !== genaiValidateSeqRef.current) {
+        return;
+      }
       setGenaiModels(models);
       const msg =
         customMsg ||
@@ -2715,6 +2803,9 @@ export const AiDetectionObjectsSection: React.FC<{
         }),
       });
       const data = await res.json().catch(() => ({}));
+      if (!aiSectionMountedRef.current || seq !== genaiValidateSeqRef.current) {
+        return;
+      }
       const loadedModels = normalizeDiscoveredGenAiModels(data, prov);
       if (res.ok && loadedModels.length > 0) {
         applyValidModels(loadedModels, data?.message);
@@ -2760,6 +2851,9 @@ export const AiDetectionObjectsSection: React.FC<{
 
         const directRes = await fetch(directUrl, { method: "GET", headers });
         const directJson = await directRes.json().catch(() => ({}));
+        if (!aiSectionMountedRef.current || seq !== genaiValidateSeqRef.current) {
+          return;
+        }
         const directModels = normalizeDiscoveredGenAiModels(directJson, prov);
         if (directRes.ok && directModels.length > 0) {
           applyValidModels(directModels);
@@ -2786,6 +2880,9 @@ export const AiDetectionObjectsSection: React.FC<{
       setGenaiValidationState({ status: "invalid", message: errMsg });
       notify(errMsg);
     } catch {
+      if (!aiSectionMountedRef.current || seq !== genaiValidateSeqRef.current) {
+        return;
+      }
       setGenaiModels([]);
       const errMsg = isPt
         ? "Erro de conexão ao validar API do provedor"
@@ -2793,7 +2890,9 @@ export const AiDetectionObjectsSection: React.FC<{
       setGenaiValidationState({ status: "invalid", message: errMsg });
       notify(errMsg);
     } finally {
-      setGenaiValidating(false);
+      if (aiSectionMountedRef.current && seq === genaiValidateSeqRef.current) {
+        setGenaiValidating(false);
+      }
     }
   };
 
@@ -4742,6 +4841,8 @@ export const AiDetectionObjectsSection: React.FC<{
                   style={{ width: "100%", marginTop: 2 }}
                   value={genaiCfg.provider || "gemini"}
                   onChange={(e) => {
+                    genaiValidateSeqRef.current += 1;
+                    setGenaiValidating(false);
                     updateGenAi(
                       buildGenAiProviderChangePatch(e.target.value, genaiCfg.base_url)
                     );
@@ -4787,10 +4888,14 @@ export const AiDetectionObjectsSection: React.FC<{
                         : `Paste key or use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
                     }
                     value={
-                      genaiCfg.api_key === "***" ? "" : genaiCfg.api_key || ""
+                      genaiCfg.api_key === "***" || genaiCfg.api_key === "*"
+                        ? ""
+                        : genaiCfg.api_key || ""
                     }
                     onChange={(e) => {
                       const val = e.target.value;
+                      genaiValidateSeqRef.current += 1;
+                      setGenaiValidating(false);
                       updateGenAi({
                         api_key: val || (genaiCfg.has_api_key ? "***" : null),
                         clear_api_key: false,
@@ -4813,6 +4918,8 @@ export const AiDetectionObjectsSection: React.FC<{
                       }
                       aria-label="Clear Vision AI Judge API Key"
                       onClick={() => {
+                        genaiValidateSeqRef.current += 1;
+                        setGenaiValidating(false);
                         updateGenAi({
                           api_key: null,
                           has_api_key: false,
@@ -4849,6 +4956,8 @@ export const AiDetectionObjectsSection: React.FC<{
                   }
                   value={genaiCfg.api_key_env}
                   onChange={(e) => {
+                    genaiValidateSeqRef.current += 1;
+                    setGenaiValidating(false);
                     updateGenAi({ api_key_env: e.target.value });
                     setGenaiValidationState({ status: "idle" });
                   }}
@@ -4877,6 +4986,8 @@ export const AiDetectionObjectsSection: React.FC<{
                   }
                   value={genaiCfg.base_url || ""}
                   onChange={(e) => {
+                    genaiValidateSeqRef.current += 1;
+                    setGenaiValidating(false);
                     updateGenAi({
                       base_url: e.target.value.trim() ? e.target.value.trim() : null,
                     });
@@ -6967,6 +7078,7 @@ export const DatasetStudioSection: React.FC<{
         }
       );
       const data = await res.json().catch(() => null);
+      if (!isMountedRef.current) return;
       if (res.ok && data) {
         const item: DatasetSampleItem = data.sample || data;
         setSamples((prev) => prev.map((s) => (s.id === item.id ? item : s)));
@@ -6978,9 +7090,13 @@ export const DatasetStudioSection: React.FC<{
         notify(data?.message || "Vision AI auto-annotation failed");
       }
     } catch {
-      notify("Network error during Vision AI auto-annotation");
+      if (isMountedRef.current) {
+        notify("Network error during Vision AI auto-annotation");
+      }
     } finally {
-      setBusyAction(null);
+      if (isMountedRef.current) {
+        setBusyAction(null);
+      }
     }
   };
 
@@ -6992,6 +7108,7 @@ export const DatasetStudioSection: React.FC<{
         credentials: "include",
       });
       const data = await res.json().catch(() => null);
+      if (!isMountedRef.current) return;
       if (res.ok && data) {
         notify(
           `Batch AI Teacher auto-annotated ${data.annotated_count ?? 0} unverified samples`
@@ -7001,9 +7118,13 @@ export const DatasetStudioSection: React.FC<{
         notify(data?.message || "Batch AI auto-annotation failed");
       }
     } catch {
-      notify("Network error during batch AI auto-annotation");
+      if (isMountedRef.current) {
+        notify("Network error during batch AI auto-annotation");
+      }
     } finally {
-      setBusyAction(null);
+      if (isMountedRef.current) {
+        setBusyAction(null);
+      }
     }
   };
 
@@ -7048,6 +7169,7 @@ export const DatasetStudioSection: React.FC<{
         body: JSON.stringify(payload),
       });
       const data = await res.json().catch(() => null);
+      if (!isMountedRef.current) return;
       if (res.ok && data?.success) {
         notify(
           `Uploaded '${data.filename}' (${data.width}×${data.height}) and hot-reloaded AiDetectorEngine`
@@ -7056,9 +7178,13 @@ export const DatasetStudioSection: React.FC<{
         notify(data?.message || "Model upload failed");
       }
     } catch {
-      notify("Network error uploading custom detector model");
+      if (isMountedRef.current) {
+        notify("Network error uploading custom detector model");
+      }
     } finally {
-      setBusyAction(null);
+      if (isMountedRef.current) {
+        setBusyAction(null);
+      }
     }
   };
 

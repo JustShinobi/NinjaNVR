@@ -55,7 +55,9 @@ import {
   isAiSubSectionVisible,
   isBundledCocoSsdModel,
   isSafeGenAiCustomBaseUrl,
+  normalizeFaceProfileName,
   resolveSettingsScopeBadge,
+  slugifyRoiLocationName,
   xyxyToYoloNormalized,
 } from "../views/settings/VisionAndAiPanels";
 import { useNvrStore } from "../store/useNvrStore";
@@ -1297,5 +1299,209 @@ describe("Phase 4C Cycle-2 — Review, Explore, Exports, System & Settings panel
     expect(html).toContain("ROI Crop Viewport Preview");
     expect(html).not.toContain("Advanced Technical Tuning / Coordenadas");
     expect(html).not.toContain("e.g. Porta do Escritório");
+  });
+});
+
+describe("Phase 4C Cycle-3 — Adversarial SSRF, traversal, secret-mask, CLI injection & state race regression suite", () => {
+  test("resolveReviewThumbUrl blocks dot camera traversal, double percent-encoding, query strings, and non-image /api/* endpoints", () => {
+    expect(
+      resolveReviewThumbUrl({
+        camera: "..",
+        thumb_path: "",
+      })
+    ).toBe("/api/unknown/latest.webp");
+    expect(
+      resolveReviewThumbUrl({
+        camera: ".",
+        thumb_path: "",
+      })
+    ).toBe("/api/unknown/latest.webp");
+    expect(
+      resolveReviewThumbUrl({
+        camera: "front_door",
+        thumb_path: "/clips/%252e%252e/%252e%252e/api/logout",
+      })
+    ).toBe("/api/front_door/latest.webp");
+    expect(
+      resolveReviewThumbUrl({
+        camera: "front_door",
+        thumb_path: "/api/ai/context?hours=24",
+      })
+    ).toBe("/api/front_door/latest.webp");
+    expect(
+      resolveReviewThumbUrl({
+        camera: "front_door",
+        thumb_path: "/api/dataset/export.zip",
+      })
+    ).toBe("/api/front_door/latest.webp");
+    expect(
+      resolveReviewThumbUrl({
+        camera: "front_door",
+        thumb_path: "/api/events/ev_123/thumbnail.webp",
+      })
+    ).toBe("/api/events/ev_123/thumbnail.webp");
+  });
+
+  test("resolveNextBriefingStep reconciles activeReviewId when operator manually selects a later queue item", () => {
+    const rev1: ReviewItem = {
+      id: "rev_1",
+      camera: "cam1",
+      start_time: 100,
+      end_time: 110,
+      severity: "alert",
+      thumb_path: "",
+      has_been_reviewed: false,
+      data: { objects: ["person"] },
+    };
+    const rev2: ReviewItem = { ...rev1, id: "rev_2", start_time: 200 };
+    const rev3: ReviewItem = { ...rev1, id: "rev_3", start_time: 300 };
+    const step = resolveNextBriefingStep(
+      ["rev_1", "rev_2", "rev_3"],
+      0,
+      [rev1, rev2, rev3],
+      "rev_2"
+    );
+    expect(step).toEqual({ nextIdx: 2, nextReview: rev3 });
+  });
+
+  test("parseSavedExplorePresets rejects out-of-range minScore > 100 and resolveSafeExportVideoUrl blocks double-encoded traversal and dot exportIds", () => {
+    const presets = parseSavedExplorePresets(
+      JSON.stringify([
+        { name: "Corrupted High Score", minScore: 999 },
+        { name: "Valid Score", minScore: 85 },
+      ])
+    );
+    expect(presets[0]?.minScore).toBe(0);
+    expect(presets[1]?.minScore).toBe(85);
+
+    expect(
+      resolveSafeExportVideoUrl(
+        "/exports/%252e%252e/%252e%252e/api/logout",
+        "exp_1"
+      )
+    ).toBe("/exports/exp_1.mp4");
+    expect(
+      resolveSafeExportVideoUrl("/exports/clip.mp4?download=1", "exp_1")
+    ).toBe("/exports/exp_1.mp4");
+    expect(resolveSafeExportVideoUrl("javascript:alert(1)", ".")).toBe("");
+    expect(
+      resolveSafeExportVideoUrl("javascript:alert(1)", "%252e%252e")
+    ).toBe("");
+  });
+
+  test("normalizeRtspProducerEndpoint scrubs query-string credentials, strips ffmpeg: prefix, and blocks IPv4-mapped IPv6 loopback", () => {
+    expect(
+      normalizeRtspProducerEndpoint(
+        "ffmpeg:rtsp://192.0.2.10:554/live/main?user=admin&password=SuperSecret123&channel=1"
+      )
+    ).toBe("rtsp://192.0.2.10:554/live/main?user=admin&password=***&channel=1");
+    expect(
+      normalizeRtspProducerEndpoint(
+        "rtsp://192.0.2.10:554/live/main?user=admin&password=***&channel=1"
+      )
+    ).toBe("rtsp://192.0.2.10:554/live/main?user=admin&password=***&channel=1");
+    expect(
+      normalizeRtspProducerEndpoint("rtsp://[::ffff:127.0.0.1]:8554/front_door")
+    ).toBeNull();
+    expect(
+      normalizeRtspProducerEndpoint("rtsp://sub.localhost:8554/front_door")
+    ).toBeNull();
+  });
+
+  test("sanitizeConfigEntrySlug, slugifyRoiLocationName, normalizeFaceProfileName, and buildOnvifPasswordPatch reject pure-punctuation slugs, prototype pollution, and mask sentinels", () => {
+    expect(sanitizeConfigEntrySlug("___")).toBe("");
+    expect(sanitizeConfigEntrySlug("---")).toBe("");
+    expect(sanitizeConfigEntrySlug("!@#$%")).toBe("");
+
+    expect(slugifyRoiLocationName("__proto__")).toBe("");
+    expect(slugifyRoiLocationName("constructor")).toBe("");
+    expect(slugifyRoiLocationName("prototype")).toBe("");
+    expect(slugifyRoiLocationName("___")).toBe("");
+    expect(slugifyRoiLocationName("Portão Principal")).toBe("portao_principal");
+
+    expect(normalizeFaceProfileName("__proto__")).toBe("");
+    expect(normalizeFaceProfileName("constructor")).toBe("");
+    expect(normalizeFaceProfileName("prototype")).toBe("");
+    expect(normalizeFaceProfileName("---")).toBe("");
+    expect(normalizeFaceProfileName("Bruno Silva")).toBe("Bruno Silva");
+
+    // Passing mask sentinel "***" or "*" when hasExistingPassword is false must not set password: "***"
+    expect(buildOnvifPasswordPatch("***", false, false)).toEqual({
+      password: "",
+      has_password: false,
+      clear_password: false,
+    });
+    expect(buildOnvifPasswordPatch("*", false, false)).toEqual({
+      password: "",
+      has_password: false,
+      clear_password: false,
+    });
+    expect(buildOnvifPasswordPatch("***", true, false)).toEqual({
+      password: "***",
+      has_password: true,
+      clear_password: false,
+    });
+  });
+
+  test("validateFederationPeerUrl and isSafeGenAiCustomBaseUrl block IPv4-mapped IPv6, NAT64, *.localhost, cloud metadata, and non-Ollama localhost ports", () => {
+    expect(validateFederationPeerUrl("http://[::ffff:127.0.0.1]:8971").valid).toBe(
+      false
+    );
+    expect(
+      validateFederationPeerUrl("http://[::ffff:169.254.169.254]/latest").valid
+    ).toBe(false);
+    expect(
+      validateFederationPeerUrl("http://[64:ff9b::169.254.169.254]/latest").valid
+    ).toBe(false);
+    expect(validateFederationPeerUrl("http://[fd00:ec2::254]/latest").valid).toBe(
+      false
+    );
+    expect(validateFederationPeerUrl("http://100.100.100.200/latest").valid).toBe(
+      false
+    );
+    expect(validateFederationPeerUrl("http://node1.localhost:8971").valid).toBe(
+      false
+    );
+
+    // GenAI custom base URL allows local Ollama (:11434) but rejects other localhost ports and IPv6-mapped metadata
+    expect(isSafeGenAiCustomBaseUrl("http://127.0.0.1:11434")).toBe(true);
+    expect(isSafeGenAiCustomBaseUrl("http://localhost:11434")).toBe(true);
+    expect(isSafeGenAiCustomBaseUrl("http://127.0.0.1:6379")).toBe(false);
+    expect(isSafeGenAiCustomBaseUrl("http://localhost")).toBe(false);
+    expect(isSafeGenAiCustomBaseUrl("http://[::1]:8080")).toBe(false);
+    expect(isSafeGenAiCustomBaseUrl("http://[::ffff:169.254.169.254]")).toBe(
+      false
+    );
+    expect(isSafeGenAiCustomBaseUrl("http://[64:ff9b::169.254.169.254]")).toBe(
+      false
+    );
+    expect(isSafeGenAiCustomBaseUrl("http://[fd00:ec2::254]")).toBe(false);
+    expect(isSafeGenAiCustomBaseUrl("http://100.100.100.200")).toBe(false);
+  });
+
+  test("buildLocalFinetuneCliCommand and buildModelUploadPayload block CLI flag injection, subshells, and percent-encoded filename traversal", () => {
+    const cli = buildLocalFinetuneCliCommand({
+      datasetPath: "--evil-flag",
+      modelArch: "-c",
+      nvrToken: "--inject-arg",
+      nvrUrl: "http://localhost:5000#(whoami)",
+    });
+    expect(cli).toContain("--dataset evil-flag");
+    expect(cli).toContain("--model c");
+    expect(cli).toContain("--nvr-token $NINJANVR_API_TOKEN");
+    expect(cli).not.toContain("#");
+    expect(cli).not.toContain("(whoami)");
+
+    const upload = buildModelUploadPayload({
+      filename: "..%2f..%2fetc%2fcron.d%2fbackdoor.onnx",
+      modelBase64: "U1lOVEhFVElD",
+      modelType: "invalid-arch",
+      inputTensor: "invalid-tensor",
+      inputPixelFormat: "invalid-color",
+    });
+    expect(upload.filename).toBe("backdoor.onnx");
+    expect(upload.model_type).toBe("yolo-generic");
+    expect(upload.input_tensor).toBe("nchw");
+    expect(upload.input_pixel_format).toBe("rgb");
   });
 });

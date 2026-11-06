@@ -92,6 +92,26 @@ export function normalizeAllowedCamerasScope(raw: string): string {
   return Array.from(new Set(parts)).join(",");
 }
 
+function extractEmbeddedIpv4(hostClean: string): string | null {
+  const hexMatch =
+    /^(?:::ffff:|0:0:0:0:0:ffff:|64:ff9b::|::)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(
+      hostClean
+    );
+  if (hexMatch) {
+    const hi = parseInt(hexMatch[1], 16);
+    const lo = parseInt(hexMatch[2], 16);
+    return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+  }
+  const dottedMatch =
+    /^(?:::ffff:|0:0:0:0:0:ffff:|64:ff9b::|::)(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(
+      hostClean
+    );
+  if (dottedMatch) {
+    return dottedMatch[1];
+  }
+  return null;
+}
+
 export function validateFederationPeerUrl(rawUrl: string): {
   valid: boolean;
   normalizedUrl: string;
@@ -133,7 +153,7 @@ export function validateFederationPeerUrl(rawUrl: string): {
       error: "Invalid peer URL: embedded credentials are not allowed",
     };
   }
-  if (parsed.search || parsed.hash) {
+  if (parsed.search || parsed.hash || parsed.port === "0") {
     return {
       valid: false,
       normalizedUrl: "",
@@ -144,18 +164,26 @@ export function validateFederationPeerUrl(rawUrl: string): {
     .replace(/^\[|\]$/g, "")
     .replace(/\.+$/, "")
     .toLowerCase();
+  const effectiveIpv4 = extractEmbeddedIpv4(hostClean) || hostClean;
   if (
     !hostClean ||
     hostClean === "localhost" ||
+    hostClean.endsWith(".localhost") ||
     hostClean === "0.0.0.0" ||
     hostClean === "::" ||
     hostClean === "::1" ||
+    hostClean === "0:0:0:0:0:0:0:0" ||
     hostClean === "0:0:0:0:0:0:0:1" ||
+    hostClean === "fd00:ec2::254" ||
     hostClean === "metadata.google.internal" ||
-    /^127(?:\.\d{1,3}){3}$/.test(hostClean) ||
-    /^169\.254(?:\.\d{1,3}){2}$/.test(hostClean) ||
+    hostClean.endsWith(".metadata.google.internal") ||
+    effectiveIpv4 === "0.0.0.0" ||
+    effectiveIpv4 === "100.100.100.200" ||
+    /^0(?:\.\d{1,3}){3}$/.test(effectiveIpv4) ||
+    /^127(?:\.\d{1,3}){3}$/.test(effectiveIpv4) ||
+    /^169\.254(?:\.\d{1,3}){2}$/.test(effectiveIpv4) ||
     /^fe[89ab][0-9a-f]:/i.test(hostClean) ||
-    /^(?:22[4-9]|23\d)(?:\.\d{1,3}){3}$/.test(hostClean) ||
+    /^(?:22[4-9]|23\d)(?:\.\d{1,3}){3}$/.test(effectiveIpv4) ||
     /^ff[0-9a-f]{2}:/i.test(hostClean)
   ) {
     return {
@@ -1538,13 +1566,13 @@ export const CommsAuthUsersSection: React.FC<{
 
   const mutateMqtt = (patch: Partial<MqttConfig>) => {
     updateDraft((next) => {
-      next.mqtt = { ...mqttCfg, ...patch };
+      next.mqtt = { ...mqttCfg, ...(next.mqtt || {}), ...patch };
     });
   };
 
   const mutateAuth = (patch: Partial<AuthConfig>) => {
     updateDraft((next) => {
-      next.auth = { ...authCfg, ...patch };
+      next.auth = { ...authCfg, ...(next.auth || {}), ...patch };
     });
   };
 
@@ -1794,7 +1822,11 @@ export const CommsAuthUsersSection: React.FC<{
                   placeholder={
                     mqttCfg.has_password ? "•••••••• (preserved)" : "Optional password"
                   }
-                  value={mqttCfg.password === "***" ? "" : mqttCfg.password || ""}
+                  value={
+                    mqttCfg.password === "***" || mqttCfg.password === "*"
+                      ? ""
+                      : mqttCfg.password || ""
+                  }
                   onChange={(e) =>
                     mutateMqtt(
                       buildOnvifPasswordPatch(
@@ -2598,12 +2630,18 @@ export const CommsAuthUsersSection: React.FC<{
                   notify(peerValidation.error || "Invalid federation peer URL");
                   return;
                 }
+                const rawTokenEnv = newPeerTokenEnv.trim();
+                const safeTokenEnv = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(
+                  rawTokenEnv
+                )
+                  ? rawTokenEnv
+                  : "NINJANVR_PEER_TOKEN";
                 updateDraft((next) => {
                   if (!next.peers) next.peers = {};
                   next.peers[slug] = {
                     enabled: true,
                     url: peerValidation.normalizedUrl,
-                    token_env: newPeerTokenEnv.trim() || "NINJANVR_PEER_TOKEN",
+                    token_env: safeTokenEnv,
                   };
                 });
                 setNewPeerId("");

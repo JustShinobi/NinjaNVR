@@ -30,8 +30,46 @@ export function toFiniteNumber(val: unknown, fallback: number = 0): number {
   return fallback;
 }
 
+const SENSITIVE_RTSP_QUERY_KEYS = new Set([
+  "password",
+  "pass",
+  "passwd",
+  "pwd",
+  "token",
+  "access_token",
+  "auth_token",
+  "api_key",
+  "apikey",
+  "secret",
+  "auth",
+  "key",
+  "sig",
+  "signature",
+]);
+
+function scrubRtspPathAndQuery(pathAndQuery: string): string {
+  const qIdx = pathAndQuery.indexOf("?");
+  if (qIdx < 0) return pathAndQuery;
+  const pathPart = pathAndQuery.slice(0, qIdx + 1);
+  const queryPart = pathAndQuery.slice(qIdx + 1);
+  const scrubbedPairs = queryPart.split("&").map((pair) => {
+    const eqIdx = pair.indexOf("=");
+    if (eqIdx < 0) return pair;
+    const rawKey = pair.slice(0, eqIdx);
+    const keyLower = rawKey.trim().toLowerCase();
+    if (SENSITIVE_RTSP_QUERY_KEYS.has(keyLower)) {
+      return `${rawKey}=***`;
+    }
+    return pair;
+  });
+  return `${pathPart}${scrubbedPairs.join("&")}`;
+}
+
 export function normalizeRtspProducerEndpoint(rawUrl: string): string | null {
-  const clean = (rawUrl || "").split("#")[0].trim();
+  const clean = (rawUrl || "")
+    .split("#")[0]
+    .trim()
+    .replace(/^(?:ffmpeg:)+/i, "");
   if (!clean) return null;
   const schemeMatch = /^(rtsps?):\/\/(.*)$/i.exec(clean);
   if (!schemeMatch) return null;
@@ -39,7 +77,9 @@ export function normalizeRtspProducerEndpoint(rawUrl: string): string | null {
   const remainder = schemeMatch[2];
   const slashIdx = remainder.indexOf("/");
   const authority = slashIdx >= 0 ? remainder.slice(0, slashIdx) : remainder;
-  const pathAndQuery = slashIdx >= 0 ? remainder.slice(slashIdx) : "/";
+  const pathAndQuery = scrubRtspPathAndQuery(
+    slashIdx >= 0 ? remainder.slice(slashIdx) : "/"
+  );
   const atIdx = authority.lastIndexOf("@");
   const hostPort = (atIdx >= 0 ? authority.slice(atIdx + 1) : authority).trim();
   if (!hostPort) return null;
@@ -55,14 +95,20 @@ export function normalizeRtspProducerEndpoint(rawUrl: string): string | null {
       hostOnly = hostOnly.slice(0, colonIdx);
     }
   }
-  hostOnly = hostOnly.replace(/\.+$/, "");
+  hostOnly = hostOnly
+    .replace(/\.+$/, "")
+    .replace(/^(?:::ffff:|0:0:0:0:0:ffff:)/, "");
   if (
     !hostOnly ||
     hostOnly === "localhost" ||
+    hostOnly.endsWith(".localhost") ||
     hostOnly === "0.0.0.0" ||
+    hostOnly === "0:0" ||
     hostOnly === "::" ||
     hostOnly === "::1" ||
+    hostOnly === "0:0:0:0:0:0:0:0" ||
     hostOnly === "0:0:0:0:0:0:0:1" ||
+    /^7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(hostOnly) ||
     /^127(?:\.\d{1,3}){3}$/.test(hostOnly)
   ) {
     return null;

@@ -22,7 +22,7 @@ export function sanitizeConfigEntrySlug(raw: string): string {
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, "_");
-  if (!slug || RESERVED_OBJECT_KEYS.has(slug)) {
+  if (!slug || !/[a-z0-9]/.test(slug) || RESERVED_OBJECT_KEYS.has(slug)) {
     return "";
   }
   return slug;
@@ -40,7 +40,8 @@ export function buildOnvifPasswordPatch(
       clear_password: true,
     };
   }
-  if (rawInput.length > 0) {
+  const isMaskSentinel = rawInput === "***" || rawInput === "*";
+  if (rawInput.length > 0 && !isMaskSentinel) {
     return {
       password: rawInput,
       has_password: Boolean(hasExistingPassword),
@@ -1366,7 +1367,8 @@ export const ChannelsStreamsSection: React.FC<{
                       }
                       aria-label="ONVIF Password"
                       value={
-                        activeCamCfg.onvif?.password === "***"
+                        activeCamCfg.onvif?.password === "***" ||
+                        activeCamCfg.onvif?.password === "*"
                           ? ""
                           : activeCamCfg.onvif?.password || ""
                       }
