@@ -5010,7 +5010,10 @@ fn build_detector_catalog_value(state: &AppState) -> Value {
 }
 
 async fn api_detectors_catalog(State(state): State<AppState>) -> Json<Value> {
-    Json(build_detector_catalog_value(&state))
+    let val = tokio::task::spawn_blocking(move || build_detector_catalog_value(&state))
+        .await
+        .unwrap_or_else(|_| json!({}));
+    Json(val)
 }
 
 async fn api_ffmpeg_presets() -> Json<Value> {
@@ -5657,7 +5660,14 @@ async fn api_mcp_handler(
                                 .clamp(1, 500) as usize,
                         ),
                     };
-                    let events = state.db.query_events(&filter).unwrap_or_default();
+                    let db_for_mcp = state.db.clone();
+                    let mut events =
+                        tokio::task::spawn_blocking(move || db_for_mcp.query_events(&filter))
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .unwrap_or_default();
+                    redact_event_slice_thumbnails_if_masked(&state.config, &mut events).await;
                     let val = json!({ "events": events, "count": events.len() });
                     Json(json!({
                         "jsonrpc": "2.0",
@@ -6468,241 +6478,247 @@ async fn api_debug_lpr_simulate(
     eff_lpr_cfg.enabled = true;
     eff_lpr_cfg.min_confidence = eff_lpr_cfg.min_confidence.min(score);
 
-    let valid_format =
-        ninjanvr_infer::validate_license_plate(&norm_plate, eff_lpr_cfg.format_regex.as_deref());
+    tokio::task::spawn_blocking(move || -> Response {
+        let valid_format = ninjanvr_infer::validate_license_plate(
+            &norm_plate,
+            eff_lpr_cfg.format_regex.as_deref(),
+        );
 
-    let mut voter = ninjanvr_infer::LprTrackVoter::new(12);
-    let mut consensus = None;
-    for frame_idx in 0..3 {
-        let frame_conf = (score - (frame_idx as f32) * 0.01).clamp(0.5, 0.999);
-        let read = ninjanvr_infer::OcrPlateRead::new(norm_plate.clone(), frame_conf);
-        let _ = state
-            .detector
-            .record_lpr_track_read(&ev_id, read.clone(), &eff_lpr_cfg);
-        consensus = voter.record_read(&ev_id, read, &eff_lpr_cfg);
-    }
-    let _ = state.detector.finalize_lpr_track(&ev_id, &eff_lpr_cfg);
-
-    let matched_sub_label = consensus
-        .as_ref()
-        .and_then(|c| c.sub_label.clone())
-        .or_else(|| ninjanvr_infer::lookup_known_plate(&norm_plate, &eff_lpr_cfg.known_plates));
-    let votes = consensus.as_ref().map(|c| c.votes).unwrap_or(3);
-    let consensus_conf = consensus.as_ref().map(|c| c.confidence).unwrap_or(score);
-
-    // Generate synthetic 640x360 vehicle + Mercosul plate frame and write snapshot/review artifacts
-    let clean_img = render_synthetic_mercosul_vehicle_frame(&norm_plate);
-    let mut annotated_img = clean_img.clone();
-    let veh_bbox = ninjanvr_vision::BoundingBox::new(140, 80, 500, 310);
-    let plate_bbox = ninjanvr_vision::BoundingBox::new(245, 225, 395, 275);
-    ninjanvr_vision::annotate_rgb_image_with_boxes(
-        &mut annotated_img,
-        &[(veh_bbox, [31, 119, 180]), (plate_bbox, [16, 185, 129])],
-    );
-
-    let clips_dir = state.media_dir.join("clips");
-    let review_dir = clips_dir.join("review");
-    let clean_webp_fname = format!("{camera}-{ev_id}-clean.webp");
-    let jpg_fname = format!("{ev_id}.jpg");
-    let webp_fname = format!("{camera}-{ev_id}.webp");
-    let rev_thumb_fname = format!("thumb-{camera}-{rev_id}.webp");
-
-    let mut thumb_b64 = None;
-    if let Ok(clean_webp) = ninjanvr_vision::encode_image_webp(&clean_img)
-        && let Err(err) = crate::pipeline::write_contained_media_file(
-            &state.media_dir,
-            &clips_dir,
-            &clean_webp_fname,
-            &clean_webp,
-        )
-    {
-        warn!("Failed to write simulated LPR clean snapshot '{clean_webp_fname}': {err}");
-    }
-    if let Ok(jpg_bytes) = ninjanvr_vision::encode_image_jpeg(&annotated_img)
-        && let Err(err) = crate::pipeline::write_contained_media_file(
-            &state.media_dir,
-            &clips_dir,
-            &jpg_fname,
-            &jpg_bytes,
-        )
-    {
-        warn!("Failed to write simulated LPR JPEG snapshot '{jpg_fname}': {err}");
-    }
-    if let Ok(webp_bytes) = ninjanvr_vision::encode_image_webp(&annotated_img) {
-        thumb_b64 = Some(base64::engine::general_purpose::STANDARD.encode(&webp_bytes));
-        if let Err(err) = crate::pipeline::write_contained_media_file(
-            &state.media_dir,
-            &clips_dir,
-            &webp_fname,
-            &webp_bytes,
-        ) {
-            warn!("Failed to write simulated LPR WebP snapshot '{webp_fname}': {err}");
+        let mut voter = ninjanvr_infer::LprTrackVoter::new(12);
+        let mut consensus = None;
+        for frame_idx in 0..3 {
+            let frame_conf = (score - (frame_idx as f32) * 0.01).clamp(0.5, 0.999);
+            let read = ninjanvr_infer::OcrPlateRead::new(norm_plate.clone(), frame_conf);
+            let _ = state
+                .detector
+                .record_lpr_track_read(&ev_id, read.clone(), &eff_lpr_cfg);
+            consensus = voter.record_read(&ev_id, read, &eff_lpr_cfg);
         }
-        if let Err(err) = crate::pipeline::write_contained_media_file(
-            &state.media_dir,
-            &review_dir,
-            &rev_thumb_fname,
-            &webp_bytes,
-        ) {
-            warn!("Failed to write simulated LPR review thumbnail '{rev_thumb_fname}': {err}");
-        }
-    }
+        let _ = state.detector.finalize_lpr_track(&ev_id, &eff_lpr_cfg);
 
-    let norm_box = veh_bbox.to_normalized(640, 360);
-    let norm_plate_box = plate_bbox.to_normalized(640, 360);
-    let mut attr_tags = vec!["license_plate".to_string(), norm_plate.clone()];
-    if let Some(ref sl) = matched_sub_label {
-        attr_tags.push(sl.clone());
-    }
-    let detected_attrs = json!([
+        let matched_sub_label = consensus
+            .as_ref()
+            .and_then(|c| c.sub_label.clone())
+            .or_else(|| ninjanvr_infer::lookup_known_plate(&norm_plate, &eff_lpr_cfg.known_plates));
+        let votes = consensus.as_ref().map(|c| c.votes).unwrap_or(3);
+        let consensus_conf = consensus.as_ref().map(|c| c.confidence).unwrap_or(score);
+
+        // Generate synthetic 640x360 vehicle + Mercosul plate frame and write snapshot/review artifacts
+        let clean_img = render_synthetic_mercosul_vehicle_frame(&norm_plate);
+        let mut annotated_img = clean_img.clone();
+        let veh_bbox = ninjanvr_vision::BoundingBox::new(140, 80, 500, 310);
+        let plate_bbox = ninjanvr_vision::BoundingBox::new(245, 225, 395, 275);
+        ninjanvr_vision::annotate_rgb_image_with_boxes(
+            &mut annotated_img,
+            &[(veh_bbox, [31, 119, 180]), (plate_bbox, [16, 185, 129])],
+        );
+
+        let clips_dir = state.media_dir.join("clips");
+        let review_dir = clips_dir.join("review");
+        let clean_webp_fname = format!("{camera}-{ev_id}-clean.webp");
+        let jpg_fname = format!("{ev_id}.jpg");
+        let webp_fname = format!("{camera}-{ev_id}.webp");
+        let rev_thumb_fname = format!("thumb-{camera}-{rev_id}.webp");
+
+        let mut thumb_b64 = None;
+        if let Ok(clean_webp) = ninjanvr_vision::encode_image_webp(&clean_img)
+            && let Err(err) = crate::pipeline::write_contained_media_file(
+                &state.media_dir,
+                &clips_dir,
+                &clean_webp_fname,
+                &clean_webp,
+            )
         {
-            "label": "license_plate",
-            "score": score,
-            "bbox": [plate_bbox.x_min, plate_bbox.y_min, plate_bbox.x_max, plate_bbox.y_max],
-            "norm_bbox": norm_plate_box,
-            "area_px": plate_bbox.area()
+            warn!("Failed to write simulated LPR clean snapshot '{clean_webp_fname}': {err}");
         }
-    ]);
+        if let Ok(jpg_bytes) = ninjanvr_vision::encode_image_jpeg(&annotated_img)
+            && let Err(err) = crate::pipeline::write_contained_media_file(
+                &state.media_dir,
+                &clips_dir,
+                &jpg_fname,
+                &jpg_bytes,
+            )
+        {
+            warn!("Failed to write simulated LPR JPEG snapshot '{jpg_fname}': {err}");
+        }
+        if let Ok(webp_bytes) = ninjanvr_vision::encode_image_webp(&annotated_img) {
+            thumb_b64 = Some(base64::engine::general_purpose::STANDARD.encode(&webp_bytes));
+            if let Err(err) = crate::pipeline::write_contained_media_file(
+                &state.media_dir,
+                &clips_dir,
+                &webp_fname,
+                &webp_bytes,
+            ) {
+                warn!("Failed to write simulated LPR WebP snapshot '{webp_fname}': {err}");
+            }
+            if let Err(err) = crate::pipeline::write_contained_media_file(
+                &state.media_dir,
+                &review_dir,
+                &rev_thumb_fname,
+                &webp_bytes,
+            ) {
+                warn!("Failed to write simulated LPR review thumbnail '{rev_thumb_fname}': {err}");
+            }
+        }
 
-    let ev_dto = ninjanvr_db::EventDto {
-        id: ev_id.clone(),
-        camera: camera.clone(),
-        label: label.clone(),
-        zones: json!([]),
-        start_time: now,
-        end_time: Some(now + 6.0),
-        has_clip: false,
-        has_snapshot: true,
-        plus_id: None,
-        retain_indefinitely: false,
-        sub_label: matched_sub_label.clone(),
-        top_score: Some(score as f64),
-        false_positive: Some(false),
-        box_coords: Some(json!(norm_box)),
-        data: json!({
-            "box": norm_box,
-            "region": [0.0, 0.0, 1.0, 1.0],
-            "score": score,
-            "top_score": score,
+        let norm_box = veh_bbox.to_normalized(640, 360);
+        let norm_plate_box = plate_bbox.to_normalized(640, 360);
+        let mut attr_tags = vec!["license_plate".to_string(), norm_plate.clone()];
+        if let Some(ref sl) = matched_sub_label {
+            attr_tags.push(sl.clone());
+        }
+        let detected_attrs = json!([
+            {
+                "label": "license_plate",
+                "score": score,
+                "bbox": [plate_bbox.x_min, plate_bbox.y_min, plate_bbox.x_max, plate_bbox.y_max],
+                "norm_bbox": norm_plate_box,
+                "area_px": plate_bbox.area()
+            }
+        ]);
+
+        let ev_dto = ninjanvr_db::EventDto {
+            id: ev_id.clone(),
+            camera: camera.clone(),
+            label: label.clone(),
+            zones: json!([]),
+            start_time: now,
+            end_time: Some(now + 6.0),
+            has_clip: false,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: matched_sub_label.clone(),
+            top_score: Some(score as f64),
+            false_positive: Some(false),
+            box_coords: Some(json!(norm_box)),
+            data: json!({
+                "box": norm_box,
+                "region": [0.0, 0.0, 1.0, 1.0],
+                "score": score,
+                "top_score": score,
+                "sub_label": matched_sub_label,
+                "sub_label_score": matched_sub_label.as_ref().map(|_| score),
+                "attributes": attr_tags,
+                "detected_attributes": detected_attrs,
+                "license_plate_box": norm_plate_box,
+                "recognized_license_plate": norm_plate,
+                "lpr_votes": votes,
+                "lpr_confidence": consensus_conf,
+                "type": "object",
+                "max_severity": "alert"
+            }),
+            thumbnail: thumb_b64,
+            area: Some(veh_bbox.area()),
+            ratio: Some((veh_bbox.width() as f32) / (veh_bbox.height().max(1) as f32)),
+            score: Some(score),
+            stationary: false,
+        };
+
+        if let Err(err) = state.db.upsert_event(&ev_dto) {
+            warn!("Failed to persist simulated LPR event '{ev_id}': {err:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Failed to persist simulated LPR event"
+                })),
+            )
+                .into_response();
+        }
+        if let Err(err) = state.db.set_event_license_plate(&ev_id, Some(&norm_plate)) {
+            warn!("Failed to set license plate on simulated LPR event '{ev_id}': {err:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Failed to set simulated LPR event license plate"
+                })),
+            )
+                .into_response();
+        }
+        if let Some(ref sl) = matched_sub_label
+            && let Err(err) =
+                state
+                    .db
+                    .set_event_sub_label_with_score(&ev_id, Some(sl), Some(score as f64))
+        {
+            warn!("Failed to set sub_label on simulated LPR event '{ev_id}': {err:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Failed to set simulated LPR event sub_label"
+                })),
+            )
+                .into_response();
+        }
+
+        let rev_dto = ninjanvr_db::ReviewItemDto {
+            id: rev_id.clone(),
+            camera: camera.clone(),
+            start_time: now,
+            end_time: Some(now + 6.0),
+            severity: "alert".to_string(),
+            thumb_path: format!("/media/ninjanvr/clips/review/thumb-{camera}-{rev_id}.webp"),
+            data: json!({
+                "detections": [ev_id],
+                "objects": [label],
+                "sub_labels": matched_sub_label.iter().cloned().collect::<Vec<_>>(),
+                "sub_label_score": matched_sub_label.as_ref().map(|_| score),
+                "detected_attributes": detected_attrs,
+                "recognized_license_plates": [norm_plate],
+                "zones": [],
+                "thumb_time": now
+            }),
+            has_been_reviewed: false,
+        };
+        if let Err(err) = state.db.insert_review_segment(&rev_dto) {
+            warn!("Failed to persist simulated LPR review segment '{rev_id}': {err:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Failed to persist simulated LPR review segment"
+                })),
+            )
+                .into_response();
+        }
+
+        state.comms.publish_json(
+            "events",
+            &json!({
+                "type": "new",
+                "before": ev_dto,
+                "after": ev_dto
+            }),
+        );
+        state.comms.publish_json(
+            "reviews",
+            &json!({
+                "type": "new",
+                "before": rev_dto,
+                "after": rev_dto
+            }),
+        );
+
+        Json(json!({
+            "success": true,
+            "event_id": ev_id,
+            "review_id": rev_id,
+            "camera": camera,
+            "plate": norm_plate,
+            "valid_format": valid_format,
+            "votes": votes,
+            "confidence": consensus_conf,
             "sub_label": matched_sub_label,
-            "sub_label_score": matched_sub_label.as_ref().map(|_| score),
-            "attributes": attr_tags,
-            "detected_attributes": detected_attrs,
-            "license_plate_box": norm_plate_box,
-            "recognized_license_plate": norm_plate,
-            "lpr_votes": votes,
-            "lpr_confidence": consensus_conf,
-            "type": "object",
-            "max_severity": "alert"
-        }),
-        thumbnail: thumb_b64,
-        area: Some(veh_bbox.area()),
-        ratio: Some((veh_bbox.width() as f32) / (veh_bbox.height().max(1) as f32)),
-        score: Some(score),
-        stationary: false,
-    };
-
-    if let Err(err) = state.db.upsert_event(&ev_dto) {
-        warn!("Failed to persist simulated LPR event '{ev_id}': {err:#}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "success": false,
-                "message": "Failed to persist simulated LPR event"
-            })),
-        )
-            .into_response();
-    }
-    if let Err(err) = state.db.set_event_license_plate(&ev_id, Some(&norm_plate)) {
-        warn!("Failed to set license plate on simulated LPR event '{ev_id}': {err:#}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "success": false,
-                "message": "Failed to set simulated LPR event license plate"
-            })),
-        )
-            .into_response();
-    }
-    if let Some(ref sl) = matched_sub_label
-        && let Err(err) =
-            state
-                .db
-                .set_event_sub_label_with_score(&ev_id, Some(sl), Some(score as f64))
-    {
-        warn!("Failed to set sub_label on simulated LPR event '{ev_id}': {err:#}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "success": false,
-                "message": "Failed to set simulated LPR event sub_label"
-            })),
-        )
-            .into_response();
-    }
-
-    let rev_dto = ninjanvr_db::ReviewItemDto {
-        id: rev_id.clone(),
-        camera: camera.clone(),
-        start_time: now,
-        end_time: Some(now + 6.0),
-        severity: "alert".to_string(),
-        thumb_path: format!("/media/ninjanvr/clips/review/thumb-{camera}-{rev_id}.webp"),
-        data: json!({
-            "detections": [ev_id],
-            "objects": [label],
-            "sub_labels": matched_sub_label.iter().cloned().collect::<Vec<_>>(),
-            "sub_label_score": matched_sub_label.as_ref().map(|_| score),
-            "detected_attributes": detected_attrs,
-            "recognized_license_plates": [norm_plate],
-            "zones": [],
-            "thumb_time": now
-        }),
-        has_been_reviewed: false,
-    };
-    if let Err(err) = state.db.insert_review_segment(&rev_dto) {
-        warn!("Failed to persist simulated LPR review segment '{rev_id}': {err:#}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "success": false,
-                "message": "Failed to persist simulated LPR review segment"
-            })),
-        )
-            .into_response();
-    }
-
-    state.comms.publish_json(
-        "events",
-        &json!({
-            "type": "new",
-            "before": ev_dto,
-            "after": ev_dto
-        }),
-    );
-    state.comms.publish_json(
-        "reviews",
-        &json!({
-            "type": "new",
-            "before": rev_dto,
-            "after": rev_dto
-        }),
-    );
-
-    Json(json!({
-        "success": true,
-        "event_id": ev_id,
-        "review_id": rev_id,
-        "camera": camera,
-        "plate": norm_plate,
-        "valid_format": valid_format,
-        "votes": votes,
-        "confidence": consensus_conf,
-        "sub_label": matched_sub_label,
-        "label": label,
-        "score": score
-    }))
-    .into_response()
+            "label": label,
+            "score": score
+        }))
+        .into_response()
+    })
+    .await
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn api_camera_proxy_root(
@@ -7862,8 +7878,10 @@ fn redact_image_bytes_with_privacy_mask(
     }
     let mut rgb = decode_bounded_snapshot_rgb(raw_bytes)
         .unwrap_or_else(|| image::RgbImage::from_pixel(64, 36, image::Rgb([12, 14, 18])));
-    if let Some(mask) = privacy_mask {
-        ninjanvr_vision::apply_privacy_masks_from_value(&mut rgb, mask);
+    if let Some(mask) = privacy_mask
+        && !apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, 0, 0)
+    {
+        rgb = image::RgbImage::from_pixel(64, 36, image::Rgb([12, 14, 18]));
     }
     if prefer_jpeg {
         let out = ninjanvr_vision::encode_image_jpeg(&rgb).unwrap_or_default();
@@ -8795,55 +8813,62 @@ async fn api_reviews_delete(
         )
             .into_response();
     }
-    if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await {
-        for id in &body.ids {
-            let permitted = state
-                .db
-                .get_review_by_id(id)
-                .ok()
-                .flatten()
-                .is_some_and(|rev| allowed.iter().any(|a| a == &rev.camera));
-            if !permitted {
+    let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let state_for_del = state.clone();
+    let ids = body.ids;
+    tokio::task::spawn_blocking(move || -> Response {
+        if let Some(ref allow_list) = allowed {
+            for id in &ids {
+                let permitted = state_for_del
+                    .db
+                    .get_review_by_id(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|rev| allow_list.iter().any(|a| a == &rev.camera));
+                if !permitted {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "success": false,
+                            "message": "Camera is not permitted for this user"
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        if let Err(err) = state_for_del.db.delete_reviews(&ids) {
+            warn!("Failed to delete reviews in bulk: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Failed to delete reviews"
+                })),
+            )
+                .into_response();
+        }
+        for id in &ids {
+            if let Err(err) = state_for_del.db.revoke_share_links_for_target(None, id) {
+                warn!("Failed to revoke share links for review '{id}': {err}");
                 return (
-                    StatusCode::FORBIDDEN,
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({
                         "success": false,
-                        "message": "Camera is not permitted for this user"
+                        "message": "Failed to revoke share links for review"
                     })),
                 )
                     .into_response();
             }
         }
-    }
-    if let Err(err) = state.db.delete_reviews(&body.ids) {
-        warn!("Failed to delete reviews in bulk: {err}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "success": false,
-                "message": "Failed to delete reviews"
-            })),
-        )
-            .into_response();
-    }
-    for id in &body.ids {
-        if let Err(err) = state.db.revoke_share_links_for_target(None, id) {
-            warn!("Failed to revoke share links for review '{id}': {err}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "success": false,
-                    "message": "Failed to revoke share links for review"
-                })),
-            )
-                .into_response();
+        for id in &ids {
+            cleanup_share_clip_artifacts(&state_for_del.media_dir, id);
         }
-    }
-    for id in &body.ids {
-        cleanup_share_clip_artifacts(&state.media_dir, id);
-    }
-    purge_revoked_share_credits(&state);
-    Json(json!({ "success": true })).into_response()
+        purge_revoked_share_credits(&state_for_del);
+        Json(json!({ "success": true })).into_response()
+    })
+    .await
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn api_events(
@@ -9110,60 +9135,66 @@ async fn api_events_bulk_delete(
         )
             .into_response();
     }
-    let mut ev_cams: Vec<(String, Option<String>)> = Vec::with_capacity(ids.len());
-    for id in &ids {
-        let cam = state
-            .db
-            .get_event(id)
-            .ok()
-            .flatten()
-            .and_then(|ev| ev["camera"].as_str().map(String::from));
-        ev_cams.push((id.clone(), cam));
-    }
-    if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await {
-        for (_id, cam_opt) in &ev_cams {
-            let permitted = cam_opt
-                .as_deref()
-                .is_some_and(|c| allowed.iter().any(|a| a == c));
-            if !permitted {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
-                )
-                    .into_response();
+    let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let state_for_del = state.clone();
+    tokio::task::spawn_blocking(move || -> Response {
+        let mut ev_cams: Vec<(String, Option<String>)> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let cam = state_for_del
+                .db
+                .get_event(id)
+                .ok()
+                .flatten()
+                .and_then(|ev| ev["camera"].as_str().map(String::from));
+            ev_cams.push((id.clone(), cam));
+        }
+        if let Some(ref allow_list) = allowed {
+            for (_id, cam_opt) in &ev_cams {
+                let permitted = cam_opt
+                    .as_deref()
+                    .is_some_and(|c| allow_list.iter().any(|a| a == c));
+                if !permitted {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+                    )
+                        .into_response();
+                }
             }
         }
-    }
-    if let Err(err) = state.db.delete_events_bulk(&ids) {
-        warn!("Failed to delete events in bulk: {err}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "success": false,
-                "message": "Failed to delete events"
-            })),
-        )
-            .into_response();
-    }
-    for (id, _) in &ev_cams {
-        if let Err(err) = state.db.revoke_share_links_for_target(None, id) {
-            warn!("Failed to revoke share links for event '{id}': {err}");
+        if let Err(err) = state_for_del.db.delete_events_bulk(&ids) {
+            warn!("Failed to delete events in bulk: {err}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
                     "success": false,
-                    "message": "Failed to revoke share links for event"
+                    "message": "Failed to delete events"
                 })),
             )
                 .into_response();
         }
-    }
-    for (id, cam_opt) in &ev_cams {
-        cleanup_share_clip_artifacts(&state.media_dir, id);
-        cleanup_event_media_artifacts(&state.media_dir, cam_opt.as_deref(), id);
-    }
-    purge_revoked_share_credits(&state);
-    Json(json!({ "success": true })).into_response()
+        for (id, _) in &ev_cams {
+            if let Err(err) = state_for_del.db.revoke_share_links_for_target(None, id) {
+                warn!("Failed to revoke share links for event '{id}': {err}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "success": false,
+                        "message": "Failed to revoke share links for event"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        for (id, cam_opt) in &ev_cams {
+            cleanup_share_clip_artifacts(&state_for_del.media_dir, id);
+            cleanup_event_media_artifacts(&state_for_del.media_dir, cam_opt.as_deref(), id);
+        }
+        purge_revoked_share_credits(&state_for_del);
+        Json(json!({ "success": true })).into_response()
+    })
+    .await
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn api_event_retain_on(
@@ -11536,24 +11567,40 @@ async fn load_dataset_sample_image_bytes(
     {
         let (raw_bytes, _, _) =
             resolve_event_clean_snapshot_bytes(&state.media_dir, &ev, ev_id).await;
+        let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
+        let (redacted_bytes, _) =
+            redact_image_bytes_with_privacy_mask_async(raw_bytes, priv_mask, false).await;
         if is_safe_id(&sample.id) {
             let sample_fname = format!("{}.webp", sample.id);
             let _ = atomic_write_within_media_subdir(
                 &state.media_dir,
                 "dataset",
                 &sample_fname,
-                &raw_bytes,
+                &redacted_bytes,
             )
             .await;
-            let clips_dataset_dir = state.media_dir.join("clips").join("dataset");
-            let _ = crate::pipeline::write_contained_media_file(
-                &state.media_dir,
-                &clips_dataset_dir,
-                &sample_fname,
-                &raw_bytes,
-            );
+            let media_dir_owned = state.media_dir.clone();
+            let fname_owned = sample_fname.clone();
+            let bytes_for_mirror = redacted_bytes.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let clips_dataset_dir = media_dir_owned.join("clips").join("dataset");
+                if crate::pipeline::write_contained_media_file(
+                    &media_dir_owned,
+                    &clips_dataset_dir,
+                    &fname_owned,
+                    &bytes_for_mirror,
+                )
+                .is_err()
+                {
+                    let mirror_p = clips_dataset_dir.join(&fname_owned);
+                    if let Some(safe_m) = ensure_clips_artifact_path(&media_dir_owned, &mirror_p) {
+                        let _ = std::fs::remove_file(safe_m);
+                    }
+                }
+            })
+            .await;
         }
-        return raw_bytes;
+        return redacted_bytes;
     }
     let img = image::RgbImage::from_pixel(64, 36, image::Rgb([24, 24, 24]));
     ninjanvr_vision::encode_image_webp(&img)
@@ -11583,7 +11630,7 @@ async fn api_dataset_sample_image_webp(
     }
     let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
     let raw_bytes = load_dataset_sample_image_bytes(&state, &sample).await;
-    let (bytes, _) = redact_image_bytes_with_privacy_mask(&raw_bytes, priv_mask.as_ref(), false);
+    let (bytes, _) = redact_image_bytes_with_privacy_mask_async(raw_bytes, priv_mask, false).await;
     ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response()
 }
 
@@ -11782,7 +11829,7 @@ pub async fn auto_annotate_dataset_sample(
     let raw_img_bytes = load_dataset_sample_image_bytes(state, &sample).await;
     let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
     let (img_bytes, mime_type) =
-        redact_image_bytes_with_privacy_mask(&raw_img_bytes, priv_mask.as_ref(), false);
+        redact_image_bytes_with_privacy_mask_async(raw_img_bytes, priv_mask, false).await;
     let img_b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
 
     let genai = state.config.read().await.genai.clone();
@@ -13139,7 +13186,9 @@ fn mirror_face_sample_to_clips(media_dir: &Path, canonical_name: &str, saved_pat
     let Some(fname) = saved_path.file_name().and_then(|s| s.to_str()) else {
         return;
     };
-    let Ok(bytes) = std::fs::read(saved_path) else {
+    let Some(bytes) =
+        read_bounded_non_symlink_bytes_sync(saved_path, MAX_DATASET_SAMPLE_FILE_BYTES)
+    else {
         return;
     };
     let target_dir = media_dir.join("clips").join("faces").join(safe_profile);
@@ -14887,27 +14936,34 @@ async fn api_recordings_storage(
     jar: CookieJar,
     headers: HeaderMap,
 ) -> Json<Value> {
-    let mut usage = state
-        .db
-        .query_recordings_storage_usage()
-        .unwrap_or_else(|_| json!({}));
-    if let Some(allow_list) = effective_caller_allowed_cameras(&state, &jar, &headers).await
-        && let Some(map) = usage.as_object_mut()
-    {
-        map.retain(|k, _| allow_list.iter().any(|a| a == k));
-    }
-    let rec_dir = state.media_dir.join("recordings");
-    let stat = stat_mount_mb(&rec_dir, "ext4");
-    let total_mb = stat["total"].as_f64().unwrap_or(100_000.0).max(1.0);
-    if let Some(map) = usage.as_object_mut() {
-        for cam_obj in map.values_mut() {
-            if let Some(obj) = cam_obj.as_object_mut() {
-                let u = obj.get("usage").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let pct = ((u / total_mb) * 100.0 * 100.0).round() / 100.0;
-                obj.insert("usage_percent".to_string(), json!(pct));
+    let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let state_for_storage = state.clone();
+    let usage = tokio::task::spawn_blocking(move || {
+        let mut usage = state_for_storage
+            .db
+            .query_recordings_storage_usage()
+            .unwrap_or_else(|_| json!({}));
+        if let Some(ref allow_list) = allowed
+            && let Some(map) = usage.as_object_mut()
+        {
+            map.retain(|k, _| allow_list.iter().any(|a| a == k));
+        }
+        let rec_dir = state_for_storage.media_dir.join("recordings");
+        let stat = stat_mount_mb(&rec_dir, "ext4");
+        let total_mb = stat["total"].as_f64().unwrap_or(100_000.0).max(1.0);
+        if let Some(map) = usage.as_object_mut() {
+            for cam_obj in map.values_mut() {
+                if let Some(obj) = cam_obj.as_object_mut() {
+                    let u = obj.get("usage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let pct = ((u / total_mb) * 100.0 * 100.0).round() / 100.0;
+                    obj.insert("usage_percent".to_string(), json!(pct));
+                }
             }
         }
-    }
+        usage
+    })
+    .await
+    .unwrap_or_else(|_| json!({}));
     Json(usage)
 }
 
@@ -17045,12 +17101,17 @@ pub fn serve_mp4_bytes_with_range(bytes: Vec<u8>, headers: &HeaderMap) -> Respon
 
 async fn serve_mp4_file_with_range(disk_path: &Path, headers: &HeaderMap) -> Option<Response> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut file = tokio::fs::File::open(disk_path).await.ok()?;
-    let meta = file.metadata().await.ok()?;
-    if !meta.is_file() {
+    let path_owned = disk_path.to_path_buf();
+    let (std_file, fmeta) =
+        tokio::task::spawn_blocking(move || open_regular_non_symlink_readonly(&path_owned).ok())
+            .await
+            .ok()
+            .flatten()?;
+    if !fmeta.is_file() {
         return None;
     }
-    let total = meta.len();
+    let total = fmeta.len();
+    let mut file = tokio::fs::File::from_std(std_file);
     if headers.contains_key(header::RANGE) {
         let Some((start, end_opt)) = parse_video_range_bounds(headers) else {
             return Some(
@@ -17163,7 +17224,29 @@ fn has_active_privacy_mask(mask: Option<&Value>) -> bool {
 }
 
 fn ensure_path_within_canon_media_dir(media_dir_canon: &Path, candidate: &Path) -> Option<PathBuf> {
+    if candidate.as_os_str().is_empty()
+        || candidate
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let lmeta = std::fs::symlink_metadata(candidate).ok()?;
+    if lmeta.file_type().is_symlink() {
+        return None;
+    }
     let candidate_canon = std::fs::canonicalize(candidate).ok()?;
+    let cmeta = std::fs::symlink_metadata(&candidate_canon).ok()?;
+    if cmeta.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if lmeta.dev() != cmeta.dev() || lmeta.ino() != cmeta.ino() {
+            return None;
+        }
+    }
     let rel = candidate_canon.strip_prefix(media_dir_canon).ok()?;
     if rel.as_os_str().is_empty()
         || rel
@@ -19379,63 +19462,100 @@ async fn api_export_create(
         )
             .into_response();
     };
-    let export_id_exists = |cand_id: &str| -> bool {
-        state
-            .db
-            .get_export_by_id(cand_id)
-            .map(|opt| opt.is_some())
-            .unwrap_or(true)
-            || std::fs::symlink_metadata(
-                state
-                    .media_dir
-                    .join("exports")
-                    .join(format!("{cand_id}.mp4")),
-            )
-            .is_ok()
-            || std::fs::symlink_metadata(
-                state
-                    .media_dir
-                    .join("clips")
-                    .join(format!("{cand_id}.webp")),
-            )
-            .is_ok()
-    };
-    let id = if !export_id_exists(&base_id) {
-        base_id
-    } else {
-        let mut unique_id = format!("{base_id}-{:08x}", rand::random::<u32>());
-        while export_id_exists(&unique_id) {
-            unique_id = format!("{base_id}-{:08x}", rand::random::<u32>());
-        }
-        unique_id
-    };
-    cleanup_share_clip_artifacts(&state.media_dir, &id);
     let parsed_body = body.map(|b| b.0).unwrap_or_default();
     let include_audio = parsed_body.include_audio && !parsed_body.strip_audio;
     let name = parsed_body
         .name
         .unwrap_or_else(|| format!("{camera} export"));
-    let video_rel = format!("/media/ninjanvr/exports/{id}.mp4");
-    let thumb_rel = format!("/media/ninjanvr/clips/{id}.webp");
     let now = unix_now() as f64;
-    if let Err(err) = state.db.insert_export(&ExportRow {
-        id: id.clone(),
-        camera: camera.clone(),
-        name: name.clone(),
-        date: now,
-        video_path: video_rel.clone(),
-        thumb_path: thumb_rel.clone(),
-        in_progress: true,
-    }) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "success": false,
-                "message": format!("Failed to register export in database: {err}")
-            })),
-        )
-            .into_response();
-    }
+    let state_for_reg = state.clone();
+    let base_id_owned = base_id.clone();
+    let cam_for_reg = camera.clone();
+    let name_for_reg = name.clone();
+    let reg_res = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(String, String, String), String> {
+            let export_id_exists = |cand_id: &str| -> std::result::Result<bool, String> {
+                let in_db = state_for_reg
+                    .db
+                    .get_export_by_id(cand_id)
+                    .map_err(|e| e.to_string())?
+                    .is_some();
+                if in_db {
+                    return Ok(true);
+                }
+                let mp4_exists = std::fs::symlink_metadata(
+                    state_for_reg
+                        .media_dir
+                        .join("exports")
+                        .join(format!("{cand_id}.mp4")),
+                )
+                .is_ok();
+                let webp_exists = std::fs::symlink_metadata(
+                    state_for_reg
+                        .media_dir
+                        .join("clips")
+                        .join(format!("{cand_id}.webp")),
+                )
+                .is_ok();
+                Ok(mp4_exists || webp_exists)
+            };
+            let id = if !export_id_exists(&base_id_owned)? {
+                base_id_owned
+            } else {
+                let mut resolved_unique = None;
+                for _ in 0..64 {
+                    let cand = format!("{base_id_owned}-{:08x}", rand::random::<u32>());
+                    if !export_id_exists(&cand)? {
+                        resolved_unique = Some(cand);
+                        break;
+                    }
+                }
+                resolved_unique.ok_or_else(|| {
+                    "Failed to allocate a unique export identifier after 64 attempts".to_string()
+                })?
+            };
+            cleanup_share_clip_artifacts(&state_for_reg.media_dir, &id);
+            let video_rel = format!("/media/ninjanvr/exports/{id}.mp4");
+            let thumb_rel = format!("/media/ninjanvr/clips/{id}.webp");
+            state_for_reg
+                .db
+                .insert_export(&ExportRow {
+                    id: id.clone(),
+                    camera: cam_for_reg,
+                    name: name_for_reg,
+                    date: now,
+                    video_path: video_rel.clone(),
+                    thumb_path: thumb_rel.clone(),
+                    in_progress: true,
+                })
+                .map_err(|e| e.to_string())?;
+            Ok((id, video_rel, thumb_rel))
+        },
+    )
+    .await;
+    let (id, video_rel, thumb_rel) = match reg_res {
+        Ok(Ok(triple)) => triple,
+        Ok(Err(err)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": format!("Failed to register export in database: {err}")
+                })),
+            )
+                .into_response();
+        }
+        Err(join_err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": format!("Failed to register export in database: {join_err}")
+                })),
+            )
+                .into_response();
+        }
+    };
     let mut in_progress_guard = ExportInProgressGuard {
         db: state.db.clone(),
         media_dir: state.media_dir.clone(),
@@ -19756,60 +19876,70 @@ async fn api_exports_bulk_delete(
         )
             .into_response();
     }
-    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
-        && !allowed.iter().any(|a| a == "*")
-    {
-        for id in &body.ids {
-            let permitted = state
+    let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
+    let state_for_del = state.clone();
+    let ids = body.ids;
+    tokio::task::spawn_blocking(move || -> Response {
+        if let Some(ref allow_list) = allowed
+            && !allow_list.iter().any(|a| a == "*")
+        {
+            for id in &ids {
+                let permitted = state_for_del
+                    .db
+                    .get_export_by_id(id)
+                    .ok()
+                    .flatten()
+                    .and_then(|exp| {
+                        exp["camera"]
+                            .as_str()
+                            .map(str::trim)
+                            .map(|c| allow_list.iter().any(|a| a == c))
+                    })
+                    .unwrap_or(false);
+                if !permitted {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "success": false,
+                            "message": "Camera is not permitted for this user"
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        for id in ids {
+            if let Err(err) = state_for_del
                 .db
-                .get_export_by_id(id)
-                .ok()
-                .flatten()
-                .and_then(|exp| {
-                    exp["camera"]
-                        .as_str()
-                        .map(str::trim)
-                        .map(|c| allowed.iter().any(|a| a == c))
-                })
-                .unwrap_or(false);
-            if !permitted {
+                .revoke_share_links_for_target(Some("export"), &id)
+            {
+                warn!("Failed to revoke share links for export '{id}': {err}");
                 return (
-                    StatusCode::FORBIDDEN,
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({
                         "success": false,
-                        "message": "Camera is not permitted for this user"
+                        "message": "Failed to revoke share links for export"
                     })),
                 )
                     .into_response();
             }
-        }
-    }
-    for id in body.ids {
-        if let Err(err) = state.db.revoke_share_links_for_target(Some("export"), &id) {
-            warn!("Failed to revoke share links for export '{id}': {err}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "success": false,
-                    "message": "Failed to revoke share links for export"
-                })),
-            )
-                .into_response();
-        }
-        cleanup_share_clip_artifacts(&state.media_dir, &id);
-        if let Ok(Some((vpath, tpath))) = state.db.delete_export(&id) {
-            let (safe_vpath, safe_tpath) =
-                resolve_safe_export_unlink_paths(&state.media_dir, &vpath, &tpath);
-            if let Some(vp) = safe_vpath {
-                let _ = tokio::fs::remove_file(vp).await;
-            }
-            if let Some(tp) = safe_tpath {
-                let _ = tokio::fs::remove_file(tp).await;
+            cleanup_share_clip_artifacts(&state_for_del.media_dir, &id);
+            if let Ok(Some((vpath, tpath))) = state_for_del.db.delete_export(&id) {
+                let (safe_vpath, safe_tpath) =
+                    resolve_safe_export_unlink_paths(&state_for_del.media_dir, &vpath, &tpath);
+                if let Some(vp) = safe_vpath {
+                    let _ = std::fs::remove_file(vp);
+                }
+                if let Some(tp) = safe_tpath {
+                    let _ = std::fs::remove_file(tp);
+                }
             }
         }
-    }
-    purge_revoked_share_credits(&state);
-    Json(json!({ "success": true })).into_response()
+        purge_revoked_share_credits(&state_for_del);
+        Json(json!({ "success": true })).into_response()
+    })
+    .await
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn api_previews(
@@ -41660,6 +41790,108 @@ cameras:
                 std::fs::read(&outside_target).unwrap(),
                 b"DO_NOT_OVERWRITE_SECRET"
             );
+
+            // =========================================================================
+            // 5. CYCLE-2: Intra-media_dir Symlink Rejection in ensure_path_within_media_dir
+            // =========================================================================
+            let sym_in_clips = clips_dir.join("front_door-sym_test-clean.webp");
+            std::os::unix::fs::symlink(&protected_webp, &sym_in_clips).unwrap();
+            assert!(
+                ensure_path_within_media_dir(&state.media_dir, &sym_in_clips).is_none(),
+                "ensure_path_within_media_dir must reject symlinks even when target is inside media_dir"
+            );
+            assert!(
+                ensure_clips_artifact_path(&state.media_dir, &sym_in_clips).is_none(),
+                "ensure_clips_artifact_path must reject intra-media_dir symlinks"
+            );
+            let _ = std::fs::remove_file(&sym_in_clips);
         }
+
+        // =========================================================================
+        // 6. CYCLE-2: Privacy-Mask Normalization & Fail-Closed Redaction Across Formats + MCP
+        // =========================================================================
+        let bright_img = image::RgbImage::from_pixel(64, 36, image::Rgb([240, 240, 240]));
+        let bright_webp = ninjanvr_vision::encode_image_webp(&bright_img).unwrap();
+        for valid_mask in [
+            json!({"zones": ["0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0"]}),
+            json!("0.0,0.0,1.0,1.0"),
+            json!([0.0, 0.0, 1.0, 1.0]),
+            json!([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]),
+            json!(["corrupt_non_empty_mask"]),
+            json!(true),
+        ] {
+            let (redacted_out, _) =
+                redact_image_bytes_with_privacy_mask(&bright_webp, Some(&valid_mask), false);
+            let decoded_out = image::load_from_memory(&redacted_out).unwrap().to_rgb8();
+            let center_px = decoded_out.get_pixel(32, 18);
+            assert!(
+                center_px[0] < 50 && center_px[1] < 50 && center_px[2] < 50,
+                "redact_image_bytes_with_privacy_mask must redact or fail-closed for mask {valid_mask}, got pixel {center_px:?}"
+            );
+        }
+
+        // MCP search_events must also redact thumbnails when camera privacy_mask is active
+        {
+            let mut cfg = state.config.write().await;
+            cfg.cameras.get_mut("front_door").unwrap().privacy_mask =
+                json!({"zones": ["0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0"]});
+        }
+        let unredacted_b64 = base64::engine::general_purpose::STANDARD.encode(&bright_webp);
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_mcp_mask_test".to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: now as f64,
+                end_time: Some((now + 5) as f64),
+                has_clip: false,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.92),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.1, 0.1, 0.5, 0.5])),
+                data: json!({"type": "object", "score": 0.92}),
+                thumbnail: Some(unredacted_b64.clone()),
+                area: Some(1000),
+                ratio: Some(1.0),
+                score: Some(0.92),
+                stationary: false,
+            })
+            .unwrap();
+        let r_mcp_search = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mcp")
+                    .header(header::AUTHORIZATION, &viewer_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_events","arguments":{"camera":"front_door","limit":5}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_mcp_search.status(), StatusCode::OK);
+        let mcp_body_bytes = axum::body::to_bytes(r_mcp_search.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let mcp_json: Value = serde_json::from_slice(&mcp_body_bytes).unwrap();
+        let mcp_ev = mcp_json["result"]["structuredContent"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == "ev_mcp_mask_test")
+            .expect("expected ev_mcp_mask_test in MCP search_events response");
+        let mcp_thumb_b64 = mcp_ev["thumbnail"].as_str().unwrap();
+        assert_ne!(
+            mcp_thumb_b64, unredacted_b64,
+            "MCP search_events must redact base64 event thumbnails for masked cameras"
+        );
     }
 }

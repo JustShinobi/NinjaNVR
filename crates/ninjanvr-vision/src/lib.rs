@@ -228,7 +228,7 @@ impl PolygonMask {
         let mut nums = Vec::new();
         for part in trimmed.split(',') {
             if nums.len() >= MAX_POLYGON_VERTICES * 2 {
-                break;
+                return None;
             }
             let v = part.trim().parse::<f32>().ok()?;
             if !v.is_finite() {
@@ -3184,6 +3184,19 @@ mod tests {
             detected_boxes.len() <= 128,
             "extract_connected_boxes must cap motion boxes at 128, got {}",
             detected_boxes.len()
+        );
+
+        // 3. PolygonMask::parse_coord_str rejects polygons exceeding MAX_POLYGON_VERTICES (256)
+        let mut oversized_coords = Vec::with_capacity(600);
+        for i in 0..300 {
+            oversized_coords.push(format!("{:.4},{:.4}", (i % 10) as f32 * 0.08, 0.2));
+        }
+        let oversized_str = oversized_coords.join(",");
+        let m_oversized =
+            PolygonMask::from_config_value(&serde_json::json!(oversized_str), 640, 360);
+        assert!(
+            m_oversized.is_empty(),
+            "PolygonMask must reject polygon strings exceeding MAX_POLYGON_VERTICES (256)"
         );
     }
 }

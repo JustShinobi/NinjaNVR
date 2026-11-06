@@ -3467,6 +3467,8 @@ pub fn privacy_mask_is_configured(mask: Option<&serde_json::Value>) -> bool {
 /// for redacting privacy regions during MP4 export transcoding.
 pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<String> {
     let privacy_mask = mask?;
+    const MAX_PRIVACY_MASK_POLYGONS: usize = 64;
+    const MAX_PRIVACY_POLYGON_COORDS: usize = 512;
 
     fn collect_polygons(
         val: &serde_json::Value,
@@ -3474,7 +3476,7 @@ pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<
         invalid: &mut bool,
         depth: usize,
     ) {
-        if depth > 16 {
+        if depth > 16 || out.len() >= MAX_PRIVACY_MASK_POLYGONS {
             *invalid = true;
             return;
         }
@@ -3486,6 +3488,10 @@ pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<
                 }
                 let mut nums = Vec::new();
                 for part in trimmed.split(',') {
+                    if nums.len() >= MAX_PRIVACY_POLYGON_COORDS {
+                        *invalid = true;
+                        return;
+                    }
                     if let Ok(n) = part.trim().parse::<f32>()
                         && n.is_finite()
                     {
@@ -3495,7 +3501,10 @@ pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<
                         return;
                     }
                 }
-                if nums.len() >= 4 && nums.len().is_multiple_of(2) {
+                if nums.len() >= 4
+                    && nums.len() <= MAX_PRIVACY_POLYGON_COORDS
+                    && nums.len().is_multiple_of(2)
+                {
                     out.push(nums);
                 } else {
                     *invalid = true;
@@ -3506,6 +3515,10 @@ pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<
                     return;
                 }
                 if arr.iter().all(|v| v.is_number()) {
+                    if arr.len() > MAX_PRIVACY_POLYGON_COORDS {
+                        *invalid = true;
+                        return;
+                    }
                     let nums: Vec<f32> = arr
                         .iter()
                         .filter_map(|v| v.as_f64().map(|n| n as f32))
@@ -3520,6 +3533,10 @@ pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<
                     v.as_array()
                         .is_some_and(|p| p.len() == 2 && p[0].is_number() && p[1].is_number())
                 }) {
+                    if arr.len() * 2 > MAX_PRIVACY_POLYGON_COORDS {
+                        *invalid = true;
+                        return;
+                    }
                     let mut nums = Vec::with_capacity(arr.len() * 2);
                     for pair in arr.iter().filter_map(|v| v.as_array()) {
                         if let (Some(x), Some(y)) = (pair[0].as_f64(), pair[1].as_f64()) {
@@ -3543,6 +3560,10 @@ pub fn build_privacy_drawbox_filter(mask: Option<&serde_json::Value>) -> Option<
                         *invalid = true;
                     }
                 } else {
+                    if arr.len() > MAX_PRIVACY_MASK_POLYGONS {
+                        *invalid = true;
+                        return;
+                    }
                     for item in arr {
                         let before = out.len();
                         collect_polygons(item, out, invalid, depth + 1);
