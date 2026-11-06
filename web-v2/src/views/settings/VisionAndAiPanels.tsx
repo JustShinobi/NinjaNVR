@@ -1,4 +1,6 @@
 import React, { useEffect, useState } from "react";
+import { SettingsScopeDivider } from "../../components/SettingsScopeDivider";
+import { CardCollapseToggle } from "../../components/CardCollapseToggle";
 import {
   Box,
   Car,
@@ -816,14 +818,17 @@ export interface AiSettingsSubSectionMeta {
   labelPt: string;
 }
 
+/** The AI section opens on one module; "All Modules" stays available last. */
+export const DEFAULT_AI_SUBSECTION: AiSettingsSubSectionId = "engine";
+
 export const AI_SETTINGS_SUBSECTIONS: AiSettingsSubSectionMeta[] = [
-  { id: "all", labelEn: "All Modules", labelPt: "Todos os Módulos" },
   { id: "engine", labelEn: "1. Engine & Tracking", labelPt: "1. Motor & Rastreamento" },
   { id: "objects", labelEn: "2. Classes & Confidence", labelPt: "2. Classes & Confiança" },
   { id: "genai", labelEn: "3. Vision AI Judge & FP", labelPt: "3. Juiz IA & Falsos Positivos" },
   { id: "faces", labelEn: "4. Face Recognition", labelPt: "4. Reconhecimento Facial" },
   { id: "lpr", labelEn: "5. License Plates (LPR)", labelPt: "5. Leitura de Placas (LPR)" },
   { id: "state_rois", labelEn: "6. State Monitor (ROI)", labelPt: "6. Estado de Área (ROI)" },
+  { id: "all", labelEn: "All Modules", labelPt: "Todos os Módulos" },
 ];
 
 export function isAiSubSectionVisible(
@@ -1186,9 +1191,10 @@ export const VisionZonesMotionSection: React.FC<{
       {/* Left Interactive Polygon Builder & Vector Inventory */}
       <div className="nvr-panel">
         <div className="nvr-panel-header">
-          <span>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             {inspectorCam.toUpperCase()} //{" "}
             {isPt ? "CONSTRUTOR DE ZONAS & MÁSCARAS" : "POLYGON VECTOR STUDIO"}
+            <span className="nvr-yaml-key-tag">cameras.{inspectorCam}.zones · lines · motion.mask</span>
           </span>
           <span className="mono">{draftPoints.length} PTS</span>
         </div>
@@ -1238,13 +1244,8 @@ export const VisionZonesMotionSection: React.FC<{
                 <button
                   key={id}
                   type="button"
-                  className={`nvr-btn ${polyType === id ? "active" : ""}`}
-                  style={{
-                    height: 24,
-                    padding: "0 6px",
-                    fontSize: "var(--text-xs)",
-                    minWidth: 0,
-                  }}
+                  className={`nvr-btn ${polyType === id ? "active" : ""} sm`}
+                  style={{ minWidth: 0 }}
                   onClick={() => setPolyType(id)}
                 >
                   {label}
@@ -1298,17 +1299,9 @@ export const VisionZonesMotionSection: React.FC<{
                       <button
                         key={preset.id}
                         type="button"
-                        className={`nvr-btn ${active ? "active" : ""}`}
+                        className={`nvr-btn ${active ? "active" : ""} sm`}
                         title={isPt ? preset.descPt : preset.descEn}
-                        style={{
-                          height: 26,
-                          padding: "0 8px",
-                          justifyContent: "flex-start",
-                          gap: 5,
-                          minWidth: 0,
-                          width: "100%",
-                          overflow: "hidden",
-                        }}
+                        style={{ justifyContent: "flex-start", gap: 5, minWidth: 0, width: "100%", overflow: "hidden" }}
                         onClick={() => applyZoneRoiPreset(preset)}
                       >
                         <IconComp size={12} style={{ flexShrink: 0 }} />
@@ -1366,8 +1359,8 @@ export const VisionZonesMotionSection: React.FC<{
                     </span>
                   </div>
                   <input
-                    className="nvr-input mono"
-                    style={{ width: "100%", height: 26, fontSize: "var(--text-xs)" }}
+                    className="nvr-input mono sm"
+                    style={{ width: "100%" }}
                     placeholder={
                       isPt
                         ? "Ex: Porta do Escritório, Portão da Garagem"
@@ -1392,8 +1385,8 @@ export const VisionZonesMotionSection: React.FC<{
                       {isPt ? "Estados Customizados (separados por vírgula)" : "Custom States (comma-separated)"}
                     </div>
                     <input
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                      className="nvr-input mono sm"
+                      style={{ width: "100%" }}
                       placeholder="closed, open"
                       value={roiClassesInput}
                       onChange={(e) => setRoiClassesInput(e.target.value)}
@@ -1414,8 +1407,7 @@ export const VisionZonesMotionSection: React.FC<{
                   <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                     <button
                       type="button"
-                      className={`nvr-btn mono ${!roiAnomalyState.trim() ? "active" : ""}`}
-                      style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                      className={`nvr-btn mono ${!roiAnomalyState.trim() ? "active" : ""} sm`}
                       onClick={() => setRoiAnomalyState("")}
                     >
                       {isPt
@@ -1429,8 +1421,7 @@ export const VisionZonesMotionSection: React.FC<{
                         <button
                           key={st}
                           type="button"
-                          className={`nvr-btn mono ${isSel ? "active" : ""}`}
-                          style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                          className={`nvr-btn mono ${isSel ? "active" : ""} sm`}
                           onClick={() => setRoiAnomalyState(st)}
                         >
                           {isPt ? `Se ficar "${st}"` : `When "${st}"`}
@@ -1463,8 +1454,7 @@ export const VisionZonesMotionSection: React.FC<{
                           type="button"
                           className={`nvr-btn mono ${
                             roiAnomalyTimeoutSec === pill.sec ? "active" : ""
-                          }`}
-                          style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                          } sm`}
                           onClick={() => setRoiAnomalyTimeoutSec(pill.sec)}
                         >
                           {pill.label}
@@ -1545,8 +1535,8 @@ export const VisionZonesMotionSection: React.FC<{
                         {isPt ? "Crop Normalizado [x1,y1,x2,y2]" : "Normalized Crop [x1,y1,x2,y2]"}
                       </div>
                       <input
-                        className="nvr-input mono"
-                        style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                        className="nvr-input mono sm"
+                        style={{ width: "100%" }}
                         placeholder="0.250,0.250,0.750,0.750"
                         aria-label="State ROI Crop Coordinates"
                         value={
@@ -1578,8 +1568,8 @@ export const VisionZonesMotionSection: React.FC<{
                           {isPt ? "Estados (Classes)" : "States (Classes)"}
                         </div>
                         <input
-                          className="nvr-input mono"
-                          style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                          className="nvr-input mono sm"
+                          style={{ width: "100%" }}
                           placeholder="closed, open"
                           aria-label="State ROI Classes"
                           value={roiClassesInput}
@@ -1598,8 +1588,8 @@ export const VisionZonesMotionSection: React.FC<{
                           {isPt ? "Estado Anômalo" : "Anomaly State"}
                         </div>
                         <input
-                          className="nvr-input mono"
-                          style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                          className="nvr-input mono sm"
+                          style={{ width: "100%" }}
                           placeholder="open (optional)"
                           aria-label="State ROI Anomaly State"
                           value={roiAnomalyState}
@@ -1629,8 +1619,8 @@ export const VisionZonesMotionSection: React.FC<{
                           type="number"
                           min={1}
                           max={300}
-                          className="nvr-input mono"
-                          style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                          className="nvr-input mono sm"
+                          style={{ width: "100%" }}
                           aria-label="State ROI Interval Seconds"
                           value={roiIntervalSec}
                           onChange={(e) =>
@@ -1653,8 +1643,8 @@ export const VisionZonesMotionSection: React.FC<{
                           type="number"
                           min={1}
                           max={30}
-                          className="nvr-input mono"
-                          style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                          className="nvr-input mono sm"
+                          style={{ width: "100%" }}
                           aria-label="State ROI Hysteresis Frames"
                           value={roiHysteresis}
                           onChange={(e) =>
@@ -1677,8 +1667,8 @@ export const VisionZonesMotionSection: React.FC<{
                           type="number"
                           min={5}
                           max={86400}
-                          className="nvr-input mono"
-                          style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                          className="nvr-input mono sm"
+                          style={{ width: "100%" }}
                           aria-label="State ROI Anomaly Timeout Seconds"
                           value={roiAnomalyTimeoutSec}
                           onChange={(e) =>
@@ -1728,16 +1718,15 @@ export const VisionZonesMotionSection: React.FC<{
             {polyType === "tripwire" && (
               <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
                 <input
-                  className="nvr-input mono"
-                  style={{ flex: 1, height: 24, fontSize: "var(--text-xs)" }}
+                  className="nvr-input mono sm"
+                  style={{ flex: 1 }}
                   placeholder="Tripwire ID (e.g. driveway_line)"
                   aria-label="Tripwire Name"
                   value={zoneNameInput}
                   onChange={(e) => setZoneNameInput(e.target.value)}
                 />
                 <select
-                  className="nvr-select mono"
-                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  className="nvr-select mono sm"
                   aria-label="Tripwire Crossing Direction"
                   value={lineDirection}
                   onChange={(e) =>
@@ -1767,8 +1756,8 @@ export const VisionZonesMotionSection: React.FC<{
                       {isPt ? "ID da Zona" : "Zone ID"}
                     </div>
                     <input
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                      className="nvr-input mono sm"
+                      style={{ width: "100%" }}
                       placeholder="e.g. portao"
                       aria-label="Zone Name"
                       value={zoneNameInput}
@@ -1791,8 +1780,8 @@ export const VisionZonesMotionSection: React.FC<{
                       type="number"
                       min={1}
                       max={60}
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                      className="nvr-input mono sm"
+                      style={{ width: "100%" }}
                       aria-label="Zone Inertia Frames"
                       value={zoneInertia}
                       onChange={(e) => setZoneInertia(Math.max(1, Number(e.target.value)))}
@@ -1814,8 +1803,8 @@ export const VisionZonesMotionSection: React.FC<{
                       type="number"
                       min={0}
                       max={300}
-                      className="nvr-input mono"
-                      style={{ width: "100%", height: 24, fontSize: "var(--text-xs)" }}
+                      className="nvr-input mono sm"
+                      style={{ width: "100%" }}
                       aria-label="Zone Loitering Seconds"
                       value={zoneLoitering}
                       onChange={(e) => setZoneLoitering(Math.max(0, Number(e.target.value)))}
@@ -1834,8 +1823,8 @@ export const VisionZonesMotionSection: React.FC<{
                     {isPt ? "PTZ Preset:" : "PTZ Preset:"}
                   </span>
                   <input
-                    className="nvr-input mono"
-                    style={{ flex: 1, height: 24, fontSize: "var(--text-xs)" }}
+                    className="nvr-input mono sm"
+                    style={{ flex: 1 }}
                     placeholder={
                       isPt
                         ? "Preset PTZ opcional (ex: entry_gate)"
@@ -1853,8 +1842,7 @@ export const VisionZonesMotionSection: React.FC<{
                       <button
                         key={lbl}
                         type="button"
-                        className={`nvr-btn mono ${active ? "active" : ""}`}
-                        style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        className={`nvr-btn mono ${active ? "active" : ""} sm`}
                         onClick={() =>
                           setZoneObjects((prev) =>
                             prev.includes(lbl)
@@ -1894,8 +1882,7 @@ export const VisionZonesMotionSection: React.FC<{
             <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
               <button
                 type="button"
-                className="nvr-btn success"
-                style={{ height: 24, fontSize: "var(--text-xs)" }}
+                className="nvr-btn success sm"
                 onClick={handleCommitPolygon}
               >
                 {polyType === "state_roi"
@@ -1917,8 +1904,7 @@ export const VisionZonesMotionSection: React.FC<{
               {polyType === "motion_mask" && (
                 <button
                   type="button"
-                  className="nvr-btn"
-                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  className="nvr-btn sm"
                   onClick={() =>
                     setDraftPoints([
                       [0.01, 0.01],
@@ -1933,8 +1919,7 @@ export const VisionZonesMotionSection: React.FC<{
               )}
               <button
                 type="button"
-                className="nvr-btn"
-                style={{ height: 24, fontSize: "var(--text-xs)" }}
+                className="nvr-btn sm"
                 onClick={() => {
                   const text =
                     currentCoordStr || "0.010,0.010,0.340,0.010,0.340,0.080,0.010,0.080";
@@ -1947,8 +1932,7 @@ export const VisionZonesMotionSection: React.FC<{
               </button>
               <button
                 type="button"
-                className="nvr-btn"
-                style={{ height: 24, fontSize: "var(--text-xs)" }}
+                className="nvr-btn sm"
                 disabled={draftPoints.length === 0}
                 onClick={() => setDraftPoints((p) => p.slice(0, -1))}
               >
@@ -1956,8 +1940,7 @@ export const VisionZonesMotionSection: React.FC<{
               </button>
               <button
                 type="button"
-                className="nvr-btn danger"
-                style={{ height: 24, fontSize: "var(--text-xs)" }}
+                className="nvr-btn danger sm"
                 disabled={draftPoints.length === 0}
                 onClick={() => setDraftPoints([])}
               >
@@ -2043,8 +2026,7 @@ export const VisionZonesMotionSection: React.FC<{
                   <div style={{ display: "flex", gap: 4 }}>
                     <button
                       type="button"
-                      className="nvr-btn"
-                      style={{ height: 22, padding: "0 6px" }}
+                      className="nvr-btn sm"
                       title="Load ROI crop and parameters into editor"
                       onClick={() => {
                         setPolyType("state_roi");
@@ -2068,8 +2050,7 @@ export const VisionZonesMotionSection: React.FC<{
                     </button>
                     <button
                       type="button"
-                      className="nvr-btn danger"
-                      style={{ height: 22, padding: "0 6px" }}
+                      className="nvr-btn danger sm"
                       title="Delete State ROI"
                       onClick={() =>
                         updateDraft((next) => {
@@ -2128,8 +2109,7 @@ export const VisionZonesMotionSection: React.FC<{
                   <div style={{ display: "flex", gap: 4 }}>
                     <button
                       type="button"
-                      className="nvr-btn"
-                      style={{ height: 22, padding: "0 6px" }}
+                      className="nvr-btn sm"
                       title="Load tripwire vertices into canvas"
                       onClick={() => {
                         setPolyType("tripwire");
@@ -2147,8 +2127,7 @@ export const VisionZonesMotionSection: React.FC<{
                     </button>
                     <button
                       type="button"
-                      className="nvr-btn danger"
-                      style={{ height: 22, padding: "0 6px" }}
+                      className="nvr-btn danger sm"
                       title="Delete tripwire"
                       onClick={() =>
                         updateDraft((next) => {
@@ -2207,8 +2186,7 @@ export const VisionZonesMotionSection: React.FC<{
                   <div style={{ display: "flex", gap: 4 }}>
                     <button
                       type="button"
-                      className="nvr-btn"
-                      style={{ height: 22, padding: "0 6px" }}
+                      className="nvr-btn sm"
                       title="Load zone vertices into canvas"
                       onClick={() => {
                         setPolyType("zone");
@@ -2226,8 +2204,7 @@ export const VisionZonesMotionSection: React.FC<{
                     </button>
                     <button
                       type="button"
-                      className="nvr-btn danger"
-                      style={{ height: 22, padding: "0 6px" }}
+                      className="nvr-btn danger sm"
                       title="Delete zone"
                       onClick={() =>
                         updateDraft((next) => {
@@ -2272,8 +2249,7 @@ export const VisionZonesMotionSection: React.FC<{
                   <div style={{ display: "flex", gap: 4 }}>
                     <button
                       type="button"
-                      className="nvr-btn danger"
-                      style={{ height: 20, padding: "0 5px" }}
+                      className="nvr-btn danger sm"
                       onClick={() =>
                         updateDraft((next) => {
                           const list = extractMaskPolygons(
@@ -2321,8 +2297,7 @@ export const VisionZonesMotionSection: React.FC<{
                   <div style={{ display: "flex", gap: 4 }}>
                     <button
                       type="button"
-                      className="nvr-btn"
-                      style={{ height: 20, padding: "0 5px" }}
+                      className="nvr-btn sm"
                       onClick={() => {
                         setPolyType("motion_mask");
                         setDraftPoints(coordStringToPoints(m, detW, detH));
@@ -2332,8 +2307,7 @@ export const VisionZonesMotionSection: React.FC<{
                     </button>
                     <button
                       type="button"
-                      className="nvr-btn danger"
-                      style={{ height: 20, padding: "0 5px" }}
+                      className="nvr-btn danger sm"
                       onClick={() =>
                         updateDraft((next) => {
                           const list = extractMaskPolygons(
@@ -2381,8 +2355,7 @@ export const VisionZonesMotionSection: React.FC<{
                   <div style={{ display: "flex", gap: 4 }}>
                     <button
                       type="button"
-                      className="nvr-btn"
-                      style={{ height: 20, padding: "0 5px" }}
+                      className="nvr-btn sm"
                       onClick={() => {
                         setPolyType("object_mask");
                         setDraftPoints(coordStringToPoints(m, detW, detH));
@@ -2392,8 +2365,7 @@ export const VisionZonesMotionSection: React.FC<{
                     </button>
                     <button
                       type="button"
-                      className="nvr-btn danger"
-                      style={{ height: 20, padding: "0 5px" }}
+                      className="nvr-btn danger sm"
                       onClick={() =>
                         updateDraft((next) => {
                           const list = extractMaskPolygons(
@@ -2468,6 +2440,7 @@ export const VisionZonesMotionSection: React.FC<{
               >
                 SIMD MOTION TUNER ({inspectorCam.toUpperCase()})
               </span>
+              <span className="nvr-yaml-key-tag">cameras.{inspectorCam}.motion</span>
               <ToggleSwitch
                 checked={motionCfg.enabled ?? true}
                 label="Enable Motion Detector"
@@ -2478,24 +2451,21 @@ export const VisionZonesMotionSection: React.FC<{
             <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
               <button
                 type="button"
-                className={`nvr-btn ${isIndoorMotion ? "active" : ""}`}
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className={`nvr-btn ${isIndoorMotion ? "active" : ""} sm`}
                 onClick={() => applyMotionPreset(22, 8, 0.85, "Indoor / High Sensitivity")}
               >
                 {isPt ? "Interno (Sensível)" : "Indoor (Sensitive)"}
               </button>
               <button
                 type="button"
-                className={`nvr-btn ${isBalancedMotion ? "active" : ""}`}
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className={`nvr-btn ${isBalancedMotion ? "active" : ""} sm`}
                 onClick={() => applyMotionPreset(30, 10, 0.8, "Balanced Default")}
               >
                 {isPt ? "Equilibrado (Padrão)" : "Balanced (Default)"}
               </button>
               <button
                 type="button"
-                className={`nvr-btn ${isOutdoorMotion ? "active" : ""}`}
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className={`nvr-btn ${isOutdoorMotion ? "active" : ""} sm`}
                 onClick={() => applyMotionPreset(45, 25, 0.65, "Outdoor / Trees & Wind")}
               >
                 {isPt ? "Externo (Vento/Sol)" : "Outdoor (Trees/Wind)"}
@@ -2514,8 +2484,7 @@ export const VisionZonesMotionSection: React.FC<{
               />
               <button
                 type="button"
-                className="nvr-btn"
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className="nvr-btn sm"
                 onClick={() => {
                   updateDraft((next) => {
                     Object.values(next.cameras).forEach((cam) => {
@@ -2610,8 +2579,8 @@ export const VisionZonesMotionSection: React.FC<{
                 step={0.05}
                 min={0.2}
                 max={1.0}
-                className="nvr-input mono"
-                style={{ width: 54, height: 24 }}
+                className="nvr-input mono sm"
+                style={{ width: 54 }}
                 value={Number((motionCfg.lightning_threshold ?? 0.8).toFixed(2))}
                 onChange={(e) =>
                   updateMotionField("lightning_threshold", Number(e.target.value))
@@ -2630,8 +2599,8 @@ export const VisionZonesMotionSection: React.FC<{
                 type="number"
                 min={32}
                 max={360}
-                className="nvr-input mono"
-                style={{ width: 54, height: 24 }}
+                className="nvr-input mono sm"
+                style={{ width: 54 }}
                 value={motionCfg.frame_height ?? 100}
                 onChange={(e) =>
                   updateMotionField("frame_height", Number(e.target.value))
@@ -2652,6 +2621,10 @@ export const AiDetectionObjectsSection: React.FC<{
   inspectorCam: string;
   notify: (msg: string) => void;
   onOpenVectorStudio?: () => void;
+  /** Module shown first; defaults to a single module rather than "All Modules". */
+  initialSubSection?: AiSettingsSubSectionId;
+  /** Operational data cards (FP memory, enrolled faces, known plates) start collapsed. */
+  initialDataCardsOpen?: boolean;
 }> = ({
   draftConfig,
   updateDraft,
@@ -2659,12 +2632,14 @@ export const AiDetectionObjectsSection: React.FC<{
   inspectorCam,
   notify,
   onOpenVectorStudio,
+  initialSubSection = DEFAULT_AI_SUBSECTION,
+  initialDataCardsOpen = false,
 }) => {
   const { locale } = useI18n();
   const isPt = locale === "pt";
   const stats = useNvrStore((s) => s.stats);
   const [activeSubSection, setActiveSubSection] =
-    useState<AiSettingsSubSectionId>("all");
+    useState<AiSettingsSubSectionId>(initialSubSection);
   const [customLabel, setCustomLabel] = useState("");
   const [selectedFilterLabel, setSelectedFilterLabel] = useState("person");
   const [showAdvancedModel, setShowAdvancedModel] = useState(false);
@@ -2674,6 +2649,9 @@ export const AiDetectionObjectsSection: React.FC<{
   const [fpSignatures, setFpSignatures] = useState<FalsePositiveSignatureItem[]>([]);
   const [fpLoading, setFpLoading] = useState(false);
   const [fpFilterMode, setFpFilterMode] = useState<"scope" | "all">("scope");
+  const [showFpMemory, setShowFpMemory] = useState(initialDataCardsOpen);
+  const [showFaceGallery, setShowFaceGallery] = useState(initialDataCardsOpen);
+  const [showKnownPlates, setShowKnownPlates] = useState(initialDataCardsOpen);
 
   const loadFpSignatures = async () => {
     setFpLoading(true);
@@ -3508,27 +3486,19 @@ export const AiDetectionObjectsSection: React.FC<{
     },
   ];
 
-  const globalScopeBadge = resolveSettingsScopeBadge(
-    "global_only",
-    scope,
-    inspectorCam,
-    isPt
-  );
-  const camOrGlobalBadge = resolveSettingsScopeBadge(
-    "camera_or_global",
-    scope,
-    inspectorCam,
-    isPt
-  );
   const effectiveRoiCam =
     scope === "global"
       ? roiTargetCam || inspectorCam || "escritorio"
       : inspectorCam || "escritorio";
-  const roiCamBadge = resolveSettingsScopeBadge(
-    "camera_only",
-    scope,
-    effectiveRoiCam,
-    isPt
+  const scopeCameraCount = Object.keys(draftConfig.cameras || {}).length;
+  const scopeDivider = (group: "global" | "camera") => (
+    <SettingsScopeDivider
+      group={group}
+      scope={scope}
+      inspectorCam={inspectorCam}
+      cameraCount={scopeCameraCount}
+      isPt={isPt}
+    />
   );
   const isCocoSsdActive = isBundledCocoSsdModel(modelCfg);
   const filteredFpSignatures = filterFalsePositiveSignaturesByScope(
@@ -3558,8 +3528,7 @@ export const AiDetectionObjectsSection: React.FC<{
               <button
                 key={sec.id}
                 type="button"
-                className={`nvr-btn mono ${isActive ? "active" : ""}`}
-                style={{ height: 24, padding: "0 9px", fontSize: "var(--text-xs)" }}
+                className={`nvr-btn mono ${isActive ? "active" : ""} sm`}
                 onClick={() => setActiveSubSection(sec.id)}
               >
                 {isPt ? sec.labelPt : sec.labelEn}
@@ -3567,31 +3536,19 @@ export const AiDetectionObjectsSection: React.FC<{
             );
           })}
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-          <span
-            className={`nvr-scope-pill ${
-              camOrGlobalBadge.isCameraScope ? "is-camera" : "is-global"
-            }`}
-          >
-            {camOrGlobalBadge.label}
-          </span>
-        </div>
       </div>
 
       {/* Guided OpenVINO AI Detector & Model Card */}
       {isAiSubSectionVisible(activeSubSection, "engine") && (
+      <>
+      {scopeDivider("global")}
       <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span>
-              {isPt
-                ? "MOTOR DE IA & PERFIL DO MODELO"
-                : "AI DETECTION ENGINE & MODEL PROFILE"}
-            </span>
-            <span className="nvr-yaml-key-tag">detectors · model</span>
+            <span>{isPt ? "MODELO DE DETECÇÃO IA" : "AI DETECTION MODEL"}</span>
+            <span className="nvr-yaml-key-tag">model</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span className="nvr-scope-pill is-global">{globalScopeBadge.label}</span>
             <span className="nvr-badge live">
               <CheckCircle2 size={11} />
               {(primaryDet.type || "openvino").toUpperCase()} ·{" "}
@@ -3664,7 +3621,17 @@ export const AiDetectionObjectsSection: React.FC<{
               );
             })}
           </div>
+        </div>
+      </div>
 
+      <div className="nvr-cfg-card">
+        <div className="nvr-cfg-card-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>{isPt ? "RUNTIME DE INFERÊNCIA" : "INFERENCE RUNTIME"}</span>
+            <span className="nvr-yaml-key-tag">detectors</span>
+          </div>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 7 }}>
           {/* Step 2: Inference Runtime Backend & Hardware Accelerator */}
           <div className="nvr-field-row" style={{ padding: "4px 0" }}>
             <div className="nvr-field-meta">
@@ -3795,14 +3762,8 @@ export const AiDetectionObjectsSection: React.FC<{
           {/* Collapsible Advanced Tensor & Path Overrides */}
           <button
             type="button"
-            className="nvr-btn mono"
-            style={{
-              width: "100%",
-              justifyContent: "space-between",
-              height: 24,
-              fontSize: "var(--text-xs)",
-              marginTop: "auto",
-            }}
+            className="nvr-btn mono sm"
+            style={{ width: "100%", justifyContent: "space-between", marginTop: "auto" }}
             onClick={() => setShowAdvancedModel((v) => !v)}
           >
             <span>
@@ -3908,26 +3869,20 @@ export const AiDetectionObjectsSection: React.FC<{
           )}
         </div>
       </div>
+      </>
       )}
 
       {/* Guided Detect & ByteTrack Behavior Card */}
       {isAiSubSectionVisible(activeSubSection, "engine") && (
+      <>
+      {scopeDivider("camera")}
       <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span>
-              {isPt ? "DETECÇÃO & RASTREAMENTO" : "CAMERA DETECTION & TRACKING"}
-            </span>
+            <span>{isPt ? "DETECÇÃO DE OBJETOS" : "OBJECT DETECTION"}</span>
             <span className="nvr-yaml-key-tag">detect</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span
-              className={`nvr-scope-pill ${
-                camOrGlobalBadge.isCameraScope ? "is-camera" : "is-global"
-              }`}
-            >
-              {camOrGlobalBadge.label}
-            </span>
             <span className={`nvr-badge ${activeDetect.enabled ? "live" : ""}`}>
               {activeDetect.enabled
                 ? `${detFps} FPS · ACTIVE`
@@ -3937,8 +3892,7 @@ export const AiDetectionObjectsSection: React.FC<{
             </span>
             <button
               type="button"
-              className="nvr-btn"
-              style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              className="nvr-btn sm"
               onClick={() => {
                 updateDraft((next) => {
                   Object.values(next.cameras).forEach((cam) => {
@@ -4012,7 +3966,6 @@ export const AiDetectionObjectsSection: React.FC<{
                 <button
                   type="button"
                   className="nvr-btn mono"
-                  style={{ height: 28, padding: "0 8px", fontSize: "var(--text-xs)" }}
                   title="Add another detector worker instance to the pool"
                   onClick={() => {
                     const nextIdx = detKeys.length + 1;
@@ -4122,25 +4075,31 @@ export const AiDetectionObjectsSection: React.FC<{
                 </div>
               </div>
             )}
+          </div>
+        </div>
+      </div>
 
-            {/* 1-Click Tracking Sensitivity Presets */}
-            <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", fontWeight: 700 }}>
-              {isPt ? "PERFIL DE RESPOSTA DO RASTREADOR" : "TRACKING RESPONSIVENESS PRESET"}
+      <div className="nvr-cfg-card">
+        <div className="nvr-cfg-card-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>{isPt ? "RESPOSTA DO RASTREADOR" : "TRACKING RESPONSIVENESS"}</span>
+            <span className="nvr-yaml-key-tag">detect.min_initialized · max_disappeared</span>
+          </div>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
+          <div
+            className={!activeDetect.enabled ? "nvr-cfg-disabled-zone" : ""}
+            style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1 }}
+          >
+            <div className="nvr-field-desc">
+              {isPt
+                ? "Quanto tempo um objeto precisa persistir antes de virar evento."
+                : "How long an object must persist before it becomes an event."}
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6 }}>
               <button
                 type="button"
-                className={`nvr-btn ${activeTrackPreset === "balanced" ? "active" : ""}`}
-                style={{
-                  height: "auto",
-                  minWidth: 0,
-                  padding: "6px 8px",
-                  flexDirection: "column",
-                  alignItems: "flex-start",
-                  textAlign: "left",
-                  whiteSpace: "normal",
-                  gap: 2,
-                }}
+                className={`nvr-btn tile ${activeTrackPreset === "balanced" ? "active" : ""}`}
                 onClick={() =>
                   updateDetect({
                     fps: 5,
@@ -4160,17 +4119,7 @@ export const AiDetectionObjectsSection: React.FC<{
 
               <button
                 type="button"
-                className={`nvr-btn ${activeTrackPreset === "fast" ? "active" : ""}`}
-                style={{
-                  height: "auto",
-                  minWidth: 0,
-                  padding: "6px 8px",
-                  flexDirection: "column",
-                  alignItems: "flex-start",
-                  textAlign: "left",
-                  whiteSpace: "normal",
-                  gap: 2,
-                }}
+                className={`nvr-btn tile ${activeTrackPreset === "fast" ? "active" : ""}`}
                 onClick={() =>
                   updateDetect({
                     fps: 8,
@@ -4190,17 +4139,7 @@ export const AiDetectionObjectsSection: React.FC<{
 
               <button
                 type="button"
-                className={`nvr-btn ${activeTrackPreset === "strict" ? "active" : ""}`}
-                style={{
-                  height: "auto",
-                  minWidth: 0,
-                  padding: "6px 8px",
-                  flexDirection: "column",
-                  alignItems: "flex-start",
-                  textAlign: "left",
-                  whiteSpace: "normal",
-                  gap: 2,
-                }}
+                className={`nvr-btn tile ${activeTrackPreset === "strict" ? "active" : ""}`}
                 onClick={() =>
                   updateDetect({
                     fps: 5,
@@ -4222,14 +4161,8 @@ export const AiDetectionObjectsSection: React.FC<{
             {/* Collapsible Advanced ByteTrack Frame Parameters */}
             <button
               type="button"
-              className="nvr-btn mono"
-              style={{
-                width: "100%",
-                justifyContent: "space-between",
-                height: 24,
-                fontSize: "var(--text-xs)",
-                marginTop: "auto",
-              }}
+              className="nvr-btn mono sm"
+              style={{ width: "100%", justifyContent: "space-between", marginTop: "auto" }}
               onClick={() => setShowAdvancedByteTrack((v) => !v)}
             >
               <span>
@@ -4346,28 +4279,20 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
         </div>
       </div>
+      </>
       )}
 
       {/* Tracked Objects & Intuitive Confidence Sliders */}
       {isAiSubSectionVisible(activeSubSection, "objects") && (
-      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+      <>
+      {scopeDivider("camera")}
+      <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span>
-              {isPt
-                ? "CLASSES DE OBJETOS MONITORADAS & SENSIBILIDADE DE CONFIANÇA"
-                : "OBJECTS TO DETECT & CONFIDENCE SENSITIVITY"}
-            </span>
-            <span className="nvr-yaml-key-tag">objects.track · objects.filters</span>
+            <span>{isPt ? "OBJETOS A DETECTAR" : "OBJECTS TO DETECT"}</span>
+            <span className="nvr-yaml-key-tag">objects.track</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span
-              className={`nvr-scope-pill ${
-                camOrGlobalBadge.isCameraScope ? "is-camera" : "is-global"
-              }`}
-            >
-              {camOrGlobalBadge.label}
-            </span>
             <span className="nvr-badge live">
               {trackedLabels.length} {isPt ? "CLASSES ATIVAS" : "ACTIVE CLASSES"}
             </span>
@@ -4376,7 +4301,7 @@ export const AiDetectionObjectsSection: React.FC<{
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
             <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", marginRight: 4 }}>
-              {isPt ? "1. ATIVAR/DESATIVAR CLASSES:" : "1. ENABLE/DISABLE CLASSES:"}
+              {isPt ? "CLASSES:" : "CLASSES:"}
             </span>
             {Array.from(new Set([...STANDARD_LABELS, ...trackedLabels])).map((lbl) => {
               const isTracked = trackedLabels.includes(lbl);
@@ -4384,8 +4309,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 <button
                   key={lbl}
                   type="button"
-                  className={`nvr-btn mono ${isTracked ? "active" : ""}`}
-                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn mono ${isTracked ? "active" : ""} sm`}
                   onClick={() => toggleTrackLabel(lbl)}
                 >
                   {isTracked ? `✓ ${lbl}` : `+ ${lbl}`}
@@ -4393,16 +4317,15 @@ export const AiDetectionObjectsSection: React.FC<{
               );
             })}
             <input
-              className="nvr-input mono"
-              style={{ width: 155, height: 24, fontSize: "var(--text-xs)" }}
+              className="nvr-input mono sm"
+              style={{ width: 155 }}
               placeholder={isPt ? "Outra classe COCO..." : "Custom COCO label..."}
               value={customLabel}
               onChange={(e) => setCustomLabel(e.target.value)}
             />
             <button
               type="button"
-              className="nvr-btn"
-              style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              className="nvr-btn sm"
               onClick={() => {
                 const clean = customLabel.trim().toLowerCase();
                 if (!clean) return;
@@ -4468,9 +4391,8 @@ export const AiDetectionObjectsSection: React.FC<{
                   {isPt ? "Política de Snapshot:" : "Snapshot Selection Policy:"}
                 </span>
                 <select
-                  className="nvr-select mono"
-                  aria-label="Snapshot Selection Policy"
-                  style={{ height: 24, width: 248, maxWidth: "100%", fontSize: "var(--text-xs)" }}
+                  className="nvr-select mono sm"
+                  aria-label="Snapshot Selection Policy" style={{ width: 248, maxWidth: "100%" }}
                   value={activeSnapshotSelection}
                   onChange={(e) =>
                     updateSnapshotSelection(
@@ -4512,13 +4434,8 @@ export const AiDetectionObjectsSection: React.FC<{
                   <button
                     key={attrLbl}
                     type="button"
-                    className={`nvr-btn mono ${isActive ? "active" : ""}`}
-                    style={{
-                      height: 24,
-                      padding: "0 8px",
-                      fontSize: "var(--text-xs)",
-                      borderStyle: isCocoSsdActive ? "dashed" : "solid",
-                    }}
+                    className={`nvr-btn mono ${isActive ? "active" : ""} sm`}
+                    style={{ borderStyle: isCocoSsdActive ? "dashed" : "solid" }}
                     onClick={() => toggleAttributeLabel(attrLbl)}
                   >
                     {isActive ? `✓ ${attrLbl}` : `+ ${attrLbl}`}
@@ -4527,13 +4444,23 @@ export const AiDetectionObjectsSection: React.FC<{
               })}
             </div>
           </div>
+        </div>
+      </div>
 
-          <div className="nvr-subcard" style={{ padding: "8px 10px" }}>
+      <div className="nvr-cfg-card">
+        <div className="nvr-cfg-card-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>{isPt ? "SENSIBILIDADE DE CONFIANÇA" : "CONFIDENCE SENSITIVITY"}</span>
+            <span className="nvr-yaml-key-tag">objects.filters</span>
+          </div>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                 <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-accent-text)", display: "flex", alignItems: "center", gap: 5 }}>
                   <Sparkles size={12} />
-                  {isPt ? "2. CALIBRAR CLASSE ATIVA:" : "2. TUNE ACTIVE CLASS:"}
+                  {isPt ? "CALIBRAR CLASSE:" : "TUNE CLASS:"}
                 </span>
                 {trackedLabels.map((lbl) => {
                   const clsFilter =
@@ -4547,8 +4474,7 @@ export const AiDetectionObjectsSection: React.FC<{
                     <button
                       key={lbl}
                       type="button"
-                      className={`nvr-btn mono ${selectedFilterLabel === lbl ? "active" : ""}`}
-                      style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      className={`nvr-btn mono ${selectedFilterLabel === lbl ? "active" : ""} sm`}
                       onClick={() => setSelectedFilterLabel(lbl)}
                     >
                       {lbl} ({pct}%)
@@ -4558,8 +4484,8 @@ export const AiDetectionObjectsSection: React.FC<{
                 {trackedLabels.length === 1 && (
                   <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
                     {isPt
-                      ? "(Ative mais classes no Passo 1 para calibrá-las individualmente)"
-                      : "(Enable additional classes in Step 1 to tune them individually)"}
+                      ? "(Ative mais classes ao lado para calibrá-las individualmente)"
+                      : "(Enable more classes to tune them individually)"}
                   </span>
                 )}
               </div>
@@ -4567,8 +4493,7 @@ export const AiDetectionObjectsSection: React.FC<{
               <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
                 <button
                   type="button"
-                  className={`nvr-btn ${activeConfPreset === "permissive" ? "active" : ""}`}
-                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn ${activeConfPreset === "permissive" ? "active" : ""} sm`}
                   onClick={() =>
                     updateObjectFilter({ min_score: 0.4, threshold: 0.58 })
                   }
@@ -4577,8 +4502,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 </button>
                 <button
                   type="button"
-                  className={`nvr-btn ${activeConfPreset === "balanced" ? "active" : ""}`}
-                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn ${activeConfPreset === "balanced" ? "active" : ""} sm`}
                   onClick={() =>
                     updateObjectFilter({ min_score: 0.5, threshold: 0.7 })
                   }
@@ -4587,8 +4511,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 </button>
                 <button
                   type="button"
-                  className={`nvr-btn ${activeConfPreset === "strict" ? "active" : ""}`}
-                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn ${activeConfPreset === "strict" ? "active" : ""} sm`}
                   onClick={() =>
                     updateObjectFilter({ min_score: 0.65, threshold: 0.82 })
                   }
@@ -4598,8 +4521,8 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
-              <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <div className="nvr-field-row" style={{ padding: "4px 0" }}>
                 <div className="nvr-field-meta">
                   <div className="nvr-field-label">
                     {isPt
@@ -4656,13 +4579,8 @@ export const AiDetectionObjectsSection: React.FC<{
 
             <button
               type="button"
-              className="nvr-btn mono"
-              style={{
-                width: "100%",
-                justifyContent: "space-between",
-                height: 22,
-                fontSize: "var(--text-xs)",
-              }}
+              className="nvr-btn mono sm"
+              style={{ width: "100%", justifyContent: "space-between" }}
               onClick={() => setShowAdvancedFilterBox((v) => !v)}
             >
               <span>
@@ -4749,22 +4667,20 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
         </div>
       </div>
+      </>
       )}
 
       {/* Vision AI Judge (genai) Configuration Card */}
       {isAiSubSectionVisible(activeSubSection, "genai") && (
-      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+      <>
+      {scopeDivider("global")}
+      <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span>
-              {isPt
-                ? "JUIZ DE IA VISUAL (GENAI) — AUDITORIA DE ALERTAS AMBÍGUOS & AUTO-SUPRESSÃO"
-                : "VISION AI JUDGE (GENAI) — AMBIGUOUS ALERT VERIFICATION & AUTO-SUPPRESSION"}
-            </span>
+            <span>{isPt ? "JUIZ DE IA VISUAL" : "VISION AI JUDGE"}</span>
             <span className="nvr-yaml-key-tag">genai</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span className="nvr-scope-pill is-global">{globalScopeBadge.label}</span>
             <span
               className={`nvr-badge ${
                 genaiCfg.enabled && Boolean(genaiCfg.model)
@@ -4822,8 +4738,7 @@ export const AiDetectionObjectsSection: React.FC<{
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns:
-                  "minmax(0, 1fr) minmax(0, 1.15fr) minmax(0, 0.95fr) minmax(0, 1.3fr)",
+                gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
                 gap: 8,
                 alignItems: "end",
               }}
@@ -5021,14 +4936,7 @@ export const AiDetectionObjectsSection: React.FC<{
                       ? "success"
                       : "primary"
                   }`}
-                  aria-label="Validate Vision AI Judge API"
-                  style={{
-                    marginTop: 2,
-                    height: 28,
-                    padding: "0 12px",
-                    whiteSpace: "nowrap",
-                    fontSize: "var(--text-xs)",
-                  }}
+                  aria-label="Validate Vision AI Judge API" style={{ marginTop: 2, whiteSpace: "nowrap" }}
                   disabled={genaiValidating}
                   onClick={() => void handleValidateGenAiApi()}
                 >
@@ -5115,15 +5023,23 @@ export const AiDetectionObjectsSection: React.FC<{
                   {genaiValidationState.message}
                 </div>
               )}
+          </div>
+        </div>
+      </div>
 
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-                gap: 12,
-                paddingTop: 4,
-              }}
-            >
+      <div className="nvr-cfg-card">
+        <div className="nvr-cfg-card-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>{isPt ? "AUTO-VERIFICAÇÃO & SUPRESSÃO" : "AUTO-VERIFY & SUPPRESSION"}</span>
+            <span className="nvr-yaml-key-tag">genai.verify_ambiguous_alerts</span>
+          </div>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
+          <div
+            className={!genaiCfg.enabled ? "nvr-cfg-disabled-zone" : ""}
+            style={{ display: "flex", flexDirection: "column", gap: 8 }}
+          >
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
                 <div className="nvr-field-meta">
                   <div className="nvr-field-label">
@@ -5176,7 +5092,7 @@ export const AiDetectionObjectsSection: React.FC<{
 
             <div
               className={!genaiCfg.verify_ambiguous_alerts ? "nvr-cfg-disabled-zone" : ""}
-              style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}
+              style={{ display: "flex", flexDirection: "column", gap: 4 }}
             >
               <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
                 <div className="nvr-field-meta">
@@ -5239,18 +5155,24 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
         </div>
       </div>
+      </>
       )}
 
       {/* Active False-Positive Memory Signatures Table */}
       {isAiSubSectionVisible(activeSubSection, "genai") && (
-      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+      <div
+        className={`nvr-cfg-card ${showFpMemory ? "" : "is-collapsed"}`}
+        style={{ gridColumn: "1 / -1" }}
+      >
         <div className="nvr-cfg-card-header">
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span>
-              {isPt
-                ? "MEMÓRIA DE FALSOS POSITIVOS ATIVA"
-                : "ACTIVE FALSE-POSITIVE MEMORY SIGNATURES"}
-            </span>
+            <CardCollapseToggle
+              open={showFpMemory}
+              onToggle={() => setShowFpMemory((v) => !v)}
+              title={isPt ? "MEMÓRIA DE FALSOS POSITIVOS" : "FALSE-POSITIVE MEMORY"}
+              count={filteredFpSignatures.length}
+              controlsId="nvr-fp-memory-body"
+            />
             <span className="nvr-yaml-key-tag">IoU &gt;= 0.72 · dhash64 &lt;= 12</span>
             <span className="nvr-yaml-key-tag">SQLite Live DB</span>
           </div>
@@ -5259,8 +5181,7 @@ export const AiDetectionObjectsSection: React.FC<{
               <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                 <button
                   type="button"
-                  className={`nvr-btn mono ${fpFilterMode === "scope" ? "active" : ""}`}
-                  style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn mono ${fpFilterMode === "scope" ? "active" : ""} sm`}
                   onClick={() => setFpFilterMode("scope")}
                 >
                   {inspectorCam.toUpperCase()} (
@@ -5276,22 +5197,16 @@ export const AiDetectionObjectsSection: React.FC<{
                 </button>
                 <button
                   type="button"
-                  className={`nvr-btn mono ${fpFilterMode === "all" ? "active" : ""}`}
-                  style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn mono ${fpFilterMode === "all" ? "active" : ""} sm`}
                   onClick={() => setFpFilterMode("all")}
                 >
                   {isPt ? "TODAS" : "ALL CAMERAS"} ({fpSignatures.length})
                 </button>
               </div>
             )}
-            <span className="mono">
-              {filteredFpSignatures.length}{" "}
-              {isPt ? "ASSINATURAS" : "SIGNATURES"}
-            </span>
             <button
               type="button"
-              className="nvr-btn mono"
-              style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              className="nvr-btn mono sm"
               onClick={() => void loadFpSignatures()}
             >
               {fpLoading
@@ -5304,7 +5219,8 @@ export const AiDetectionObjectsSection: React.FC<{
             </button>
           </div>
         </div>
-        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 6 }}>
+        {showFpMemory && (
+        <div id="nvr-fp-memory-body" className="nvr-cfg-card-body" style={{ padding: 10, gap: 6 }}>
           {filteredFpSignatures.length === 0 ? (
             <div
               className="mono"
@@ -5443,8 +5359,7 @@ export const AiDetectionObjectsSection: React.FC<{
                         <td style={{ padding: "5px 6px", textAlign: "right" }}>
                           <button
                             type="button"
-                            className="nvr-btn danger mono"
-                            style={{ height: 22, padding: "0 6px" }}
+                            className="nvr-btn danger mono sm"
                             aria-label={`Delete false-positive signature ${sig.id}`}
                             onClick={() => void handleDeleteFpSignature(sig.id)}
                           >
@@ -5459,23 +5374,21 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
           )}
         </div>
+        )}
       </div>
       )}
 
       {/* Face Recognition & Enrolled Gallery Card */}
       {isAiSubSectionVisible(activeSubSection, "faces") && (
-      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+      <>
+      {scopeDivider("global")}
+      <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span>
-              {isPt
-                ? "RECONHECIMENTO FACIAL LOCAL & GALERIA CADASTRADA (ARCFACE / ADAFACE 512-D)"
-                : "FACE RECOGNITION & ENROLLED GALLERY (ARCFACE / ADAFACE 512-D)"}
-            </span>
+            <span>{isPt ? "RECONHECIMENTO FACIAL" : "FACE RECOGNITION"}</span>
             <span className="nvr-yaml-key-tag">face_recognition</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span className="nvr-scope-pill is-global">{globalScopeBadge.label}</span>
             <span className={`nvr-badge ${faceCfg.enabled ? "live" : ""}`}>
               {faceCfg.enabled
                 ? isPt
@@ -5490,13 +5403,7 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
-              gap: 10,
-            }}
-          >
+          <div style={{ display: "flex", flexDirection: "column" }}>
             <div className="nvr-field-row" style={{ padding: "4px 0" }}>
               <div className="nvr-field-meta">
                 <div className="nvr-field-label">
@@ -5547,7 +5454,7 @@ export const AiDetectionObjectsSection: React.FC<{
             className={!faceCfg.enabled ? "nvr-cfg-disabled-zone" : ""}
             style={{
               display: "grid",
-              gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 0.8fr) minmax(0, 1.4fr)",
+              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
               gap: 10,
               alignItems: "end",
             }}
@@ -5626,108 +5533,23 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
           </div>
 
-          {/* Alert Suppression for Known Residents (exclude_sub_labels) */}
-          <div className="nvr-subcard" style={{ padding: "8px 10px", gap: 6 }}>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                flexWrap: "wrap",
-                gap: 8,
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                <span
-                  className="mono"
-                  style={{
-                    fontSize: "var(--text-xs)",
-                    fontWeight: 700,
-                    color: "var(--signal-accent-text)",
-                  }}
-                >
-                  {isPt
-                    ? "SUPRESSÃO DE ALERTA PARA MORADORES CONHECIDOS"
-                    : "RESIDENT ALERT SUPPRESSION — DOWNGRADE TO DETECTION"}
-                </span>
-                <span className="nvr-yaml-key-tag">review.alerts.exclude_sub_labels</span>
-                <span
-                  className={`nvr-scope-pill ${
-                    camOrGlobalBadge.isCameraScope ? "is-camera" : "is-global"
-                  }`}
-                >
-                  {camOrGlobalBadge.label}
-                </span>
-              </div>
-              <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-                <input
-                  className="nvr-input mono"
-                  style={{ width: 220, height: 24, fontSize: "var(--text-xs)" }}
-                  placeholder={
-                    isPt ? "Nome do morador (ex: Bruno)" : "Resident name (e.g. Bruno)"
-                  }
-                  aria-label="Exclude sub-label resident name"
-                  value={excludeSubLabelInput}
-                  onChange={(e) => setExcludeSubLabelInput(e.target.value)}
-                />
-                <button
-                  type="button"
-                  className="nvr-btn mono"
-                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                  onClick={() => {
-                    const clean = normalizeFaceProfileName(excludeSubLabelInput);
-                    if (!clean) return;
-                    handleToggleExcludeSubLabel(clean);
-                    setExcludeSubLabelInput("");
-                  }}
-                >
-                  {isPt ? "+ Suprimir Alerta" : "+ Suppress Alert"}
-                </button>
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
-              {Array.from(
-                new Set([
-                  ...enrolledProfiles.map((p) => p.name),
-                  ...activeExcludeSubLabels,
-                ])
-              ).map((personName) => {
-                const isExcluded = activeExcludeSubLabels.some(
-                  (x) => x.toLowerCase() === personName.toLowerCase()
-                );
-                return (
-                  <button
-                    key={personName}
-                    type="button"
-                    className={`nvr-btn mono ${isExcluded ? "active" : ""}`}
-                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                    onClick={() => handleToggleExcludeSubLabel(personName)}
-                    title={
-                      isPt
-                        ? "Alternar rebaixamento de alerta (alerta -> detecção) quando este morador for reconhecido"
-                        : "Toggle alert downgrade (alert -> detection) when this resident is recognized"
-                    }
-                  >
-                    {isExcluded
-                      ? isPt
-                        ? `✓ ${personName} (Rebaixado p/ Detecção)`
-                        : `✓ ${personName} (Downgraded to Detection)`
-                      : isPt
-                      ? `${personName} (Gera Alerta)`
-                      : `${personName} (Triggers Alert)`}
-                  </button>
-                );
-              })}
-              {enrolledProfiles.length === 0 && activeExcludeSubLabels.length === 0 && (
-                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                  {isPt
-                    ? "Nenhum morador configurado para supressão de alerta. Cadastre um perfil abaixo ou adicione o nome acima."
-                    : "No resident sub_labels excluded yet. Enroll a profile below or add a name above."}
-                </span>
-              )}
-            </div>
-          </div>
+        </div>
+      </div>
 
+      <div className={`nvr-cfg-card ${showFaceGallery ? "" : "is-collapsed"}`}>
+        <div className="nvr-cfg-card-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <CardCollapseToggle
+              open={showFaceGallery}
+              onToggle={() => setShowFaceGallery((v) => !v)}
+              title={isPt ? "PERFIS CADASTRADOS" : "ENROLLED FACES"}
+              count={enrolledProfiles.length}
+              controlsId="nvr-face-gallery-body"
+            />
+          </div>
+        </div>
+        {showFaceGallery && (
+        <div id="nvr-face-gallery-body" className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
           {/* Enrolled Profiles Gallery & Upload */}
           <div className="nvr-subcard" style={{ padding: "8px 10px" }}>
             <div
@@ -5747,8 +5569,8 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                 <input
-                  className="nvr-input mono"
-                  style={{ width: 220, height: 26, fontSize: "var(--text-xs)" }}
+                  className="nvr-input mono sm"
+                  style={{ width: 220 }}
                   placeholder={
                     isPt ? "Nome do perfil (ex: Bruno)" : "Profile name (e.g. Bruno)"
                   }
@@ -5758,8 +5580,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 />
                 <label className="nvr-file-picker">
                   <span
-                    className="nvr-btn mono"
-                    style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    className="nvr-btn mono sm"
                   >
                     {isPt ? "Escolher Foto..." : "Choose Photo..."}
                   </span>
@@ -5804,8 +5625,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 </label>
                 <button
                   type="button"
-                  className="nvr-btn primary mono"
-                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  className="nvr-btn primary mono sm"
                   disabled={enrollBusy}
                   onClick={handleEnrollProfile}
                 >
@@ -5843,8 +5663,7 @@ export const AiDetectionObjectsSection: React.FC<{
                   </span>
                   <button
                     type="button"
-                    className="nvr-btn danger mono"
-                    style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                    className="nvr-btn danger mono sm"
                     aria-label={`Delete face profile ${prof.name}`}
                     onClick={() => handleDeleteProfile(prof.name)}
                   >
@@ -5862,23 +5681,119 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
           </div>
         </div>
+        )}
       </div>
+
+      {scopeDivider("camera")}
+      <div className="nvr-cfg-card">
+        <div className="nvr-cfg-card-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>{isPt ? "SUPRESSÃO DE ALERTA PARA MORADORES" : "RESIDENT ALERT SUPPRESSION"}</span>
+            <span className="nvr-yaml-key-tag">review.alerts.exclude_sub_labels</span>
+          </div>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
+          {/* Alert Suppression for Known Residents (exclude_sub_labels) */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                flexWrap: "wrap",
+                gap: 8,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <span className="nvr-field-desc">
+                  {isPt
+                    ? "Moradores listados aqui viram detecção em vez de alerta."
+                    : "Residents listed here are downgraded from alert to detection."}
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                <input
+                  className="nvr-input mono sm"
+                  style={{ width: 220 }}
+                  placeholder={
+                    isPt ? "Nome do morador (ex: Bruno)" : "Resident name (e.g. Bruno)"
+                  }
+                  aria-label="Exclude sub-label resident name"
+                  value={excludeSubLabelInput}
+                  onChange={(e) => setExcludeSubLabelInput(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn mono sm"
+                  onClick={() => {
+                    const clean = normalizeFaceProfileName(excludeSubLabelInput);
+                    if (!clean) return;
+                    handleToggleExcludeSubLabel(clean);
+                    setExcludeSubLabelInput("");
+                  }}
+                >
+                  {isPt ? "+ Suprimir Alerta" : "+ Suppress Alert"}
+                </button>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              {Array.from(
+                new Set([
+                  ...enrolledProfiles.map((p) => p.name),
+                  ...activeExcludeSubLabels,
+                ])
+              ).map((personName) => {
+                const isExcluded = activeExcludeSubLabels.some(
+                  (x) => x.toLowerCase() === personName.toLowerCase()
+                );
+                return (
+                  <button
+                    key={personName}
+                    type="button"
+                    className={`nvr-btn mono ${isExcluded ? "active" : ""} sm`}
+                    onClick={() => handleToggleExcludeSubLabel(personName)}
+                    title={
+                      isPt
+                        ? "Alternar rebaixamento de alerta (alerta -> detecção) quando este morador for reconhecido"
+                        : "Toggle alert downgrade (alert -> detection) when this resident is recognized"
+                    }
+                  >
+                    {isExcluded
+                      ? isPt
+                        ? `✓ ${personName} (Rebaixado p/ Detecção)`
+                        : `✓ ${personName} (Downgraded to Detection)`
+                      : isPt
+                      ? `${personName} (Gera Alerta)`
+                      : `${personName} (Triggers Alert)`}
+                  </button>
+                );
+              })}
+              {enrolledProfiles.length === 0 && activeExcludeSubLabels.length === 0 && (
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                  {isPt
+                    ? "Nenhum morador configurado para supressão de alerta. Cadastre um rosto em Perfis Cadastrados ou adicione o nome acima."
+                    : "No resident sub_labels excluded yet. Enroll a face under Enrolled Faces or add a name above."}
+                </span>
+              )}
+            </div>
+          </div>
+
+        </div>
+      </div>
+      </>
       )}
 
       {/* License Plate Recognition (LPR) & Known Plates Card */}
       {isAiSubSectionVisible(activeSubSection, "lpr") && (
-      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+      <>
+      {scopeDivider("global")}
+      <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span>
-              {isPt
-                ? "RECONHECIMENTO DE PLACAS (LPR / ANPR) & PLACAS CONHECIDAS"
-                : "LICENSE PLATE RECOGNITION (LPR) & KNOWN PLATES"}
-            </span>
+            <span>{isPt ? "RECONHECIMENTO DE PLACAS (LPR)" : "LICENSE PLATE RECOGNITION (LPR)"}</span>
             <span className="nvr-yaml-key-tag">lpr</span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span className="nvr-scope-pill is-global">{globalScopeBadge.label}</span>
             <span className={`nvr-badge ${lprCfg.enabled ? "live" : ""}`}>
               {lprCfg.enabled
                 ? isPt
@@ -5893,14 +5808,7 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-              gap: 12,
-              alignItems: "center",
-            }}
-          >
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
             <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
               <div className="nvr-field-meta">
                 <div className="nvr-field-label">
@@ -5959,12 +5867,12 @@ export const AiDetectionObjectsSection: React.FC<{
             className={!lprCfg.enabled ? "nvr-cfg-disabled-zone" : ""}
             style={{
               display: "grid",
-              gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr)",
+              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
               gap: 10,
               alignItems: "end",
             }}
           >
-            <div>
+            <div style={{ gridColumn: "1 / -1" }}>
               <div
                 className="mono"
                 style={{
@@ -5982,8 +5890,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 </span>
                 <button
                   type="button"
-                  className="nvr-btn mono"
-                  style={{ height: 18, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                  className="nvr-btn mono sm"
                   onClick={() =>
                     updateLpr({ format_regex: DEFAULT_LPR_FORMAT_REGEX })
                   }
@@ -6053,6 +5960,128 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
           </div>
 
+          {/* Collapsible Diagnostic Drawer: Test LPR Scenario (Simulate Vehicle Pass) */}
+          <details className="nvr-diag-drawer">
+            <summary>
+              <span>
+                {isPt
+                  ? "▸ FERRAMENTA DE DIAGNÓSTICO: SIMULAR PASSAGEM DE VEÍCULO (TESTE DE PIPELINE LPR)"
+                  : "▸ DIAGNOSTIC TOOL: SIMULATE VEHICLE PASS (TEST LPR PIPELINE)"}
+              </span>
+              <span className="nvr-yaml-key-tag">/api/debug/lpr-simulate</span>
+            </summary>
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+                marginTop: 8,
+                paddingTop: 8,
+                borderTop: "1px solid var(--border-divider)",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  flexWrap: "wrap",
+                  gap: 8,
+                }}
+              >
+                <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt
+                    ? "Gera um frame sintético Mercosul, executa votação multi-frame LprTrackVoter + lookup known_plates e grava um evento de teste."
+                    : "Generates a synthetic Mercosul plate frame, runs LprTrackVoter multi-frame consensus + known_plates lookup, and persists a test event."}
+                </span>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  <select
+                    className="nvr-select mono sm"
+                    aria-label="Simulate LPR Camera"
+                    value={simLprCamera}
+                    onChange={(e) => setSimLprCamera(e.target.value)}
+                  >
+                    {(Object.keys(draftConfig.cameras || {}).length > 0
+                      ? Object.keys(draftConfig.cameras || {})
+                      : [inspectorCam || "escritorio"]
+                    ).map((c) => (
+                      <option key={c} value={c}>
+                        {c.toUpperCase()}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    className="nvr-input mono sm"
+                    aria-label="Simulate LPR Plate" style={{ width: 110, fontFamily: "var(--font-mono)" }}
+                    placeholder="BRA2E19"
+                    value={simLprPlate}
+                    onChange={(e) => setSimLprPlate(e.target.value.toUpperCase())}
+                  />
+                  {(["BRA2E19", "ABC1D23", "XYZ9876"] as const).map((presetPlate) => (
+                    <button
+                      key={presetPlate}
+                      type="button"
+                      className={`nvr-btn mono ${
+                        normalizeLicensePlate(simLprPlate) === presetPlate ? "active" : ""
+                      } sm`}
+                      onClick={() => setSimLprPlate(presetPlate)}
+                    >
+                      {presetPlate}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    className="nvr-btn success mono sm"
+                    disabled={simLprBusy}
+                    onClick={() => void handleSimulateLprPass()}
+                  >
+                    {simLprBusy
+                      ? isPt
+                        ? "Simulando..."
+                        : "Simulating..."
+                      : isPt
+                      ? "Simular Detecção de Placa Agora"
+                      : "Simulate Plate Detection Now"}
+                  </button>
+                </div>
+              </div>
+              {simLprLastResult && (
+                <div
+                  className="mono"
+                  style={{
+                    fontSize: "var(--text-xs)",
+                    color: "var(--signal-live-text)",
+                  }}
+                >
+                  ✓ Simulated Event #{simLprLastResult.eventId.slice(-8)} on{" "}
+                  {simLprLastResult.camera.toUpperCase()} · Plate:{" "}
+                  <strong>{simLprLastResult.plate}</strong>
+                  {simLprLastResult.subLabel
+                    ? ` · Matched Known Vehicle: ${simLprLastResult.subLabel}`
+                    : ""}
+                </div>
+              )}
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <div className={`nvr-cfg-card ${showKnownPlates ? "" : "is-collapsed"}`}>
+        <div className="nvr-cfg-card-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <CardCollapseToggle
+              open={showKnownPlates}
+              onToggle={() => setShowKnownPlates((v) => !v)}
+              title={isPt ? "PLACAS CONHECIDAS" : "KNOWN PLATES"}
+              count={Object.keys(lprCfg.known_plates || {}).length}
+              controlsId="nvr-known-plates-body"
+            />
+            <span className="nvr-yaml-key-tag">lpr.known_plates</span>
+          </div>
+        </div>
+        {showKnownPlates && (
+        <div id="nvr-known-plates-body" className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
           <div className="nvr-subcard" style={{ padding: "8px 10px" }}>
             <div
               style={{
@@ -6080,30 +6109,22 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                 <input
-                  className="nvr-input mono"
-                  aria-label="Known plate number"
-                  style={{
-                    width: 120,
-                    height: 24,
-                    fontSize: "var(--text-xs)",
-                    fontFamily: "var(--font-mono)",
-                  }}
+                  className="nvr-input mono sm"
+                  aria-label="Known plate number" style={{ width: 120, fontFamily: "var(--font-mono)" }}
                   placeholder="ABC1D23"
                   value={newKnownPlate}
                   onChange={(e) => setNewKnownPlate(e.target.value.toUpperCase())}
                 />
                 <input
-                  className="nvr-input"
-                  aria-label="Known plate vehicle label"
-                  style={{ width: 190, height: 24, fontSize: "var(--text-xs)" }}
+                  className="nvr-input sm"
+                  aria-label="Known plate vehicle label" style={{ width: 190 }}
                   placeholder={isPt ? "Ex: SUV da Família" : "e.g. Family SUV"}
                   value={newKnownPlateLabel}
                   onChange={(e) => setNewKnownPlateLabel(e.target.value)}
                 />
                 <button
                   type="button"
-                  className="nvr-btn primary mono"
-                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  className="nvr-btn primary mono sm"
                   onClick={() => {
                     const norm = normalizeLicensePlate(newKnownPlate || simLprPlate);
                     if (!norm) {
@@ -6162,8 +6183,7 @@ export const AiDetectionObjectsSection: React.FC<{
                   <span style={{ color: "var(--text-primary)" }}>→ {vehicleLabel}</span>
                   <button
                     type="button"
-                    className="nvr-btn danger mono"
-                    style={{ height: 18, padding: "0 4px", fontSize: "var(--text-xs)" }}
+                    className="nvr-btn danger mono sm"
                     aria-label={`Remove known plate ${plateKey}`}
                     onClick={() =>
                       updateLpr({
@@ -6235,12 +6255,7 @@ export const AiDetectionObjectsSection: React.FC<{
                       ) : (
                         <button
                           type="button"
-                          className="nvr-btn primary mono"
-                          style={{
-                            height: 18,
-                            padding: "0 6px",
-                            fontSize: "var(--text-xs)",
-                          }}
+                          className="nvr-btn primary mono sm"
                           onClick={() => {
                             const label =
                               newKnownPlateLabel.trim() ||
@@ -6271,134 +6286,26 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
             )}
           </div>
-
-          {/* Collapsible Diagnostic Drawer: Test LPR Scenario (Simulate Vehicle Pass) */}
-          <details className="nvr-diag-drawer">
-            <summary>
-              <span>
-                {isPt
-                  ? "▸ FERRAMENTA DE DIAGNÓSTICO: SIMULAR PASSAGEM DE VEÍCULO (TESTE DE PIPELINE LPR)"
-                  : "▸ DIAGNOSTIC TOOL: SIMULATE VEHICLE PASS (TEST LPR PIPELINE)"}
-              </span>
-              <span className="nvr-yaml-key-tag">/api/debug/lpr-simulate</span>
-            </summary>
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: 8,
-                marginTop: 8,
-                paddingTop: 8,
-                borderTop: "1px solid var(--border-divider)",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  flexWrap: "wrap",
-                  gap: 8,
-                }}
-              >
-                <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  {isPt
-                    ? "Gera um frame sintético Mercosul, executa votação multi-frame LprTrackVoter + lookup known_plates e grava um evento de teste."
-                    : "Generates a synthetic Mercosul plate frame, runs LprTrackVoter multi-frame consensus + known_plates lookup, and persists a test event."}
-                </span>
-
-                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                  <select
-                    className="nvr-select mono"
-                    aria-label="Simulate LPR Camera"
-                    style={{ height: 26, fontSize: "var(--text-xs)" }}
-                    value={simLprCamera}
-                    onChange={(e) => setSimLprCamera(e.target.value)}
-                  >
-                    {(Object.keys(draftConfig.cameras || {}).length > 0
-                      ? Object.keys(draftConfig.cameras || {})
-                      : [inspectorCam || "escritorio"]
-                    ).map((c) => (
-                      <option key={c} value={c}>
-                        {c.toUpperCase()}
-                      </option>
-                    ))}
-                  </select>
-                  <input
-                    className="nvr-input mono"
-                    aria-label="Simulate LPR Plate"
-                    style={{
-                      width: 110,
-                      height: 26,
-                      fontSize: "var(--text-xs)",
-                      fontFamily: "var(--font-mono)",
-                    }}
-                    placeholder="BRA2E19"
-                    value={simLprPlate}
-                    onChange={(e) => setSimLprPlate(e.target.value.toUpperCase())}
-                  />
-                  {(["BRA2E19", "ABC1D23", "XYZ9876"] as const).map((presetPlate) => (
-                    <button
-                      key={presetPlate}
-                      type="button"
-                      className={`nvr-btn mono ${
-                        normalizeLicensePlate(simLprPlate) === presetPlate ? "active" : ""
-                      }`}
-                      style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
-                      onClick={() => setSimLprPlate(presetPlate)}
-                    >
-                      {presetPlate}
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    className="nvr-btn success mono"
-                    style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                    disabled={simLprBusy}
-                    onClick={() => void handleSimulateLprPass()}
-                  >
-                    {simLprBusy
-                      ? isPt
-                        ? "Simulando..."
-                        : "Simulating..."
-                      : isPt
-                      ? "Simular Detecção de Placa Agora"
-                      : "Simulate Plate Detection Now"}
-                  </button>
-                </div>
-              </div>
-              {simLprLastResult && (
-                <div
-                  className="mono"
-                  style={{
-                    fontSize: "var(--text-xs)",
-                    color: "var(--signal-live-text)",
-                  }}
-                >
-                  ✓ Simulated Event #{simLprLastResult.eventId.slice(-8)} on{" "}
-                  {simLprLastResult.camera.toUpperCase()} · Plate:{" "}
-                  <strong>{simLprLastResult.plate}</strong>
-                  {simLprLastResult.subLabel
-                    ? ` · Matched Known Vehicle: ${simLprLastResult.subLabel}`
-                    : ""}
-                </div>
-              )}
-            </div>
-          </details>
         </div>
+        )}
       </div>
+      </>
       )}
 
       {/* ROI State Classifier Card (Gate Open/Closed, Parking Spot Occupied, Anomaly Mode) */}
       {isAiSubSectionVisible(activeSubSection, "state_rois") && (
-      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+      <>
+      <SettingsScopeDivider
+        group="camera"
+        scope={effectiveRoiCam}
+        inspectorCam={effectiveRoiCam}
+        cameraCount={scopeCameraCount}
+        isPt={isPt}
+      />
+      <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span>
-              {isPt
-                ? "MONITOR DE ESTADO DE ROI (PORTÃO ABERTO/FECHADO, VAGA & OBJETO FIXO)"
-                : "ROI STATE MONITOR (GATE OPEN/CLOSED, PARKING & FIXED OBJECTS)"}
-            </span>
+            <span>{isPt ? "NOVO MONITOR DE ESTADO" : "NEW STATE MONITOR"}</span>
             <span className="nvr-yaml-key-tag">
               cameras.{effectiveRoiCam}.state_rois
             </span>
@@ -6410,9 +6317,8 @@ export const AiDetectionObjectsSection: React.FC<{
                   {isPt ? "Câmera Alvo:" : "Target Camera:"}
                 </span>
                 <select
-                  className="nvr-select mono"
+                  className="nvr-select mono sm"
                   aria-label="ROI Target Camera"
-                  style={{ height: 22, fontSize: "var(--text-xs)", padding: "0 6px" }}
                   value={effectiveRoiCam}
                   onChange={(e) => setRoiTargetCam(e.target.value)}
                 >
@@ -6427,16 +6333,10 @@ export const AiDetectionObjectsSection: React.FC<{
                 </select>
               </div>
             )}
-            <span className="nvr-scope-pill is-camera">{roiCamBadge.label}</span>
-            <span className="nvr-badge">
-              {Object.keys(draftConfig.cameras?.[effectiveRoiCam]?.state_rois || {}).length}{" "}
-              {isPt ? "ROIS CONFIGURADOS" : "CONFIGURED ROIS"}
-            </span>
             {onOpenVectorStudio && (
               <button
                 type="button"
-                className="nvr-btn mono"
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className="nvr-btn mono sm"
                 onClick={onOpenVectorStudio}
                 title={
                   isPt
@@ -6550,7 +6450,7 @@ export const AiDetectionObjectsSection: React.FC<{
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "minmax(0, 1.1fr) minmax(0, 1.4fr) minmax(0, 1.3fr) auto",
+              gridTemplateColumns: "minmax(0, 1fr) auto",
               gap: 10,
               alignItems: "end",
             }}
@@ -6627,8 +6527,7 @@ export const AiDetectionObjectsSection: React.FC<{
                     <button
                       key={cropPreset}
                       type="button"
-                      className={`nvr-btn mono ${newRoiCrop === cropPreset ? "active" : ""}`}
-                      style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                      className={`nvr-btn mono ${newRoiCrop === cropPreset ? "active" : ""} sm`}
                       onClick={() => setNewRoiCrop(cropPreset)}
                     >
                       {label}
@@ -6651,8 +6550,7 @@ export const AiDetectionObjectsSection: React.FC<{
               <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
                 <button
                   type="button"
-                  className={`nvr-btn mono ${!newRoiAnomalyState.trim() ? "active" : ""}`}
-                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn mono ${!newRoiAnomalyState.trim() ? "active" : ""} sm`}
                   onClick={() => setNewRoiAnomalyState("")}
                 >
                   {isPt
@@ -6666,8 +6564,7 @@ export const AiDetectionObjectsSection: React.FC<{
                     <button
                       key={st}
                       type="button"
-                      className={`nvr-btn mono ${isSel ? "active" : ""}`}
-                      style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      className={`nvr-btn mono ${isSel ? "active" : ""} sm`}
                       onClick={() => setNewRoiAnomalyState(st)}
                     >
                       {isPt ? `Alertar quando '${st}'` : `Alert when ${st}`}
@@ -6681,8 +6578,7 @@ export const AiDetectionObjectsSection: React.FC<{
                       type="button"
                       className={`nvr-btn mono ${
                         newRoiAnomalyTimeoutSec === pill.sec ? "active" : ""
-                      }`}
-                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                      } sm`}
                       onClick={() => setNewRoiAnomalyTimeoutSec(pill.sec)}
                     >
                       {pill.label}
@@ -6694,7 +6590,6 @@ export const AiDetectionObjectsSection: React.FC<{
             <button
               type="button"
               className="nvr-btn success mono"
-              style={{ height: 28, padding: "0 12px", fontSize: "var(--text-xs)" }}
               onClick={() => {
                 const slug = slugifyRoiLocationName(newRoiName);
                 if (!slug || slug.length < 2) {
@@ -6860,7 +6755,27 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
             </div>
           </details>
+        </div>
+      </div>
 
+      <div className="nvr-cfg-card">
+        <div className="nvr-cfg-card-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>{isPt ? "MONITORES CONFIGURADOS" : "CONFIGURED MONITORS"}</span>
+            <span className="nvr-yaml-key-tag">cameras.{effectiveRoiCam}.state_rois</span>
+          </div>
+          <span className="nvr-badge">
+            {Object.keys(draftConfig.cameras?.[effectiveRoiCam]?.state_rois || {}).length}
+          </span>
+        </div>
+        <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
+          {Object.entries(draftConfig.cameras?.[effectiveRoiCam]?.state_rois || {}).length === 0 && (
+            <div className="nvr-field-desc">
+              {isPt
+                ? "Nenhum monitor nesta câmera. Crie um ao lado."
+                : "No monitors on this camera yet. Create one alongside."}
+            </div>
+          )}
           {Object.entries(draftConfig.cameras?.[effectiveRoiCam]?.state_rois || {}).length > 0 && (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {Object.entries(draftConfig.cameras?.[effectiveRoiCam]?.state_rois || {}).map(
@@ -6892,8 +6807,7 @@ export const AiDetectionObjectsSection: React.FC<{
                     <div style={{ display: "flex", gap: 4 }}>
                       <button
                         type="button"
-                        className="nvr-btn"
-                        style={{ height: 22, padding: "0 6px" }}
+                        className="nvr-btn sm"
                         title={
                           isPt
                             ? `Carregar ROI ${rName} para edição`
@@ -6916,8 +6830,7 @@ export const AiDetectionObjectsSection: React.FC<{
                       </button>
                       <button
                         type="button"
-                        className="nvr-btn danger"
-                        style={{ height: 22, padding: "0 6px" }}
+                        className="nvr-btn danger sm"
                         title={`Remove ROI ${rName}`}
                         onClick={() =>
                           updateDraft((next) => {
@@ -6937,6 +6850,7 @@ export const AiDetectionObjectsSection: React.FC<{
           )}
         </div>
       </div>
+      </>
       )}
     </div>
   );
@@ -7235,16 +7149,14 @@ export const DatasetStudioSection: React.FC<{
             </span>
             <button
               type="button"
-              className="nvr-btn mono"
-              style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              className="nvr-btn mono sm"
               onClick={() => void loadDatasetState()}
             >
               {isPt ? "Atualizar" : "Refresh"}
             </button>
             <button
               type="button"
-              className="nvr-btn mono"
-              style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              className="nvr-btn mono sm"
               disabled={busyAction === "batch-auto"}
               onClick={() => void handleBatchAutoAnnotate()}
             >
@@ -7256,12 +7168,7 @@ export const DatasetStudioSection: React.FC<{
             <a
               href="/api/dataset/export.zip"
               download="ninjanvr-yolo-dataset.zip"
-              className="nvr-btn primary mono"
-              style={{
-                height: 22,
-                padding: "0 8px",
-                fontSize: "var(--text-xs)",
-              }}
+              className="nvr-btn primary mono sm"
             >
               Export YOLO Dataset (.zip)
             </a>
@@ -7447,9 +7354,8 @@ export const DatasetStudioSection: React.FC<{
               </div>
 
               <select
-                className="nvr-select mono"
-                aria-label="Filter dataset samples by kind"
-                style={{ width: "100%", height: 26, fontSize: "var(--text-xs)" }}
+                className="nvr-select mono sm"
+                aria-label="Filter dataset samples by kind" style={{ width: "100%" }}
                 value={filterKind}
                 onChange={(e) => setFilterKind(e.target.value)}
               >
@@ -7560,9 +7466,8 @@ export const DatasetStudioSection: React.FC<{
                     CLASS (0..14):
                   </span>
                   <select
-                    className="nvr-select mono"
-                    aria-label="YOLO Security Class Selector"
-                    style={{ height: 24, width: 165, fontSize: "var(--text-xs)" }}
+                    className="nvr-select mono sm"
+                    aria-label="YOLO Security Class Selector" style={{ width: 165 }}
                     value={activeClassId}
                     onChange={(e) => setActiveClassId(Number(e.target.value))}
                   >
@@ -7579,8 +7484,7 @@ export const DatasetStudioSection: React.FC<{
                       <button
                         key={cls}
                         type="button"
-                        className={`nvr-btn mono ${isAct ? "active" : ""}`}
-                        style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                        className={`nvr-btn mono ${isAct ? "active" : ""} sm`}
                         onClick={() => setActiveClassId(idx)}
                       >
                         {idx}:{cls}
@@ -7593,8 +7497,7 @@ export const DatasetStudioSection: React.FC<{
                   <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                     <button
                       type="button"
-                      className={`nvr-btn mono ${selectedSample.verified ? "active" : ""}`}
-                      style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      className={`nvr-btn mono ${selectedSample.verified ? "active" : ""} sm`}
                       onClick={() =>
                         void handleUpdateSample(selectedSample, {
                           verified: !selectedSample.verified,
@@ -7605,8 +7508,7 @@ export const DatasetStudioSection: React.FC<{
                     </button>
                     <button
                       type="button"
-                      className="nvr-btn mono"
-                      style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      className="nvr-btn mono sm"
                       disabled={busyAction === `auto-${selectedSample.id}`}
                       onClick={() => void handleAutoAnnotateSample(selectedSample.id)}
                     >
@@ -7615,8 +7517,7 @@ export const DatasetStudioSection: React.FC<{
                     </button>
                     <button
                       type="button"
-                      className="nvr-btn danger mono"
-                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                      className="nvr-btn danger mono sm"
                       aria-label="Delete dataset sample"
                       onClick={() => void handleDeleteSample(selectedSample.id)}
                     >
@@ -7759,7 +7660,6 @@ export const DatasetStudioSection: React.FC<{
                   ? "active"
                   : "primary"
               }`}
-              style={{ height: 28, padding: "0 10px", fontSize: "var(--text-xs)" }}
               onClick={() => {
                 updateDraft?.((next) => {
                   next.model = applySecurity15ClassPreset(next.model);
@@ -7792,11 +7692,6 @@ export const DatasetStudioSection: React.FC<{
               target="_blank"
               rel="noopener noreferrer"
               className="nvr-btn success mono"
-              style={{
-                height: 28,
-                padding: "0 10px",
-                fontSize: "var(--text-xs)",
-              }}
             >
               <Sparkles size={11} />
               Launch Google Colab Notebook (G4 / A100 / T4)
@@ -7821,8 +7716,7 @@ export const DatasetStudioSection: React.FC<{
               </span>
               <button
                 type="button"
-                className="nvr-btn mono"
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className="nvr-btn mono sm"
                 onClick={() => {
                   const origin =
                     typeof window !== "undefined" && window.location?.origin
@@ -7969,13 +7863,7 @@ export const DatasetStudioSection: React.FC<{
           <button
             type="button"
             className="nvr-btn success mono"
-            style={{
-              width: "100%",
-              height: 28,
-              padding: "0 12px",
-              fontSize: "var(--text-xs)",
-              marginTop: "auto",
-            }}
+            style={{ width: "100%", marginTop: "auto" }}
             disabled={busyAction === "upload-model"}
             onClick={() => void handleUploadModel()}
           >

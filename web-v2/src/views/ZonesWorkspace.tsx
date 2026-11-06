@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Camera,
   CheckCircle2,
@@ -22,6 +22,8 @@ import {
 } from "../types/nvr";
 import { buildCleanYamlFromDraft } from "../utils/configYaml";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
+import { useNvrStore } from "../store/useNvrStore";
+import { countChangedSections, formatUnsavedLabel } from "../utils/settingsUx";
 import {
   ChannelsStreamsSection,
   ConsoleUiSection,
@@ -682,6 +684,8 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const draftRevisionRef = useRef<number>(0);
   const isMountedRef = useRef<boolean>(true);
+  const showYamlKeys = useNvrStore((s) => s.showYamlKeys);
+  const setShowYamlKeys = useNvrStore((s) => s.setShowYamlKeys);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -930,6 +934,18 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     setDraftPoints([]);
   };
 
+  const unsavedCount = useMemo(
+    () => (isDirty && config && draftConfig ? countChangedSections(config, draftConfig) : 0),
+    [isDirty, config, draftConfig]
+  );
+  const unsavedLabel = isDirty
+    ? activeCategory === "yaml" || unsavedCount === 0
+      ? isPt
+        ? "NÃO SALVO"
+        : "UNSAVED"
+      : formatUnsavedLabel(unsavedCount, isPt)
+    : "";
+
   const supportsGlobalAndCamScope =
     activeCategory === "ai" || activeCategory === "recording";
   const supportsCameraOnlyBar =
@@ -1006,14 +1022,6 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
       <aside className="nvr-settings-rail" aria-label="Settings Categories">
         <div className="nvr-panel-header">
           <span>{isPt ? "BANCADA DE CONFIGURAÇÕES" : "SETTINGS WORKBENCH"}</span>
-          {isDirty && (
-            <span
-              className="nvr-badge motion"
-              style={{ padding: "1px 5px", fontSize: "var(--text-xs)" }}
-            >
-              {isPt ? "NÃO SALVO" : "UNSAVED"}
-            </span>
-          )}
         </div>
         {categories.map((cat) => {
           const isActive = activeCategory === cat.id;
@@ -1074,7 +1082,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
       </aside>
 
       {/* Right Main Configuration Stage */}
-      <section className="nvr-settings-stage">
+      <section className={`nvr-settings-stage ${showYamlKeys ? "show-yaml-keys" : ""}`}>
         {/* Contextual Scope & Save Action Header */}
         <div className="nvr-settings-header">
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
@@ -1096,8 +1104,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 <span className="nvr-divider" aria-hidden="true" />
                 <button
                   type="button"
-                  className={`nvr-btn mono ${scope === "global" ? "active" : ""}`}
-                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn mono ${scope === "global" ? "active" : ""} sm`}
                   onClick={() => {
                     setScope("global");
                     setDraftPoints([]);
@@ -1158,6 +1165,11 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               </span>
             ) : activeCategory === "yaml" ? (
               <>
+                {unsavedLabel && (
+                  <span className="nvr-badge motion" role="status">
+                    {unsavedLabel}
+                  </span>
+                )}
                 {isDirty && (
                   <button
                     type="button"
@@ -1199,6 +1211,24 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               </>
             ) : (
               <>
+                <button
+                  type="button"
+                  className={`nvr-btn mono ${showYamlKeys ? "active" : ""}`}
+                  aria-pressed={showYamlKeys}
+                  onClick={() => setShowYamlKeys(!showYamlKeys)}
+                  title={
+                    isPt
+                      ? "Mostrar as chaves do config.yml ao lado de cada configuração"
+                      : "Show the config.yml key next to each setting"
+                  }
+                >
+                  {isPt ? "Chaves YAML" : "YAML keys"}
+                </button>
+                {unsavedLabel && (
+                  <span className="nvr-badge motion" role="status">
+                    {unsavedLabel}
+                  </span>
+                )}
                 {isDirty && (
                   <button
                     type="button"
@@ -1262,39 +1292,14 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
             {activeCategory === "console" && <ConsoleUiSection notify={notify} />}
 
             {draftConfig && activeCategory === "channels" && (
-              <>
-                <ChannelsStreamsSection
-                  draftConfig={draftConfig}
-                  updateDraft={updateDraft}
-                  inspectorCam={effectiveInspectorCam}
-                  setInspectorCam={switchInspectorCamera}
-                  ffprobeInfo={ffprobeInfo}
-                  notify={notify}
-                />
-                <div className="nvr-cfg-card">
-                  <div className="nvr-cfg-card-header">
-                    <span>CAMERA TECHNICAL & MAINTENANCE NOTES // {effectiveInspectorCam.toUpperCase()}</span>
-                    <span className="mono">cameras.{effectiveInspectorCam}.notes</span>
-                  </div>
-                  <div className="nvr-cfg-card-body">
-                    <textarea
-                      className="nvr-input mono"
-                      rows={3}
-                      style={{ width: "100%", height: "auto", padding: 8, resize: "vertical" }}
-                      placeholder="PoE switch port, lens focal length, mounting height, or maintenance log..."
-                      value={draftConfig.cameras?.[effectiveInspectorCam]?.notes || ""}
-                      onChange={(e) => {
-                        const val = e.target.value;
-                        updateDraft((next) => {
-                          if (next.cameras[effectiveInspectorCam]) {
-                            next.cameras[effectiveInspectorCam].notes = val;
-                          }
-                        });
-                      }}
-                    />
-                  </div>
-                </div>
-              </>
+              <ChannelsStreamsSection
+                draftConfig={draftConfig}
+                updateDraft={updateDraft}
+                inspectorCam={effectiveInspectorCam}
+                setInspectorCam={switchInspectorCamera}
+                ffprobeInfo={ffprobeInfo}
+                notify={notify}
+              />
             )}
 
             {draftConfig && activeCategory === "ai" && (

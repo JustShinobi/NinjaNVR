@@ -13,7 +13,7 @@ import {
   LiveLayoutMode,
   ThemeMode,
 } from "../../utils/format";
-import { TacticalCameraPicker } from "../../components/TacticalCameraPicker";
+import { SettingsScopeDivider } from "../../components/SettingsScopeDivider";
 
 const RESERVED_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -310,8 +310,7 @@ export const ConsoleUiSection: React.FC<{
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <button
                 type="button"
-                className="nvr-btn mono"
-                style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className="nvr-btn mono sm"
                 onClick={async () => {
                   try {
                     const res = await fetch("/api/notifications/test", {
@@ -370,8 +369,7 @@ export const ConsoleUiSection: React.FC<{
             <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
               <button
                 type="button"
-                className={`nvr-btn mono ${simulatedFleetCount === 0 ? "active" : ""}`}
-                style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className={`nvr-btn mono ${simulatedFleetCount === 0 ? "active" : ""} sm`}
                 onClick={() => {
                   if (simulatedFleetCount !== 0) {
                     setSimulatedFleetCount(0);
@@ -385,8 +383,7 @@ export const ConsoleUiSection: React.FC<{
                 <button
                   key={cnt}
                   type="button"
-                  className={`nvr-btn mono ${simulatedFleetCount === cnt ? "active" : ""}`}
-                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn mono ${simulatedFleetCount === cnt ? "active" : ""} sm`}
                   onClick={() => {
                     const next = simulatedFleetCount === cnt ? 0 : cnt;
                     setSimulatedFleetCount(next);
@@ -404,8 +401,7 @@ export const ConsoleUiSection: React.FC<{
                 <>
                   <button
                     type="button"
-                    className="nvr-btn primary mono"
-                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)", fontWeight: 700 }}
+                    className="nvr-btn primary mono sm"
                     onClick={() => {
                       useNvrStore.getState().setActiveTab("live");
                       if (typeof window !== "undefined") {
@@ -419,8 +415,7 @@ export const ConsoleUiSection: React.FC<{
                   </button>
                   <button
                     type="button"
-                    className="nvr-btn danger mono"
-                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)", fontWeight: 700 }}
+                    className="nvr-btn danger mono sm"
                     onClick={() => {
                       setSimulatedFleetCount(0);
                       notify(`Restored ${realCameraCount} physical cameras`);
@@ -442,8 +437,7 @@ export const ConsoleUiSection: React.FC<{
           </span>
           <button
             type="button"
-            className="nvr-btn"
-            style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+            className="nvr-btn sm"
             onClick={() => {
               resetUiPreferences();
               setLocale("en");
@@ -909,25 +903,12 @@ export const ChannelsStreamsSection: React.FC<{
       {/* Camera Matrix State Table */}
       <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header" style={{ flexWrap: "wrap" }}>
-          <span>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             {isPt
               ? `CANAIS DE CÂMERA & FUNÇÕES DE PIPELINE (${camKeys.length})`
               : `CAMERA CHANNELS & PIPELINE ROLES (${camKeys.length})`}
+            <span className="nvr-yaml-key-tag">cameras</span>
           </span>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <TacticalCameraPicker
-              cameras={camKeys}
-              selectedCamera={inspectorCam}
-              onSelect={setInspectorCam}
-              cameraGroups={draftConfig.camera_groups}
-              ariaLabel="Channel inspector selector"
-            />
-            <span className="mono" style={{ color: "var(--signal-accent-text)" }}>
-              {isPt
-                ? `INSPECIONANDO: ${inspectorCam.toUpperCase()}`
-                : `ACTIVE CHANNEL: ${inspectorCam.toUpperCase()}`}
-            </span>
-          </div>
         </div>
         <div style={{ overflowX: "auto" }}>
           <table className="nvr-table mono">
@@ -1043,8 +1024,7 @@ export const ChannelsStreamsSection: React.FC<{
                     <td onClick={(e) => e.stopPropagation()}>
                       <button
                         type="button"
-                        className="nvr-btn danger"
-                        style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                        className="nvr-btn danger sm"
                         disabled={camKeys.length <= 1}
                         title="Remove camera from configuration"
                         onClick={() => {
@@ -1070,6 +1050,13 @@ export const ChannelsStreamsSection: React.FC<{
       </div>
 
       <div className="nvr-card-grid">
+        <SettingsScopeDivider
+          group="camera"
+          scope={inspectorCam}
+          inspectorCam={inspectorCam}
+          cameraCount={camKeys.length}
+          isPt={isPt}
+        />
         {/* Selected Camera FFmpeg Inputs & Live Stream Mapping */}
         {activeCamCfg && (
           <div className="nvr-cfg-card">
@@ -1080,8 +1067,7 @@ export const ChannelsStreamsSection: React.FC<{
               </span>
               <button
                 type="button"
-                className="nvr-btn primary"
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className="nvr-btn primary sm"
                 onClick={() =>
                   updateDraft((next) => {
                     const cam = next.cameras[inspectorCam];
@@ -1121,8 +1107,7 @@ export const ChannelsStreamsSection: React.FC<{
                     </span>
                     <button
                       type="button"
-                      className="nvr-btn danger"
-                      style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                      className="nvr-btn danger sm"
                       disabled={(activeCamCfg.ffmpeg?.inputs?.length || 0) <= 1}
                       onClick={() =>
                         updateDraft((next) => {
@@ -1159,8 +1144,7 @@ export const ChannelsStreamsSection: React.FC<{
                         <button
                           key={role}
                           type="button"
-                          className={`nvr-btn mono ${hasRole ? "active" : ""}`}
-                          style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                          className={`nvr-btn mono ${hasRole ? "active" : ""} sm`}
                           onClick={() => handleToggleInputRole(idx, role)}
                         >
                           {role.toUpperCase()}
@@ -1193,8 +1177,7 @@ export const ChannelsStreamsSection: React.FC<{
                       <button
                         key={deg}
                         type="button"
-                        className={`nvr-btn mono ${curRot === deg ? "active" : ""}`}
-                        style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                        className={`nvr-btn mono ${curRot === deg ? "active" : ""} sm`}
                         onClick={() =>
                           updateDraft((next) => {
                             const cam = next.cameras[inspectorCam];
@@ -1263,8 +1246,7 @@ export const ChannelsStreamsSection: React.FC<{
                   }}
                 >
                   <input
-                    className="nvr-input mono"
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    className="nvr-input mono sm"
                     placeholder="ONVIF Host / IP (e.g. 192.0.2.50)"
                     aria-label="ONVIF Host"
                     value={activeCamCfg.onvif?.host || ""}
@@ -1286,8 +1268,7 @@ export const ChannelsStreamsSection: React.FC<{
                     type="number"
                     min={1}
                     max={65535}
-                    className="nvr-input mono"
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    className="nvr-input mono sm"
                     placeholder="Port (80)"
                     aria-label="ONVIF Port"
                     value={activeCamCfg.onvif?.port ?? 80}
@@ -1308,8 +1289,7 @@ export const ChannelsStreamsSection: React.FC<{
                     type="number"
                     min={1}
                     max={30}
-                    className="nvr-input mono"
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    className="nvr-input mono sm"
                     placeholder="Timeout (s)"
                     aria-label="ONVIF Timeout Seconds"
                     value={activeCamCfg.onvif?.timeout_sec ?? 5}
@@ -1336,8 +1316,7 @@ export const ChannelsStreamsSection: React.FC<{
                   }}
                 >
                   <input
-                    className="nvr-input mono"
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    className="nvr-input mono sm"
                     placeholder="ONVIF Username"
                     aria-label="ONVIF Username"
                     value={activeCamCfg.onvif?.user || ""}
@@ -1358,8 +1337,8 @@ export const ChannelsStreamsSection: React.FC<{
                   <div style={{ display: "flex", gap: 4 }}>
                     <input
                       type="password"
-                      className="nvr-input mono"
-                      style={{ flex: 1, minWidth: 0, height: 24, fontSize: "var(--text-xs)" }}
+                      className="nvr-input mono sm"
+                      style={{ flex: 1, minWidth: 0 }}
                       placeholder={
                         activeCamCfg.onvif?.has_password
                           ? "*** (password saved)"
@@ -1396,8 +1375,7 @@ export const ChannelsStreamsSection: React.FC<{
                         activeCamCfg.onvif.password !== "")) && (
                       <button
                         type="button"
-                        className="nvr-btn danger mono"
-                        style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        className="nvr-btn danger mono sm"
                         title="Clear saved ONVIF password"
                         aria-label="Clear ONVIF Password"
                         onClick={() => {
@@ -1419,8 +1397,7 @@ export const ChannelsStreamsSection: React.FC<{
                     )}
                   </div>
                   <input
-                    className="nvr-input mono"
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    className="nvr-input mono sm"
                     placeholder="Return Preset (e.g. home)"
                     aria-label="ONVIF Return Preset"
                     value={activeCamCfg.onvif?.return_preset || ""}
@@ -1461,8 +1438,7 @@ export const ChannelsStreamsSection: React.FC<{
                 </span>
                 <button
                   type="button"
-                  className="nvr-btn mono"
-                  style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  className="nvr-btn mono sm"
                   disabled={probeBusy}
                   onClick={() =>
                     handleRunStreamProbe(activeCamCfg.ffmpeg?.inputs?.[0]?.path)
@@ -1570,9 +1546,49 @@ export const ChannelsStreamsSection: React.FC<{
           </div>
         )}
 
+        {/* Camera Technical & Maintenance Notes */}
+        {activeCamCfg && (
+          <div className="nvr-cfg-card" style={{ alignSelf: "start" }}>
+            <div className="nvr-cfg-card-header">
+              <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                {isPt ? "NOTAS TÉCNICAS & MANUTENÇÃO" : "TECHNICAL & MAINTENANCE NOTES"}
+                <span className="nvr-yaml-key-tag">cameras.{inspectorCam}.notes</span>
+              </span>
+            </div>
+            <div className="nvr-cfg-card-body">
+              <textarea
+                className="nvr-input mono"
+                rows={4}
+                style={{ width: "100%", height: "auto", padding: 8, resize: "vertical" }}
+                aria-label={isPt ? "Notas da câmera" : "Camera notes"}
+                placeholder={
+                  isPt
+                    ? "Porta do switch PoE, distância focal, altura de instalação ou log de manutenção..."
+                    : "PoE switch port, lens focal length, mounting height, or maintenance log..."
+                }
+                value={activeCamCfg.notes || ""}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  updateDraft((next) => {
+                    if (next.cameras[inspectorCam]) {
+                      next.cameras[inspectorCam].notes = val;
+                    }
+                  });
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        <SettingsScopeDivider
+          group="global"
+          scope="global"
+          inspectorCam={inspectorCam}
+          cameraCount={camKeys.length}
+          isPt={isPt}
+        />
         {/* Add New Camera + go2rtc Restream Registry */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <div className="nvr-cfg-card">
+        <div className="nvr-cfg-card" style={{ alignSelf: "start" }}>
             <div className="nvr-cfg-card-header">
               <span>
                 {isPt ? "ADICIONAR NOVO CANAL DE CÂMERA" : "ADD NEW CAMERA CHANNEL"}
@@ -1619,7 +1635,7 @@ export const ChannelsStreamsSection: React.FC<{
             </div>
           </div>
 
-          <div className="nvr-cfg-card">
+          <div className="nvr-cfg-card" style={{ alignSelf: "start" }}>
             <div className="nvr-cfg-card-header">
               <span>
                 GO2RTC RESTREAM REGISTRY ({filteredGo2rtcEntries.length}/
@@ -1627,8 +1643,7 @@ export const ChannelsStreamsSection: React.FC<{
               </span>
               <button
                 type="button"
-                className={`nvr-btn mono ${showAllGo2rtc ? "active" : ""}`}
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className={`nvr-btn mono ${showAllGo2rtc ? "active" : ""} sm`}
                 onClick={() => setShowAllGo2rtc((v) => !v)}
               >
                 <RefreshCw size={11} />
@@ -1671,8 +1686,8 @@ export const ChannelsStreamsSection: React.FC<{
                       {sName}
                     </span>
                     <input
-                      className="nvr-input mono"
-                      style={{ flex: 1, height: 24, fontSize: "var(--text-xs)" }}
+                      className="nvr-input mono sm"
+                      style={{ flex: 1 }}
                       aria-label={`go2rtc stream ${sName}`}
                       value={urlStr}
                       onChange={(e) => {
@@ -1685,8 +1700,7 @@ export const ChannelsStreamsSection: React.FC<{
                     />
                     <button
                       type="button"
-                      className="nvr-btn danger"
-                      style={{ height: 24, padding: "0 6px" }}
+                      className="nvr-btn danger sm"
                       onClick={() =>
                         updateDraft((next) => {
                           if (next.go2rtc?.streams) {
@@ -1738,7 +1752,6 @@ export const ChannelsStreamsSection: React.FC<{
               </div>
             </div>
           </div>
-        </div>
       </div>
     </div>
   );

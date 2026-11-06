@@ -43,6 +43,7 @@ import {
 } from "../views/settings/RecordingAndSecurityPanels";
 import {
   AI_SETTINGS_SUBSECTIONS,
+  DEFAULT_AI_SUBSECTION,
   AiDetectionObjectsSection,
   buildLocalFinetuneCliCommand,
   buildModelUploadPayload,
@@ -1052,15 +1053,17 @@ describe("Phase 4C Cycle-2 — Review, Explore, Exports, System & Settings panel
 
   test("VisionAndAiPanels Settings UI/UX: standardizes scope badges, sub-navigation, SSD attribute warnings, FP filtering, disabled zones, and i18n strings", () => {
     // 1. Sub-navigation pills & visibility helper
+    // The section opens on a single module; "All Modules" is the last pill.
     expect(AI_SETTINGS_SUBSECTIONS.map((s) => s.id)).toEqual([
-      "all",
       "engine",
       "objects",
       "genai",
       "faces",
       "lpr",
       "state_rois",
+      "all",
     ]);
+    expect(DEFAULT_AI_SUBSECTION).toBe("engine");
     expect(isAiSubSectionVisible("all", "engine")).toBe(true);
     expect(isAiSubSectionVisible("all", "state_rois")).toBe(true);
     expect(isAiSubSectionVisible("faces", "faces")).toBe(true);
@@ -1286,11 +1289,17 @@ describe("Phase 4C Cycle-2 — Review, Explore, Exports, System & Settings panel
         scope: "escritorio",
         inspectorCam: "escritorio",
         notify: () => {},
+        initialSubSection: "all",
+        initialDataCardsOpen: true,
       })
     );
 
     expect(html).toContain("nvr-settings-subnav");
-    expect(html).toContain("nvr-scope-pill");
+    // Scope is shown once per group by dividers, not repeated as per-card pills.
+    expect(html).toContain("nvr-scope-divider");
+    expect(html).toContain("GLOBAL · 1 CAMERA");
+    expect(html).toContain("ESCRITORIO · THIS CAMERA ONLY");
+    expect(html).not.toContain("nvr-scope-pill");
     expect(html).toContain("nvr-yaml-key-tag");
     expect(html).toContain("nvr-cfg-disabled-zone");
     expect(html).toContain("nvr-file-picker");

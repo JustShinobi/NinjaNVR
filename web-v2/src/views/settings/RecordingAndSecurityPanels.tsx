@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { KeyRound, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { useI18n } from "../../i18n";
+import { SettingsScopeDivider } from "../../components/SettingsScopeDivider";
 import {
   AudioConfig,
   AuthConfig,
@@ -363,17 +364,23 @@ export const RecordingReviewSection: React.FC<{
 
   return (
     <div className="nvr-card-grid">
+      <SettingsScopeDivider
+        group="camera"
+        scope={scope}
+        inspectorCam={inspectorCam}
+        cameraCount={Object.keys(draftConfig.cameras || {}).length}
+        isPt={isPt}
+      />
       {/* Recording & Retention Card */}
       <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
-          <span>
-            {isPt ? "GRAVAÇÃO MP4 & RETENÇÃO" : "MP4 RECORDING & RETENTION"} (
-            {scope === "global" ? "GLOBAL" : inspectorCam.toUpperCase()})
+          <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            {isPt ? "GRAVAÇÃO MP4 & RETENÇÃO" : "MP4 RECORDING & RETENTION"}
+            <span className="nvr-yaml-key-tag">record</span>
           </span>
           <button
             type="button"
-            className="nvr-btn"
-            style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+            className="nvr-btn sm"
             onClick={() => {
               updateDraft((next) => {
                 Object.values(next.cameras).forEach((cam) => {
@@ -1026,11 +1033,11 @@ export const RecordingReviewSection: React.FC<{
       {/* Snapshots & Review Classification Rules */}
       <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
-          <span>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             {isPt
               ? "SNAPSHOTS & CLASSIFICAÇÃO DE REVISÃO"
-              : "SNAPSHOTS & REVIEW CLASSIFICATION"}{" "}
-            ({scope === "global" ? "GLOBAL" : inspectorCam.toUpperCase()})
+              : "SNAPSHOTS & REVIEW CLASSIFICATION"}
+            <span className="nvr-yaml-key-tag">snapshots · review · audio</span>
           </span>
         </div>
         <div className="nvr-cfg-card-body">
@@ -1218,8 +1225,7 @@ export const RecordingReviewSection: React.FC<{
                   <button
                     key={lbl}
                     type="button"
-                    className={`nvr-btn mono ${on ? "active" : ""}`}
-                    style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    className={`nvr-btn mono ${on ? "active" : ""} sm`}
                     onClick={() =>
                       mutateRev((rv) => {
                         const curr = rv.alerts.labels || ["person", "car"];
@@ -1250,8 +1256,7 @@ export const RecordingReviewSection: React.FC<{
                       <button
                         key={z}
                         type="button"
-                        className={`nvr-btn mono ${on ? "active" : ""}`}
-                        style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                        className={`nvr-btn mono ${on ? "active" : ""} sm`}
                         onClick={() =>
                           mutateRev((rv) => {
                             const curr = rv.alerts.required_zones || [];
@@ -1396,8 +1401,7 @@ export const RecordingReviewSection: React.FC<{
                   <button
                     key={dbVal}
                     type="button"
-                    className={`nvr-btn mono ${(activeAudio.min_volume_dbfs ?? -60) === dbVal ? "active" : ""}`}
-                    style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    className={`nvr-btn mono ${(activeAudio.min_volume_dbfs ?? -60) === dbVal ? "active" : ""} sm`}
                     onClick={() =>
                       mutateAudio((a) => {
                         a.enabled = true;
@@ -1715,10 +1719,11 @@ export const CommsAuthUsersSection: React.FC<{
       {/* MQTT Broker Configuration */}
       <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
-          <span>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             {isPt
               ? "BROKER MQTT & TELEMETRIA HOME ASSISTANT"
               : "MQTT TELEMETRY & HOME ASSISTANT BROKER"}
+            <span className="nvr-yaml-key-tag">mqtt</span>
           </span>
           <ToggleSwitch
             checked={mqttCfg.enabled}
@@ -1861,10 +1866,11 @@ export const CommsAuthUsersSection: React.FC<{
       {/* Authentication, JWT & TLS Card */}
       <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
-          <span>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             {isPt
               ? "AUTENTICAÇÃO JWT, TLS & BANCO DE DADOS"
               : "JWT AUTHENTICATION, TLS & DATABASE"}
+            <span className="nvr-yaml-key-tag">auth · tls · database</span>
           </span>
           <ShieldCheck size={13} color="var(--signal-live-text)" />
         </div>
@@ -2014,8 +2020,7 @@ export const CommsAuthUsersSection: React.FC<{
                   <td style={{ fontWeight: 700 }}>{u.username}</td>
                   <td>
                     <select
-                      className="nvr-select mono"
-                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      className="nvr-select mono sm"
                       aria-label={`Role for ${u.username}`}
                       value={u.role}
                       onChange={(e) => handleRoleChange(u.username, e.target.value)}
@@ -2028,8 +2033,8 @@ export const CommsAuthUsersSection: React.FC<{
                   <td>
                     <input
                       key={`${u.username}-${u.allowed_cameras || "*"}`}
-                      className="nvr-input mono"
-                      style={{ height: 24, width: 140, fontSize: "var(--text-xs)" }}
+                      className="nvr-input mono sm"
+                      style={{ width: 140 }}
                       aria-label={`Allowed cameras for ${u.username}`}
                       defaultValue={u.allowed_cameras || "*"}
                       disabled={u.role === "admin"}
@@ -2055,24 +2060,22 @@ export const CommsAuthUsersSection: React.FC<{
                         <>
                           <input
                             type="password"
-                            className="nvr-input mono"
-                            style={{ height: 24, width: 150, fontSize: "var(--text-xs)" }}
+                            className="nvr-input mono sm"
+                            style={{ width: 150 }}
                             placeholder="New password..."
                             value={pwResetValue}
                             onChange={(e) => setPwResetValue(e.target.value)}
                           />
                           <button
                             type="button"
-                            className="nvr-btn success"
-                            style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                            className="nvr-btn success sm"
                             onClick={() => handlePasswordReset(u.username)}
                           >
                             Save
                           </button>
                           <button
                             type="button"
-                            className="nvr-btn"
-                            style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                            className="nvr-btn sm"
                             onClick={() => {
                               setPwResetTarget(null);
                               setPwResetValue("");
@@ -2084,8 +2087,7 @@ export const CommsAuthUsersSection: React.FC<{
                       ) : (
                         <button
                           type="button"
-                          className="nvr-btn"
-                          style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                          className="nvr-btn sm"
                           onClick={() => {
                             setPwResetTarget(u.username);
                             setPwResetValue("");
@@ -2097,8 +2099,7 @@ export const CommsAuthUsersSection: React.FC<{
                       )}
                       <button
                         type="button"
-                        className="nvr-btn danger"
-                        style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                        className="nvr-btn danger sm"
                         disabled={users.length <= 1}
                         title="Delete user account"
                         onClick={() => handleDeleteUser(u.username)}
@@ -2200,8 +2201,7 @@ export const CommsAuthUsersSection: React.FC<{
               </span>
               <button
                 type="button"
-                className="nvr-btn success mono"
-                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className="nvr-btn success mono sm"
                 onClick={async () => {
                   try {
                     await navigator.clipboard?.writeText(createdPlaintextToken);
@@ -2235,8 +2235,7 @@ export const CommsAuthUsersSection: React.FC<{
                     <td>
                       <button
                         type="button"
-                        className="nvr-btn danger"
-                        style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                        className="nvr-btn danger sm"
                         onClick={() => handleRevokeToken(tk.id)}
                       >
                         <Trash2 size={11} />
@@ -2280,21 +2279,27 @@ export const CommsAuthUsersSection: React.FC<{
             </button>
           </div>
 
-          <div
-            className="nvr-subcard"
-            style={{
-              marginTop: 4,
-              display: "flex",
-              flexDirection: "column",
-              gap: 10,
-            }}
-          >
+        </div>
+      </div>
+
+      {/* SSO: OpenID Connect & Trusted-Proxy ForwardAuth */}
+      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="nvr-cfg-card-header">
+          <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            {isPt
+              ? "SSO OPENID CONNECT & FORWARDAUTH"
+              : "OPENID CONNECT (OIDC) SSO & TRUSTED-PROXY FORWARDAUTH"}
+            <span className="nvr-yaml-key-tag">auth.oidc · auth.proxy</span>
+          </span>
+        </div>
+        <div className="nvr-cfg-card-body">
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-              <strong className="mono" style={{ fontSize: 12, color: "var(--text-primary)" }}>
+              <span className="nvr-field-desc">
                 {isPt
-                  ? "SSO OPENID CONNECT (AUTHELIA / ZITADEL) & FORWARDAUTH"
-                  : "OPENID CONNECT (OIDC) SSO & TRUSTED-PROXY FORWARDAUTH"}
-              </strong>
+                  ? "Login único via OIDC (Authelia, Zitadel) ou cabeçalhos de um proxy confiável."
+                  : "Single sign-on through OIDC (Authelia, Zitadel) or headers from a trusted proxy."}
+              </span>
               <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                 <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   OIDC SSO:
@@ -2506,16 +2511,16 @@ export const CommsAuthUsersSection: React.FC<{
       {/* Multi-Node NVR Federation (Single Glass Console) Card */}
       <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
         <div className="nvr-cfg-card-header">
-          <span>
+          <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
             {isPt
               ? `FEDERAÇÃO MULTI-NÓ NVR (${Object.keys(draftConfig.peers || {}).length + 1} NÓS)`
               : `MULTI-NODE NVR FEDERATION (${Object.keys(draftConfig.peers || {}).length + 1} NODES)`}
+            <span className="nvr-yaml-key-tag">peers</span>
           </span>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <button
               type="button"
-              className="nvr-btn mono"
-              style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              className="nvr-btn mono sm"
               onClick={async () => {
                 try {
                   const res = await fetch("/api/federation/nodes", { credentials: "include" });
@@ -2575,8 +2580,7 @@ export const CommsAuthUsersSection: React.FC<{
                       />
                       <button
                         type="button"
-                        className="nvr-btn danger mono"
-                        style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        className="nvr-btn danger mono sm"
                         onClick={() =>
                           updateDraft((next) => {
                             if (next.peers) {

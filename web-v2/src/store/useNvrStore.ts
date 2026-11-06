@@ -289,6 +289,7 @@ interface NvrRealtimeState {
   firstWeekday: FirstWeekday;
   themeMode: ThemeMode;
   highContrast: boolean;
+  showYamlKeys: boolean;
   timeShiftTs: number | null;
   playbackSpeed: number;
   simulatedFleetCount: SimulatedFleetCount;
@@ -324,6 +325,7 @@ interface NvrRealtimeState {
   setFirstWeekday: (day: FirstWeekday) => void;
   setThemeMode: (mode: ThemeMode) => void;
   setHighContrast: (fnOrVal: boolean | ((prev: boolean) => boolean)) => void;
+  setShowYamlKeys: (val: boolean) => void;
   setTimeShiftTs: (ts: number | null) => void;
   setPlaybackSpeed: (spd: number) => void;
   setSimulatedFleetCount: (count: SimulatedFleetCount) => void;
@@ -360,6 +362,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
   firstWeekday: resolveInitialFirstWeekday(),
   themeMode: resolveInitialThemeMode(),
   highContrast: resolveInitialBool("ninjanvr_high_contrast", false),
+  showYamlKeys: resolveInitialBool("ninjanvr_show_yaml_keys", false),
   timeShiftTs: null,
   playbackSpeed: resolveInitialPlaybackSpeed(),
   simulatedFleetCount: resolveInitialSimulatedFleetCount(),
@@ -478,6 +481,10 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       applyThemeToDocument(s.themeMode, next);
       return { highContrast: next };
     }),
+  setShowYamlKeys: (showYamlKeys) => {
+    safeStorageSet("ninjanvr_show_yaml_keys", String(showYamlKeys));
+    set({ showYamlKeys });
+  },
   setTimeShiftTs: (timeShiftTs) =>
     set({
       timeShiftTs:
@@ -556,6 +563,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       "ninjanvr_first_weekday",
       "ninjanvr_theme_mode",
       "ninjanvr_high_contrast",
+      "ninjanvr_show_yaml_keys",
       "ninjanvr_playback_speed",
       "ninjanvr_simulated_fleet_count",
     ].forEach((k) => safeStorageRemove(k));
@@ -578,6 +586,7 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       firstWeekday: "sunday",
       themeMode: "dark",
       highContrast: false,
+      showYamlKeys: false,
       playbackSpeed: 1,
       simulatedFleetCount: 0,
     });
