@@ -588,6 +588,28 @@ pub fn probe_mp4_audio_dbfs_fast(path: &Path) -> i64 {
     0
 }
 
+fn is_known_iso_top_level_box(btype: &[u8; 4]) -> bool {
+    matches!(
+        btype,
+        b"ftyp"
+            | b"styp"
+            | b"moov"
+            | b"moof"
+            | b"mdat"
+            | b"free"
+            | b"skip"
+            | b"wide"
+            | b"uuid"
+            | b"pdin"
+            | b"meta"
+            | b"sidx"
+            | b"ssix"
+            | b"prft"
+            | b"emsg"
+            | b"mfra"
+    )
+}
+
 /// Fast pure-Rust ISO-BMFF `moov` inspection helper that returns `true` when the MP4 container
 /// carries an audio (`soun`) track with non-empty samples (or a `soun` `trak` box).
 pub fn mp4_file_has_audio_track(path: &Path) -> bool {
@@ -599,6 +621,9 @@ pub fn mp4_file_has_audio_track(path: &Path) -> bool {
         return true;
     }
     let file_len = meta.len();
+    if file_len < 8 {
+        return false;
+    }
     let Ok(mut file) = std::fs::File::open(path) else {
         return true;
     };
@@ -615,6 +640,9 @@ pub fn mp4_file_has_audio_track(path: &Path) -> bool {
         }
         let size32 = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
         let btype = [hdr[4], hdr[5], hdr[6], hdr[7]];
+        if boxes_seen == 1 && !is_known_iso_top_level_box(&btype) {
+            return false;
+        }
         let (box_size, hdr_len) = if size32 == 1 {
             if pos.checked_add(16).is_none_or(|end| end > file_len) {
                 return true;
@@ -649,7 +677,7 @@ pub fn mp4_file_has_audio_track(path: &Path) -> bool {
         }
         pos = next_pos;
     }
-    file_len > 0 && pos != file_len
+    pos != file_len
 }
 
 fn moov_has_soun_trak(moov: &[u8]) -> bool {
@@ -5132,6 +5160,20 @@ cameras:
         let no_hdlr_path = root.join("no_hdlr_mdia.mp4");
         std::fs::write(&no_hdlr_path, &no_hdlr_mdia).unwrap();
         assert!(mp4_file_has_audio_track(&no_hdlr_path));
+
+        // 4. Synthetic non-ISO test byte payloads (first 8 bytes do not start with a known ISO-BMFF 4CC) return false
+        for (idx, payload) in [
+            vec![0x42u8; 4096],
+            (0u8..64u8).collect::<Vec<u8>>(),
+            b"REDACTED_V1_BYTES".to_vec(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let non_iso_path = root.join(format!("synthetic_non_iso_{idx}.mp4"));
+            std::fs::write(&non_iso_path, &payload).unwrap();
+            assert!(!mp4_file_has_audio_track(&non_iso_path));
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
