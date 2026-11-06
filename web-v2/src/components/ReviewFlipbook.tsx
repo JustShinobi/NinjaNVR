@@ -19,7 +19,7 @@ export function sanitizeReviewFrameUrls(reviewId: string, payload: unknown): str
   const out: string[] = [];
   for (const frame of frames) {
     const url = typeof frame?.url === "string" ? frame.url : "";
-    if (url.startsWith(prefix) && /^\d{1,2}\.jpg$/.test(url.slice(prefix.length))) {
+    if (url.startsWith(prefix) && /^\d{1,16}\.jpg$/.test(url.slice(prefix.length))) {
       out.push(url);
     }
     if (out.length >= 16) break;

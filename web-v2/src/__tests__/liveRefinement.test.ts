@@ -118,8 +118,9 @@ describe("ReviewFlipbook", () => {
   test("keeps only same-origin frame URLs for the same review", () => {
     const urls = sanitizeReviewFrameUrls("rev_1", {
       frames: [
-        { url: "/api/review/rev_1/frames/0.jpg" },
-        { url: "/api/review/rev_1/frames/1.jpg" },
+        { url: "/api/review/rev_1/frames/1793984364123.jpg" },
+        { url: "/api/review/rev_1/frames/1793984365123.jpg" },
+        { url: "/api/review/rev_1/frames/12345678901234567.jpg" },
         { url: "/api/review/other/frames/2.jpg" },
         { url: "https://evil.example/frames/3.jpg" },
         { url: "/api/review/rev_1/frames/../../x.jpg" },
@@ -127,7 +128,11 @@ describe("ReviewFlipbook", () => {
         { url: 5 },
       ],
     });
-    expect(urls).toEqual(["/api/review/rev_1/frames/0.jpg", "/api/review/rev_1/frames/1.jpg"]);
+    // Frames are named by capture time in ms; absurdly long names are rejected.
+    expect(urls).toEqual([
+      "/api/review/rev_1/frames/1793984364123.jpg",
+      "/api/review/rev_1/frames/1793984365123.jpg",
+    ]);
     expect(sanitizeReviewFrameUrls("../x", { frames: [] })).toEqual([]);
     expect(sanitizeReviewFrameUrls("rev_1", null)).toEqual([]);
   });
