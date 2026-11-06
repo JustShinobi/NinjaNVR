@@ -13,7 +13,7 @@ use ninjanvr_server::{
     generate_self_signed_tls_config_with_sans, new_app_state,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Semaphore, watch};
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tracing::{error, info, warn};
@@ -534,18 +534,26 @@ async fn main() -> Result<()> {
     let camera_metrics = state.camera_metrics.clone();
     let app_http = build_router_with_auth(state.clone(), false);
     let app_https = build_router_with_auth(state, true);
-    let shutdown_notify = Arc::new(Notify::new());
+    let (shutdown_tx, mut http_shutdown_rx) = watch::channel(false);
 
     // 1. Spawn HTTP server on :5000 (internal / healthcheck port) with strict x-peer-ip sanitization
     let http_addr = SocketAddr::from(([0, 0, 0, 0], http_port));
     let http_listener = TcpListener::bind(http_addr).await?;
     let http_conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    let http_shutdown = shutdown_notify.clone();
     info!("Listening on HTTP http://{http_addr}");
     tokio::spawn(async move {
         loop {
+            if *http_shutdown_rx.borrow() {
+                break;
+            }
             let (tcp_stream, remote_addr) = tokio::select! {
-                _ = http_shutdown.notified() => break,
+                biased;
+                _ = http_shutdown_rx.changed() => {
+                    if *http_shutdown_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
                 res = http_listener.accept() => match res {
                     Ok(conn) => conn,
                     Err(err) => {
@@ -607,8 +615,9 @@ async fn main() -> Result<()> {
 
     loop {
         let (tcp_stream, remote_addr) = tokio::select! {
+            biased;
             _ = &mut shutdown_signal => {
-                shutdown_notify.notify_waiters();
+                let _ = shutdown_tx.send(true);
                 break;
             }
             res = https_listener.accept() => match res {
@@ -919,5 +928,70 @@ mod tests {
         );
         assert_eq!(cli_eq.http_port, 5090);
         assert_eq!(cli_eq.https_port, 8999);
+    }
+
+    #[tokio::test]
+    async fn watch_shutdown_with_biased_select_terminates_accept_loop_immediately_when_concurrent_ready()
+     {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Case 1: Shutdown signal fired BEFORE entering the accept loop while TCP clients are already queued
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let _queued_client1 = TcpStream::connect(addr).await.unwrap();
+        let _queued_client2 = TcpStream::connect(addr).await.unwrap();
+        shutdown_tx.send(true).unwrap();
+
+        let mut accepted_before_break = 0usize;
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                res = listener.accept() => {
+                    if res.is_ok() {
+                        accepted_before_break += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            accepted_before_break, 0,
+            "watch-based shutdown signal fired before loop entry must terminate immediately without accepting queued connections"
+        );
+
+        // Case 2: Both `shutdown_rx.changed()` and `listener.accept()` are ready simultaneously inside `tokio::select! { biased; ... }`
+        let (shutdown_tx2, mut shutdown_rx2) = watch::channel(false);
+        // Mark initial false as seen so `shutdown_rx2.changed()` awaits the next transition
+        let _ = *shutdown_rx2.borrow_and_update();
+        let _queued_client3 = TcpStream::connect(addr).await.unwrap();
+        shutdown_tx2.send(true).unwrap();
+
+        let mut accepted_concurrent = 0usize;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx2.changed() => {
+                    if *shutdown_rx2.borrow() {
+                        break;
+                    }
+                }
+                res = listener.accept() => {
+                    if res.is_ok() {
+                        accepted_concurrent += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            accepted_concurrent, 0,
+            "biased tokio::select! must prioritize ready shutdown_rx.changed() over ready listener.accept()"
+        );
     }
 }

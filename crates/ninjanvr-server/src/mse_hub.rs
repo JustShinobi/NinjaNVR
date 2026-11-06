@@ -292,6 +292,7 @@ pub struct MseClientSubscription {
     pub burst: Option<MseGopBurst>,
     pub rx: broadcast::Receiver<MseLivePacket>,
     pub last_seq: u64,
+    pub needs_resync: bool,
     active_clients: Arc<AtomicUsize>,
 }
 
@@ -304,6 +305,20 @@ impl MseClientSubscription {
         hub: &MseStreamHub,
         stream: &str,
     ) -> Result<MseLivePacket, Option<MseGopBurst>> {
+        if self.needs_resync {
+            let (fresh, fresh_rx) = hub.resync_after_lag(stream).await;
+            if let Some(rx) = fresh_rx {
+                self.rx = rx;
+            } else {
+                while self.rx.try_recv().is_ok() {}
+            }
+            if let Some(ref b) = fresh {
+                self.last_seq = self.last_seq.max(b.last_seq);
+            }
+            self.burst = fresh.clone();
+            self.needs_resync = false;
+            return Err(fresh);
+        }
         loop {
             match self.rx.recv().await {
                 Ok(MseLivePacket::Fragment { seq, bytes }) => {
@@ -315,6 +330,7 @@ impl MseClientSubscription {
                 }
                 Ok(pkt) => return Ok(pkt),
                 Err(broadcast::error::RecvError::Lagged(_)) => {
+                    self.needs_resync = true;
                     let (fresh, fresh_rx) = hub.resync_after_lag(stream).await;
                     if let Some(rx) = fresh_rx {
                         self.rx = rx;
@@ -325,6 +341,7 @@ impl MseClientSubscription {
                         self.last_seq = self.last_seq.max(b.last_seq);
                     }
                     self.burst = fresh.clone();
+                    self.needs_resync = false;
                     return Err(fresh);
                 }
                 Err(broadcast::error::RecvError::Closed) => return Err(None),
@@ -579,6 +596,7 @@ impl MseStreamHub {
             burst: None,
             rx: initial_rx,
             last_seq: 0,
+            needs_resync: false,
             active_clients,
         };
 
@@ -1237,5 +1255,66 @@ mod tests {
             "new stream must succeed by evicting the idle session once a client drops"
         );
         assert_eq!(hub.sessions.read().await.len(), MAX_CACHED_STREAMS);
+    }
+
+    #[tokio::test]
+    async fn recv_or_resync_preserves_needs_resync_when_cancelled_at_resync_after_lag() {
+        let hub = MseStreamHub::new();
+        let stream = "patio_sub";
+        let valid_codec = r#"{"type":"mse","value":"video/mp4; codecs=\"avc1.640029\""}"#;
+        hub.ingest_upstream_text(stream, valid_codec).await;
+        hub.ingest_upstream_binary(stream, build_test_init_segment())
+            .await;
+        hub.ingest_upstream_binary(stream, build_test_fragment(true, &[0x01; 48]))
+            .await;
+
+        let mut sub = hub
+            .subscribe_client("ws://127.0.0.1:9", stream)
+            .await
+            .expect("client subscription must succeed");
+        assert!(!sub.needs_resync);
+
+        // Overflow the 256-slot broadcast ring buffer so the next `rx.recv().await` returns `RecvError::Lagged`
+        for i in 0..300u16 {
+            let is_key = i == 290;
+            let payload = [(i & 0xFF) as u8; 32];
+            hub.ingest_upstream_binary(stream, build_test_fragment(is_key, &payload))
+                .await;
+        }
+
+        // Hold a write lock on `hub.caches` so `resync_after_lag(stream).await` suspends at `self.caches.read().await`
+        let caches_write_guard = hub.caches.write().await;
+
+        // Poll `recv_or_resync` inside a `tokio::select!` that cancels it while suspended at `resync_after_lag`
+        tokio::select! {
+            _ = sub.recv_or_resync(&hub, stream) => {
+                panic!("recv_or_resync must suspend on hub.caches.read() while write lock is held");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        assert!(
+            sub.needs_resync,
+            "cancelling recv_or_resync while suspended at resync_after_lag must preserve needs_resync = true"
+        );
+
+        // Release write lock and push a non-keyframe delta fragment into the broadcast ring
+        drop(caches_write_guard);
+        hub.ingest_upstream_binary(stream, build_test_fragment(false, &[0xDE; 32]))
+            .await;
+
+        // Next `recv_or_resync` call must immediately complete the pending resync and return Err(Some(burst))
+        // instead of returning the post-gap delta fragment!
+        let recovered = sub.recv_or_resync(&hub, stream).await;
+        assert!(
+            !sub.needs_resync,
+            "completing the resync must clear needs_resync = false"
+        );
+        let burst = recovered
+            .err()
+            .flatten()
+            .expect("post-cancellation recv_or_resync must deliver the GOP keyframe burst");
+        assert!(!burst.gop_fragments.is_empty());
+        assert_eq!(burst.last_seq, 302);
     }
 }
