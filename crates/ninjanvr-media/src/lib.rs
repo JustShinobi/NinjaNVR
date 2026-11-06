@@ -1360,6 +1360,54 @@ pub fn prune_empty_parent_dirs(file_path: &Path, stop_at: &Path) {
     }
 }
 
+/// Maximum age of a cached Live event-strip flipbook (`clips/review_frames/<review id>/`).
+pub const REVIEW_FRAME_CACHE_MAX_AGE_SECS: u64 = 24 * 3600;
+
+/// Removes cached flipbook frame directories under `clips/review_frames` whose
+/// last modification is older than `max_age_secs`. Symlinks and stray files are
+/// removed without being followed. Returns how many entries were removed.
+pub fn prune_review_frame_cache(
+    media_dir: &Path,
+    now: std::time::SystemTime,
+    max_age_secs: u64,
+) -> usize {
+    let root = media_dir.join("clips").join("review_frames");
+    let Ok(meta) = std::fs::symlink_metadata(&root) else {
+        return 0;
+    };
+    if !meta.file_type().is_dir() {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(u64::MAX);
+        if age <= max_age_secs {
+            continue;
+        }
+        let ok = if meta.file_type().is_dir() {
+            std::fs::remove_dir_all(&path).is_ok()
+        } else {
+            std::fs::remove_file(&path).is_ok()
+        };
+        if ok {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 #[derive(Debug, Clone)]
 pub struct CameraRecordPolicy {
     pub keep_continuous: bool,
@@ -2413,6 +2461,17 @@ impl RecordingEngine {
                     warn!("Hot-to-cold storage tier migration skipped: {err:#}");
                 }
             }
+
+            // Drop stale Live event-strip flipbook frames (regenerated on demand)
+            let media_dir_frames = self.media_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                prune_review_frame_cache(
+                    &media_dir_frames,
+                    std::time::SystemTime::now(),
+                    REVIEW_FRAME_CACHE_MAX_AGE_SECS,
+                )
+            })
+            .await;
 
             // Prune expired share links and remove orphaned share clip/redacted artifacts
             let engine_share = self.clone();
@@ -3899,6 +3958,47 @@ mod tests {
         assert!(stats.3, "expected mp4a stsd to be marked as compressed");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn prune_review_frame_cache_removes_only_stale_entries() {
+        let root = std::env::temp_dir().join(format!("ninjanvr-frames-{}", random_suffix()));
+        let frames = root.join("clips").join("review_frames");
+        std::fs::create_dir_all(frames.join("old_review")).unwrap();
+        std::fs::write(frames.join("old_review").join("0.jpg"), b"jpg").unwrap();
+        std::fs::create_dir_all(frames.join("fresh_review")).unwrap();
+
+        // Nothing is older than a day yet.
+        let now = std::time::SystemTime::now();
+        assert_eq!(prune_review_frame_cache(&root, now, 3600), 0);
+        assert!(frames.join("old_review").exists());
+
+        // Two days later both entries are stale.
+        let later = now + std::time::Duration::from_secs(2 * 24 * 3600);
+        assert_eq!(
+            prune_review_frame_cache(&root, later, REVIEW_FRAME_CACHE_MAX_AGE_SECS),
+            2
+        );
+        assert!(!frames.join("old_review").exists());
+        assert!(!frames.join("fresh_review").exists());
+        assert!(frames.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_review_frame_cache_ignores_missing_or_non_directory_root() {
+        let root = std::env::temp_dir().join(format!("ninjanvr-frames-none-{}", random_suffix()));
+        assert_eq!(
+            prune_review_frame_cache(&root, std::time::SystemTime::now(), 0),
+            0
+        );
+        std::fs::create_dir_all(root.join("clips")).unwrap();
+        std::fs::write(root.join("clips").join("review_frames"), b"not a dir").unwrap();
+        assert_eq!(
+            prune_review_frame_cache(&root, std::time::SystemTime::now(), 0),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
