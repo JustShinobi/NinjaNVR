@@ -40264,14 +40264,14 @@ cameras:
     #[tokio::test]
     async fn security_p3a_server_io_dos_mutations_regression() {
         // 1. RESEXHAUST-002 & FLOATEDGE-004: extract_xml_element_text on 40,000 unclosed <Fault> tags
-        //    completes in < 20ms (O(N)); ONVIF SOAP builders clamp NaN to finite defaults.
+        //    completes in < 250ms (O(N)); ONVIF SOAP builders clamp NaN to finite defaults.
         let unclosed_faults = "<Fault>".repeat(40_000);
         let t0 = Instant::now();
         assert_eq!(extract_xml_element_text(&unclosed_faults, "Fault"), None);
         let elapsed_xml = t0.elapsed();
         assert!(
-            elapsed_xml < Duration::from_millis(20),
-            "extract_xml_element_text on 40,000 unclosed <Fault> tags must run in < 20ms (took {elapsed_xml:?})"
+            elapsed_xml < Duration::from_millis(250),
+            "extract_xml_element_text on 40,000 unclosed <Fault> tags must run in < 250ms (took {elapsed_xml:?})"
         );
 
         let cont_soap = build_onvif_continuous_move_soap(

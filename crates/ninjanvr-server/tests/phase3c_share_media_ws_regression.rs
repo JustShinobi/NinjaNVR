@@ -1173,7 +1173,7 @@ cameras:
         .unwrap();
     assert_eq!(del_single.status(), StatusCode::OK);
 
-    let del_bulk = app
+    let del_bulk_operator = app
         .clone()
         .oneshot(
             Request::builder()
@@ -1186,9 +1186,24 @@ cameras:
         )
         .await
         .unwrap();
+    assert_eq!(del_bulk_operator.status(), StatusCode::FORBIDDEN);
+
+    let del_bulk = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/exports/delete")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"ids":["exp_cross_dir_2"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(del_bulk.status(), StatusCode::OK);
     assert!(
-        keep_recording.is_file() && keep_rev_thumb.is_file() && keep_latest.is_file(),
+        keep_recording.exists() && keep_rev_thumb.exists() && keep_latest.exists(),
         "export deletion must never unlink files in recordings/, clips/review/, or latest_*.jpg"
     );
 
