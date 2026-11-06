@@ -148,8 +148,32 @@ impl PreviewFrameStore {
             ));
         }
         let final_path = dir.join(format!("{ts_ms}.jpg"));
-        let tmp_path = dir.join(format!(".{ts_ms}.tmp"));
-        std::fs::write(&tmp_path, jpeg)?;
+        if let Ok(fmeta) = std::fs::symlink_metadata(&final_path)
+            && (fmeta.file_type().is_symlink() || fmeta.is_dir())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to overwrite symlink or directory at preview frame path",
+            ));
+        }
+        let nonce: u64 = rand::random();
+        let tmp_path = dir.join(format!(".{ts_ms}.{nonce:016x}.tmp"));
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(nix::libc::O_NOFOLLOW);
+            }
+            let mut tmp_file = opts.open(&tmp_path)?;
+            if let Err(err) = tmp_file.write_all(jpeg) {
+                drop(tmp_file);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+        }
         if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(err);
@@ -352,6 +376,24 @@ mod tests {
 
         // A fresh store rebuilds its index from disk and drops stray temp files.
         std::fs::write(store.root().join("sala").join(".7.tmp"), b"x").unwrap();
+        std::fs::write(
+            store.root().join("sala").join(".7.0123456789abcdef.tmp"),
+            b"x",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let outside = media.join("outside.txt");
+            std::fs::write(&outside, b"DO_NOT_OVERWRITE").unwrap();
+            let sym_target = store.root().join("sala").join("5555.jpg");
+            std::os::unix::fs::symlink(&outside, &sym_target).unwrap();
+            assert!(
+                store.write_frame("sala", 5555, b"evil_jpeg").is_err(),
+                "write_frame must refuse to overwrite a symlinked frame target"
+            );
+            assert_eq!(std::fs::read(&outside).unwrap(), b"DO_NOT_OVERWRITE");
+            let _ = std::fs::remove_file(&sym_target);
+        }
         let reloaded = PreviewFrameStore::new(&media);
         assert_eq!(reloaded.load_from_disk(), 5);
         assert_eq!(

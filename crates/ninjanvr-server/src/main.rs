@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -184,13 +186,17 @@ pub fn ensure_private_key_permissions(key_path: &Path) -> Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let file = std::fs::File::open(key_path).with_context(|| {
-            format!(
-                "failed to open TLS private key handle {}",
-                key_path.display()
-            )
-        })?;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(key_path)
+            .with_context(|| {
+                format!(
+                    "failed to open TLS private key handle {}",
+                    key_path.display()
+                )
+            })?;
         let f_meta = file.metadata().with_context(|| {
             format!(
                 "failed to fstat TLS private key handle {}",
@@ -218,6 +224,8 @@ pub fn ensure_private_key_permissions(key_path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+pub const MAX_CONFIG_FILE_BYTES: u64 = 1_048_576;
 
 /// Validates that a configuration path is not empty, does not traverse `..`, and is a regular file when present.
 pub fn validate_config_file_path(config_path: &Path) -> Result<()> {
@@ -251,6 +259,41 @@ pub fn validate_config_file_path(config_path: &Path) -> Result<()> {
                 "configuration path {} is not a regular file",
                 config_path.display()
             );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(config_path)
+                .with_context(|| {
+                    format!(
+                        "failed to open configuration file {} with O_NOFOLLOW",
+                        config_path.display()
+                    )
+                })?;
+            let f_meta = file.metadata().with_context(|| {
+                format!(
+                    "failed to fstat configuration file {}",
+                    config_path.display()
+                )
+            })?;
+            if !f_meta.file_type().is_file()
+                || (f_meta.dev(), f_meta.ino()) != (meta.dev(), meta.ino())
+            {
+                anyhow::bail!(
+                    "refusing configuration file whose inode changed or is not a regular file at {}",
+                    config_path.display()
+                );
+            }
+            if f_meta.len() > MAX_CONFIG_FILE_BYTES {
+                anyhow::bail!(
+                    "configuration file {} exceeds maximum allowed size ({} bytes)",
+                    config_path.display(),
+                    MAX_CONFIG_FILE_BYTES
+                );
+            }
         }
     }
     Ok(())
@@ -856,6 +899,24 @@ mod tests {
             validate_config_file_path(Path::new("/config/../etc/passwd")).is_err(),
             "parent traversal in config path must be rejected"
         );
+        #[cfg(unix)]
+        {
+            let real_cfg = tmp_dir.join("real.yml");
+            std::fs::write(&real_cfg, b"cameras: {}\n").unwrap();
+            assert!(validate_config_file_path(&real_cfg).is_ok());
+            let sym_cfg = tmp_dir.join("sym.yml");
+            std::os::unix::fs::symlink(&real_cfg, &sym_cfg).unwrap();
+            assert!(
+                validate_config_file_path(&sym_cfg).is_err(),
+                "symlinked config file must be rejected"
+            );
+            let huge_cfg = tmp_dir.join("huge.yml");
+            std::fs::write(&huge_cfg, vec![b'a'; (MAX_CONFIG_FILE_BYTES as usize) + 1]).unwrap();
+            assert!(
+                validate_config_file_path(&huge_cfg).is_err(),
+                "oversized config file > 1 MiB must be rejected"
+            );
+        }
 
         // 5. MAIN-C2-01b: cleanup_supervised_processes_and_shm wipes and removes /dev/shm/go2rtc.yaml
         let shm_file = tmp_dir.join("go2rtc.yaml");

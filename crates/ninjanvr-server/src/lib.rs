@@ -1,4 +1,5 @@
 #![recursion_limit = "512"]
+#![forbid(unsafe_code)]
 
 pub mod mse_hub;
 pub mod pipeline;
@@ -293,7 +294,7 @@ impl ProcCpuTracker {
     }
 }
 
-pub type LazySnapshotCacheKey = (String, u32, bool);
+pub type LazySnapshotCacheKey = (String, u32, bool, String);
 pub type LazySnapshotCacheValue = (Instant, Bytes, u64);
 
 #[derive(Clone)]
@@ -563,6 +564,69 @@ pub fn normalize_jwt_secret_entropy(raw: &str) -> String {
     derived.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn open_regular_non_symlink_readonly(
+    path: &Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let lmeta = std::fs::symlink_metadata(path)?;
+    if !lmeta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "target is not a regular file",
+        ));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path)?;
+    let fmeta = file.metadata()?;
+    if !fmeta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "opened descriptor is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if lmeta.dev() != fmeta.dev() || lmeta.ino() != fmeta.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file inode changed during open",
+            ));
+        }
+    }
+    Ok((file, fmeta))
+}
+
+fn read_bounded_non_symlink_bytes_sync(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let (mut file, fmeta) = open_regular_non_symlink_readonly(path).ok()?;
+    if fmeta.len() > max_bytes {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(fmeta.len() as usize);
+    (&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .ok()?;
+    if (buf.len() as u64) > max_bytes {
+        return None;
+    }
+    Some(buf)
+}
+
+async fn read_bounded_non_symlink_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let path_owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_bounded_non_symlink_bytes_sync(&path_owned, max_bytes))
+        .await
+        .ok()
+        .flatten()
+}
+
 pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
     if let Ok(env_secret) = std::env::var("NINJANVR_JWT_SECRET") {
         let trimmed = env_secret.trim();
@@ -571,22 +635,30 @@ pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
         }
     }
     let secret_path = config_dir.join(".jwt_secret");
-    if let Ok(existing) = std::fs::read_to_string(&secret_path) {
-        let trimmed = existing.trim();
-        if !trimmed.is_empty() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(err) =
-                    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+    if let Ok((mut file, fmeta)) = open_regular_non_symlink_readonly(&secret_path)
+        && fmeta.len() > 0
+        && fmeta.len() <= 4096
+    {
+        use std::io::Read;
+        let mut raw = Vec::with_capacity(fmeta.len() as usize);
+        if (&mut file).take(4097).read_to_end(&mut raw).is_ok()
+            && raw.len() <= 4096
+            && let Ok(existing) = String::from_utf8(raw)
+        {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty() {
+                #[cfg(unix)]
                 {
-                    warn!(
-                        "Failed to enforce 0o600 permissions on {}: {err}",
-                        secret_path.display()
-                    );
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(err) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                        warn!(
+                            "Failed to enforce 0o600 permissions on {}: {err}",
+                            secret_path.display()
+                        );
+                    }
                 }
+                return normalize_jwt_secret_entropy(trimmed);
             }
-            return normalize_jwt_secret_entropy(trimmed);
         }
     }
     let mut bytes = [0u8; 64];
@@ -1034,17 +1106,37 @@ async fn api_ui_version() -> Json<Value> {
     }))
 }
 
+const MAX_SPA_STATIC_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+fn read_contained_web_asset_sync(base_dir: &Path, candidate: &Path) -> Option<Vec<u8>> {
+    let base_canon = std::fs::canonicalize(base_dir).ok()?;
+    let cand_canon = std::fs::canonicalize(candidate).ok()?;
+    if !cand_canon.starts_with(&base_canon) {
+        return None;
+    }
+    let bytes = read_bounded_non_symlink_bytes_sync(candidate, MAX_SPA_STATIC_FILE_BYTES)?;
+    Some(bytes)
+}
+
 async fn serve_login_page(State(state): State<AppState>) -> Response {
-    let index_path = state.web_dir.join("index.html");
-    match tokio::fs::read_to_string(&index_path).await {
-        Ok(html) => Html(html).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    let web_dir = state.web_dir.clone();
+    let index_path = web_dir.join("index.html");
+    let html_opt = tokio::task::spawn_blocking(move || {
+        read_contained_web_asset_sync(&web_dir, &index_path)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    })
+    .await
+    .ok()
+    .flatten();
+    match html_opt {
+        Some(html) => Html(html).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let rel_path = uri.path().trim_start_matches('/');
-    let primary_dir = &state.web_dir;
+    let primary_dir = state.web_dir.clone();
 
     if !rel_path.is_empty()
         && !rel_path.contains("..")
@@ -1056,20 +1148,17 @@ async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri)
                 && !dec.split('/').any(|seg| seg.starts_with('.'))
         })
     {
-        let mut file_candidate = primary_dir.join(rel_path);
-        if rel_path == "favicon.ico" && !file_candidate.is_file() {
-            file_candidate = primary_dir.join("favicon.svg");
-        }
-        let is_safe_regular_file = std::fs::symlink_metadata(&file_candidate)
-            .is_ok_and(|m| m.file_type().is_file())
-            && match (
-                std::fs::canonicalize(primary_dir),
-                std::fs::canonicalize(&file_candidate),
-            ) {
-                (Ok(base_c), Ok(cand_c)) => cand_c.starts_with(&base_c),
-                _ => false,
-            };
-        if is_safe_regular_file && let Ok(bytes) = tokio::fs::read(&file_candidate).await {
+        let rel_owned = rel_path.to_string();
+        let dir_for_cand = primary_dir.clone();
+        let resolved_asset = tokio::task::spawn_blocking(move || {
+            let mut file_candidate = dir_for_cand.join(&rel_owned);
+            if rel_owned == "favicon.ico"
+                && !std::fs::symlink_metadata(&file_candidate)
+                    .is_ok_and(|m| m.file_type().is_file())
+            {
+                file_candidate = dir_for_cand.join("favicon.svg");
+            }
+            let bytes = read_contained_web_asset_sync(&dir_for_cand, &file_candidate)?;
             let mime = match file_candidate.extension().and_then(|e| e.to_str()) {
                 Some("js" | "mjs") => "application/javascript; charset=utf-8",
                 Some("css") => "text/css; charset=utf-8",
@@ -1082,14 +1171,27 @@ async fn serve_spa_fallback(State(state): State<AppState>, uri: axum::http::Uri)
                 Some("html") => "text/html; charset=utf-8",
                 _ => "application/octet-stream",
             };
+            Some((mime, bytes))
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some((mime, bytes)) = resolved_asset {
             return ([(header::CONTENT_TYPE, mime)], bytes).into_response();
         }
     }
 
     let index_path = primary_dir.join("index.html");
-    match tokio::fs::read_to_string(&index_path).await {
-        Ok(html) => Html(html).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    let html_opt = tokio::task::spawn_blocking(move || {
+        read_contained_web_asset_sync(&primary_dir, &index_path)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    })
+    .await
+    .ok()
+    .flatten();
+    match html_opt {
+        Some(html) => Html(html).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -1465,6 +1567,14 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
     None
 }
 
+fn path_matches_segment_prefix(path: &str, prefix: &str) -> bool {
+    let clean_prefix = prefix.trim_end_matches('/');
+    path == clean_prefix
+        || path
+            .strip_prefix(clean_prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 async fn auth_gate_middleware(
     State((state, enforce_auth)): State<(AppState, bool)>,
     jar: CookieJar,
@@ -1543,39 +1653,38 @@ async fn auth_gate_middleware(
                 }
             }
 
-            let is_admin_only = path.starts_with("/api/config/save")
-                || path.starts_with("/api/config/structured")
-                || path.starts_with("/api/config/set")
-                || path.starts_with("/api/config/raw")
-                || path.starts_with("/api/restart")
-                || path.starts_with("/api/tokens")
-                || path.starts_with("/api/users")
-                || path.starts_with("/api/camera-proxy")
-                || path.starts_with("/api/recordings/sync")
-                || path.starts_with("/api/logs")
-                || path.starts_with("/api/genai/models")
-                || path.starts_with("/api/genai/validate")
-                || path.starts_with("/api/detectors/models/upload")
-                || path.starts_with("/api/streams/probe")
-                || path.starts_with("/api/federation")
-                || path.starts_with("/api/debug/")
-                || path == "/api/debug"
-                || path.starts_with("/api/notifications/test")
+            let is_admin_only = path_matches_segment_prefix(&path, "/api/config/save")
+                || path_matches_segment_prefix(&path, "/api/config/structured")
+                || path_matches_segment_prefix(&path, "/api/config/set")
+                || path_matches_segment_prefix(&path, "/api/config/raw")
+                || path_matches_segment_prefix(&path, "/api/restart")
+                || path_matches_segment_prefix(&path, "/api/tokens")
+                || path_matches_segment_prefix(&path, "/api/users")
+                || path_matches_segment_prefix(&path, "/api/camera-proxy")
+                || path_matches_segment_prefix(&path, "/api/recordings/sync")
+                || path_matches_segment_prefix(&path, "/api/logs")
+                || path_matches_segment_prefix(&path, "/api/genai/models")
+                || path_matches_segment_prefix(&path, "/api/genai/validate")
+                || path_matches_segment_prefix(&path, "/api/detectors/models/upload")
+                || path_matches_segment_prefix(&path, "/api/streams/probe")
+                || path_matches_segment_prefix(&path, "/api/federation")
+                || path_matches_segment_prefix(&path, "/api/debug")
+                || path_matches_segment_prefix(&path, "/api/notifications/test")
                 || path == "/api/exports/delete"
                 || path == "/api/reviews/delete"
                 || path == "/api/events/delete"
                 || (method != "GET"
                     && method != "HEAD"
-                    && (path.starts_with("/api/faces")
-                        || path.starts_with("/api/dataset")
-                        || path.starts_with("/api/false_positives")))
+                    && (path_matches_segment_prefix(&path, "/api/faces")
+                        || path_matches_segment_prefix(&path, "/api/dataset")
+                        || path_matches_segment_prefix(&path, "/api/false_positives")))
                 || (method == "DELETE"
                     && !path.ends_with("/retain")
                     && !path.ends_with("/viewed")
                     && (path.ends_with("/recordings")
-                        || path.starts_with("/api/events")
-                        || path.starts_with("/api/review")
-                        || path.starts_with("/api/export")));
+                        || path_matches_segment_prefix(&path, "/api/events")
+                        || path_matches_segment_prefix(&path, "/api/review")
+                        || path_matches_segment_prefix(&path, "/api/export")));
             if is_admin_only && role_lc != "admin" {
                 state.log_hub.push_nginx(&method, &path, 403);
                 return (
@@ -1586,7 +1695,7 @@ async fn auth_gate_middleware(
             }
 
             if role_lc == "read_only"
-                && !path.starts_with("/api/mcp")
+                && !path_matches_segment_prefix(&path, "/api/mcp")
                 && ((method != "GET" && method != "HEAD")
                     || !(path.starts_with("/api/") || path == "/api"))
             {
@@ -1601,8 +1710,8 @@ async fn auth_gate_middleware(
             if role_lc == "viewer"
                 && method != "GET"
                 && method != "HEAD"
-                && !path.starts_with("/api/logout")
-                && !path.starts_with("/api/mcp")
+                && !path_matches_segment_prefix(&path, "/api/logout")
+                && !path_matches_segment_prefix(&path, "/api/mcp")
             {
                 state.log_hub.push_nginx(&method, &path, 403);
                 return (
@@ -4584,6 +4693,110 @@ async fn api_config_raw(State(state): State<AppState>) -> Json<Value> {
     )))
 }
 
+static CONFIG_COMMIT_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn acquire_state_config_commit_lock(state: &AppState) -> Arc<tokio::sync::Mutex<()>> {
+    let key = Arc::as_ptr(&state.config) as usize;
+    let mut map = CONFIG_COMMIT_LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if map.len() > 256 {
+        map.retain(|_, v| Arc::strong_count(v) > 1);
+    }
+    map.entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn persist_config_yaml_atomically(path: &Path, raw_yaml: &str) -> Result<()> {
+    use std::io::Write;
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "Refusing to persist configuration to unsafe path {}",
+            path.display()
+        );
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "Refusing to overwrite symlinked configuration file at {}",
+                path.display()
+            );
+        }
+        if meta.is_dir() {
+            anyhow::bail!(
+                "Refusing to overwrite directory at configuration path {}",
+                path.display()
+            );
+        }
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if let Ok(pmeta) = std::fs::symlink_metadata(parent)
+        && pmeta.file_type().is_symlink()
+    {
+        anyhow::bail!(
+            "Refusing to persist configuration inside symlinked directory {}",
+            parent.display()
+        );
+    }
+    std::fs::create_dir_all(parent)?;
+    let fname = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("config.yml");
+    let nonce: u64 = rand::random();
+    let tmp_path = parent.join(format!(".{fname}.{nonce:016x}.tmp"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let mut tmp_file = opts.open(&tmp_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            drop(tmp_file);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+    }
+    if let Err(err) = tmp_file
+        .write_all(raw_yaml.as_bytes())
+        .and_then(|()| tmp_file.sync_all())
+    {
+        drop(tmp_file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    drop(tmp_file);
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && (meta.file_type().is_symlink() || meta.is_dir())
+    {
+        let _ = std::fs::remove_file(&tmp_path);
+        anyhow::bail!(
+            "Refusing to rename configuration over symlink or directory at {}",
+            path.display()
+        );
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
 async fn api_config_save(
     State(state): State<AppState>,
     uri: Uri,
@@ -4610,74 +4823,64 @@ async fn api_config_save(
         )
             .into_response();
     }
-    let prev_cfg = state.config.read().await.clone();
-    let path = prev_cfg.config_path.clone();
-    match NinjaConfig::from_yaml_str(&body, path.clone()) {
-        Ok(mut new_cfg) => {
-            if let Err(msg) = validate_config_labelmap_paths(&new_cfg) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "success": false, "message": msg })),
-                )
-                    .into_response();
-            }
-            new_cfg.restore_scrubbed_from_previous(&prev_cfg);
-            if let Err(msg) = validate_config_labelmap_paths(&new_cfg) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "success": false, "message": msg })),
-                )
-                    .into_response();
-            }
-            let state_for_io = state.clone();
-            let io_res = tokio::task::spawn_blocking(
-                move || -> std::result::Result<(NinjaConfig, Vec<HeuristicAlertDto>), String> {
-                    if let Err(err) = std::fs::write(&path, &new_cfg.raw_yaml) {
-                        error!("Failed to persist config.yml: {err:#}");
-                        return Err(err.to_string());
-                    }
-                    if let Err(err) = new_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH) {
-                        warn!(
-                            "Failed to write go2rtc config to {DEFAULT_GO2RTC_SHM_PATH}: {err:#}"
-                        );
-                    }
-                    state_for_io.detector.reload(&new_cfg);
-                    let rec_dir = state_for_io.media_dir.join("recordings");
-                    let rec_mount = stat_mount_mb(&rec_dir, "ext4");
-                    let heuristics = evaluate_system_heuristics(
-                        &new_cfg,
-                        &serde_json::Map::new(),
-                        &rec_mount,
-                        14.0,
-                    );
-                    Ok((new_cfg, heuristics))
-                },
-            )
-            .await;
-            let (new_cfg, heuristics) = match io_res {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(err_msg)) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "success": false, "message": err_msg })),
-                    )
-                        .into_response();
+    let commit_res = tokio::spawn(async move {
+        let commit_lock = acquire_state_config_commit_lock(&state);
+        let _commit_guard = commit_lock.lock().await;
+        let prev_cfg = state.config.read().await.clone();
+        let path = prev_cfg.config_path.clone();
+        let mut new_cfg = match NinjaConfig::from_yaml_str(&body, path.clone()) {
+            Ok(cfg) => cfg,
+            Err(err) => return Err((StatusCode::BAD_REQUEST, err.to_string())),
+        };
+        if let Err(msg) = validate_config_labelmap_paths(&new_cfg) {
+            return Err((StatusCode::BAD_REQUEST, msg.to_string()));
+        }
+        new_cfg.restore_scrubbed_from_previous(&prev_cfg);
+        if let Err(msg) = validate_config_labelmap_paths(&new_cfg) {
+            return Err((StatusCode::BAD_REQUEST, msg.to_string()));
+        }
+        let state_for_io = state.clone();
+        let io_res = tokio::task::spawn_blocking(
+            move || -> std::result::Result<(NinjaConfig, Vec<HeuristicAlertDto>), String> {
+                if let Err(err) = persist_config_yaml_atomically(&path, &new_cfg.raw_yaml) {
+                    error!("Failed to persist config.yml: {err:#}");
+                    return Err(err.to_string());
                 }
-                Err(join_err) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "success": false, "message": join_err.to_string() })),
-                    )
-                        .into_response();
+                if let Err(err) = new_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH) {
+                    warn!("Failed to write go2rtc config to {DEFAULT_GO2RTC_SHM_PATH}: {err:#}");
                 }
-            };
-            emit_heuristics_to_logs(&state.log_hub, &heuristics);
-            *state.config.write().await = new_cfg;
+                state_for_io.detector.reload(&new_cfg);
+                let rec_dir = state_for_io.media_dir.join("recordings");
+                let rec_mount = stat_mount_mb(&rec_dir, "ext4");
+                let heuristics =
+                    evaluate_system_heuristics(&new_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
+                Ok((new_cfg, heuristics))
+            },
+        )
+        .await;
+        let (new_cfg, heuristics) = match io_res {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(err_msg)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg)),
+            Err(join_err) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, join_err.to_string()));
+            }
+        };
+        emit_heuristics_to_logs(&state.log_hub, &heuristics);
+        *state.config.write().await = new_cfg;
+        Ok(())
+    })
+    .await;
+
+    match commit_res {
+        Ok(Ok(())) => {
             Json(json!({ "success": true, "message": "Config saved successfully" })).into_response()
         }
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "message": err.to_string() })),
+        Ok(Err((status, msg))) => {
+            (status, Json(json!({ "success": false, "message": msg }))).into_response()
+        }
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": join_err.to_string() })),
         )
             .into_response(),
     }
@@ -4699,68 +4902,69 @@ async fn api_config_structured(
         )
             .into_response();
     }
-    let mut next_cfg = state.config.read().await.clone();
-    if let Err(err) = next_cfg.apply_structured_json(&body) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "message": format!("{err:#}") })),
+    let commit_res = tokio::spawn(async move {
+        let commit_lock = acquire_state_config_commit_lock(&state);
+        let _commit_guard = commit_lock.lock().await;
+        let mut next_cfg = state.config.read().await.clone();
+        if let Err(err) = next_cfg.apply_structured_json(&body) {
+            return Err((StatusCode::BAD_REQUEST, format!("{err:#}")));
+        }
+        if let Err(msg) = validate_config_labelmap_paths(&next_cfg) {
+            return Err((StatusCode::BAD_REQUEST, msg.to_string()));
+        }
+        let state_for_io = state.clone();
+        let io_res = tokio::task::spawn_blocking(
+            move || -> std::result::Result<(NinjaConfig, Vec<HeuristicAlertDto>, Value, String), String> {
+                if let Err(err) =
+                    persist_config_yaml_atomically(&next_cfg.config_path, &next_cfg.raw_yaml)
+                {
+                    error!("Failed to persist structured config.yml: {err:#}");
+                    return Err(err.to_string());
+                }
+                if let Err(err) = next_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH) {
+                    warn!("Failed to write go2rtc config to {DEFAULT_GO2RTC_SHM_PATH}: {err:#}");
+                }
+                state_for_io.detector.reload(&next_cfg);
+                let rec_dir = state_for_io.media_dir.join("recordings");
+                let rec_mount = stat_mount_mb(&rec_dir, "ext4");
+                let heuristics =
+                    evaluate_system_heuristics(&next_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
+                let api_cfg = next_cfg.to_api_config();
+                let raw_yaml = scrub_raw_yaml_secrets_strict(&next_cfg.raw_yaml, &next_cfg);
+                Ok((next_cfg, heuristics, api_cfg, raw_yaml))
+            },
         )
-            .into_response();
-    }
-    if let Err(msg) = validate_config_labelmap_paths(&next_cfg) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "message": msg })),
-        )
-            .into_response();
-    }
-    let state_for_io = state.clone();
-    let io_res = tokio::task::spawn_blocking(
-        move || -> std::result::Result<(NinjaConfig, Vec<HeuristicAlertDto>, Value, String), String> {
-            if let Err(err) = std::fs::write(&next_cfg.config_path, &next_cfg.raw_yaml) {
-                error!("Failed to persist structured config.yml: {err:#}");
-                return Err(err.to_string());
+        .await;
+        let (next_cfg, heuristics, api_cfg, raw_yaml) = match io_res {
+            Ok(Ok(quad)) => quad,
+            Ok(Err(err_msg)) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err_msg)),
+            Err(join_err) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, join_err.to_string()));
             }
-            if let Err(err) = next_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH) {
-                warn!("Failed to write go2rtc config to {DEFAULT_GO2RTC_SHM_PATH}: {err:#}");
-            }
-            state_for_io.detector.reload(&next_cfg);
-            let rec_dir = state_for_io.media_dir.join("recordings");
-            let rec_mount = stat_mount_mb(&rec_dir, "ext4");
-            let heuristics =
-                evaluate_system_heuristics(&next_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
-            let api_cfg = next_cfg.to_api_config();
-            let raw_yaml = scrub_raw_yaml_secrets_strict(&next_cfg.raw_yaml, &next_cfg);
-            Ok((next_cfg, heuristics, api_cfg, raw_yaml))
-        },
-    )
+        };
+        emit_heuristics_to_logs(&state.log_hub, &heuristics);
+        *state.config.write().await = next_cfg;
+        Ok((api_cfg, raw_yaml))
+    })
     .await;
-    let (next_cfg, heuristics, api_cfg, raw_yaml) = match io_res {
-        Ok(Ok(quad)) => quad,
-        Ok(Err(err_msg)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": err_msg })),
-            )
-                .into_response();
+
+    match commit_res {
+        Ok(Ok((api_cfg, raw_yaml))) => Json(json!({
+            "success": true,
+            "message": "Structured configuration saved",
+            "raw_yaml": raw_yaml,
+            "config": api_cfg
+        }))
+        .into_response(),
+        Ok(Err((status, msg))) => {
+            (status, Json(json!({ "success": false, "message": msg }))).into_response()
         }
-        Err(join_err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": join_err.to_string() })),
-            )
-                .into_response();
-        }
-    };
-    emit_heuristics_to_logs(&state.log_hub, &heuristics);
-    *state.config.write().await = next_cfg;
-    Json(json!({
-        "success": true,
-        "message": "Structured configuration saved",
-        "raw_yaml": raw_yaml,
-        "config": api_cfg
-    }))
-    .into_response()
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": join_err.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn api_config_set() -> Json<Value> {
@@ -6121,10 +6325,11 @@ fn is_safe_federation_peer_base_url(raw_url: &str) -> bool {
     let host = bare_hostname(host_port_no_auth)
         .trim()
         .trim_end_matches('.');
+    let host_lc = host.to_ascii_lowercase();
     if host.is_empty()
         || host.contains(['@', '%'])
-        || host.eq_ignore_ascii_case("metadata.google.internal")
-        || host.ends_with(".metadata.google.internal")
+        || host_lc == "metadata.google.internal"
+        || host_lc.ends_with(".metadata.google.internal")
     {
         return false;
     }
@@ -6144,9 +6349,10 @@ fn is_safe_federation_peer_base_url(raw_url: &str) -> bool {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .trim_end_matches('.');
+    let norm_host_lc = norm_host.to_ascii_lowercase();
     if norm_host.is_empty()
-        || norm_host.eq_ignore_ascii_case("metadata.google.internal")
-        || norm_host.ends_with(".metadata.google.internal")
+        || norm_host_lc == "metadata.google.internal"
+        || norm_host_lc.ends_with(".metadata.google.internal")
     {
         return false;
     }
@@ -6296,24 +6502,50 @@ async fn api_debug_lpr_simulate(
 
     let clips_dir = state.media_dir.join("clips");
     let review_dir = clips_dir.join("review");
-    let _ = std::fs::create_dir_all(&review_dir);
-
-    let jpg_path = clips_dir.join(format!("{ev_id}.jpg"));
-    let webp_path = clips_dir.join(format!("{camera}-{ev_id}.webp"));
-    let clean_webp_path = clips_dir.join(format!("{camera}-{ev_id}-clean.webp"));
-    let rev_thumb_path = review_dir.join(format!("thumb-{camera}-{rev_id}.webp"));
+    let clean_webp_fname = format!("{camera}-{ev_id}-clean.webp");
+    let jpg_fname = format!("{ev_id}.jpg");
+    let webp_fname = format!("{camera}-{ev_id}.webp");
+    let rev_thumb_fname = format!("thumb-{camera}-{rev_id}.webp");
 
     let mut thumb_b64 = None;
-    if let Ok(clean_webp) = ninjanvr_vision::encode_image_webp(&clean_img) {
-        let _ = std::fs::write(&clean_webp_path, clean_webp);
+    if let Ok(clean_webp) = ninjanvr_vision::encode_image_webp(&clean_img)
+        && let Err(err) = crate::pipeline::write_contained_media_file(
+            &state.media_dir,
+            &clips_dir,
+            &clean_webp_fname,
+            &clean_webp,
+        )
+    {
+        warn!("Failed to write simulated LPR clean snapshot '{clean_webp_fname}': {err}");
     }
-    if let Ok(jpg_bytes) = ninjanvr_vision::encode_image_jpeg(&annotated_img) {
-        let _ = std::fs::write(&jpg_path, jpg_bytes);
+    if let Ok(jpg_bytes) = ninjanvr_vision::encode_image_jpeg(&annotated_img)
+        && let Err(err) = crate::pipeline::write_contained_media_file(
+            &state.media_dir,
+            &clips_dir,
+            &jpg_fname,
+            &jpg_bytes,
+        )
+    {
+        warn!("Failed to write simulated LPR JPEG snapshot '{jpg_fname}': {err}");
     }
     if let Ok(webp_bytes) = ninjanvr_vision::encode_image_webp(&annotated_img) {
         thumb_b64 = Some(base64::engine::general_purpose::STANDARD.encode(&webp_bytes));
-        let _ = std::fs::write(&webp_path, &webp_bytes);
-        let _ = std::fs::write(&rev_thumb_path, &webp_bytes);
+        if let Err(err) = crate::pipeline::write_contained_media_file(
+            &state.media_dir,
+            &clips_dir,
+            &webp_fname,
+            &webp_bytes,
+        ) {
+            warn!("Failed to write simulated LPR WebP snapshot '{webp_fname}': {err}");
+        }
+        if let Err(err) = crate::pipeline::write_contained_media_file(
+            &state.media_dir,
+            &review_dir,
+            &rev_thumb_fname,
+            &webp_bytes,
+        ) {
+            warn!("Failed to write simulated LPR review thumbnail '{rev_thumb_fname}': {err}");
+        }
     }
 
     let norm_box = veh_bbox.to_normalized(640, 360);
@@ -6370,12 +6602,43 @@ async fn api_debug_lpr_simulate(
         stationary: false,
     };
 
-    let _ = state.db.upsert_event(&ev_dto);
-    let _ = state.db.set_event_license_plate(&ev_id, Some(&norm_plate));
-    if let Some(ref sl) = matched_sub_label {
-        let _ = state
-            .db
-            .set_event_sub_label_with_score(&ev_id, Some(sl), Some(score as f64));
+    if let Err(err) = state.db.upsert_event(&ev_dto) {
+        warn!("Failed to persist simulated LPR event '{ev_id}': {err:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to persist simulated LPR event"
+            })),
+        )
+            .into_response();
+    }
+    if let Err(err) = state.db.set_event_license_plate(&ev_id, Some(&norm_plate)) {
+        warn!("Failed to set license plate on simulated LPR event '{ev_id}': {err:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to set simulated LPR event license plate"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(ref sl) = matched_sub_label
+        && let Err(err) =
+            state
+                .db
+                .set_event_sub_label_with_score(&ev_id, Some(sl), Some(score as f64))
+    {
+        warn!("Failed to set sub_label on simulated LPR event '{ev_id}': {err:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to set simulated LPR event sub_label"
+            })),
+        )
+            .into_response();
     }
 
     let rev_dto = ninjanvr_db::ReviewItemDto {
@@ -6397,7 +6660,17 @@ async fn api_debug_lpr_simulate(
         }),
         has_been_reviewed: false,
     };
-    let _ = state.db.insert_review_segment(&rev_dto);
+    if let Err(err) = state.db.insert_review_segment(&rev_dto) {
+        warn!("Failed to persist simulated LPR review segment '{rev_id}': {err:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to persist simulated LPR review segment"
+            })),
+        )
+            .into_response();
+    }
 
     state.comms.publish_json(
         "events",
@@ -7511,7 +7784,8 @@ pub fn evaluate_system_heuristics(
 
     // 7. Corrupted or orphan streams in /config/go2rtc_homekit.yml
     let hk_path = Path::new(ninjanvr_config::DEFAULT_GO2RTC_HOMEKIT_PATH);
-    if let Ok(hk_content) = std::fs::read_to_string(hk_path)
+    if let Some(hk_bytes) = read_bounded_non_symlink_bytes_sync(hk_path, 256 * 1024)
+        && let Ok(hk_content) = String::from_utf8(hk_bytes)
         && (hk_content.contains("wizard_stream_")
             || hk_content.contains("test_")
             || hk_content.matches("streams:").count() > 1)
@@ -7586,10 +7860,8 @@ fn redact_image_bytes_with_privacy_mask(
     if !has_active_privacy_mask(privacy_mask) {
         return (raw_bytes.to_vec(), default_mime);
     }
-    let mut rgb = match image::load_from_memory(raw_bytes) {
-        Ok(dyn_img) => dyn_img.to_rgb8(),
-        Err(_) => image::RgbImage::from_pixel(64, 36, image::Rgb([12, 14, 18])),
-    };
+    let mut rgb = decode_bounded_snapshot_rgb(raw_bytes)
+        .unwrap_or_else(|| image::RgbImage::from_pixel(64, 36, image::Rgb([12, 14, 18])));
     if let Some(mask) = privacy_mask {
         ninjanvr_vision::apply_privacy_masks_from_value(&mut rgb, mask);
     }
@@ -7603,6 +7875,40 @@ fn redact_image_bytes_with_privacy_mask(
     }
 }
 
+async fn redact_image_bytes_with_privacy_mask_async(
+    raw_bytes: Vec<u8>,
+    privacy_mask: Option<Value>,
+    prefer_jpeg: bool,
+) -> (Vec<u8>, &'static str) {
+    let default_mime = if prefer_jpeg {
+        "image/jpeg"
+    } else {
+        "image/webp"
+    };
+    if !has_active_privacy_mask(privacy_mask.as_ref()) {
+        return (raw_bytes, default_mime);
+    }
+    tokio::task::spawn_blocking(move || {
+        redact_image_bytes_with_privacy_mask(&raw_bytes, privacy_mask.as_ref(), prefer_jpeg)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let fallback_rgb = image::RgbImage::from_pixel(64, 36, image::Rgb([12, 14, 18]));
+        if prefer_jpeg {
+            (
+                ninjanvr_vision::encode_image_jpeg(&fallback_rgb).unwrap_or_default(),
+                "image/jpeg",
+            )
+        } else {
+            (
+                ninjanvr_vision::encode_image_webp(&fallback_rgb)
+                    .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec()),
+                "image/webp",
+            )
+        }
+    })
+}
+
 async fn camera_privacy_mask_value(
     config: &Arc<RwLock<NinjaConfig>>,
     camera: &str,
@@ -7611,16 +7917,13 @@ async fn camera_privacy_mask_value(
     cfg.cameras.get(camera).map(|c| c.privacy_mask.clone())
 }
 
-fn redact_event_json_thumbnail_with_cfg(cfg: &NinjaConfig, ev: &mut Value) {
+fn redact_event_json_thumbnail_with_masks(active_masks: &HashMap<String, Value>, ev: &mut Value) {
     let Some(cam) = ev.get("camera").and_then(|v| v.as_str()) else {
         return;
     };
-    let Some(cam_cfg) = cfg.cameras.get(cam) else {
+    let Some(mask) = active_masks.get(cam) else {
         return;
     };
-    if !has_active_privacy_mask(Some(&cam_cfg.privacy_mask)) {
-        return;
-    }
     let Some(b64) = ev
         .get("thumbnail")
         .and_then(|v| v.as_str())
@@ -7632,8 +7935,7 @@ fn redact_event_json_thumbnail_with_cfg(cfg: &NinjaConfig, ev: &mut Value) {
     let raw_bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .unwrap_or_default();
-    let (redacted, _) =
-        redact_image_bytes_with_privacy_mask(&raw_bytes, Some(&cam_cfg.privacy_mask), false);
+    let (redacted, _) = redact_image_bytes_with_privacy_mask(&raw_bytes, Some(mask), false);
     if let Some(obj) = ev.as_object_mut() {
         obj.insert(
             "thumbnail".to_string(),
@@ -7649,16 +7951,44 @@ async fn redact_event_slice_thumbnails_if_masked(
     if events.is_empty() {
         return;
     }
-    let cfg = config.read().await;
-    let any_masked = cfg
-        .cameras
-        .values()
-        .any(|c| has_active_privacy_mask(Some(&c.privacy_mask)));
-    if !any_masked {
+    let active_masks: HashMap<String, Value> = {
+        let cfg = config.read().await;
+        cfg.cameras
+            .iter()
+            .filter(|(_, c)| has_active_privacy_mask(Some(&c.privacy_mask)))
+            .map(|(k, c)| (k.clone(), c.privacy_mask.clone()))
+            .collect()
+    };
+    if active_masks.is_empty() {
         return;
     }
-    for ev in events.iter_mut() {
-        redact_event_json_thumbnail_with_cfg(&cfg, ev);
+    let needs_redaction = events.iter().any(|ev| {
+        ev.get("camera")
+            .and_then(|v| v.as_str())
+            .is_some_and(|cam| active_masks.contains_key(cam))
+            && ev
+                .get("thumbnail")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty())
+    });
+    if !needs_redaction {
+        return;
+    }
+    let mut owned_events: Vec<Value> = events
+        .iter_mut()
+        .map(|ev| std::mem::replace(ev, Value::Null))
+        .collect();
+    if let Ok(redacted_events) = tokio::task::spawn_blocking(move || {
+        for ev in &mut owned_events {
+            redact_event_json_thumbnail_with_masks(&active_masks, ev);
+        }
+        owned_events
+    })
+    .await
+    {
+        for (dst, src) in events.iter_mut().zip(redacted_events) {
+            *dst = src;
+        }
     }
 }
 
@@ -7750,37 +8080,68 @@ async fn atomic_write_within_media_subdir(
     if !is_safe_id(filename) || filename.contains('/') || filename.contains('\\') {
         anyhow::bail!("Invalid filename '{filename}'");
     }
-    let subdir = media_dir.join(subdir_name);
-    if let Ok(meta) = std::fs::symlink_metadata(&subdir)
-        && meta.file_type().is_symlink()
-    {
-        anyhow::bail!("Target directory '{subdir_name}' must not be a symlink");
-    }
-    tokio::fs::create_dir_all(&subdir).await?;
-    let Some(canon_subdir) = ensure_path_within_media_dir(media_dir, &subdir) else {
-        anyhow::bail!("Target directory '{subdir_name}' escapes media_dir");
-    };
-    let final_path = canon_subdir.join(filename);
-    if let Ok(meta) = std::fs::symlink_metadata(&final_path)
-        && meta.file_type().is_symlink()
-    {
-        anyhow::bail!(
-            "Refusing to overwrite symlink at '{}'",
-            final_path.display()
-        );
-    }
-    let tmp_name = format!("tmp_{}_{}", rand::random::<u64>(), filename);
-    let tmp_path = canon_subdir.join(&tmp_name);
-    tokio::fs::write(&tmp_path, bytes).await?;
-    if let Err(err) = tokio::fs::rename(&tmp_path, &final_path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(err.into());
-    }
-    let Some(safe_final) = ensure_path_within_media_dir(&canon_subdir, &final_path) else {
-        let _ = tokio::fs::remove_file(&final_path).await;
-        anyhow::bail!("Written file escapes '{subdir_name}' directory");
-    };
-    Ok(safe_final)
+    let media_dir_owned = media_dir.to_path_buf();
+    let subdir_owned = subdir_name.to_string();
+    let filename_owned = filename.to_string();
+    let bytes_owned = bytes.to_vec();
+    tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        use std::io::Write;
+        let subdir = media_dir_owned.join(&subdir_owned);
+        if let Ok(meta) = std::fs::symlink_metadata(&subdir)
+            && meta.file_type().is_symlink()
+        {
+            anyhow::bail!("Target directory '{subdir_owned}' must not be a symlink");
+        }
+        std::fs::create_dir_all(&subdir)?;
+        let Some(canon_subdir) = ensure_path_within_media_dir(&media_dir_owned, &subdir) else {
+            anyhow::bail!("Target directory '{subdir_owned}' escapes media_dir");
+        };
+        let final_path = canon_subdir.join(&filename_owned);
+        if let Ok(meta) = std::fs::symlink_metadata(&final_path)
+            && (meta.file_type().is_symlink() || meta.is_dir())
+        {
+            anyhow::bail!(
+                "Refusing to overwrite symlink or directory at '{}'",
+                final_path.display()
+            );
+        }
+        let nonce: u64 = rand::random();
+        let tmp_name = format!(".{filename_owned}.{nonce:016x}.tmp");
+        let tmp_path = canon_subdir.join(&tmp_name);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(nix::libc::O_NOFOLLOW);
+        }
+        let mut tmp_file = opts.open(&tmp_path)?;
+        if let Err(err) = tmp_file.write_all(&bytes_owned) {
+            drop(tmp_file);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+        drop(tmp_file);
+        if let Ok(meta) = std::fs::symlink_metadata(&final_path)
+            && (meta.file_type().is_symlink() || meta.is_dir())
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            anyhow::bail!(
+                "Refusing to overwrite symlink or directory at '{}'",
+                final_path.display()
+            );
+        }
+        if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
+        let Some(safe_final) = ensure_path_within_media_dir(&canon_subdir, &final_path) else {
+            let _ = std::fs::remove_file(&final_path);
+            anyhow::bail!("Written file escapes '{subdir_owned}' directory");
+        };
+        Ok(safe_final)
+    })
+    .await?
 }
 
 fn cleanup_event_media_artifacts(media_dir: &Path, camera: Option<&str>, event_id: &str) {
@@ -7827,10 +8188,11 @@ async fn redact_dataset_sample_file_if_masked(
         }
     });
     if let Some(safe_path) = resolved_path
-        && let Ok(raw_bytes) = tokio::fs::read(&safe_path).await
+        && let Some(raw_bytes) =
+            read_bounded_non_symlink_bytes(&safe_path, MAX_DATASET_SAMPLE_FILE_BYTES).await
     {
         let (redacted, _) =
-            redact_image_bytes_with_privacy_mask(&raw_bytes, priv_mask.as_ref(), false);
+            redact_image_bytes_with_privacy_mask_async(raw_bytes, priv_mask, false).await;
         if let Some(fname) = safe_path.file_name().and_then(|s| s.to_str()) {
             if let Err(err) =
                 atomic_write_within_media_subdir(media_dir, "dataset", fname, &redacted).await
@@ -7843,12 +8205,21 @@ async fn redact_dataset_sample_file_if_masked(
                 }
             } else {
                 let clips_dataset_dir = media_dir.join("clips").join("dataset");
-                let _ = crate::pipeline::write_contained_media_file(
+                if let Err(err) = crate::pipeline::write_contained_media_file(
                     media_dir,
                     &clips_dataset_dir,
                     fname,
                     &redacted,
-                );
+                ) {
+                    warn!(
+                        "Failed to persist redacted dataset mirror sample 'clips/dataset/{fname}': {err:#}"
+                    );
+                    let clips_mirror = clips_dataset_dir.join(fname);
+                    if let Some(safe_mirror) = ensure_clips_artifact_path(media_dir, &clips_mirror)
+                    {
+                        let _ = tokio::fs::remove_file(&safe_mirror).await;
+                    }
+                }
             }
         }
     }
@@ -8063,21 +8434,19 @@ async fn api_review_frame(
     let Some(path) = state.preview_frames.frame_path(&item.camera, ts) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !is_regular_non_symlink_file(&path) {
+    let Some(bytes) = read_bounded_non_symlink_bytes(&path, MAX_SNAPSHOT_FRAME_BYTES as u64).await
+    else {
         return StatusCode::NOT_FOUND.into_response();
-    }
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            [
-                (header::CONTENT_TYPE, "image/jpeg"),
-                // Frame files never change once written.
-                (header::CACHE_CONTROL, "private, max-age=86400, immutable"),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            // Frame files never change once written.
+            (header::CACHE_CONTROL, "private, max-age=86400, immutable"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 async fn api_review_preview(
@@ -8118,7 +8487,8 @@ async fn api_review_preview(
                 let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
                 if let Some(safe_path) =
                     ensure_recording_segment_path(&state.media_dir, Some(cam), &disk_path)
-                    && let Ok(bytes) = tokio::fs::read(&safe_path).await
+                    && let Some(bytes) =
+                        read_bounded_non_symlink_bytes(&safe_path, 256 * 1024 * 1024).await
                 {
                     return (
                         [
@@ -8139,7 +8509,8 @@ async fn api_review_preview(
                 let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
                 if let Some(safe_path) =
                     ensure_recording_segment_path(&state.media_dir, Some(cam), &disk_path)
-                    && let Ok(bytes) = tokio::fs::read(&safe_path).await
+                    && let Some(bytes) =
+                        read_bounded_non_symlink_bytes(&safe_path, 256 * 1024 * 1024).await
                 {
                     return (
                         [
@@ -8612,10 +8983,8 @@ async fn api_event_by_id(
                 )
                     .into_response();
             }
-            {
-                let cfg = state.config.read().await;
-                redact_event_json_thumbnail_with_cfg(&cfg, &mut ev);
-            }
+            redact_event_slice_thumbnails_if_masked(&state.config, std::slice::from_mut(&mut ev))
+                .await;
             Json(ev).into_response()
         }
         _ => StatusCode::NOT_FOUND.into_response(),
@@ -10062,7 +10431,8 @@ pub async fn verify_event_with_genai_components(
     let mut raw_img_bytes: Option<(Vec<u8>, &'static str)> = None;
     for (path, mime) in candidates {
         if let Some(safe_path) = ensure_clips_artifact_path(&media_dir, &path)
-            && let Ok(bytes) = tokio::fs::read(&safe_path).await
+            && let Some(bytes) =
+                read_bounded_non_symlink_bytes(&safe_path, MAX_DATASET_SAMPLE_FILE_BYTES).await
             && !bytes.is_empty()
         {
             raw_img_bytes = Some((bytes, mime));
@@ -10080,7 +10450,12 @@ pub async fn verify_event_with_genai_components(
 
     let (final_bytes, mime_type) = match raw_img_bytes {
         Some((bytes, mime)) => {
-            redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), mime == "image/jpeg")
+            redact_image_bytes_with_privacy_mask_async(
+                bytes,
+                priv_mask.clone(),
+                mime == "image/jpeg",
+            )
+            .await
         }
         None => {
             if let Some(thumb) = ev["thumbnail"].as_str()
@@ -10424,7 +10799,8 @@ async fn resolve_event_clean_snapshot_with_ir(
     let mut found_bytes: Option<Vec<u8>> = None;
     for path in candidates {
         if let Some(safe_path) = ensure_clips_artifact_path(media_dir, &path)
-            && let Ok(bytes) = tokio::fs::read(&safe_path).await
+            && let Some(bytes) =
+                read_bounded_non_symlink_bytes(&safe_path, MAX_DATASET_SAMPLE_FILE_BYTES).await
             && !bytes.is_empty()
         {
             found_bytes = Some(bytes);
@@ -10439,26 +10815,35 @@ async fn resolve_event_clean_snapshot_with_ir(
     {
         found_bytes = Some(bytes);
     }
-    let mut bytes = found_bytes.unwrap_or_else(|| {
+    let bytes = found_bytes.unwrap_or_else(|| {
         let img = image::RgbImage::from_pixel(64, 36, image::Rgb([24, 24, 24]));
         ninjanvr_vision::encode_image_webp(&img)
             .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec())
     });
-    let mut w = 1280u32;
-    let mut h = 720u32;
-    let mut is_ir = false;
-    if let Ok(dyn_img) = image::load_from_memory(&bytes) {
-        let rgb = dyn_img.to_rgb8();
-        w = rgb.width();
-        h = rgb.height();
-        is_ir = is_rgb_image_monochrome_ir(&rgb);
-        if bytes.starts_with(&[0xFF, 0xD8])
-            && let Ok(webp) = ninjanvr_vision::encode_image_webp(&rgb)
-        {
-            bytes = webp;
+    tokio::task::spawn_blocking(move || {
+        let mut out_bytes = bytes;
+        let mut w = 1280u32;
+        let mut h = 720u32;
+        let mut is_ir = false;
+        if let Some(rgb) = decode_bounded_snapshot_rgb(&out_bytes) {
+            w = rgb.width();
+            h = rgb.height();
+            is_ir = is_rgb_image_monochrome_ir(&rgb);
+            if out_bytes.starts_with(&[0xFF, 0xD8])
+                && let Ok(webp) = ninjanvr_vision::encode_image_webp(&rgb)
+            {
+                out_bytes = webp;
+            }
         }
-    }
-    (bytes, w, h, is_ir)
+        (out_bytes, w, h, is_ir)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let img = image::RgbImage::from_pixel(64, 36, image::Rgb([24, 24, 24]));
+        let fallback = ninjanvr_vision::encode_image_webp(&img)
+            .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec());
+        (fallback, 1280, 720, false)
+    })
 }
 
 pub async fn create_dataset_sample_from_event(
@@ -10514,7 +10899,7 @@ async fn create_dataset_sample_from_event_with_config(
             .and_then(|loaded| loaded.cameras.get(&camera).map(|c| c.privacy_mask.clone()))
     };
     let (img_bytes, _) =
-        redact_image_bytes_with_privacy_mask(&raw_img_bytes, priv_mask.as_ref(), false);
+        redact_image_bytes_with_privacy_mask_async(raw_img_bytes, priv_mask, false).await;
     let night_mode = ev["data"]["night_mode"]
         .as_bool()
         .unwrap_or(inferred_night_ir);
@@ -11091,27 +11476,19 @@ static DATASET_EXPORT_ZIP_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore>
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
 
 fn read_bounded_dataset_file_sync(path: &Path) -> Option<Vec<u8>> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_DATASET_SAMPLE_FILE_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.is_empty() || bytes.len() as u64 > MAX_DATASET_SAMPLE_FILE_BYTES {
+    let bytes = read_bounded_non_symlink_bytes_sync(path, MAX_DATASET_SAMPLE_FILE_BYTES)?;
+    if bytes.is_empty() {
         return None;
     }
     Some(bytes)
 }
 
 async fn read_bounded_dataset_file(path: &Path) -> Option<Vec<u8>> {
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_DATASET_SAMPLE_FILE_BYTES {
-        return None;
-    }
-    let bytes = tokio::fs::read(path).await.ok()?;
-    if bytes.is_empty() || bytes.len() as u64 > MAX_DATASET_SAMPLE_FILE_BYTES {
-        return None;
-    }
-    Some(bytes)
+    let path_owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_bounded_dataset_file_sync(&path_owned))
+        .await
+        .ok()
+        .flatten()
 }
 
 fn load_dataset_sample_image_bytes_sync(
@@ -12796,8 +13173,7 @@ fn crop_event_face_square_from_bytes(ev: &Value, raw_image_bytes: &[u8]) -> Opti
     if raw_box.iter().all(|&v| v <= 0.0) {
         return None;
     }
-    let dyn_img = image::load_from_memory(raw_image_bytes).ok()?;
-    let rgb = dyn_img.to_rgb8();
+    let rgb = decode_bounded_snapshot_rgb(raw_image_bytes)?;
     let fw = rgb.width();
     let fh = rgb.height();
     let person_bbox = norm_box_to_pixel_bbox(ev, raw_box, fw, fh)?;
@@ -12928,7 +13304,8 @@ fn load_event_face_sample_bytes_sync(
                 (clips_dir.join(format!("{event_id}.jpg")), true),
             ] {
                 if let Some(safe_p) = ensure_clips_artifact_path(&state.media_dir, &candidate)
-                    && let Ok(bytes) = std::fs::read(&safe_p)
+                    && let Some(bytes) =
+                        read_bounded_non_symlink_bytes_sync(&safe_p, MAX_DATASET_SAMPLE_FILE_BYTES)
                     && !bytes.is_empty()
                 {
                     let (out, _) = redact_image_bytes_with_privacy_mask(&bytes, priv_mask, is_jpeg);
@@ -12957,50 +13334,21 @@ async fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> Vec<u
     if !is_safe_id(event_id) {
         return format!("event-face-sample:{event_id}").into_bytes();
     }
-    let clips_dir = state.media_dir.join("clips");
-    if let Ok(Some(ev)) = state.db.get_event(event_id) {
-        let cam_opt = ev["camera"].as_str().filter(|c| is_safe_id(c));
-        let priv_mask = if let Some(cam) = cam_opt {
-            camera_privacy_mask_value(&state.config, cam).await
-        } else {
-            None
-        };
-        if let Some(cam) = cam_opt {
-            for (candidate, is_jpeg) in [
-                (
-                    clips_dir.join(format!("{cam}-{event_id}-clean.webp")),
-                    false,
-                ),
-                (clips_dir.join(format!("{event_id}-clean.jpg")), true),
-                (clips_dir.join(format!("{cam}-{event_id}.webp")), false),
-                (clips_dir.join(format!("{event_id}.jpg")), true),
-            ] {
-                if let Some(safe_p) = ensure_clips_artifact_path(&state.media_dir, &candidate)
-                    && let Ok(bytes) = tokio::fs::read(&safe_p).await
-                    && !bytes.is_empty()
-                {
-                    let (out, _) =
-                        redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), is_jpeg);
-                    if let Some(cropped) = crop_event_face_square_from_bytes(&ev, &out) {
-                        return cropped;
-                    }
-                    return out;
-                }
-            }
-        }
-        if let Some(thumb_b64) = ev["thumbnail"].as_str()
-            && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(thumb_b64.trim())
-            && !decoded.is_empty()
-        {
-            let (out, _) =
-                redact_image_bytes_with_privacy_mask(&decoded, priv_mask.as_ref(), false);
-            if let Some(cropped) = crop_event_face_square_from_bytes(&ev, &out) {
-                return cropped;
-            }
-            return out;
-        }
-    }
-    format!("event-face-sample:{event_id}").into_bytes()
+    let masks: HashMap<String, Value> = {
+        let cfg = state.config.read().await;
+        cfg.cameras
+            .iter()
+            .map(|(k, v)| (k.clone(), v.privacy_mask.clone()))
+            .collect()
+    };
+    let state_owned = state.clone();
+    let event_id_owned = event_id.to_string();
+    let fallback_id = event_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        load_event_face_sample_bytes_sync(&state_owned, &masks, &event_id_owned)
+    })
+    .await
+    .unwrap_or_else(|_| format!("event-face-sample:{fallback_id}").into_bytes())
 }
 
 async fn api_event_sub_label(
@@ -13059,20 +13407,32 @@ async fn api_event_sub_label(
         .sub_label
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let canonical_sub_owned: Option<String> = raw_sub.map(|s| {
-        let profiles = state.detector.list_face_profiles(&faces_dir);
-        profiles
-            .iter()
-            .find(|p| p.name.eq_ignore_ascii_case(s))
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| s.to_string())
-    });
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let state_for_sub = state.clone();
+    let faces_dir_for_sub = faces_dir.clone();
+    let id_for_sub = id.clone();
+    let score_for_sub = body.sub_label_score;
+    let (canonical_sub_owned, updated) = tokio::task::spawn_blocking(move || {
+        let canonical = raw_sub.map(|s| {
+            let profiles = state_for_sub
+                .detector
+                .list_face_profiles(&faces_dir_for_sub);
+            profiles
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(&s))
+                .map(|p| p.name.clone())
+                .unwrap_or(s)
+        });
+        let updated = state_for_sub
+            .db
+            .set_event_sub_label_with_score(&id_for_sub, canonical.as_deref(), score_for_sub)
+            .unwrap_or(0);
+        (canonical, updated)
+    })
+    .await
+    .unwrap_or((None, 0));
     let clean_sub = canonical_sub_owned.as_deref();
-    let updated = state
-        .db
-        .set_event_sub_label_with_score(&id, clean_sub, body.sub_label_score)
-        .unwrap_or(0);
 
     let is_unrestricted = allowed_opt
         .as_ref()
@@ -13084,13 +13444,20 @@ async fn api_event_sub_label(
         && !name.eq_ignore_ascii_case("unknown")
     {
         let sample_bytes = load_event_face_sample_bytes(&state, &id).await;
-        if let Ok((saved_path, _)) =
-            state
-                .detector
-                .enroll_face_profile(&faces_dir, name, &id, &sample_bytes)
-        {
-            mirror_face_sample_to_clips(&state.media_dir, name, &saved_path);
-        }
+        let state_for_enroll = state.clone();
+        let name_owned = name.to_string();
+        let id_owned = id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok((saved_path, _)) = state_for_enroll.detector.enroll_face_profile(
+                &faces_dir,
+                &name_owned,
+                &id_owned,
+                &sample_bytes,
+            ) {
+                mirror_face_sample_to_clips(&state_for_enroll.media_dir, &name_owned, &saved_path);
+            }
+        })
+        .await;
     }
 
     Json(json!({
@@ -13119,66 +13486,74 @@ async fn api_faces_list(
     jar: CookieJar,
     headers: HeaderMap,
 ) -> Json<Value> {
-    let faces_dir = state.media_dir.join("faces");
-    let mut profiles = state.detector.list_face_profiles(&faces_dir);
-    if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await
-        && !allowed.iter().any(|a| a == "*")
-    {
-        let scoped_events = state
-            .db
-            .query_events(&EventFilter {
-                cameras: scope_cameras_filter(None, Some(allowed.clone())),
-                limit: Some(1000),
-                ..Default::default()
-            })
-            .unwrap_or_default();
-        let mut allowed_sub_labels = BTreeSet::new();
-        for ev in &scoped_events {
-            if let Some(sl) = ev["sub_label"]
-                .as_str()
-                .or_else(|| ev["data"]["sub_label"].as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                allowed_sub_labels.insert(sl.to_ascii_lowercase());
-            }
-        }
-        for item in state.db.query_events_summary().unwrap_or_default() {
-            if item["camera"]
-                .as_str()
-                .is_some_and(|cam| allowed.iter().any(|a| a == cam))
-                && let Some(sl) = item["sub_label"]
+    let allowed_opt = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let state_for_list = state.clone();
+    let root = tokio::task::spawn_blocking(move || {
+        let faces_dir = state_for_list.media_dir.join("faces");
+        let mut profiles = state_for_list.detector.list_face_profiles(&faces_dir);
+        if let Some(allowed) = allowed_opt
+            && !allowed.iter().any(|a| a == "*")
+        {
+            let scoped_events = state_for_list
+                .db
+                .query_events(&EventFilter {
+                    cameras: scope_cameras_filter(None, Some(allowed.clone())),
+                    limit: Some(1000),
+                    ..Default::default()
+                })
+                .unwrap_or_default();
+            let mut allowed_sub_labels = BTreeSet::new();
+            for ev in &scoped_events {
+                if let Some(sl) = ev["sub_label"]
                     .as_str()
+                    .or_else(|| ev["data"]["sub_label"].as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-            {
-                allowed_sub_labels.insert(sl.to_ascii_lowercase());
+                {
+                    allowed_sub_labels.insert(sl.to_ascii_lowercase());
+                }
+            }
+            for item in state_for_list.db.query_events_summary().unwrap_or_default() {
+                if item["camera"]
+                    .as_str()
+                    .is_some_and(|cam| allowed.iter().any(|a| a == cam))
+                    && let Some(sl) = item["sub_label"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    allowed_sub_labels.insert(sl.to_ascii_lowercase());
+                }
+            }
+            profiles.retain_mut(|p| {
+                p.sample_files.retain(|fname| {
+                    let stem = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname);
+                    match state_for_list.db.get_event(stem) {
+                        Ok(Some(ev)) => ev["camera"]
+                            .as_str()
+                            .is_some_and(|cam| allowed.iter().any(|a| a == cam)),
+                        _ => false,
+                    }
+                });
+                p.sample_count = p.sample_files.len();
+                allowed_sub_labels.contains(&p.name.to_ascii_lowercase())
+                    || !p.sample_files.is_empty()
+            });
+        }
+        let mut faces_map = serde_json::Map::new();
+        let mut root = serde_json::Map::new();
+        for p in &profiles {
+            faces_map.insert(p.name.clone(), json!(p.sample_files));
+            if p.name != "profiles" && p.name != "faces" {
+                root.insert(p.name.clone(), json!(p.sample_files));
             }
         }
-        profiles.retain_mut(|p| {
-            p.sample_files.retain(|fname| {
-                let stem = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname);
-                match state.db.get_event(stem) {
-                    Ok(Some(ev)) => ev["camera"]
-                        .as_str()
-                        .is_some_and(|cam| allowed.iter().any(|a| a == cam)),
-                    _ => false,
-                }
-            });
-            p.sample_count = p.sample_files.len();
-            allowed_sub_labels.contains(&p.name.to_ascii_lowercase()) || !p.sample_files.is_empty()
-        });
-    }
-    let mut faces_map = serde_json::Map::new();
-    let mut root = serde_json::Map::new();
-    for p in &profiles {
-        faces_map.insert(p.name.clone(), json!(p.sample_files));
-        if p.name != "profiles" && p.name != "faces" {
-            root.insert(p.name.clone(), json!(p.sample_files));
-        }
-    }
-    root.insert("profiles".to_string(), json!(profiles));
-    root.insert("faces".to_string(), Value::Object(faces_map));
+        root.insert("profiles".to_string(), json!(profiles));
+        root.insert("faces".to_string(), Value::Object(faces_map));
+        root
+    })
+    .await
+    .unwrap_or_default();
     Json(Value::Object(root))
 }
 
@@ -13407,15 +13782,22 @@ async fn api_face_delete(
             .into_response();
     };
     let faces_dir = state.media_dir.join("faces");
-    let deleted = state
-        .detector
-        .delete_face_profile(&faces_dir, &clean_name)
-        .unwrap_or(false);
-    remove_face_profile_from_clips_mirror(&state.media_dir, &clean_name);
-    let cleared_events = state
-        .db
-        .clear_face_profile_sub_labels(&clean_name)
-        .unwrap_or(0);
+    let state_for_del = state.clone();
+    let clean_for_del = clean_name.clone();
+    let (deleted, cleared_events) = tokio::task::spawn_blocking(move || {
+        let deleted = state_for_del
+            .detector
+            .delete_face_profile(&faces_dir, &clean_for_del)
+            .unwrap_or(false);
+        remove_face_profile_from_clips_mirror(&state_for_del.media_dir, &clean_for_del);
+        let cleared_events = state_for_del
+            .db
+            .clear_face_profile_sub_labels(&clean_for_del)
+            .unwrap_or(0);
+        (deleted, cleared_events)
+    })
+    .await
+    .unwrap_or((false, 0));
     Json(json!({
         "success": true,
         "name": clean_name,
@@ -13430,52 +13812,59 @@ async fn api_sub_labels(
     jar: CookieJar,
     headers: HeaderMap,
 ) -> Json<Value> {
-    let mut set = BTreeSet::new();
-    if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await
-        && !allowed.iter().any(|a| a == "*")
-    {
-        let scoped_events = state
-            .db
-            .query_events(&EventFilter {
-                cameras: scope_cameras_filter(None, Some(allowed.clone())),
-                limit: Some(1000),
-                ..Default::default()
-            })
-            .unwrap_or_default();
-        for ev in scoped_events {
-            if let Some(sl) = ev["sub_label"]
-                .as_str()
-                .or_else(|| ev["data"]["sub_label"].as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                set.insert(sl.to_string());
-            }
-        }
-        for item in state.db.query_events_summary().unwrap_or_default() {
-            if item["camera"]
-                .as_str()
-                .is_some_and(|cam| allowed.iter().any(|a| a == cam))
-                && let Some(sl) = item["sub_label"]
+    let allowed_opt = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let state_for_subs = state.clone();
+    let list = tokio::task::spawn_blocking(move || {
+        let mut set = BTreeSet::new();
+        if let Some(allowed) = allowed_opt
+            && !allowed.iter().any(|a| a == "*")
+        {
+            let scoped_events = state_for_subs
+                .db
+                .query_events(&EventFilter {
+                    cameras: scope_cameras_filter(None, Some(allowed.clone())),
+                    limit: Some(1000),
+                    ..Default::default()
+                })
+                .unwrap_or_default();
+            for ev in scoped_events {
+                if let Some(sl) = ev["sub_label"]
                     .as_str()
+                    .or_else(|| ev["data"]["sub_label"].as_str())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-            {
-                set.insert(sl.to_string());
+                {
+                    set.insert(sl.to_string());
+                }
+            }
+            for item in state_for_subs.db.query_events_summary().unwrap_or_default() {
+                if item["camera"]
+                    .as_str()
+                    .is_some_and(|cam| allowed.iter().any(|a| a == cam))
+                    && let Some(sl) = item["sub_label"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    set.insert(sl.to_string());
+                }
+            }
+            return set.into_iter().collect::<Vec<_>>();
+        }
+        if let Ok(db_subs) = state_for_subs.db.list_distinct_sub_labels() {
+            for s in db_subs {
+                set.insert(s);
             }
         }
-        return Json(json!(set.into_iter().collect::<Vec<_>>()));
-    }
-    if let Ok(db_subs) = state.db.list_distinct_sub_labels() {
-        for s in db_subs {
-            set.insert(s);
+        let faces_dir = state_for_subs.media_dir.join("faces");
+        for p in state_for_subs.detector.list_face_profiles(&faces_dir) {
+            set.insert(p.name);
         }
-    }
-    let faces_dir = state.media_dir.join("faces");
-    for p in state.detector.list_face_profiles(&faces_dir) {
-        set.insert(p.name);
-    }
-    Json(json!(set.into_iter().collect::<Vec<_>>()))
+        set.into_iter().collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    Json(json!(list))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -13569,8 +13958,17 @@ async fn api_event_license_plate(
 
     if updated > 0
         && let Some(ref sl) = resolved_sub_label
+        && let Err(err) = state.db.set_event_sub_label(&id, Some(sl))
     {
-        let _ = state.db.set_event_sub_label(&id, Some(sl));
+        warn!("Failed to update sub_label for event '{id}' during license plate update: {err:#}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to update event sub_label"
+            })),
+        )
+            .into_response();
     }
 
     Json(json!({
@@ -13867,18 +14265,20 @@ async fn api_event_snapshot_clean_webp(
         let priv_mask = camera_privacy_mask_value(&state.config, cam).await;
         let clean_candidate = clips_dir.join(format!("{cam}-{id}-clean.webp"));
         if let Some(safe_p) = ensure_clips_artifact_path(&state.media_dir, &clean_candidate)
-            && let Ok(bytes) = tokio::fs::read(&safe_p).await
+            && let Some(bytes) =
+                read_bounded_non_symlink_bytes(&safe_p, MAX_DATASET_SAMPLE_FILE_BYTES).await
         {
             let (out_bytes, _) =
-                redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
+                redact_image_bytes_with_privacy_mask_async(bytes, priv_mask, false).await;
             return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
         }
         let webp_candidate = clips_dir.join(format!("{cam}-{id}.webp"));
         if let Some(safe_p) = ensure_clips_artifact_path(&state.media_dir, &webp_candidate)
-            && let Ok(bytes) = tokio::fs::read(&safe_p).await
+            && let Some(bytes) =
+                read_bounded_non_symlink_bytes(&safe_p, MAX_DATASET_SAMPLE_FILE_BYTES).await
         {
             let (out_bytes, _) =
-                redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
+                redact_image_bytes_with_privacy_mask_async(bytes, priv_mask, false).await;
             return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
         }
     }
@@ -13946,10 +14346,11 @@ async fn api_event_snapshot_jpg(
         let priv_mask = camera_privacy_mask_value(&state.config, cam).await;
         let snap_path = state.media_dir.join("clips").join(format!("{id}.jpg"));
         if let Some(safe_p) = ensure_clips_artifact_path(&state.media_dir, &snap_path)
-            && let Ok(bytes) = tokio::fs::read(&safe_p).await
+            && let Some(bytes) =
+                read_bounded_non_symlink_bytes(&safe_p, MAX_DATASET_SAMPLE_FILE_BYTES).await
         {
             let (out_bytes, _) =
-                redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), true);
+                redact_image_bytes_with_privacy_mask_async(bytes, priv_mask, true).await;
             return ([(header::CONTENT_TYPE, "image/jpeg")], out_bytes).into_response();
         }
     }
@@ -13973,7 +14374,7 @@ async fn serve_event_thumb(state: &AppState, id: &str, content_type: &'static st
             && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64)
         {
             let (out_bytes, _) =
-                redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), prefer_jpeg);
+                redact_image_bytes_with_privacy_mask_async(bytes, priv_mask, prefer_jpeg).await;
             return ([(header::CONTENT_TYPE, content_type)], out_bytes).into_response();
         }
         if let Some(cam) = cam_opt {
@@ -13982,10 +14383,11 @@ async fn serve_event_thumb(state: &AppState, id: &str, content_type: &'static st
                 .join("clips")
                 .join(format!("{cam}-{id}.webp"));
             if let Some(safe_p) = ensure_clips_artifact_path(&state.media_dir, &candidate)
-                && let Ok(bytes) = tokio::fs::read(&safe_p).await
+                && let Some(bytes) =
+                    read_bounded_non_symlink_bytes(&safe_p, MAX_DATASET_SAMPLE_FILE_BYTES).await
             {
                 let (out_bytes, _) =
-                    redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
+                    redact_image_bytes_with_privacy_mask_async(bytes, priv_mask, false).await;
                 return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
             }
         }
@@ -14032,7 +14434,7 @@ async fn api_event_clip_mp4(
     }
     let direct_clip = state.media_dir.join("clips").join(format!("{id}.mp4"));
     if let Some(safe_clip) = ensure_clips_artifact_path(&state.media_dir, &direct_clip)
-        && let Ok(bytes) = tokio::fs::read(&safe_clip).await
+        && let Some(bytes) = read_bounded_non_symlink_bytes(&safe_clip, 256 * 1024 * 1024).await
     {
         return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
     }
@@ -14042,7 +14444,7 @@ async fn api_event_clip_mp4(
         let mocks_dir = state.media_dir.join("clips/mocks");
         let mock_path = mocks_dir.join(mock_vid);
         if let Some(safe_mock) = ensure_path_within_media_dir(&mocks_dir, &mock_path)
-            && let Ok(bytes) = tokio::fs::read(&safe_mock).await
+            && let Some(bytes) = read_bounded_non_symlink_bytes(&safe_mock, 256 * 1024 * 1024).await
         {
             return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
         }
@@ -14054,7 +14456,8 @@ async fn api_event_clip_mp4(
                 let disk_path = resolve_recording_disk_path(&state.media_dir, &rec.path);
                 if let Some(safe_rec) =
                     ensure_recording_segment_path(&state.media_dir, Some(cam), &disk_path)
-                    && let Ok(bytes) = tokio::fs::read(&safe_rec).await
+                    && let Some(bytes) =
+                        read_bounded_non_symlink_bytes(&safe_rec, 256 * 1024 * 1024).await
                 {
                     return ([(header::CONTENT_TYPE, "video/mp4")], bytes).into_response();
                 }
@@ -14707,33 +15110,43 @@ async fn api_camera_recordings_delete(
         )
             .into_response();
     }
-    let deleted = state
-        .db
-        .delete_recordings_in_range(&camera, after, before)
-        .unwrap_or_default();
-    let recordings_root = state.media_dir.join("recordings");
-    let mut freed_bytes: u64 = 0;
-    for (_id, db_path, seg_size_mb) in &deleted {
-        let disk_path = resolve_recording_disk_path(&state.media_dir, db_path);
-        if let Some(safe_disk_path) =
-            ensure_recording_segment_path(&state.media_dir, Some(&camera), &disk_path)
-        {
-            if let Ok(meta) = std::fs::metadata(&safe_disk_path) {
-                freed_bytes += meta.len();
+    let state_for_del = state.clone();
+    let cam_for_del = camera.clone();
+    let (deleted_len, freed_bytes) = tokio::task::spawn_blocking(move || {
+        let deleted = state_for_del
+            .db
+            .delete_recordings_in_range(&cam_for_del, after, before)
+            .unwrap_or_default();
+        let recordings_root = state_for_del.media_dir.join("recordings");
+        let canon_rec_root = std::fs::canonicalize(&recordings_root).ok();
+        let mut freed_bytes: u64 = 0;
+        for (_id, db_path, seg_size_mb) in &deleted {
+            let disk_path = resolve_recording_disk_path(&state_for_del.media_dir, db_path);
+            if let Some(safe_disk_path) = ensure_recording_segment_path(
+                &state_for_del.media_dir,
+                Some(&cam_for_del),
+                &disk_path,
+            ) {
+                if let Ok(meta) = std::fs::metadata(&safe_disk_path) {
+                    freed_bytes += meta.len();
+                } else {
+                    freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
+                }
+                let _ = std::fs::remove_file(&safe_disk_path);
+                if let Some(ref canon_root) = canon_rec_root {
+                    ninjanvr_media::prune_empty_parent_dirs(&safe_disk_path, canon_root);
+                }
             } else {
                 freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
             }
-            let _ = std::fs::remove_file(&safe_disk_path);
-            if let Ok(canon_rec_root) = std::fs::canonicalize(&recordings_root) {
-                ninjanvr_media::prune_empty_parent_dirs(&safe_disk_path, &canon_rec_root);
-            }
-        } else {
-            freed_bytes += (seg_size_mb * 1024.0 * 1024.0).round() as u64;
         }
-    }
-    cleanup_camera_share_clip_artifacts_in_range(&state, &camera, after, before);
+        cleanup_camera_share_clip_artifacts_in_range(&state_for_del, &cam_for_del, after, before);
+        (deleted.len(), freed_bytes)
+    })
+    .await
+    .unwrap_or((0, 0));
     Json(json!({
-        "deleted_segments": deleted.len(),
+        "deleted_segments": deleted_len,
         "freed_bytes": freed_bytes
     }))
     .into_response()
@@ -15269,16 +15682,17 @@ fn bare_hostname(host_port: &str) -> &str {
 }
 
 fn is_internal_backend_host(host_port: &str) -> bool {
-    let host = bare_hostname(host_port);
-    if host.eq_ignore_ascii_case("localhost")
-        || host.eq_ignore_ascii_case("ninjanvr")
-        || host.ends_with(".svc")
-        || host.ends_with(".cluster.local")
-        || host.ends_with(".internal")
+    let host_raw = bare_hostname(host_port).trim().trim_end_matches('.');
+    let host_lc = host_raw.to_ascii_lowercase();
+    if host_lc == "localhost"
+        || host_lc == "ninjanvr"
+        || host_lc.ends_with(".svc")
+        || host_lc.ends_with(".cluster.local")
+        || host_lc.ends_with(".internal")
     {
         return true;
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+    if let Ok(ip) = host_raw.parse::<std::net::IpAddr>() {
         return match ip {
             std::net::IpAddr::V4(v4) => v4.is_loopback(),
             std::net::IpAddr::V6(v6) => {
@@ -15925,8 +16339,12 @@ fn verify_share_jti_with_view_mode(
             .map(|cfg| cfg.auth.enabled)
             .unwrap_or(true);
         let revoke_invalid_creator_jti = |reason: &'static str, force_db_revoke: bool| {
-            if force_db_revoke || created_by != "admin" {
-                let _ = state.db.revoke_share_link(jti);
+            let mut db_revoke_failed = false;
+            if (force_db_revoke || created_by != "admin")
+                && let Err(err) = state.db.revoke_share_link(jti)
+            {
+                warn!("Failed to revoke share link '{jti}' after creator permission loss: {err:#}");
+                db_revoke_failed = true;
             }
             if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
                 if !auto_map.contains_key(jti) && auto_map.len() >= 512 {
@@ -15944,7 +16362,24 @@ fn verify_share_jti_with_view_mode(
             if let Ok(mut map) = state.share_page_video_credits.lock() {
                 map.remove(jti);
             }
-            if !has_active_or_in_flight_share_for_target(state, &payload.id, now_ts) {
+            let other_active_link = db_revoke_failed
+                && state
+                    .db
+                    .list_share_links()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|item| {
+                        item["id"].as_str() != Some(jti)
+                            && !item["revoked"].as_bool().unwrap_or(false)
+                            && item["expires_at"]
+                                .as_f64()
+                                .is_some_and(|exp| exp > now_ts as f64)
+                            && item["target_id"].as_str() == Some(payload.id.as_str())
+                    });
+            if (!db_revoke_failed
+                && !has_active_or_in_flight_share_for_target(state, &payload.id, now_ts))
+                || (db_revoke_failed && !other_active_link)
+            {
                 cleanup_share_clip_artifacts(&state.media_dir, &payload.id);
             }
         };
@@ -16854,14 +17289,12 @@ fn ensure_safe_media_subdir(media_dir: &Path, subdir: &str) -> Option<PathBuf> {
 }
 
 fn read_non_symlink_string(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() || meta.len() > 4096 {
-        return None;
-    }
-    std::fs::read_to_string(path).ok()
+    let bytes = read_bounded_non_symlink_bytes_sync(path, 4096)?;
+    String::from_utf8(bytes).ok()
 }
 
 fn write_atomic_non_symlink_file(dir: &Path, filename: &str, contents: &[u8]) -> bool {
+    use std::io::Write;
     if filename.is_empty() || filename.contains("..") || filename.contains(['/', '\\']) {
         return false;
     }
@@ -16882,10 +17315,25 @@ fn write_atomic_non_symlink_file(dir: &Path, filename: &str, contents: &[u8]) ->
     }
     let nonce: u64 = rand::random();
     let tmp_path = dir.join(format!(".{filename}.{nonce:016x}.tmp"));
-    if std::fs::symlink_metadata(&tmp_path).is_ok() {
-        let _ = std::fs::remove_file(&tmp_path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(nix::libc::O_NOFOLLOW);
     }
-    if std::fs::write(&tmp_path, contents).is_err() {
+    let Ok(mut tmp_file) = opts.open(&tmp_path) else {
+        return false;
+    };
+    if tmp_file.write_all(contents).is_err() {
+        drop(tmp_file);
+        let _ = std::fs::remove_file(&tmp_path);
+        return false;
+    }
+    drop(tmp_file);
+    if let Ok(target_meta) = std::fs::symlink_metadata(&target_path)
+        && (target_meta.file_type().is_symlink() || target_meta.file_type().is_dir())
+    {
         let _ = std::fs::remove_file(&tmp_path);
         return false;
     }
@@ -16960,6 +17408,15 @@ fn cleanup_camera_share_clip_artifacts_in_range(
     let cam_trimmed = camera.trim();
     let query_after = (after - 15.0).max(0.0);
     let query_before = before + 15.0;
+    let mut revoked_target_ids: BTreeSet<String> = BTreeSet::new();
+    let mut revoke_target = |tid: &str| {
+        revoked_target_ids.insert(tid.to_string());
+        if let Err(err) = state.db.revoke_share_links_for_target(None, tid) {
+            warn!(
+                "Failed to revoke share links for target '{tid}' during recording deletion cleanup: {err:#}"
+            );
+        }
+    };
     if let Ok(events) = state.db.query_events(&EventFilter {
         cameras: Some(vec![cam_trimmed.to_string()]),
         after: Some(query_after),
@@ -16973,7 +17430,7 @@ fn cleanup_camera_share_clip_artifacts_in_range(
                 let ev_start = ev["start_time"].as_f64().unwrap_or(0.0);
                 let ev_end = ev["end_time"].as_f64().unwrap_or(ev_start + 15.0);
                 if !has_valid_recording_segments_for_window(state, cam_trimmed, ev_start, ev_end) {
-                    let _ = state.db.revoke_share_links_for_target(None, id);
+                    revoke_target(id);
                 }
             }
         }
@@ -16990,31 +17447,30 @@ fn cleanup_camera_share_clip_artifacts_in_range(
             let rev_end = rev.end_time.unwrap_or(rev.start_time + 15.0);
             if !has_valid_recording_segments_for_window(state, cam_trimmed, rev.start_time, rev_end)
             {
-                let _ = state.db.revoke_share_links_for_target(None, &rev.id);
+                revoke_target(&rev.id);
             }
         }
     }
-    if let Ok(links) = state.db.list_share_links() {
-        for link in links {
-            if link["revoked"].as_bool().unwrap_or(false) {
-                continue;
-            }
-            let kind = link["kind"].as_str().unwrap_or("");
-            if kind != "event" && kind != "review" {
-                continue;
-            }
-            let link_cam = link["camera"].as_str().map(str::trim).unwrap_or("");
-            if !link_cam.is_empty() && link_cam != cam_trimmed {
-                continue;
-            }
-            let Some(tid) = link["target_id"].as_str() else {
-                continue;
-            };
-            let (resolved_cam, _, _, has_recs) = resolve_share_target_metadata(state, kind, tid);
-            if resolved_cam.as_deref() == Some(cam_trimmed) && !has_recs {
-                let _ = state.db.revoke_share_links_for_target(None, tid);
-                cleanup_share_clip_artifacts(&state.media_dir, tid);
-            }
+    let existing_links = state.db.list_share_links().unwrap_or_default();
+    for link in &existing_links {
+        if link["revoked"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let kind = link["kind"].as_str().unwrap_or("");
+        if kind != "event" && kind != "review" {
+            continue;
+        }
+        let link_cam = link["camera"].as_str().map(str::trim).unwrap_or("");
+        if !link_cam.is_empty() && link_cam != cam_trimmed {
+            continue;
+        }
+        let Some(tid) = link["target_id"].as_str() else {
+            continue;
+        };
+        let (resolved_cam, _, _, has_recs) = resolve_share_target_metadata(state, kind, tid);
+        if resolved_cam.as_deref() == Some(cam_trimmed) && !has_recs {
+            revoke_target(tid);
+            cleanup_share_clip_artifacts(&state.media_dir, tid);
         }
     }
     for dir in [
@@ -17050,7 +17506,7 @@ fn cleanup_camera_share_clip_artifacts_in_range(
                 let no_recs =
                     !has_valid_recording_segments_for_window(state, cam_trimmed, start, end);
                 if no_recs {
-                    let _ = state.db.revoke_share_links_for_target(None, tid);
+                    revoke_target(tid);
                 }
                 if (start <= query_before && end >= query_after) || no_recs {
                     should_clean = true;
@@ -17065,7 +17521,7 @@ fn cleanup_camera_share_clip_artifacts_in_range(
                 let no_recs =
                     !has_valid_recording_segments_for_window(state, cam_trimmed, start, end);
                 if no_recs {
-                    let _ = state.db.revoke_share_links_for_target(None, tid);
+                    revoke_target(tid);
                 }
                 if (start <= query_before && end >= query_after) || no_recs {
                     should_clean = true;
@@ -17073,6 +17529,17 @@ fn cleanup_camera_share_clip_artifacts_in_range(
             }
             if should_clean {
                 cleanup_share_clip_artifacts(&state.media_dir, tid);
+            }
+        }
+    }
+    if !revoked_target_ids.is_empty()
+        && let Ok(mut credits) = state.share_page_video_credits.lock()
+    {
+        for link in &existing_links {
+            if let (Some(jti), Some(tid)) = (link["id"].as_str(), link["target_id"].as_str())
+                && revoked_target_ids.contains(tid)
+            {
+                credits.remove(jti);
             }
         }
     }
@@ -17444,12 +17911,18 @@ async fn redact_mp4_file_with_privacy(
     if !matches!(status_res, Ok(Ok(s)) if s.success()) {
         return false;
     }
-    if !is_regular_non_symlink_file(&tmp_out_file)
-        || ninjanvr_media::mp4_file_has_audio_track(&tmp_out_file)
-    {
-        return false;
-    }
-    std::fs::rename(&tmp_out_file, out_file).is_ok()
+    let tmp_for_check = tmp_out_file.clone();
+    let out_for_rename = out_file.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if !is_regular_non_symlink_file(&tmp_for_check)
+            || share_mp4_file_has_audio_track(&tmp_for_check)
+        {
+            return false;
+        }
+        std::fs::rename(&tmp_for_check, &out_for_rename).is_ok()
+    })
+    .await
+    .unwrap_or(false)
 }
 
 async fn strip_mp4_audio_to_file(
@@ -17499,32 +17972,40 @@ async fn strip_mp4_audio_to_file(
     if !matches!(status_res, Ok(Ok(s)) if s.success()) {
         return false;
     }
-    if !is_regular_non_symlink_file(&tmp_out_file)
-        || ninjanvr_media::mp4_file_has_audio_track(&tmp_out_file)
-    {
-        return false;
-    }
-    std::fs::rename(&tmp_out_file, out_file).is_ok()
+    let tmp_for_check = tmp_out_file.clone();
+    let out_for_rename = out_file.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if !is_regular_non_symlink_file(&tmp_for_check)
+            || share_mp4_file_has_audio_track(&tmp_for_check)
+        {
+            return false;
+        }
+        std::fs::rename(&tmp_for_check, &out_for_rename).is_ok()
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn share_mp4_file_has_audio_track(path: &Path) -> bool {
     use std::io::Read;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
+    let lmeta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
     };
-    if !meta.file_type().is_file() {
+    if !lmeta.file_type().is_file() {
         return true;
     }
-    let len = meta.len();
+    let Ok((mut f, fmeta)) = open_regular_non_symlink_readonly(path) else {
+        return true;
+    };
+    let len = fmeta.len();
     if len == 0 {
         return false;
     }
     if len <= 8192 {
         let mut buf = Vec::with_capacity(len as usize);
-        let Ok(mut f) = std::fs::File::open(path) else {
-            return true;
-        };
-        if f.read_to_end(&mut buf).is_err() {
+        if (&mut f).take(8193).read_to_end(&mut buf).is_err() || buf.len() > 8192 {
             return true;
         }
         let has_iso_root_box = buf.len() >= 8
@@ -17552,6 +18033,13 @@ fn share_mp4_file_has_audio_track(path: &Path) -> bool {
         }
     }
     ninjanvr_media::mp4_file_has_audio_track(path)
+}
+
+async fn share_mp4_file_has_audio_track_async(path: &Path) -> bool {
+    let path_owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || share_mp4_file_has_audio_track(&path_owned))
+        .await
+        .unwrap_or(true)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -17587,7 +18075,9 @@ fn verify_post_build_share_target_and_jti(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         {
-            let _ = state.db.revoke_share_link(jti);
+            if let Err(err) = state.db.revoke_share_link(jti) {
+                warn!("Failed to revoke share link '{jti}' after post-build verification: {err:#}");
+            }
             if let Ok(mut map) = state.share_page_video_credits.lock() {
                 map.remove(jti);
             }
@@ -17870,21 +18360,30 @@ async fn share_video_mp4(
                     let clip_lock = acquire_share_clip_lock(&state, &redacted_id).await;
                     let _clip_guard = clip_lock.lock().await;
 
-                    if is_regular_non_symlink_file(&redacted_path) {
-                        let hash_matches = read_non_symlink_string(&mask_hash_path)
-                            .map(|existing_hash| existing_hash.trim() == current_mask_hash)
-                            .unwrap_or(false);
-                        if !hash_matches
-                            || is_cached_share_artifact_stale(
-                                &redacted_path,
-                                std::slice::from_ref(&source_path),
-                            )
-                            || share_mp4_file_has_audio_track(&redacted_path)
-                        {
-                            remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
-                            remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
-                        }
-                    } else if std::fs::symlink_metadata(&redacted_path).is_ok() {
+                    let cache_invalid = {
+                        let red_p = redacted_path.clone();
+                        let mh_p = mask_hash_path.clone();
+                        let src_p = source_path.clone();
+                        let exp_hash = current_mask_hash.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if is_regular_non_symlink_file(&red_p) {
+                                let hash_matches = read_non_symlink_string(&mh_p)
+                                    .map(|existing_hash| existing_hash.trim() == exp_hash)
+                                    .unwrap_or(false);
+                                !hash_matches
+                                    || is_cached_share_artifact_stale(
+                                        &red_p,
+                                        std::slice::from_ref(&src_p),
+                                    )
+                                    || share_mp4_file_has_audio_track(&red_p)
+                            } else {
+                                std::fs::symlink_metadata(&red_p).is_ok()
+                            }
+                        })
+                        .await
+                        .unwrap_or(true)
+                    };
+                    if cache_invalid {
                         remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
                         remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
                     }
@@ -17918,13 +18417,19 @@ async fn share_video_mp4(
                         .await;
                         if build_ok
                             && is_regular_non_symlink_file(&redacted_path)
-                            && !share_mp4_file_has_audio_track(&redacted_path)
+                            && !share_mp4_file_has_audio_track_async(&redacted_path).await
                         {
-                            let _ = write_atomic_non_symlink_file(
-                                &exports_dir,
-                                &mask_hash_fname,
-                                current_mask_hash.as_bytes(),
-                            );
+                            let exp_dir_clone = exports_dir.clone();
+                            let mh_fname_clone = mask_hash_fname.clone();
+                            let mh_bytes = current_mask_hash.into_bytes();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                write_atomic_non_symlink_file(
+                                    &exp_dir_clone,
+                                    &mh_fname_clone,
+                                    &mh_bytes,
+                                )
+                            })
+                            .await;
                         } else {
                             remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
                             remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
@@ -17951,7 +18456,7 @@ async fn share_video_mp4(
                     return StatusCode::NOT_FOUND.into_response();
                 }
 
-                if share_mp4_file_has_audio_track(&source_path) {
+                if share_mp4_file_has_audio_track_async(&source_path).await {
                     if safe_id.is_empty() || payload.id != safe_id || payload.id.contains("..") {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
@@ -17966,15 +18471,23 @@ async fn share_video_mp4(
                     let clip_lock = acquire_share_clip_lock(&state, &clip_id).await;
                     let _clip_guard = clip_lock.lock().await;
 
-                    if (is_regular_non_symlink_file(&clip_path)
-                        && (share_mp4_file_has_audio_track(&clip_path)
-                            || is_cached_share_artifact_stale(
-                                &clip_path,
-                                std::slice::from_ref(&source_path),
-                            )))
-                        || (std::fs::symlink_metadata(&clip_path).is_ok()
-                            && !is_regular_non_symlink_file(&clip_path))
-                    {
+                    let clip_invalid = {
+                        let cp = clip_path.clone();
+                        let sp = source_path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            (is_regular_non_symlink_file(&cp)
+                                && (share_mp4_file_has_audio_track(&cp)
+                                    || is_cached_share_artifact_stale(
+                                        &cp,
+                                        std::slice::from_ref(&sp),
+                                    )))
+                                || (std::fs::symlink_metadata(&cp).is_ok()
+                                    && !is_regular_non_symlink_file(&cp))
+                        })
+                        .await
+                        .unwrap_or(true)
+                    };
+                    if clip_invalid {
                         remove_non_symlink_dir_child(&exports_dir, &clip_fname);
                     }
 
@@ -18006,7 +18519,7 @@ async fn share_video_mp4(
                         .await;
                         if !build_ok
                             || !is_regular_non_symlink_file(&clip_path)
-                            || share_mp4_file_has_audio_track(&clip_path)
+                            || share_mp4_file_has_audio_track_async(&clip_path).await
                         {
                             remove_non_symlink_dir_child(&exports_dir, &clip_fname);
                             return StatusCode::NOT_FOUND.into_response();
@@ -18198,18 +18711,27 @@ async fn share_video_mp4(
                     let clip_lock = acquire_share_clip_lock(&state, &redacted_id).await;
                     let _clip_guard = clip_lock.lock().await;
 
-                    if is_regular_non_symlink_file(&redacted_path) {
-                        let hash_matches = read_non_symlink_string(&mask_hash_path)
-                            .map(|existing_hash| existing_hash.trim() == current_mask_hash)
-                            .unwrap_or(false);
-                        if !hash_matches
-                            || is_cached_share_artifact_stale(&redacted_path, &recs)
-                            || share_mp4_file_has_audio_track(&redacted_path)
-                        {
-                            remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
-                            remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
-                        }
-                    } else if std::fs::symlink_metadata(&redacted_path).is_ok() {
+                    let cache_invalid = {
+                        let red_p = redacted_path.clone();
+                        let mh_p = mask_hash_path.clone();
+                        let recs_p = recs.clone();
+                        let exp_hash = current_mask_hash.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if is_regular_non_symlink_file(&red_p) {
+                                let hash_matches = read_non_symlink_string(&mh_p)
+                                    .map(|existing_hash| existing_hash.trim() == exp_hash)
+                                    .unwrap_or(false);
+                                !hash_matches
+                                    || is_cached_share_artifact_stale(&red_p, &recs_p)
+                                    || share_mp4_file_has_audio_track(&red_p)
+                            } else {
+                                std::fs::symlink_metadata(&red_p).is_ok()
+                            }
+                        })
+                        .await
+                        .unwrap_or(true)
+                    };
+                    if cache_invalid {
                         remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
                         remove_non_symlink_dir_child(&exports_dir, &mask_hash_fname);
                     }
@@ -18256,13 +18778,20 @@ async fn share_video_mp4(
                         match build_res {
                             Ok(Ok(()))
                                 if is_regular_non_symlink_file(&redacted_path)
-                                    && !share_mp4_file_has_audio_track(&redacted_path) =>
+                                    && !share_mp4_file_has_audio_track_async(&redacted_path)
+                                        .await =>
                             {
-                                let _ = write_atomic_non_symlink_file(
-                                    &exports_dir,
-                                    &mask_hash_fname,
-                                    current_mask_hash.as_bytes(),
-                                );
+                                let exp_dir_clone = exports_dir.clone();
+                                let mh_fname_clone = mask_hash_fname.clone();
+                                let mh_bytes = current_mask_hash.into_bytes();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    write_atomic_non_symlink_file(
+                                        &exp_dir_clone,
+                                        &mh_fname_clone,
+                                        &mh_bytes,
+                                    )
+                                })
+                                .await;
                             }
                             _ => {
                                 remove_non_symlink_dir_child(&exports_dir, &redacted_fname);
@@ -18303,12 +18832,20 @@ async fn share_video_mp4(
                 let clip_path = exports_dir.join(&clip_fname);
                 let clip_lock = acquire_share_clip_lock(&state, &clip_id).await;
                 let _clip_guard = clip_lock.lock().await;
-                if (is_regular_non_symlink_file(&clip_path)
-                    && (is_cached_share_artifact_stale(&clip_path, &recs)
-                        || share_mp4_file_has_audio_track(&clip_path)))
-                    || (std::fs::symlink_metadata(&clip_path).is_ok()
-                        && !is_regular_non_symlink_file(&clip_path))
-                {
+                let clip_invalid = {
+                    let cp = clip_path.clone();
+                    let recs_p = recs.clone();
+                    tokio::task::spawn_blocking(move || {
+                        (is_regular_non_symlink_file(&cp)
+                            && (is_cached_share_artifact_stale(&cp, &recs_p)
+                                || share_mp4_file_has_audio_track(&cp)))
+                            || (std::fs::symlink_metadata(&cp).is_ok()
+                                && !is_regular_non_symlink_file(&cp))
+                    })
+                    .await
+                    .unwrap_or(true)
+                };
+                if clip_invalid {
                     remove_non_symlink_dir_child(&exports_dir, &clip_fname);
                 }
                 if !is_regular_non_symlink_file(&clip_path) {
@@ -18350,16 +18887,36 @@ async fn share_video_mp4(
                         &state.media_dir.join("clips"),
                         &format!("{clip_id}.webp"),
                     );
-                    if !matches!(build_res, Ok(Ok(())))
-                        && recs.len() == 1
-                        && !share_mp4_file_has_audio_track(&recs[0])
-                        && let Ok(bytes) = std::fs::read(&recs[0])
-                    {
-                        let _ = write_atomic_non_symlink_file(&exports_dir, &clip_fname, &bytes);
-                    }
-                    if !is_regular_non_symlink_file(&clip_path)
-                        || share_mp4_file_has_audio_track(&clip_path)
-                    {
+                    let post_build_ok = {
+                        let build_succeeded = matches!(build_res, Ok(Ok(())));
+                        let single_rec = if recs.len() == 1 {
+                            Some(recs[0].clone())
+                        } else {
+                            None
+                        };
+                        let exp_dir_clone = exports_dir.clone();
+                        let clip_fname_clone = clip_fname.clone();
+                        let clip_path_clone = clip_path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if !build_succeeded
+                                && let Some(ref rec0) = single_rec
+                                && !share_mp4_file_has_audio_track(rec0)
+                                && let Some(bytes) =
+                                    read_bounded_non_symlink_bytes_sync(rec0, 256 * 1024 * 1024)
+                            {
+                                let _ = write_atomic_non_symlink_file(
+                                    &exp_dir_clone,
+                                    &clip_fname_clone,
+                                    &bytes,
+                                );
+                            }
+                            is_regular_non_symlink_file(&clip_path_clone)
+                                && !share_mp4_file_has_audio_track(&clip_path_clone)
+                        })
+                        .await
+                        .unwrap_or(false)
+                    };
+                    if !post_build_ok {
                         remove_non_symlink_dir_child(&exports_dir, &clip_fname);
                         return StatusCode::NOT_FOUND.into_response();
                     }
@@ -18843,9 +19400,11 @@ async fn api_export_create(
         )
             .into_response();
     }
+    const MAX_EXPORT_UNIX_TIMESTAMP_SEC: f64 = 4_102_444_800.0;
     if !start.is_finite()
         || !end.is_finite()
-        || start < 0.0
+        || !(0.0..=MAX_EXPORT_UNIX_TIMESTAMP_SEC).contains(&start)
+        || !(0.0..=MAX_EXPORT_UNIX_TIMESTAMP_SEC).contains(&end)
         || end <= start
         || (end - start) > 86400.0
     {
@@ -18853,13 +19412,25 @@ async fn api_export_create(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "success": false,
-                "message": "Export start and end timestamps must be finite, non-negative, and satisfy 0 < end - start <= 86400"
+                "message": "Export start and end timestamps must be finite, within [0, 4102444800], and satisfy 0 < end - start <= 86400"
             })),
         )
             .into_response();
     }
-    let id = format!("{camera}_{}_{}", start as u64, end as u64);
-    let export_lock = acquire_share_clip_lock(&state, &id).await;
+    let base_id = if start.fract() == 0.0 && end.fract() == 0.0 {
+        format!("{camera}_{}_{}", start as u64, end as u64)
+    } else {
+        let s_us = (start * 1_000_000.0).round() as u64;
+        let e_us = (end * 1_000_000.0).round() as u64;
+        if s_us.is_multiple_of(1000) && e_us.is_multiple_of(1000) && s_us != e_us {
+            format!("{camera}_{}ms_{}ms", s_us / 1000, e_us / 1000)
+        } else if s_us != e_us {
+            format!("{camera}_{s_us}us_{e_us}us")
+        } else {
+            format!("{camera}_{s_us}us_{e_us}us-{:08x}", rand::random::<u32>())
+        }
+    };
+    let export_lock = acquire_share_clip_lock(&state, &base_id).await;
     let _export_guard = export_lock.lock().await;
     let Ok(_sem_permit) = state.share_ffmpeg_semaphore.acquire().await else {
         return (
@@ -18870,6 +19441,36 @@ async fn api_export_create(
             })),
         )
             .into_response();
+    };
+    let export_id_exists = |cand_id: &str| -> bool {
+        state
+            .db
+            .get_export_by_id(cand_id)
+            .map(|opt| opt.is_some())
+            .unwrap_or(true)
+            || std::fs::symlink_metadata(
+                state
+                    .media_dir
+                    .join("exports")
+                    .join(format!("{cand_id}.mp4")),
+            )
+            .is_ok()
+            || std::fs::symlink_metadata(
+                state
+                    .media_dir
+                    .join("clips")
+                    .join(format!("{cand_id}.webp")),
+            )
+            .is_ok()
+    };
+    let id = if !export_id_exists(&base_id) {
+        base_id
+    } else {
+        let mut unique_id = format!("{base_id}-{:08x}", rand::random::<u32>());
+        while export_id_exists(&unique_id) {
+            unique_id = format!("{base_id}-{:08x}", rand::random::<u32>());
+        }
+        unique_id
     };
     cleanup_share_clip_artifacts(&state.media_dir, &id);
     let parsed_body = body.map(|b| b.0).unwrap_or_default();
@@ -19046,14 +19647,41 @@ fn resolve_safe_export_unlink_paths(
     vpath: &str,
     tpath: &str,
 ) -> (Option<PathBuf>, Option<PathBuf>) {
+    let same_regular_inode = |raw_p: &Path, canon_p: &Path| -> bool {
+        let Ok(lmeta) = std::fs::symlink_metadata(raw_p) else {
+            return false;
+        };
+        if !lmeta.file_type().is_file() {
+            return false;
+        }
+        let Ok(cmeta) = std::fs::symlink_metadata(canon_p) else {
+            return false;
+        };
+        if !cmeta.file_type().is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if lmeta.dev() != cmeta.dev() || lmeta.ino() != cmeta.ino() {
+                return false;
+            }
+        }
+        true
+    };
     let raw_vpath = resolve_recording_disk_path(media_dir, vpath);
     let safe_vpath = if std::fs::symlink_metadata(&raw_vpath).is_ok_and(|m| m.file_type().is_file())
     {
-        ensure_path_within_media_dir(media_dir, &raw_vpath).filter(|canon_v| {
-            std::fs::canonicalize(media_dir.join("exports"))
-                .ok()
-                .is_some_and(|exports_canon| canon_v.parent() == Some(exports_canon.as_path()))
-        })
+        ensure_path_within_media_dir(media_dir, &raw_vpath)
+            .filter(|canon_v| {
+                same_regular_inode(&raw_vpath, canon_v)
+                    && std::fs::canonicalize(media_dir.join("exports"))
+                        .ok()
+                        .is_some_and(|exports_canon| {
+                            canon_v.parent() == Some(exports_canon.as_path())
+                        })
+            })
+            .map(|_| raw_vpath)
     } else {
         None
     };
@@ -19061,16 +19689,19 @@ fn resolve_safe_export_unlink_paths(
     let raw_tpath = resolve_recording_disk_path(media_dir, tpath);
     let safe_tpath = if std::fs::symlink_metadata(&raw_tpath).is_ok_and(|m| m.file_type().is_file())
     {
-        ensure_path_within_media_dir(media_dir, &raw_tpath).filter(|canon_t| {
-            let not_latest = !canon_t
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("latest_"));
-            not_latest
-                && std::fs::canonicalize(media_dir.join("clips"))
-                    .ok()
-                    .is_some_and(|clips_canon| canon_t.parent() == Some(clips_canon.as_path()))
-        })
+        ensure_path_within_media_dir(media_dir, &raw_tpath)
+            .filter(|canon_t| {
+                let not_latest = !canon_t
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("latest_"));
+                not_latest
+                    && same_regular_inode(&raw_tpath, canon_t)
+                    && std::fs::canonicalize(media_dir.join("clips"))
+                        .ok()
+                        .is_some_and(|clips_canon| canon_t.parent() == Some(clips_canon.as_path()))
+            })
+            .map(|_| raw_tpath)
     } else {
         None
     };
@@ -21027,16 +21658,25 @@ async fn api_camera_latest_frame(
         }
     };
     let mask_active = has_active_privacy_mask(priv_mask.as_ref());
+    let mask_hash = if mask_active {
+        compute_privacy_mask_hash(priv_mask.as_ref())
+    } else {
+        String::new()
+    };
 
-    // 1. Check short-lived 400ms in-memory encoded snapshot cache
-    let cache_key = (camera.clone(), target_height.unwrap_or(0), is_webp);
-    if !mask_active
-        && let Some((cached_at, cached_bytes, cached_ts)) = state
-            .lazy_snapshot_cache
-            .read()
-            .await
-            .get(&cache_key)
-            .cloned()
+    // 1. Check short-lived 400ms in-memory encoded snapshot cache (keyed by camera, height, format, and privacy_mask_hash)
+    let cache_key = (
+        camera.clone(),
+        target_height.unwrap_or(0),
+        is_webp,
+        mask_hash,
+    );
+    if let Some((cached_at, cached_bytes, cached_ts)) = state
+        .lazy_snapshot_cache
+        .read()
+        .await
+        .get(&cache_key)
+        .cloned()
         && cached_at.elapsed() <= Duration::from_millis(400)
     {
         return (
@@ -21049,70 +21689,88 @@ async fn api_camera_latest_frame(
             .into_response();
     }
 
-    // 2. Encode on demand from latest_yuv_frames (zero-copy raw YuvFrame)
-    if let Some(raw_yuv) = state.latest_yuv_frames.read().await.get(&camera).cloned() {
-        let Some(yuv_frame) = pipeline::normalize_yuv_frame_for_processing(&raw_yuv) else {
-            return placeholder_jpeg_response();
-        };
-        let mut rgb =
-            ninjanvr_vision::yuv420p_to_rgb_image_scaled(&yuv_frame, None, &[], target_height);
-        if let Some(ref mask) = priv_mask
-            && mask_active
-        {
-            let eff_w = if detect_w > 0 {
-                detect_w
+    let store_lazy_snapshot_cache = |key: LazySnapshotCacheKey, bytes: Bytes, ts: u64| async move {
+        let mut cache = state.lazy_snapshot_cache.write().await;
+        if cache.len() >= MAX_LAZY_SNAPSHOT_CACHE_ENTRIES {
+            cache.retain(|_, (at, _, _)| at.elapsed() <= Duration::from_millis(400));
+        }
+        while cache.len() >= MAX_LAZY_SNAPSHOT_CACHE_ENTRIES {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, (at, _, _))| *at)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest_key);
             } else {
-                yuv_frame.width
-            };
-            let eff_h = if detect_h > 0 {
-                detect_h
-            } else {
-                yuv_frame.height
-            };
-            if !apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, eff_w, eff_h) {
-                return placeholder_jpeg_response();
+                break;
             }
         }
-        let encoded_res = if is_webp {
-            ninjanvr_vision::encode_image_webp(&rgb)
-        } else {
-            ninjanvr_vision::encode_image_jpeg(&rgb)
-        };
-        if let Ok(encoded_vec) = encoded_res {
-            let out_bytes = Bytes::from(encoded_vec);
-            let ts = if yuv_frame.timestamp > 0.0 {
-                yuv_frame.timestamp as u64
-            } else if metric_ts > 0.0 {
-                metric_ts as u64
-            } else {
-                unix_now()
-            };
-            if !mask_active {
-                let mut cache = state.lazy_snapshot_cache.write().await;
-                if cache.len() >= MAX_LAZY_SNAPSHOT_CACHE_ENTRIES {
-                    cache.retain(|_, (at, _, _)| at.elapsed() <= Duration::from_millis(400));
-                }
-                while cache.len() >= MAX_LAZY_SNAPSHOT_CACHE_ENTRIES {
-                    if let Some(oldest_key) = cache
-                        .iter()
-                        .min_by_key(|(_, (at, _, _))| *at)
-                        .map(|(k, _)| k.clone())
-                    {
-                        cache.remove(&oldest_key);
+        cache.insert(key, (Instant::now(), bytes, ts));
+    };
+
+    // 2. Encode on demand from latest_yuv_frames (zero-copy raw YuvFrame) on blocking pool
+    if let Some(raw_yuv) = state.latest_yuv_frames.read().await.get(&camera).cloned() {
+        let priv_for_yuv = priv_mask.clone();
+        let yuv_res =
+            tokio::task::spawn_blocking(move || -> std::result::Result<(Bytes, u64), bool> {
+                let Some(yuv_frame) = pipeline::normalize_yuv_frame_for_processing(&raw_yuv) else {
+                    return Err(true);
+                };
+                let mut rgb = ninjanvr_vision::yuv420p_to_rgb_image_scaled(
+                    &yuv_frame,
+                    None,
+                    &[],
+                    target_height,
+                );
+                if let Some(ref mask) = priv_for_yuv
+                    && mask_active
+                {
+                    let eff_w = if detect_w > 0 {
+                        detect_w
                     } else {
-                        break;
+                        yuv_frame.width
+                    };
+                    let eff_h = if detect_h > 0 {
+                        detect_h
+                    } else {
+                        yuv_frame.height
+                    };
+                    if !apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, eff_w, eff_h) {
+                        return Err(true);
                     }
                 }
-                cache.insert(cache_key, (Instant::now(), out_bytes.clone(), ts));
+                let encoded_res = if is_webp {
+                    ninjanvr_vision::encode_image_webp(&rgb)
+                } else {
+                    ninjanvr_vision::encode_image_jpeg(&rgb)
+                };
+                let Ok(encoded_vec) = encoded_res else {
+                    return Err(false);
+                };
+                let ts = if yuv_frame.timestamp > 0.0 {
+                    yuv_frame.timestamp as u64
+                } else if metric_ts > 0.0 {
+                    metric_ts as u64
+                } else {
+                    unix_now()
+                };
+                Ok((Bytes::from(encoded_vec), ts))
+            })
+            .await;
+        match yuv_res {
+            Ok(Ok((out_bytes, ts))) => {
+                store_lazy_snapshot_cache(cache_key, out_bytes.clone(), ts).await;
+                return (
+                    [
+                        (header::CONTENT_TYPE, content_type),
+                        (ts_hdr, ts.to_string()),
+                    ],
+                    out_bytes,
+                )
+                    .into_response();
             }
-            return (
-                [
-                    (header::CONTENT_TYPE, content_type),
-                    (ts_hdr, ts.to_string()),
-                ],
-                out_bytes,
-            )
-                .into_response();
+            Ok(Err(true)) => return placeholder_jpeg_response(),
+            Ok(Err(false)) | Err(_) => {}
         }
     }
 
@@ -21125,25 +21783,37 @@ async fn api_camera_latest_frame(
         if let Some(ref mask) = priv_mask
             && mask_active
         {
-            if let Some(mut rgb) = decode_bounded_snapshot_rgb(&frame_bytes) {
-                if !apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, detect_w, detect_h) {
-                    return placeholder_jpeg_response();
+            let mask_owned = mask.clone();
+            let masked_opt = tokio::task::spawn_blocking(move || -> Option<Bytes> {
+                let mut rgb = decode_bounded_snapshot_rgb(&frame_bytes)?;
+                if !apply_camera_privacy_mask_or_fail_closed(
+                    &mut rgb,
+                    &mask_owned,
+                    detect_w,
+                    detect_h,
+                ) {
+                    return None;
                 }
-                let encoded_res = if is_webp {
-                    ninjanvr_vision::encode_image_webp(&rgb)
+                let encoded = if is_webp {
+                    ninjanvr_vision::encode_image_webp(&rgb).ok()?
                 } else {
-                    ninjanvr_vision::encode_image_jpeg(&rgb)
+                    ninjanvr_vision::encode_image_jpeg(&rgb).ok()?
                 };
-                if let Ok(out_bytes) = encoded_res {
-                    return (
-                        [
-                            (header::CONTENT_TYPE, content_type),
-                            (ts_hdr, ts.to_string()),
-                        ],
-                        out_bytes,
-                    )
-                        .into_response();
-                }
+                Some(Bytes::from(encoded))
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(out_bytes) = masked_opt {
+                store_lazy_snapshot_cache(cache_key, out_bytes.clone(), ts).await;
+                return (
+                    [
+                        (header::CONTENT_TYPE, content_type),
+                        (ts_hdr, ts.to_string()),
+                    ],
+                    out_bytes,
+                )
+                    .into_response();
             }
             return placeholder_jpeg_response();
         }
@@ -21161,56 +21831,76 @@ async fn api_camera_latest_frame(
         .media_dir
         .join("clips")
         .join(format!("latest_{camera}.jpg"));
-    if let Some(safe_disk_latest) = ensure_path_within_media_dir(&state.media_dir, &disk_latest)
-        && std::fs::symlink_metadata(&safe_disk_latest).is_ok_and(|m| {
-            m.file_type().is_file() && m.len() > 0 && m.len() <= MAX_SNAPSHOT_FRAME_BYTES as u64
-        })
-        && let Ok(disk_bytes) = tokio::fs::read(&safe_disk_latest).await
-        && !disk_bytes.is_empty()
-    {
-        let disk_ts = if metric_ts > 0.0 {
-            metric_ts as u64
-        } else {
-            std::fs::metadata(&safe_disk_latest)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or_else(unix_now)
-        };
-        if let Some(ref mask) = priv_mask
-            && mask_active
-        {
-            if let Some(mut rgb) = decode_bounded_snapshot_rgb(&disk_bytes) {
+    let media_dir_for_disk = state.media_dir.clone();
+    let priv_for_disk = priv_mask.clone();
+    let disk_res = tokio::task::spawn_blocking(
+        move || -> Option<std::result::Result<(Bytes, u64, bool), ()>> {
+            let safe_disk_latest = ensure_path_within_media_dir(&media_dir_for_disk, &disk_latest)?;
+            let (mut file, fmeta) = open_regular_non_symlink_readonly(&safe_disk_latest).ok()?;
+            if fmeta.len() == 0 || fmeta.len() > MAX_SNAPSHOT_FRAME_BYTES as u64 {
+                return None;
+            }
+            use std::io::Read;
+            let mut disk_bytes = Vec::with_capacity(fmeta.len() as usize);
+            (&mut file)
+                .take(MAX_SNAPSHOT_FRAME_BYTES as u64 + 1)
+                .read_to_end(&mut disk_bytes)
+                .ok()?;
+            if disk_bytes.is_empty() || disk_bytes.len() > MAX_SNAPSHOT_FRAME_BYTES {
+                return None;
+            }
+            let disk_ts = if metric_ts > 0.0 {
+                metric_ts as u64
+            } else {
+                fmeta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or_else(unix_now)
+            };
+            if let Some(ref mask) = priv_for_disk
+                && mask_active
+            {
+                let Some(mut rgb) = decode_bounded_snapshot_rgb(&disk_bytes) else {
+                    return Some(Err(()));
+                };
                 if !apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, detect_w, detect_h) {
-                    return placeholder_jpeg_response();
+                    return Some(Err(()));
                 }
                 let encoded_res = if is_webp {
                     ninjanvr_vision::encode_image_webp(&rgb)
                 } else {
                     ninjanvr_vision::encode_image_jpeg(&rgb)
                 };
-                if let Ok(out_bytes) = encoded_res {
-                    return (
-                        [
-                            (header::CONTENT_TYPE, content_type),
-                            (ts_hdr, disk_ts.to_string()),
-                        ],
-                        out_bytes,
-                    )
-                        .into_response();
-                }
+                let Ok(out_vec) = encoded_res else {
+                    return Some(Err(()));
+                };
+                return Some(Ok((Bytes::from(out_vec), disk_ts, true)));
             }
-            return placeholder_jpeg_response();
+            Some(Ok((Bytes::from(disk_bytes), disk_ts, false)))
+        },
+    )
+    .await
+    .ok()
+    .flatten();
+    if let Some(res) = disk_res {
+        match res {
+            Ok((out_bytes, disk_ts, was_masked)) => {
+                let mime = if was_masked {
+                    content_type
+                } else {
+                    "image/jpeg".to_string()
+                };
+                store_lazy_snapshot_cache(cache_key, out_bytes.clone(), disk_ts).await;
+                return (
+                    [(header::CONTENT_TYPE, mime), (ts_hdr, disk_ts.to_string())],
+                    out_bytes,
+                )
+                    .into_response();
+            }
+            Err(()) => return placeholder_jpeg_response(),
         }
-        return (
-            [
-                (header::CONTENT_TYPE, "image/jpeg".to_string()),
-                (ts_hdr, disk_ts.to_string()),
-            ],
-            disk_bytes,
-        )
-            .into_response();
     }
 
     let encoded_cam = urlencoding_simple(&camera);
@@ -21230,25 +21920,38 @@ async fn api_camera_latest_frame(
         if let Some(ref mask) = priv_mask
             && mask_active
         {
-            if let Some(mut rgb) = decode_bounded_snapshot_rgb(&bytes) {
-                if !apply_camera_privacy_mask_or_fail_closed(&mut rgb, mask, detect_w, detect_h) {
-                    return placeholder_jpeg_response();
+            let mask_owned = mask.clone();
+            let masked_opt = tokio::task::spawn_blocking(move || -> Option<Bytes> {
+                let mut rgb = decode_bounded_snapshot_rgb(&bytes)?;
+                if !apply_camera_privacy_mask_or_fail_closed(
+                    &mut rgb,
+                    &mask_owned,
+                    detect_w,
+                    detect_h,
+                ) {
+                    return None;
                 }
-                let encoded_res = if is_webp {
-                    ninjanvr_vision::encode_image_webp(&rgb)
+                let encoded = if is_webp {
+                    ninjanvr_vision::encode_image_webp(&rgb).ok()?
                 } else {
-                    ninjanvr_vision::encode_image_jpeg(&rgb)
+                    ninjanvr_vision::encode_image_jpeg(&rgb).ok()?
                 };
-                if let Ok(out_vec) = encoded_res {
-                    return (
-                        [
-                            (header::CONTENT_TYPE, content_type),
-                            (ts_hdr, unix_now().to_string()),
-                        ],
-                        Bytes::from(out_vec),
-                    )
-                        .into_response();
-                }
+                Some(Bytes::from(encoded))
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(out_bytes) = masked_opt {
+                let now_ts = unix_now();
+                store_lazy_snapshot_cache(cache_key, out_bytes.clone(), now_ts).await;
+                return (
+                    [
+                        (header::CONTENT_TYPE, content_type),
+                        (ts_hdr, now_ts.to_string()),
+                    ],
+                    out_bytes,
+                )
+                    .into_response();
             }
             return placeholder_jpeg_response();
         }
@@ -21770,35 +22473,7 @@ async fn handle_state_ws(
     let mut rx = state.comms.subscribe_ws();
     loop {
         tokio::select! {
-            recv_res = rx.recv() => {
-                let msg = match recv_res {
-                    Ok(m) => m,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                };
-                let Some((_, live_allowed)) = reverify_ws_caller_access(
-                    &state,
-                    caller_user.as_deref(),
-                    had_db_user_at_connect,
-                    &caller_role,
-                    &allowed_cameras,
-                ) else {
-                    break;
-                };
-                if let Some(filtered) =
-                    filter_ws_message_for_allowed_cameras(&msg, live_allowed.as_deref())
-                    && !matches!(
-                        tokio::time::timeout(
-                            Duration::from_secs(5),
-                            socket.send(AxumWsMsg::Text(filtered.into())),
-                        )
-                        .await,
-                        Ok(Ok(()))
-                    )
-                {
-                    break;
-                }
-            }
+            biased;
             incoming = socket.next() => {
                 match incoming {
                     Some(Ok(AxumWsMsg::Text(text))) => {
@@ -21889,6 +22564,35 @@ async fn handle_state_ws(
                     Some(Ok(AxumWsMsg::Binary(bin))) if bin.len() > MAX_STATE_WS_MESSAGE_BYTES => break,
                     Some(Ok(AxumWsMsg::Close(_))) | Some(Err(_)) | None => break,
                     _ => {}
+                }
+            }
+            recv_res = rx.recv() => {
+                let msg = match recv_res {
+                    Ok(m) => m,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let Some((_, live_allowed)) = reverify_ws_caller_access(
+                    &state,
+                    caller_user.as_deref(),
+                    had_db_user_at_connect,
+                    &caller_role,
+                    &allowed_cameras,
+                ) else {
+                    break;
+                };
+                if let Some(filtered) =
+                    filter_ws_message_for_allowed_cameras(&msg, live_allowed.as_deref())
+                    && !matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            socket.send(AxumWsMsg::Text(filtered.into())),
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    )
+                {
+                    break;
                 }
             }
         }
@@ -22028,6 +22732,7 @@ async fn bridge_go2rtc_ws_with_mode(
 
         loop {
             tokio::select! {
+                biased;
                 client_msg = client_stream.next() => {
                     match client_msg {
                         Some(Ok(AxumWsMsg::Ping(p))) => {
@@ -22539,12 +23244,10 @@ fn restore_persistent_clips_mirrors(media_dir: &Path, config_dir: &Path) {
     {
         for entry in entries.flatten() {
             let p = entry.path();
-            if std::fs::symlink_metadata(&p)
-                .is_ok_and(|m| m.file_type().is_file() && m.len() <= 16 * 1024 * 1024)
-                && let Some(fname) = p.file_name().and_then(|s| s.to_str())
+            if let Some(fname) = p.file_name().and_then(|s| s.to_str())
                 && is_safe_id(fname)
                 && !dataset_dir.join(fname).exists()
-                && let Ok(bytes) = std::fs::read(&p)
+                && let Some(bytes) = read_bounded_non_symlink_bytes_sync(&p, 16 * 1024 * 1024)
             {
                 let _ = crate::pipeline::write_contained_media_file(
                     media_dir,
@@ -22580,12 +23283,11 @@ fn restore_persistent_clips_mirrors(media_dir: &Path, config_dir: &Path) {
             if let Ok(files) = std::fs::read_dir(&prof_path) {
                 for file_entry in files.flatten() {
                     let fp = file_entry.path();
-                    if std::fs::symlink_metadata(&fp)
-                        .is_ok_and(|m| m.file_type().is_file() && m.len() <= 16 * 1024 * 1024)
-                        && let Some(fname) = fp.file_name().and_then(|s| s.to_str())
+                    if let Some(fname) = fp.file_name().and_then(|s| s.to_str())
                         && is_safe_id(fname)
                         && !dst_prof_dir.join(fname).exists()
-                        && let Ok(bytes) = std::fs::read(&fp)
+                        && let Some(bytes) =
+                            read_bounded_non_symlink_bytes_sync(&fp, 16 * 1024 * 1024)
                     {
                         let _ = crate::pipeline::write_contained_media_file(
                             media_dir,
@@ -22607,12 +23309,10 @@ fn restore_persistent_clips_mirrors(media_dir: &Path, config_dir: &Path) {
     {
         for entry in entries.flatten() {
             let p = entry.path();
-            if std::fs::symlink_metadata(&p)
-                .is_ok_and(|m| m.file_type().is_file() && m.len() <= 64 * 1024 * 1024)
-                && let Some(fname) = p.file_name().and_then(|s| s.to_str())
+            if let Some(fname) = p.file_name().and_then(|s| s.to_str())
                 && is_safe_id(fname)
                 && !media_models_dir.join(fname).exists()
-                && let Ok(bytes) = std::fs::read(&p)
+                && let Some(bytes) = read_bounded_non_symlink_bytes_sync(&p, 64 * 1024 * 1024)
             {
                 let _ = crate::pipeline::write_contained_media_file(
                     media_dir,
@@ -22664,18 +23364,39 @@ pub async fn new_app_state(
                     cfg.database.path
                 ));
             }
-            let fallback_db = std::env::temp_dir().join(format!(
-                "ninjanvr-degraded-{}-{:032x}.db",
+            let fallback_dir = std::env::temp_dir().join(format!(
+                "ninjanvr-degraded-{}-{:032x}",
                 std::process::id(),
                 rand::random::<u128>()
             ));
+            std::fs::create_dir_all(&fallback_dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&fallback_dir, std::fs::Permissions::from_mode(0o700))
+                    .with_context(|| {
+                        format!(
+                            "failed to set 0700 permissions on fallback DB dir {}",
+                            fallback_dir.display()
+                        )
+                    })?;
+            }
+            let fallback_db = fallback_dir.join("ninjanvr-degraded.db");
             let opened = NinjaDatabase::open(&fallback_db)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 for suffix in ["", "-wal", "-shm"] {
                     let p = PathBuf::from(format!("{}{suffix}", fallback_db.display()));
-                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                    if p.exists() {
+                        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
+                            .with_context(|| {
+                                format!(
+                                    "failed to set 0600 permissions on fallback DB file {}",
+                                    p.display()
+                                )
+                            })?;
+                    }
                 }
             }
             opened
@@ -22702,9 +23423,8 @@ pub async fn new_app_state(
     comms.init_from_config(&cfg);
     let profile_file = config_dir.join(".active_profile");
     comms.set_profile_persist_path(profile_file.clone());
-    if std::fs::symlink_metadata(&profile_file)
-        .is_ok_and(|m| m.file_type().is_file() && m.len() <= 256)
-        && let Ok(saved_prof) = std::fs::read_to_string(&profile_file)
+    if let Some(prof_bytes) = read_bounded_non_symlink_bytes_sync(&profile_file, 256)
+        && let Ok(saved_prof) = String::from_utf8(prof_bytes)
     {
         let trimmed_prof = saved_prof.trim();
         if is_safe_id(trimmed_prof) {
@@ -40744,6 +41464,255 @@ cameras:
                 r_vod.status(),
                 StatusCode::BAD_REQUEST,
                 "Expected 400 BAD_REQUEST on {vod_uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn security_p3_server_audit_remediation_regression() {
+        let ctx = setup_test_app().await;
+        let state = ctx.state.clone();
+        let auth_app = build_router_with_auth(state.clone(), true);
+        let now = unix_now();
+        let mint_jwt = |sub: &str, role: &str, cams: Option<&str>| -> String {
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &JwtClaims {
+                    sub: sub.to_string(),
+                    role: role.to_string(),
+                    allowed_cameras: cams.map(str::to_string),
+                    iat: now,
+                    exp: now + 3600,
+                },
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            )
+            .unwrap()
+        };
+        state
+            .db
+            .create_user_with_cameras("op_audit", "pass1234", "operator", "*", 1000)
+            .unwrap();
+        state
+            .db
+            .create_user_with_cameras("viewer_audit", "pass1234", "viewer", "*", 1000)
+            .unwrap();
+        let admin_bearer = format!("Bearer {}", mint_jwt("admin", "admin", Some("*")));
+        let op_bearer = format!("Bearer {}", mint_jwt("op_audit", "operator", Some("*")));
+        let viewer_bearer = format!("Bearer {}", mint_jwt("viewer_audit", "viewer", Some("*")));
+
+        // =========================================================================
+        // 1. LOSSYFROM-001: Export Timestamp Upper-Bound Rejection, Sub-Second Non-Collision,
+        //    and Protection of Admin-Owned Exports Against Operator Overwrite/Deletion
+        // =========================================================================
+        for bad_export_uri in [
+            "/api/export/front_door/start/4102444801/end/4102444810",
+            "/api/export/front_door/start/4102444795/end/4102444805",
+            "/api/export/front_door/start/18446744073709552000/end/18446744073709556096",
+        ] {
+            let r_oob = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(bad_export_uri)
+                        .header(header::AUTHORIZATION, &op_bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_oob.status(),
+                StatusCode::BAD_REQUEST,
+                "Out-of-bounds export timestamp {bad_export_uri} must return 400 BAD_REQUEST"
+            );
+        }
+
+        // Seed a protected existing export `front_door_7000_7010` on disk and in SQLite
+        let exports_dir = state.media_dir.join("exports");
+        let clips_dir = state.media_dir.join("clips");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        let protected_id = "front_door_7000_7010";
+        let protected_mp4 = exports_dir.join(format!("{protected_id}.mp4"));
+        let protected_webp = clips_dir.join(format!("{protected_id}.webp"));
+        std::fs::write(&protected_mp4, b"ADMIN_PROTECTED_MP4").unwrap();
+        std::fs::write(&protected_webp, b"ADMIN_PROTECTED_WEBP").unwrap();
+        state
+            .db
+            .insert_export(&ExportRow {
+                id: protected_id.to_string(),
+                camera: "front_door".to_string(),
+                name: "Admin Evidence Clip".to_string(),
+                date: now as f64,
+                video_path: format!("/media/ninjanvr/exports/{protected_id}.mp4"),
+                thumb_path: format!("/media/ninjanvr/clips/{protected_id}.webp"),
+                in_progress: false,
+            })
+            .unwrap();
+
+        // Operator attempts both exact integer `/start/7000/end/7010` and sub-second `/start/7000.1/end/7010.9`
+        // (and same-second `/start/7000.1/end/7000.9`) when no source recordings exist for 7000..7010
+        // (so build_mp4_export_with_privacy fails and triggers ExportInProgressGuard::drop).
+        for op_export_uri in [
+            "/api/export/front_door/start/7000/end/7010",
+            "/api/export/front_door/start/7000.1/end/7010.9",
+            "/api/export/front_door/start/7000.1/end/7000.9",
+        ] {
+            let r_op_exp = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(op_export_uri)
+                        .header(header::AUTHORIZATION, &op_bearer)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"name":"op_overwrite_attempt"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r_op_exp.status(), StatusCode::BAD_REQUEST);
+            let surviving = state
+                .db
+                .get_export_by_id(protected_id)
+                .unwrap()
+                .expect("Admin export row must survive operator colliding export request");
+            assert_eq!(surviving["name"], "Admin Evidence Clip");
+            assert_eq!(surviving["in_progress"], false);
+            assert_eq!(
+                std::fs::read(&protected_mp4).unwrap(),
+                b"ADMIN_PROTECTED_MP4",
+                "Admin export MP4 file must never be unlinked or overwritten by operator"
+            );
+            assert_eq!(
+                std::fs::read(&protected_webp).unwrap(),
+                b"ADMIN_PROTECTED_WEBP",
+                "Admin export WebP thumbnail must never be unlinked or overwritten by operator"
+            );
+        }
+
+        // =========================================================================
+        // 2. STRCMP-001 & STRCMP-003: Segment Boundaries in auth_gate_middleware &
+        //    Case-Insensitive Host Comparison in is_internal_backend_host / federation
+        // =========================================================================
+        {
+            let mut cfg = state.config.write().await;
+            let base_cam = cfg.cameras.get("front_door").unwrap().clone();
+            cfg.cameras.insert("mcp_cam".to_string(), base_cam.clone());
+            cfg.cameras
+                .insert("logout_cam".to_string(), base_cam.clone());
+            cfg.cameras.insert("users_lobby".to_string(), base_cam);
+        }
+        // Viewer MUST be blocked from mutating `/api/mcp_cam/state` and `/api/logout_cam/state`
+        for mut_cam_uri in ["/api/mcp_cam/state", "/api/logout_cam/state"] {
+            let r_viewer_mut = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(mut_cam_uri)
+                        .header(header::AUTHORIZATION, &viewer_bearer)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"detect":false}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_viewer_mut.status(),
+                StatusCode::FORBIDDEN,
+                "Viewer must be blocked from mutating prefix-colliding camera route {mut_cam_uri}"
+            );
+        }
+        // Viewer and Operator MUST be allowed to read `/api/users_lobby/latest.jpg` (not falsely blocked as `/api/users`)
+        let r_viewer_users_cam = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/users_lobby/latest.jpg")
+                    .header(header::AUTHORIZATION, &viewer_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_viewer_users_cam.status(),
+            StatusCode::OK,
+            "Camera named users_lobby must not be falsely rejected by /api/users admin-only prefix"
+        );
+
+        assert!(is_internal_backend_host(
+            "NINJANVR.DEFAULT.SVC.CLUSTER.LOCAL.:5000"
+        ));
+        assert!(is_internal_backend_host("gateway.INTERNAL.:8443"));
+        assert!(!is_safe_federation_peer_base_url(
+            "http://sub.METADATA.GOOGLE.INTERNAL./api"
+        ));
+
+        // =========================================================================
+        // 3. RESEXHAUST-002 & ASYNCBLOCK-005: Bounded Snapshot Decode & Masked Snapshot Cache
+        // =========================================================================
+        // Craft a PNG header claiming 16384x16384 dimensions (> 8192 limit)
+        let mut bomb_png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bomb_png.extend_from_slice(&13u32.to_be_bytes());
+        bomb_png.extend_from_slice(b"IHDR");
+        bomb_png.extend_from_slice(&16384u32.to_be_bytes());
+        bomb_png.extend_from_slice(&16384u32.to_be_bytes());
+        bomb_png.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            decode_bounded_snapshot_rgb(&bomb_png).is_none(),
+            "decode_bounded_snapshot_rgb must reject 16384x16384 image header before allocating"
+        );
+        let (fallback_redacted, mime) = redact_image_bytes_with_privacy_mask(
+            &bomb_png,
+            Some(&json!(["0.1,0.1,0.5,0.1,0.5,0.5,0.1,0.5"])),
+            false,
+        );
+        assert_eq!(mime, "image/webp");
+        assert!(!fallback_redacted.is_empty());
+
+        // =========================================================================
+        // 4. CANCELSAFETY-002 & TOCTOU-011: Atomic Config Persistence & Symlink Rejection
+        // =========================================================================
+        let r_cfg_struct = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/config/structured")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"mqtt":{"enabled":false}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_cfg_struct.status(), StatusCode::OK);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cfg_mode = std::fs::metadata(&ctx.cfg_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                cfg_mode, 0o600,
+                "config.yml persisted by api_config_structured must enforce 0o600 permissions"
+            );
+            let outside_target = state.media_dir.join("outside_secret_cfg.yml");
+            std::fs::write(&outside_target, b"DO_NOT_OVERWRITE_SECRET").unwrap();
+            let sym_cfg = state.media_dir.join("symlink_cfg.yml");
+            std::os::unix::fs::symlink(&outside_target, &sym_cfg).unwrap();
+            assert!(
+                persist_config_yaml_atomically(&sym_cfg, "cameras: {}\n").is_err(),
+                "persist_config_yaml_atomically must refuse to overwrite a symlink"
+            );
+            assert_eq!(
+                std::fs::read(&outside_target).unwrap(),
+                b"DO_NOT_OVERWRITE_SECRET"
             );
         }
     }

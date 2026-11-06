@@ -390,10 +390,14 @@ pub fn write_contained_media_file(
     }
     {
         use std::io::Write;
-        let mut tmp_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(nix::libc::O_NOFOLLOW);
+        }
+        let mut tmp_file = opts.open(&tmp_path)?;
         if let Err(err) = tmp_file.write_all(bytes) {
             drop(tmp_file);
             let _ = std::fs::remove_file(&tmp_path);
@@ -881,15 +885,17 @@ impl VisionPipeline {
                         }
                     }
 
-                    let _ = self.evaluate_camera_tamper(
-                        &camera,
-                        &yuv_frame.data,
-                        width,
-                        height,
-                        now,
-                        &mut consecutive_tamper_frames,
-                        tamper_threshold_frames,
-                    );
+                    let _ = self
+                        .evaluate_camera_tamper(
+                            &camera,
+                            &yuv_frame.data,
+                            width,
+                            height,
+                            now,
+                            &mut consecutive_tamper_frames,
+                            tamper_threshold_frames,
+                        )
+                        .await;
 
                     // 1. SIMD Motion Detection on Y-plane
                     let motion_boxes = if rt_flags.enabled && rt_flags.detect {
@@ -903,16 +909,18 @@ impl VisionPipeline {
                         .min(width.saturating_mul(height));
 
                     if rt_flags.enabled && rt_flags.detect && !roi_monitor.is_empty() {
-                        let _ = self.evaluate_camera_roi_states(
-                            &camera,
-                            &yuv_frame.data,
-                            width,
-                            height,
-                            now,
-                            &motion_boxes,
-                            &mut roi_monitor,
-                            false,
-                        );
+                        let _ = self
+                            .evaluate_camera_roi_states(
+                                &camera,
+                                &yuv_frame.data,
+                                width,
+                                height,
+                                now,
+                                &motion_boxes,
+                                &mut roi_monitor,
+                                false,
+                            )
+                            .await;
                     }
 
                     // 2. Dynamic Region Cropping & AI Object Detection (only when motion or non-stationary objects exist)
@@ -1284,7 +1292,7 @@ impl VisionPipeline {
     /// consecutive blind/flat frames) and updates `CommsHub`, `LogBufferHub`, and SQLite `reviewsegment`.
     /// Returns `true` when the camera is currently in an active tamper state.
     #[allow(clippy::too_many_arguments)]
-    pub fn evaluate_camera_tamper(
+    pub async fn evaluate_camera_tamper(
         &self,
         camera: &str,
         yuv_data: &[u8],
@@ -1332,24 +1340,12 @@ impl VisionPipeline {
                         has_been_reviewed: false,
                     };
                     let db_clone = self.db.clone();
-                    let insert_res = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                            tokio::task::block_in_place(|| {
-                                handle.block_on(tokio::task::spawn_blocking(move || {
-                                    db_clone.insert_review_segment(&dto)
-                                }))
-                            })
+                    let insert_res =
+                        tokio::task::spawn_blocking(move || db_clone.insert_review_segment(&dto))
+                            .await
                             .unwrap_or_else(|e| {
                                 Err(anyhow::anyhow!("spawn_blocking join error: {e}"))
-                            })
-                        } else {
-                            std::thread::spawn(move || db_clone.insert_review_segment(&dto))
-                                .join()
-                                .unwrap_or_else(|_| Err(anyhow::anyhow!("thread join error")))
-                        }
-                    } else {
-                        db_clone.insert_review_segment(&dto)
-                    };
+                            });
                     if let Err(err) = insert_res {
                         warn!(
                             "Failed to persist camera tamper review segment for {camera}: {err:#}"
@@ -1370,7 +1366,7 @@ impl VisionPipeline {
     /// motion-settle triggers, and `hysteresis`), publishes transitions over MQTT and `/ws`,
     /// and emits a `ReviewSegment` alert when an `anomaly_state` persists `>= anomaly_timeout_sec`.
     #[allow(clippy::too_many_arguments)]
-    pub fn evaluate_camera_roi_states(
+    pub async fn evaluate_camera_roi_states(
         &self,
         camera: &str,
         yuv_data: &[u8],
@@ -1394,7 +1390,7 @@ impl VisionPipeline {
                     .publish_roi_state(camera, &tr.roi_name, &tr.current_state);
             }
             if tr.anomaly_triggered {
-                self.emit_roi_anomaly_review_alert(camera, tr, now);
+                self.emit_roi_anomaly_review_alert(camera, tr, now).await;
             }
         }
         transitions
@@ -1403,7 +1399,7 @@ impl VisionPipeline {
     /// Records a classified ROI state observation into `roi_monitor` for `roi_name`,
     /// publishing state transitions via `CommsHub` and persisting a `ReviewSegment` alert
     /// when `anomaly_state` persists `>= anomaly_timeout_sec`.
-    pub fn record_roi_state_observation(
+    pub async fn record_roi_state_observation(
         &self,
         camera: &str,
         roi_monitor: &mut CameraRoiStateMonitor,
@@ -1421,12 +1417,12 @@ impl VisionPipeline {
                 .publish_roi_state(camera, &tr.roi_name, &tr.current_state);
         }
         if tr.anomaly_triggered {
-            self.emit_roi_anomaly_review_alert(camera, &tr, now);
+            self.emit_roi_anomaly_review_alert(camera, &tr, now).await;
         }
         Some(tr)
     }
 
-    fn emit_roi_anomaly_review_alert(&self, camera: &str, tr: &RoiStateTransition, now: f64) {
+    async fn emit_roi_anomaly_review_alert(&self, camera: &str, tr: &RoiStateTransition, now: f64) {
         self.log_hub.push_ninjanvr(
             "WARNING",
             &format!("ninjanvr.vision.{camera}"),
@@ -1460,22 +1456,10 @@ impl VisionPipeline {
         };
         let db_clone = self.db.clone();
         let dto_for_db = dto.clone();
-        let insert_res = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                tokio::task::block_in_place(|| {
-                    handle.block_on(tokio::task::spawn_blocking(move || {
-                        db_clone.insert_review_segment(&dto_for_db)
-                    }))
-                })
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking join error: {e}")))
-            } else {
-                std::thread::spawn(move || db_clone.insert_review_segment(&dto_for_db))
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("thread join error")))
-            }
-        } else {
-            db_clone.insert_review_segment(&dto_for_db)
-        };
+        let insert_res =
+            tokio::task::spawn_blocking(move || db_clone.insert_review_segment(&dto_for_db))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking join error: {e}")));
         match insert_res {
             Ok(()) => {
                 self.comms.publish_json(
@@ -3162,8 +3146,8 @@ mod tests {
         assert_eq!(classify_dominant_color_tag(&gray, w, h, bbox), "color:gray");
     }
 
-    #[test]
-    fn evaluate_camera_tamper_triggers_after_sustained_luma_drop_and_clears_on_recovery() {
+    #[tokio::test]
+    async fn evaluate_camera_tamper_triggers_after_sustained_luma_drop_and_clears_on_recovery() {
         let (pipeline, tmp_dir) = build_isolated_pipeline("tamper");
         let mut ws_rx = pipeline.comms.subscribe_ws();
         let w = 320u32;
@@ -3183,41 +3167,53 @@ mod tests {
         let threshold = 4u32;
 
         // Normal frame keeps counter at 0
-        assert!(!pipeline.evaluate_camera_tamper(
-            "front_door",
-            &normal_scene,
-            w,
-            h,
-            1000.0,
-            &mut consecutive,
-            threshold
-        ));
+        assert!(
+            !pipeline
+                .evaluate_camera_tamper(
+                    "front_door",
+                    &normal_scene,
+                    w,
+                    h,
+                    1000.0,
+                    &mut consecutive,
+                    threshold
+                )
+                .await
+        );
         assert_eq!(consecutive, 0);
 
         // Frames 1..3 of sustained luma drop increment counter without triggering yet
         for i in 1..threshold {
-            assert!(!pipeline.evaluate_camera_tamper(
-                "front_door",
-                &occluded_scene,
-                w,
-                h,
-                1000.0 + i as f64,
-                &mut consecutive,
-                threshold
-            ));
+            assert!(
+                !pipeline
+                    .evaluate_camera_tamper(
+                        "front_door",
+                        &occluded_scene,
+                        w,
+                        h,
+                        1000.0 + i as f64,
+                        &mut consecutive,
+                        threshold
+                    )
+                    .await
+            );
             assert_eq!(consecutive, i);
         }
 
         // Frame 4 reaches threshold: triggers tamper alert, broadcasts ON, and persists reviewsegment
-        assert!(pipeline.evaluate_camera_tamper(
-            "front_door",
-            &occluded_scene,
-            w,
-            h,
-            1004.0,
-            &mut consecutive,
-            threshold
-        ));
+        assert!(
+            pipeline
+                .evaluate_camera_tamper(
+                    "front_door",
+                    &occluded_scene,
+                    w,
+                    h,
+                    1004.0,
+                    &mut consecutive,
+                    threshold
+                )
+                .await
+        );
         assert_eq!(consecutive, threshold);
 
         let msgs = drain_ws_messages(&mut ws_rx);
@@ -3232,15 +3228,19 @@ mod tests {
         assert_eq!(reviews[0].data["objects"], json!(["camera_tamper"]));
 
         // Scene restoration clears tamper state and broadcasts OFF
-        assert!(!pipeline.evaluate_camera_tamper(
-            "front_door",
-            &normal_scene,
-            w,
-            h,
-            1005.0,
-            &mut consecutive,
-            threshold
-        ));
+        assert!(
+            !pipeline
+                .evaluate_camera_tamper(
+                    "front_door",
+                    &normal_scene,
+                    w,
+                    h,
+                    1005.0,
+                    &mut consecutive,
+                    threshold
+                )
+                .await
+        );
         assert_eq!(consecutive, 0);
         let recovery_msgs = drain_ws_messages(&mut ws_rx);
         assert!(
@@ -3917,8 +3917,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn evaluate_camera_roi_states_enforces_hysteresis_and_emits_anomaly_review_segment_after_timeout()
+    #[tokio::test]
+    async fn evaluate_camera_roi_states_enforces_hysteresis_and_emits_anomaly_review_segment_after_timeout()
      {
         use ninjanvr_config::StateRoiConfig;
 
@@ -3943,6 +3943,7 @@ mod tests {
         // 1. Initial baseline observation ("closed") publishes initial state
         let tr0 = pipeline
             .record_roi_state_observation(camera, &mut monitor, "gate", "closed", 0.95, 1000.0)
+            .await
             .unwrap();
         assert_eq!(tr0.current_state, "closed");
         assert!(!tr0.state_changed);
@@ -3962,30 +3963,15 @@ mod tests {
         );
 
         // 2. Single-frame and 2-frame flicker to "open" must NOT transition (hysteresis = 3)
-        let _ = pipeline.record_roi_state_observation(
-            camera,
-            &mut monitor,
-            "gate",
-            "open",
-            0.90,
-            1005.0,
-        );
-        let _ = pipeline.record_roi_state_observation(
-            camera,
-            &mut monitor,
-            "gate",
-            "open",
-            0.90,
-            1010.0,
-        );
-        let _ = pipeline.record_roi_state_observation(
-            camera,
-            &mut monitor,
-            "gate",
-            "closed",
-            0.95,
-            1015.0,
-        );
+        let _ = pipeline
+            .record_roi_state_observation(camera, &mut monitor, "gate", "open", 0.90, 1005.0)
+            .await;
+        let _ = pipeline
+            .record_roi_state_observation(camera, &mut monitor, "gate", "open", 0.90, 1010.0)
+            .await;
+        let _ = pipeline
+            .record_roi_state_observation(camera, &mut monitor, "gate", "closed", 0.95, 1015.0)
+            .await;
         assert_eq!(
             pipeline
                 .comms
@@ -3997,24 +3983,15 @@ mod tests {
         assert!(drain_ws_messages(&mut ws_rx).is_empty());
 
         // 3. 3 consecutive "open" frames transition CLOSED -> OPEN at t=1030.0
-        let _ = pipeline.record_roi_state_observation(
-            camera,
-            &mut monitor,
-            "gate",
-            "open",
-            0.91,
-            1020.0,
-        );
-        let _ = pipeline.record_roi_state_observation(
-            camera,
-            &mut monitor,
-            "gate",
-            "open",
-            0.92,
-            1025.0,
-        );
+        let _ = pipeline
+            .record_roi_state_observation(camera, &mut monitor, "gate", "open", 0.91, 1020.0)
+            .await;
+        let _ = pipeline
+            .record_roi_state_observation(camera, &mut monitor, "gate", "open", 0.92, 1025.0)
+            .await;
         let tr_open = pipeline
             .record_roi_state_observation(camera, &mut monitor, "gate", "open", 0.93, 1030.0)
+            .await
             .unwrap();
         assert!(tr_open.state_changed);
         assert_eq!(tr_open.current_state, "open");
@@ -4028,32 +4005,18 @@ mod tests {
         );
 
         // 4. Recovery to "closed" at t=1110.0 (elapsed 80s < 120s timeout) resets anomaly timer without firing ReviewSegment
-        let _ = pipeline.record_roi_state_observation(
-            camera,
-            &mut monitor,
-            "gate",
-            "open",
-            0.93,
-            1095.0,
-        );
-        let _ = pipeline.record_roi_state_observation(
-            camera,
-            &mut monitor,
-            "gate",
-            "closed",
-            0.94,
-            1100.0,
-        );
-        let _ = pipeline.record_roi_state_observation(
-            camera,
-            &mut monitor,
-            "gate",
-            "closed",
-            0.95,
-            1105.0,
-        );
+        let _ = pipeline
+            .record_roi_state_observation(camera, &mut monitor, "gate", "open", 0.93, 1095.0)
+            .await;
+        let _ = pipeline
+            .record_roi_state_observation(camera, &mut monitor, "gate", "closed", 0.94, 1100.0)
+            .await;
+        let _ = pipeline
+            .record_roi_state_observation(camera, &mut monitor, "gate", "closed", 0.95, 1105.0)
+            .await;
         let tr_rec = pipeline
             .record_roi_state_observation(camera, &mut monitor, "gate", "closed", 0.96, 1110.0)
+            .await
             .unwrap();
         assert!(tr_rec.state_changed);
         assert_eq!(tr_rec.current_state, "closed");
@@ -4079,50 +4042,22 @@ mod tests {
             }
         }
 
-        let _ = pipeline.evaluate_camera_roi_states(
-            camera,
-            &open_yuv,
-            w,
-            h,
-            1190.0,
-            &[],
-            &mut monitor,
-            true,
-        );
-        let _ = pipeline.evaluate_camera_roi_states(
-            camera,
-            &open_yuv,
-            w,
-            h,
-            1195.0,
-            &[],
-            &mut monitor,
-            true,
-        );
-        let trs_open2 = pipeline.evaluate_camera_roi_states(
-            camera,
-            &open_yuv,
-            w,
-            h,
-            1200.0,
-            &[],
-            &mut monitor,
-            true,
-        );
+        let _ = pipeline
+            .evaluate_camera_roi_states(camera, &open_yuv, w, h, 1190.0, &[], &mut monitor, true)
+            .await;
+        let _ = pipeline
+            .evaluate_camera_roi_states(camera, &open_yuv, w, h, 1195.0, &[], &mut monitor, true)
+            .await;
+        let trs_open2 = pipeline
+            .evaluate_camera_roi_states(camera, &open_yuv, w, h, 1200.0, &[], &mut monitor, true)
+            .await;
         assert_eq!(trs_open2[0].current_state, "open");
         assert!(trs_open2[0].state_changed);
 
         // At t=1319.0 (119s < 120s): still no alert
-        let _ = pipeline.evaluate_camera_roi_states(
-            camera,
-            &open_yuv,
-            w,
-            h,
-            1319.0,
-            &[],
-            &mut monitor,
-            true,
-        );
+        let _ = pipeline
+            .evaluate_camera_roi_states(camera, &open_yuv, w, h, 1319.0, &[], &mut monitor, true)
+            .await;
         assert!(
             pipeline
                 .db
@@ -4132,16 +4067,9 @@ mod tests {
         );
 
         // At t=1320.0 (120s >= 120s): triggers ReviewSegment alert
-        let trs_alert = pipeline.evaluate_camera_roi_states(
-            camera,
-            &open_yuv,
-            w,
-            h,
-            1320.0,
-            &[],
-            &mut monitor,
-            true,
-        );
+        let trs_alert = pipeline
+            .evaluate_camera_roi_states(camera, &open_yuv, w, h, 1320.0, &[], &mut monitor, true)
+            .await;
         assert!(trs_alert[0].anomaly_triggered);
 
         let reviews = pipeline.db.query_reviews(&ReviewFilter::default()).unwrap();
