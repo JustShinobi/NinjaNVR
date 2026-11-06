@@ -11162,6 +11162,8 @@ async fn api_dataset_samples(
 pub struct CreateSampleFromEventBody {
     pub sample_kind: Option<String>,
     pub annotations: Option<Vec<ninjanvr_db::DatasetAnnotationBox>>,
+    #[serde(default, alias = "autoAnnotate")]
+    pub auto_annotate: Option<bool>,
 }
 
 async fn api_dataset_sample_from_event(
@@ -11218,12 +11220,13 @@ async fn api_dataset_sample_from_event(
                 .into_response();
         }
     }
-    let (kind, override_anns) = match body {
+    let (kind, override_anns, auto_annotate) = match body {
         Some(Json(b)) => (
             b.sample_kind.unwrap_or_else(|| "true_positive".to_string()),
             b.annotations,
+            b.auto_annotate.unwrap_or(false),
         ),
-        None => ("true_positive".to_string(), None),
+        None => ("true_positive".to_string(), None, false),
     };
     match create_dataset_sample_from_event_with_config(
         Some(&state.config),
@@ -11237,7 +11240,19 @@ async fn api_dataset_sample_from_event(
     {
         Ok(sample) => {
             redact_dataset_sample_file_if_masked(&state.config, &state.media_dir, &sample).await;
-            Json(sample_dto_to_response_json(&sample)).into_response()
+            let genai_enabled = {
+                let cfg = state.config.read().await;
+                cfg.genai.enabled && !cfg.genai.model.trim().is_empty()
+            };
+            let final_sample =
+                if auto_annotate && genai_enabled && sample.sample_kind == "true_positive" {
+                    auto_annotate_dataset_sample(&state, &sample.id)
+                        .await
+                        .unwrap_or(sample)
+                } else {
+                    sample
+                };
+            Json(sample_dto_to_response_json(&final_sample)).into_response()
         }
         Err(err) => {
             let msg = err.to_string();

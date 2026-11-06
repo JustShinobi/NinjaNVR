@@ -351,7 +351,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         `/api/dataset/samples/from-event/${encodeURIComponent(targetId)}`,
         {
           method: "POST",
+          headers: { "Content-Type": "application/json" },
           credentials: "include",
+          body: JSON.stringify({ auto_annotate: true }),
         }
       );
       const data = await res.json().catch(() => null);
@@ -365,21 +367,48 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         )
           .trim()
           .toLowerCase();
-        if (isSafeDatasetSampleId(rawSampleId) && sampleKind !== "hard_negative") {
-          void fetch(
-            `/api/dataset/samples/${encodeURIComponent(rawSampleId)}/auto-annotate`,
-            {
-              method: "POST",
-              credentials: "include",
+        let split = data.split || data.sample?.split || "train";
+        let aiBoxCount: number | null =
+          sampleKind === "ai_annotated" && Array.isArray(data.annotations)
+            ? data.annotations.length
+            : null;
+        if (
+          isSafeDatasetSampleId(rawSampleId) &&
+          sampleKind !== "hard_negative" &&
+          sampleKind !== "ai_annotated"
+        ) {
+          try {
+            const aiRes = await fetch(
+              `/api/dataset/samples/${encodeURIComponent(rawSampleId)}/auto-annotate`,
+              {
+                method: "POST",
+                credentials: "include",
+              }
+            );
+            const aiData = await aiRes.json().catch(() => null);
+            if (aiRes.ok && aiData) {
+              const anns = aiData.annotations || aiData.sample?.annotations;
+              if (Array.isArray(anns)) {
+                aiBoxCount = anns.length;
+              }
+              if (aiData.split || aiData.sample?.split) {
+                split = aiData.split || aiData.sample?.split;
+              }
             }
-          ).catch(() => null);
+          } catch {
+            // Keep sample even if AI teacher is offline
+          }
         }
+        if (!isMountedRef.current) return;
         setAddedDatasetIds((prev) => ({ ...prev, [targetId]: true }));
-        const split = data.split || data.sample?.split || "train";
         notify(
-          `Added event #${targetId.slice(-8)} clean frame to Active Learning Dataset (split: ${String(
-            split
-          ).toUpperCase()})`
+          aiBoxCount !== null
+            ? `Added event #${targetId.slice(-8)} & AI-annotated ${aiBoxCount} YOLO boxes (split: ${String(
+                split
+              ).toUpperCase()})`
+            : `Added event #${targetId.slice(-8)} clean frame to Active Learning Dataset (split: ${String(
+                split
+              ).toUpperCase()})`
         );
       } else {
         notify(data?.message || "Failed to add event snapshot to training dataset");
