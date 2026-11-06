@@ -51,6 +51,21 @@ export const en = {
     spotlightPausedBadge: "SPOTLIGHT PAUSED // TIME-SHIFT",
     resumeSpotlight: "Resume Spotlight",
     focusCameraBtn: "Focus",
+    matrixMode: "Matrix",
+    spotlightMode: "Spotlight",
+    tacticalMap: "Tactical Map",
+    viewMode: "Live view mode",
+    density: "DENSITY",
+    densityNeedsMore: "Needs more than {n} cameras",
+    densityAuto: "Showing every camera at this size",
+    unreviewedShort: "UNREVIEWED",
+    openReview: "Review",
+    recentEvents: "Recent events",
+    eventTimeShift: "Click to jump to this moment",
+    exportClip: "Export clip",
+    exportThisEvent: "Export this event as a clip",
+    clipLast30s: "Clip 30s",
+    clipLast30sHint: "Export the last 30 seconds of this camera",
   },
   sync: {
     title: "MULTI-CAMERA SYNCHRONIZED TIME MACHINE",
@@ -212,6 +227,21 @@ export interface TranslationDict {
     spotlightPausedBadge: string;
     resumeSpotlight: string;
     focusCameraBtn: string;
+    matrixMode: string;
+    spotlightMode: string;
+    tacticalMap: string;
+    viewMode: string;
+    density: string;
+    densityNeedsMore: string;
+    densityAuto: string;
+    unreviewedShort: string;
+    openReview: string;
+    recentEvents: string;
+    eventTimeShift: string;
+    exportClip: string;
+    exportThisEvent: string;
+    clipLast30s: string;
+    clipLast30sHint: string;
   };
   sync: {
     title: string;

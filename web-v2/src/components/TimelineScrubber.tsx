@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowDownToLine,
   ChevronLeft,
   ChevronRight,
   Download,
+  Play,
   Grid,
   Scissors,
   SkipBack,
@@ -20,6 +22,7 @@ import { TacticalCameraPicker } from "./TacticalCameraPicker";
 import { formatDuration, resolveEffectiveTheme } from "../utils/format";
 import { resolveCanvasThemePalette } from "../utils/themeTokens";
 import { useNvrStore } from "../store/useNvrStore";
+import { useI18n } from "../i18n";
 
 export type TimelineZoomMinutes = 5 | 15 | 60 | 360 | 1440;
 
@@ -44,7 +47,127 @@ interface TimelineScrubberProps {
   ) => Promise<{ exportId?: string; videoUrl?: string } | void>;
   titlePrefix?: string;
   defaultRangeMode?: boolean;
+  /** Opens Export clip mode with this range; a new `nonce` re-opens it. */
+  clipRequest?: TimelineClipRequest | null;
+  /** Shown as "Open in Exports" after a clip is saved. */
+  onOpenExports?: () => void;
 }
+
+export interface TimelineClipRequest {
+  camera: string;
+  start: number;
+  end: number;
+  nonce: number;
+}
+
+/** Zoom that keeps a clip of `spanSec` comfortably visible while editing it. */
+export function resolveClipZoom(spanSec: number): TimelineZoomMinutes {
+  const span = Number.isFinite(spanSec) && spanSec > 0 ? spanSec : 30;
+  if (span <= 4 * 60) return 5;
+  if (span <= 12 * 60) return 15;
+  if (span <= 50 * 60) return 60;
+  return 360;
+}
+
+/**
+ * Parses "HH:MM" or "HH:MM:SS" (24 h) as a time on the same local day as
+ * `referenceTs`. Returns null for anything that is not a valid clock time.
+ */
+export function parseClockOnDay(text: string, referenceTs: number): number | null {
+  if (!Number.isFinite(referenceTs)) return null;
+  const m = /^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$/.exec(text || "");
+  if (!m) return null;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  const ss = m[3] === undefined ? 0 : Number(m[3]);
+  if (hh > 23 || mm > 59 || ss > 59) return null;
+  const d = new Date(referenceTs * 1000);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setHours(hh, mm, ss, 0);
+  return Math.floor(d.getTime() / 1000);
+}
+
+/**
+ * Clip range for "This event": the camera's review containing `anchorTs`, or
+ * else the latest one that started within the previous 10 minutes, padded by
+ * `padSec` and never extending past `nowSec`.
+ */
+export function resolveEventClipRange(
+  reviews: ReviewItem[],
+  camera: string,
+  anchorTs: number,
+  nowSec: number,
+  padSec = 5
+): { start: number; end: number } | null {
+  if (!Array.isArray(reviews) || !Number.isFinite(anchorTs)) return null;
+  const own = reviews.filter(
+    (r) => r && r.camera === camera && Number.isFinite(r.start_time)
+  );
+  const endOf = (r: ReviewItem) =>
+    typeof r.end_time === "number" && Number.isFinite(r.end_time) && r.end_time > r.start_time
+      ? r.end_time
+      : r.start_time + 15;
+  let pick = own.find((r) => r.start_time <= anchorTs && anchorTs <= endOf(r)) || null;
+  if (!pick) {
+    pick =
+      own
+        .filter((r) => r.start_time <= anchorTs && anchorTs - r.start_time <= 600)
+        .sort((a, b) => b.start_time - a.start_time)[0] || null;
+  }
+  if (!pick) return null;
+  const start = Math.floor(pick.start_time - padSec);
+  const end = Math.ceil(Math.min(Number.isFinite(nowSec) ? nowSec : Infinity, endOf(pick) + padSec));
+  return end > start ? { start, end } : null;
+}
+
+/** Event lanes on the seek track: alerts on top, detections right below. */
+export function resolveReviewLane(severity: string): { y: number; h: number } {
+  return severity === "alert" ? { y: 2, h: 5 } : { y: 9, h: 5 };
+}
+
+/** Text input that edits a unix timestamp as a local HH:MM:SS clock time. */
+const ClockInput: React.FC<{
+  value: number;
+  ariaLabel: string;
+  onCommit: (ts: number) => boolean;
+}> = ({ value, ariaLabel, onCommit }) => {
+  const shown = formatHHMMSS(value);
+  const [draft, setDraft] = useState<string>(shown);
+  const [invalid, setInvalid] = useState(false);
+  useEffect(() => {
+    setDraft(shown);
+    setInvalid(false);
+  }, [shown]);
+  const commit = () => {
+    const ts = parseClockOnDay(draft, value);
+    if (ts === null || !onCommit(ts)) {
+      setInvalid(true);
+      setDraft(shown);
+      return;
+    }
+    setInvalid(false);
+  };
+  return (
+    <input
+      className="nvr-input mono sm nvr-clock-input"
+      aria-label={ariaLabel}
+      aria-invalid={invalid}
+      inputMode="numeric"
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          commit();
+        } else if (e.key === "Escape") {
+          setDraft(shown);
+          (e.target as HTMLInputElement).blur();
+        }
+      }}
+    />
+  );
+};
 
 function formatHHMM(unixSec: number): string {
   if (!Number.isFinite(unixSec)) return "--:--";
@@ -238,7 +361,11 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   onExportRange,
   titlePrefix,
   defaultRangeMode = false,
+  clipRequest = null,
+  onOpenExports,
 }) => {
+  const { t, locale } = useI18n();
+  const isPt = locale === "pt";
   const trackRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const themeMode = useNvrStore((s) => s.themeMode);
@@ -277,6 +404,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   const [clipLabel, setClipLabel] = useState<string>("");
   const [exportBusy, setExportBusy] = useState<boolean>(false);
   const [readyDownloadUrl, setReadyDownloadUrl] = useState<string | null>(null);
+  const [exportSaved, setExportSaved] = useState<boolean>(false);
   const [draggingTarget, setDraggingTarget] = useState<
     "track" | "in" | "out" | null
   >(null);
@@ -839,17 +967,35 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   };
 
   // Toggle Range Export Mode and initialize `[IN, OUT]` around current viewed window/playhead
+  /** Enters Export clip mode on [start, end] and zooms so the clip is easy to adjust. */
+  const openClipMode = (start: number, end: number) => {
+    const s = Math.floor(Math.max(dayBounds.dayStart, Math.min(start, end)));
+    const e = Math.ceil(Math.min(nowSec, Math.max(start, end)));
+    if (!(e > s)) return;
+    const zoom = resolveClipZoom(e - s);
+    const span = zoom * 60;
+    const targetEnd = Math.round(e + Math.max(0, span - (e - s)) / 2);
+    setZoomMin(zoom);
+    setCustomWinEnd(targetEnd >= nowSec - 5 ? null : clampWinEndToDay(targetEnd));
+    setRangeStart(s);
+    setRangeEnd(e);
+    setReadyDownloadUrl(null);
+    setExportSaved(false);
+    setRangeMode(true);
+  };
+
+  const closeClipMode = () => {
+    setRangeMode(false);
+    setExportSaved(false);
+  };
+
   const toggleRangeSelector = () => {
     if (!rangeMode) {
-      const anchor = currentTs ?? winEnd - 60;
-      const s = Math.max(winStart, Math.min(winEnd - 15, anchor - 20));
-      const e = Math.min(winEnd, s + 60);
-      setRangeStart(Math.floor(s));
-      setRangeEnd(Math.floor(e));
-      setReadyDownloadUrl(null);
-      setRangeMode(true);
+      // Default: the last 30 seconds up to the playhead (or the live edge).
+      const anchor = Math.round(currentTs ?? nowSec);
+      openClipMode(anchor - 30, anchor);
     } else {
-      setRangeMode(false);
+      closeClipMode();
     }
   };
 
@@ -973,6 +1119,58 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
   }, [activeDaySummary]);
 
   const effectivePlayheadTs = scrubPreviewTs ?? currentTs;
+  const clipAnchorTs = Math.round(effectivePlayheadTs ?? nowSec);
+
+  /** Applies a new clip range; rejects empty, inverted or future ranges. */
+  const applyClipRange = (start: number, end: number): boolean => {
+    const s = Math.max(dayBounds.dayStart, Math.floor(start));
+    const e = Math.min(nowSec, Math.ceil(end));
+    if (!(e - s >= 1)) return false;
+    setRangeStart(s);
+    setRangeEnd(e);
+    setReadyDownloadUrl(null);
+    setExportSaved(false);
+    return true;
+  };
+
+  const eventClipRange = useMemo(
+    () => resolveEventClipRange(windowReviews, camera, clipAnchorTs, nowSec),
+    [windowReviews, camera, clipAnchorTs, nowSec]
+  );
+
+  // External "Export this event" / "Clip 30s" requests open clip mode pre-filled.
+  const lastClipNonceRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!clipRequest || clipRequest.nonce === lastClipNonceRef.current) return;
+    lastClipNonceRef.current = clipRequest.nonce;
+    openClipMode(clipRequest.start, clipRequest.end);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clipRequest]);
+
+  // Keyboard while clipping: Esc leaves, I / O set start / end to the playhead.
+  useEffect(() => {
+    if (!rangeMode) return;
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) return;
+      if (e.altKey || e.ctrlKey || e.metaKey) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setRangeMode(false);
+        setExportSaved(false);
+      } else if (e.key === "i" || e.key === "I") {
+        e.preventDefault();
+        if (clipAnchorTs < rangeEnd) applyClipRange(clipAnchorTs, rangeEnd);
+      } else if (e.key === "o" || e.key === "O") {
+        e.preventDefault();
+        if (clipAnchorTs > rangeStart) applyClipRange(rangeStart, clipAnchorTs);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rangeMode, clipAnchorTs, rangeStart, rangeEnd, nowSec]);
 
   const playheadPct =
     effectivePlayheadTs === null
@@ -1069,7 +1267,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
       if (seg.objects > 0) {
         ctx.fillStyle = palette.objectBarFill;
-        ctx.fillRect(x0, h - 23, segW, 18);
+        ctx.fillRect(x0, h - 19, segW, 14);
       } else if (seg.motion > 0) {
         ctx.fillStyle = palette.motionBarFill;
         ctx.fillRect(x0, h - 15, segW, 10);
@@ -1099,14 +1297,15 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       ctx.restore();
     }
 
-    // 3. Review event markers along upper track lane (top: 4px, height: 6px)
+    // 3. Review events in two lanes: alerts on top, detections right below
     for (const rev of visibleReviews) {
       const x0 = Math.max(0, Math.min(w, ((rev.start_time - winStart) / windowSpanSec) * w));
       const dur = Math.max(15, (rev.end_time || rev.start_time + 15) - rev.start_time);
       const revW = Math.max(3, (dur / windowSpanSec) * w);
+      const lane = resolveReviewLane(rev.severity);
       ctx.fillStyle =
         rev.severity === "alert" ? palette.alertPinFill : palette.motionPinFill;
-      ctx.fillRect(x0, 4, revW, 6);
+      ctx.fillRect(x0, lane.y, revW, lane.h);
     }
   }, [
     effectiveTheme,
@@ -1132,6 +1331,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           ""
         )}`;
       const res = await onExportRange(camera, rangeStart, rangeEnd, label);
+      if (res && (res.exportId || res.videoUrl)) {
+        setExportSaved(true);
+      }
       if (res && res.videoUrl) {
         const candidate = res.videoUrl.trim();
         if (
@@ -1222,15 +1424,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 return (
                   <button
                     key={d.day}
-                    className={`nvr-btn mono ${isSelected ? "active" : ""}`}
-                    style={{
-                      height: 26,
-                      padding: "0 8px",
-                      fontSize: "var(--text-xs)",
-                      display: "inline-flex",
-                      alignItems: "center",
-                      gap: 6,
-                    }}
+                    className={`nvr-btn mono ${isSelected ? "active" : ""} sm`}
+                    style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
                     onClick={() => handleSelectDay(d)}
                   >
                     <span style={{ fontWeight: 700 }}>{formatDayShort(d.day)}</span>
@@ -1277,8 +1472,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 }}
               />
               <button
-                className={`nvr-btn ${showStoryboard ? "primary" : ""}`}
-                style={{ height: 24, fontSize: "var(--text-xs)" }}
+                className={`nvr-btn ${showStoryboard ? "primary" : ""} sm`}
                 onClick={() => setShowStoryboard((s) => !s)}
                 title="Scan visual thumbnails across this day/hour to spot changes quickly"
               >
@@ -1286,8 +1480,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                 {showStoryboard ? "Hide Storyboard" : `Storyboard Scan (${windowReviews.length})`}
               </button>
               <button
-                className="nvr-btn"
-                style={{ height: 24, padding: "0 5px" }}
+                className="nvr-btn sm"
                 onClick={() => setShowArchiveDeck(false)}
                 aria-label="Collapse multi-day navigator"
                 title="Collapse multi-day navigator"
@@ -1493,8 +1686,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                             {formatHHMMSS(rev.start_time)}
                           </span>
                           <button
-                            className="nvr-btn"
-                            style={{ height: 20, padding: "0 6px", fontSize: 10.5 }}
+                            className="nvr-btn sm"
                             title="Open Segment Clipper on this exact event"
                             onClick={(e) => {
                               e.stopPropagation();
@@ -1524,6 +1716,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
       {/* =====================================================================
           MAIN TIMELINE CONTROL BAR
          ===================================================================== */}
+      {!rangeMode && (
       <div
         style={{
           display: "flex",
@@ -1581,13 +1774,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
                   <button
                     key={sc}
                     type="button"
-                    className={`nvr-btn mono ${camera === sc ? "active" : ""}`}
-                    style={{
-                      height: 22,
-                      padding: "0 7px",
-                      fontSize: "var(--text-xs)",
-                      textTransform: "uppercase",
-                    }}
+                    className={`nvr-btn mono ${camera === sc ? "active" : ""} sm`}
+                    style={{ textTransform: "uppercase" }}
                     onClick={() => onSelectCamera(sc)}
                   >
                     {sc}
@@ -1608,8 +1796,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           {onFocusCamera && (
             <button
               type="button"
-              className="nvr-btn mono"
-              style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+              className="nvr-btn mono sm"
               title="Expand active timeline camera into Focus stage view"
               onClick={() => onFocusCamera(camera)}
             >
@@ -1639,12 +1826,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
           {/* 24h Activity Matrix Toggle: neutral when closed, accent when open */}
           <button
-            className={`nvr-btn ${showArchiveDeck ? "active" : ""}`}
-            style={{
-              height: 26,
-              padding: "0 9px",
-              fontSize: "var(--text-xs)",
-            }}
+            className={`nvr-btn ${showArchiveDeck ? "active" : ""} sm`}
             onClick={() => setShowArchiveDeck((v) => !v)}
           >
             <Grid size={12} />
@@ -1665,8 +1847,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
           {/* Skip Silence: Prev / Next Activity Event */}
           <button
-            className="nvr-btn"
-            style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+            className="nvr-btn sm"
             onClick={() => jumpToActivity("prev")}
             title="Jump to previous motion or person event (skip empty gaps)"
           >
@@ -1674,8 +1855,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             Prev Event
           </button>
           <button
-            className="nvr-btn"
-            style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+            className="nvr-btn sm"
             onClick={() => jumpToActivity("next")}
             title="Jump to next motion or person event (skip empty gaps)"
           >
@@ -1684,15 +1864,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           </button>
 
           <button
-            className="nvr-btn mono"
-            style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+            className="nvr-btn mono sm"
             onClick={() => onSeek(clampTsToDay((currentTs ?? winEnd) - 30))}
           >
             -30s
           </button>
           <button
-            className="nvr-btn mono"
-            style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+            className="nvr-btn mono sm"
             onClick={() => {
               const next = clampTsToDay((currentTs ?? winEnd) + 30);
               onSeek(dayBounds.isToday && next >= nowSec - 2 ? null : next);
@@ -1702,8 +1880,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           </button>
           {currentTs !== null && (
             <button
-              className="nvr-btn success"
-              style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              className="nvr-btn success sm"
               onClick={() => {
                 setSelectedDay(toLocalDateInputValue(nowSec));
                 setCustomWinEnd(null);
@@ -1717,6 +1894,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
         {/* Right: Zoom (5m / 15m / 1h / 6h / 24h), Pan, and Segment Clipper Toggle */}
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          <span className="nvr-timeline-legend mono" aria-label={isPt ? "Legenda" : "Legend"}>
+            <span><i className="is-alert" aria-hidden="true" />{isPt ? "Alertas" : "Alerts"}</span>
+            <span><i className="is-detection" aria-hidden="true" />{isPt ? "Detecções" : "Detections"}</span>
+          </span>
           <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
             <span
               style={{
@@ -1738,8 +1919,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
             ).map((z) => (
               <button
                 key={z.min}
-                className={`nvr-btn mono ${zoomMin === z.min ? "active" : ""}`}
-                style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                className={`nvr-btn mono ${zoomMin === z.min ? "active" : ""} sm`}
                 onClick={() => {
                   setZoomMin(z.min);
                   if (currentTs !== null) {
@@ -1760,8 +1940,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
           <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
             <button
-              className="nvr-btn"
-              style={{ height: 24, padding: "0 5px" }}
+              className="nvr-btn sm"
               aria-label="Pan timeline earlier within selected day"
               title="Pan timeline earlier within selected day"
               disabled={winStart <= dayBounds.dayStart}
@@ -1774,8 +1953,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
               <ChevronLeft size={12} />
             </button>
             <button
-              className="nvr-btn"
-              style={{ height: 24, padding: "0 5px" }}
+              className="nvr-btn sm"
               aria-label="Pan timeline later within selected day"
               title="Pan timeline later within selected day"
               disabled={winEnd >= dayBounds.dayEnd}
@@ -1790,242 +1968,173 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           </div>
 
           <button
-            className={`nvr-btn ${rangeMode ? "primary" : ""}`}
-            style={{
-              height: 26,
-              padding: "0 10px",
-              fontSize: "var(--text-xs)",
-            }}
+            type="button"
+            className="nvr-btn sm"
+            title={
+              isPt
+                ? "Escolha um intervalo na timeline e salve como clipe MP4"
+                : "Pick a time range on the timeline and save it as an MP4 clip"
+            }
             onClick={toggleRangeSelector}
           >
             <Scissors size={12} />
-            {rangeMode ? "Close Segment Clipper" : "Select Segment to Export"}
+            {t.live.exportClip}
           </button>
         </div>
       </div>
+      )}
 
       {/* =====================================================================
-          INTERACTIVE SEGMENT EXPORT CONTROL BAR (`[ IN ... OUT ]`)
+          EXPORT CLIP MODE: replaces the control bar while a range is being picked
          ===================================================================== */}
       {rangeMode && (
         <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 8,
-            padding: "5px 10px",
-            background: "rgba(14, 165, 233, 0.08)",
-            border: "1px solid rgba(14, 165, 233, 0.4)",
-            borderRadius: 3,
-            flexWrap: "wrap",
-          }}
+          className="nvr-clip-bar"
+          role="group"
+          aria-label={`${t.live.exportClip} · ${camera}`}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <span
-              className="mono"
-              style={{
-                fontSize: "var(--text-xs)",
-                fontWeight: 700,
-                color: "var(--signal-accent-text)",
+          <span className="mono nvr-clip-bar-title">
+            <Scissors size={12} />
+            {t.live.exportClip.toUpperCase()} · {camera.toUpperCase()}
+          </span>
+          <span className="nvr-divider" aria-hidden="true" />
+          <label className="nvr-clip-field mono">
+            {isPt ? "INÍCIO" : "START"}
+            <ClockInput
+              value={rangeStart}
+              ariaLabel={isPt ? "Início do clipe" : "Clip start time"}
+              onCommit={(ts) => applyClipRange(ts, rangeEnd)}
+            />
+          </label>
+          <button
+            type="button"
+            className="nvr-btn sm"
+            title={isPt ? "Usar o playhead como início (I)" : "Set start to the playhead (I)"}
+            disabled={clipAnchorTs >= rangeEnd}
+            onClick={() => applyClipRange(clipAnchorTs, rangeEnd)}
+          >
+            <ArrowDownToLine size={11} />
+            Playhead
+          </button>
+          <span aria-hidden="true" className="nvr-clip-arrow">→</span>
+          <label className="nvr-clip-field mono">
+            {isPt ? "FIM" : "END"}
+            <ClockInput
+              value={rangeEnd}
+              ariaLabel={isPt ? "Fim do clipe" : "Clip end time"}
+              onCommit={(ts) => applyClipRange(rangeStart, ts)}
+            />
+          </label>
+          <button
+            type="button"
+            className="nvr-btn sm"
+            title={isPt ? "Usar o playhead como fim (O)" : "Set end to the playhead (O)"}
+            disabled={clipAnchorTs <= rangeStart}
+            onClick={() => applyClipRange(rangeStart, clipAnchorTs)}
+          >
+            <ArrowDownToLine size={11} />
+            Playhead
+          </button>
+          <span className="nvr-badge mono nvr-clip-duration">
+            {formatDuration(rangeEnd - rangeStart)}
+          </span>
+          <span className="nvr-divider" aria-hidden="true" />
+          <span className="nvr-subbar-label mono">{isPt ? "INTERVALO" : "RANGE"}</span>
+          <div
+            className="nvr-segmented mono"
+            role="group"
+            aria-label={isPt ? "Intervalo rápido" : "Quick range"}
+          >
+            <button
+              type="button"
+              className={`nvr-btn ${
+                eventClipRange &&
+                eventClipRange.start === rangeStart &&
+                eventClipRange.end === rangeEnd
+                  ? "active"
+                  : ""
+              }`}
+              disabled={!eventClipRange}
+              title={
+                isPt
+                  ? "O evento sob o playhead, com 5 s de margem"
+                  : "The event under the playhead, with 5 s of padding"
+              }
+              onClick={() => {
+                if (eventClipRange) applyClipRange(eventClipRange.start, eventClipRange.end);
               }}
             >
-              EXPORT [{camera.toUpperCase()} · {toLocalDateInputValue(rangeStart)}]:
-            </span>
-
-            {/* IN Start Controls */}
-            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                IN:
-              </span>
-              <button
-                className="nvr-btn mono"
-                style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                onClick={() => {
-                  setRangeStart((s) => Math.max(dayBounds.dayStart, s - 10));
-                  setReadyDownloadUrl(null);
-                }}
-              >
-                -10s
-              </button>
-              <span
-                className="mono"
-                style={{
-                  padding: "2px 6px",
-                  background: "var(--bg-deep)",
-                  border: "1px solid var(--border-strong)",
-                  borderRadius: 2,
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 700,
-                  color: "var(--signal-motion-text)",
-                }}
-              >
-                {formatHHMMSS(rangeStart)}
-              </span>
-              <button
-                className="nvr-btn mono"
-                style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                onClick={() => {
-                  setRangeStart((s) => Math.min(rangeEnd - 5, s + 10));
-                  setReadyDownloadUrl(null);
-                }}
-              >
-                +10s
-              </button>
-              <button
-                className="nvr-btn"
-                style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                title="Set IN point to current playhead"
-                onClick={() => {
-                  const anchor = Math.round(effectivePlayheadTs ?? winEnd - 60);
-                  setRangeStart(anchor);
-                  if (rangeEnd <= anchor + 5 || rangeEnd - anchor > 600) {
-                    setRangeEnd(Math.min(dayBounds.dayEnd, anchor + 60));
+              {isPt ? "Este evento" : "This event"}
+            </button>
+            {([30, 60, 300] as const).map((sec) => {
+              const active = rangeEnd === Math.min(nowSec, clipAnchorTs) && rangeEnd - rangeStart === sec;
+              const label = sec < 60 ? `${sec}s` : `${sec / 60}m`;
+              return (
+                <button
+                  key={sec}
+                  type="button"
+                  className={`nvr-btn ${active ? "active" : ""}`}
+                  title={
+                    isPt
+                      ? `${label} terminando no playhead`
+                      : `${label} ending at the playhead`
                   }
-                  setReadyDownloadUrl(null);
-                }}
-              >
-                [ Set IN
-              </button>
-            </div>
-
-            <span style={{ color: "var(--border-strong)" }}>→</span>
-
-            {/* OUT End Controls */}
-            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                OUT:
-              </span>
-              <button
-                className="nvr-btn mono"
-                style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                onClick={() => {
-                  setRangeEnd((e) => Math.max(rangeStart + 5, e - 10));
-                  setReadyDownloadUrl(null);
-                }}
-              >
-                -10s
-              </button>
-              <span
-                className="mono"
-                style={{
-                  padding: "2px 6px",
-                  background: "var(--bg-deep)",
-                  border: "1px solid var(--border-strong)",
-                  borderRadius: 2,
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 700,
-                  color: "var(--signal-motion-text)",
-                }}
-              >
-                {formatHHMMSS(rangeEnd)}
-              </span>
-              <button
-                className="nvr-btn mono"
-                style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                onClick={() => {
-                  setRangeEnd((e) => Math.min(nowSec, e + 10));
-                  setReadyDownloadUrl(null);
-                }}
-              >
-                +10s
-              </button>
-              <button
-                className="nvr-btn"
-                style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                title="Set OUT point to current playhead"
-                onClick={() => {
-                  const anchor = Math.round(effectivePlayheadTs ?? winEnd);
-                  setRangeEnd(anchor);
-                  if (rangeStart >= anchor - 5 || anchor - rangeStart > 600) {
-                    setRangeStart(Math.max(dayBounds.dayStart, anchor - 60));
-                  }
-                  setReadyDownloadUrl(null);
-                }}
-              >
-                Set OUT ]
-              </button>
-            </div>
-
-            <span className="nvr-badge" style={{ color: "var(--signal-accent-text)" }}>
-              {formatDuration(rangeEnd - rangeStart)}
-            </span>
-
-            {(
-              [
-                { sec: 30, label: "30s" },
-                { sec: 60, label: "1m" },
-                { sec: 180, label: "3m" },
-                { sec: 300, label: "5m" },
-              ] as const
-            ).map((p) => (
-              <button
-                key={p.sec}
-                className="nvr-btn mono"
-                style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
-                onClick={() => {
-                  setRangeEnd(Math.min(nowSec, rangeStart + p.sec));
-                  setReadyDownloadUrl(null);
-                }}
-              >
-                {p.label}
-              </button>
-            ))}
+                  onClick={() => applyClipRange(clipAnchorTs - sec, clipAnchorTs)}
+                >
+                  {isPt ? `Últimos ${label}` : `Last ${label}`}
+                </button>
+              );
+            })}
           </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <input
-              className="nvr-input"
-              style={{ height: 24, width: 145, fontSize: "var(--text-xs)" }}
-              placeholder="Clip label (optional)"
-              aria-label="Clip export label"
-              value={clipLabel}
-              onChange={(e) => setClipLabel(e.target.value)}
-            />
-            <button
-              className="nvr-btn"
-              style={{ height: 24, fontSize: "var(--text-xs)" }}
-              onClick={() => onSeek(rangeStart)}
-              title="Preview selected segment from IN point"
-            >
-              Preview
+          <span style={{ flex: 1 }} />
+          <input
+            className="nvr-input sm"
+            style={{ width: 170 }}
+            placeholder={isPt ? "Rótulo (opcional)" : "Label (optional)"}
+            aria-label={isPt ? "Rótulo do clipe" : "Clip label"}
+            value={clipLabel}
+            onChange={(e) => setClipLabel(e.target.value)}
+          />
+          <button
+            type="button"
+            className="nvr-btn sm"
+            onClick={() => onSeek(rangeStart)}
+            title={isPt ? "Tocar o intervalo selecionado" : "Play the selected range"}
+          >
+            <Play size={11} />
+            Preview
+          </button>
+          <button
+            type="button"
+            className="nvr-btn sm primary"
+            disabled={exportBusy || rangeEnd - rangeStart < 1}
+            onClick={handleTriggerExport}
+          >
+            {exportBusy
+              ? isPt
+                ? "Exportando…"
+                : "Exporting…"
+              : `Export MP4 · ${formatDuration(rangeEnd - rangeStart)}`}
+          </button>
+          {readyDownloadUrl && (
+            <a href={readyDownloadUrl} download className="nvr-btn sm" style={{ textDecoration: "none" }}>
+              <Download size={11} />
+              Download
+            </a>
+          )}
+          {exportSaved && onOpenExports && (
+            <button type="button" className="nvr-btn sm success" role="status" onClick={onOpenExports}>
+              {isPt ? "Clipe salvo · Abrir em Exports →" : "Clip saved · Open in Exports →"}
             </button>
-            <button
-              className="nvr-btn success"
-              style={{ height: 24, fontSize: "var(--text-xs)", fontWeight: 600 }}
-              disabled={exportBusy}
-              onClick={handleTriggerExport}
-            >
-              {exportBusy
-                ? "Remuxing MP4..."
-                : `Export MP4 (${formatDuration(rangeEnd - rangeStart)})`}
-            </button>
-            {readyDownloadUrl && (
-              <a
-                href={readyDownloadUrl}
-                download
-                className="nvr-btn primary"
-                style={{
-                  height: 24,
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 700,
-                  textDecoration: "none",
-                }}
-              >
-                <Download size={12} />
-                Download MP4
-              </a>
-            )}
-            <button
-              className="nvr-btn"
-              style={{ height: 24, padding: "0 5px" }}
-              onClick={() => setRangeMode(false)}
-              aria-label="Close segment clipper"
-              title="Close segment clipper"
-            >
-              <X size={12} />
-            </button>
-          </div>
+          )}
+          <button
+            type="button"
+            className="nvr-btn sm"
+            onClick={closeClipMode}
+            title={isPt ? "Sair do modo de recorte (Esc)" : "Leave clip mode (Esc)"}
+          >
+            {isPt ? "Cancelar" : "Cancel"}
+          </button>
         </div>
       )}
 

@@ -473,6 +473,7 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
         onSeek={(ts) =>
           applyBoundedSyncSeek(ts ?? Math.floor(Date.now() / 1000) - 30)
         }
+        onOpenExports={() => useNvrStore.getState().setActiveTab("exports")}
         onExportRange={handleQuickExport}
         titlePrefix="4-CH SYNC TIMELINE"
       />

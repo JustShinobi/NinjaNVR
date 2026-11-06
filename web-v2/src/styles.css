@@ -412,6 +412,36 @@ body,
   color: var(--signal-live-text);
 }
 
+/* Segmented control: a group of mutually exclusive .nvr-btn choices */
+.nvr-segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-hairline);
+  border-radius: 3px;
+}
+
+.nvr-segmented > .nvr-btn {
+  height: 24px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.nvr-segmented > .nvr-btn.active {
+  background: var(--signal-accent-tint);
+  border-color: var(--signal-accent);
+  color: var(--signal-accent-text);
+}
+
+.nvr-subbar-label {
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
 /* Compact control size for dense chip rows and card-header actions */
 .nvr-btn.sm,
 .nvr-input.sm,
@@ -501,7 +531,7 @@ textarea:focus {
   align-items: center;
   gap: 8px;
   overflow-x: auto;
-  min-height: 82px;
+  min-height: 108px;
 }
 
 .nvr-alert-card {
@@ -546,6 +576,175 @@ textarea:focus {
   flex-direction: column;
   justify-content: space-between;
   padding: 4px 6px;
+}
+
+/* Recent events strip (Live): count + actions, then looping event cards */
+.nvr-event-strip-head {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  padding-right: 10px;
+  margin-right: 2px;
+  border-right: 1px solid var(--border-hairline);
+  align-self: stretch;
+  flex-shrink: 0;
+}
+
+.nvr-event-strip-count {
+  font-size: var(--text-xs);
+  font-weight: 700;
+  color: var(--signal-alert-text);
+}
+
+.nvr-alert-card.nvr-event-card {
+  width: 166px;
+  min-width: 166px;
+  height: 94px;
+}
+
+.nvr-event-card-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+  min-width: 0;
+}
+
+.nvr-event-card-cam {
+  font-size: var(--text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  color: #f1f5f9;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nvr-event-card-label {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  color: #fcd34d;
+  white-space: nowrap;
+}
+
+.nvr-event-card-ago {
+  font-size: var(--text-xs);
+  font-weight: 700;
+  color: #f1f5f9;
+}
+
+/* Per-card actions appear on hover / keyboard focus only */
+.nvr-event-card-actions {
+  display: inline-flex;
+  gap: 3px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.nvr-event-card:hover .nvr-event-card-actions,
+.nvr-event-card:focus-within .nvr-event-card-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.nvr-event-card-actions .nvr-btn.sm {
+  width: 24px;
+  padding: 0;
+}
+
+.nvr-event-progress {
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  bottom: 2px;
+  height: 2px;
+  background: rgba(241, 245, 249, 0.25);
+  border-radius: 1px;
+  pointer-events: none;
+}
+
+.nvr-event-progress > span {
+  display: block;
+  height: 2px;
+  background: #38bdf8;
+  border-radius: 1px;
+}
+
+/* Timeline: Export clip mode bar and legend */
+.nvr-clip-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--signal-accent-border);
+}
+
+.nvr-clip-bar-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--signal-accent-text);
+  white-space: nowrap;
+}
+
+.nvr-clip-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.nvr-clock-input {
+  width: 78px;
+}
+
+.nvr-clock-input[aria-invalid="true"] {
+  border-color: var(--signal-alert);
+}
+
+.nvr-clip-arrow {
+  color: var(--text-muted);
+}
+
+.nvr-clip-duration {
+  color: var(--signal-accent-text);
+  border-color: var(--signal-accent-border);
+}
+
+.nvr-timeline-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.nvr-timeline-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.nvr-timeline-legend i {
+  display: inline-block;
+  width: 10px;
+  height: 4px;
+  border-radius: 1px;
+}
+
+.nvr-timeline-legend i.is-alert {
+  background: var(--signal-alert);
+}
+
+.nvr-timeline-legend i.is-detection {
+  background: var(--signal-motion);
 }
 
 /* Camera Grid Layouts */
@@ -933,6 +1132,21 @@ textarea:focus {
   background: var(--signal-motion-tint);
   border-color: var(--signal-motion-border);
   color: var(--signal-motion-text);
+}
+
+/* Over live video, tinted status badges sit on the opaque HUD surface so the
+   camera name and state stay legible (>= 4.5:1) on bright frames */
+.nvr-cam-hud .nvr-badge.live {
+  background: linear-gradient(var(--signal-live-tint), var(--signal-live-tint)), var(--badge-surface);
+}
+
+.nvr-cam-hud .nvr-badge.rewind,
+.nvr-cam-hud .nvr-badge.motion {
+  background: linear-gradient(var(--signal-motion-tint), var(--signal-motion-tint)), var(--badge-surface);
+}
+
+.nvr-cam-hud .nvr-badge.alert {
+  background: linear-gradient(var(--signal-alert-tint), var(--signal-alert-tint)), var(--badge-surface);
 }
 
 /* Timeline Scrubber Bar */

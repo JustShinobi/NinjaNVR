@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Camera, Check, ChevronLeft, ChevronRight, Eye, Play, RefreshCw } from "lucide-react";
+import { Camera, Check, ChevronLeft, ChevronRight, Eye, Play, RefreshCw, Scissors } from "lucide-react";
 import { useI18n } from "../i18n";
 import {
   expandSimulatedFleet,
@@ -30,6 +30,7 @@ import {
 } from "../types/nvr";
 import {
   HudPosition,
+  LiveLayoutMode,
   MatrixDensity,
   SpotlightFilter,
   formatTs,
@@ -37,11 +38,16 @@ import {
 } from "../utils/format";
 import { resolveCanvasThemePalette } from "../utils/themeTokens";
 import { LiveMsePlayer, PushToTalkButton, VodHlsPlayer } from "../components/VideoPlayers";
-import { TimelineScrubber } from "../components/TimelineScrubber";
+import { TimelineScrubber, type TimelineClipRequest } from "../components/TimelineScrubber";
+import { ReviewFlipbook } from "../components/ReviewFlipbook";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 import {
   computeLiveStageDescriptors,
+  formatRelativeAgo,
   resolveEffectiveSpotlightHeroCam,
+  resolveAspectMatrixGridStyle,
+  resolveMatrixDensityOptions,
+  selectRecentEvents,
   resolvePersistentStageContainerStyle,
   resolvePersistentTileStyle,
   resolveTileClickAction,
@@ -1471,8 +1477,7 @@ export const TacticalPtzHudOverlay: React.FC<{
       </button>
       <button
         type="button"
-        className="nvr-btn danger nvr-tile-action mono"
-        style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+        className="nvr-btn danger nvr-tile-action mono sm"
         aria-label={`PTZ Stop ${camera}`}
         title="Stop PTZ Movement"
         onClick={() => stopContinuousMove(true)}
@@ -1481,9 +1486,8 @@ export const TacticalPtzHudOverlay: React.FC<{
       </button>
       {presets.length > 0 && (
         <select
-          className="nvr-select mono"
+          className="nvr-select mono sm"
           aria-label={`PTZ Preset Selector ${camera}`}
-          style={{ height: 20, padding: "0 4px", fontSize: "var(--text-xs)" }}
           value={activePreset || ""}
           onChange={(e) => {
             if (e.target.value) {
@@ -1525,12 +1529,42 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   handleMarkReviews,
   handleQuickExport,
 }) => {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [hoveredAlertId, setHoveredAlertId] = useState<string | null>(null);
+  const setActiveTab = useNvrStore((s) => s.setActiveTab);
+  const [stripNowSec, setStripNowSec] = useState<number>(() => Math.floor(Date.now() / 1000));
+  const [clipRequest, setClipRequest] = useState<TimelineClipRequest | null>(null);
+  const recentEvents = useMemo(() => selectRecentEvents(unreviewedAlerts, 10), [unreviewedAlerts]);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [stageSize, setStageSize] = useState<{ width: number; height: number } | null>(null);
+
+
+  // Relative event ages ("4m ago") only need a coarse clock.
+  useEffect(() => {
+    const timer = window.setInterval(() => setStripNowSec(Math.floor(Date.now() / 1000)), 15000);
+    return () => window.clearInterval(timer);
+  }, []);
   const [hoveredDockCam, setHoveredDockCam] = useState<string | null>(null);
 
   const liveLayout = useNvrStore((s) => s.liveLayout);
   const setLiveLayout = useNvrStore((s) => s.setLiveLayout);
+
+  // Measure the matrix stage so 16:9 tiles can be centred inside it.
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect;
+      if (!rect) return;
+      const width = Math.round(rect.width);
+      const height = Math.round(rect.height);
+      setStageSize((prev) =>
+        prev && prev.width === width && prev.height === height ? prev : { width, height }
+      );
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [liveLayout]);
   const activeCameraGroup = useNvrStore((s) => s.activeCameraGroup);
   const setActiveCameraGroup = useNvrStore((s) => s.setActiveCameraGroup);
   const matrixDensity = useNvrStore((s) => s.matrixDensity);
@@ -2084,6 +2118,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     effectiveCameraGroups,
   ]);
 
+  const matrixDensityOptions = useMemo(
+    () => resolveMatrixDensityOptions(groupCams.length, matrixDensity),
+    [groupCams.length, matrixDensity]
+  );
+
   const { visibleMatrixCams, pageSize, totalPages, safePage } = useMemo(
     () => sliceMatrixPage(groupCams, matrixPage, matrixDensity),
     [groupCams, matrixPage, matrixDensity]
@@ -2154,6 +2193,18 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         }
       }
     }
+  };
+
+  /** Opens the timeline's Export clip mode on `camera` with the given range. */
+  const requestClip = (camera: string, startSec: number, endSec: number) => {
+    if (!Number.isFinite(startSec) || !Number.isFinite(endSec)) return;
+    selectCameraAndRevealOnStage(camera);
+    setClipRequest({
+      camera,
+      start: Math.floor(Math.min(startSec, endSec)),
+      end: Math.ceil(Math.max(startSec, endSec)),
+      nonce: Date.now(),
+    });
   };
 
   useEffect(() => {
@@ -2269,76 +2320,69 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
     <>
       <div className="nvr-subbar">
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <button
-            className={`nvr-btn ${
-              liveLayout === "2x2" && matrixDensity === "2x2" ? "active" : ""
-            }`}
-            onClick={() => {
-              setLiveLayout("2x2");
-              setMatrixDensity("2x2");
-              setTimeShiftTs(null);
-            }}
-          >
-            {t.live.grid2x2}
-          </button>
-          <button
-            className={`nvr-btn mono ${
-              liveLayout === "2x2" && matrixDensity === "3x3" ? "active" : ""
-            }`}
-            onClick={() => {
-              setLiveLayout("2x2");
-              setMatrixDensity("3x3");
-              setTimeShiftTs(null);
-            }}
-            title="3x3 Paginated Tactical Matrix (9 channels per page)"
-          >
-            3x3 Grid
-          </button>
-          <button
-            className={`nvr-btn mono ${
-              liveLayout === "2x2" && matrixDensity === "4x4" ? "active" : ""
-            }`}
-            onClick={() => {
-              setLiveLayout("2x2");
-              setMatrixDensity("4x4");
-              setTimeShiftTs(null);
-            }}
-            title="4x4 High-Density Tactical Matrix (16 channels per page)"
-          >
-            4x4 Grid
-          </button>
-          <button
-            className={`nvr-btn ${liveLayout === "focus" ? "active" : ""}`}
-            onClick={() => setLiveLayout("focus")}
-          >
-            {t.live.focusStage}
-          </button>
-          <button
-            className={`nvr-btn ${liveLayout === "single" ? "active" : ""}`}
-            onClick={() => setLiveLayout("single")}
-          >
-            {t.live.singleFull}
-          </button>
-          <button
-            className={`nvr-btn ${liveLayout === "spotlight" ? "active" : ""}`}
-            onClick={() => {
-              setLiveLayout("spotlight");
-              setTimeShiftTs(null);
-            }}
-            title="Zero-CPU Dynamic Birdseye: automatically enlarges cameras with active motion or tracked objects"
-          >
-            Spotlight
-          </button>
-          <button
-            className={`nvr-btn ${liveLayout === "map" ? "active" : ""}`}
-            onClick={() => {
-              setLiveLayout("map");
-              setTimeShiftTs(null);
-            }}
-            title="Interactive Tactical Map / Floorplan with FOV cones and real-time motion/object pulses"
-          >
-            Tactical Map
-          </button>
+          <div className="nvr-segmented" role="group" aria-label={t.live.viewMode}>
+            {(
+              [
+                ["2x2", t.live.matrixMode, undefined],
+                ["focus", t.live.focusStage, undefined],
+                ["single", t.live.singleFull, undefined],
+                [
+                  "spotlight",
+                  t.live.spotlightMode,
+                  "Zero-CPU Dynamic Birdseye: automatically enlarges cameras with active motion or tracked objects",
+                ],
+                [
+                  "map",
+                  t.live.tacticalMap,
+                  "Interactive Tactical Map / Floorplan with FOV cones and real-time motion/object pulses",
+                ],
+              ] as Array<[LiveLayoutMode, string, string | undefined]>
+            ).map(([mode, label, hint]) => (
+              <button
+                key={mode}
+                type="button"
+                className={`nvr-btn ${liveLayout === mode ? "active" : ""}`}
+                aria-pressed={liveLayout === mode}
+                title={hint}
+                onClick={() => {
+                  setLiveLayout(mode);
+                  if (mode !== "focus" && mode !== "single") setTimeShiftTs(null);
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {liveLayout === "2x2" && (
+            <>
+              <span className="nvr-subbar-label mono">{t.live.density}</span>
+              <div className="nvr-segmented mono" role="group" aria-label={t.live.density}>
+                {matrixDensityOptions.options.map((opt) => (
+                  <button
+                    key={opt.density}
+                    type="button"
+                    className={`nvr-btn ${opt.active ? "active" : ""}`}
+                    aria-pressed={opt.active}
+                    disabled={!opt.enabled}
+                    title={
+                      opt.enabled
+                        ? `${opt.density.replace("x", "×")} · ${getMatrixPageSize(opt.density)} ${
+                            t.live.allCameras.toLowerCase()
+                          }`
+                        : t.live.densityNeedsMore.replace("{n}", String(opt.needsMoreThan))
+                    }
+                    onClick={() => {
+                      setMatrixDensity(opt.density);
+                      setTimeShiftTs(null);
+                    }}
+                  >
+                    {opt.density.replace("x", "×")}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
 
           {cameraGroupEntries.length > 0 && (
             <>
@@ -2347,8 +2391,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 type="button"
                 className={`nvr-btn mono ${
                   activeCameraGroup === "all" ? "active" : ""
-                }`}
-                style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                } sm`}
                 onClick={() => setActiveCameraGroup("all")}
               >
                 ALL ({effectiveCameraNames.length})
@@ -2359,13 +2402,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   type="button"
                   className={`nvr-btn mono ${
                     activeCameraGroup === gName ? "active" : ""
-                  }`}
-                  style={{
-                    height: 24,
-                    padding: "0 7px",
-                    fontSize: "var(--text-xs)",
-                    textTransform: "uppercase",
-                  }}
+                  } sm`} style={{ textTransform: "uppercase" }}
                   onClick={() => setActiveCameraGroup(gName)}
                 >
                   {gName} ({gCfg.cameras?.length || 0})
@@ -2379,8 +2416,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               <span className="nvr-divider" aria-hidden="true" />
               <button
                 type="button"
-                className="nvr-btn mono"
-                style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                className="nvr-btn mono sm"
                 aria-label="Previous matrix page"
                 onClick={() =>
                   setMatrixPage((p) => (p - 1 + totalPages) % totalPages)
@@ -2396,8 +2432,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               </span>
               <button
                 type="button"
-                className="nvr-btn mono"
-                style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                className="nvr-btn mono sm"
                 aria-label="Next matrix page"
                 onClick={() =>
                   setMatrixPage((p) => nextMatrixTourPage(p, totalPages))
@@ -2407,8 +2442,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               </button>
               <button
                 type="button"
-                className={`nvr-btn mono ${matrixTourEnabled ? "active" : ""}`}
-                style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                className={`nvr-btn mono ${matrixTourEnabled ? "active" : ""} sm`}
                 onClick={() => setMatrixTourEnabled((v) => !v)}
                 title="Auto-Tour carousel across matrix pages"
               >
@@ -2431,17 +2465,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               ).map(([flt, lbl]) => (
                 <button
                   key={flt}
-                  className={`nvr-btn mono ${spotlightFilter === flt ? "active" : ""}`}
-                  style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn mono ${spotlightFilter === flt ? "active" : ""} sm`}
                   onClick={() => setSpotlightFilter(flt)}
                 >
                   {lbl}
                 </button>
               ))}
               <select
-                className="nvr-select mono"
+                className="nvr-select mono sm"
                 aria-label="Spotlight hold duration"
-                style={{ height: 24, fontSize: "var(--text-xs)" }}
                 value={spotlightHoldSec}
                 onChange={(e) => setSpotlightHoldSec(Number(e.target.value))}
                 title="How long a promoted camera stays on the main stage before returning to standby"
@@ -2456,8 +2488,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 data-testid="spotlight-timeline-mode-reactive"
                 className={`nvr-btn mono ${
                   spotlightTimelineMode === "reactive" ? "active" : ""
-                }`}
-                style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                } sm`}
                 onClick={() => setSpotlightTimelineMode("reactive")}
                 title="Show Timeline scrubber in Spotlight and auto-pause Spotlight camera rotation while scrubbing or playing time-shift"
               >
@@ -2468,8 +2499,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 data-testid="spotlight-timeline-mode-wall"
                 className={`nvr-btn mono ${
                   spotlightTimelineMode === "wall" ? "active" : ""
-                }`}
-                style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                } sm`}
                 onClick={() => setSpotlightTimelineMode("wall")}
                 title="Hide bottom Timeline scrubber during live Spotlight wall monitoring (automatically appears during time-shift)"
               >
@@ -2487,8 +2517,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   <button
                     type="button"
                     data-testid="spotlight-resume-btn"
-                    className="nvr-btn success mono"
-                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    className="nvr-btn success mono sm"
                     onClick={() => setTimeShiftTs(null)}
                   >
                     <Play size={11} />
@@ -2516,8 +2545,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       <button
                         key={`${item.cam}-${item.ts}-${idx}`}
                         type="button"
-                        className={`nvr-btn mono ${isCurrent ? "active" : ""}`}
-                        style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        className={`nvr-btn mono ${isCurrent ? "active" : ""} sm`}
                         onClick={() => {
                           lastActiveRef.current[item.cam] = nowTick;
                           lastSurgeRef.current[item.cam] = nowTick;
@@ -2554,8 +2582,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           {simulatedFleetCount > 0 && (
             <button
               type="button"
-              className="nvr-btn danger mono"
-              style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)", fontWeight: 700 }}
+              className="nvr-btn danger mono sm"
               aria-label={`Exit Simulation (Restore ${cameraNames.filter((c) => !/_sim_\d+$/.test(c)).length || 4} Cameras)`}
               onClick={() => setSimulatedFleetCount(0)}
             >
@@ -2565,7 +2592,6 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           <select
             className="nvr-select mono"
             aria-label="Camera HUD badge position"
-            style={{ height: 28, fontSize: "var(--text-xs)" }}
             value={hudPosition}
             onChange={(e) => {
               setHudPosition(e.target.value as HudPosition);
@@ -2593,93 +2619,72 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             <Eye size={13} />
             {t.live.zonesOverlay}
           </button>
-          {liveLayout !== "spotlight" &&
-            liveLayout !== "map" &&
-            unreviewedAlerts.length > 0 && (
-              <button
-                className="nvr-btn success"
-                onClick={() =>
-                  handleMarkReviews(
-                    unreviewedAlerts.map((r) => r.id),
-                    true
-                  )
-                }
-              >
-                <Check size={13} />
-                {t.live.markAllReviewed} ({unreviewedAlerts.length})
-              </button>
-            )}
         </div>
       </div>
 
-      {/* Zero-Decoder-Bloat Unreviewed Alert Ribbon (Video mounts ONLY on pointer hover!) */}
+      {/* Recent events strip: each card loops its still frames as a flipbook (<img> swaps,
+          no video decoder). The full MP4 preview still mounts ONLY on pointer hover. */}
       {shouldRenderLiveAlertRibbon(
         liveLayout,
         showAlertRibbon,
         unreviewedAlerts.length
       ) && (
-        <div className="nvr-alert-ribbon" aria-label={t.live.unreviewedAlerts}>
-          <div
-            style={{
-              minWidth: 118,
-              display: "flex",
-              flexDirection: "column",
-              justifyContent: "center",
-              gap: 3,
-              paddingRight: 6,
-              borderRight: "1px solid var(--border-hairline)",
-            }}
-          >
-            <div
-              className="mono"
-              style={{
-                fontSize: "var(--text-xs)",
-                fontWeight: 700,
-                color: "var(--signal-alert-text)",
-              }}
+        <div className="nvr-alert-ribbon" aria-label={t.live.recentEvents}>
+          <div className="nvr-event-strip-head">
+            <span className="mono nvr-event-strip-count">
+              {unreviewedAlerts.length} {t.live.unreviewedShort}
+            </span>
+            <button
+              type="button"
+              className="nvr-btn sm"
+              onClick={() => setActiveTab("review")}
             >
-              {unreviewedAlerts.length} UNREVIEWED
-            </div>
-            <div
-              style={{
-                fontSize: "var(--text-xs)",
-                color: "var(--text-muted)",
-                lineHeight: 1.25,
-              }}
+              {t.live.openReview} →
+            </button>
+            <button
+              type="button"
+              className="nvr-btn sm success"
+              onClick={() =>
+                handleMarkReviews(
+                  unreviewedAlerts.map((r) => r.id),
+                  true
+                )
+              }
             >
-              Hover for MP4 · Click for Time-Shift
-            </div>
+              <Check size={12} />
+              {t.live.markAllReviewed}
+            </button>
           </div>
 
-          {unreviewedAlerts.slice(0, 14).map((item) => {
+          {recentEvents.map((item) => {
             const isHovered = hoveredAlertId === item.id;
             const thumbSrc = resolveSafeAlertThumbSrc(
               item.thumb_path,
               item.camera
             );
-            const objs = item.data?.objects || ["person"];
+            const label = (item.data?.objects || [])[0] || item.severity;
+            const timeShiftToEvent = () => {
+              setSelectedCamera(item.camera);
+              setLiveLayout("focus");
+              setTimeShiftTs(sanitizeTimeShiftSeek(item.start_time));
+            };
 
             return (
               <div
                 key={item.id}
                 role="button"
                 tabIndex={0}
-                className={`nvr-alert-card severity-${item.severity}`}
+                className={`nvr-alert-card nvr-event-card severity-${item.severity}`}
+                title={`${item.camera.toUpperCase()} · ${formatTs(item.start_time)} · ${t.live.eventTimeShift}`}
                 onPointerEnter={() => setHoveredAlertId(item.id)}
                 onPointerLeave={() =>
                   setHoveredAlertId((curr) => (curr === item.id ? null : curr))
                 }
-                onClick={() => {
-                  setSelectedCamera(item.camera);
-                  setLiveLayout("focus");
-                  setTimeShiftTs(sanitizeTimeShiftSeek(item.start_time));
-                }}
+                onClick={timeShiftToEvent}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
-                    setSelectedCamera(item.camera);
-                    setLiveLayout("focus");
-                    setTimeShiftTs(sanitizeTimeShiftSeek(item.start_time));
+                    timeShiftToEvent();
                   }
                 }}
               >
@@ -2692,70 +2697,48 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     playsInline
                   />
                 ) : (
-                  <img
-                    src={thumbSrc}
-                    alt={`${item.camera} alert`}
-                    width={156}
-                    height={68}
-                    loading="lazy"
+                  <ReviewFlipbook
+                    reviewId={item.id}
+                    fallbackSrc={thumbSrc}
+                    alt={`${item.camera} ${label} event`}
                   />
                 )}
                 <div className="nvr-alert-card-hud">
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                    }}
-                  >
-                    <span
-                      className="mono"
-                      style={{
-                        fontSize: "var(--text-xs)",
-                        fontWeight: 700,
-                        textTransform: "uppercase",
-                        color: "var(--text-primary)",
-                      }}
-                    >
-                      {item.camera}
-                    </span>
-                    <button
-                      className="nvr-btn"
-                      style={{
-                        height: 20,
-                        padding: "0 5px",
-                        fontSize: "var(--text-xs)",
-                        background: "rgba(16,185,129,0.25)",
-                        borderColor: "rgba(16,185,129,0.6)",
-                      }}
-                      title={t.live.markReviewed}
-                      aria-label={`Mark ${item.camera} alert at ${formatTs(
-                        item.start_time
-                      )} as reviewed`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleMarkReviews([item.id], true);
-                      }}
-                    >
-                      <Check size={10} />
-                    </button>
+                  <div className="nvr-event-card-row">
+                    <span className="mono nvr-event-card-cam">{item.camera}</span>
+                    <span className="mono nvr-event-card-label">{label}</span>
                   </div>
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      fontSize: "var(--text-xs)",
-                    }}
-                  >
-                    <span
-                      className="mono"
-                      style={{ color: "var(--signal-motion-text)", textTransform: "uppercase" }}
-                    >
-                      {objs[0]}
+                  <div className="nvr-event-card-row">
+                    <span className="mono nvr-event-card-ago">
+                      {formatRelativeAgo(stripNowSec, item.start_time, locale === "pt")}
                     </span>
-                    <span className="mono" style={{ color: "var(--text-primary)" }}>
-                      {formatTs(item.start_time)}
+                    <span className="nvr-event-card-actions">
+                      <button
+                        type="button"
+                        className="nvr-btn sm"
+                        title={t.live.exportThisEvent}
+                        aria-label={`${t.live.exportThisEvent}: ${item.camera} ${formatTs(item.start_time)}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          // Park the playhead on the event so "This event" and Preview line up.
+                          setTimeShiftTs(sanitizeTimeShiftSeek(item.start_time));
+                          requestClip(item.camera, item.start_time - 5, (item.end_time ?? item.start_time + 15) + 5);
+                        }}
+                      >
+                        <Scissors size={11} />
+                      </button>
+                      <button
+                        type="button"
+                        className="nvr-btn sm success"
+                        title={t.live.markReviewed}
+                        aria-label={`${t.live.markReviewed}: ${item.camera} ${formatTs(item.start_time)}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleMarkReviews([item.id], true);
+                        }}
+                      >
+                        <Check size={11} />
+                      </button>
                     </span>
                   </div>
                 </div>
@@ -2776,15 +2759,21 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               ? "is-layout-spotlight nvr-focus-layout"
               : "is-layout-focus nvr-focus-layout"
           }`}
-          style={resolvePersistentStageContainerStyle(
-            liveLayout,
-            stageDescriptors,
-            matrixDensity,
-            resolveAdaptiveMatrixGridStyle(
-              visibleMatrixCams.length,
-              matrixDensity
+          ref={stageRef}
+          style={
+            (liveLayout === "2x2"
+              ? resolveAspectMatrixGridStyle(stageSize, visibleMatrixCams.length)
+              : undefined) ??
+            resolvePersistentStageContainerStyle(
+              liveLayout,
+              stageDescriptors,
+              matrixDensity,
+              resolveAdaptiveMatrixGridStyle(
+                visibleMatrixCams.length,
+                matrixDensity
+              )
             )
-          )}
+          }
         >
           {stageDescriptors.map((descriptor) => {
             const cam = descriptor.camera;
@@ -2969,19 +2958,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                               : ""
                           }`}
                     </span>
-                    {isGrid && isTimelineCam && visibleMatrixCams.length > 1 && (
-                      <span
-                        className="nvr-badge mono"
-                        style={{
-                          borderColor: "var(--signal-accent)",
-                          color: "var(--signal-accent-text)",
-                        }}
-                        title="Active camera bound to the bottom Timeline scrubber"
-                      >
-                        ● TIMELINE
-                      </span>
-                    )}
-                    <span className="nvr-badge">
+                    <span className={`nvr-badge ${isHero ? "" : "nvr-tile-action"}`}>
                       {isHero
                         ? `${camStat?.camera_fps?.toFixed(1) || "5.0"} FPS · AI ${
                             camStat?.detection_fps?.toFixed(1) || "0.0"
@@ -3010,7 +2987,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     )}
                     {Boolean(act?.night_mode || camStat?.night_mode) && (
                       <span
-                        className="nvr-badge mono"
+                        className={`nvr-badge mono ${isHero ? "" : "nvr-tile-action"}`}
                         title="Infrared (IR) monochrome night profile active — spider/insect flash filter engaged"
                       >
                         IR NIGHT
@@ -3050,7 +3027,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     )}
                     {isGrid && (
                       <>
-                        <span className="nvr-badge">
+                        <span className="nvr-badge nvr-tile-action">
                           AI {camStat?.detection_fps?.toFixed(1) || "0.0"} FPS
                         </span>
                         {(
@@ -3076,12 +3053,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                             type="button"
                             className={`nvr-btn nvr-tile-action mono ${
                               isOn ? "active" : ""
-                            }`}
-                            style={{
-                              height: 22,
-                              padding: "0 5px",
-                              fontSize: "var(--text-xs)",
-                            }}
+                            } sm`}
                             title={`Toggle ${flagKey} at runtime without server restart`}
                             onClick={(e) => {
                               e.stopPropagation();
@@ -3102,12 +3074,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           </button>
                         ))}
                         <button
-                          className="nvr-btn nvr-tile-action mono"
-                          style={{
-                            height: 22,
-                            padding: "0 6px",
-                            fontSize: "var(--text-xs)",
-                          }}
+                          className="nvr-btn nvr-tile-action mono sm"
                           onClick={(e) => {
                             e.stopPropagation();
                             setSelectedCamera(cam);
@@ -3116,14 +3083,22 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         >
                           {t.live.rewind30s}
                         </button>
+                        <button
+                          type="button"
+                          className="nvr-btn nvr-tile-action mono sm"
+                          title={t.live.clipLast30sHint}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const nowSec = Math.floor(Date.now() / 1000);
+                            requestClip(cam, nowSec - 30, nowSec);
+                          }}
+                        >
+                          <Scissors size={11} />
+                          {t.live.clipLast30s}
+                        </button>
                         {isTimeShifted && (
                           <button
-                            className="nvr-btn success mono"
-                            style={{
-                              height: 22,
-                              padding: "0 6px",
-                              fontSize: "var(--text-xs)",
-                            }}
+                            className="nvr-btn success mono sm"
                             onClick={(e) => {
                               e.stopPropagation();
                               setTimeShiftTs(null);
@@ -3133,12 +3108,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           </button>
                         )}
                         <button
-                          className="nvr-btn nvr-tile-action"
-                          style={{
-                            height: 22,
-                            padding: "0 6px",
-                            fontSize: "var(--text-xs)",
-                          }}
+                          className="nvr-btn nvr-tile-action sm"
                           onClick={(e) => {
                             e.stopPropagation();
                             triggerMainStreamPrewarmIfNeeded(realCam, true);
@@ -3155,12 +3125,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         <button
                           type="button"
                           data-testid="spotlight-hero-rewind30s"
-                          className="nvr-btn nvr-tile-action mono"
-                          style={{
-                            height: 22,
-                            padding: "0 6px",
-                            fontSize: "var(--text-xs)",
-                          }}
+                          className="nvr-btn nvr-tile-action mono sm"
                           onClick={(e) => {
                             e.stopPropagation();
                             setLockedSpotlightCam(cam);
@@ -3173,12 +3138,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         <button
                           type="button"
                           data-testid="spotlight-hero-focus"
-                          className="nvr-btn nvr-tile-action mono"
-                          style={{
-                            height: 22,
-                            padding: "0 6px",
-                            fontSize: "var(--text-xs)",
-                          }}
+                          className="nvr-btn nvr-tile-action mono sm"
                           onClick={(e) => {
                             e.stopPropagation();
                             triggerMainStreamPrewarmIfNeeded(realCam, true);
@@ -3290,12 +3250,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   <span>SCALE:</span>
                   <input
                     type="number"
-                    className="nvr-input mono"
+                    className="nvr-input mono sm"
                     aria-label="Floorplan total width in meters"
                     min={2}
                     max={500}
-                    step={1}
-                    style={{ height: 24, width: 52, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                    step={1} style={{ width: 52 }}
                     value={floorplanWidthM}
                     onChange={(e) => {
                       const v = Math.max(2, Math.min(500, Number(e.target.value) || 20));
@@ -3306,12 +3265,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   <span>m ×</span>
                   <input
                     type="number"
-                    className="nvr-input mono"
+                    className="nvr-input mono sm"
                     aria-label="Floorplan total height in meters"
                     min={2}
                     max={500}
-                    step={1}
-                    style={{ height: 24, width: 52, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                    step={1} style={{ width: 52 }}
                     value={floorplanHeightM}
                     onChange={(e) => {
                       const v = Math.max(2, Math.min(500, Number(e.target.value) || 12));
@@ -3324,8 +3282,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
                 <button
                   type="button"
-                  className={`nvr-btn mono ${showMeasurements ? "active" : ""}`}
-                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn mono ${showMeasurements ? "active" : ""} sm`}
                   onClick={() => setShowMeasurements((v) => !v)}
                   title="Toggle metric dimensions (meters & m²) on rooms and walls"
                 >
@@ -3341,8 +3298,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 />
                 <button
                   type="button"
-                  className="nvr-btn mono"
-                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  className="nvr-btn mono sm"
                   onClick={() => floorplanFileInputRef.current?.click()}
                   title="Upload PNG, SVG, WebP, or JPEG floorplan background"
                 >
@@ -3351,8 +3307,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 {mapFloorplanUrl && (
                   <button
                     type="button"
-                    className="nvr-btn mono"
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    className="nvr-btn mono sm"
                     onClick={handleClearFloorplanImage}
                     title="Clear uploaded or linked floorplan image"
                   >
@@ -3413,8 +3368,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 </label>
                 <button
                   type="button"
-                  className={`nvr-btn mono ${mapEditMode ? "active" : ""}`}
-                  style={{ height: 24, fontSize: "var(--text-xs)" }}
+                  className={`nvr-btn mono ${mapEditMode ? "active" : ""} sm`}
                   onClick={() => {
                     setMapEditMode((v) => !v);
                     setWallStartPoint(null);
@@ -3430,8 +3384,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 {mapEditMode && (
                   <button
                     type="button"
-                    className="nvr-btn primary mono"
-                    style={{ height: 24, fontSize: "var(--text-xs)" }}
+                    className="nvr-btn primary mono sm"
                     onClick={handleSaveMapPlacements}
                   >
                     {mapSaveStatus || "Save Placement"}
@@ -3468,8 +3421,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     </span>
                     <button
                       type="button"
-                      className={`nvr-btn mono ${mapTool === "select" ? "active" : ""}`}
-                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      className={`nvr-btn mono ${mapTool === "select" ? "active" : ""} sm`}
                       onClick={() => {
                         setMapTool("select");
                         setWallStartPoint(null);
@@ -3481,8 +3433,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     </button>
                     <button
                       type="button"
-                      className={`nvr-btn mono ${mapTool === "draw_room" ? "active" : ""}`}
-                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      className={`nvr-btn mono ${mapTool === "draw_room" ? "active" : ""} sm`}
                       onClick={() => {
                         setMapTool("draw_room");
                         setWallStartPoint(null);
@@ -3495,8 +3446,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       type="button"
                       className={`nvr-btn mono ${
                         mapTool === "draw_wall" && wallKindDraft === "wall" ? "active" : ""
-                      }`}
-                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      } sm`}
                       onClick={() => {
                         setMapTool("draw_wall");
                         setWallKindDraft("wall");
@@ -3510,8 +3460,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       type="button"
                       className={`nvr-btn mono ${
                         mapTool === "draw_wall" && wallKindDraft === "door" ? "active" : ""
-                      }`}
-                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      } sm`}
                       onClick={() => {
                         setMapTool("draw_wall");
                         setWallKindDraft("door");
@@ -3525,8 +3474,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       type="button"
                       className={`nvr-btn mono ${
                         mapTool === "draw_wall" && wallKindDraft === "window" ? "active" : ""
-                      }`}
-                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      } sm`}
                       onClick={() => {
                         setMapTool("draw_wall");
                         setWallKindDraft("window");
@@ -3552,9 +3500,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     >
                       <span>SNAP:</span>
                       <select
-                        className="nvr-select mono"
+                        className="nvr-select mono sm"
                         aria-label="Floorplan grid snap step"
-                        style={{ height: 24, fontSize: "var(--text-xs)", padding: "0 4px" }}
                         value={String(snapStep)}
                         onChange={(e) => setSnapStep(Number(e.target.value))}
                       >
@@ -3567,8 +3514,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
                     <button
                       type="button"
-                      className={`nvr-btn mono ${orthoSnap ? "active" : ""}`}
-                      style={{ height: 24, fontSize: "var(--text-xs)" }}
+                      className={`nvr-btn mono ${orthoSnap ? "active" : ""} sm`}
                       onClick={() => setOrthoSnap((v) => !v)}
                       title="Snap wall angles to 0° / 45° / 90° and snap endpoints to corners"
                     >
@@ -3646,9 +3592,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           ROOM SELECTED:
                         </span>
                         <input
-                          className="nvr-input mono"
-                          aria-label="Selected room label"
-                          style={{ height: 24, width: 115, fontSize: "var(--text-xs)" }}
+                          className="nvr-input mono sm"
+                          aria-label="Selected room label" style={{ width: 115 }}
                           value={selRoom.label}
                           onChange={(e) => {
                             const nextLabel = e.target.value;
@@ -3663,12 +3608,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           <span>Largura W (m):</span>
                           <input
                             type="number"
-                            className="nvr-input mono"
+                            className="nvr-input mono sm"
                             aria-label="Selected room width in meters"
                             step={0.1}
                             min={0.3}
-                            max={floorplanWidthM}
-                            style={{ height: 24, width: 64, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                            max={floorplanWidthM} style={{ width: 64 }}
                             value={rmMetrics.widthM}
                             onChange={(e) => {
                               const nextW = Math.max(0.2, Number(e.target.value) || 0.5);
@@ -3692,12 +3636,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           <span>Comprimento H (m):</span>
                           <input
                             type="number"
-                            className="nvr-input mono"
+                            className="nvr-input mono sm"
                             aria-label="Selected room height in meters"
                             step={0.1}
                             min={0.3}
-                            max={floorplanHeightM}
-                            style={{ height: 24, width: 64, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                            max={floorplanHeightM} style={{ width: 64 }}
                             value={rmMetrics.heightM}
                             onChange={(e) => {
                               const nextH = Math.max(0.2, Number(e.target.value) || 0.5);
@@ -3749,8 +3692,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         </div>
                         <button
                           type="button"
-                          className="nvr-btn mono"
-                          style={{ height: 24, fontSize: "var(--text-xs)" }}
+                          className="nvr-btn mono sm"
                           title="Generate 4 individual editable walls around this room"
                           onClick={() => {
                             const newWalls = extractRoomBoundaryWalls(selRoom);
@@ -3761,8 +3703,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         </button>
                         <button
                           type="button"
-                          className="nvr-btn mono"
-                          style={{ height: 24, fontSize: "var(--text-xs)" }}
+                          className="nvr-btn mono sm"
                           title="Duplicate room"
                           onClick={() => {
                             const dupId = `room_${Date.now()}_${floorplanRooms.length + 1}`;
@@ -3781,8 +3722,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         </button>
                         <button
                           type="button"
-                          className="nvr-btn danger mono"
-                          style={{ height: 24, fontSize: "var(--text-xs)" }}
+                          className="nvr-btn danger mono sm"
                           onClick={() => {
                             setFloorplanRooms((prev) =>
                               prev.filter((r) => r.id !== selRoom.id)
@@ -3822,10 +3762,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           WALL #{wallIdx + 1}:
                         </span>
                         <input
-                          className="nvr-input mono"
+                          className="nvr-input mono sm"
                           placeholder={`Wall #${wallIdx + 1}`}
-                          aria-label="Selected wall label"
-                          style={{ height: 24, width: 100, fontSize: "var(--text-xs)" }}
+                          aria-label="Selected wall label" style={{ width: 100 }}
                           value={selWall.label || ""}
                           onChange={(e) => {
                             const val = e.target.value;
@@ -3837,9 +3776,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           }}
                         />
                         <select
-                          className="nvr-select mono"
+                          className="nvr-select mono sm"
                           aria-label="Selected wall kind"
-                          style={{ height: 24, fontSize: "var(--text-xs)", padding: "0 4px" }}
                           value={selWall.kind || "wall"}
                           onChange={(e) => {
                             const nextKind = e.target.value;
@@ -3858,12 +3796,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           <span>Medida (m):</span>
                           <input
                             type="number"
-                            className="nvr-input mono"
+                            className="nvr-input mono sm"
                             aria-label="Selected wall length in meters"
                             step={0.1}
                             min={0.1}
-                            max={Math.hypot(floorplanWidthM, floorplanHeightM)}
-                            style={{ height: 24, width: 68, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                            max={Math.hypot(floorplanWidthM, floorplanHeightM)} style={{ width: 68 }}
                             value={wMetrics.lengthM}
                             onChange={(e) => {
                               const targetM = Math.max(0.1, Number(e.target.value) || 0.5);
@@ -3889,8 +3826,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           <button
                             key={presetM}
                             type="button"
-                            className="nvr-btn mono"
-                            style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                            className="nvr-btn mono sm"
                             title={`Set wall length to ${presetM}.0m`}
                             onClick={() => {
                               setFloorplanWalls((prev) =>
@@ -3917,12 +3853,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                           <span>Ângulo (°):</span>
                           <input
                             type="number"
-                            className="nvr-input mono"
+                            className="nvr-input mono sm"
                             aria-label="Selected wall angle in degrees"
                             step={15}
                             min={0}
-                            max={360}
-                            style={{ height: 24, width: 58, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                            max={360} style={{ width: 58 }}
                             value={Math.round(wMetrics.angleDeg)}
                             onChange={(e) => {
                               const deg = Number(e.target.value) || 0;
@@ -3946,8 +3881,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         </label>
                         <button
                           type="button"
-                          className="nvr-btn mono"
-                          style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                          className="nvr-btn mono sm"
                           onClick={() =>
                             setFloorplanWalls((prev) =>
                               prev.map((w, idx) =>
@@ -3970,8 +3904,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         </button>
                         <button
                           type="button"
-                          className="nvr-btn mono"
-                          style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                          className="nvr-btn mono sm"
                           onClick={() =>
                             setFloorplanWalls((prev) =>
                               prev.map((w, idx) =>
@@ -3994,8 +3927,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         </button>
                         <button
                           type="button"
-                          className="nvr-btn danger mono"
-                          style={{ height: 24, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                          className="nvr-btn danger mono sm"
                           onClick={() => {
                             setFloorplanWalls((prev) =>
                               prev.filter((_, idx) => idx !== wallIdx)
@@ -4029,12 +3961,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         </span>
                         <input
                           type="number"
-                          className="nvr-input mono"
+                          className="nvr-input mono sm"
                           aria-label="Quick insert wall length in meters"
                           step={0.1}
                           min={0.2}
-                          max={floorplanWidthM}
-                          style={{ height: 24, width: 64, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                          max={floorplanWidthM} style={{ width: 64 }}
                           value={quickWallLenM}
                           onChange={(e) =>
                             setQuickWallLenM(Math.max(0.2, Number(e.target.value) || 1))
@@ -4043,8 +3974,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         <span>m</span>
                         <button
                           type="button"
-                          className="nvr-btn mono"
-                          style={{ height: 24, fontSize: "var(--text-xs)" }}
+                          className="nvr-btn mono sm"
                           onClick={() => {
                             const startX = 0.2;
                             const startY = Number(
@@ -4072,8 +4002,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         </button>
                         <button
                           type="button"
-                          className="nvr-btn mono"
-                          style={{ height: 24, fontSize: "var(--text-xs)" }}
+                          className="nvr-btn mono sm"
                           onClick={() => {
                             const startX = Number(
                               Math.min(0.85, 0.2 + floorplanWalls.length * 0.05).toFixed(3)
@@ -4102,8 +4031,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         {wallStartPoint && (
                           <button
                             type="button"
-                            className="nvr-btn mono"
-                            style={{ height: 24, fontSize: "var(--text-xs)" }}
+                            className="nvr-btn mono sm"
                             onClick={() => {
                               setWallStartPoint(null);
                               setWallPreviewPoint(null);
@@ -5396,8 +5324,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               <span>SECTOR FEED // {selectedCamera.toUpperCase()}</span>
               <button
                 type="button"
-                className="nvr-btn mono"
-                style={{ height: 22, fontSize: "var(--text-xs)" }}
+                className="nvr-btn mono sm"
                 onClick={() => setLiveLayout("focus")}
               >
                 Open Focus
@@ -5516,8 +5443,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 </span>
                 <button
                   type="button"
-                  className="nvr-btn mono"
-                  style={{ height: 22, fontSize: "var(--text-xs)" }}
+                  className="nvr-btn mono sm"
                   onClick={() => {
                     setMapEditMode(true);
                     const nextIdx = floorplanRooms.length;
@@ -5580,9 +5506,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   >
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                       <input
-                        className="nvr-input mono"
-                        aria-label={`Room label ${room.id}`}
-                        style={{ height: 22, flex: 1, fontSize: "var(--text-xs)" }}
+                        className="nvr-input mono sm"
+                        aria-label={`Room label ${room.id}`} style={{ flex: 1 }}
                         value={room.label}
                         onChange={(e) => {
                           const nextLabel = e.target.value;
@@ -5602,8 +5527,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       </span>
                       <button
                         type="button"
-                        className="nvr-btn mono"
-                        style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                        className="nvr-btn mono sm"
                         onClick={(e) => {
                           e.stopPropagation();
                           setMapEditMode(true);
@@ -5632,12 +5556,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       <span>W:</span>
                       <input
                         type="number"
-                        className="nvr-input mono"
+                        className="nvr-input mono sm"
                         aria-label={`Room width meters ${room.id}`}
                         step={0.1}
                         min={0.2}
-                        max={floorplanWidthM}
-                        style={{ height: 22, width: 58, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                        max={floorplanWidthM} style={{ width: 58 }}
                         value={rmMetrics.widthM}
                         onChange={(e) => {
                           const nextW = Math.max(0.2, Number(e.target.value) || 0.5);
@@ -5660,12 +5583,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       <span>m × H:</span>
                       <input
                         type="number"
-                        className="nvr-input mono"
+                        className="nvr-input mono sm"
                         aria-label={`Room height meters ${room.id}`}
                         step={0.1}
                         min={0.2}
-                        max={floorplanHeightM}
-                        style={{ height: 22, width: 58, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                        max={floorplanHeightM} style={{ width: 58 }}
                         value={rmMetrics.heightM}
                         onChange={(e) => {
                           const nextH = Math.max(0.2, Number(e.target.value) || 0.5);
@@ -5709,8 +5631,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                 <div style={{ display: "flex", gap: 4 }}>
                   <button
                     type="button"
-                    className="nvr-btn mono"
-                    style={{ height: 22, fontSize: "var(--text-xs)" }}
+                    className="nvr-btn mono sm"
                     onClick={() => {
                       setMapEditMode(true);
                       const pts = resizeWallToLengthMeters(
@@ -5732,8 +5653,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   {floorplanWalls.length > 0 && mapEditMode && (
                     <button
                       type="button"
-                      className="nvr-btn mono"
-                      style={{ height: 22, fontSize: "var(--text-xs)" }}
+                      className="nvr-btn mono sm"
                       onClick={() => {
                         setFloorplanWalls((prev) => prev.slice(0, -1));
                         setSelectedWallIdx(null);
@@ -5795,12 +5715,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     </span>
                     <input
                       type="number"
-                      className="nvr-input mono"
+                      className="nvr-input mono sm"
                       aria-label={`Wall ${wIdx + 1} length in meters`}
                       step={0.1}
                       min={0.1}
-                      max={Math.hypot(floorplanWidthM, floorplanHeightM)}
-                      style={{ height: 22, width: 62, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                      max={Math.hypot(floorplanWidthM, floorplanHeightM)} style={{ width: 62 }}
                       value={wMetrics.lengthM}
                       onChange={(e) => {
                         const targetM = Math.max(0.1, Number(e.target.value) || 0.5);
@@ -5830,8 +5749,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     </span>
                     <button
                       type="button"
-                      className="nvr-btn mono"
-                      style={{ height: 22, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                      className="nvr-btn mono sm"
                       title="Rotate wall 90°"
                       onClick={(e) => {
                         e.stopPropagation();
@@ -5857,13 +5775,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     </button>
                     <button
                       type="button"
-                      className="nvr-btn mono"
-                      style={{
-                        height: 22,
-                        padding: "0 6px",
-                        fontSize: "var(--text-xs)",
-                        marginLeft: "auto",
-                      }}
+                      className="nvr-btn mono sm"
+                      style={{ marginLeft: "auto" }}
                       onClick={(e) => {
                         e.stopPropagation();
                         setMapEditMode(true);
@@ -5917,6 +5830,8 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           currentTs={timeShiftTs}
           onSeek={(ts) => setTimeShiftTs(sanitizeTimeShiftSeek(ts))}
           onExportRange={handleQuickExport}
+          clipRequest={clipRequest}
+          onOpenExports={() => setActiveTab("exports")}
           titlePrefix="TIMELINE"
         />
       )}

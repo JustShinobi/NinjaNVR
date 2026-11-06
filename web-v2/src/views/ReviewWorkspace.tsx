@@ -1767,6 +1767,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                     });
                   }
                 }}
+                onOpenExports={() => useNvrStore.getState().setActiveTab("exports")}
                 onExportRange={async (cam, start, end, label) => {
                   const cleanCam = (cam || "").trim();
                   if (!cleanCam) return;

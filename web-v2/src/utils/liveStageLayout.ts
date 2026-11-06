@@ -411,3 +411,140 @@ export function resolveEffectiveSpotlightHeroCam(
     trailCams.length > 0 ? trailCams[trailCams.length - 1].cam : "";
   return promotedCams[0] || latestTrailCam || selectedCamera || fallbackCam || "";
 }
+
+/* ------------------------------------------------------------------ */
+/* Live Matrix toolbar & event strip helpers                          */
+/* ------------------------------------------------------------------ */
+
+const MATRIX_DENSITY_STEPS: Array<{ density: MatrixDensity; pageSize: number }> = [
+  { density: "2x2", pageSize: 4 },
+  { density: "3x3", pageSize: 9 },
+  { density: "4x4", pageSize: 16 },
+];
+
+export interface MatrixDensityOption {
+  density: MatrixDensity;
+  /** A denser grid only helps when there are more cameras than the previous step holds. */
+  enabled: boolean;
+  /** Camera count the previous step holds (shown in the disabled tooltip). */
+  needsMoreThan: number;
+  active: boolean;
+}
+
+/**
+ * Densities the operator can actually tell apart. With 4 cameras, 3×3 and 4×4
+ * render the same adaptive 2×2 grid, so they are disabled and the effective
+ * density (2×2) is the one shown as active.
+ */
+export function resolveMatrixDensityOptions(
+  cameraCount: number,
+  selected: MatrixDensity
+): { options: MatrixDensityOption[]; effective: MatrixDensity } {
+  const count = Number.isFinite(cameraCount) && cameraCount > 0 ? Math.floor(cameraCount) : 0;
+  const options = MATRIX_DENSITY_STEPS.map((step, idx) => {
+    const needsMoreThan = idx === 0 ? 0 : MATRIX_DENSITY_STEPS[idx - 1].pageSize;
+    return { density: step.density, enabled: idx === 0 || count > needsMoreThan, needsMoreThan };
+  });
+  // A disabled selection falls back to the densest step that still makes a difference.
+  const selectedIdx = Math.max(0, options.findIndex((o) => o.density === selected));
+  let effective: MatrixDensity = "2x2";
+  for (let i = 0; i <= selectedIdx; i++) {
+    if (options[i].enabled) effective = options[i].density;
+  }
+  return {
+    options: options.map((o) => ({ ...o, active: o.density === effective })),
+    effective,
+  };
+}
+
+/** "55s ago" / "4m ago" / "2h ago" (or "há 4 min" in Portuguese). */
+export function formatRelativeAgo(nowSec: number, tsSec: number, isPt = false): string {
+  if (!Number.isFinite(nowSec) || !Number.isFinite(tsSec)) return "";
+  const diff = Math.max(0, Math.floor(nowSec - tsSec));
+  if (diff < 60) return isPt ? `há ${diff}s` : `${diff}s ago`;
+  const min = Math.floor(diff / 60);
+  if (min < 60) return isPt ? `há ${min} min` : `${min}m ago`;
+  const hours = Math.floor(min / 60);
+  if (hours < 24) return isPt ? `há ${hours} h` : `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return isPt ? `há ${days} d` : `${days}d ago`;
+}
+
+/** Most recent first, capped, ignoring entries without a finite start time. */
+export function selectRecentEvents<T extends { start_time: number }>(
+  items: T[],
+  limit = 10
+): T[] {
+  if (!Array.isArray(items) || limit <= 0) return [];
+  return items
+    .filter((it) => it && Number.isFinite(it.start_time))
+    .slice()
+    .sort((a, b) => b.start_time - a.start_time)
+    .slice(0, Math.floor(limit));
+}
+
+/** Columns × rows the matrix uses for `visibleCount` tiles (mirrors the adaptive grid). */
+export function resolveMatrixGridShape(visibleCount: number): { cols: number; rows: number } {
+  const n = Number.isFinite(visibleCount) ? Math.max(1, Math.floor(visibleCount)) : 1;
+  if (n === 1) return { cols: 1, rows: 1 };
+  if (n === 2) return { cols: 2, rows: 1 };
+  if (n <= 4) return { cols: 2, rows: 2 };
+  if (n <= 6) return { cols: 3, rows: 2 };
+  if (n <= 9) return { cols: 3, rows: 3 };
+  if (n <= 12) return { cols: 4, rows: 3 };
+  return { cols: 4, rows: 4 };
+}
+
+/**
+ * Largest tile of the given aspect ratio that fits `cols × rows` tiles (with
+ * `gap` px between them) inside the stage. Returns whole pixels.
+ */
+export function computeAspectFitTiles(
+  stageWidth: number,
+  stageHeight: number,
+  cols: number,
+  rows: number,
+  gap = 2,
+  aspect = 16 / 9
+): { tileWidth: number; tileHeight: number } | null {
+  if (
+    ![stageWidth, stageHeight, cols, rows, gap, aspect].every((v) => Number.isFinite(v)) ||
+    stageWidth <= 0 ||
+    stageHeight <= 0 ||
+    cols < 1 ||
+    rows < 1 ||
+    aspect <= 0
+  ) {
+    return null;
+  }
+  const byWidth = (stageWidth - gap * (cols - 1)) / cols;
+  const byHeight = ((stageHeight - gap * (rows - 1)) / rows) * aspect;
+  const tileWidth = Math.floor(Math.min(byWidth, byHeight));
+  const tileHeight = Math.floor(tileWidth / aspect);
+  if (tileWidth < 16 || tileHeight < 9) return null;
+  return { tileWidth, tileHeight };
+}
+
+/**
+ * Matrix grid style with 16:9 tiles centred on the stage, so letterboxing
+ * collects at the outer edges instead of between the videos. Returns
+ * undefined until the stage has been measured.
+ */
+export function resolveAspectMatrixGridStyle(
+  stageSize: { width: number; height: number } | null,
+  visibleCount: number,
+  gap = 2
+): React.CSSProperties | undefined {
+  if (!stageSize) return undefined;
+  const { cols, rows } = resolveMatrixGridShape(visibleCount);
+  const fit = computeAspectFitTiles(stageSize.width, stageSize.height, cols, rows, gap);
+  if (!fit) return undefined;
+  return {
+    gridTemplateColumns: `repeat(${cols}, ${fit.tileWidth}px)`,
+    gridTemplateRows: `repeat(${rows}, ${fit.tileHeight}px)`,
+    gap,
+    justifyContent: "center",
+    alignContent: "center",
+    background: "var(--video-stage-bg)",
+  };
+}
