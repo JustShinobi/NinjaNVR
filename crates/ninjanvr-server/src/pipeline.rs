@@ -22,8 +22,8 @@ use ninjanvr_vision::{
     BoundingBox, CameraRoiStateMonitor, RgbImage, RoiStateTransition, SimdMotionDetector,
     annotate_rgb_image_with_boxes, apply_privacy_masks_from_value, check_frame_tamper,
     compute_crop_dhash64, compute_inference_regions, crop_yuv420p_to_tensor_nhwc,
-    encode_image_jpeg, encode_image_webp, is_monochrome_ir, yuv420p_to_rgb_image,
-    yuv420p_to_rgb_image_scaled,
+    encode_image_jpeg, encode_image_jpeg_with_quality, encode_image_webp, is_monochrome_ir,
+    yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -663,6 +663,7 @@ pub struct VisionPipeline {
     pub activity_ledger: SharedActivityLedger,
     pub latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     pub latest_yuv_frames: SharedLatestYuvFrames,
+    pub preview_frames: crate::preview_frames::PreviewFrameStore,
     pub camera_metrics: SharedCameraMetrics,
     pub media_dir: PathBuf,
     pub log_hub: crate::LogBufferHub,
@@ -710,6 +711,7 @@ impl VisionPipeline {
         let mut motion_detector = SimdMotionDetector::new(width, height, cam_cfg.motion.clone());
         let mut roi_monitor = CameraRoiStateMonitor::new(&cam_cfg.state_rois);
         let mut tracker = ByteTracker::new(&camera, width, height, &cam_cfg);
+        let mut preview_sampler = crate::preview_frames::PreviewFrameSampler::default();
         let (model_w, model_h, _) = self.detector.model_dimensions();
         let init_tensor_len = (model_w as usize)
             .saturating_mul(model_h as usize)
@@ -1082,6 +1084,54 @@ impl VisionPipeline {
                         .entry(camera.clone())
                         .or_default()
                         .last_frame_ts = now;
+
+                    // 6b. Live event-strip preview frames, sampled from this already-decoded
+                    // frame: no extra decoder or ffmpeg, just a downscale + small JPEG.
+                    let moving_objects = active_tracks.iter().any(|t| !t.stationary);
+                    let fast_object = active_tracks.iter().any(|t| {
+                        !t.stationary
+                            && matches!(
+                                t.label.as_str(),
+                                "car" | "truck" | "bus" | "motorcycle" | "bicycle"
+                            )
+                    });
+                    if cam_cfg.record.enabled
+                        && preview_sampler.should_write(now, motion_on, moving_objects, fast_object)
+                    {
+                        let store = self.preview_frames.clone();
+                        let frame_for_preview = yuv_frame.clone();
+                        let mask_for_preview = normalized_priv_mask.clone();
+                        let cam_for_preview = camera.clone();
+                        let ts_ms = (now.max(0.0) * 1000.0) as u64;
+                        tokio::task::spawn_blocking(move || {
+                            let mut rgb = yuv420p_to_rgb_image_scaled(
+                                &frame_for_preview,
+                                None,
+                                &[],
+                                Some(crate::preview_frames::PREVIEW_FRAME_HEIGHT),
+                            );
+                            apply_privacy_masks_from_value(&mut rgb, &mask_for_preview);
+                            match encode_image_jpeg_with_quality(
+                                &rgb,
+                                crate::preview_frames::PREVIEW_FRAME_JPEG_QUALITY,
+                            ) {
+                                Ok(jpeg) => {
+                                    if let Err(err) =
+                                        store.write_frame(&cam_for_preview, ts_ms, &jpeg)
+                                    {
+                                        warn!(
+                                            "Failed to write preview frame for {cam_for_preview}: {err}"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        "Failed to encode preview frame for {cam_for_preview}: {err:#}"
+                                    );
+                                }
+                            }
+                        });
+                    }
 
                     if frame_count == 1 || frame_count.is_multiple_of(150) {
                         let annotated: Vec<(BoundingBox, [u8; 3])> =
@@ -2942,6 +2992,7 @@ mod tests {
             activity_ledger: new_activity_ledger(),
             latest_frames: Arc::new(RwLock::new(HashMap::new())),
             latest_yuv_frames: Arc::new(RwLock::new(HashMap::new())),
+            preview_frames: crate::preview_frames::PreviewFrameStore::new(&media_dir),
             camera_metrics: Arc::new(RwLock::new(HashMap::new())),
             media_dir,
             log_hub: crate::LogBufferHub::new(),

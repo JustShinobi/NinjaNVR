@@ -1107,6 +1107,16 @@ pub fn encode_image_jpeg(img: &RgbImage) -> Result<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
+/// JPEG with an explicit quality (1-100), for small derived images such as
+/// preview frames where the default quality would waste bytes.
+pub fn encode_image_jpeg_with_quality(img: &RgbImage, quality: u8) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.clamp(1, 100));
+    img.write_with_encoder(encoder)?;
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FrameIntegrityReport {
     pub y_variance: f32,
@@ -2031,6 +2041,21 @@ pub fn decode_or_extract_rgb_grid_16x16(data: &[u8]) -> Option<[[f32; 3]; 256]> 
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn jpeg_quality_controls_size_and_output_is_valid_jpeg() {
+        let mut img = RgbImage::new(320, 180);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = Rgb([(x % 256) as u8, (y % 256) as u8, ((x * y) % 256) as u8]);
+        }
+        let small = encode_image_jpeg_with_quality(&img, 40).unwrap();
+        let large = encode_image_jpeg_with_quality(&img, 95).unwrap();
+        assert_eq!(&small[..2], &[0xFF, 0xD8], "JPEG SOI marker");
+        assert!(small.len() < large.len());
+        // Out-of-range qualities are clamped instead of failing.
+        assert!(encode_image_jpeg_with_quality(&img, 0).is_ok());
+        assert!(encode_image_jpeg_with_quality(&img, 255).is_ok());
+    }
 
     #[test]
     fn simd_motion_detector_detects_moving_object_after_warmup() {

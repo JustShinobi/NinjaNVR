@@ -2,6 +2,7 @@
 
 pub mod mse_hub;
 pub mod pipeline;
+pub mod preview_frames;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -310,6 +311,7 @@ pub struct AppState {
     pub media_dir: PathBuf,
     pub latest_frames: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     pub latest_yuv_frames: SharedLatestYuvFrames,
+    pub preview_frames: preview_frames::PreviewFrameStore,
     pub lazy_snapshot_cache: Arc<RwLock<HashMap<LazySnapshotCacheKey, LazySnapshotCacheValue>>>,
     pub mse_hub: MseStreamHub,
     pub activity_ledger: SharedActivityLedger,
@@ -7944,110 +7946,6 @@ async fn api_review_by_id(
     }
 }
 
-/// Number of still frames served per review item for the Live event-strip flipbook.
-pub const REVIEW_FRAME_COUNT: usize = 8;
-/// Longest stretch of a review item the flipbook samples (long reviews are capped).
-const REVIEW_FRAME_MAX_WINDOW_SEC: f64 = 60.0;
-/// Width the flipbook frames are scaled to (height keeps the aspect ratio).
-const REVIEW_FRAME_WIDTH_PX: u32 = 320;
-/// Concurrent ffmpeg frame extractions. Every Live client asks for up to 80
-/// frames at once; unbounded, each request spawned its own 1080p decoder and
-/// pushed the pod past its memory limit.
-pub const REVIEW_FRAME_MAX_CONCURRENT_EXTRACTIONS: usize = 2;
-/// How long a frame request waits for an extraction slot before answering 503.
-const REVIEW_FRAME_QUEUE_WAIT_SECS: u64 = 20;
-
-static REVIEW_FRAME_EXTRACT_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| {
-        tokio::sync::Semaphore::new(REVIEW_FRAME_MAX_CONCURRENT_EXTRACTIONS)
-    });
-
-/// ffmpeg arguments for one flipbook still: single-threaded, keyframes only
-/// (cheap to decode, plenty for a flipbook), scaled down, one JPEG out.
-/// `-noaccurate_seek` keeps the keyframe at or before the offset, so a seek
-/// near the end of a segment still yields a frame.
-pub fn build_review_frame_ffmpeg_args(offset_sec: f64, input: &str, output: &str) -> Vec<String> {
-    let offset = if offset_sec.is_finite() {
-        offset_sec.max(0.0)
-    } else {
-        0.0
-    };
-    [
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-threads",
-        "1",
-        "-skip_frame",
-        "nokey",
-        "-noaccurate_seek",
-        "-ss",
-    ]
-    .iter()
-    .map(|a| a.to_string())
-    .chain([format!("{offset:.3}"), "-i".to_string(), input.to_string()])
-    .chain(
-        ["-frames:v", "1", "-an", "-threads", "1", "-vf"]
-            .iter()
-            .map(|a| a.to_string()),
-    )
-    .chain([format!("scale={REVIEW_FRAME_WIDTH_PX}:-2")])
-    .chain(["-q:v", "6", "-f", "image2"].iter().map(|a| a.to_string()))
-    .chain([output.to_string()])
-    .collect()
-}
-
-/// Evenly spaced capture timestamps across a review item, for the event-strip flipbook.
-///
-/// Open-ended reviews use a 15 s window; long ones are capped at
-/// `REVIEW_FRAME_MAX_WINDOW_SEC`. The last frame is pulled 0.25 s inside the
-/// window so it lands in a recorded segment rather than on its end boundary.
-pub fn plan_review_frame_timestamps(start: f64, end: Option<f64>, count: usize) -> Vec<f64> {
-    if !start.is_finite() || count == 0 {
-        return Vec::new();
-    }
-    let stop = end
-        .filter(|e| e.is_finite() && *e > start)
-        .unwrap_or(start + 15.0)
-        .min(start + REVIEW_FRAME_MAX_WINDOW_SEC);
-    let span = stop - start;
-    if count == 1 {
-        return vec![start + span / 2.0];
-    }
-    let last = if span > 0.5 { stop - 0.25 } else { stop };
-    let usable = last - start;
-    (0..count)
-        .map(|i| start + usable * (i as f64) / ((count - 1) as f64))
-        .collect()
-}
-
-/// Finds the recording segment (given as `(start, end)` spans) that contains `ts`
-/// and the seek offset into it. End boundaries are exclusive.
-pub fn locate_recording_offset(spans: &[(f64, f64)], ts: f64) -> Option<(usize, f64)> {
-    if !ts.is_finite() {
-        return None;
-    }
-    spans
-        .iter()
-        .enumerate()
-        .find(|(_, (start, end))| start.is_finite() && end.is_finite() && ts >= *start && ts < *end)
-        .map(|(idx, (start, _))| (idx, (ts - start).max(0.0)))
-}
-
-/// Parses a flipbook frame file name (`"3.jpg"`) into its index.
-pub fn parse_review_frame_name(name: &str) -> Option<usize> {
-    let digits = name.strip_suffix(".jpg")?;
-    if digits.is_empty() || digits.len() > 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits
-        .parse::<usize>()
-        .ok()
-        .filter(|idx| *idx < REVIEW_FRAME_COUNT)
-}
-
 /// Why review media was refused (kept small so `Result` stays cheap to move).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewMediaDenied {
@@ -8101,6 +7999,21 @@ async fn authorize_review_media(
     Ok(item)
 }
 
+/// Window of a review item the flipbook covers: open-ended reviews use 15 s and
+/// long ones are capped at 60 s, padded by 1 s on each side.
+pub fn review_preview_window_ms(start: f64, end: Option<f64>) -> Option<(u64, u64)> {
+    if !start.is_finite() || start < 0.0 {
+        return None;
+    }
+    let stop = end
+        .filter(|e| e.is_finite() && *e > start)
+        .unwrap_or(start + 15.0)
+        .min(start + 60.0);
+    let from = ((start - 1.0).max(0.0) * 1000.0).floor() as u64;
+    let to = ((stop + 1.0) * 1000.0).ceil() as u64;
+    Some((from, to))
+}
+
 async fn api_review_frames(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -8111,26 +8024,15 @@ async fn api_review_frames(
         Ok(item) => item,
         Err(denied) => return denied.into_response(),
     };
-    let timestamps =
-        plan_review_frame_timestamps(item.start_time, item.end_time, REVIEW_FRAME_COUNT);
-    // Only advertise frames that fall inside a recorded segment, so clients never
-    // request frames whose recording was never written or already expired.
-    let (first, last) = (
-        timestamps.first().copied().unwrap_or(item.start_time),
-        timestamps.last().copied().unwrap_or(item.start_time),
-    );
-    let spans: Vec<(f64, f64)> = state
-        .db
-        .query_recordings(&item.camera, first - 30.0, last + 30.0)
+    let frames: Vec<Value> = review_preview_window_ms(item.start_time, item.end_time)
+        .map(|(from, to)| {
+            state
+                .preview_frames
+                .range(&item.camera, from, to, preview_frames::PREVIEW_FRAMES_PER_REVIEW)
+        })
         .unwrap_or_default()
-        .iter()
-        .map(|r| (r.start_time, r.end_time))
-        .collect();
-    let frames: Vec<Value> = timestamps
-        .iter()
-        .enumerate()
-        .filter(|(_, ts)| locate_recording_offset(&spans, **ts).is_some())
-        .map(|(idx, ts)| json!({ "url": format!("/api/review/{id}/frames/{idx}.jpg"), "ts": ts }))
+        .into_iter()
+        .map(|ts| json!({ "url": format!("/api/review/{id}/frames/{ts}.jpg"), "ts": ts as f64 / 1000.0 }))
         .collect();
     (
         [(header::CACHE_CONTROL, "private, no-store")],
@@ -8145,112 +8047,37 @@ async fn api_review_frame(
     headers: HeaderMap,
     AxumPath((id, frame)): AxumPath<(String, String)>,
 ) -> Response {
-    let Some(idx) = parse_review_frame_name(&frame) else {
+    let Some(ts) = preview_frames::parse_preview_frame_name(&frame) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let item = match authorize_review_media(&state, &jar, &headers, &id).await {
         Ok(item) => item,
         Err(denied) => return denied.into_response(),
     };
-    let serve = |bytes: Vec<u8>| {
-        (
+    // Only frames of this review's own camera and time window are served.
+    let in_window = review_preview_window_ms(item.start_time, item.end_time)
+        .is_some_and(|(from, to)| (from..=to).contains(&ts));
+    if !in_window || !state.preview_frames.contains(&item.camera, ts) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(path) = state.preview_frames.frame_path(&item.camera, ts) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !is_regular_non_symlink_file(&path) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
             [
                 (header::CONTENT_TYPE, "image/jpeg"),
-                (header::CACHE_CONTROL, "private, max-age=3600"),
+                // Frame files never change once written.
+                (header::CACHE_CONTROL, "private, max-age=86400, immutable"),
             ],
             bytes,
         )
-            .into_response()
-    };
-
-    let clips_dir = state.media_dir.join("clips");
-    let frames_root = clips_dir.join("review_frames");
-    let cache_dir = frames_root.join(&id);
-    let out_file = cache_dir.join(format!("{idx}.jpg"));
-    if is_regular_non_symlink_file(&out_file)
-        && let Ok(bytes) = tokio::fs::read(&out_file).await
-    {
-        return serve(bytes);
+            .into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
-
-    let Some(ts) = plan_review_frame_timestamps(item.start_time, item.end_time, REVIEW_FRAME_COUNT)
-        .get(idx)
-        .copied()
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let recs = state
-        .db
-        .query_recordings(&item.camera, ts - 30.0, ts + 30.0)
-        .unwrap_or_default();
-    let spans: Vec<(f64, f64)> = recs.iter().map(|r| (r.start_time, r.end_time)).collect();
-    let Some((rec_idx, offset)) = locate_recording_offset(&spans, ts) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let disk_path = resolve_recording_disk_path(&state.media_dir, &recs[rec_idx].path);
-    let Some(segment) =
-        ensure_recording_segment_path(&state.media_dir, Some(&item.camera), &disk_path)
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    if std::fs::create_dir_all(&cache_dir).is_err()
-        || ensure_path_within_media_dir(&state.media_dir, &cache_dir).is_none()
-        || !std::fs::symlink_metadata(&cache_dir)
-            .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
-    {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    let nonce: u64 = rand::random();
-    let tmp_file = cache_dir.join(format!(".{idx}.{nonce:016x}.tmp.jpg"));
-    struct TempFileGuard(PathBuf);
-    impl Drop for TempFileGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _guard = TempFileGuard(tmp_file.clone());
-
-    // Bound concurrent extractions so a burst of Live clients cannot OOM the pod.
-    let Ok(Ok(_permit)) = tokio::time::timeout(
-        Duration::from_secs(REVIEW_FRAME_QUEUE_WAIT_SECS),
-        REVIEW_FRAME_EXTRACT_SEMAPHORE.acquire(),
-    )
-    .await
-    else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::RETRY_AFTER, "5")],
-        )
-            .into_response();
-    };
-    // Another request may have produced this frame while we waited for a slot.
-    if is_regular_non_symlink_file(&out_file)
-        && let Ok(bytes) = tokio::fs::read(&out_file).await
-    {
-        return serve(bytes);
-    }
-
-    let ffmpeg_bin = ninjanvr_media::resolve_ffmpeg_bin();
-    let mut cmd = tokio::process::Command::new(&ffmpeg_bin);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .args(build_review_frame_ffmpeg_args(
-            offset,
-            &sanitize_local_ffmpeg_path_arg(&segment),
-            &sanitize_local_ffmpeg_path_arg(&tmp_file),
-        ));
-    let status_res = tokio::time::timeout(Duration::from_secs(15), cmd.status()).await;
-    if !matches!(status_res, Ok(Ok(s)) if s.success()) || !is_regular_non_symlink_file(&tmp_file) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let Ok(bytes) = tokio::fs::read(&tmp_file).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let _ = std::fs::rename(&tmp_file, &out_file);
-    serve(bytes)
 }
 
 async fn api_review_preview(
@@ -22937,6 +22764,35 @@ pub async fn new_app_state(
     let activity_ledger = new_activity_ledger();
     let latest_frames = Arc::new(RwLock::new(HashMap::new()));
     let latest_yuv_frames: SharedLatestYuvFrames = Arc::new(RwLock::new(HashMap::new()));
+    // Live event-strip preview frames: index what survived a restart, drop the cache
+    // left by the earlier on-demand ffmpeg extractor, and prune on a timer.
+    let preview_frame_store = preview_frames::PreviewFrameStore::new(&media_dir);
+    {
+        let store = preview_frame_store.clone();
+        let legacy_cache = media_dir.join("clips").join("review_frames");
+        let loaded = tokio::task::spawn_blocking(move || {
+            if std::fs::symlink_metadata(&legacy_cache).is_ok_and(|m| m.is_dir()) {
+                let _ = std::fs::remove_dir_all(&legacy_cache);
+            }
+            store.load_from_disk()
+        })
+        .await
+        .unwrap_or(0);
+        info!("Indexed {loaded} cached preview frames");
+        let store = preview_frame_store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                tick.tick().await;
+                let store = store.clone();
+                let now_ms = unix_now().saturating_mul(1000);
+                let _ = tokio::task::spawn_blocking(move || {
+                    store.prune(now_ms, preview_frames::PREVIEW_FRAME_RETENTION_SECS * 1000)
+                })
+                .await;
+            }
+        });
+    }
     let lazy_snapshot_cache = Arc::new(RwLock::new(HashMap::new()));
     let mse_hub = MseStreamHub::new();
     let camera_metrics: SharedCameraMetrics = Arc::new(RwLock::new(HashMap::new()));
@@ -22978,6 +22834,7 @@ pub async fn new_app_state(
             activity_ledger: activity_ledger.clone(),
             latest_frames: latest_frames.clone(),
             latest_yuv_frames: latest_yuv_frames.clone(),
+            preview_frames: preview_frame_store.clone(),
             camera_metrics: camera_metrics.clone(),
             media_dir: media_dir.clone(),
             log_hub: log_hub.clone(),
@@ -23018,6 +22875,7 @@ pub async fn new_app_state(
         media_dir,
         latest_frames,
         latest_yuv_frames,
+        preview_frames: preview_frame_store,
         lazy_snapshot_cache,
         mse_hub,
         activity_ledger,
@@ -23095,110 +22953,28 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
-    fn plan_review_frame_timestamps_spreads_frames_inside_the_review() {
-        let ts = plan_review_frame_timestamps(100.0, Some(108.0), 8);
-        assert_eq!(ts.len(), 8);
-        assert_eq!(ts[0], 100.0);
-        assert!(
-            (ts[7] - 107.75).abs() < 1e-9,
-            "last frame pulled inside the window"
-        );
-        assert!(ts.windows(2).all(|w| w[1] > w[0]));
-    }
-
-    #[test]
-    fn plan_review_frame_timestamps_handles_open_long_and_invalid_reviews() {
-        let open = plan_review_frame_timestamps(50.0, None, 4);
-        assert_eq!(open.first().copied(), Some(50.0));
-        assert!(
-            (open[3] - 64.75).abs() < 1e-9,
-            "open reviews use a 15 s window"
-        );
-
-        let long = plan_review_frame_timestamps(0.0, Some(3600.0), 2);
-        assert!(
-            (long[1] - 59.75).abs() < 1e-9,
-            "long reviews are capped at 60 s"
-        );
-
-        let inverted = plan_review_frame_timestamps(10.0, Some(5.0), 2);
-        assert!(
-            (inverted[1] - 24.75).abs() < 1e-9,
-            "end before start falls back to 15 s"
-        );
-
+    fn review_preview_window_covers_the_review_with_padding_and_caps() {
         assert_eq!(
-            plan_review_frame_timestamps(10.0, Some(30.0), 1),
-            vec![20.0]
+            review_preview_window_ms(100.0, Some(108.0)),
+            Some((99_000, 109_000))
         );
-        assert!(plan_review_frame_timestamps(f64::NAN, Some(1.0), 8).is_empty());
-        assert!(plan_review_frame_timestamps(1.0, Some(2.0), 0).is_empty());
-        assert!(
-            plan_review_frame_timestamps(1.0, Some(f64::INFINITY), 3)
-                .iter()
-                .all(|t| t.is_finite())
-        );
-    }
-
-    #[test]
-    fn locate_recording_offset_finds_the_containing_segment() {
-        let spans = [(100.0, 110.0), (110.0, 120.0), (130.0, 140.0)];
-        assert_eq!(locate_recording_offset(&spans, 100.0), Some((0, 0.0)));
+        // Open-ended reviews cover 15 s; long ones are capped at 60 s.
         assert_eq!(
-            locate_recording_offset(&spans, 110.0),
-            Some((1, 0.0)),
-            "end is exclusive"
+            review_preview_window_ms(100.0, None),
+            Some((99_000, 116_000))
         );
-        assert_eq!(locate_recording_offset(&spans, 135.5), Some((2, 5.5)));
         assert_eq!(
-            locate_recording_offset(&spans, 125.0),
-            None,
-            "gap between segments"
+            review_preview_window_ms(100.0, Some(5_000.0)),
+            Some((99_000, 161_000))
         );
-        assert_eq!(locate_recording_offset(&spans, f64::NAN), None);
-        assert_eq!(locate_recording_offset(&[(f64::NAN, 5.0)], 1.0), None);
-    }
-
-    #[test]
-    fn review_frame_ffmpeg_args_stay_single_threaded_and_keyframe_only() {
-        let args = build_review_frame_ffmpeg_args(4.5, "file:/in.mp4", "/out.jpg");
-        let input_at = args.iter().position(|a| a == "-i").unwrap();
-        let before_input = &args[..input_at];
-        // Decoder options must come before -i to apply to the input.
-        for opt in ["-skip_frame", "-noaccurate_seek", "-ss"] {
-            assert!(
-                before_input.iter().any(|a| a == opt),
-                "{opt} must precede -i"
-            );
-        }
-        assert_eq!(args.iter().filter(|a| *a == "-threads").count(), 2);
-        assert_eq!(args[input_at + 1], "file:/in.mp4");
-        assert!(args.windows(2).any(|w| w[0] == "-ss" && w[1] == "4.500"));
-        assert!(args.windows(2).any(|w| w[0] == "-frames:v" && w[1] == "1"));
-        assert!(args.iter().any(|a| a == "scale=320:-2"));
-        assert_eq!(args.last().map(String::as_str), Some("/out.jpg"));
-        let negative = build_review_frame_ffmpeg_args(f64::NAN, "a", "b");
-        assert!(
-            negative
-                .windows(2)
-                .any(|w| w[0] == "-ss" && w[1] == "0.000")
-        );
-        assert_eq!(REVIEW_FRAME_MAX_CONCURRENT_EXTRACTIONS, 2);
-    }
-
-    #[test]
-    fn parse_review_frame_name_accepts_only_bounded_jpeg_indices() {
-        assert_eq!(parse_review_frame_name("0.jpg"), Some(0));
+        // An end before the start falls back to 15 s; the left pad never goes negative.
+        assert_eq!(review_preview_window_ms(0.5, Some(0.1)), Some((0, 16_500)));
+        assert_eq!(review_preview_window_ms(f64::NAN, None), None);
+        assert_eq!(review_preview_window_ms(-1.0, None), None);
         assert_eq!(
-            parse_review_frame_name("7.jpg"),
-            Some(REVIEW_FRAME_COUNT - 1)
+            review_preview_window_ms(10.0, Some(f64::INFINITY)),
+            Some((9_000, 26_000))
         );
-        for bad in [
-            "8.jpg", "99.jpg", "100.jpg", ".jpg", "-1.jpg", "1.png", "../0.jpg", "01x.jpg",
-            "+1.jpg",
-        ] {
-            assert_eq!(parse_review_frame_name(bad), None, "{bad} must be rejected");
-        }
     }
 
     struct TestApp {
@@ -25645,7 +25421,7 @@ version: 0.18-0
                 StatusCode::NOT_FOUND,
             ),
             (
-                "/api/review/missing_review/frames/8.jpg",
+                "/api/review/missing_review/frames/abc.jpg",
                 StatusCode::BAD_REQUEST,
             ),
             // Encoded traversal never reaches the handler: the router guard refuses it.
@@ -25671,29 +25447,8 @@ version: 0.18-0
             assert_eq!(r.status(), expected, "unexpected status on {frames_uri}");
         }
 
-        // The frame list only advertises frames that land inside a recorded segment
-        // (recordings cover 5000-5020; the review runs 5014-5030).
-        for (seg_id, seg_start) in [("seg_frames_a", 5000.0), ("seg_frames_b", 5010.0)] {
-            state
-                .db
-                .insert_recording(&ninjanvr_db::RecordingRow {
-                    id: seg_id.to_string(),
-                    camera: "front_door".to_string(),
-                    path: format!(
-                        "/media/ninjanvr/recordings/2026-11-01/01/front_door/{seg_id}.mp4"
-                    ),
-                    start_time: seg_start,
-                    end_time: seg_start + 10.0,
-                    duration: 10.0,
-                    motion: 0,
-                    objects: 0,
-                    dbfs: 0,
-                    segment_size: 0.001,
-                    regions: 0,
-                    motion_heatmap: None,
-                })
-                .unwrap();
-        }
+        // The frame list serves preview frames captured for this review's camera and
+        // window only (review 5014-5030 -> window 5013-5031).
         state
             .db
             .insert_review_segment(&ninjanvr_db::ReviewItemDto {
@@ -25706,6 +25461,16 @@ version: 0.18-0
                 data: json!({ "objects": ["person"] }),
                 has_been_reviewed: false,
             })
+            .unwrap();
+        for ts in [5_000_000u64, 5_014_000, 5_020_500, 5_031_000, 5_040_000] {
+            state
+                .preview_frames
+                .write_frame("front_door", ts, b"\xff\xd8jpeg")
+                .unwrap();
+        }
+        state
+            .preview_frames
+            .write_frame("other_cam", 5_015_000, b"jpeg")
             .unwrap();
         let resp_frames = app
             .clone()
@@ -25730,23 +25495,50 @@ version: 0.18-0
         assert_eq!(
             urls,
             vec![
-                "/api/review/rev_frames/frames/0.jpg",
-                "/api/review/rev_frames/frames/1.jpg",
-                "/api/review/rev_frames/frames/2.jpg",
+                "/api/review/rev_frames/frames/5014000.jpg",
+                "/api/review/rev_frames/frames/5020500.jpg",
+                "/api/review/rev_frames/frames/5031000.jpg",
             ]
         );
-        // A frame outside every recording is a 404 without spawning ffmpeg.
-        let resp_gap = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/review/rev_frames/frames/6.jpg")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp_gap.status(), StatusCode::NOT_FOUND);
+        for (frame_uri, expected) in [
+            ("/api/review/rev_frames/frames/5020500.jpg", StatusCode::OK),
+            // Exists on disk but outside the review window, or on another camera.
+            (
+                "/api/review/rev_frames/frames/5040000.jpg",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/review/rev_frames/frames/5015000.jpg",
+                StatusCode::NOT_FOUND,
+            ),
+            // Inside the window but never captured.
+            (
+                "/api/review/rev_frames/frames/5016000.jpg",
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(frame_uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), expected, "unexpected status on {frame_uri}");
+            if expected == StatusCode::OK {
+                assert_eq!(
+                    r.headers()
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok()),
+                    Some("image/jpeg")
+                );
+                let body = to_bytes(r.into_body(), 1024).await.unwrap();
+                assert_eq!(&body[..], b"\xff\xd8jpeg");
+            }
+        }
 
         let resp_webrtc = app
             .clone()
