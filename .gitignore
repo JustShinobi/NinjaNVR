@@ -24,6 +24,8 @@ CLAUDE.md
 .kimi-code/
 .specify/
 .playwright-mcp/
+.rust-review/
+.rust-review-results/
 local/
 .local/
 /temp/
