@@ -32,7 +32,7 @@ jobs:
     if: >-
       !startsWith(github.event.head_commit.message, 'chore(release):') &&
       (github.event_name == 'push' || inputs.publish_tag == '')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
@@ -61,7 +61,7 @@ jobs:
         needs.cut-release.outputs.release_created == 'true' ||
         (github.event_name == 'workflow_dispatch' && inputs.publish_tag != '')
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     outputs:
       image_tag: ${{ steps.resolve.outputs.tag }}
@@ -235,7 +235,7 @@ jobs:
     name: Promote Release Tag to GitOps
     needs: [publish-ghcr]
     if: always() && needs.publish-ghcr.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     env:
       GITOPS_TOKEN: ${{ secrets.PLATFORM_GITOPS_TOKEN }}
