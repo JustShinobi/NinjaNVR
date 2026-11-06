@@ -511,7 +511,11 @@ impl MqttConfig {
     pub fn should_use_tls(&self) -> bool {
         match self.tls_enabled {
             Some(v) => v,
-            None => self.port == 8883 || self.tls_ca_certs.is_some(),
+            None => {
+                self.port == 8883
+                    || self.tls_ca_certs.is_some()
+                    || (self.tls_client_cert.is_some() && self.tls_client_key.is_some())
+            }
         }
     }
 }
@@ -2906,13 +2910,7 @@ impl NinjaConfig {
     /// `cameras.*.onvif.host`, `cameras.*.webui_url`, `go2rtc.streams`, `genai.base_url`,
     /// `peers.*.url`, `auth.oidc.issuer_url`, and `auth.proxy.logout_url`.
     pub fn collect_original_urls(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for cam in self.cameras.values() {
-            collect_camera_urls(cam, &mut out);
-        }
-        for val in self.go2rtc.streams.values() {
-            collect_urls_from_json_val(val, &mut out);
-        }
+        let mut out = self.collect_camera_and_stream_urls();
         if let Some(ref u) = self.genai.base_url
             && u.contains("://")
         {
@@ -2932,25 +2930,35 @@ impl NinjaConfig {
         out
     }
 
+    fn collect_camera_and_stream_urls(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for cam in self.cameras.values() {
+            collect_camera_urls(cam, &mut out);
+        }
+        for val in self.go2rtc.streams.values() {
+            collect_urls_from_json_val(val, &mut out);
+        }
+        out
+    }
+
     /// Restores scrubbed URLs (`*:*@`, `*@`, `=***`) and masked secret fields (`***`, `*`) in `self`
     /// from a previously loaded `NinjaConfig` and refreshes `self.raw_yaml` when any secret is restored.
     pub fn restore_scrubbed_from_previous(&mut self, prev: &NinjaConfig) {
-        let originals = prev.collect_original_urls();
+        let stream_and_cam_originals = prev.collect_camera_and_stream_urls();
         let mut restored_any = false;
 
         for (cam_name, cam) in &mut self.cameras {
-            let mut cam_originals = Vec::new();
+            let mut own_originals = Vec::new();
             if let Some(prev_cam) = prev.cameras.get(cam_name) {
-                collect_camera_urls(prev_cam, &mut cam_originals);
-            }
-            for u in &originals {
-                if !cam_originals.contains(u) {
-                    cam_originals.push(u.clone());
-                }
+                collect_camera_urls(prev_cam, &mut own_originals);
             }
             for inp in &mut cam.ffmpeg.inputs {
                 if is_url_scrubbed(&inp.path) {
-                    let restored = restore_scrubbed_url(&inp.path, &cam_originals);
+                    let restored = restore_scrubbed_url_with_fallback(
+                        &inp.path,
+                        &own_originals,
+                        &stream_and_cam_originals,
+                    );
                     if restored != inp.path {
                         inp.path = restored;
                         restored_any = true;
@@ -2960,7 +2968,11 @@ impl NinjaConfig {
             if let Some(ref h) = cam.onvif.host
                 && is_url_scrubbed(h)
             {
-                let restored = restore_scrubbed_url(h, &cam_originals);
+                let restored = restore_scrubbed_url_with_fallback(
+                    h,
+                    &own_originals,
+                    &stream_and_cam_originals,
+                );
                 if &restored != h {
                     cam.onvif.host = Some(restored);
                     restored_any = true;
@@ -2969,7 +2981,11 @@ impl NinjaConfig {
             if let Some(ref u) = cam.webui_url
                 && is_url_scrubbed(u)
             {
-                let restored = restore_scrubbed_url(u, &cam_originals);
+                let restored = restore_scrubbed_url_with_fallback(
+                    u,
+                    &own_originals,
+                    &stream_and_cam_originals,
+                );
                 if &restored != u {
                     cam.webui_url = Some(restored);
                     restored_any = true;
@@ -2990,8 +3006,12 @@ impl NinjaConfig {
         }
 
         for (stream_key, v) in &mut self.go2rtc.streams {
-            let stream_originals = build_stream_originals(prev, stream_key, &originals);
-            let next_v = restore_scrubbed_json(v, &stream_originals);
+            let own_stream_originals = build_own_stream_originals(prev, stream_key);
+            let next_v = restore_scrubbed_json_with_fallback(
+                v,
+                &own_stream_originals,
+                &stream_and_cam_originals,
+            );
             if next_v != *v {
                 *v = next_v;
                 restored_any = true;
@@ -3007,11 +3027,6 @@ impl NinjaConfig {
             {
                 genai_originals.push(prev_u.clone());
             }
-            for orig in &originals {
-                if !genai_originals.contains(orig) {
-                    genai_originals.push(orig.clone());
-                }
-            }
             let restored = restore_scrubbed_url(u, &genai_originals);
             if &restored != u {
                 self.genai.base_url = Some(restored);
@@ -3019,20 +3034,25 @@ impl NinjaConfig {
             }
         }
 
+        let all_peer_originals: Vec<String> = prev
+            .peers
+            .values()
+            .filter(|p| p.url.contains("://"))
+            .map(|p| p.url.clone())
+            .collect();
         for (peer_name, peer) in &mut self.peers {
             if is_url_scrubbed(&peer.url) {
-                let mut peer_originals = Vec::new();
+                let mut own_peer_originals = Vec::new();
                 if let Some(prev_peer) = prev.peers.get(peer_name)
                     && prev_peer.url.contains("://")
                 {
-                    peer_originals.push(prev_peer.url.clone());
+                    own_peer_originals.push(prev_peer.url.clone());
                 }
-                for u in &originals {
-                    if !peer_originals.contains(u) {
-                        peer_originals.push(u.clone());
-                    }
-                }
-                let restored = restore_scrubbed_url(&peer.url, &peer_originals);
+                let restored = restore_scrubbed_url_with_fallback(
+                    &peer.url,
+                    &own_peer_originals,
+                    &all_peer_originals,
+                );
                 if restored != peer.url {
                     peer.url = restored;
                     restored_any = true;
@@ -3041,7 +3061,12 @@ impl NinjaConfig {
         }
 
         if is_url_scrubbed(&self.auth.oidc.issuer_url) {
-            let restored = restore_scrubbed_url(&self.auth.oidc.issuer_url, &originals);
+            let oidc_originals = if prev.auth.oidc.issuer_url.contains("://") {
+                vec![prev.auth.oidc.issuer_url.clone()]
+            } else {
+                Vec::new()
+            };
+            let restored = restore_scrubbed_url(&self.auth.oidc.issuer_url, &oidc_originals);
             if restored != self.auth.oidc.issuer_url {
                 self.auth.oidc.issuer_url = restored;
                 restored_any = true;
@@ -3049,7 +3074,12 @@ impl NinjaConfig {
         }
 
         if is_url_scrubbed(&self.auth.proxy.logout_url) {
-            let restored = restore_scrubbed_url(&self.auth.proxy.logout_url, &originals);
+            let proxy_originals = if prev.auth.proxy.logout_url.contains("://") {
+                vec![prev.auth.proxy.logout_url.clone()]
+            } else {
+                Vec::new()
+            };
+            let restored = restore_scrubbed_url(&self.auth.proxy.logout_url, &proxy_originals);
             if restored != self.auth.proxy.logout_url {
                 self.auth.proxy.logout_url = restored;
                 restored_any = true;
@@ -3094,7 +3124,17 @@ impl NinjaConfig {
         let Some(obj) = patch.as_object() else {
             anyhow::bail!("structured config payload must be a JSON object");
         };
-        let originals = self.collect_original_urls();
+        let stream_and_cam_originals = self.collect_camera_and_stream_urls();
+        let prev_oidc_originals = if self.auth.oidc.issuer_url.contains("://") {
+            vec![self.auth.oidc.issuer_url.clone()]
+        } else {
+            Vec::new()
+        };
+        let prev_proxy_originals = if self.auth.proxy.logout_url.contains("://") {
+            vec![self.auth.proxy.logout_url.clone()]
+        } else {
+            Vec::new()
+        };
         let prev_global_model = self.model.clone();
 
         if let Some(mqtt_val) = obj.get("mqtt") {
@@ -3134,11 +3174,11 @@ impl NinjaConfig {
                 serde_json::from_value(merged_auth).context("invalid auth config")?;
             if is_url_scrubbed(&next_auth.oidc.issuer_url) {
                 next_auth.oidc.issuer_url =
-                    restore_scrubbed_url(&next_auth.oidc.issuer_url, &originals);
+                    restore_scrubbed_url(&next_auth.oidc.issuer_url, &prev_oidc_originals);
             }
             if is_url_scrubbed(&next_auth.proxy.logout_url) {
                 next_auth.proxy.logout_url =
-                    restore_scrubbed_url(&next_auth.proxy.logout_url, &originals);
+                    restore_scrubbed_url(&next_auth.proxy.logout_url, &prev_proxy_originals);
             }
             self.auth = next_auth;
         }
@@ -3147,7 +3187,8 @@ impl NinjaConfig {
             let mut next_oidc: OidcAuthConfig =
                 serde_json::from_value(merged_oidc).context("invalid oidc config")?;
             if is_url_scrubbed(&next_oidc.issuer_url) {
-                next_oidc.issuer_url = restore_scrubbed_url(&next_oidc.issuer_url, &originals);
+                next_oidc.issuer_url =
+                    restore_scrubbed_url(&next_oidc.issuer_url, &prev_oidc_originals);
             }
             self.auth.oidc = next_oidc;
         }
@@ -3158,7 +3199,8 @@ impl NinjaConfig {
             let mut next_proxy: ProxyAuthConfig =
                 serde_json::from_value(merged_proxy).context("invalid proxy config")?;
             if is_url_scrubbed(&next_proxy.logout_url) {
-                next_proxy.logout_url = restore_scrubbed_url(&next_proxy.logout_url, &originals);
+                next_proxy.logout_url =
+                    restore_scrubbed_url(&next_proxy.logout_url, &prev_proxy_originals);
             }
             self.auth.proxy = next_proxy;
         }
@@ -3247,11 +3289,6 @@ impl NinjaConfig {
                 {
                     genai_originals.push(prev_u.clone());
                 }
-                for orig in &originals {
-                    if !genai_originals.contains(orig) {
-                        genai_originals.push(orig.clone());
-                    }
-                }
                 next_genai.base_url = Some(restore_scrubbed_url(u, &genai_originals));
             }
             self.genai = next_genai;
@@ -3320,20 +3357,25 @@ impl NinjaConfig {
         if let Some(peers_val) = obj.get("peers") {
             let mut next_peers: BTreeMap<String, PeerNodeConfig> =
                 serde_json::from_value(peers_val.clone()).context("invalid peers config")?;
+            let all_peer_originals: Vec<String> = self
+                .peers
+                .values()
+                .filter(|p| p.url.contains("://"))
+                .map(|p| p.url.clone())
+                .collect();
             for (peer_name, peer) in &mut next_peers {
                 if is_url_scrubbed(&peer.url) {
-                    let mut peer_originals = Vec::new();
+                    let mut own_peer_originals = Vec::new();
                     if let Some(prev_peer) = self.peers.get(peer_name)
                         && prev_peer.url.contains("://")
                     {
-                        peer_originals.push(prev_peer.url.clone());
+                        own_peer_originals.push(prev_peer.url.clone());
                     }
-                    for u in &originals {
-                        if !peer_originals.contains(u) {
-                            peer_originals.push(u.clone());
-                        }
-                    }
-                    peer.url = restore_scrubbed_url(&peer.url, &peer_originals);
+                    peer.url = restore_scrubbed_url_with_fallback(
+                        &peer.url,
+                        &own_peer_originals,
+                        &all_peer_originals,
+                    );
                 }
             }
             self.peers = next_peers;
@@ -3367,8 +3409,12 @@ impl NinjaConfig {
                         serde_json::from_value(gv.clone())
                             .context("invalid go2rtc.streams config")?;
                     for (stream_key, stream_val) in &mut next_streams {
-                        let stream_originals = build_stream_originals(self, stream_key, &originals);
-                        *stream_val = restore_scrubbed_json(stream_val, &stream_originals);
+                        let own_stream_originals = build_own_stream_originals(self, stream_key);
+                        *stream_val = restore_scrubbed_json_with_fallback(
+                            stream_val,
+                            &own_stream_originals,
+                            &stream_and_cam_originals,
+                        );
                     }
                     validate_go2rtc_streams_map(&next_streams)?;
                     self.go2rtc.streams = next_streams;
@@ -3391,14 +3437,9 @@ impl NinjaConfig {
             };
             let mut next_cams: BTreeMap<String, CameraConfig> = BTreeMap::new();
             for (cam_name, cam_patch_val) in cams_map {
-                let mut cam_originals = Vec::new();
+                let mut own_cam_originals = Vec::new();
                 if let Some(prev_cam) = self.cameras.get(cam_name) {
-                    collect_camera_urls(prev_cam, &mut cam_originals);
-                }
-                for u in &originals {
-                    if !cam_originals.contains(u) {
-                        cam_originals.push(u.clone());
-                    }
+                    collect_camera_urls(prev_cam, &mut own_cam_originals);
                 }
                 let merged_cam_val = if let Some(prev_cam) = self.cameras.get(cam_name) {
                     merge_section_json(
@@ -3423,18 +3464,30 @@ impl NinjaConfig {
 
                 for inp in &mut cam.ffmpeg.inputs {
                     if is_url_scrubbed(&inp.path) {
-                        inp.path = restore_scrubbed_url(&inp.path, &cam_originals);
+                        inp.path = restore_scrubbed_url_with_fallback(
+                            &inp.path,
+                            &own_cam_originals,
+                            &stream_and_cam_originals,
+                        );
                     }
                 }
                 if let Some(ref h) = cam.onvif.host
                     && is_url_scrubbed(h)
                 {
-                    cam.onvif.host = Some(restore_scrubbed_url(h, &cam_originals));
+                    cam.onvif.host = Some(restore_scrubbed_url_with_fallback(
+                        h,
+                        &own_cam_originals,
+                        &stream_and_cam_originals,
+                    ));
                 }
                 if let Some(ref u) = cam.webui_url
                     && is_url_scrubbed(u)
                 {
-                    cam.webui_url = Some(restore_scrubbed_url(u, &cam_originals));
+                    cam.webui_url = Some(restore_scrubbed_url_with_fallback(
+                        u,
+                        &own_cam_originals,
+                        &stream_and_cam_originals,
+                    ));
                 }
 
                 let prev_cam_opt = self.cameras.get(cam_name);
@@ -3592,11 +3645,7 @@ fn collect_urls_from_json_val(v: &Value, out: &mut Vec<String>) {
     }
 }
 
-fn build_stream_originals(
-    prev: &NinjaConfig,
-    stream_key: &str,
-    global_originals: &[String],
-) -> Vec<String> {
+fn build_own_stream_originals(prev: &NinjaConfig, stream_key: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(prev_val) = prev.go2rtc.streams.get(stream_key) {
         collect_urls_from_json_val(prev_val, &mut out);
@@ -3605,12 +3654,52 @@ fn build_stream_originals(
     if let Some(prev_cam) = prev.cameras.get(base_cam) {
         collect_camera_urls(prev_cam, &mut out);
     }
-    for u in global_originals {
-        if !out.contains(u) {
-            out.push(u.clone());
-        }
-    }
     out
+}
+
+fn restore_scrubbed_url_with_fallback(
+    input: &str,
+    own_originals: &[String],
+    fallback_originals: &[String],
+) -> String {
+    if !is_url_scrubbed(input) {
+        return input.to_string();
+    }
+    let primary = restore_scrubbed_url(input, own_originals);
+    if !is_url_scrubbed(&primary) {
+        return primary;
+    }
+    restore_scrubbed_url(&primary, fallback_originals)
+}
+
+fn restore_scrubbed_json_with_fallback(
+    val: &Value,
+    own_originals: &[String],
+    fallback_originals: &[String],
+) -> Value {
+    match val {
+        Value::String(s) => Value::String(restore_scrubbed_url_with_fallback(
+            s,
+            own_originals,
+            fallback_originals,
+        )),
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|v| restore_scrubbed_json_with_fallback(v, own_originals, fallback_originals))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(
+                    k.clone(),
+                    restore_scrubbed_json_with_fallback(v, own_originals, fallback_originals),
+                );
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
 }
 
 fn collect_camera_urls(cam: &CameraConfig, out: &mut Vec<String>) {
@@ -3796,14 +3885,22 @@ fn validate_go2rtc_extra_map(extra: &BTreeMap<String, Value>) -> Result<()> {
                     let arg_lc = arg_str.to_ascii_lowercase();
                     if arg_str.chars().any(|c| c.is_control())
                         || arg_lc.contains("..")
+                        || arg_lc.contains("://")
                         || arg_lc.contains("exec:")
                         || arg_lc.contains("file:")
+                        || arg_lc.contains("pipe:")
+                        || arg_lc.contains("fd:")
+                        || arg_lc.contains("unix:")
                         || arg_lc.contains("subfile")
                         || arg_lc.contains("concat")
                         || arg_lc.contains("protocol_whitelist")
                         || arg_lc.contains("filter_complex")
+                        || arg_lc.contains("-filter")
                         || arg_lc.contains("lavfi")
                         || arg_lc.contains("movie=")
+                        || arg_lc.contains("amovie=")
+                        || arg_lc.contains("textfile=")
+                        || (arg_lc.contains("-i ") && !arg_lc.contains("-i {input}"))
                         || arg_lc.contains("/etc")
                         || arg_lc.contains("/proc")
                         || arg_lc.contains("/sys")
@@ -3812,6 +3909,7 @@ fn validate_go2rtc_extra_map(extra: &BTreeMap<String, Value>) -> Result<()> {
                         || arg_lc.contains("/config")
                         || arg_lc.contains("/run")
                         || arg_lc.contains("/var")
+                        || arg_lc.contains("/tmp")
                     {
                         anyhow::bail!("disallowed go2rtc.ffmpeg.{fk} arguments");
                     }
@@ -3929,12 +4027,35 @@ pub fn is_disallowed_go2rtc_producer(raw: &str) -> bool {
         {
             return true;
         }
-        let lc_after = after_scheme.to_ascii_lowercase();
-        if lc_after.starts_with("169.254.169.254")
-            || lc_after.starts_with("100.100.100.200")
-            || lc_after.starts_with("[fd00:ec2:")
-            || lc_after.starts_with("metadata.google.internal")
-        {
+        let authority = after_scheme
+            .split(['/', '?', '#', '\\'])
+            .next()
+            .unwrap_or(after_scheme);
+        let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+        if host_port.is_empty() || host_port.contains('%') {
+            return true;
+        }
+        let host_only = extract_authority_host(host_port);
+        let port_part = &host_port[host_only.len()..];
+        let valid_port = if port_part.is_empty() {
+            true
+        } else if let Some(p_str) = port_part.strip_prefix(':') {
+            !p_str.is_empty()
+                && p_str.chars().all(|c| c.is_ascii_digit())
+                && p_str.parse::<u16>().is_ok_and(|p| p > 0)
+        } else {
+            false
+        };
+        if !valid_port {
+            return true;
+        }
+        let scheme_lc = scheme.trim().to_ascii_lowercase();
+        let is_rtsp_loopback = matches!(scheme_lc.as_str(), "rtsp" | "rtsps" | "rtspx")
+            && matches!(
+                host_only.to_ascii_lowercase().as_str(),
+                "127.0.0.1" | "localhost" | "[::1]"
+            );
+        if !is_rtsp_loopback && extract_non_loopback_host(current).is_none() {
             return true;
         }
     } else if !wrapped_in_ffmpeg || !is_valid_go2rtc_stream_ref(current) {
@@ -3953,6 +4074,7 @@ pub fn is_disallowed_go2rtc_producer(raw: &str) -> bool {
         if matches!(lhs, "input" | "params" | "raw" | "backchannel")
             || has_disallowed_scheme(frag_lc.as_str())
             || has_disallowed_scheme(rhs)
+            || frag_lc.chars().any(char::is_whitespace)
             || frag_lc.contains(" -")
             || frag_lc.contains('\t')
             || frag_lc.contains('/')
@@ -4030,12 +4152,20 @@ fn has_forbidden_path_components_or_prefix(path: &Path) -> bool {
         return true;
     };
     let trimmed = raw_str.trim();
-    if trimmed.is_empty() || trimmed.contains('\\') || trimmed.chars().any(|c| c.is_control()) {
+    if trimmed.is_empty()
+        || trimmed.contains('\\')
+        || trimmed.contains("/./")
+        || trimmed.ends_with("/.")
+        || trimmed.starts_with("./")
+        || trimmed == "."
+        || trimmed.chars().any(|c| c.is_control())
+    {
         return true;
     }
+    let mut normal_segments: Vec<String> = Vec::new();
     for comp in path.components() {
         match comp {
-            std::path::Component::ParentDir => return true,
+            std::path::Component::ParentDir | std::path::Component::CurDir => return true,
             std::path::Component::Normal(part) => {
                 let Some(s) = part.to_str() else {
                     return true;
@@ -4043,8 +4173,22 @@ fn has_forbidden_path_components_or_prefix(path: &Path) -> bool {
                 if s.starts_with('.') {
                     return true;
                 }
+                normal_segments.push(s.to_ascii_lowercase());
             }
             _ => {}
+        }
+    }
+    if path.is_absolute()
+        && let Some(first) = normal_segments.first().map(String::as_str)
+    {
+        if matches!(first, "proc" | "sys" | "dev" | "etc" | "root") {
+            return true;
+        }
+        let second = normal_segments.get(1).map(String::as_str);
+        if (first == "var" && matches!(second, Some("run" | "secrets")))
+            || (first == "run" && second == Some("secrets"))
+        {
+            return true;
         }
     }
     let lc = trimmed.to_ascii_lowercase();
@@ -4061,12 +4205,20 @@ fn has_forbidden_tls_path_components_or_prefix(path: &Path) -> bool {
         return true;
     };
     let trimmed = raw_str.trim();
-    if trimmed.is_empty() || trimmed.contains('\\') || trimmed.chars().any(|c| c.is_control()) {
+    if trimmed.is_empty()
+        || trimmed.contains('\\')
+        || trimmed.contains("/./")
+        || trimmed.ends_with("/.")
+        || trimmed.starts_with("./")
+        || trimmed == "."
+        || trimmed.chars().any(|c| c.is_control())
+    {
         return true;
     }
+    let mut normal_segments: Vec<String> = Vec::new();
     for comp in path.components() {
         match comp {
-            std::path::Component::ParentDir => return true,
+            std::path::Component::ParentDir | std::path::Component::CurDir => return true,
             std::path::Component::Normal(part) => {
                 let Some(s) = part.to_str() else {
                     return true;
@@ -4074,8 +4226,25 @@ fn has_forbidden_tls_path_components_or_prefix(path: &Path) -> bool {
                 if s.starts_with('.') {
                     return true;
                 }
+                normal_segments.push(s.to_ascii_lowercase());
             }
             _ => {}
+        }
+    }
+    if path.is_absolute()
+        && let Some(first) = normal_segments.first().map(String::as_str)
+    {
+        if matches!(first, "proc" | "sys" | "dev" | "root") {
+            return true;
+        }
+        let second = normal_segments.get(1).map(String::as_str);
+        if (first == "var" && matches!(second, Some("run" | "secrets")))
+            || (first == "run" && second == Some("secrets"))
+        {
+            return true;
+        }
+        if first == "etc" && !matches!(second, Some("ssl" | "pki" | "ca-certificates")) {
+            return true;
         }
     }
     let lc = trimmed.to_ascii_lowercase();
@@ -4162,6 +4331,9 @@ pub fn is_safe_labelmap_path(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
     {
+        return false;
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return false;
     }
     validate_existing_or_ancestor_canonical_path(path, &["txt"], Some(256 * 1024))
@@ -4342,7 +4514,7 @@ fn extract_non_loopback_host(url: &str) -> Option<String> {
     if authority.is_empty()
         || authority
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '%')
+            .any(|c| c.is_whitespace() || c.is_control())
     {
         return None;
     }
@@ -4351,7 +4523,7 @@ fn extract_non_loopback_host(url: &str) -> Option<String> {
     } else {
         authority
     };
-    if host_port.is_empty() {
+    if host_port.is_empty() || host_port.contains('%') {
         return None;
     }
 
@@ -4360,6 +4532,9 @@ fn extract_non_loopback_host(url: &str) -> Option<String> {
         let rest_port = &host_port[end + 1..];
         if !rest_port.is_empty() {
             let port_str = rest_port.strip_prefix(':')?;
+            if port_str.is_empty() || !port_str.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
             let port = port_str.parse::<u16>().ok()?;
             if port == 0 {
                 return None;
@@ -4382,7 +4557,7 @@ fn extract_non_loopback_host(url: &str) -> Option<String> {
         None => (host_port, None),
     };
     if let Some(p) = port_opt {
-        if p.contains(':') {
+        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
         let port = p.parse::<u16>().ok()?;
@@ -4507,7 +4682,7 @@ fn extract_authority_host_port(host_port_and_more: &str) -> &str {
 }
 
 fn find_userinfo_at_index(after_scheme: &str) -> Option<usize> {
-    let slash_end = after_scheme.find(['/', '\\']).unwrap_or(after_scheme.len());
+    let slash_end = after_scheme.find('/').unwrap_or(after_scheme.len());
     let pre_slash = &after_scheme[..slash_end];
     if let Some(q_or_h) = pre_slash.find(['?', '#']) {
         let before_qh = &pre_slash[..q_or_h];
@@ -4527,7 +4702,7 @@ fn find_userinfo_at_index(after_scheme: &str) -> Option<usize> {
     let at_idx = pre_slash.rfind('@')?;
     let after_at = &pre_slash[at_idx + 1..];
     let host_end = after_at
-        .find(['?', '#', ' ', '\t', ')', ']', ',', '"', '\''])
+        .find(['\\', '?', '#', ' ', '\t', ')', ']', ',', '"', '\''])
         .unwrap_or(after_at.len());
     let host_port_candidate = &after_at[..host_end];
     if host_port_candidate.is_empty() || host_port_candidate.contains('=') {
@@ -4591,22 +4766,25 @@ fn scrub_url_query_params(url_after_authority: &str) -> String {
     format!("{prefix}{}{frag_part}", scrubbed_pairs.join("&"))
 }
 
-fn restore_url_query_params(scrubbed_rest: &str, orig_after_scheme: &str) -> String {
-    if !scrubbed_rest.contains("=***") {
+fn restore_url_query_params(
+    scrubbed_rest: &str,
+    orig_after_scheme: &str,
+    originals: &[String],
+) -> String {
+    if !is_url_scrubbed(scrubbed_rest) {
         return scrubbed_rest.to_string();
     }
     let Some(q_idx) = scrubbed_rest.find('?') else {
         return scrubbed_rest.to_string();
     };
-    let Some(orig_q_idx) = orig_after_scheme.find('?') else {
-        return scrubbed_rest.to_string();
-    };
-    let orig_after_q = &orig_after_scheme[orig_q_idx + 1..];
-    let orig_query = orig_after_q.split('#').next().unwrap_or(orig_after_q);
     let mut orig_params = BTreeMap::new();
-    for pair in orig_query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            orig_params.insert(k.to_ascii_lowercase(), v);
+    if let Some(orig_q_idx) = orig_after_scheme.find('?') {
+        let orig_after_q = &orig_after_scheme[orig_q_idx + 1..];
+        let orig_query = orig_after_q.split('#').next().unwrap_or(orig_after_q);
+        for pair in orig_query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                orig_params.insert(k.to_ascii_lowercase(), v);
+            }
         }
     }
 
@@ -4618,11 +4796,30 @@ fn restore_url_query_params(scrubbed_rest: &str, orig_after_scheme: &str) -> Str
     };
     let mut restored_pairs = Vec::new();
     for pair in query_part.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && v == "***"
-            && let Some(orig_v) = orig_params.get(&k.to_ascii_lowercase())
-        {
-            restored_pairs.push(format!("{k}={orig_v}"));
+        if let Some((k, v)) = pair.split_once('=') {
+            if v == "***" {
+                if let Some(orig_v) = orig_params.get(&k.to_ascii_lowercase())
+                    && *orig_v != "***"
+                {
+                    restored_pairs.push(format!("{k}={orig_v}"));
+                } else {
+                    restored_pairs.push(pair.to_string());
+                }
+            } else if is_url_scrubbed(v) {
+                let mut nested_candidates = Vec::new();
+                if let Some(orig_v) = orig_params.get(&k.to_ascii_lowercase()) {
+                    nested_candidates.push((*orig_v).to_string());
+                }
+                for u in originals {
+                    if !nested_candidates.contains(u) {
+                        nested_candidates.push(u.clone());
+                    }
+                }
+                let restored_v = restore_scrubbed_url(v, &nested_candidates);
+                restored_pairs.push(format!("{k}={restored_v}"));
+            } else {
+                restored_pairs.push(pair.to_string());
+            }
         } else {
             restored_pairs.push(pair.to_string());
         }
@@ -4651,6 +4848,7 @@ pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
             let rest = &after_scheme[at_idx + 1..];
             let target_host_port = extract_authority_host_port(rest);
             let target_host = extract_authority_host(rest);
+            let mut partial_match: Option<String> = None;
             for tier in 0..4 {
                 for orig in originals {
                     let Some(orig_scheme_idx) = orig.find("://") else {
@@ -4678,17 +4876,28 @@ pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
                         } else {
                             input_userinfo
                         };
-                        let restored_rest = restore_url_query_params(rest, orig_after);
-                        return format!(
+                        let restored_rest = restore_url_query_params(rest, orig_after, originals);
+                        let candidate = format!(
                             "{}{}@{}",
                             &input[..scheme_idx + 3],
                             effective_creds,
                             restored_rest
                         );
+                        if candidate != input {
+                            if !is_url_scrubbed(&candidate) {
+                                return candidate;
+                            }
+                            if partial_match.is_none() {
+                                partial_match = Some(candidate);
+                            }
+                        }
                     }
                 }
             }
-        } else if input.contains("=***") {
+            if let Some(partial) = partial_match {
+                return partial;
+            }
+        } else if is_url_scrubbed(after_scheme) {
             let target_host_port = extract_authority_host_port(after_scheme);
             let target_host = extract_authority_host(after_scheme);
             for tier in 0..4 {
@@ -4712,8 +4921,11 @@ pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
                         _ => orig_host == target_host,
                     };
                     if matched {
-                        let restored_after = restore_url_query_params(after_scheme, orig_after);
-                        return format!("{}{}", &input[..scheme_idx + 3], restored_after);
+                        let restored_after =
+                            restore_url_query_params(after_scheme, orig_after, originals);
+                        if restored_after != after_scheme {
+                            return format!("{}{}", &input[..scheme_idx + 3], restored_after);
+                        }
                     }
                 }
             }
@@ -4812,12 +5024,28 @@ fn scrub_all_urls_in_text(raw: &str) -> String {
             .unwrap_or(usize::MAX);
         let mut in_ipv6_brackets = false;
         let mut prev_was_ws = false;
+        let mut skip_next_quote = false;
         for (offset, ch) in raw[after_sep..].char_indices() {
             let abs_pos = after_sep + offset;
             if ch == '\r' || ch == '\n' {
                 break;
             }
             if let Some(q) = quote_char {
+                if skip_next_quote {
+                    skip_next_quote = false;
+                    url_end = abs_pos + ch.len_utf8();
+                    continue;
+                }
+                if q == '"' && ch == '\\' {
+                    skip_next_quote = true;
+                    url_end = abs_pos + ch.len_utf8();
+                    continue;
+                }
+                if q == '\'' && ch == '\'' && raw[abs_pos + 1..].starts_with('\'') {
+                    skip_next_quote = true;
+                    url_end = abs_pos + ch.len_utf8();
+                    continue;
+                }
                 if ch == q {
                     break;
                 }
@@ -4863,6 +5091,9 @@ fn scrub_all_urls_in_text(raw: &str) -> String {
 /// Scrubs `user:password@` and sensitive query parameter credentials from RTSP/HTTP URLs before returning them in API responses.
 pub fn scrub_rtsp_credentials(input: &str) -> String {
     if !input.contains("://") {
+        if input.contains('=') {
+            return scrub_inline_key_equals_secrets(input);
+        }
         return input.to_string();
     }
     if !input.chars().any(char::is_whitespace) && input.matches("://").count() == 1 {
@@ -4897,18 +5128,136 @@ fn is_sensitive_yaml_key_name(key: &str) -> bool {
     )
 }
 
+fn strip_yaml_inline_comment(val: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut prev_ws = true;
+    for (idx, ch) in val.char_indices() {
+        if escaped {
+            escaped = false;
+            prev_ws = false;
+            continue;
+        }
+        if in_double && ch == '\\' {
+            escaped = true;
+            prev_ws = false;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            prev_ws = false;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            prev_ws = false;
+            continue;
+        }
+        if !in_single && !in_double && ch == '#' && prev_ws {
+            return val[..idx].trim_end();
+        }
+        prev_ws = ch.is_whitespace();
+    }
+    val.trim()
+}
+
+fn has_unclosed_yaml_quote(val_no_comment: &str) -> Option<char> {
+    let first = val_no_comment.chars().next()?;
+    if first != '"' && first != '\'' {
+        return None;
+    }
+    let mut escaped = false;
+    let mut skip_single = false;
+    let mut closed = false;
+    let rest = &val_no_comment[first.len_utf8()..];
+    for (idx, ch) in rest.char_indices() {
+        if closed {
+            break;
+        }
+        if first == '"' {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                closed = true;
+            }
+        } else {
+            if skip_single {
+                skip_single = false;
+                continue;
+            }
+            if ch == '\'' {
+                if rest[idx + 1..].starts_with('\'') {
+                    skip_single = true;
+                } else {
+                    closed = true;
+                }
+            }
+        }
+    }
+    if closed { None } else { Some(first) }
+}
+
+fn closes_yaml_quote(line_body: &str, quote: char) -> bool {
+    let mut escaped = false;
+    let mut skip_single = false;
+    for (idx, ch) in line_body.char_indices() {
+        if quote == '"' {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                return true;
+            }
+        } else {
+            if skip_single {
+                skip_single = false;
+                continue;
+            }
+            if ch == '\'' {
+                if line_body[idx + 1..].starts_with('\'') {
+                    skip_single = true;
+                } else {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn is_yaml_block_scalar_header(val_part: &str) -> bool {
-    let without_comment = match val_part.find('#') {
-        Some(idx) => val_part[..idx].trim(),
-        None => val_part.trim(),
-    };
-    let Some(first) = without_comment.chars().next() else {
+    let mut rest = strip_yaml_inline_comment(val_part);
+    loop {
+        let trimmed = rest.trim_start();
+        if let Some(after_tag_or_anchor) = trimmed.strip_prefix(['!', '&']) {
+            let token_end = after_tag_or_anchor
+                .find(char::is_whitespace)
+                .unwrap_or(after_tag_or_anchor.len());
+            rest = &after_tag_or_anchor[token_end..];
+        } else {
+            rest = trimmed;
+            break;
+        }
+    }
+    let Some(first) = rest.chars().next() else {
         return false;
     };
     if first != '|' && first != '>' {
         return false;
     }
-    without_comment[1..]
+    rest[1..]
         .chars()
         .all(|c| c == '-' || c == '+' || c.is_ascii_digit())
 }
@@ -4918,7 +5267,8 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
     let out = scrub_all_urls_in_text(raw_yaml);
 
     let mut scrubbed_lines = String::with_capacity(out.len());
-    let mut in_multiline_secret_indent: Option<usize> = None;
+    let mut in_multiline_secret_indent: Option<(usize, bool)> = None;
+    let mut in_unclosed_secret_quote: Option<char> = None;
     for chunk in out.split_inclusive('\n') {
         let (line_body, newline) = if let Some(stripped) = chunk.strip_suffix("\r\n") {
             (stripped, "\r\n")
@@ -4930,20 +5280,35 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
         let trimmed_start = line_body.trim_start();
         let indent = line_body.len() - trimmed_start.len();
 
-        if let Some(base_indent) = in_multiline_secret_indent {
-            if trimmed_start.is_empty() || trimmed_start.starts_with('#') {
-                scrubbed_lines.push_str(chunk);
+        if let Some(q) = in_unclosed_secret_quote {
+            if closes_yaml_quote(line_body, q) {
+                in_unclosed_secret_quote = None;
+            }
+            continue;
+        }
+
+        if let Some((base_indent, ref mut mask_emitted)) = in_multiline_secret_indent {
+            if trimmed_start.is_empty() {
+                if !*mask_emitted {
+                    scrubbed_lines.push_str(chunk);
+                }
                 continue;
             }
             if indent > base_indent {
-                let leading_ws = &line_body[..indent];
-                scrubbed_lines.push_str(leading_ws);
-                scrubbed_lines.push_str("***");
-                scrubbed_lines.push_str(newline);
+                if !*mask_emitted {
+                    let leading_ws = &line_body[..indent];
+                    scrubbed_lines.push_str(leading_ws);
+                    scrubbed_lines.push_str("\"***\"");
+                    scrubbed_lines.push_str(newline);
+                    *mask_emitted = true;
+                }
                 continue;
-            } else {
-                in_multiline_secret_indent = None;
             }
+            if trimmed_start.starts_with('#') {
+                scrubbed_lines.push_str(chunk);
+                continue;
+            }
+            in_multiline_secret_indent = None;
         }
 
         if trimmed_start.is_empty() || trimmed_start.starts_with('#') {
@@ -4968,26 +5333,29 @@ pub fn scrub_yaml_credentials(raw_yaml: &str) -> String {
         {
             let canonical_key = format!("{}:", raw_k.trim_end());
             let val_part = after_colon.trim();
+            let val_no_comment = strip_yaml_inline_comment(val_part);
             if is_yaml_block_scalar_header(val_part) {
-                in_multiline_secret_indent = Some(indent);
+                in_multiline_secret_indent = Some((indent, true));
                 scrubbed_lines.push_str(leading_prefix);
                 scrubbed_lines.push_str(&canonical_key);
                 scrubbed_lines.push_str(" \"***\"");
                 scrubbed_lines.push_str(newline);
                 replaced = true;
-            } else if val_part.is_empty() || val_part.starts_with('#') {
+            } else if val_no_comment.is_empty() {
                 // Value may be on the next indented line as a multiline plain scalar
-                in_multiline_secret_indent = Some(indent);
+                in_multiline_secret_indent = Some((indent, false));
                 scrubbed_lines.push_str(line_body);
                 scrubbed_lines.push_str(newline);
                 replaced = true;
             } else {
-                let unquoted = val_part.trim_matches('"').trim_matches('\'').trim();
+                in_unclosed_secret_quote = has_unclosed_yaml_quote(val_no_comment);
+                let unquoted = val_no_comment.trim_matches('"').trim_matches('\'').trim();
                 if !unquoted.is_empty()
                     && !unquoted.eq_ignore_ascii_case("null")
                     && unquoted != "~"
                     && !unquoted.starts_with('#')
                 {
+                    in_multiline_secret_indent = Some((indent, true));
                     scrubbed_lines.push_str(leading_prefix);
                     scrubbed_lines.push_str(&canonical_key);
                     scrubbed_lines.push_str(" \"***\"");
@@ -5034,8 +5402,63 @@ fn find_flow_value_end(val_trimmed: &str) -> usize {
     val_trimmed.len()
 }
 
+fn scrub_inline_key_equals_secrets(line: &str) -> String {
+    if !line.contains('=') {
+        return line.to_string();
+    }
+    let mut current = line.to_string();
+    let mut search_from = 0usize;
+    while search_from < current.len() {
+        let Some(rel_eq) = current[search_from..].find('=') else {
+            break;
+        };
+        let eq_pos = search_from + rel_eq;
+        let bytes = current.as_bytes();
+        let mut k_start = eq_pos;
+        while k_start > search_from
+            && (bytes[k_start - 1].is_ascii_alphanumeric()
+                || bytes[k_start - 1] == b'_'
+                || bytes[k_start - 1] == b'-')
+        {
+            k_start -= 1;
+        }
+        if k_start == eq_pos {
+            search_from = eq_pos + 1;
+            continue;
+        }
+        if k_start > 0 {
+            let prev = bytes[k_start - 1];
+            if !matches!(
+                prev,
+                b'?' | b'&' | b';' | b' ' | b'\t' | b'"' | b'\'' | b',' | b'{' | b'[' | b'('
+            ) {
+                search_from = eq_pos + 1;
+                continue;
+            }
+        }
+        let key_name = &current[k_start..eq_pos];
+        if !is_sensitive_query_param_key(key_name) {
+            search_from = eq_pos + 1;
+            continue;
+        }
+        let val_start = eq_pos + 1;
+        let rest = &current[val_start..];
+        let val_end_rel = rest
+            .find(['&', ';', ' ', '\t', '"', '\'', '#', ',', '}', ']', ')'])
+            .unwrap_or(rest.len());
+        let val_slice = &rest[..val_end_rel];
+        if !val_slice.is_empty() && val_slice != "***" && val_slice != "*" {
+            current.replace_range(val_start..val_start + val_end_rel, "***");
+            search_from = val_start + 3;
+        } else {
+            search_from = val_start + val_end_rel;
+        }
+    }
+    current
+}
+
 fn scrub_inline_yaml_secret_keys(line: &str) -> String {
-    if !line.contains(':') {
+    if !line.contains(':') && !line.contains('=') {
         return line.to_string();
     }
     let mut current = line.to_string();
@@ -5087,7 +5510,7 @@ fn scrub_inline_yaml_secret_keys(line: &str) -> String {
         let ws_len = rest.len() - rest.trim_start().len();
         let val_trimmed = &rest[ws_len..];
         let val_end_rel = find_flow_value_end(val_trimmed);
-        let raw_val = val_trimmed[..val_end_rel].trim();
+        let raw_val = strip_yaml_inline_comment(&val_trimmed[..val_end_rel]);
         let unquoted = raw_val.trim_matches('"').trim_matches('\'').trim();
         if !unquoted.is_empty()
             && !unquoted.eq_ignore_ascii_case("null")
@@ -5101,6 +5524,9 @@ fn scrub_inline_yaml_secret_keys(line: &str) -> String {
         } else {
             search_from = val_start + ws_len + val_end_rel;
         }
+    }
+    if current.contains('=') {
+        current = scrub_inline_key_equals_secrets(&current);
     }
     current
 }
@@ -5143,6 +5569,56 @@ pub fn scrub_json_value(val: &Value) -> Value {
         }
         other => other.clone(),
     }
+}
+
+/// Validates that a `go2rtc` overlay YAML file (such as `go2rtc_homekit.yml`) is a regular,
+/// non-symlink file containing only safe streams and extra keys before passing `-config=` to `go2rtc`.
+pub fn is_safe_go2rtc_overlay_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 256 * 1024 {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Ok(doc) = serde_yaml::from_str::<Value>(trimmed) else {
+        return false;
+    };
+    if doc.is_null() {
+        return true;
+    }
+    let Ok(overlay) = serde_json::from_value::<Go2RtcConfig>(doc) else {
+        return false;
+    };
+    if validate_go2rtc_streams_map(&overlay.streams).is_err()
+        || validate_go2rtc_extra_map(&overlay.extra).is_err()
+    {
+        return false;
+    }
+    for k in overlay.extra.keys() {
+        let k_norm = k.trim().to_ascii_lowercase();
+        if matches!(
+            k_norm.as_str(),
+            "exec"
+                | "expr"
+                | "echo"
+                | "hass"
+                | "ngrok"
+                | "publish"
+                | "webtorrent"
+                | "roborock"
+                | "dvrip"
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Supervises the go2rtc child process, ensuring `/dev/shm/go2rtc.yaml` is written
@@ -5223,9 +5699,7 @@ impl Go2RtcSupervisor {
                 }
 
                 let mut cmd = Command::new(&self.go2rtc_bin);
-                if std::fs::symlink_metadata(&self.homekit_config_path)
-                    .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
-                {
+                if is_safe_go2rtc_overlay_file(&self.homekit_config_path) {
                     cmd.arg(format!("-config={}", self.homekit_config_path.display()));
                 }
                 cmd.arg(format!("-config={}", self.shm_config_path.display()));
@@ -8231,5 +8705,277 @@ flow_test: { "password": "part_a,part_b}", 'token': 'flow_tok_secret' }
         unsafe {
             std::env::remove_var(&brace_env);
         }
+    }
+
+    #[test]
+    fn c3_phase1a_yaml_multiline_hash_tagged_block_escaped_quotes_and_cross_section_isolation() {
+        // 1. Block scalar with '#' prefixed secret lines, tagged/anchored block scalars (!!str |, &pw |),
+        // multiline quoted/plain scalars, and null/empty with trailing comments must scrub cleanly AND remain valid YAML.
+        let tricky_multiline_yaml = r#"
+mqtt:
+  enabled: true
+  password: |
+    block_secret_1
+    #hash_prefixed_block_secret_2
+  port: 1883
+genai:
+  enabled: true
+  api_key: !!str |
+    tagged_block_api_key_secret
+cameras:
+  cam_quoted:
+    enabled: true
+    onvif:
+      host: 192.0.2.50
+      password: "multiline_double_q_1
+        multiline_double_q_2"
+    ffmpeg:
+      inputs:
+        - path: "rtsp://admin:es\"caped_pw@192.0.2.50:554/main"
+          roles: [record]
+        - path: 'rtsp://admin:es''caped_sq@192.0.2.50:554/sub'
+          roles: [detect]
+  cam_null:
+    enabled: true
+    onvif:
+      host: 192.0.2.51
+      password: null # optional comment must not turn null into "***"
+"#;
+        let scrubbed = scrub_yaml_credentials(tricky_multiline_yaml);
+        for secret in [
+            "block_secret_1",
+            "#hash_prefixed_block_secret_2",
+            "tagged_block_api_key_secret",
+            "multiline_double_q_1",
+            "multiline_double_q_2",
+            "caped_pw",
+            "caped_sq",
+        ] {
+            assert!(
+                !scrubbed.contains(secret),
+                "scrub_yaml_credentials leaked '{secret}' in:\n{scrubbed}"
+            );
+        }
+        // Scrubbed YAML must remain syntactically valid YAML and parse into NinjaConfig
+        let mut parsed_scrubbed =
+            NinjaConfig::from_yaml_str(&scrubbed, PathBuf::from("/tmp/c3_scrubbed.yml"))
+                .expect("scrubbed YAML with block scalars must remain valid parseable YAML");
+        assert_eq!(parsed_scrubbed.mqtt.password.as_deref(), Some("***"));
+        assert_eq!(parsed_scrubbed.genai.api_key.as_deref(), Some("***"));
+        assert_eq!(
+            parsed_scrubbed.cameras["cam_quoted"]
+                .onvif
+                .password
+                .as_deref(),
+            Some("***")
+        );
+        assert!(
+            parsed_scrubbed.cameras["cam_null"].onvif.password.is_none(),
+            "password: null # comment must remain None after scrubbing"
+        );
+
+        let orig_cfg =
+            NinjaConfig::from_yaml_str(tricky_multiline_yaml, PathBuf::from("/tmp/c3_orig.yml"))
+                .unwrap();
+        parsed_scrubbed.restore_scrubbed_from_previous(&orig_cfg);
+        assert_eq!(
+            parsed_scrubbed.mqtt.password.as_deref(),
+            Some("block_secret_1\n#hash_prefixed_block_secret_2\n")
+        );
+        assert_eq!(
+            parsed_scrubbed.genai.api_key.as_deref(),
+            Some("tagged_block_api_key_secret\n")
+        );
+
+        // 2. Cross-section credential isolation: auth.proxy.logout_url, auth.oidc.issuer_url,
+        // genai.base_url, and peers.*.url must NEVER steal RTSP credentials from cameras on the same host
+        let mut isolated_cfg = orig_cfg.clone();
+        isolated_cfg
+            .apply_structured_json(&json!({
+                "auth": {
+                    "oidc": {
+                        "issuer_url": "https://*:*@192.0.2.50:8443/oidc"
+                    },
+                    "proxy": {
+                        "logout_url": "https://*:*@192.0.2.50:8443/logout"
+                    }
+                },
+                "genai": {
+                    "enabled": true,
+                    "base_url": "http://*:*@192.0.2.50:11434"
+                },
+                "peers": {
+                    "edge_node": {
+                        "enabled": true,
+                        "url": "https://*:*@192.0.2.50:8971"
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            isolated_cfg.auth.oidc.issuer_url,
+            "https://*:*@192.0.2.50:8443/oidc"
+        );
+        assert_eq!(
+            isolated_cfg.auth.proxy.logout_url,
+            "https://*:*@192.0.2.50:8443/logout"
+        );
+        assert_eq!(
+            isolated_cfg.genai.base_url.as_deref(),
+            Some("http://*:*@192.0.2.50:11434")
+        );
+        assert_eq!(
+            isolated_cfg.peers["edge_node"].url,
+            "https://*:*@192.0.2.50:8971"
+        );
+
+        // 3. Same-host multi-camera path edit: cam_b editing its path to match cam_a's path
+        // must keep cam_b's own credentials rather than stealing cam_a's credentials via exact match
+        let multi_cam_yaml = r#"
+cameras:
+  cam_a:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://user_a:secret_a@192.0.2.50:554/ch1
+          roles: [record]
+  cam_b:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://user_b:secret_b@192.0.2.50:554/ch2
+          roles: [record]
+"#;
+        let mut multi_cfg =
+            NinjaConfig::from_yaml_str(multi_cam_yaml, PathBuf::from("/tmp/multi.yml")).unwrap();
+        multi_cfg
+            .apply_structured_json(&json!({
+                "cameras": {
+                    "cam_a": {
+                        "enabled": true,
+                        "ffmpeg": {
+                            "inputs": [{ "path": "rtsp://*:*@192.0.2.50:554/ch1", "roles": ["record"] }]
+                        }
+                    },
+                    "cam_b": {
+                        "enabled": true,
+                        "ffmpeg": {
+                            "inputs": [{ "path": "rtsp://*:*@192.0.2.50:554/ch1", "roles": ["record"] }]
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            multi_cfg.cameras["cam_b"].ffmpeg.inputs[0].path,
+            "rtsp://user_b:secret_b@192.0.2.50:554/ch1"
+        );
+
+        // 4. Query-param restoration when first same-host original has no query params, plus nested query URLs
+        let mixed_originals = vec![
+            "rtsp://192.0.2.50:554/main".to_string(),
+            "rtsp://192.0.2.50:554/sub?token=real_query_secret".to_string(),
+            "http://192.0.2.60/proxy?url=rtsp://u_nest:p_nest@192.0.2.61:554/live".to_string(),
+        ];
+        assert_eq!(
+            restore_scrubbed_url(
+                "rtsp://192.0.2.50:554/edited_sub?token=***",
+                &mixed_originals
+            ),
+            "rtsp://192.0.2.50:554/edited_sub?token=real_query_secret"
+        );
+        assert_eq!(
+            restore_scrubbed_url(
+                "http://192.0.2.60/proxy_v2?url=rtsp://*:*@192.0.2.61:554/live",
+                &mixed_originals
+            ),
+            "http://192.0.2.60/proxy_v2?url=rtsp://u_nest:p_nest@192.0.2.61:554/live"
+        );
+    }
+
+    #[test]
+    fn c3_phase1a_go2rtc_ssrf_userinfo_overlay_validation_and_case_insensitive_path_traversal() {
+        // 1. go2rtc producer SSRF with userinfo@, IPv6-mapped IMDS, non-RTSP loopback, and fragment whitespace
+        for bad_producer in [
+            "rtsp://admin:pass@169.254.169.254:554/live",
+            "http://user:pass@169.254.169.254/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://169.254.169.254.nip.io/latest/meta-data/",
+            "http://127.0.0.1:5000/api/config",
+            "http://localhost:1984/api/streams",
+            "rtsp://127.0.0.1:0/live",
+            "ffmpeg:rtsp://192.0.2.10:554/main#video=h264 config.yml",
+        ] {
+            assert!(
+                is_disallowed_go2rtc_producer(bad_producer),
+                "go2rtc SSRF/injection producer '{bad_producer}' must be disallowed"
+            );
+        }
+        // Local RTSP loopback relay and percent-encoded RTSP password on LAN camera remain allowed
+        assert!(!is_disallowed_go2rtc_producer(
+            "rtsp://127.0.0.1:8554/front_door"
+        ));
+        assert!(!is_disallowed_go2rtc_producer(
+            "ffmpeg:rtsp://127.0.0.1:8554/front_door#audio=aac"
+        ));
+        assert!(!is_disallowed_go2rtc_producer(
+            "rtsps://oper:p%40ss@192.0.2.11:322/live/main"
+        ));
+
+        // 2. extract_non_loopback_host rejects ':+80' port syntax while allowing '%40' in userinfo
+        assert!(extract_non_loopback_host("http://192.0.2.10:+8080/").is_none());
+        assert!(extract_non_loopback_host("http://[2001:db8::1]:+8080/").is_none());
+        assert_eq!(
+            extract_non_loopback_host("rtsp://admin:p%40ss@192.0.2.81:554/main").as_deref(),
+            Some("192.0.2.81")
+        );
+
+        // 3. Redundant slashes + uppercase system directories (//ETC, /./ETC, /var//RUN) blocked across path validators
+        for unsafe_p in [
+            Path::new("//ETC/shadow.txt"),
+            Path::new("/./ETC/passwd.txt"),
+            Path::new("/var//RUN/secrets.txt"),
+            Path::new("./labels.txt"),
+        ] {
+            assert!(
+                !is_safe_labelmap_path(unsafe_p),
+                "unsafe labelmap path '{}' must be rejected",
+                unsafe_p.display()
+            );
+        }
+        for unsafe_tls in [
+            Path::new("//ETC/shadow.pem"),
+            Path::new("/./etc/shadow.key"),
+            Path::new("/var//RUN/secret.crt"),
+            Path::new("./ca.pem"),
+        ] {
+            assert!(
+                !is_safe_tls_path(unsafe_tls),
+                "unsafe TLS path '{}' must be rejected",
+                unsafe_tls.display()
+            );
+        }
+
+        // 4. is_safe_go2rtc_overlay_file validates go2rtc_homekit.yml before supervisor uses it
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_hk_overlay_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let safe_hk = tmp_dir.join("safe_hk.yml");
+        std::fs::write(
+            &safe_hk,
+            "streams:\n  front_door:\n    - rtsp://192.0.2.10:554/main\n",
+        )
+        .unwrap();
+        assert!(is_safe_go2rtc_overlay_file(&safe_hk));
+
+        let evil_hk = tmp_dir.join("evil_hk.yml");
+        std::fs::write(&evil_hk, "streams:\n  pwn:\n    - exec:id\n").unwrap();
+        assert!(!is_safe_go2rtc_overlay_file(&evil_hk));
+
+        let evil_extra_hk = tmp_dir.join("evil_extra_hk.yml");
+        std::fs::write(&evil_extra_hk, "exec:\n  allow: true\n").unwrap();
+        assert!(!is_safe_go2rtc_overlay_file(&evil_extra_hk));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

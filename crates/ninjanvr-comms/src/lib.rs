@@ -143,6 +143,7 @@ fn sanitize_mqtt_client_id(raw: &str) -> String {
         .trim()
         .chars()
         .filter(|c| !c.is_control() && !c.is_whitespace())
+        .take(128)
         .collect();
     if cleaned.is_empty() {
         "ninjanvr".to_string()
@@ -194,8 +195,9 @@ impl CommsHub {
         if !is_valid_mqtt_publish_topic(topic) {
             return;
         }
+        let clean_topic = topic.trim_matches('/');
         let msg = json!({
-            "topic": topic,
+            "topic": clean_topic,
             "payload": payload.into(),
         });
         if let Ok(serialized) = serde_json::to_string(&msg) {
@@ -207,11 +209,12 @@ impl CommsHub {
         if !is_valid_mqtt_publish_topic(topic) {
             return;
         }
+        let clean_topic = topic.trim_matches('/');
         let payload_str = payload.into();
-        self.publish_ws_only(topic, payload_str.clone());
+        self.publish_ws_only(clean_topic, payload_str.clone());
         let _ = self
             .mqtt_tx
-            .try_send((topic.to_string(), payload_str.into_bytes(), false));
+            .try_send((clean_topic.to_string(), payload_str.into_bytes(), false));
     }
 
     pub fn publish_json(&self, topic: &str, value: &Value) {
@@ -224,7 +227,10 @@ impl CommsHub {
         if !is_valid_mqtt_publish_topic(topic) {
             return;
         }
-        let _ = self.mqtt_tx.try_send((topic.to_string(), bytes, retain));
+        let clean_topic = topic.trim_matches('/');
+        let _ = self
+            .mqtt_tx
+            .try_send((clean_topic.to_string(), bytes, retain));
     }
 
     /// Updates per-camera online/offline connectivity state and publishes `<camera>/available`
@@ -418,27 +424,31 @@ impl CommsHub {
                 .or_insert_with(default_camera_activity_entry);
             if let Some(obj) = entry.as_object_mut() {
                 obj.insert("enabled".to_string(), json!(cam_cfg.enabled));
-                if !cam_cfg.state_rois.is_empty() {
-                    let states_entry = obj.entry("states".to_string()).or_insert_with(|| json!({}));
-                    if let Some(states_obj) = states_entry.as_object_mut() {
-                        for (roi_name, roi_cfg) in &cam_cfg.state_rois {
-                            if !is_valid_topic_segment(roi_name) {
-                                continue;
-                            }
-                            if !states_obj.contains_key(roi_name)
-                                && states_obj.len() >= MAX_ROI_STATES_PER_CAMERA
-                            {
-                                break;
-                            }
-                            let initial_state = roi_cfg
-                                .classes
-                                .first()
-                                .cloned()
-                                .unwrap_or_else(|| "closed".to_string());
-                            states_obj
-                                .entry(roi_name.clone())
-                                .or_insert_with(|| json!(initial_state));
+                let states_entry = obj.entry("states".to_string()).or_insert_with(|| json!({}));
+                if !states_entry.is_object() {
+                    *states_entry = json!({});
+                }
+                if let Some(states_obj) = states_entry.as_object_mut() {
+                    states_obj.retain(|k, _| {
+                        cam_cfg.state_rois.contains_key(k) && is_valid_topic_segment(k)
+                    });
+                    for (roi_name, roi_cfg) in &cam_cfg.state_rois {
+                        if !is_valid_topic_segment(roi_name) {
+                            continue;
                         }
+                        if !states_obj.contains_key(roi_name)
+                            && states_obj.len() >= MAX_ROI_STATES_PER_CAMERA
+                        {
+                            break;
+                        }
+                        let initial_state = roi_cfg
+                            .classes
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "closed".to_string());
+                        states_obj
+                            .entry(roi_name.clone())
+                            .or_insert_with(|| json!(initial_state));
                     }
                 }
             }
@@ -564,11 +574,12 @@ impl CommsHub {
                 .unwrap_or_else(|e| e.into_inner());
             *g = norm.clone();
         }
-        let guard = self
+        let persist_path = self
             .profile_persist_path
             .read()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(ref p) = *guard {
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(ref p) = persist_path {
             let is_symlink = std::fs::symlink_metadata(p)
                 .map(|m| m.file_type().is_symlink())
                 .unwrap_or(false);
@@ -597,7 +608,6 @@ impl CommsHub {
                 }
             }
         }
-        drop(guard);
         self.publish_topic("profile/state", norm.clone());
         norm
     }
@@ -803,14 +813,26 @@ impl CommsHub {
 }
 
 fn read_bounded_tls_file(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::io::Read;
     if !is_safe_tls_path(path) {
         return None;
     }
-    let meta = std::fs::metadata(path).ok()?;
+    let canon = std::fs::canonicalize(path).ok()?;
+    if !is_safe_tls_path(&canon) {
+        return None;
+    }
+    let file = std::fs::File::open(&canon).ok()?;
+    let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > MAX_TLS_FILE_BYTES {
         return None;
     }
-    std::fs::read(path).ok()
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    let mut reader = file.take(MAX_TLS_FILE_BYTES + 1);
+    reader.read_to_end(&mut buf).ok()?;
+    if (buf.len() as u64) > MAX_TLS_FILE_BYTES {
+        return None;
+    }
+    Some(buf)
 }
 
 /// Builds `MqttOptions` from `MqttConfig`, automatically configuring MQTTS (`Transport::Tls`)
@@ -832,8 +854,10 @@ pub fn build_mqtt_options(cfg: &MqttConfig) -> MqttOptions {
         QoS::AtMostOnce,
         true,
     ));
-    if let (Some(u), Some(p)) = (&cfg.user, &cfg.password) {
-        mqtt_opts.set_credentials(u, p);
+    if let (Some(u), Some(p)) = (&cfg.user, &cfg.password)
+        && !u.trim().is_empty()
+    {
+        mqtt_opts.set_credentials(u.trim(), p);
     }
     if cfg.should_use_tls() {
         let ca = cfg
@@ -1001,7 +1025,7 @@ impl ActivityLedger {
         regions: u32,
         dbfs: i64,
     ) {
-        if !timestamp.is_finite() || !is_valid_topic_segment(camera) {
+        if !timestamp.is_finite() || timestamp < 0.0 || !is_valid_topic_segment(camera) {
             return;
         }
         let mut guard = self.rings.write().unwrap_or_else(|e| e.into_inner());
@@ -1016,16 +1040,15 @@ impl ActivityLedger {
             regions,
             dbfs,
         });
-        let cutoff = timestamp - ACTIVITY_LEDGER_WINDOW_SECS;
-        while let Some(front) = q.front() {
-            if !front.timestamp.is_finite()
-                || front.timestamp < cutoff
-                || q.len() > self.max_samples
-            {
-                q.pop_front();
-            } else {
-                break;
-            }
+        let max_ts = q
+            .iter()
+            .filter(|s| s.timestamp.is_finite())
+            .map(|s| s.timestamp)
+            .fold(timestamp, f64::max);
+        let cutoff = max_ts - ACTIVITY_LEDGER_WINDOW_SECS;
+        q.retain(|s| s.timestamp.is_finite() && s.timestamp >= cutoff);
+        while q.len() > self.max_samples {
+            q.pop_front();
         }
     }
 
@@ -1152,8 +1175,9 @@ impl LogBufferHub {
 
     pub fn push_nginx(&self, method: &str, path: &str, status: u16) {
         let (outer_ts, inner_ts, _) = format_utc_timestamps();
+        let safe_path = redact_share_path(path);
         let line = format!(
-            "{outer_ts}  127.0.0.1 - - [{inner_ts} +0000] \"{method} {path} HTTP/1.1\" {status} 0 \"-\" \"NinjaNVR\""
+            "{outer_ts}  127.0.0.1 - - [{inner_ts} +0000] \"{method} {safe_path} HTTP/1.1\" {status} 0 \"-\" \"NinjaNVR\""
         );
         self.push_raw("nginx", line);
     }
@@ -1165,9 +1189,9 @@ impl LogBufferHub {
         let raw_line: String = line
             .into()
             .chars()
-            .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+            .map(|c| if c.is_control() { ' ' } else { c })
             .collect();
-        let scrubbed_line = if raw_line.contains(':') {
+        let scrubbed_line = if raw_line.contains(':') || raw_line.contains('=') {
             ninjanvr_config::scrub_yaml_credentials(&raw_line)
         } else {
             raw_line
@@ -1210,8 +1234,9 @@ impl LogBufferHub {
             None => 0,
         };
         let end_idx = match end {
-            Some(e) if e >= 0 => (e as usize).min(total),
-            _ => total,
+            Some(e) if e < 0 => total.saturating_sub(e.unsigned_abs() as usize),
+            Some(e) => (e as usize).min(total),
+            None => total,
         };
         if start_idx >= end_idx {
             return (total, Vec::new());
@@ -1228,6 +1253,27 @@ impl LogBufferHub {
     pub fn subscribe(&self) -> broadcast::Receiver<(String, String)> {
         self.stream_tx.subscribe()
     }
+}
+
+fn redact_share_path(path: &str) -> String {
+    let clean: String = path
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = clean.trim_start_matches('/');
+    if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("share/") {
+        let rest = &trimmed[6..];
+        let (token_and_path, query_suffix) = match rest.find('?') {
+            Some(q) => (&rest[..q], &rest[q..]),
+            None => (rest, ""),
+        };
+        if let Some((_, suffix)) = token_and_path.split_once('/') {
+            return format!("/share/<redacted>/{suffix}{query_suffix}");
+        } else if !token_and_path.is_empty() {
+            return format!("/share/<redacted>{query_suffix}");
+        }
+    }
+    clean
 }
 
 #[cfg(test)]
@@ -1906,5 +1952,86 @@ cameras:
         assert!(!lines[0].contains('\r'));
         assert!(!lines[0].contains('\n'));
         assert!(!lines[0].contains("secret_upper_pw"));
+    }
+
+    #[tokio::test]
+    async fn c3_phase1a_comms_roi_prune_nginx_log_scrubbing_negative_end_slice_and_out_of_order_ledger()
+     {
+        // 1. init_from_config prunes removed state_rois on config reload
+        let yaml_v1 = r#"
+cameras:
+  driveway:
+    enabled: true
+    state_rois:
+      gate:
+        crop: [0.1, 0.2, 0.5, 0.8]
+        classes: [closed, open]
+      spot:
+        crop: [0.5, 0.4, 0.9, 0.9]
+        classes: [empty, occupied]
+"#;
+        let cfg_v1 = NinjaConfig::from_yaml_str(yaml_v1, PathBuf::from("/tmp/v1.yml")).unwrap();
+        let hub = CommsHub::new();
+        hub.init_from_config(&cfg_v1);
+        assert_eq!(hub.get_camera_roi_states("driveway").len(), 2);
+
+        let yaml_v2 = r#"
+cameras:
+  driveway:
+    enabled: true
+    state_rois:
+      gate:
+        crop: [0.1, 0.2, 0.5, 0.8]
+        classes: [closed, open]
+"#;
+        let cfg_v2 = NinjaConfig::from_yaml_str(yaml_v2, PathBuf::from("/tmp/v2.yml")).unwrap();
+        hub.init_from_config(&cfg_v2);
+        let states_v2 = hub.get_camera_roi_states("driveway");
+        assert_eq!(states_v2.len(), 1);
+        assert!(states_v2.contains_key("gate"));
+        assert!(!states_v2.contains_key("spot"));
+
+        // 2. publish_topic / publish_ws_only normalizes leading/trailing slashes on topics
+        let mut rx = hub.subscribe_ws();
+        hub.publish_topic("/driveway/motion/", "ON");
+        let ws_msg: WsMessage = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(ws_msg.topic, "driveway/motion");
+
+        // 3. LogBufferHub::push_nginx redacts /share/<token> paths and scrubs ?token=... query secrets,
+        // push_raw scrubs key=value without colons and strips ANSI control chars, and query_lines handles negative end
+        let log_hub = LogBufferHub::with_capacity(10);
+        log_hub.push_nginx(
+            "GET",
+            "/share/secret_share_tok_999/clip.mp4?token=jwt_query_secret_123",
+            200,
+        );
+        log_hub.push_raw("ninjanvr", "auth_check password=bare_eq_secret\x1b[31m_red");
+        let nginx_logs = log_hub.get_logs("nginx");
+        assert_eq!(nginx_logs.len(), 1);
+        assert!(!nginx_logs[0].contains("secret_share_tok_999"));
+        assert!(!nginx_logs[0].contains("jwt_query_secret_123"));
+        assert!(nginx_logs[0].contains("/share/<redacted>/clip.mp4?token=***"));
+
+        let nvr_logs = log_hub.get_logs("ninjanvr");
+        assert_eq!(nvr_logs.len(), 1);
+        assert!(!nvr_logs[0].contains("bare_eq_secret"));
+        assert!(!nvr_logs[0].contains('\x1b'));
+        assert!(nvr_logs[0].contains("password=***"));
+
+        for i in 0..4 {
+            log_hub.push_raw("go2rtc", format!("g-{i}"));
+        }
+        let (tot, mid) = log_hub.query_lines("go2rtc", Some(-3), Some(-1));
+        assert_eq!(tot, 4);
+        assert_eq!(mid, vec!["g-1".to_string(), "g-2".to_string()]);
+
+        // 4. ActivityLedger rejects negative timestamps and evicts out-of-order stale samples
+        let ledger = ActivityLedger::with_capacity(10);
+        ledger.record_sample("cam1", -50.0, 100, 1, 1);
+        assert_eq!(ledger.sample_count("cam1"), 0);
+        ledger.record_sample("cam1", 1500.0, 10, 1, 1);
+        ledger.record_sample("cam1", 1000.0, 99, 9, 9); // stale out-of-order sample (< 1500 - 300)
+        assert_eq!(ledger.sample_count("cam1"), 1);
+        assert_eq!(ledger.samples("cam1")[0].timestamp, 1500.0);
     }
 }
