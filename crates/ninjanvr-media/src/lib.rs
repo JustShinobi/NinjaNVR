@@ -632,14 +632,11 @@ pub fn mp4_file_has_audio_track(path: &Path) -> bool {
         let Some(next_pos) = pos.checked_add(box_size) else {
             return true;
         };
-        if box_size < hdr_len {
-            if &btype == b"moov" {
-                return true;
-            }
-            break;
+        if box_size < hdr_len || next_pos > file_len || &btype == b"moof" {
+            return true;
         }
         if &btype == b"moov" {
-            if box_size - hdr_len > 16 * 1024 * 1024 || next_pos > file_len {
+            if box_size - hdr_len > 16 * 1024 * 1024 {
                 return true;
             }
             let mut moov = vec![0u8; (box_size - hdr_len) as usize];
@@ -650,12 +647,9 @@ pub fn mp4_file_has_audio_track(path: &Path) -> bool {
                 return true;
             }
         }
-        if next_pos > file_len {
-            break;
-        }
         pos = next_pos;
     }
-    false
+    file_len > 0 && pos != file_len
 }
 
 fn moov_has_soun_trak(moov: &[u8]) -> bool {
@@ -676,6 +670,7 @@ fn moov_has_soun_trak(moov: &[u8]) -> bool {
                     if malformed_mdia {
                         return true;
                     }
+                    let mut saw_hdlr = false;
                     let mut is_soun = false;
                     let mut minf_payloads: Vec<&[u8]> = Vec::new();
                     for db in mdia_boxes {
@@ -683,12 +678,16 @@ fn moov_has_soun_trak(moov: &[u8]) -> bool {
                             if db.payload.len() < 12 {
                                 return true;
                             }
+                            saw_hdlr = true;
                             if &db.payload[8..12] == b"soun" {
                                 is_soun = true;
                             }
                         } else if &db.box_type == b"minf" {
                             minf_payloads.push(db.payload);
                         }
+                    }
+                    if !saw_hdlr {
+                        return true;
                     }
                     if !is_soun {
                         continue;
@@ -5110,6 +5109,29 @@ cameras:
             repaired_rows[0].dbfs, 0,
             "traversal path outside media_dir must be reset to 0 without probing outside file"
         );
+
+        // 3. Top-level box corruption before moov, fragmented moof, trailing truncated bytes, and missing hdlr fail closed
+        let mut bad_free_before_moov = vec![0, 0, 0, 4, b'f', b'r', b'e', b'e'];
+        bad_free_before_moov.extend_from_slice(&large_moov);
+        let bad_free_path = root.join("bad_free_before_moov.mp4");
+        std::fs::write(&bad_free_path, &bad_free_before_moov).unwrap();
+        assert!(mp4_file_has_audio_track(&bad_free_path));
+
+        let moof_only = make_box(b"moof", &[0u8; 16]);
+        let moof_path = root.join("moof_fragment.mp4");
+        std::fs::write(&moof_path, &moof_only).unwrap();
+        assert!(mp4_file_has_audio_track(&moof_path));
+
+        let mut trailing_garbage = ftyp.clone();
+        trailing_garbage.extend_from_slice(b"moov");
+        let trailing_path = root.join("trailing_4bytes.mp4");
+        std::fs::write(&trailing_path, &trailing_garbage).unwrap();
+        assert!(mp4_file_has_audio_track(&trailing_path));
+
+        let no_hdlr_mdia = make_box(b"moov", &make_box(b"trak", &make_box(b"mdia", &minf)));
+        let no_hdlr_path = root.join("no_hdlr_mdia.mp4");
+        std::fs::write(&no_hdlr_path, &no_hdlr_mdia).unwrap();
+        assert!(mp4_file_has_audio_track(&no_hdlr_path));
 
         let _ = std::fs::remove_dir_all(&root);
     }

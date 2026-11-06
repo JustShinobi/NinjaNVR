@@ -380,7 +380,6 @@ fn parse_tracks_from_moov(
 
     let mut tracks = Vec::new();
     let mut trak_boxes_seen = 0usize;
-    let mut cumulative_sample_bytes = 0usize;
     for b in &moov_boxes {
         if &b.box_type != b"trak" {
             continue;
@@ -409,15 +408,9 @@ fn parse_tracks_from_moov(
                 let Some(soun_total) = soun_bytes else {
                     continue;
                 };
-                if t.samples.is_empty()
-                    || soun_total > file_len
-                    || cumulative_sample_bytes
-                        .checked_add(soun_total)
-                        .is_none_or(|tot| tot > file_len)
-                {
+                if t.samples.is_empty() || soun_total > file_len {
                     continue;
                 }
-                cumulative_sample_bytes += soun_total;
             } else {
                 t.samples.retain(|s| {
                     s.size > 0
@@ -429,18 +422,20 @@ fn parse_tracks_from_moov(
                 if t.samples.is_empty() {
                     continue;
                 }
-                if let Some(track_total) = t
-                    .samples
-                    .iter()
-                    .try_fold(0usize, |acc, s| acc.checked_add(s.size as usize))
-                {
-                    cumulative_sample_bytes = cumulative_sample_bytes.saturating_add(track_total);
-                }
             }
             tracks.push(t);
             if tracks.len() >= MAX_TRACKS {
                 break;
             }
+        }
+    }
+    if tracks.iter().any(|t| &t.handler_type != b"soun") {
+        let total_all: Option<usize> = tracks
+            .iter()
+            .flat_map(|t| t.samples.iter())
+            .try_fold(0usize, |acc, s| acc.checked_add(s.size as usize));
+        if total_all.is_none_or(|tot| tot > file_len) {
+            tracks.retain(|t| &t.handler_type != b"soun");
         }
     }
     if tracks.is_empty() {
@@ -2177,5 +2172,24 @@ mod tests {
             .expect("corrupted soun track with chunk aliasing should be stripped so vide succeeds");
         assert!(m4s.ends_with(&video_sample));
         let _ = std::fs::remove_file(&tmp_soun_alias);
+
+        // 5. soun track appearing BEFORE vide in moov where soun_total <= file_len individually,
+        //    but soun_total + vide_total > file_len, must also strip soun so vide remuxing succeeds
+        let soun_first_trak = build_trak_n(2, b"soun", mdat_offset, 64, 12);
+        let vide_second_trak = build_trak_n(1, b"vide", mdat_offset, 64, 5);
+        let mut moov_soun_first = Vec::new();
+        moov_soun_first.extend_from_slice(&mvhd);
+        moov_soun_first.extend_from_slice(&soun_first_trak);
+        moov_soun_first.extend_from_slice(&vide_second_trak);
+        let mut mp4_soun_first = Vec::new();
+        mp4_soun_first.extend_from_slice(&ftyp);
+        mp4_soun_first.extend_from_slice(&make_box(b"mdat", &vec![0x65u8; 320]));
+        mp4_soun_first.extend_from_slice(&make_box(b"moov", &moov_soun_first));
+        let tmp_soun_first = std::env::temp_dir().join("ninjanvr-vod-soun-first-alias.mp4");
+        std::fs::write(&tmp_soun_first, &mp4_soun_first).unwrap();
+        let m4s_sf = build_media_segment_m4s(&tmp_soun_first, 1, 0.0)
+            .expect("soun-first track pushing total payload over file_len must be stripped");
+        assert!(m4s_sf.ends_with(&vec![0x65u8; 320]));
+        let _ = std::fs::remove_file(&tmp_soun_first);
     }
 }
