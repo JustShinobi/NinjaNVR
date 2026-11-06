@@ -84,6 +84,10 @@ pub struct ActivitySample {
     pub dbfs: i64,
 }
 
+pub const MAX_ACTIVITY_SAMPLES: usize = 4_096;
+pub const MAX_RETENTION_DAYS: f64 = 36_500.0;
+pub const MAX_STORAGE_QUOTA_GB: f64 = 1_000_000.0;
+
 #[derive(Default)]
 pub struct CameraActivityRing {
     samples: VecDeque<ActivitySample>,
@@ -97,6 +101,14 @@ impl CameraActivityRing {
 
     pub fn is_record_enabled(&self) -> bool {
         self.record_enabled.unwrap_or(true)
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
     }
 
     pub fn record_sample(
@@ -117,6 +129,22 @@ impl CameraActivityRing {
         regions: u32,
         dbfs: i64,
     ) {
+        if !timestamp.is_finite() || timestamp < 0.0 {
+            return;
+        }
+        let cutoff = timestamp - 300.0;
+        while let Some(front) = self.samples.front() {
+            if !front.timestamp.is_finite() || front.timestamp < cutoff {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.samples
+            .retain(|s| s.timestamp.is_finite() && s.timestamp >= cutoff);
+        while self.samples.len() >= MAX_ACTIVITY_SAMPLES {
+            self.samples.pop_front();
+        }
         self.samples.push_back(ActivitySample {
             timestamp,
             motion_px,
@@ -124,14 +152,6 @@ impl CameraActivityRing {
             regions,
             dbfs,
         });
-        let cutoff = timestamp - 300.0;
-        while let Some(front) = self.samples.front() {
-            if front.timestamp < cutoff {
-                self.samples.pop_front();
-            } else {
-                break;
-            }
-        }
     }
 
     pub fn aggregate_range(&self, start_time: f64, end_time: f64) -> (i64, i64, i64) {
@@ -144,15 +164,18 @@ impl CameraActivityRing {
         start_time: f64,
         end_time: f64,
     ) -> (i64, i64, i64, i64) {
+        if !start_time.is_finite() || !end_time.is_finite() || end_time < start_time {
+            return (0, 0, 0, 0);
+        }
         let mut motion_sum = 0i64;
         let mut obj_sum = 0i64;
         let mut reg_sum = 0i64;
         let mut peak_dbfs = 0i64;
         for s in &self.samples {
-            if s.timestamp >= start_time && s.timestamp <= end_time {
-                motion_sum += s.motion_px as i64;
-                obj_sum += s.active_objects as i64;
-                reg_sum += s.regions as i64;
+            if s.timestamp.is_finite() && s.timestamp >= start_time && s.timestamp <= end_time {
+                motion_sum = motion_sum.saturating_add(s.motion_px as i64);
+                obj_sum = obj_sum.saturating_add(s.active_objects as i64);
+                reg_sum = reg_sum.saturating_add(s.regions as i64);
                 if s.dbfs != 0 && (peak_dbfs == 0 || s.dbfs > peak_dbfs) {
                     peak_dbfs = s.dbfs;
                 }
@@ -160,6 +183,71 @@ impl CameraActivityRing {
         }
         (motion_sum, obj_sum, reg_sum, peak_dbfs)
     }
+}
+
+/// Validates a configured retention window in days, falling back to `default_days` when
+/// `days` is non-finite (`NaN`, `+Inf`, `-Inf`) or `<= 0.0`, and clamping to `[min_days, MAX_RETENTION_DAYS]`.
+pub fn sanitize_retention_days(days: f64, default_days: f64, min_days: f64) -> f64 {
+    let safe_min = if min_days.is_finite() && min_days > 0.0 {
+        min_days.min(MAX_RETENTION_DAYS)
+    } else {
+        0.1
+    };
+    let safe_default = if default_days.is_finite() && default_days > 0.0 {
+        default_days.clamp(safe_min, MAX_RETENTION_DAYS)
+    } else {
+        7.0_f64.clamp(safe_min, MAX_RETENTION_DAYS)
+    };
+    if days.is_finite() && days > 0.0 {
+        days.clamp(safe_min, MAX_RETENTION_DAYS)
+    } else {
+        safe_default
+    }
+}
+
+/// Validates a configured storage quota or headroom threshold in GB, returning `None` when
+/// non-finite, `<= 0.0`, or overflowing `val * 1024.0`, and capping to `MAX_STORAGE_QUOTA_GB`.
+pub fn sanitize_quota_gb(val: Option<f64>) -> Option<f64> {
+    let v = val?;
+    if v.is_finite() && v > 0.0 && (v * 1024.0).is_finite() {
+        Some(v.min(MAX_STORAGE_QUOTA_GB))
+    } else {
+        None
+    }
+}
+
+/// Computes the allowed recording storage footprint in MB when free disk space drops below
+/// `min_free_gb`, returning `None` if any input is non-finite, out of range, or when sufficient
+/// free space is already available.
+pub fn compute_headroom_allowed_mb(
+    current_rec_mb: f64,
+    free_mb: f64,
+    min_free_gb: f64,
+) -> Option<f64> {
+    if !min_free_gb.is_finite()
+        || min_free_gb <= 0.0
+        || min_free_gb > MAX_STORAGE_QUOTA_GB
+        || !(min_free_gb * 1024.0).is_finite()
+    {
+        return None;
+    }
+    if !current_rec_mb.is_finite() || current_rec_mb < 0.0 || !free_mb.is_finite() || free_mb < 0.0
+    {
+        return None;
+    }
+    let min_free_mb = min_free_gb * 1024.0;
+    if !min_free_mb.is_finite() || free_mb >= min_free_mb {
+        return None;
+    }
+    let deficit_mb = min_free_mb - free_mb;
+    if !deficit_mb.is_finite() || deficit_mb <= 0.0 {
+        return None;
+    }
+    let raw_allowed = current_rec_mb - deficit_mb;
+    if !raw_allowed.is_finite() {
+        return None;
+    }
+    Some(raw_allowed.max(0.1))
 }
 
 pub type SharedActivityLedger = Arc<RwLock<HashMap<String, CameraActivityRing>>>;
@@ -1280,6 +1368,7 @@ pub struct CameraRecordPolicy {
 }
 
 /// Manages direct segment recording and retention cleanup for all configured cameras.
+#[derive(Clone)]
 pub struct RecordingEngine {
     config: Arc<RwLock<NinjaConfig>>,
     db: NinjaDatabase,
@@ -1351,10 +1440,11 @@ impl RecordingEngine {
                         || c.record.detections.pre_capture > 0
                         || c.record.detections.post_capture > 0;
                     let policy = CameraRecordPolicy {
-                        keep_continuous: c.record.continuous.days > 0.0
+                        keep_continuous: (c.record.continuous.days.is_finite()
+                            && c.record.continuous.days > 0.0)
                             || use_sub_default
                             || has_pre_post_buffer,
-                        keep_motion: c.record.motion.days > 0.0,
+                        keep_motion: c.record.motion.days.is_finite() && c.record.motion.days > 0.0,
                         continuous_substream: use_sub_default,
                         retain_mode: c.record.alerts.retain.mode.clone(),
                         audio_offset_ms: c.ffmpeg.audio_offset_ms.unwrap_or(0),
@@ -1400,24 +1490,34 @@ impl RecordingEngine {
             cfg.record.storage_tiers.cold_dir.clone()
         };
         loop {
-            let batch = self.db.list_recordings_by_dbfs(-5, 100).unwrap_or_default();
-            if batch.is_empty() {
+            let engine_ref = self.clone();
+            let cold_ref = configured_cold_dir.clone();
+            let repaired_batch = tokio::task::spawn_blocking(move || {
+                let batch = engine_ref
+                    .db
+                    .list_recordings_by_dbfs(-5, 100)
+                    .unwrap_or_default();
+                if batch.is_empty() {
+                    return 0usize;
+                }
+                let count = batch.len();
+                for (id, db_path) in batch {
+                    let real_dbfs = if let Some(media_path) =
+                        engine_ref.resolve_contained_recording_file(&db_path, cold_ref.as_deref())
+                    {
+                        let d = probe_mp4_audio_dbfs_fast(&media_path);
+                        if d == -5 { 0 } else { d }
+                    } else {
+                        0
+                    };
+                    let _ = engine_ref.db.update_recording_dbfs(&id, real_dbfs);
+                }
+                count
+            })
+            .await
+            .unwrap_or(0);
+            if repaired_batch == 0 {
                 break;
-            }
-            for (id, db_path) in batch {
-                let Some(media_path) =
-                    self.resolve_contained_recording_file(&db_path, configured_cold_dir.as_deref())
-                else {
-                    let _ = self.db.update_recording_dbfs(&id, 0);
-                    continue;
-                };
-                let real_dbfs = tokio::task::spawn_blocking(move || {
-                    let d = probe_mp4_audio_dbfs_fast(&media_path);
-                    if d == -5 { 0 } else { d }
-                })
-                .await
-                .unwrap_or(0);
-                let _ = self.db.update_recording_dbfs(&id, real_dbfs);
             }
             tokio::task::yield_now().await;
         }
@@ -1426,7 +1526,11 @@ impl RecordingEngine {
     async fn run_storage_recovery_probe_loop(&self) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            match probe_storage_writable(&self.media_dir) {
+            let media_dir = self.media_dir.clone();
+            let probe_res = tokio::task::spawn_blocking(move || probe_storage_writable(&media_dir))
+                .await
+                .unwrap_or_else(|e| Err(format!("storage probe task panicked: {e}")));
+            match probe_res {
                 Ok(()) => {
                     if self.storage_degraded.swap(false, Ordering::SeqCst) {
                         info!(
@@ -1459,22 +1563,33 @@ impl RecordingEngine {
         staging_dir: &Path,
         policy: &CameraRecordPolicy,
     ) {
-        let Ok(entries) = std::fs::read_dir(staging_dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("mp4") {
-                if probe_mp4_duration_fast(&path).is_some() {
-                    let _ = self
-                        .finalize_closed_segment(camera, &path, 10.0, policy)
-                        .await;
+        let staging_dir_buf = staging_dir.to_path_buf();
+        let valid_mp4s = tokio::task::spawn_blocking(move || {
+            let mut valid = Vec::new();
+            let Ok(entries) = std::fs::read_dir(&staging_dir_buf) else {
+                return valid;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("mp4") {
+                    if probe_mp4_duration_fast(&path).is_some() {
+                        valid.push(path);
+                    } else {
+                        let _ = std::fs::remove_file(&path);
+                    }
                 } else {
                     let _ = std::fs::remove_file(&path);
                 }
-            } else {
-                let _ = std::fs::remove_file(&path);
             }
+            valid
+        })
+        .await
+        .unwrap_or_default();
+
+        for path in valid_mp4s {
+            let _ = self
+                .finalize_closed_segment(camera, &path, 10.0, policy)
+                .await;
         }
     }
 
@@ -1583,20 +1698,6 @@ impl RecordingEngine {
         if !is_safe_identifier(camera) {
             anyhow::bail!("unsafe camera identifier: {camera}");
         }
-        let meta = std::fs::symlink_metadata(staged_path)
-            .with_context(|| format!("missing staged segment {}", staged_path.display()))?;
-        if !meta.file_type().is_file() {
-            anyhow::bail!(
-                "staged segment {} is not a regular file",
-                staged_path.display()
-            );
-        }
-        let size_bytes = meta.len();
-        if size_bytes < 1024 {
-            let _ = std::fs::remove_file(staged_path);
-            return Ok(());
-        }
-
         let record_allowed = {
             let ledger = self.activity_ledger.read().await;
             ledger
@@ -1604,17 +1705,61 @@ impl RecordingEngine {
                 .map(|r| r.is_record_enabled())
                 .unwrap_or(true)
         };
-        if !record_allowed {
-            let _ = std::fs::remove_file(staged_path);
-            return Ok(());
+
+        struct StagedSegmentProbe {
+            size_bytes: u64,
+            duration: f64,
+            start_time: f64,
+            end_time: f64,
+            probed_dbfs: i64,
         }
 
-        let duration = probe_mp4_duration_fast(staged_path)
-            .unwrap_or(csv_duration)
-            .clamp(0.5, 60.0);
-        let start_time = parse_staged_start_time(camera, staged_path)
-            .unwrap_or_else(|| unix_now_f64() - duration);
-        let end_time = start_time + duration;
+        let staged_probe_path = staged_path.to_path_buf();
+        let cam_probe = camera.to_string();
+        let probe_res =
+            tokio::task::spawn_blocking(move || -> Result<Option<StagedSegmentProbe>> {
+                let meta = std::fs::symlink_metadata(&staged_probe_path).with_context(|| {
+                    format!("missing staged segment {}", staged_probe_path.display())
+                })?;
+                if !meta.file_type().is_file() {
+                    anyhow::bail!(
+                        "staged segment {} is not a regular file",
+                        staged_probe_path.display()
+                    );
+                }
+                let size_bytes = meta.len();
+                if size_bytes < 1024 || !record_allowed {
+                    let _ = std::fs::remove_file(&staged_probe_path);
+                    return Ok(None);
+                }
+                let duration = probe_mp4_duration_fast(&staged_probe_path)
+                    .unwrap_or(csv_duration)
+                    .clamp(0.5, 60.0);
+                let start_time = parse_staged_start_time(&cam_probe, &staged_probe_path)
+                    .unwrap_or_else(|| unix_now_f64() - duration);
+                let end_time = start_time + duration;
+                let probed_dbfs = probe_mp4_audio_dbfs_fast(&staged_probe_path);
+                Ok(Some(StagedSegmentProbe {
+                    size_bytes,
+                    duration,
+                    start_time,
+                    end_time,
+                    probed_dbfs,
+                }))
+            })
+            .await
+            .context("staged segment probe task panicked")??;
+
+        let Some(StagedSegmentProbe {
+            size_bytes,
+            duration,
+            start_time,
+            end_time,
+            probed_dbfs,
+        }) = probe_res
+        else {
+            return Ok(());
+        };
 
         let (motion, objects, regions, ledger_dbfs) = {
             let ledger = self.activity_ledger.read().await;
@@ -1623,7 +1768,6 @@ impl RecordingEngine {
                 .map(|ring| ring.aggregate_range_with_audio(start_time, end_time))
                 .unwrap_or((0, 0, 0, 0))
         };
-        let probed_dbfs = probe_mp4_audio_dbfs_fast(staged_path);
         let dbfs = if ledger_dbfs != 0 {
             ledger_dbfs
         } else {
@@ -1638,59 +1782,6 @@ impl RecordingEngine {
             objects > 0
         };
 
-        if !should_keep {
-            let _ = std::fs::remove_file(staged_path);
-            return Ok(());
-        }
-
-        let dt = Utc
-            .timestamp_opt(start_time as i64, 0)
-            .single()
-            .unwrap_or_else(Utc::now);
-        let date_dir = dt.format("%Y-%m-%d").to_string();
-        let hour_dir = dt.format("%H").to_string();
-        let mut file_name = format!("{}.mp4", dt.format("%M.%S"));
-
-        let target_dir = self
-            .media_dir
-            .join("recordings")
-            .join(&date_dir)
-            .join(&hour_dir)
-            .join(camera);
-        std::fs::create_dir_all(&target_dir)?;
-
-        let mut final_disk_path = target_dir.join(&file_name);
-        if final_disk_path.exists() {
-            file_name = format!("{}-{}.mp4", dt.format("%M.%S"), &random_suffix()[..4]);
-            final_disk_path = target_dir.join(&file_name);
-        }
-
-        std::fs::rename(staged_path, &final_disk_path).or_else(|_| {
-            std::fs::copy(staged_path, &final_disk_path)?;
-            std::fs::remove_file(staged_path)
-        })?;
-
-        let db_canonical_path =
-            format!("/media/ninjanvr/recordings/{date_dir}/{hour_dir}/{camera}/{file_name}");
-        let seg_size_mb = ((size_bytes as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
-        let id = format!("{:.1}-{}", start_time, random_suffix());
-
-        self.db.insert_recording(&RecordingRow {
-            id: id.clone(),
-            camera: camera.to_string(),
-            path: db_canonical_path,
-            start_time,
-            end_time,
-            duration,
-            motion,
-            objects,
-            dbfs,
-            segment_size: seg_size_mb,
-            regions,
-            motion_heatmap: None,
-        })?;
-
-        // Emit dedicated acoustic event and ReviewSegment when audio exceeds threshold
         let audio_cfg = {
             let cfg = self.config.read().await;
             cfg.cameras
@@ -1704,66 +1795,155 @@ impl RecordingEngine {
                 })
                 .unwrap_or_else(|| cfg.audio.clone())
         };
-        if let Some(audio_label) = check_acoustic_event_trigger(dbfs, &audio_cfg) {
-            let ev_id = format!("audio-{id}");
-            let _ = self.db.upsert_event(&EventDto {
-                id: ev_id.clone(),
-                camera: camera.to_string(),
-                label: "audio".to_string(),
-                zones: json!([]),
-                start_time,
-                end_time: Some(end_time),
-                has_clip: true,
-                has_snapshot: false,
-                plus_id: None,
-                retain_indefinitely: false,
-                sub_label: Some(audio_label.clone()),
-                top_score: Some(0.90),
-                false_positive: Some(false),
-                box_coords: None,
-                data: json!({
-                    "type": "audio",
-                    "label": audio_label,
-                    "dbfs": dbfs,
-                    "score": 0.90,
-                    "top_score": 0.90
-                }),
-                thumbnail: None,
-                area: None,
-                ratio: None,
-                score: Some(0.90),
-                stationary: false,
-            });
-            let _ = self.db.insert_review_segment(&ReviewItemDto {
-                id: format!("rev-{ev_id}"),
-                camera: camera.to_string(),
-                start_time,
-                end_time: Some(end_time),
-                severity: "detection".to_string(),
-                thumb_path: format!("/api/{camera}/latest.jpg"),
-                data: json!({
-                    "detections": [ev_id],
-                    "objects": ["audio"],
-                    "zones": [],
-                    "audio": [audio_label],
-                    "dbfs": dbfs,
-                    "thumb_time": start_time
-                }),
-                has_been_reviewed: false,
-            });
-        }
 
-        debug!(
-            "Recorded segment for {camera}: {:.2}s ({:.2} MB, motion={}, objects={}, dbfs={})",
-            duration, seg_size_mb, motion, objects, dbfs
-        );
-        let tier = if policy.continuous_substream && objects == 0 && motion == 0 {
-            "sub"
-        } else {
-            "main"
-        };
-        let _ = self.db.set_recording_stream_tier(&id, tier);
-        Ok(())
+        let db_ref = self.db.clone();
+        let media_dir_ref = self.media_dir.clone();
+        let staged_commit_path = staged_path.to_path_buf();
+        let cam_commit = camera.to_string();
+        let continuous_substream = policy.continuous_substream;
+
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            if !should_keep {
+                let _ = std::fs::remove_file(&staged_commit_path);
+                return Ok(());
+            }
+
+            let dt = Utc
+                .timestamp_opt(start_time as i64, 0)
+                .single()
+                .unwrap_or_else(Utc::now);
+            let date_dir = dt.format("%Y-%m-%d").to_string();
+            let hour_dir = dt.format("%H").to_string();
+            let mut file_name = format!("{}.mp4", dt.format("%M.%S"));
+
+            let target_dir = media_dir_ref
+                .join("recordings")
+                .join(&date_dir)
+                .join(&hour_dir)
+                .join(&cam_commit);
+            std::fs::create_dir_all(&target_dir)?;
+
+            let mut final_disk_path = target_dir.join(&file_name);
+            if final_disk_path.exists() {
+                file_name = format!("{}-{}.mp4", dt.format("%M.%S"), &random_suffix()[..4]);
+                final_disk_path = target_dir.join(&file_name);
+            }
+
+            std::fs::rename(&staged_commit_path, &final_disk_path).or_else(|_| {
+                std::fs::copy(&staged_commit_path, &final_disk_path)?;
+                std::fs::remove_file(&staged_commit_path)
+            })?;
+
+            let db_canonical_path =
+                format!("/media/ninjanvr/recordings/{date_dir}/{hour_dir}/{cam_commit}/{file_name}");
+            let seg_size_mb = ((size_bytes as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
+            let id = format!("{:.1}-{}", start_time, random_suffix());
+
+            db_ref.insert_recording(&RecordingRow {
+                id: id.clone(),
+                camera: cam_commit.clone(),
+                path: db_canonical_path,
+                start_time,
+                end_time,
+                duration,
+                motion,
+                objects,
+                dbfs,
+                segment_size: seg_size_mb,
+                regions,
+                motion_heatmap: None,
+            })?;
+
+            // Emit dedicated acoustic event and ReviewSegment when audio exceeds threshold
+            if let Some(audio_label) = check_acoustic_event_trigger(dbfs, &audio_cfg) {
+                let ev_id = format!("audio-{id}");
+                if let Err(err) = db_ref.upsert_event(&EventDto {
+                    id: ev_id.clone(),
+                    camera: cam_commit.clone(),
+                    label: "audio".to_string(),
+                    zones: json!([]),
+                    start_time,
+                    end_time: Some(end_time),
+                    has_clip: true,
+                    has_snapshot: false,
+                    plus_id: None,
+                    retain_indefinitely: false,
+                    sub_label: Some(audio_label.clone()),
+                    top_score: Some(0.90),
+                    false_positive: Some(false),
+                    box_coords: None,
+                    data: json!({
+                        "type": "audio",
+                        "label": audio_label,
+                        "dbfs": dbfs,
+                        "score": 0.90,
+                        "top_score": 0.90
+                    }),
+                    thumbnail: None,
+                    area: None,
+                    ratio: None,
+                    score: Some(0.90),
+                    stationary: false,
+                }) {
+                    warn!("Failed to persist acoustic event {ev_id} for {cam_commit}: {err:#}");
+                } else {
+                    if let Err(err) = db_ref.insert_review_segment(&ReviewItemDto {
+                        id: format!("rev-{ev_id}"),
+                        camera: cam_commit.clone(),
+                        start_time,
+                        end_time: Some(end_time),
+                        severity: "detection".to_string(),
+                        thumb_path: format!("/api/{cam_commit}/latest.jpg"),
+                        data: json!({
+                            "detections": [ev_id],
+                            "objects": ["audio"],
+                            "zones": [],
+                            "audio": [audio_label],
+                            "dbfs": dbfs,
+                            "thumb_time": start_time
+                        }),
+                        has_been_reviewed: false,
+                    }) {
+                        warn!(
+                            "Failed to persist acoustic review segment rev-{ev_id} for {cam_commit}: {err:#}"
+                        );
+                    }
+                    if let Err(err) = db_ref.insert_timeline_entry(
+                        start_time,
+                        &cam_commit,
+                        "audio",
+                        Some(&ev_id),
+                        "heard",
+                        &json!({
+                            "label": audio_label,
+                            "dbfs": dbfs,
+                            "score": 0.90,
+                            "top_score": 0.90
+                        }),
+                    ) {
+                        warn!(
+                            "Failed to persist acoustic timeline entry for {ev_id} on {cam_commit}: {err:#}"
+                        );
+                    }
+                }
+            }
+
+            debug!(
+                "Recorded segment for {cam_commit}: {:.2}s ({:.2} MB, motion={}, objects={}, dbfs={})",
+                duration, seg_size_mb, motion, objects, dbfs
+            );
+            let tier = if continuous_substream && objects == 0 && motion == 0 {
+                "sub"
+            } else {
+                "main"
+            };
+            if let Err(err) = db_ref.set_recording_stream_tier(&id, tier) {
+                warn!("Failed to persist recording stream tier for {id} on {cam_commit}: {err:#}");
+            }
+            Ok(())
+        })
+        .await
+        .context("staged segment finalize task panicked")?
     }
 
     async fn run_retention_cleanup_loop(&self) {
@@ -1797,16 +1977,12 @@ impl RecordingEngine {
             ) = {
                 let cfg = self.config.read().await;
                 let interval = cfg.record.expire_interval.max(30);
-                let global_quota = cfg
-                    .record
-                    .max_size_gb
-                    .or(cfg.record.alerts.retain.max_size_gb)
-                    .or(cfg.record.detections.retain.max_size_gb);
-                let global_min_free = cfg
-                    .record
-                    .min_free_gb
-                    .or(cfg.record.alerts.retain.min_free_gb)
-                    .or(cfg.record.detections.retain.min_free_gb);
+                let global_quota = sanitize_quota_gb(cfg.record.max_size_gb)
+                    .or_else(|| sanitize_quota_gb(cfg.record.alerts.retain.max_size_gb))
+                    .or_else(|| sanitize_quota_gb(cfg.record.detections.retain.max_size_gb));
+                let global_min_free = sanitize_quota_gb(cfg.record.min_free_gb)
+                    .or_else(|| sanitize_quota_gb(cfg.record.alerts.retain.min_free_gb))
+                    .or_else(|| sanitize_quota_gb(cfg.record.detections.retain.min_free_gb));
                 let cams = cfg
                     .cameras
                     .iter()
@@ -1826,24 +2002,30 @@ impl RecordingEngine {
                             .max(cfg.record.alerts.post_capture)
                             as f64;
                         let min_buffer_days = ((pre_cap + post_cap + 60.0) / 86400.0).max(0.002);
-                        let continuous_days = c.record.continuous.days.max(min_buffer_days);
-                        let alerts_days = c.record.alerts.retain.days.max(0.1);
-                        let detections_days = c.record.detections.retain.days.max(0.1);
+                        let continuous_days =
+                            sanitize_retention_days(c.record.continuous.days, 7.0, min_buffer_days);
+                        let alerts_days =
+                            sanitize_retention_days(c.record.alerts.retain.days, 7.0, 0.1);
+                        let detections_days =
+                            sanitize_retention_days(c.record.detections.retain.days, 7.0, 0.1);
                         let event_days = alerts_days.min(detections_days);
-                        let motion_days = if c.record.motion.days > 0.0 {
-                            c.record.motion.days.max(continuous_days)
-                        } else if c.record.alerts.retain.mode != "active_objects"
-                            || c.record.detections.retain.mode != "active_objects"
-                        {
-                            event_days.max(continuous_days)
-                        } else {
-                            continuous_days
-                        };
-                        let quota_gb = c
-                            .record
-                            .max_size_gb
-                            .or(c.record.alerts.retain.max_size_gb)
-                            .or(c.record.detections.retain.max_size_gb);
+                        let motion_days =
+                            if c.record.motion.days.is_finite() && c.record.motion.days > 0.0 {
+                                sanitize_retention_days(
+                                    c.record.motion.days,
+                                    continuous_days,
+                                    continuous_days,
+                                )
+                            } else if c.record.alerts.retain.mode != "active_objects"
+                                || c.record.detections.retain.mode != "active_objects"
+                            {
+                                event_days.max(continuous_days)
+                            } else {
+                                continuous_days
+                            };
+                        let quota_gb = sanitize_quota_gb(c.record.max_size_gb)
+                            .or_else(|| sanitize_quota_gb(c.record.alerts.retain.max_size_gb))
+                            .or_else(|| sanitize_quota_gb(c.record.detections.retain.max_size_gb));
                         let mode_tiering = c.record.mode_tiering
                             || cfg.record.mode_tiering
                             || c.record.continuous_substream
@@ -1888,7 +2070,7 @@ impl RecordingEngine {
                 let cfg = self.config.read().await;
                 cfg.record.storage_tiers.clone()
             };
-            let configured_cold_dir = tier_cfg.cold_dir.as_deref();
+            let configured_cold_dir = tier_cfg.cold_dir.clone();
 
             let now = unix_now_f64();
             for CameraRetentionEntry {
@@ -1912,18 +2094,25 @@ impl RecordingEngine {
             {
                 if mode_tiering {
                     let idle_main_cutoff = now - (continuous_days.min(1.0) * 86400.0);
-                    if let Ok(idle_paths) = self
-                        .db
-                        .delete_expired_idle_main_recordings(&camera, idle_main_cutoff)
-                    {
-                        for db_path in &idle_paths {
-                            let _ = self.remove_contained_recording_file(
-                                db_path,
-                                configured_cold_dir,
-                                &recordings_root,
-                            );
+                    let engine_idle = self.clone();
+                    let cam_idle = camera.clone();
+                    let cold_idle = configured_cold_dir.clone();
+                    let rec_root_idle = recordings_root.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(idle_paths) = engine_idle
+                            .db
+                            .delete_expired_idle_main_recordings(&cam_idle, idle_main_cutoff)
+                        {
+                            for db_path in &idle_paths {
+                                let _ = engine_idle.remove_contained_recording_file(
+                                    db_path,
+                                    cold_idle.as_deref(),
+                                    &rec_root_idle,
+                                );
+                            }
                         }
-                    }
+                    })
+                    .await;
                 }
                 let continuous_cutoff = now - continuous_days * 86400.0;
                 let motion_cutoff = now - motion_days * 86400.0;
@@ -1931,35 +2120,43 @@ impl RecordingEngine {
                 let detections_cutoff = now - detections_days * 86400.0;
                 let event_recording_cutoff = alerts_cutoff.min(detections_cutoff);
                 loop {
-                    let db_ref = self.db.clone();
+                    let engine_exp = self.clone();
                     let cam_ref = camera.clone();
-                    let Ok(Ok(expired_paths)) = tokio::task::spawn_blocking(move || {
-                        db_ref.delete_expired_recordings_with_window(
-                            &cam_ref,
-                            continuous_cutoff,
-                            motion_cutoff,
-                            event_recording_cutoff,
-                            pre_capture_sec,
-                            post_capture_sec,
-                        )
-                    })
-                    .await
+                    let cold_exp = configured_cold_dir.clone();
+                    let rec_root_exp = recordings_root.clone();
+                    let Ok(Ok((batch_len, removed_files))) =
+                        tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
+                            let expired_paths =
+                                engine_exp.db.delete_expired_recordings_with_window(
+                                    &cam_ref,
+                                    continuous_cutoff,
+                                    motion_cutoff,
+                                    event_recording_cutoff,
+                                    pre_capture_sec,
+                                    post_capture_sec,
+                                )?;
+                            if expired_paths.is_empty() {
+                                return Ok((0, 0));
+                            }
+                            let batch_len = expired_paths.len();
+                            let mut removed_files = 0usize;
+                            for db_path in &expired_paths {
+                                if engine_exp.remove_contained_recording_file(
+                                    db_path,
+                                    cold_exp.as_deref(),
+                                    &rec_root_exp,
+                                ) {
+                                    removed_files += 1;
+                                }
+                            }
+                            Ok((batch_len, removed_files))
+                        })
+                        .await
                     else {
                         break;
                     };
-                    if expired_paths.is_empty() {
+                    if batch_len == 0 {
                         break;
-                    }
-                    let batch_len = expired_paths.len();
-                    let mut removed_files = 0usize;
-                    for db_path in &expired_paths {
-                        if self.remove_contained_recording_file(
-                            db_path,
-                            configured_cold_dir,
-                            &recordings_root,
-                        ) {
-                            removed_files += 1;
-                        }
                     }
                     info!(
                         "Retention cleanup for {camera}: pruned {batch_len} DB rows and {removed_files} segment files"
@@ -1971,185 +2168,256 @@ impl RecordingEngine {
                 }
 
                 if let Some(max_gb) = quota_gb
+                    && max_gb.is_finite()
                     && max_gb > 0.0
-                    && let Ok(quota_paths) = self
-                        .db
-                        .delete_recordings_over_quota_mb(&camera, max_gb * 1024.0)
+                    && (max_gb * 1024.0).is_finite()
                 {
-                    for db_path in &quota_paths {
-                        let _ = self.remove_contained_recording_file(
-                            db_path,
-                            configured_cold_dir,
-                            &recordings_root,
-                        );
-                    }
+                    let engine_quota = self.clone();
+                    let cam_quota = camera.clone();
+                    let cold_quota = configured_cold_dir.clone();
+                    let rec_root_quota = recordings_root.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(quota_paths) = engine_quota
+                            .db
+                            .delete_recordings_over_quota_mb(&cam_quota, max_gb * 1024.0)
+                        {
+                            for db_path in &quota_paths {
+                                let _ = engine_quota.remove_contained_recording_file(
+                                    db_path,
+                                    cold_quota.as_deref(),
+                                    &rec_root_quota,
+                                );
+                            }
+                        }
+                    })
+                    .await;
                 }
 
-                let db_ev = self.db.clone();
+                let engine_ev = self.clone();
                 let cam_ev = camera.clone();
-                if let Ok(Ok(clip_paths)) = tokio::task::spawn_blocking(move || {
-                    db_ev.cleanup_expired_events_and_reviews(
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(clip_paths) = engine_ev.db.cleanup_expired_events_and_reviews(
                         &cam_ev,
                         alerts_cutoff,
                         detections_cutoff,
-                    )
-                })
-                .await
-                {
-                    for cp in clip_paths {
-                        let _ = self.remove_contained_media_file(&cp);
+                    ) {
+                        for cp in clip_paths {
+                            let _ = engine_ev.remove_contained_media_file(&cp);
+                        }
                     }
-                }
+                })
+                .await;
 
                 if compact_enabled {
                     let compact_before = now - (compact_after_hours as f64) * 3600.0;
-                    if let Ok(candidates) = self.db.list_cold_compaction_candidates(
-                        &camera,
-                        compact_before,
-                        compact_idle_only,
-                        pre_capture_sec,
-                        post_capture_sec,
-                        12,
-                    ) {
-                        for (seg_id, db_path) in candidates {
-                            let Some(disk_path) = self
-                                .resolve_contained_recording_file(&db_path, configured_cold_dir)
-                            else {
-                                let _ = self.db.update_recording_compacted(&seg_id, 0.0);
-                                continue;
-                            };
-                            let Ok(orig_meta) = std::fs::symlink_metadata(&disk_path) else {
-                                let _ = self.db.update_recording_compacted(&seg_id, 0.0);
-                                continue;
-                            };
-                            if !orig_meta.file_type().is_file() {
-                                let _ = self.db.update_recording_compacted(&seg_id, 0.0);
-                                continue;
-                            }
-                            let orig_len = orig_meta.len();
-                            if orig_len < 65_536 {
-                                let mb =
-                                    ((orig_len as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
-                                let _ = self.db.update_recording_compacted(&seg_id, mb);
-                                continue;
-                            }
-                            let tmp_out = disk_path.with_extension("compact.mp4");
-                            let _tmp_compact_guard = TempPathGuard(tmp_out.clone());
-                            let primary_args = build_cold_compaction_ffmpeg_args(
+                    let db_cand = self.db.clone();
+                    let cam_cand = camera.clone();
+                    let candidates = tokio::task::spawn_blocking(move || {
+                        db_cand.list_cold_compaction_candidates(
+                            &cam_cand,
+                            compact_before,
+                            compact_idle_only,
+                            pre_capture_sec,
+                            post_capture_sec,
+                            12,
+                        )
+                    })
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default();
+
+                    for (seg_id, db_path) in candidates {
+                        let engine_prep = self.clone();
+                        let cold_prep = configured_cold_dir.clone();
+                        let seg_id_prep = seg_id.clone();
+                        let prep_res =
+                            tokio::task::spawn_blocking(move || -> Option<(PathBuf, u64)> {
+                                let Some(disk_path) = engine_prep.resolve_contained_recording_file(
+                                    &db_path,
+                                    cold_prep.as_deref(),
+                                ) else {
+                                    let _ = engine_prep
+                                        .db
+                                        .update_recording_compacted(&seg_id_prep, 0.0);
+                                    return None;
+                                };
+                                let Ok(orig_meta) = std::fs::symlink_metadata(&disk_path) else {
+                                    let _ = engine_prep
+                                        .db
+                                        .update_recording_compacted(&seg_id_prep, 0.0);
+                                    return None;
+                                };
+                                if !orig_meta.file_type().is_file() {
+                                    let _ = engine_prep
+                                        .db
+                                        .update_recording_compacted(&seg_id_prep, 0.0);
+                                    return None;
+                                }
+                                let orig_len = orig_meta.len();
+                                if orig_len < 65_536 {
+                                    let mb = ((orig_len as f64) / (1024.0 * 1024.0) * 100.0)
+                                        .round()
+                                        / 100.0;
+                                    let _ =
+                                        engine_prep.db.update_recording_compacted(&seg_id_prep, mb);
+                                    return None;
+                                }
+                                Some((disk_path, orig_len))
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+
+                        let Some((disk_path, orig_len)) = prep_res else {
+                            continue;
+                        };
+
+                        let tmp_out = disk_path.with_extension("compact.mp4");
+                        let _tmp_compact_guard = TempPathGuard(tmp_out.clone());
+                        let primary_args = build_cold_compaction_ffmpeg_args(
+                            &disk_path,
+                            &tmp_out,
+                            &compact_codec,
+                            &compact_preset,
+                            &compact_hwaccel,
+                            compact_crf,
+                        );
+                        let mut cmd = Command::new(&ffmpeg_bin);
+                        cmd.args(&primary_args)
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .kill_on_drop(true);
+                        let mut status = cmd.status().await;
+                        if !status.as_ref().map(|s| s.success()).unwrap_or(false)
+                            && compact_hwaccel != "none"
+                        {
+                            let fallback_args = build_cold_compaction_ffmpeg_args(
                                 &disk_path,
                                 &tmp_out,
                                 &compact_codec,
                                 &compact_preset,
-                                &compact_hwaccel,
+                                "none",
                                 compact_crf,
                             );
-                            let mut cmd = Command::new(&ffmpeg_bin);
-                            cmd.args(&primary_args)
+                            let mut fb_cmd = Command::new(&ffmpeg_bin);
+                            fb_cmd
+                                .args(&fallback_args)
                                 .stdin(Stdio::null())
                                 .stdout(Stdio::null())
                                 .stderr(Stdio::null())
                                 .kill_on_drop(true);
-                            let mut status = cmd.status().await;
-                            if !status.as_ref().map(|s| s.success()).unwrap_or(false)
-                                && compact_hwaccel != "none"
-                            {
-                                let fallback_args = build_cold_compaction_ffmpeg_args(
-                                    &disk_path,
-                                    &tmp_out,
-                                    &compact_codec,
-                                    &compact_preset,
-                                    "none",
-                                    compact_crf,
-                                );
-                                let mut fb_cmd = Command::new(&ffmpeg_bin);
-                                fb_cmd
-                                    .args(&fallback_args)
-                                    .stdin(Stdio::null())
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .kill_on_drop(true);
-                                status = fb_cmd.status().await;
-                            }
+                            status = fb_cmd.status().await;
+                        }
+                        let ff_success = status.map(|s| s.success()).unwrap_or(false);
+                        let db_fin = self.db.clone();
+                        let tmp_out_fin = tmp_out.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
                             let mut final_mb =
                                 ((orig_len as f64) / (1024.0 * 1024.0) * 100.0).round() / 100.0;
-                            if status.map(|s| s.success()).unwrap_or(false)
-                                && let Ok(new_meta) = std::fs::metadata(&tmp_out)
+                            if ff_success
+                                && let Ok(new_meta) = std::fs::metadata(&tmp_out_fin)
                                 && new_meta.len() > 4096
                                 && new_meta.len() < orig_len
-                                && probe_mp4_duration_fast(&tmp_out).is_some()
+                                && probe_mp4_duration_fast(&tmp_out_fin).is_some()
                             {
-                                if std::fs::rename(&tmp_out, &disk_path).is_ok() {
+                                if std::fs::rename(&tmp_out_fin, &disk_path).is_ok() {
                                     final_mb = ((new_meta.len() as f64) / (1024.0 * 1024.0)
                                         * 100.0)
                                         .round()
                                         / 100.0;
                                 } else {
-                                    let _ = std::fs::remove_file(&tmp_out);
+                                    let _ = std::fs::remove_file(&tmp_out_fin);
                                 }
                             } else {
-                                let _ = std::fs::remove_file(&tmp_out);
+                                let _ = std::fs::remove_file(&tmp_out_fin);
                             }
-                            let _ = self.db.update_recording_compacted(&seg_id, final_mb);
-                        }
+                            let _ = db_fin.update_recording_compacted(&seg_id, final_mb);
+                        })
+                        .await;
                     }
                 }
             }
 
             // Global disk quota (`max_size_gb`) and minimum free disk headroom (`min_free_gb`) eviction pass
-            let mut effective_global_max_mb = global_quota_gb.map(|g| g * 1024.0);
-            if let Some(min_free_gb) = global_min_free_gb
-                && min_free_gb > 0.0
-                && let Ok(stat) = nix::sys::statvfs::statvfs(&recordings_root)
             {
-                let bsize = stat.fragment_size() as f64;
-                let free_mb = (stat.blocks_available() as f64 * bsize) / (1024.0 * 1024.0);
-                let min_free_mb = min_free_gb * 1024.0;
-                if free_mb < min_free_mb {
-                    let deficit_mb = min_free_mb - free_mb;
-                    if let Ok(usage_val) = self.db.query_recordings_storage_usage()
-                        && let Some(obj) = usage_val.as_object()
+                let engine_glob = self.clone();
+                let rec_root_glob = recordings_root.clone();
+                let cold_glob = configured_cold_dir.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut effective_global_max_mb =
+                        sanitize_quota_gb(global_quota_gb).map(|g| g * 1024.0);
+                    if let Some(min_free_gb) = sanitize_quota_gb(global_min_free_gb)
+                        && let Ok(stat) = nix::sys::statvfs::statvfs(&rec_root_glob)
                     {
-                        let current_rec_mb: f64 =
-                            obj.values().filter_map(|v| v["usage"].as_f64()).sum();
-                        let allowed_mb = (current_rec_mb - deficit_mb).max(0.1);
-                        effective_global_max_mb = Some(
-                            effective_global_max_mb
-                                .map(|m| m.min(allowed_mb))
-                                .unwrap_or(allowed_mb),
-                        );
+                        let bsize = stat.fragment_size() as f64;
+                        let free_mb = (stat.blocks_available() as f64 * bsize) / (1024.0 * 1024.0);
+                        if let Ok(usage_val) = engine_glob.db.query_recordings_storage_usage()
+                            && let Some(obj) = usage_val.as_object()
+                        {
+                            let current_rec_mb: f64 = obj
+                                .values()
+                                .filter_map(|v| v["usage"].as_f64())
+                                .filter(|v| v.is_finite() && *v >= 0.0)
+                                .sum();
+                            if let Some(allowed_mb) =
+                                compute_headroom_allowed_mb(current_rec_mb, free_mb, min_free_gb)
+                            {
+                                effective_global_max_mb = Some(
+                                    effective_global_max_mb
+                                        .map(|m| m.min(allowed_mb))
+                                        .unwrap_or(allowed_mb),
+                                );
+                            }
+                        }
                     }
-                }
-            }
-            if let Some(max_mb) = effective_global_max_mb
-                && max_mb > 0.0
-                && let Ok(evicted_paths) = self.db.delete_global_recordings_over_quota_mb(max_mb)
-            {
-                for db_path in &evicted_paths {
-                    let _ = self.remove_contained_recording_file(
-                        db_path,
-                        configured_cold_dir,
-                        &recordings_root,
-                    );
-                }
+                    if let Some(max_mb) = effective_global_max_mb
+                        && max_mb.is_finite()
+                        && max_mb > 0.0
+                        && let Ok(evicted_paths) = engine_glob
+                            .db
+                            .delete_global_recordings_over_quota_mb(max_mb)
+                    {
+                        for db_path in &evicted_paths {
+                            let _ = engine_glob.remove_contained_recording_file(
+                                db_path,
+                                cold_glob.as_deref(),
+                                &rec_root_glob,
+                            );
+                        }
+                    }
+                })
+                .await;
             }
 
             // Hot-to-Cold tiered storage migration pass
             if tier_cfg.enabled
-                && let Some(ref cold_dir) = tier_cfg.cold_dir
+                && let Some(cold_dir) = tier_cfg.cold_dir.clone()
             {
                 let migrate_before = now - (tier_cfg.migrate_after_hours.max(1) as f64) * 3600.0;
-                if let Err(err) = migrate_hot_segments_to_cold(
-                    &self.db,
-                    &self.media_dir,
-                    cold_dir,
-                    migrate_before,
-                ) {
+                let db_tier = self.db.clone();
+                let media_dir_tier = self.media_dir.clone();
+                if let Ok(Err(err)) = tokio::task::spawn_blocking(move || {
+                    migrate_hot_segments_to_cold(
+                        &db_tier,
+                        &media_dir_tier,
+                        &cold_dir,
+                        migrate_before,
+                    )
+                })
+                .await
+                {
                     warn!("Hot-to-cold storage tier migration skipped: {err:#}");
                 }
             }
 
             // Prune expired share links and remove orphaned share clip/redacted artifacts
-            self.prune_expired_share_link_artifacts(now);
+            let engine_share = self.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                engine_share.prune_expired_share_link_artifacts(now);
+            })
+            .await;
 
             // Periodic SQLite query-planner optimization & WAL checkpointing
             let db_maint = self.db.clone();
@@ -2301,7 +2569,6 @@ impl RecordingEngine {
             let now = unix_now_f64();
             let current_hour_start = ((now as i64) / 3600) * 3600;
             let prev_hour_start = current_hour_start - 3600;
-            let canon_media_dir = std::fs::canonicalize(&self.media_dir).ok();
 
             for (camera, preview_quality) in cameras {
                 if !is_safe_identifier(&camera) {
@@ -2316,67 +2583,85 @@ impl RecordingEngine {
                 for hour_start_i64 in [prev_hour_start, current_hour_start] {
                     let hour_start = hour_start_i64 as f64;
                     let hour_end = (hour_start_i64 + 3600) as f64;
-
-                    let Ok(segs) = self.db.query_recordings(&camera, hour_start, hour_end) else {
-                        continue;
-                    };
-                    if segs.len() < 2 {
-                        continue;
-                    }
-                    let start_ts = segs
-                        .first()
-                        .map(|s| s.start_time.max(hour_start))
-                        .unwrap_or(hour_start);
-                    let end_ts = segs
-                        .last()
-                        .map(|s| s.end_time.min(hour_end))
-                        .unwrap_or(hour_end.min(now));
-                    let duration = (end_ts - start_ts).max(1.0);
-
-                    let preview_dir = self.media_dir.join("clips").join("previews").join(&camera);
-                    if std::fs::create_dir_all(&preview_dir).is_err() {
-                        continue;
-                    }
                     let file_name = format!("{hour_start_i64}-{}.mp4", hour_start_i64 + 3600);
-                    let out_file = preview_dir.join(&file_name);
-                    if let Ok(meta) = std::fs::metadata(&out_file)
-                        && meta.len() > 1024
-                    {
-                        if hour_start_i64 == prev_hour_start {
-                            // Previous hour preview already exists on disk; never regenerate
-                            continue;
-                        }
-                        if let Ok(mtime) = meta.modified()
-                            && mtime.elapsed().map(|d| d.as_secs() < 900).unwrap_or(false)
-                        {
-                            // Active hour preview was updated less than 15m ago
-                            continue;
-                        }
-                    }
                     let list_file = std::env::temp_dir()
                         .join(format!("ninjanvr-prev-{camera}-{hour_start_i64}.txt"));
                     let _list_guard = TempPathGuard(list_file.clone());
 
-                    let mut list_content = String::new();
-                    for seg in &segs {
-                        let local_path = if let Some(rel) = strip_media_root(&seg.path) {
-                            self.media_dir.join(rel)
-                        } else {
-                            PathBuf::from(&seg.path)
-                        };
-                        if let (Some(root_canon), Ok(seg_canon)) =
-                            (&canon_media_dir, std::fs::canonicalize(&local_path))
-                            && seg_canon.starts_with(root_canon)
-                            && seg_canon.is_file()
-                            && let Some(line) = format_ffmpeg_concat_file_line(&seg_canon)
-                        {
-                            list_content.push_str(&line);
-                        }
-                    }
-                    if list_content.is_empty() || std::fs::write(&list_file, &list_content).is_err()
-                    {
+                    let db_prep = self.db.clone();
+                    let media_dir_prep = self.media_dir.clone();
+                    let cam_prep = camera.clone();
+                    let file_name_prep = file_name.clone();
+                    let list_file_prep = list_file.clone();
+                    let prep_res =
+                        tokio::task::spawn_blocking(move || -> Option<(PathBuf, f64, f64, f64)> {
+                            let segs = db_prep
+                                .query_recordings(&cam_prep, hour_start, hour_end)
+                                .ok()?;
+                            if segs.len() < 2 {
+                                return None;
+                            }
+                            let start_ts = segs
+                                .first()
+                                .map(|s| s.start_time.max(hour_start))
+                                .unwrap_or(hour_start);
+                            let end_ts = segs
+                                .last()
+                                .map(|s| s.end_time.min(hour_end))
+                                .unwrap_or(hour_end.min(now));
+                            let duration = (end_ts - start_ts).max(1.0);
+
+                            let preview_dir = media_dir_prep
+                                .join("clips")
+                                .join("previews")
+                                .join(&cam_prep);
+                            if std::fs::create_dir_all(&preview_dir).is_err() {
+                                return None;
+                            }
+                            let out_file = preview_dir.join(&file_name_prep);
+                            if let Ok(meta) = std::fs::metadata(&out_file)
+                                && meta.len() > 1024
+                            {
+                                if hour_start_i64 == prev_hour_start {
+                                    return None;
+                                }
+                                if let Ok(mtime) = meta.modified()
+                                    && mtime.elapsed().map(|d| d.as_secs() < 900).unwrap_or(false)
+                                {
+                                    return None;
+                                }
+                            }
+                            let canon_media_dir = std::fs::canonicalize(&media_dir_prep).ok();
+                            let mut list_content = String::new();
+                            for seg in &segs {
+                                let local_path = if let Some(rel) = strip_media_root(&seg.path) {
+                                    media_dir_prep.join(rel)
+                                } else {
+                                    PathBuf::from(&seg.path)
+                                };
+                                if let (Some(root_canon), Ok(seg_canon)) =
+                                    (&canon_media_dir, std::fs::canonicalize(&local_path))
+                                    && seg_canon.starts_with(root_canon)
+                                    && seg_canon.is_file()
+                                    && let Some(line) = format_ffmpeg_concat_file_line(&seg_canon)
+                                {
+                                    list_content.push_str(&line);
+                                }
+                            }
+                            if list_content.is_empty()
+                                || std::fs::write(&list_file_prep, &list_content).is_err()
+                            {
+                                return None;
+                            }
+                            Some((out_file, start_ts, end_ts, duration))
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+
+                    let Some((out_file, start_ts, end_ts, duration)) = prep_res else {
                         continue;
-                    }
+                    };
 
                     let mut cmd = Command::new(&ffmpeg_bin);
                     cmd.args([
@@ -2413,16 +2698,22 @@ impl RecordingEngine {
                     .stderr(Stdio::null())
                     .kill_on_drop(true);
                     let status = cmd.status().await;
-                    let _ = std::fs::remove_file(&list_file);
-
-                    if status.map(|s| s.success()).unwrap_or(false) && out_file.exists() {
-                        let id = format!("{camera}_{hour_start_i64}");
-                        let db_path =
-                            format!("/media/ninjanvr/clips/previews/{camera}/{file_name}");
-                        let _ = self
-                            .db
-                            .insert_preview(&id, &camera, &db_path, start_ts, end_ts, duration);
-                    }
+                    let ff_ok = status.map(|s| s.success()).unwrap_or(false);
+                    let db_fin = self.db.clone();
+                    let cam_fin = camera.clone();
+                    let list_fin = list_file.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = std::fs::remove_file(&list_fin);
+                        if ff_ok && out_file.exists() {
+                            let id = format!("{cam_fin}_{hour_start_i64}");
+                            let db_path =
+                                format!("/media/ninjanvr/clips/previews/{cam_fin}/{file_name}");
+                            let _ = db_fin.insert_preview(
+                                &id, &cam_fin, &db_path, start_ts, end_ts, duration,
+                            );
+                        }
+                    })
+                    .await;
                 }
             }
 
@@ -2590,8 +2881,6 @@ pub async fn backup_alert_clip(
         .unwrap_or_else(Utc::now);
     let date_dir = dt.format("%Y-%m-%d").to_string();
     let day_dir = target_dir.join(&date_dir);
-    std::fs::create_dir_all(&day_dir)
-        .with_context(|| format!("failed to create alert backup dir {}", day_dir.display()))?;
 
     let safe_camera: String = camera
         .chars()
@@ -2609,51 +2898,74 @@ pub async fn backup_alert_clip(
         .collect();
     let stem = format!("{safe_camera}_{}_{safe_label}", start_time.max(0.0) as u64);
     let out_mp4 = day_dir.join(format!("{stem}.mp4"));
+    let list_path = day_dir.join(format!(".{stem}_concat.txt"));
+    let _list_guard = TempPathGuard(list_path.clone());
 
-    let mut segments = db.query_recordings(camera, start_time, end_time)?;
-    if segments.is_empty() {
-        segments = db.query_recordings(camera, start_time - 15.0, end_time + 15.0)?;
-    }
-    let canon_media_dir = std::fs::canonicalize(media_dir).ok();
-    let existing_paths: Vec<PathBuf> = segments
-        .iter()
-        .filter_map(|s| {
-            let local = if let Some(rel) = strip_media_root(&s.path) {
-                media_dir.join(rel)
-            } else {
-                PathBuf::from(&s.path)
-            };
-            let lmeta = std::fs::symlink_metadata(&local).ok()?;
-            if !lmeta.file_type().is_file() {
-                return None;
-            }
-            let canon = std::fs::canonicalize(&local).ok()?;
-            if let Some(ref root_c) = canon_media_dir
-                && !canon.starts_with(root_c)
-            {
-                return None;
-            }
-            Some(canon)
-        })
-        .collect();
-
-    let Some(first_src) = existing_paths.first() else {
-        anyhow::bail!("no recording segments found to back up for {camera}");
-    };
-
-    if existing_paths.len() == 1 {
-        std::fs::copy(first_src, &out_mp4)
-            .with_context(|| format!("failed to copy alert clip to {}", out_mp4.display()))?;
-    } else {
-        let list_path = day_dir.join(format!(".{stem}_concat.txt"));
-        let _list_guard = TempPathGuard(list_path.clone());
-        let mut list_content = String::new();
-        for p in &existing_paths {
-            if let Some(line) = format_ffmpeg_concat_file_line(p) {
-                list_content.push_str(&line);
-            }
+    let db_prep = db.clone();
+    let media_dir_prep = media_dir.to_path_buf();
+    let day_dir_prep = day_dir.clone();
+    let cam_prep = camera.to_string();
+    let out_mp4_prep = out_mp4.clone();
+    let list_path_prep = list_path.clone();
+    let existing_paths = tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
+        std::fs::create_dir_all(&day_dir_prep).with_context(|| {
+            format!(
+                "failed to create alert backup dir {}",
+                day_dir_prep.display()
+            )
+        })?;
+        let mut segments = db_prep.query_recordings(&cam_prep, start_time, end_time)?;
+        if segments.is_empty() {
+            segments = db_prep.query_recordings(&cam_prep, start_time - 15.0, end_time + 15.0)?;
         }
-        let _ = std::fs::write(&list_path, &list_content);
+        let canon_media_dir = std::fs::canonicalize(&media_dir_prep).ok();
+        let existing_paths: Vec<PathBuf> = segments
+            .iter()
+            .filter_map(|s| {
+                let local = if let Some(rel) = strip_media_root(&s.path) {
+                    media_dir_prep.join(rel)
+                } else {
+                    PathBuf::from(&s.path)
+                };
+                let lmeta = std::fs::symlink_metadata(&local).ok()?;
+                if !lmeta.file_type().is_file() {
+                    return None;
+                }
+                let canon = std::fs::canonicalize(&local).ok()?;
+                if let Some(ref root_c) = canon_media_dir
+                    && !canon.starts_with(root_c)
+                {
+                    return None;
+                }
+                Some(canon)
+            })
+            .collect();
+
+        let Some(first_src) = existing_paths.first() else {
+            anyhow::bail!("no recording segments found to back up for {cam_prep}");
+        };
+
+        if existing_paths.len() == 1 {
+            std::fs::copy(first_src, &out_mp4_prep).with_context(|| {
+                format!("failed to copy alert clip to {}", out_mp4_prep.display())
+            })?;
+        } else {
+            let mut list_content = String::new();
+            for p in &existing_paths {
+                if let Some(line) = format_ffmpeg_concat_file_line(p) {
+                    list_content.push_str(&line);
+                }
+            }
+            std::fs::write(&list_path_prep, &list_content).with_context(|| {
+                format!("failed to write concat list {}", list_path_prep.display())
+            })?;
+        }
+        Ok(existing_paths)
+    })
+    .await
+    .context("alert backup preparation task panicked")??;
+
+    let remux_needed_fallback = if existing_paths.len() > 1 {
         let dur = if (end_time - start_time).is_finite() {
             (end_time - start_time).clamp(10.0, 3600.0)
         } else {
@@ -2668,45 +2980,59 @@ pub async fn backup_alert_clip(
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let remux_ok = cmd.status().await.map(|st| st.success()).unwrap_or(false);
-        let _ = std::fs::remove_file(&list_path);
-        if !remux_ok || !out_mp4.exists() {
-            std::fs::copy(first_src, &out_mp4)
-                .with_context(|| format!("failed to copy alert clip to {}", out_mp4.display()))?;
-        }
-    }
+        !remux_ok
+    } else {
+        false
+    };
 
-    if include_snapshot && let Some(t_rel) = thumb_rel {
-        let thumb_disk = if let Some(rel) = strip_media_root(t_rel) {
-            media_dir.join(rel)
-        } else {
-            PathBuf::from(t_rel)
-        };
-        if let Ok(lmeta) = std::fs::symlink_metadata(&thumb_disk)
-            && lmeta.file_type().is_file()
-            && let (Some(root_c), Ok(canon_thumb)) =
-                (&canon_media_dir, std::fs::canonicalize(&thumb_disk))
-            && canon_thumb.starts_with(root_c)
-        {
-            let ext: String = canon_thumb
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("webp")
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .collect();
-            let safe_ext = if ext.is_empty() { "webp" } else { &ext };
-            let snap_dst = day_dir.join(format!("{stem}.{safe_ext}"));
-            if let Err(err) = std::fs::copy(&canon_thumb, &snap_dst) {
-                warn!(
-                    "Failed to copy alert snapshot {} to {}: {err}",
-                    canon_thumb.display(),
-                    snap_dst.display()
-                );
+    let media_dir_fin = media_dir.to_path_buf();
+    let day_dir_fin = day_dir.clone();
+    let out_mp4_fin = out_mp4.clone();
+    let list_path_fin = list_path.clone();
+    let thumb_rel_owned = thumb_rel.map(|s| s.to_string());
+    tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        let _ = std::fs::remove_file(&list_path_fin);
+        if existing_paths.len() > 1 && (remux_needed_fallback || !out_mp4_fin.exists()) {
+            std::fs::copy(&existing_paths[0], &out_mp4_fin).with_context(|| {
+                format!("failed to copy alert clip to {}", out_mp4_fin.display())
+            })?;
+        }
+
+        if include_snapshot && let Some(ref t_rel) = thumb_rel_owned {
+            let canon_media_dir = std::fs::canonicalize(&media_dir_fin).ok();
+            let thumb_disk = if let Some(rel) = strip_media_root(t_rel) {
+                media_dir_fin.join(rel)
+            } else {
+                PathBuf::from(t_rel)
+            };
+            if let Ok(lmeta) = std::fs::symlink_metadata(&thumb_disk)
+                && lmeta.file_type().is_file()
+                && let (Some(root_c), Ok(canon_thumb)) =
+                    (&canon_media_dir, std::fs::canonicalize(&thumb_disk))
+                && canon_thumb.starts_with(root_c)
+            {
+                let ext: String = canon_thumb
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("webp")
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                let safe_ext = if ext.is_empty() { "webp" } else { &ext };
+                let snap_dst = day_dir_fin.join(format!("{stem}.{safe_ext}"));
+                if let Err(err) = std::fs::copy(&canon_thumb, &snap_dst) {
+                    warn!(
+                        "Failed to copy alert snapshot {} to {}: {err}",
+                        canon_thumb.display(),
+                        snap_dst.display()
+                    );
+                }
             }
         }
-    }
-
-    Ok(out_mp4)
+        Ok(out_mp4_fin)
+    })
+    .await
+    .context("alert backup finalize task panicked")?
 }
 
 /// Builds the FFmpeg CLI arguments used to remux/concatenate segments into an exported MP4 clip.
@@ -3053,6 +3379,31 @@ pub async fn build_mp4_export_with_privacy(
     include_audio: bool,
     privacy_mask: Option<&serde_json::Value>,
 ) -> Result<()> {
+    struct ExportCancelGuard {
+        db: NinjaDatabase,
+        export_id: String,
+        cancelled: Arc<AtomicBool>,
+        disarmed: bool,
+    }
+    impl Drop for ExportCancelGuard {
+        fn drop(&mut self) {
+            if !self.disarmed {
+                self.cancelled.store(true, Ordering::SeqCst);
+                if is_safe_identifier(&self.export_id) {
+                    let _ = self.db.delete_export(&self.export_id);
+                }
+            }
+        }
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut cancel_guard = ExportCancelGuard {
+        db: db.clone(),
+        export_id: export_id.to_string(),
+        cancelled: cancelled.clone(),
+        disarmed: false,
+    };
+
     let res = build_mp4_export_inner(
         db,
         media_dir,
@@ -3063,10 +3414,11 @@ pub async fn build_mp4_export_with_privacy(
         end_time,
         include_audio,
         privacy_mask,
+        cancelled,
     )
     .await;
-    if res.is_err() && is_safe_identifier(export_id) {
-        let _ = db.delete_export(export_id);
+    if res.is_ok() {
+        cancel_guard.disarmed = true;
     }
     res
 }
@@ -3104,15 +3456,25 @@ async fn build_mp4_export_inner(
     end_time: f64,
     include_audio: bool,
     privacy_mask: Option<&serde_json::Value>,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<()> {
     struct ExportTempGuard {
         tmp_out_file: PathBuf,
         list_file: PathBuf,
+        tmp_thumb_file: PathBuf,
+        thumb_file: PathBuf,
+        out_file: PathBuf,
+        disarmed: bool,
     }
     impl Drop for ExportTempGuard {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.list_file);
             let _ = std::fs::remove_file(&self.tmp_out_file);
+            let _ = std::fs::remove_file(&self.tmp_thumb_file);
+            if !self.disarmed {
+                let _ = std::fs::remove_file(&self.thumb_file);
+                let _ = std::fs::remove_file(&self.out_file);
+            }
         }
     }
 
@@ -3126,75 +3488,108 @@ async fn build_mp4_export_inner(
         anyhow::bail!("invalid export time range [{start_time}, {end_time}]");
     }
 
-    let mut segments = db.query_recordings(camera, start_time, end_time)?;
-    if segments.is_empty() {
-        segments = db.query_recordings(camera, start_time - 15.0, end_time + 15.0)?;
-    }
-    if segments.is_empty() {
-        anyhow::bail!("no recording segments found for {camera} in [{start_time}, {end_time}]");
-    }
-
     let exports_dir = media_dir.join("exports");
     let clips_dir = media_dir.join("clips");
-    std::fs::create_dir_all(&exports_dir)?;
-    std::fs::create_dir_all(&clips_dir)?;
-
     let nonce: u64 = rand::random();
     let out_file = exports_dir.join(format!("{export_id}.mp4"));
     let (tmp_out_file, list_file) = build_export_temp_paths(&exports_dir, export_id, nonce);
+    let tmp_thumb_file = clips_dir.join(format!(".{export_id}.{nonce:016x}.tmp.webp"));
     let thumb_file = clips_dir.join(format!("{export_id}.webp"));
-    let _temp_guard = ExportTempGuard {
+    let mut temp_guard = ExportTempGuard {
         tmp_out_file: tmp_out_file.clone(),
         list_file: list_file.clone(),
+        tmp_thumb_file: tmp_thumb_file.clone(),
+        thumb_file: thumb_file.clone(),
+        out_file: out_file.clone(),
+        disarmed: false,
     };
 
-    let mut list_content = String::new();
-    let mut existing_paths = Vec::new();
-    let mut first_seg_start = None;
-    let canon_media_dir = std::fs::canonicalize(media_dir).ok();
-    for seg in &segments {
-        let local_path = if let Some(rel) = strip_media_root(&seg.path) {
-            media_dir.join(rel)
-        } else {
-            PathBuf::from(&seg.path)
-        };
-        if std::fs::symlink_metadata(&local_path)
-            .map(|m| m.file_type().is_file())
-            .unwrap_or(false)
-            && let (Some(root_canon), Ok(seg_canon)) =
-                (&canon_media_dir, std::fs::canonicalize(&local_path))
-            && seg_canon.starts_with(root_canon)
-            && seg_canon.is_file()
-            && let Some(line) = format_ffmpeg_concat_file_line(&seg_canon)
-        {
-            if first_seg_start.is_none() {
-                first_seg_start = Some(seg.start_time);
+    if privacy_mask_is_configured(privacy_mask)
+        && build_privacy_drawbox_filter(privacy_mask).is_none()
+    {
+        anyhow::bail!(
+            "privacy mask is configured for {camera} but could not be compiled into a redaction filter"
+        );
+    }
+
+    let db_prep = db.clone();
+    let media_dir_prep = media_dir.to_path_buf();
+    let exports_dir_prep = exports_dir.clone();
+    let clips_dir_prep = clips_dir.clone();
+    let cam_prep = camera.to_string();
+    let exp_id_prep = export_id.to_string();
+    let list_file_prep = list_file.clone();
+    let tmp_out_prep = tmp_out_file.clone();
+    let tmp_thumb_prep = tmp_thumb_file.clone();
+    let cancel_prep = cancelled.clone();
+    let (existing_paths, first_seg_start) =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<PathBuf>, Option<f64>)> {
+            if cancel_prep.load(Ordering::SeqCst) {
+                anyhow::bail!("export {exp_id_prep} cancelled");
             }
-            list_content.push_str(&line);
-            existing_paths.push(seg_canon);
-        }
-    }
+            let mut segments = db_prep.query_recordings(&cam_prep, start_time, end_time)?;
+            if segments.is_empty() {
+                segments =
+                    db_prep.query_recordings(&cam_prep, start_time - 15.0, end_time + 15.0)?;
+            }
+            if segments.is_empty() {
+                anyhow::bail!(
+                    "no recording segments found for {cam_prep} in [{start_time}, {end_time}]"
+                );
+            }
 
-    if existing_paths.is_empty() {
-        anyhow::bail!("no segment files exist on disk for export {export_id}");
-    }
+            std::fs::create_dir_all(&exports_dir_prep)?;
+            std::fs::create_dir_all(&clips_dir_prep)?;
 
-    std::fs::write(&list_file, &list_content)?;
-    let _ = std::fs::remove_file(&tmp_out_file);
+            let mut list_content = String::new();
+            let mut existing_paths = Vec::new();
+            let mut first_seg_start = None;
+            let canon_media_dir = std::fs::canonicalize(&media_dir_prep).ok();
+            for seg in &segments {
+                let local_path = if let Some(rel) = strip_media_root(&seg.path) {
+                    media_dir_prep.join(rel)
+                } else {
+                    PathBuf::from(&seg.path)
+                };
+                if std::fs::symlink_metadata(&local_path)
+                    .map(|m| m.file_type().is_file())
+                    .unwrap_or(false)
+                    && let (Some(root_canon), Ok(seg_canon)) =
+                        (&canon_media_dir, std::fs::canonicalize(&local_path))
+                    && seg_canon.starts_with(root_canon)
+                    && seg_canon.is_file()
+                    && let Some(line) = format_ffmpeg_concat_file_line(&seg_canon)
+                {
+                    if first_seg_start.is_none() {
+                        first_seg_start = Some(seg.start_time);
+                    }
+                    list_content.push_str(&line);
+                    existing_paths.push(seg_canon);
+                }
+            }
+
+            if existing_paths.is_empty() {
+                anyhow::bail!("no segment files exist on disk for export {exp_id_prep}");
+            }
+            if cancel_prep.load(Ordering::SeqCst) {
+                anyhow::bail!("export {exp_id_prep} cancelled");
+            }
+            std::fs::write(&list_file_prep, &list_content)?;
+            if cancel_prep.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&list_file_prep);
+                anyhow::bail!("export {exp_id_prep} cancelled");
+            }
+            let _ = std::fs::remove_file(&tmp_out_prep);
+            let _ = std::fs::remove_file(&tmp_thumb_prep);
+            Ok((existing_paths, first_seg_start))
+        })
+        .await
+        .context("export preparation task panicked")??;
 
     let trim_offset = first_seg_start
         .map(|s0| (start_time - s0).max(0.0))
         .unwrap_or(0.0);
     let target_dur = (end_time - start_time).clamp(3.0, 86_400.0);
-
-    if privacy_mask_is_configured(privacy_mask)
-        && build_privacy_drawbox_filter(privacy_mask).is_none()
-    {
-        let _ = std::fs::remove_file(&list_file);
-        anyhow::bail!(
-            "privacy mask is configured for {camera} but could not be compiled into a redaction filter"
-        );
-    }
 
     let ffmpeg_bin = resolve_ffmpeg_bin();
     let ffmpeg_args = build_mp4_export_ffmpeg_args_with_privacy(
@@ -3212,34 +3607,72 @@ async fn build_mp4_export_inner(
         .kill_on_drop(true);
     let status = cmd.args(&ffmpeg_args).status().await;
 
-    let _ = std::fs::remove_file(&list_file);
-
-    if status.map(|s| !s.success()).unwrap_or(true)
-        || std::fs::metadata(&tmp_out_file)
-            .map(|m| m.len() < 1024)
-            .unwrap_or(true)
-    {
-        if privacy_mask_is_configured(privacy_mask) {
-            let _ = std::fs::remove_file(&tmp_out_file);
-            anyhow::bail!(
-                "failed to redact export {export_id} with privacy mask for camera {camera}"
-            );
+    let ff_ok = status.map(|s| s.success()).unwrap_or(false);
+    let mask_configured = privacy_mask_is_configured(privacy_mask);
+    let list_file_v = list_file.clone();
+    let tmp_out_v = tmp_out_file.clone();
+    let exp_id_v = export_id.to_string();
+    let cam_v = camera.to_string();
+    let cancel_v = cancelled.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let _ = std::fs::remove_file(&list_file_v);
+        if cancel_v.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&tmp_out_v);
+            anyhow::bail!("export {exp_id_v} cancelled");
         }
-        if !include_audio && existing_paths.iter().any(|p| mp4_file_has_audio_track(p)) {
-            let _ = std::fs::remove_file(&tmp_out_file);
-            anyhow::bail!("failed to strip audio track for export {export_id} on camera {camera}");
+        let valid_tmp = ff_ok
+            && std::fs::metadata(&tmp_out_v)
+                .map(|m| m.len() >= 1024)
+                .unwrap_or(false);
+        if !valid_tmp {
+            if mask_configured {
+                let _ = std::fs::remove_file(&tmp_out_v);
+                anyhow::bail!(
+                    "failed to redact export {exp_id_v} with privacy mask for camera {cam_v}"
+                );
+            }
+            if !include_audio && existing_paths.iter().any(|p| mp4_file_has_audio_track(p)) {
+                let _ = std::fs::remove_file(&tmp_out_v);
+                anyhow::bail!(
+                    "failed to strip audio track for export {exp_id_v} on camera {cam_v}"
+                );
+            }
+            std::fs::copy(&existing_paths[0], &tmp_out_v)?;
+            if cancel_v.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&tmp_out_v);
+                anyhow::bail!("export {exp_id_v} cancelled");
+            }
         }
-        std::fs::copy(&existing_paths[0], &tmp_out_file)?;
-    }
-
-    // Atomically publish completed MP4 only after +faststart rewrite has finished
-    std::fs::rename(&tmp_out_file, &out_file)?;
+        Ok(())
+    })
+    .await
+    .context("export segment verification task panicked")??;
 
     if export_id.starts_with("share_redacted_") || export_id.starts_with("share_clip_") {
+        let tmp_out_share = tmp_out_file.clone();
+        let out_share = out_file.clone();
+        let cancel_share = cancelled.clone();
+        let exp_id_share = export_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            if cancel_share.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&tmp_out_share);
+                anyhow::bail!("export {exp_id_share} cancelled");
+            }
+            std::fs::rename(&tmp_out_share, &out_share)?;
+            if cancel_share.load(Ordering::SeqCst) {
+                let _ = std::fs::remove_file(&out_share);
+                anyhow::bail!("export {exp_id_share} cancelled");
+            }
+            Ok(())
+        })
+        .await
+        .context("share export rename task panicked")??;
+        temp_guard.disarmed = true;
         return Ok(());
     }
 
-    // Extract a real video frame thumbnail as WebP (with RgbImage fallback and privacy mask filter)
+    // Extract a real video frame thumbnail from `tmp_out_file` into `tmp_thumb_file` BEFORE
+    // publishing `out_file`, so cancellation/timeout during thumbnail extraction never orphans `out_file`.
     let thumb_vf = if let Some(db_f) = build_privacy_drawbox_filter(privacy_mask) {
         format!("{db_f},scale=320:-1")
     } else {
@@ -3253,32 +3686,75 @@ async fn build_mp4_export_inner(
         .kill_on_drop(true);
     let thumb_status = thumb_cmd
         .args(["-y", "-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
-        .arg(sanitize_ffmpeg_path_arg(&out_file))
+        .arg(sanitize_ffmpeg_path_arg(&tmp_out_file))
         .args(["-frames:v", "1", "-vf", &thumb_vf])
-        .arg(sanitize_ffmpeg_path_arg(&thumb_file))
+        .arg(sanitize_ffmpeg_path_arg(&tmp_thumb_file))
         .status()
         .await;
 
-    if thumb_status.map(|s| !s.success()).unwrap_or(true) || !thumb_file.exists() {
-        let mut img = image::RgbImage::new(320, 180);
-        for p in img.pixels_mut() {
-            *p = image::Rgb([24, 30, 38]);
+    let thumb_ok = thumb_status.map(|s| s.success()).unwrap_or(false);
+    let db_fin = db.clone();
+    let exp_id_fin = export_id.to_string();
+    let cam_fin = camera.to_string();
+    let name_fin = name.to_string();
+    let tmp_out_fin = tmp_out_file.clone();
+    let out_fin = out_file.clone();
+    let tmp_thumb_fin = tmp_thumb_file.clone();
+    let thumb_fin = thumb_file.clone();
+    let cancel_fin = cancelled.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        if cancel_fin.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&tmp_out_fin);
+            let _ = std::fs::remove_file(&tmp_thumb_fin);
+            anyhow::bail!("export {exp_id_fin} cancelled");
         }
-        let _ = img.save_with_format(&thumb_file, image::ImageFormat::WebP);
-    }
+        if !thumb_ok || !tmp_thumb_fin.exists() {
+            let mut img = image::RgbImage::new(320, 180);
+            for p in img.pixels_mut() {
+                *p = image::Rgb([24, 30, 38]);
+            }
+            let _ = img.save_with_format(&tmp_thumb_fin, image::ImageFormat::WebP);
+        }
+        if cancel_fin.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&tmp_out_fin);
+            let _ = std::fs::remove_file(&tmp_thumb_fin);
+            anyhow::bail!("export {exp_id_fin} cancelled");
+        }
 
-    let video_rel = format!("/media/ninjanvr/exports/{export_id}.mp4");
-    let thumb_rel = format!("/media/ninjanvr/clips/{export_id}.webp");
-    db.insert_export(&ninjanvr_db::ExportRow {
-        id: export_id.to_string(),
-        camera: camera.to_string(),
-        name: name.to_string(),
-        date: unix_now_f64(),
-        video_path: video_rel,
-        thumb_path: thumb_rel,
-        in_progress: false,
-    })?;
+        let _ = std::fs::rename(&tmp_thumb_fin, &thumb_fin);
+        if let Err(err) = std::fs::rename(&tmp_out_fin, &out_fin) {
+            let _ = std::fs::remove_file(&thumb_fin);
+            return Err(err.into());
+        }
 
+        let video_rel = format!("/media/ninjanvr/exports/{exp_id_fin}.mp4");
+        let thumb_rel = format!("/media/ninjanvr/clips/{exp_id_fin}.webp");
+        if let Err(err) = db_fin.insert_export(&ninjanvr_db::ExportRow {
+            id: exp_id_fin.clone(),
+            camera: cam_fin,
+            name: name_fin,
+            date: unix_now_f64(),
+            video_path: video_rel,
+            thumb_path: thumb_rel,
+            in_progress: false,
+        }) {
+            let _ = std::fs::remove_file(&out_fin);
+            let _ = std::fs::remove_file(&thumb_fin);
+            return Err(err);
+        }
+
+        if cancel_fin.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&out_fin);
+            let _ = std::fs::remove_file(&thumb_fin);
+            let _ = db_fin.delete_export(&exp_id_fin);
+            anyhow::bail!("export {exp_id_fin} cancelled");
+        }
+        Ok(())
+    })
+    .await
+    .context("export publish task panicked")??;
+
+    temp_guard.disarmed = true;
     Ok(())
 }
 
@@ -5174,6 +5650,312 @@ cameras:
             std::fs::write(&non_iso_path, &payload).unwrap();
             assert!(!mp4_file_has_audio_track(&non_iso_path));
         }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sanitize_retention_days_and_headroom_reject_non_finite_and_overflow_bounds() {
+        // FLOATEDGE-001: NaN, +Inf, -Inf, 0.0, and negative values in retention days never coerce to 0.002 or 0.1
+        for bad_days in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -7.0,
+            -0.001,
+        ] {
+            let cont = sanitize_retention_days(bad_days, 7.0, 0.002);
+            assert_eq!(
+                cont, 7.0,
+                "bad continuous days {bad_days} must fall back to 7.0"
+            );
+            assert_ne!(cont, 0.002);
+
+            let alerts = sanitize_retention_days(bad_days, 7.0, 0.1);
+            assert_eq!(
+                alerts, 7.0,
+                "bad alerts days {bad_days} must fall back to 7.0"
+            );
+            assert_ne!(alerts, 0.1);
+
+            let motion = sanitize_retention_days(bad_days, cont, cont);
+            assert_eq!(
+                motion, 7.0,
+                "bad motion days {bad_days} must fall back to continuous"
+            );
+            assert!(motion.is_finite());
+        }
+
+        // Valid finite retention days clamp cleanly between min_days and MAX_RETENTION_DAYS
+        assert_eq!(sanitize_retention_days(0.0005, 7.0, 0.002), 0.002);
+        assert_eq!(sanitize_retention_days(14.0, 7.0, 0.002), 14.0);
+        assert_eq!(
+            sanitize_retention_days(1e100, 7.0, 0.002),
+            MAX_RETENTION_DAYS
+        );
+
+        // FLOATEDGE-001: NaN, +Inf, -Inf, <= 0.0, and overflowing min_free_gb never produce 0.1 MB cutoffs
+        for bad_gb in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -10.0,
+            f64::MAX,
+            f64::MAX / 512.0,
+            MAX_STORAGE_QUOTA_GB * 2.0,
+        ] {
+            assert_eq!(
+                compute_headroom_allowed_mb(5_000.0, 10_000.0, bad_gb),
+                None,
+                "bad min_free_gb {bad_gb} must never produce a 0.1 MB cutoff"
+            );
+        }
+        for bad_quota in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -5.0,
+            f64::MAX,
+            f64::MAX / 512.0,
+        ] {
+            assert_eq!(sanitize_quota_gb(Some(bad_quota)), None);
+        }
+        assert_eq!(
+            sanitize_quota_gb(Some(MAX_STORAGE_QUOTA_GB * 5.0)),
+            Some(MAX_STORAGE_QUOTA_GB)
+        );
+        assert_eq!(sanitize_quota_gb(Some(50.0)), Some(50.0));
+
+        // Valid finite deficit computes exact headroom target and returns None when free space is sufficient
+        assert_eq!(compute_headroom_allowed_mb(5_000.0, 4_096.0, 2.0), None);
+        assert_eq!(
+            compute_headroom_allowed_mb(5_000.0, 1_024.0, 2.0),
+            Some(3_976.0)
+        );
+        assert_eq!(compute_headroom_allowed_mb(f64::NAN, 1_024.0, 2.0), None);
+        assert_eq!(
+            compute_headroom_allowed_mb(5_000.0, f64::INFINITY, 2.0),
+            None
+        );
+    }
+
+    #[test]
+    fn activity_ring_rejects_non_finite_caps_max_samples_and_saturates_sums() {
+        let mut ring = CameraActivityRing::default();
+        ring.record_sample_with_audio(1_000.0, 100, 2, 1, -30);
+        assert_eq!(ring.len(), 1);
+
+        // FLOATEDGE-002: NaN, +Inf, -Inf, and negative timestamps are rejected without wiping history or wedging eviction
+        for bad_ts in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            ring.record_sample_with_audio(bad_ts, 999, 9, 9, -5);
+        }
+        assert_eq!(ring.len(), 1);
+        assert_eq!(
+            ring.aggregate_range_with_audio(990.0, 1_010.0),
+            (100, 2, 1, -30)
+        );
+        assert_eq!(
+            ring.aggregate_range_with_audio(f64::NAN, 1_010.0),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            ring.aggregate_range_with_audio(1_010.0, 990.0),
+            (0, 0, 0, 0)
+        );
+
+        // Advancing past 300s evicts the 1_000.0 sample cleanly
+        ring.record_sample_with_audio(1_305.0, 50, 1, 1, -20);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(
+            ring.aggregate_range_with_audio(990.0, 1_310.0),
+            (50, 1, 1, -20)
+        );
+
+        // RESEXHAUST-008: Pushing > MAX_ACTIVITY_SAMPLES within 300s enforces the hard cap
+        for i in 0..(MAX_ACTIVITY_SAMPLES + 500) {
+            ring.record_sample_with_audio(
+                1_305.0 + (i as f64) * 0.01,
+                u32::MAX,
+                u32::MAX,
+                u32::MAX,
+                -15,
+            );
+        }
+        assert_eq!(ring.len(), MAX_ACTIVITY_SAMPLES);
+
+        // Saturating addition handles repeated u32::MAX samples without overflow
+        let (m, o, r, peak) = ring.aggregate_range_with_audio(1_300.0, 2_000.0);
+        assert_eq!(m, (u32::MAX as i64) * (MAX_ACTIVITY_SAMPLES as i64));
+        assert_eq!(o, (u32::MAX as i64) * (MAX_ACTIVITY_SAMPLES as i64));
+        assert_eq!(r, (u32::MAX as i64) * (MAX_ACTIVITY_SAMPLES as i64));
+        assert_eq!(peak, -15);
+    }
+
+    #[tokio::test]
+    async fn export_cancellation_and_backup_concat_write_failure_clean_up_without_orphans() {
+        let root =
+            std::env::temp_dir().join(format!("ninjanvr-cancel-export-test-{}", random_suffix()));
+        let rec_dir = root.join("recordings/2026-11-05/12/front_door");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        let db = NinjaDatabase::open(root.join("ninjanvr.db")).unwrap();
+        let seg1 = rec_dir.join("00.00.mp4");
+        let seg2 = rec_dir.join("00.10.mp4");
+        let mut fake_mp4 = vec![0u8; 2048];
+        fake_mp4[0..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p']);
+        std::fs::write(&seg1, &fake_mp4).unwrap();
+        std::fs::write(&seg2, &fake_mp4).unwrap();
+
+        db.insert_recording(&RecordingRow {
+            id: "seg_c1".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-05/12/front_door/00.00.mp4".to_string(),
+            start_time: 1730808000.0,
+            end_time: 1730808010.0,
+            duration: 10.0,
+            motion: 5,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 0.002,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+        db.insert_recording(&RecordingRow {
+            id: "seg_c2".to_string(),
+            camera: "front_door".to_string(),
+            path: "/media/ninjanvr/recordings/2026-11-05/12/front_door/00.10.mp4".to_string(),
+            start_time: 1730808010.0,
+            end_time: 1730808020.0,
+            duration: 10.0,
+            motion: 5,
+            objects: 1,
+            dbfs: 0,
+            segment_size: 0.002,
+            regions: 1,
+            motion_heatmap: None,
+        })
+        .unwrap();
+
+        // CANCELSAFETY-003: Pre-insert an `in_progress: true` row, advance `build_mp4_export_with_privacy`
+        // across successive `.await` points, and drop the future before completion; verify the DB row is
+        // deleted and no orphaned `out_file`, `thumb_file`, or `.tmp.*` files remain on disk.
+        for (idx, max_polls) in [1usize, 2, 3].into_iter().enumerate() {
+            let export_id = format!("front_door_cancel_test_{idx}");
+            db.insert_export(&ninjanvr_db::ExportRow {
+                id: export_id.clone(),
+                camera: "front_door".to_string(),
+                name: "Cancelled Export".to_string(),
+                date: 1730808000.0,
+                video_path: format!("/media/ninjanvr/exports/{export_id}.mp4"),
+                thumb_path: format!("/media/ninjanvr/clips/{export_id}.webp"),
+                in_progress: true,
+            })
+            .unwrap();
+            assert!(db.get_export_by_id(&export_id).unwrap().is_some());
+
+            let mut completed_early = false;
+            {
+                let fut = build_mp4_export_with_privacy(
+                    &db,
+                    &root,
+                    &export_id,
+                    "front_door",
+                    "Cancelled Export",
+                    1730808000.0,
+                    1730808020.0,
+                    true,
+                    None,
+                );
+                tokio::pin!(fut);
+                let waker = std::task::Waker::noop();
+                let mut cx = std::task::Context::from_waker(waker);
+                for p in 0..max_polls {
+                    if std::future::Future::poll(fut.as_mut(), &mut cx).is_ready() {
+                        completed_early = true;
+                        break;
+                    }
+                    if p + 1 < max_polls {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+            if !completed_early {
+                assert!(
+                    db.get_export_by_id(&export_id).unwrap().is_none(),
+                    "dropping build_mp4_export_with_privacy (polls={max_polls}) must delete the stuck in_progress DB row"
+                );
+                assert!(
+                    !root
+                        .join("exports")
+                        .join(format!("{export_id}.mp4"))
+                        .exists(),
+                    "cancelled export (polls={max_polls}) must never leave an orphaned MP4 file"
+                );
+                assert!(
+                    !root
+                        .join("clips")
+                        .join(format!("{export_id}.webp"))
+                        .exists(),
+                    "cancelled export (polls={max_polls}) must never leave an orphaned thumbnail file"
+                );
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(root.join("exports")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                assert!(
+                    !name.ends_with(".tmp.mp4"),
+                    "leftover temp MP4 file after cancellation: {name}"
+                );
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(root.join("clips")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                assert!(
+                    !name.ends_with(".tmp.webp"),
+                    "leftover temp WebP file after cancellation: {name}"
+                );
+            }
+        }
+
+        // RESDISC-008: Multi-segment backup_alert_clip propagates concat list write errors instead of truncating
+        let backup_dir = root.join("backup_target");
+        let dt = Utc.timestamp_opt(1730808000, 0).single().unwrap();
+        let day_dir = backup_dir.join(dt.format("%Y-%m-%d").to_string());
+        // Pre-create the concat list path as a directory so `std::fs::write(&list_path, ...)` fails deterministically
+        let blocked_list_dir = day_dir.join(".front_door_1730808000_person_concat.txt");
+        std::fs::create_dir_all(&blocked_list_dir).unwrap();
+
+        let backup_err = backup_alert_clip(
+            &db,
+            &root,
+            &backup_dir,
+            "front_door",
+            "person",
+            1730808000.0,
+            1730808020.0,
+            None,
+            false,
+        )
+        .await
+        .expect_err("concat list write failure must propagate instead of silently truncating");
+        assert!(
+            backup_err
+                .to_string()
+                .contains("failed to write concat list"),
+            "unexpected backup error: {backup_err:#}"
+        );
+        assert!(
+            !day_dir.join("front_door_1730808000_person.mp4").exists(),
+            "truncated single-segment fallback must not be written when concat list write fails"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
