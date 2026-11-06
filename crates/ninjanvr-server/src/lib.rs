@@ -67,7 +67,10 @@ pub fn sanitize_logged_path(path: &str) -> String {
         .collect();
     let redact_share = |candidate: &str| -> Option<String> {
         let trimmed = candidate.trim_start_matches('/');
-        if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("share/") {
+        if trimmed
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("share/"))
+        {
             let rest = &trimmed[6..];
             if let Some((_, suffix)) = rest.split_once('/') {
                 return Some(format!("/share/<redacted>/{suffix}"));
@@ -572,8 +575,14 @@ pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600));
+                if let Err(err) =
+                    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+                {
+                    warn!(
+                        "Failed to enforce 0o600 permissions on {}: {err}",
+                        secret_path.display()
+                    );
+                }
             }
             return normalize_jwt_secret_entropy(trimmed);
         }
@@ -581,24 +590,92 @@ pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
     let mut bytes = [0u8; 64];
     rand::fill(&mut bytes);
     let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp_path = config_dir.join(format!(
+        ".jwt_secret.tmp.{}.{:016x}",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&secret_path)
-        {
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-            let _ = file.write_all(secret.as_bytes());
+        #[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
+        const O_NOFOLLOW_FLAG: i32 = 0o100000;
+        #[cfg(all(
+            target_os = "linux",
+            not(any(target_arch = "arm", target_arch = "aarch64"))
+        ))]
+        const O_NOFOLLOW_FLAG: i32 = 0o400000;
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))]
+        const O_NOFOLLOW_FLAG: i32 = 0x0100;
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd"
+            ))
+        ))]
+        const O_NOFOLLOW_FLAG: i32 = 0;
+
+        let persist_res = (|| -> std::io::Result<()> {
+            if std::fs::symlink_metadata(&secret_path)
+                .is_ok_and(|m| m.file_type().is_dir() || m.file_type().is_symlink())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Refusing to overwrite directory or symlink at .jwt_secret",
+                ));
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(O_NOFOLLOW_FLAG)
+                .open(&tmp_path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(secret.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp_path, &secret_path)?;
+            Ok(())
+        })();
+        if let Err(err) = persist_res {
+            let _ = std::fs::remove_file(&tmp_path);
+            warn!(
+                "Failed to persist generated JWT secret to {}: {err}",
+                secret_path.display()
+            );
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = std::fs::write(&secret_path, &secret);
+        use std::io::Write;
+        let persist_res = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            file.write_all(secret.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp_path, &secret_path)?;
+            Ok(())
+        })();
+        if let Err(err) = persist_res {
+            let _ = std::fs::remove_file(&tmp_path);
+            warn!(
+                "Failed to persist generated JWT secret to {}: {err}",
+                secret_path.display()
+            );
+        }
     }
     secret
 }
@@ -1480,12 +1557,17 @@ async fn auth_gate_middleware(
                 || path.starts_with("/api/debug/")
                 || path == "/api/debug"
                 || path.starts_with("/api/notifications/test")
+                || path == "/api/exports/delete"
+                || path == "/api/reviews/delete"
+                || path == "/api/events/delete"
                 || (method != "GET"
                     && method != "HEAD"
                     && (path.starts_with("/api/faces")
                         || path.starts_with("/api/dataset")
                         || path.starts_with("/api/false_positives")))
                 || (method == "DELETE"
+                    && !path.ends_with("/retain")
+                    && !path.ends_with("/viewed")
                     && (path.ends_with("/recordings")
                         || path.starts_with("/api/events")
                         || path.starts_with("/api/review")
@@ -2765,20 +2847,23 @@ async fn api_auth_oidc_callback(
                     };
                     let username = username_str.to_string();
                     let oidc_role = resolve_oidc_role(&merged_claims, &oidc_cfg);
-                    let (role, allowed_cameras) = match state.db.get_user(&username) {
-                        Ok(Some(db_u)) => (
-                            cap_external_role_by_db(&oidc_role, &db_u.role),
-                            Some(db_u.allowed_cameras),
-                        ),
-                        _ => (oidc_role, Some("*".to_string())),
-                    };
+                    let (canonical_username, role, allowed_cameras) =
+                        match state.db.get_user(&username) {
+                            Ok(Some(db_u)) => (
+                                db_u.username,
+                                cap_external_role_by_db(&oidc_role, &db_u.role),
+                                Some(db_u.allowed_cameras),
+                            ),
+                            _ => (username, oidc_role, Some("*".to_string())),
+                        };
                     let now = unix_now();
+                    let clamped_session_len = session_len.clamp(60, 86_400 * 365);
                     let jwt_claims = JwtClaims {
-                        sub: username,
+                        sub: canonical_username,
                         role,
                         allowed_cameras,
                         iat: now,
-                        exp: now + session_len,
+                        exp: now.saturating_add(clamped_session_len),
                     };
                     let session_token = jsonwebtoken::encode(
                         &Header::new(Algorithm::HS256),
@@ -2890,6 +2975,11 @@ fn clear_login_failures(scope_key: &str, user_key: &str) {
     guard.remove(&(scope_key.to_string(), user_key.to_ascii_lowercase()));
 }
 
+fn auth_pbkdf2_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(2))
+}
+
 async fn api_login(
     State(state): State<AppState>,
     uri: Uri,
@@ -2964,8 +3054,8 @@ async fn api_login(
         );
     }
 
-    let rate_scope = state.jwt_secret.as_str();
-    if check_login_rate_limited(rate_scope, trimmed_user) {
+    let rate_scope = state.jwt_secret.clone();
+    if check_login_rate_limited(&rate_scope, trimmed_user) {
         return (
             jar,
             (
@@ -2976,14 +3066,45 @@ async fn api_login(
         );
     }
 
-    let Ok(Some(db_user)) = state.db.get_user(trimmed_user) else {
-        // Equalize PBKDF2 timing when user does not exist to prevent username enumeration timing oracle
-        let dummy_hash = format!(
-            "pbkdf2_sha256${}$dummysalt0000000$0000000000000000000000000000000000000000000=",
-            hash_iterations.clamp(1_000, 600_000)
+    let Ok(_pbkdf2_permit) = auth_pbkdf2_semaphore().acquire().await else {
+        return (
+            jar,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "message": "Authentication worker pool unavailable" })),
+            )
+                .into_response(),
         );
-        let _ = verify_password(&body.password, &dummy_hash);
-        record_login_failure(rate_scope, trimmed_user);
+    };
+
+    let db_clone = state.db.clone();
+    let user_owned = trimmed_user.to_string();
+    let password_owned = body.password.clone();
+    let auth_res = tokio::task::spawn_blocking(move || match db_clone.get_user(&user_owned) {
+        Ok(Some(db_user)) => {
+            if verify_password(&password_owned, &db_user.password_hash) {
+                Some(db_user)
+            } else {
+                None
+            }
+        }
+        _ => {
+            // Equalize PBKDF2 timing when user does not exist to prevent username enumeration timing oracle
+            let dummy_hash = format!(
+                "pbkdf2_sha256${}$dummysalt0000000$0000000000000000000000000000000000000000000=",
+                hash_iterations.clamp(1_000, 600_000)
+            );
+            let _ = verify_password(&password_owned, &dummy_hash);
+            None
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    drop(_pbkdf2_permit);
+
+    let Some(db_user) = auth_res else {
+        record_login_failure(&rate_scope, trimmed_user);
         return (
             jar,
             (
@@ -2994,31 +3115,20 @@ async fn api_login(
         );
     };
 
-    if !verify_password(&body.password, &db_user.password_hash) {
-        record_login_failure(rate_scope, trimmed_user);
-        return (
-            jar,
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "message": "Login failed" })),
-            )
-                .into_response(),
-        );
-    }
-
-    clear_login_failures(rate_scope, trimmed_user);
+    clear_login_failures(&rate_scope, trimmed_user);
 
     if db_user.role == "admin" {
         state.config.write().await.auth.admin_first_time_login = false;
     }
 
     let now = unix_now();
+    let clamped_session_len = session_len.clamp(60, 86_400 * 365);
     let claims = JwtClaims {
         sub: db_user.username.clone(),
         role: db_user.role.clone(),
         allowed_cameras: Some(db_user.allowed_cameras.clone()),
         iat: now,
-        exp: now + session_len,
+        exp: now.saturating_add(clamped_session_len),
     };
 
     let token = jsonwebtoken::encode(
@@ -3172,7 +3282,7 @@ fn extract_authenticated_user_with_cfg(
                 };
                 if let Ok(Some(db_u)) = state.db.get_user(remote_user) {
                     return Some((
-                        remote_user.to_string(),
+                        db_u.username,
                         cap_external_role_by_db(&proxy_role, &db_u.role),
                     ));
                 }
@@ -3215,11 +3325,15 @@ fn extract_authenticated_user_with_cfg(
         return None;
     }
 
-    let role = match state.db.get_user(&decoded.claims.sub) {
-        Ok(Some(db_u)) => cap_external_role_by_db(&decoded.claims.role, &db_u.role),
+    let (canonical_sub, role) = match state.db.get_user(&decoded.claims.sub) {
+        Ok(Some(db_u)) => (
+            db_u.username,
+            cap_external_role_by_db(&decoded.claims.role, &db_u.role),
+        ),
         Ok(None) => {
-            if !decoded.claims.sub.eq_ignore_ascii_case("admin")
-                && decoded.claims.role.eq_ignore_ascii_case("admin")
+            if auth_cfg.enabled
+                && (decoded.claims.role.eq_ignore_ascii_case("admin")
+                    || decoded.claims.sub.eq_ignore_ascii_case("admin"))
             {
                 let oidc_active = auth_cfg.oidc.enabled
                     && (!auth_cfg.oidc.issuer_url.trim().is_empty()
@@ -3231,12 +3345,12 @@ fn extract_authenticated_user_with_cfg(
                     return None;
                 }
             }
-            decoded.claims.role
+            (decoded.claims.sub, decoded.claims.role)
         }
         Err(_) => return None,
     };
 
-    Some((decoded.claims.sub, role))
+    Some((canonical_sub, role))
 }
 
 async fn api_profile(
@@ -3331,10 +3445,6 @@ async fn api_profile_set(
             .into_response();
     }
     let active = state.comms.set_active_profile(&body.profile);
-    let cfg = state.config.read().await;
-    if let Some(cfg_dir) = cfg.config_path.parent() {
-        let _ = std::fs::write(cfg_dir.join(".active_profile"), &active);
-    }
     Json(json!({
         "success": true,
         "active_profile": active
@@ -3397,22 +3507,48 @@ async fn api_user_create(
             .into_response();
     }
     let iterations = state.config.read().await.auth.hash_iterations;
-    let cams = body.allowed_cameras.as_deref().unwrap_or("*");
-    match state.db.create_user_with_cameras(
-        &body.username,
-        &body.password,
-        &body.role,
-        cams,
-        iterations,
-    ) {
-        Ok(()) => Json(json!({
+    let Ok(_pbkdf2_permit) = auth_pbkdf2_semaphore().acquire().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "success": false, "message": "Authentication worker pool unavailable" })),
+        )
+            .into_response();
+    };
+    let db_clone = state.db.clone();
+    let username_owned = body.username.clone();
+    let password_owned = body.password.clone();
+    let role_owned = body.role.clone();
+    let cams_owned = body
+        .allowed_cameras
+        .clone()
+        .unwrap_or_else(|| "*".to_string());
+    let create_res = tokio::task::spawn_blocking(move || {
+        db_clone
+            .create_user_with_cameras(
+                &username_owned,
+                &password_owned,
+                &role_owned,
+                &cams_owned,
+                iterations,
+            )
+            .map(|()| db_clone.list_users().unwrap_or_default())
+    })
+    .await;
+    drop(_pbkdf2_permit);
+    match create_res {
+        Ok(Ok(users)) => Json(json!({
             "success": true,
             "message": format!("User '{}' created", body.username.trim()),
-            "users": state.db.list_users().unwrap_or_default()
+            "users": users
         }))
         .into_response(),
-        Err(err) => (
+        Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "success": false, "message": err.to_string() })),
         )
             .into_response(),
@@ -3449,13 +3585,36 @@ async fn api_user_password(
             .into_response();
     }
     let iterations = state.config.read().await.auth.hash_iterations;
-    match state
-        .db
-        .update_user_password(&username, &body.password, iterations)
-    {
-        Ok(true) => {
+    let Ok(_pbkdf2_permit) = auth_pbkdf2_semaphore().acquire().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "success": false, "message": "Authentication worker pool unavailable" })),
+        )
+            .into_response();
+    };
+    let db_clone = state.db.clone();
+    let username_owned = username.clone();
+    let password_owned = body.password.clone();
+    let update_res = tokio::task::spawn_blocking(move || {
+        let updated =
+            db_clone.update_user_password(&username_owned, &password_owned, iterations)?;
+        let is_admin_role = if updated {
+            db_clone
+                .get_user(&username_owned)
+                .ok()
+                .flatten()
+                .is_some_and(|u| u.role.trim().eq_ignore_ascii_case("admin"))
+        } else {
+            false
+        };
+        Ok::<(bool, bool), anyhow::Error>((updated, is_admin_role))
+    })
+    .await;
+    drop(_pbkdf2_permit);
+    match update_res {
+        Ok(Ok((true, is_admin_role))) => {
             clear_login_failures(&state.jwt_secret, username.trim());
-            if username.trim().eq_ignore_ascii_case("admin") {
+            if username.trim().eq_ignore_ascii_case("admin") && is_admin_role {
                 state.config.write().await.auth.admin_first_time_login = false;
             }
             Json(json!({
@@ -3464,13 +3623,18 @@ async fn api_user_password(
             }))
             .into_response()
         }
-        Ok(false) => (
+        Ok(Ok((false, _))) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "success": false, "message": "User not found" })),
         )
             .into_response(),
-        Err(err) => (
+        Ok(Err(err)) => (
             StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "success": false, "message": err.to_string() })),
         )
             .into_response(),
@@ -3506,19 +3670,41 @@ async fn api_user_role(
         )
             .into_response();
     }
-    match state.db.update_user_role(&username, &body.role) {
+    if let Some(ref cams) = body.allowed_cameras
+        && (cams.len() > 4096
+            || cams
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "*")
+                .any(|c| !is_safe_id(c)))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Invalid allowed_cameras format"
+            })),
+        )
+            .into_response();
+    }
+    match state.db.update_user_role_with_cameras(
+        &username,
+        &body.role,
+        body.allowed_cameras.as_deref(),
+    ) {
         Ok(true) => {
-            if let Some(ref cams) = body.allowed_cameras {
-                let _ = state.db.update_user_allowed_cameras(&username, cams);
-            } else if !body.role.trim().eq_ignore_ascii_case("admin")
-                && let Ok(Some(existing_u)) = state.db.get_user(&username)
-            {
-                let _ = state
-                    .db
-                    .update_user_allowed_cameras(&username, &existing_u.allowed_cameras);
-            }
             if body.role.trim().eq_ignore_ascii_case("viewer") {
-                let _ = state.db.revoke_share_links_by_creator(&username);
+                if let Err(err) = state.db.revoke_share_links_by_creator(&username) {
+                    warn!("Failed to revoke share links for demoted user '{username}': {err}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "success": false,
+                            "message": "Failed to revoke share links for demoted user"
+                        })),
+                    )
+                        .into_response();
+                }
                 if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
                     remove_creator_from_auto_revoked(&state, &mut auto_map, Some(&username), None);
                 }
@@ -3606,7 +3792,17 @@ async fn api_user_delete(
     match state.db.delete_user(&username) {
         Ok(true) => {
             clear_login_failures(&state.jwt_secret, username.trim());
-            let _ = state.db.revoke_share_links_by_creator(&username);
+            if let Err(err) = state.db.revoke_share_links_by_creator(&username) {
+                warn!("Failed to revoke share links for deleted user '{username}': {err}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "success": false,
+                        "message": "Failed to revoke share links for deleted user"
+                    })),
+                )
+                    .into_response();
+            }
             if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
                 remove_creator_from_auto_revoked(&state, &mut auto_map, Some(&username), None);
             }
@@ -3738,10 +3934,20 @@ async fn api_token_delete(
     });
     match state.db.delete_api_token(&id) {
         Ok(true) => {
-            if let Some(ref name) = token_name {
-                let _ = state
+            if let Some(ref name) = token_name
+                && let Err(err) = state
                     .db
-                    .revoke_share_links_by_creator(&format!("token:{name}"));
+                    .revoke_share_links_by_creator(&format!("token:{name}"))
+            {
+                warn!("Failed to revoke share links for deleted token '{name}': {err}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "success": false,
+                        "message": "Failed to revoke share links for deleted API token"
+                    })),
+                )
+                    .into_response();
             }
             if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
                 remove_creator_from_auto_revoked(
@@ -3862,7 +4068,9 @@ fn resolve_user_allowed_cameras(
                 .get(..6)
                 .is_some_and(|p| p.eq_ignore_ascii_case("token:"));
             if (is_token_principal && !has_non_api_jwt)
-                || (user.eq_ignore_ascii_case("admin") && role.eq_ignore_ascii_case("admin"))
+                || (!auth_cfg.enabled
+                    && user.eq_ignore_ascii_case("admin")
+                    && role.eq_ignore_ascii_case("admin"))
             {
                 return None;
             }
@@ -3892,7 +4100,7 @@ fn resolve_user_allowed_cameras(
                     headers
                         .get(user_hdr_name.as_str())
                         .and_then(|v| v.to_str().ok())
-                        .is_some_and(|u| u.trim() == user)
+                        .is_some_and(|u| u.trim().eq_ignore_ascii_case(user))
                 }
                 && {
                     let has_any_ip_hdr = headers.contains_key("x-peer-ip")
@@ -5277,10 +5485,6 @@ async fn api_mcp_handler(
                         .and_then(|v| v.as_str())
                         .unwrap_or("armed");
                     let active = state.comms.set_active_profile(prof);
-                    let cfg = state.config.read().await;
-                    if let Some(cfg_dir) = cfg.config_path.parent() {
-                        let _ = std::fs::write(cfg_dir.join(".active_profile"), &active);
-                    }
                     let res_val = json!({ "success": true, "active_profile": active });
                     Json(json!({
                         "jsonrpc": "2.0",
@@ -7875,8 +8079,28 @@ async fn api_review_delete(
                 .into_response();
         }
     }
-    let _ = state.db.delete_reviews(std::slice::from_ref(&id));
-    let _ = state.db.revoke_share_links_for_target(None, &id);
+    if let Err(err) = state.db.delete_reviews(std::slice::from_ref(&id)) {
+        warn!("Failed to delete review '{id}': {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to delete review"
+            })),
+        )
+            .into_response();
+    }
+    if let Err(err) = state.db.revoke_share_links_for_target(None, &id) {
+        warn!("Failed to revoke share links for review '{id}': {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to revoke share links for review"
+            })),
+        )
+            .into_response();
+    }
     purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
     Json(json!({ "success": true })).into_response()
@@ -7939,9 +8163,31 @@ async fn api_reviews_delete(
             }
         }
     }
-    let _ = state.db.delete_reviews(&body.ids);
+    if let Err(err) = state.db.delete_reviews(&body.ids) {
+        warn!("Failed to delete reviews in bulk: {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to delete reviews"
+            })),
+        )
+            .into_response();
+    }
     for id in &body.ids {
-        let _ = state.db.revoke_share_links_for_target(None, id);
+        if let Err(err) = state.db.revoke_share_links_for_target(None, id) {
+            warn!("Failed to revoke share links for review '{id}': {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Failed to revoke share links for review"
+                })),
+            )
+                .into_response();
+        }
+    }
+    for id in &body.ids {
         cleanup_share_clip_artifacts(&state.media_dir, id);
     }
     purge_revoked_share_credits(&state);
@@ -8139,8 +8385,28 @@ async fn api_event_delete(
                 .into_response();
         }
     }
-    let _ = state.db.delete_event(&id);
-    let _ = state.db.revoke_share_links_for_target(None, &id);
+    if let Err(err) = state.db.delete_event(&id) {
+        warn!("Failed to delete event '{id}': {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to delete event"
+            })),
+        )
+            .into_response();
+    }
+    if let Err(err) = state.db.revoke_share_links_for_target(None, &id) {
+        warn!("Failed to revoke share links for event '{id}': {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to revoke share links for event"
+            })),
+        )
+            .into_response();
+    }
     purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
     cleanup_event_media_artifacts(&state.media_dir, ev_cam.as_deref(), &id);
@@ -8218,9 +8484,31 @@ async fn api_events_bulk_delete(
             }
         }
     }
-    let _ = state.db.delete_events_bulk(&ids);
+    if let Err(err) = state.db.delete_events_bulk(&ids) {
+        warn!("Failed to delete events in bulk: {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to delete events"
+            })),
+        )
+            .into_response();
+    }
+    for (id, _) in &ev_cams {
+        if let Err(err) = state.db.revoke_share_links_for_target(None, id) {
+            warn!("Failed to revoke share links for event '{id}': {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Failed to revoke share links for event"
+                })),
+            )
+                .into_response();
+        }
+    }
     for (id, cam_opt) in &ev_cams {
-        let _ = state.db.revoke_share_links_for_target(None, id);
         cleanup_share_clip_artifacts(&state.media_dir, id);
         cleanup_event_media_artifacts(&state.media_dir, cam_opt.as_deref(), id);
     }
@@ -13716,6 +14004,16 @@ async fn api_camera_recordings_delete(
     let now = unix_now() as f64;
     let before = q.before.unwrap_or(now);
     let after = q.after.unwrap_or(0.0);
+    if !after.is_finite() || !before.is_finite() || after < 0.0 || before < after {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Invalid recordings deletion time range"
+            })),
+        )
+            .into_response();
+    }
     let deleted = state
         .db
         .delete_recordings_in_range(&camera, after, before)
@@ -14475,7 +14773,17 @@ async fn api_share_revoke(
                 .into_response();
         }
     }
-    let _ = state.db.revoke_share_link(&id);
+    if let Err(err) = state.db.revoke_share_link(&id) {
+        warn!("Failed to revoke share link '{id}' in database: {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to revoke share link"
+            })),
+        )
+            .into_response();
+    }
     if let Ok(mut map) = state.share_page_video_credits.lock() {
         map.remove(&id);
     }
@@ -14522,7 +14830,7 @@ fn remove_creator_from_auto_revoked(
         };
         if let Some(u) = target_user {
             let link_u = cb.strip_prefix("ext:").unwrap_or(cb).trim();
-            if !cb.starts_with("token:") && link_u == u {
+            if !cb.starts_with("token:") && link_u.eq_ignore_ascii_case(u) {
                 return false;
             }
         }
@@ -14634,17 +14942,17 @@ async fn api_share_create(
     let jti = format!("shr_{}_{:032x}", now, rand::random::<u128>());
     let created_by = {
         let cfg = state.config.read().await;
+        let auth_enabled = cfg.auth.enabled;
         extract_authenticated_user_with_cfg(&state, &jar, &headers, &cfg.auth)
             .map(|(u, _)| {
-                if u.starts_with("token:")
-                    || u.starts_with("ext:")
-                    || matches!(state.db.get_user(&u), Ok(Some(_)))
-                    || (u.eq_ignore_ascii_case("admin")
-                        && matches!(state.db.get_user(&u), Ok(None)))
-                {
+                if u.starts_with("token:") || u.starts_with("ext:") {
                     u
+                } else if let Ok(Some(db_u)) = state.db.get_user(&u) {
+                    db_u.username
+                } else if !auth_enabled && u.eq_ignore_ascii_case("admin") {
+                    "admin".to_string()
                 } else {
-                    format!("ext:{u}")
+                    format!("ext:{}", u.to_ascii_lowercase())
                 }
             })
             .unwrap_or_else(|| "admin".to_string())
@@ -14915,8 +15223,13 @@ fn verify_share_jti_with_view_mode(
     if let Some(created_by) = link["created_by"].as_str()
         && !created_by.is_empty()
     {
-        let revoke_invalid_creator_jti = |reason: &'static str| {
-            if !created_by.eq_ignore_ascii_case("admin") {
+        let auth_enabled = state
+            .config
+            .try_read()
+            .map(|cfg| cfg.auth.enabled)
+            .unwrap_or(true);
+        let revoke_invalid_creator_jti = |reason: &'static str, force_db_revoke: bool| {
+            if force_db_revoke || created_by != "admin" {
                 let _ = state.db.revoke_share_link(jti);
             }
             if let Ok(mut auto_map) = state.share_creator_auto_revoked.lock() {
@@ -14946,14 +15259,14 @@ fn verify_share_jti_with_view_mode(
                 .unwrap_or(false);
             if !token_valid {
                 let reason = "Share link creator API token revoked or expired";
-                revoke_invalid_creator_jti(reason);
+                revoke_invalid_creator_jti(reason, false);
                 return Err((StatusCode::FORBIDDEN, reason));
             }
         } else if let Some(ext_user) = created_by.strip_prefix("ext:") {
             let trimmed_ext = ext_user.trim();
             if trimmed_ext.is_empty() {
                 let reason = "Share link creator user no longer exists";
-                revoke_invalid_creator_jti(reason);
+                revoke_invalid_creator_jti(reason, true);
                 return Err((StatusCode::FORBIDDEN, reason));
             }
             if let Ok(Some(db_u)) = state.db.get_user(trimmed_ext) {
@@ -14963,7 +15276,7 @@ fn verify_share_jti_with_view_mode(
                     || role_trimmed.eq_ignore_ascii_case("metrics")
                 {
                     let reason = "Share link creator role is not permitted to share";
-                    revoke_invalid_creator_jti(reason);
+                    revoke_invalid_creator_jti(reason, false);
                     return Err((StatusCode::FORBIDDEN, reason));
                 }
                 if !role_trimmed.eq_ignore_ascii_case("admin") {
@@ -14981,7 +15294,7 @@ fn verify_share_jti_with_view_mode(
                                 .is_some_and(|c| allowed.contains(&c));
                         if !cam_ok {
                             let reason = "Share link creator camera access revoked";
-                            revoke_invalid_creator_jti(reason);
+                            revoke_invalid_creator_jti(reason, false);
                             return Err((StatusCode::FORBIDDEN, reason));
                         }
                     }
@@ -14996,7 +15309,7 @@ fn verify_share_jti_with_view_mode(
                         || role_trimmed.eq_ignore_ascii_case("metrics")
                     {
                         let reason = "Share link creator role is not permitted to share";
-                        revoke_invalid_creator_jti(reason);
+                        revoke_invalid_creator_jti(reason, false);
                         return Err((StatusCode::FORBIDDEN, reason));
                     }
                     if !role_trimmed.eq_ignore_ascii_case("admin") {
@@ -15014,16 +15327,16 @@ fn verify_share_jti_with_view_mode(
                                     .is_some_and(|c| allowed.contains(&c));
                             if !cam_ok {
                                 let reason = "Share link creator camera access revoked";
-                                revoke_invalid_creator_jti(reason);
+                                revoke_invalid_creator_jti(reason, false);
                                 return Err((StatusCode::FORBIDDEN, reason));
                             }
                         }
                     }
                 }
-                Ok(None) if created_by.eq_ignore_ascii_case("admin") => {}
+                Ok(None) if !auth_enabled && created_by.eq_ignore_ascii_case("admin") => {}
                 Ok(None) | Err(_) => {
                     let reason = "Share link creator user no longer exists";
-                    revoke_invalid_creator_jti(reason);
+                    revoke_invalid_creator_jti(reason, true);
                     return Err((StatusCode::FORBIDDEN, reason));
                 }
             }
@@ -15122,6 +15435,34 @@ fn rollback_share_stream_cursor(
             entry.active_stream_expires[idx] = prev_exp;
         }
         entry.sync_stream_summary();
+    }
+}
+
+struct ShareStreamCursorGuard {
+    state: AppState,
+    payload: ShareTokenPayload,
+    cursor: Option<(usize, u64, u64)>,
+}
+
+impl ShareStreamCursorGuard {
+    fn new(state: AppState, payload: ShareTokenPayload, cursor: Option<(usize, u64, u64)>) -> Self {
+        Self {
+            state,
+            payload,
+            cursor,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cursor = None;
+    }
+}
+
+impl Drop for ShareStreamCursorGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.cursor.take() {
+            rollback_share_stream_cursor(&self.state, &self.payload, Some(c));
+        }
     }
 }
 
@@ -15913,6 +16254,9 @@ fn cleanup_camera_share_clip_artifacts_in_range(
     after: f64,
     before: f64,
 ) {
+    if !after.is_finite() || !before.is_finite() || after < 0.0 || before < after {
+        return;
+    }
     let cam_trimmed = camera.trim();
     let query_after = (after - 15.0).max(0.0);
     let query_before = before + 15.0;
@@ -16637,6 +16981,9 @@ async fn share_video_mp4(
         }
     }
 
+    let mut stream_cursor_guard =
+        ShareStreamCursorGuard::new(state.clone(), payload.clone(), prev_stream_cursor);
+
     let resp: Response = async {
         let count_view = match verify_share_jti_with_view_mode(
             &state,
@@ -17340,8 +17687,8 @@ async fn share_video_mp4(
     }
     .await;
 
-    if !resp.status().is_success() {
-        rollback_share_stream_cursor(&state, &payload, prev_stream_cursor);
+    if resp.status().is_success() {
+        stream_cursor_guard.disarm();
     }
     resp
 }
@@ -17694,6 +18041,43 @@ impl Default for CreateExportBody {
     }
 }
 
+struct ExportInProgressGuard {
+    db: NinjaDatabase,
+    media_dir: PathBuf,
+    id: String,
+    video_rel: String,
+    thumb_rel: String,
+    armed: bool,
+}
+
+impl ExportInProgressGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ExportInProgressGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.db.delete_export(&self.id);
+        cleanup_share_clip_artifacts(&self.media_dir, &self.id);
+        let (safe_vpath, safe_tpath) =
+            resolve_safe_export_unlink_paths(&self.media_dir, &self.video_rel, &self.thumb_rel);
+        if let Some(vp) = safe_vpath {
+            let _ = std::fs::remove_file(vp);
+        }
+        if let Some(tp) = safe_tpath {
+            let _ = std::fs::remove_file(tp);
+        }
+        let exports_dir = self.media_dir.join("exports");
+        let clips_dir = self.media_dir.join("clips");
+        remove_non_symlink_dir_child(&exports_dir, &format!("{}.mp4", self.id));
+        remove_non_symlink_dir_child(&clips_dir, &format!("{}.webp", self.id));
+    }
+}
+
 async fn api_export_create(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -17796,15 +18180,32 @@ async fn api_export_create(
     let video_rel = format!("/media/ninjanvr/exports/{id}.mp4");
     let thumb_rel = format!("/media/ninjanvr/clips/{id}.webp");
     let now = unix_now() as f64;
-    let _ = state.db.insert_export(&ExportRow {
+    if let Err(err) = state.db.insert_export(&ExportRow {
         id: id.clone(),
         camera: camera.clone(),
         name: name.clone(),
         date: now,
-        video_path: video_rel,
-        thumb_path: thumb_rel,
+        video_path: video_rel.clone(),
+        thumb_path: thumb_rel.clone(),
         in_progress: true,
-    });
+    }) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": format!("Failed to register export in database: {err}")
+            })),
+        )
+            .into_response();
+    }
+    let mut in_progress_guard = ExportInProgressGuard {
+        db: state.db.clone(),
+        media_dir: state.media_dir.clone(),
+        id: id.clone(),
+        video_rel,
+        thumb_rel,
+        armed: true,
+    };
 
     let db_clone = state.db.clone();
     let media_dir_clone = state.media_dir.clone();
@@ -17838,15 +18239,18 @@ async fn api_export_create(
     cleanup_share_clip_artifacts(&state.media_dir, &id);
 
     match export_res {
-        Ok(Ok(())) => Json(json!({
-            "success": true,
-            "export_id": id,
-            "video_url": format!("/exports/{id}.mp4"),
-            "thumb_url": format!("/clips/{id}.webp")
-        }))
-        .into_response(),
+        Ok(Ok(())) => {
+            in_progress_guard.disarm();
+            Json(json!({
+                "success": true,
+                "export_id": id,
+                "video_url": format!("/exports/{id}.mp4"),
+                "thumb_url": format!("/clips/{id}.webp")
+            }))
+            .into_response()
+        }
         Ok(Err(err)) => {
-            let _ = state.db.delete_export(&id);
+            drop(in_progress_guard);
             (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -17857,7 +18261,7 @@ async fn api_export_create(
                 .into_response()
         }
         Err(_) => {
-            let _ = state.db.delete_export(&id);
+            drop(in_progress_guard);
             (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(json!({
@@ -17981,8 +18385,12 @@ async fn api_export_delete(
         )
             .into_response();
     }
-    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
-        return err_resp;
+    if !caller_can_mutate(&state, &jar, &headers, true).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Forbidden: admin role required" })),
+        )
+            .into_response();
     }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
         && !allowed.iter().any(|a| a == "*")
@@ -18010,7 +18418,17 @@ async fn api_export_delete(
                 .into_response();
         }
     }
-    let _ = state.db.revoke_share_links_for_target(Some("export"), &id);
+    if let Err(err) = state.db.revoke_share_links_for_target(Some("export"), &id) {
+        warn!("Failed to revoke share links for export '{id}': {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to revoke share links for export"
+            })),
+        )
+            .into_response();
+    }
     purge_revoked_share_credits(&state);
     cleanup_share_clip_artifacts(&state.media_dir, &id);
     if let Ok(Some((vpath, tpath))) = state.db.delete_export(&id) {
@@ -18043,8 +18461,12 @@ async fn api_exports_bulk_delete(
         )
             .into_response();
     }
-    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
-        return err_resp;
+    if !caller_can_mutate(&state, &jar, &headers, true).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Forbidden: admin role required" })),
+        )
+            .into_response();
     }
     if body.ids.len() > 1000 {
         return (
@@ -18085,7 +18507,17 @@ async fn api_exports_bulk_delete(
         }
     }
     for id in body.ids {
-        let _ = state.db.revoke_share_links_for_target(Some("export"), &id);
+        if let Err(err) = state.db.revoke_share_links_for_target(Some("export"), &id) {
+            warn!("Failed to revoke share links for export '{id}': {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Failed to revoke share links for export"
+                })),
+            )
+                .into_response();
+        }
         cleanup_share_clip_artifacts(&state.media_dir, &id);
         if let Ok(Some((vpath, tpath))) = state.db.delete_export(&id) {
             let (safe_vpath, safe_tpath) =
@@ -28371,13 +28803,27 @@ cameras:
                 in_progress: false,
             })
             .unwrap();
-        let resp_bulk_del_fd_ok = auth_app
+        let resp_bulk_del_fd_op = auth_app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/exports/delete")
                     .header(header::AUTHORIZATION, &scoped_op_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ids":["front_door_300_400"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_bulk_del_fd_op.status(), StatusCode::FORBIDDEN);
+        let resp_bulk_del_fd_ok = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/exports/delete")
+                    .header(header::AUTHORIZATION, &admin_hdr)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"ids":["front_door_300_400"]}"#))
                     .unwrap(),
@@ -38837,5 +39283,316 @@ cameras:
         assert_eq!(ds_admin_json["by_camera"]["backyard"], 1);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn security_p2b_server_auth_rbac_share_cancel_safety_regression() {
+        // 1. STRSLICE-001: sanitize_logged_path("/a€€") and GET /a%E2%82%AC%E2%82%AC do not panic
+        assert_eq!(sanitize_logged_path("/a€€"), "/a€€");
+        assert_eq!(
+            sanitize_logged_path("/a%E2%82%AC%E2%82%AC"),
+            "/a%E2%82%AC%E2%82%AC"
+        );
+        assert_eq!(
+            sanitize_logged_path("/SHARE/tok123/video.mp4"),
+            "/share/<redacted>/video.mp4"
+        );
+
+        let ctx = setup_test_app().await;
+        let state = ctx.state.clone();
+        let auth_app = build_router_with_auth(state.clone(), true);
+
+        let r_utf8_path = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/a%E2%82%AC%E2%82%AC")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_utf8_path.status(), StatusCode::OK);
+
+        // 2. STRCMP-001: case-variant OIDC/ForwardAuth user 'Alice' is capped by DB user 'alice';
+        //    deleted 'admin' JWT is rejected when auth.enabled = true.
+        state
+            .db
+            .create_user_with_cameras("alice", "pass1234", "viewer", "front_door", 1000)
+            .unwrap();
+        {
+            let mut cfg = state.config.write().await;
+            cfg.auth.proxy.enabled = true;
+            cfg.auth.proxy.user_header = "Remote-User".to_string();
+            cfg.auth.proxy.groups_header = "Remote-Groups".to_string();
+            cfg.auth.proxy.trusted_proxies = vec!["127.0.0.1/32".to_string()];
+            cfg.auth.oidc.role_mapping.admin = vec!["admins".to_string()];
+        }
+        let mut proxy_headers = HeaderMap::new();
+        proxy_headers.insert("remote-user", "Alice".parse().unwrap());
+        proxy_headers.insert("remote-groups", "admins".parse().unwrap());
+        proxy_headers.insert("x-peer-ip", "127.0.0.1".parse().unwrap());
+        let auth_cfg_snap = state.config.read().await.auth.clone();
+        let extracted = extract_authenticated_user_with_cfg(
+            &state,
+            &CookieJar::new(),
+            &proxy_headers,
+            &auth_cfg_snap,
+        );
+        assert_eq!(
+            extracted,
+            Some(("alice".to_string(), "viewer".to_string())),
+            "ForwardAuth user 'Alice' must resolve to canonical 'alice' and be capped to DB role 'viewer'"
+        );
+        let allowed_cams = resolve_user_allowed_cameras(
+            &state,
+            &CookieJar::new(),
+            &proxy_headers,
+            &auth_cfg_snap,
+            "Alice",
+            "viewer",
+        );
+        assert_eq!(
+            allowed_cams,
+            Some(vec!["front_door".to_string()]),
+            "ForwardAuth user 'Alice' must be restricted to DB user 'alice' allowed_cameras"
+        );
+        {
+            let mut cfg = state.config.write().await;
+            cfg.auth.proxy.enabled = false;
+        }
+
+        let now = unix_now();
+        let mint_jwt = |sub: &str, role: &str, cams: Option<&str>| -> String {
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &JwtClaims {
+                    sub: sub.to_string(),
+                    role: role.to_string(),
+                    allowed_cameras: cams.map(str::to_string),
+                    iat: now,
+                    exp: now + 3600,
+                },
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            )
+            .unwrap()
+        };
+
+        // Create second admin so we can delete 'admin' and verify stale 'admin' JWT is rejected
+        state
+            .db
+            .create_user_with_cameras("backup_admin", "pass1234", "admin", "*", 1000)
+            .unwrap();
+        let stale_admin_jwt = mint_jwt("admin", "admin", Some("*"));
+        assert!(state.db.delete_user("admin").unwrap());
+        let auth_cfg_after_del = state.config.read().await.auth.clone();
+        let mut stale_admin_hdrs = HeaderMap::new();
+        stale_admin_hdrs.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {stale_admin_jwt}").parse().unwrap(),
+        );
+        assert_eq!(
+            extract_authenticated_user_with_cfg(
+                &state,
+                &CookieJar::new(),
+                &stale_admin_hdrs,
+                &auth_cfg_after_del,
+            ),
+            None,
+            "Deleted 'admin' JWT must be rejected when auth.enabled = true and OIDC is inactive"
+        );
+        assert_eq!(
+            resolve_user_allowed_cameras(
+                &state,
+                &CookieJar::new(),
+                &stale_admin_hdrs,
+                &auth_cfg_after_del,
+                "admin",
+                "admin",
+            ),
+            Some(Vec::new()),
+            "Deleted 'admin' must resolve to empty allowed_cameras when auth.enabled = true"
+        );
+        // Restore default admin for subsequent checks
+        state
+            .db
+            .create_user_with_cameras("admin", "adminpass123", "admin", "*", 1000)
+            .unwrap();
+
+        // 3. STRCMP-002: operator calling POST /api/exports/delete is rejected with 403 Forbidden,
+        //    while operator calling DELETE /api/events/{id}/retain or DELETE /api/review/{id}/viewed is allowed
+        state
+            .db
+            .create_user_with_cameras("op_p2b", "pass1234", "operator", "*", 1000)
+            .unwrap();
+        let op_bearer = format!("Bearer {}", mint_jwt("op_p2b", "operator", Some("*")));
+        state
+            .db
+            .insert_export(&ExportRow {
+                id: "exp_p2b_1".to_string(),
+                camera: "front_door".to_string(),
+                name: "P2B Export".to_string(),
+                date: now as f64,
+                video_path: "/media/ninjanvr/exports/exp_p2b_1.mp4".to_string(),
+                thumb_path: "/media/ninjanvr/clips/exp_p2b_1.webp".to_string(),
+                in_progress: false,
+            })
+            .unwrap();
+
+        let r_op_bulk_exp_del = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/exports/delete")
+                    .header(header::AUTHORIZATION, &op_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"ids":["exp_p2b_1"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_op_bulk_exp_del.status(), StatusCode::FORBIDDEN);
+        assert!(state.db.get_export_by_id("exp_p2b_1").unwrap().is_some());
+
+        state
+            .db
+            .upsert_event(&ninjanvr_db::EventDto {
+                id: "ev_p2b_retain".to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: 1000.0,
+                end_time: Some(1005.0),
+                has_clip: false,
+                has_snapshot: false,
+                plus_id: None,
+                retain_indefinitely: true,
+                sub_label: None,
+                top_score: Some(0.9),
+                false_positive: Some(false),
+                box_coords: None,
+                data: json!({}),
+                thumbnail: None,
+                area: None,
+                ratio: None,
+                score: Some(0.9),
+                stationary: false,
+            })
+            .unwrap();
+        let r_op_retain_off = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/events/ev_p2b_retain/retain")
+                    .header(header::AUTHORIZATION, &op_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_op_retain_off.status(), StatusCode::OK);
+
+        state
+            .db
+            .insert_review_segment(&ninjanvr_db::ReviewItemDto {
+                id: "rev_p2b_viewed".to_string(),
+                camera: "front_door".to_string(),
+                severity: "alert".to_string(),
+                start_time: 1000.0,
+                end_time: Some(1010.0),
+                has_been_reviewed: true,
+                data: json!({}),
+                thumb_path: "/media/ninjanvr/clips/front_door-rev_p2b_viewed.webp".to_string(),
+            })
+            .unwrap();
+        let r_op_unview = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/review/rev_p2b_viewed/viewed")
+                    .header(header::AUTHORIZATION, &op_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_op_unview.status(), StatusCode::OK);
+
+        // 4. CANCELSAFETY-002: dropping ShareStreamCursorGuard rolls back active_streams[idx] in share_page_video_credits
+        {
+            let mut map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.entry("shr_cancel_test".to_string()).or_default();
+            entry.active_streams = vec![1024];
+            entry.active_stream_expires = vec![now + 900];
+            entry.sync_stream_summary();
+        }
+        let guard_payload = ShareTokenPayload {
+            k: "export".to_string(),
+            id: "exp_p2b_1".to_string(),
+            exp: now + 3600,
+            cam: Some("front_door".to_string()),
+            jti: Some("shr_cancel_test".to_string()),
+        };
+        {
+            let _guard = ShareStreamCursorGuard::new(
+                state.clone(),
+                guard_payload.clone(),
+                Some((0, 128, now + 300)),
+            );
+        }
+        {
+            let map = state.share_page_video_credits.lock().unwrap();
+            let entry = map.get("shr_cancel_test").unwrap();
+            assert_eq!(entry.active_streams[0], 128);
+            assert_eq!(entry.active_stream_expires[0], now + 300);
+        }
+
+        // 5. FLOATEDGE-003 & ARITHOFL-001: cleanup_camera_share_clip_artifacts_in_range(NaN) is a no-op;
+        //    extreme session_length clamps without overflow.
+        let exports_dir = state.media_dir.join("exports");
+        std::fs::create_dir_all(&exports_dir).unwrap();
+        let cached_clip = exports_dir.join("share_clip_ev_p2b_retain.mp4");
+        std::fs::write(&cached_clip, b"CACHED_CLIP_BYTES").unwrap();
+        cleanup_camera_share_clip_artifacts_in_range(&state, "front_door", f64::NAN, now as f64);
+        assert!(
+            cached_clip.exists(),
+            "cleanup_camera_share_clip_artifacts_in_range(NaN) must be a no-op and preserve cached artifacts"
+        );
+        let admin_bearer = format!("Bearer {}", mint_jwt("admin", "admin", Some("*")));
+        let r_nan_del = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/front_door/recordings?after=NaN")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_nan_del.status(), StatusCode::BAD_REQUEST);
+        assert!(cached_clip.exists());
+
+        {
+            let mut cfg = state.config.write().await;
+            cfg.auth.session_length = u64::MAX;
+        }
+        let r_login_extreme = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"user":"admin","password":"adminpass123"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_login_extreme.status(), StatusCode::OK);
     }
 }
