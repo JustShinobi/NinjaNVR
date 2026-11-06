@@ -356,6 +356,16 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       const data = await res.json().catch(() => null);
       if (!isMountedRef.current) return;
       if (res.ok && data) {
+        const sampleId = String(data.id || data.sample?.id || `ds_${targetId}`);
+        if (sampleId) {
+          void fetch(
+            `/api/dataset/samples/${encodeURIComponent(sampleId)}/auto-annotate`,
+            {
+              method: "POST",
+              credentials: "include",
+            }
+          ).catch(() => null);
+        }
         setAddedDatasetIds((prev) => ({ ...prev, [targetId]: true }));
         const split = data.split || data.sample?.split || "train";
         notify(
