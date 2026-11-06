@@ -470,6 +470,32 @@ pub fn crop_and_scale_rgb_image(
     out
 }
 
+/// Crops `region` from `full_img` and scales it into a square `side x side` `RgbImage`
+/// (e.g. `112x112` for ArcFace/AdaFace and `decode_or_extract_rgb_grid_16x16` face matching).
+pub fn crop_and_scale_rgb_square(full_img: &RgbImage, region: BoundingBox, side: u32) -> RgbImage {
+    let eff_side = side.max(16);
+    if full_img.width() == 0 || full_img.height() == 0 {
+        return RgbImage::new(eff_side, eff_side);
+    }
+    let fw = full_img.width().max(1);
+    let fh = full_img.height().max(1);
+    let x0 = region.x_min.min(fw - 1);
+    let y0 = region.y_min.min(fh - 1);
+    let x1 = region.x_max.clamp(x0 + 1, fw);
+    let y1 = region.y_max.clamp(y0 + 1, fh);
+    let rw = (x1 - x0).max(1);
+    let rh = (y1 - y0).max(1);
+    let mut out = RgbImage::new(eff_side, eff_side);
+    for dy in 0..eff_side {
+        let sy = (y0 + ((dy as u64 * rh as u64) / (eff_side as u64)) as u32).min(fh - 1);
+        for dx in 0..eff_side {
+            let sx = (x0 + ((dx as u64 * rw as u64) / (eff_side as u64)) as u32).min(fw - 1);
+            out.put_pixel(dx, dy, *full_img.get_pixel(sx, sy));
+        }
+    }
+    out
+}
+
 /// Validates and normalizes a `YuvFrame` so its width and height are non-zero, bounded, and even
 /// (`multiple_of(2)`), repacking planes if odd dimensions were supplied so downstream 4:2:0
 /// chroma indexing can never panic.
@@ -1479,8 +1505,7 @@ impl VisionPipeline {
                         apply_privacy_masks_from_value(&mut img, &normalized_priv_mask);
                         img
                     });
-                    let face_rgb =
-                        crop_and_scale_rgb_image(full_redacted, face_crop_box, Some(112));
+                    let face_rgb = crop_and_scale_rgb_square(full_redacted, face_crop_box, 112);
                     if let Some(m) = self.detector.match_face_crop(
                         &faces_dir,
                         face_rgb.as_raw(),
@@ -1873,6 +1898,7 @@ impl VisionPipeline {
                         "face_box": face_box,
                         "license_plate_box": license_plate_box,
                         "recognized_license_plate": recognized_license_plate,
+                        "night_mode": is_frame_night_ir(&frame.data, frame.width, frame.height),
                         "type": "object",
                         "max_severity": severity,
                         "provenance": trk.provenance

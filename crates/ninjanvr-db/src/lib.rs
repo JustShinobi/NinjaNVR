@@ -2935,14 +2935,39 @@ impl NinjaDatabase {
             }
 
             if let Some(sl) = normalized_sub {
-                if !sub_labels.iter().any(|x| x.trim().eq_ignore_ascii_case(sl)) {
+                if let Some(existing) = sub_labels
+                    .iter_mut()
+                    .find(|x| x.trim().eq_ignore_ascii_case(sl))
+                {
+                    *existing = sl.to_string();
+                } else {
                     sub_labels.push(sl.to_string());
                 }
+                let mut deduped: Vec<String> = Vec::with_capacity(sub_labels.len());
+                for item in sub_labels {
+                    if !deduped
+                        .iter()
+                        .any(|d| d.trim().eq_ignore_ascii_case(item.trim()))
+                    {
+                        deduped.push(item);
+                    }
+                }
+                sub_labels = deduped;
                 obj.insert("sub_labels".to_string(), json!(sub_labels));
                 if let Some(sc) = finite_score {
                     obj.insert("sub_label_score".to_string(), json!(sc));
                 }
             } else {
+                let mut deduped: Vec<String> = Vec::with_capacity(sub_labels.len());
+                for item in sub_labels {
+                    if !deduped
+                        .iter()
+                        .any(|d| d.trim().eq_ignore_ascii_case(item.trim()))
+                    {
+                        deduped.push(item);
+                    }
+                }
+                sub_labels = deduped;
                 obj.insert("sub_labels".to_string(), json!(sub_labels));
                 if sub_labels.is_empty() {
                     obj.remove("sub_label_score");

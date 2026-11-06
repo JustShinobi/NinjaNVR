@@ -8408,6 +8408,16 @@ async fn api_event_false_positive(
             if let Some(safe_p) = ensure_dataset_sample_path(&state.media_dir, &p) {
                 let _ = tokio::fs::remove_file(&safe_p).await;
             }
+            if is_safe_id(&existing.id) {
+                let mirror_p = state
+                    .media_dir
+                    .join("clips")
+                    .join("dataset")
+                    .join(format!("{}.webp", existing.id));
+                if let Some(safe_mp) = ensure_clips_artifact_path(&state.media_dir, &mirror_p) {
+                    let _ = tokio::fs::remove_file(&safe_mp).await;
+                }
+            }
             let _ = state.db.delete_dataset_sample(&sample_id);
         }
     }
@@ -9693,6 +9703,22 @@ pub fn xyxy_to_yolo_normalized(x1: f64, y1: f64, x2: f64, y2: f64) -> (f64, f64,
     (round6(cx), round6(cy), round6(w), round6(h))
 }
 
+pub fn xywh_to_yolo_normalized(b: [f64; 4]) -> (f64, f64, f64, f64) {
+    if b.iter().all(|&v| v == 0.0) {
+        return (0.5, 0.5, 0.25, 0.4);
+    }
+    let xmin = b[0].clamp(0.0, 1.0);
+    let ymin = b[1].clamp(0.0, 1.0);
+    let w = b[2].clamp(0.001, (1.0 - xmin).max(0.001));
+    let h = b[3].clamp(0.001, (1.0 - ymin).max(0.001));
+    (
+        round6((xmin + w / 2.0).clamp(0.0, 1.0)),
+        round6((ymin + h / 2.0).clamp(0.0, 1.0)),
+        round6(w),
+        round6(h),
+    )
+}
+
 fn event_box_to_yolo_normalized(b: [f64; 4]) -> (f64, f64, f64, f64) {
     if b.iter().all(|&v| v == 0.0) {
         return (0.5, 0.5, 0.25, 0.4);
@@ -9700,17 +9726,48 @@ fn event_box_to_yolo_normalized(b: [f64; 4]) -> (f64, f64, f64, f64) {
     if b[2] > b[0] && b[3] > b[1] {
         xyxy_to_yolo_normalized(b[0], b[1], b[2], b[3])
     } else {
-        let xmin = b[0].clamp(0.0, 1.0);
-        let ymin = b[1].clamp(0.0, 1.0);
-        let w = b[2].clamp(0.001, 1.0 - xmin);
-        let h = b[3].clamp(0.001, 1.0 - ymin);
-        (
-            round6(xmin + w / 2.0),
-            round6(ymin + h / 2.0),
-            round6(w),
-            round6(h),
-        )
+        xywh_to_yolo_normalized(b)
     }
+}
+
+fn event_uses_xywh_norm_boxes(ev: &Value) -> bool {
+    ev["data"].get("provenance").is_some_and(|p| p.is_object())
+        || ev["data"].get("region").is_some_and(|r| r.is_array())
+}
+
+fn is_rgb_image_monochrome_ir(rgb: &image::RgbImage) -> bool {
+    let w = rgb.width();
+    let h = rgb.height();
+    if w < 8 || h < 8 {
+        return false;
+    }
+    let mut diff_sum = 0.0f64;
+    let mut luma_sum = 0.0f64;
+    let mut luma_sq_sum = 0.0f64;
+    let mut samples = 0u32;
+    for gy in 0..16u32 {
+        let y = ((gy * h) / 16).min(h - 1);
+        for gx in 0..16u32 {
+            let x = ((gx * w) / 16).min(w - 1);
+            let px = rgb.get_pixel(x, y);
+            let r = px[0] as f64;
+            let g = px[1] as f64;
+            let b = px[2] as f64;
+            diff_sum += (r - g).abs() + (g - b).abs() + (r - b).abs();
+            let y_val = 0.299 * r + 0.587 * g + 0.114 * b;
+            luma_sum += y_val;
+            luma_sq_sum += y_val * y_val;
+            samples += 1;
+        }
+    }
+    if samples == 0 {
+        return false;
+    }
+    let n = samples as f64;
+    let mean_diff = diff_sum / (n * 3.0);
+    let mean_luma = luma_sum / n;
+    let luma_var = (luma_sq_sum / n) - (mean_luma * mean_luma);
+    mean_diff <= 4.0 && luma_var > 4.0
 }
 
 fn extract_event_box_array(ev: &Value) -> [f64; 4] {
@@ -9737,6 +9794,15 @@ async fn resolve_event_clean_snapshot_bytes(
     ev: &Value,
     event_id: &str,
 ) -> (Vec<u8>, u32, u32) {
+    let (bytes, w, h, _) = resolve_event_clean_snapshot_with_ir(media_dir, ev, event_id).await;
+    (bytes, w, h)
+}
+
+async fn resolve_event_clean_snapshot_with_ir(
+    media_dir: &Path,
+    ev: &Value,
+    event_id: &str,
+) -> (Vec<u8>, u32, u32, bool) {
     let camera = ev["camera"].as_str().unwrap_or("camera");
     let clips_dir = media_dir.join("clips");
     let mut candidates = Vec::with_capacity(4);
@@ -9766,15 +9832,26 @@ async fn resolve_event_clean_snapshot_bytes(
     {
         found_bytes = Some(bytes);
     }
-    let bytes = found_bytes.unwrap_or_else(|| {
+    let mut bytes = found_bytes.unwrap_or_else(|| {
         let img = image::RgbImage::from_pixel(64, 36, image::Rgb([24, 24, 24]));
         ninjanvr_vision::encode_image_webp(&img)
             .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec())
     });
-    let (w, h) = image::load_from_memory(&bytes)
-        .map(|img| (img.width(), img.height()))
-        .unwrap_or((1280, 720));
-    (bytes, w, h)
+    let mut w = 1280u32;
+    let mut h = 720u32;
+    let mut is_ir = false;
+    if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+        let rgb = dyn_img.to_rgb8();
+        w = rgb.width();
+        h = rgb.height();
+        is_ir = is_rgb_image_monochrome_ir(&rgb);
+        if bytes.starts_with(&[0xFF, 0xD8])
+            && let Ok(webp) = ninjanvr_vision::encode_image_webp(&rgb)
+        {
+            bytes = webp;
+        }
+    }
+    (bytes, w, h, is_ir)
 }
 
 pub async fn create_dataset_sample_from_event(
@@ -9797,10 +9874,13 @@ pub async fn create_dataset_sample_from_event(
         .or_else(|| ev["data"]["top_score"].as_f64())
         .or_else(|| ev["score"].as_f64())
         .unwrap_or(0.9);
-    let night_mode = ev["data"]["night_mode"].as_bool().unwrap_or(false);
 
-    let (img_bytes, width, height) =
-        resolve_event_clean_snapshot_bytes(media_dir, &ev, event_id).await;
+    let (img_bytes, width, height, inferred_night_ir) =
+        resolve_event_clean_snapshot_with_ir(media_dir, &ev, event_id).await;
+    let night_mode = ev["data"]["night_mode"]
+        .as_bool()
+        .unwrap_or(inferred_night_ir);
+
     let dataset_dir = media_dir.join("dataset");
     let sample_id = if event_id.starts_with("ds_") {
         event_id.to_string()
@@ -9812,7 +9892,23 @@ pub async fn create_dataset_sample_from_event(
     }
     let sample_fname = format!("{sample_id}.webp");
     atomic_write_within_media_subdir(media_dir, "dataset", &sample_fname, &img_bytes).await?;
+    let clips_dataset_dir = media_dir.join("clips").join("dataset");
+    let _ = crate::pipeline::write_contained_media_file(
+        media_dir,
+        &clips_dataset_dir,
+        &sample_fname,
+        &img_bytes,
+    );
     let img_path = dataset_dir.join(&sample_fname);
+
+    let use_xywh = event_uses_xywh_norm_boxes(&ev);
+    let to_yolo = |b: [f64; 4]| -> (f64, f64, f64, f64) {
+        if use_xywh {
+            xywh_to_yolo_normalized(b)
+        } else {
+            event_box_to_yolo_normalized(b)
+        }
+    };
 
     let annotations = if sample_kind == "hard_negative" {
         Vec::new()
@@ -9821,7 +9917,7 @@ pub async fn create_dataset_sample_from_event(
     } else {
         let mut anns = Vec::new();
         let raw_box = extract_event_box_array(&ev);
-        let (cx, cy, w, h) = event_box_to_yolo_normalized(raw_box);
+        let (cx, cy, w, h) = to_yolo(raw_box);
         let class_id = ninjanvr_db::security_class_id(&label).unwrap_or(0);
         let canonical_label = ninjanvr_db::security_class_label(class_id)
             .unwrap_or("person")
@@ -9853,7 +9949,7 @@ pub async fn create_dataset_sample_from_event(
                         nb[2].as_f64().unwrap_or(0.0),
                         nb[3].as_f64().unwrap_or(0.0),
                     ];
-                    let (acx, acy, aw, ah) = event_box_to_yolo_normalized(arr);
+                    let (acx, acy, aw, ah) = to_yolo(arr);
                     anns.push(ninjanvr_db::DatasetAnnotationBox {
                         class_id: attr_cid,
                         label: ninjanvr_db::security_class_label(attr_cid)
@@ -9864,6 +9960,35 @@ pub async fn create_dataset_sample_from_event(
                         w: aw,
                         h: ah,
                         score: attr["score"].as_f64().unwrap_or(0.9),
+                        source: "event".to_string(),
+                    });
+                }
+            }
+        }
+        for (box_key, extra_cid, extra_lbl) in [
+            ("face_box", 1usize, "face"),
+            ("license_plate_box", 7usize, "license_plate"),
+        ] {
+            if !anns.iter().any(|a| a.class_id == extra_cid)
+                && let Some(nb) = ev["data"][box_key].as_array()
+                && nb.len() >= 4
+            {
+                let arr = [
+                    nb[0].as_f64().unwrap_or(0.0),
+                    nb[1].as_f64().unwrap_or(0.0),
+                    nb[2].as_f64().unwrap_or(0.0),
+                    nb[3].as_f64().unwrap_or(0.0),
+                ];
+                if arr.iter().any(|&v| v > 0.0) {
+                    let (acx, acy, aw, ah) = to_yolo(arr);
+                    anns.push(ninjanvr_db::DatasetAnnotationBox {
+                        class_id: extra_cid,
+                        label: extra_lbl.to_string(),
+                        cx: acx,
+                        cy: acy,
+                        w: aw,
+                        h: ah,
+                        score,
                         source: "event".to_string(),
                     });
                 }
@@ -10299,6 +10424,14 @@ async fn api_dataset_sample_delete(
             if let Some(safe_fb) = ensure_dataset_sample_path(&state.media_dir, &fallback_p) {
                 let _ = tokio::fs::remove_file(&safe_fb).await;
             }
+            let mirror_p = state
+                .media_dir
+                .join("clips")
+                .join("dataset")
+                .join(format!("{}.webp", sample.id));
+            if let Some(safe_mp) = ensure_clips_artifact_path(&state.media_dir, &mirror_p) {
+                let _ = tokio::fs::remove_file(&safe_mp).await;
+            }
         }
     }
     let deleted = state.db.delete_dataset_sample(&id).unwrap_or(0);
@@ -10310,6 +10443,76 @@ async fn api_dataset_sample_delete(
             .into_response();
     }
     Json(json!({ "success": true, "deleted": deleted, "id": id })).into_response()
+}
+
+async fn load_dataset_sample_image_bytes(
+    state: &AppState,
+    sample: &ninjanvr_db::DatasetSampleDto,
+) -> Vec<u8> {
+    let direct_path = PathBuf::from(&sample.image_path);
+    if let Some(safe_direct) = ensure_dataset_sample_path(&state.media_dir, &direct_path)
+        && let Ok(bytes) = tokio::fs::read(&safe_direct).await
+        && !bytes.is_empty()
+    {
+        return bytes;
+    }
+    if is_safe_id(&sample.id) {
+        let sample_fname = format!("{}.webp", sample.id);
+        let dataset_fallback = state.media_dir.join("dataset").join(&sample_fname);
+        if let Some(safe_fallback) = ensure_dataset_sample_path(&state.media_dir, &dataset_fallback)
+            && let Ok(bytes) = tokio::fs::read(&safe_fallback).await
+            && !bytes.is_empty()
+        {
+            return bytes;
+        }
+        let clips_mirror = state
+            .media_dir
+            .join("clips")
+            .join("dataset")
+            .join(&sample_fname);
+        if let Some(safe_mirror) = ensure_clips_artifact_path(&state.media_dir, &clips_mirror)
+            && let Ok(bytes) = tokio::fs::read(&safe_mirror).await
+            && !bytes.is_empty()
+        {
+            let _ = atomic_write_within_media_subdir(
+                &state.media_dir,
+                "dataset",
+                &sample_fname,
+                &bytes,
+            )
+            .await;
+            return bytes;
+        }
+    }
+    if let Some(ref ev_id) = sample.event_id
+        && is_safe_id(ev_id)
+        && let Ok(Some(ev)) = state.db.get_event(ev_id)
+        && ev["camera"].as_str() == Some(sample.camera.as_str())
+    {
+        let (raw_bytes, _, _) =
+            resolve_event_clean_snapshot_bytes(&state.media_dir, &ev, ev_id).await;
+        if is_safe_id(&sample.id) {
+            let sample_fname = format!("{}.webp", sample.id);
+            let _ = atomic_write_within_media_subdir(
+                &state.media_dir,
+                "dataset",
+                &sample_fname,
+                &raw_bytes,
+            )
+            .await;
+            let clips_dataset_dir = state.media_dir.join("clips").join("dataset");
+            let _ = crate::pipeline::write_contained_media_file(
+                &state.media_dir,
+                &clips_dataset_dir,
+                &sample_fname,
+                &raw_bytes,
+            );
+        }
+        return raw_bytes;
+    }
+    let img = image::RgbImage::from_pixel(64, 36, image::Rgb([24, 24, 24]));
+    ninjanvr_vision::encode_image_webp(&img)
+        .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec())
 }
 
 async fn api_dataset_sample_image_webp(
@@ -10334,45 +10537,8 @@ async fn api_dataset_sample_image_webp(
             .into_response();
     }
     let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
-    let direct_path = PathBuf::from(&sample.image_path);
-    if let Some(safe_direct) = ensure_dataset_sample_path(&state.media_dir, &direct_path)
-        && let Ok(bytes) = tokio::fs::read(&safe_direct).await
-        && !bytes.is_empty()
-    {
-        let (out_bytes, _) =
-            redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
-        return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
-    }
-    if is_safe_id(&sample.id) {
-        let dataset_fallback = state
-            .media_dir
-            .join("dataset")
-            .join(format!("{}.webp", sample.id));
-        if let Some(safe_fallback) = ensure_dataset_sample_path(&state.media_dir, &dataset_fallback)
-            && let Ok(bytes) = tokio::fs::read(&safe_fallback).await
-            && !bytes.is_empty()
-        {
-            let (out_bytes, _) =
-                redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), false);
-            return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
-        }
-    }
-    if let Some(ref ev_id) = sample.event_id
-        && is_safe_id(ev_id)
-        && let Ok(Some(ev)) = state.db.get_event(ev_id)
-        && ev["camera"].as_str() == Some(sample.camera.as_str())
-    {
-        let (raw_bytes, _, _) =
-            resolve_event_clean_snapshot_bytes(&state.media_dir, &ev, ev_id).await;
-        let (out_bytes, _) =
-            redact_image_bytes_with_privacy_mask(&raw_bytes, priv_mask.as_ref(), false);
-        return ([(header::CONTENT_TYPE, "image/webp")], out_bytes).into_response();
-    }
-    let img = image::RgbImage::from_pixel(64, 36, image::Rgb([24, 24, 24]));
-    let raw_placeholder = ninjanvr_vision::encode_image_webp(&img)
-        .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec());
-    let (bytes, _) =
-        redact_image_bytes_with_privacy_mask(&raw_placeholder, priv_mask.as_ref(), false);
+    let raw_bytes = load_dataset_sample_image_bytes(&state, &sample).await;
+    let (bytes, _) = redact_image_bytes_with_privacy_mask(&raw_bytes, priv_mask.as_ref(), false);
     ([(header::CONTENT_TYPE, "image/webp")], bytes).into_response()
 }
 
@@ -10568,27 +10734,7 @@ pub async fn auto_annotate_dataset_sample(
     let Some(sample) = state.db.get_dataset_sample(sample_id)? else {
         anyhow::bail!("Dataset sample '{sample_id}' not found");
     };
-    let raw_img_bytes = if let Some(safe_path) =
-        ensure_dataset_sample_path(&state.media_dir, Path::new(&sample.image_path))
-        && let Ok(bytes) = tokio::fs::read(&safe_path).await
-        && !bytes.is_empty()
-    {
-        bytes
-    } else if is_safe_id(&sample.id)
-        && let Some(safe_fallback) = ensure_dataset_sample_path(
-            &state.media_dir,
-            &state
-                .media_dir
-                .join("dataset")
-                .join(format!("{}.webp", sample.id)),
-        )
-        && let Ok(bytes) = tokio::fs::read(&safe_fallback).await
-        && !bytes.is_empty()
-    {
-        bytes
-    } else {
-        b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec()
-    };
+    let raw_img_bytes = load_dataset_sample_image_bytes(state, &sample).await;
     let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
     let (img_bytes, mime_type) =
         redact_image_bytes_with_privacy_mask(&raw_img_bytes, priv_mask.as_ref(), false);
@@ -10625,7 +10771,9 @@ pub async fn auto_annotate_dataset_sample(
     let prompt = format!(
         "You are a Teacher Vision AI auto-annotator for security camera '{}'. \
          Detect all visible objects belonging ONLY to these 15 canonical classes: [{}]. \
-         Respond ONLY with JSON containing {{\"detections\": [{{\"label\": \"class_name\", \"bbox\": [x_min, y_min, x_max, y_max], \"score\": 0.95}}]}} \
+         Whenever a person is visible, annotate both 'person' (full body) and 'face' (head/face region if visible), \
+         plus any visible backpack, package, dog, cat, car, license_plate, etc. \
+         Respond ONLY with JSON containing {{\"detections\": [{{\"label\": \"class_name\", \"x_min\": 0.10, \"y_min\": 0.20, \"x_max\": 0.35, \"y_max\": 0.85, \"bbox\": [x_min, y_min, x_max, y_max], \"score\": 0.95}}]}} \
          where coordinates are normalized in [0.0, 1.0].",
         sample.camera, classes_list
     );
@@ -11237,25 +11385,7 @@ async fn api_dataset_export_zip(
         } else {
             "train"
         };
-        let raw_img_bytes = if let Some(safe_path) =
-            ensure_dataset_sample_path(&state.media_dir, Path::new(&sample.image_path))
-            && let Ok(bytes) = tokio::fs::read(&safe_path).await
-            && !bytes.is_empty()
-        {
-            bytes
-        } else if let Some(safe_fb) = ensure_dataset_sample_path(
-            &state.media_dir,
-            &state
-                .media_dir
-                .join("dataset")
-                .join(format!("{}.webp", sample.id)),
-        ) && let Ok(bytes) = tokio::fs::read(&safe_fb).await
-            && !bytes.is_empty()
-        {
-            bytes
-        } else {
-            b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec()
-        };
+        let raw_img_bytes = load_dataset_sample_image_bytes(&state, &sample).await;
         let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
         let (img_bytes, _) =
             redact_image_bytes_with_privacy_mask(&raw_img_bytes, priv_mask.as_ref(), false);
@@ -11771,6 +11901,158 @@ pub struct SubLabelBody {
     pub enroll_face: Option<bool>,
 }
 
+fn norm_box_to_pixel_bbox(
+    ev: &Value,
+    raw: [f64; 4],
+    fw: u32,
+    fh: u32,
+) -> Option<ninjanvr_vision::BoundingBox> {
+    if fw == 0 || fh == 0 || raw.iter().all(|&v| v <= 0.0) {
+        return None;
+    }
+    let use_xywh = event_uses_xywh_norm_boxes(ev) || !(raw[2] > raw[0] && raw[3] > raw[1]);
+    let (xmin_n, ymin_n, xmax_n, ymax_n) = if use_xywh {
+        let x0 = raw[0].clamp(0.0, 1.0);
+        let y0 = raw[1].clamp(0.0, 1.0);
+        let w = raw[2].clamp(0.001, (1.0 - x0).max(0.001));
+        let h = raw[3].clamp(0.001, (1.0 - y0).max(0.001));
+        (x0, y0, (x0 + w).clamp(0.0, 1.0), (y0 + h).clamp(0.0, 1.0))
+    } else {
+        let x0 = raw[0].min(raw[2]).clamp(0.0, 1.0);
+        let y0 = raw[1].min(raw[3]).clamp(0.0, 1.0);
+        let x1 = raw[0].max(raw[2]).clamp(0.0, 1.0);
+        let y1 = raw[1].max(raw[3]).clamp(0.0, 1.0);
+        (x0, y0, x1, y1)
+    };
+    let x_min = (xmin_n * (fw as f64)).round().clamp(0.0, (fw - 1) as f64) as u32;
+    let y_min = (ymin_n * (fh as f64)).round().clamp(0.0, (fh - 1) as f64) as u32;
+    let x_max = (xmax_n * (fw as f64))
+        .round()
+        .clamp((x_min + 1) as f64, fw as f64) as u32;
+    let y_max = (ymax_n * (fh as f64))
+        .round()
+        .clamp((y_min + 1) as f64, fh as f64) as u32;
+    Some(ninjanvr_vision::BoundingBox::new(
+        x_min, y_min, x_max, y_max,
+    ))
+}
+
+fn crop_event_face_square_from_bytes(ev: &Value, raw_image_bytes: &[u8]) -> Option<Vec<u8>> {
+    let raw_box = extract_event_box_array(ev);
+    if raw_box.iter().all(|&v| v <= 0.0) {
+        return None;
+    }
+    let dyn_img = image::load_from_memory(raw_image_bytes).ok()?;
+    let rgb = dyn_img.to_rgb8();
+    let fw = rgb.width();
+    let fh = rgb.height();
+    let person_bbox = norm_box_to_pixel_bbox(ev, raw_box, fw, fh)?;
+    let face_attr_bbox = ev["data"]["face_box"]
+        .as_array()
+        .filter(|a| a.len() >= 4)
+        .and_then(|a| {
+            Some([
+                a[0].as_f64()?,
+                a[1].as_f64()?,
+                a[2].as_f64()?,
+                a[3].as_f64()?,
+            ])
+        })
+        .and_then(|fb| norm_box_to_pixel_bbox(ev, fb, fw, fh));
+    let crop_box = ninjanvr_infer::resolve_face_crop_bbox(person_bbox, face_attr_bbox, fw, fh, 1)
+        .unwrap_or(person_bbox);
+    let square = crate::pipeline::crop_and_scale_rgb_square(&rgb, crop_box, 112);
+    ninjanvr_vision::encode_image_jpeg(&square).ok()
+}
+
+fn mirror_face_sample_to_clips(media_dir: &Path, canonical_name: &str, saved_path: &Path) {
+    let Some(safe_profile) = ninjanvr_infer::sanitize_face_profile_name(canonical_name) else {
+        return;
+    };
+    let Some(fname) = saved_path.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(saved_path) else {
+        return;
+    };
+    let target_dir = media_dir.join("clips").join("faces").join(safe_profile);
+    let _ = crate::pipeline::write_contained_media_file(media_dir, &target_dir, fname, &bytes);
+}
+
+fn remove_face_profile_from_clips_mirror(media_dir: &Path, profile_name: &str) {
+    let Some(clean_name) = ninjanvr_infer::sanitize_face_profile_name(profile_name) else {
+        return;
+    };
+    let mirror_root = media_dir.join("clips").join("faces");
+    if !std::fs::symlink_metadata(&mirror_root).is_ok_and(|m| m.file_type().is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&mirror_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_dir())
+            && let Some(dir_name) = p.file_name().and_then(|s| s.to_str())
+            && dir_name.eq_ignore_ascii_case(&clean_name)
+            && ensure_clips_artifact_path(media_dir, &p).is_some()
+        {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+}
+
+async fn backfill_face_gallery_events(
+    state: &AppState,
+    faces_dir: &Path,
+    exclude_event_id: Option<&str>,
+) -> usize {
+    let similarity_threshold = {
+        let cfg = state.config.read().await;
+        cfg.face_recognition.similarity_threshold
+    };
+    let candidates = state
+        .db
+        .query_events(&EventFilter {
+            labels: Some(vec!["person".to_string()]),
+            limit: Some(500),
+            ..Default::default()
+        })
+        .unwrap_or_default();
+    let mut matched_count = 0usize;
+    for ev in candidates {
+        let Some(ev_id) = ev["id"].as_str().filter(|id| is_safe_id(id)) else {
+            continue;
+        };
+        if exclude_event_id.is_some_and(|ex| ex == ev_id) {
+            continue;
+        }
+        let existing_sub = ev["sub_label"]
+            .as_str()
+            .or_else(|| ev["data"]["sub_label"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"));
+        if existing_sub.is_some() {
+            continue;
+        }
+        let sample_bytes = load_event_face_sample_bytes(state, ev_id).await;
+        if let Some(m) =
+            state
+                .detector
+                .match_face_crop(faces_dir, &sample_bytes, similarity_threshold, false)
+            && m.is_known
+            && state
+                .db
+                .set_event_sub_label_with_score(ev_id, Some(&m.sub_label), Some(m.score as f64))
+                .unwrap_or(0)
+                > 0
+        {
+            matched_count += 1;
+        }
+    }
+    matched_count
+}
+
 async fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> Vec<u8> {
     if !is_safe_id(event_id) {
         return format!("event-face-sample:{event_id}").into_bytes();
@@ -11799,6 +12081,9 @@ async fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> Vec<u
                 {
                     let (out, _) =
                         redact_image_bytes_with_privacy_mask(&bytes, priv_mask.as_ref(), is_jpeg);
+                    if let Some(cropped) = crop_event_face_square_from_bytes(&ev, &out) {
+                        return cropped;
+                    }
                     return out;
                 }
             }
@@ -11809,6 +12094,9 @@ async fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> Vec<u
         {
             let (out, _) =
                 redact_image_bytes_with_privacy_mask(&decoded, priv_mask.as_ref(), false);
+            if let Some(cropped) = crop_event_face_square_from_bytes(&ev, &out) {
+                return cropped;
+            }
             return out;
         }
     }
@@ -11866,11 +12154,21 @@ async fn api_event_sub_label(
         }
     }
 
-    let clean_sub = body
+    let faces_dir = state.media_dir.join("faces");
+    let raw_sub = body
         .sub_label
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let canonical_sub_owned: Option<String> = raw_sub.map(|s| {
+        let profiles = state.detector.list_face_profiles(&faces_dir);
+        profiles
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(s))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| s.to_string())
+    });
+    let clean_sub = canonical_sub_owned.as_deref();
     let updated = state
         .db
         .set_event_sub_label_with_score(&id, clean_sub, body.sub_label_score)
@@ -11885,11 +12183,14 @@ async fn api_event_sub_label(
         && let Some(name) = clean_sub
         && !name.eq_ignore_ascii_case("unknown")
     {
-        let faces_dir = state.media_dir.join("faces");
         let sample_bytes = load_event_face_sample_bytes(&state, &id).await;
-        let _ = state
-            .detector
-            .enroll_face_profile(&faces_dir, name, &id, &sample_bytes);
+        if let Ok((saved_path, _)) =
+            state
+                .detector
+                .enroll_face_profile(&faces_dir, name, &id, &sample_bytes)
+        {
+            mirror_face_sample_to_clips(&state.media_dir, name, &saved_path);
+        }
     }
 
     Json(json!({
@@ -11909,6 +12210,8 @@ pub struct FaceEnrollBody {
     pub image_base64: Option<String>,
     #[serde(default, alias = "assignSubLabel")]
     pub assign_sub_label: Option<bool>,
+    #[serde(default, alias = "backfillEvents")]
+    pub backfill_events: Option<bool>,
 }
 
 async fn api_faces_list(
@@ -12023,6 +12326,7 @@ async fn api_face_enroll(
 
     let mut sample_id = format!("enroll_{}", unix_now());
     let mut event_to_assign: Option<String> = None;
+    let mut should_backfill = false;
     let first_non_ws = body_bytes
         .iter()
         .copied()
@@ -12039,6 +12343,7 @@ async fn api_face_enroll(
             )
                 .into_response();
         };
+        should_backfill = parsed.backfill_events.unwrap_or(false);
         if let Some(ref ev_id) = parsed.event_id
             && !ev_id.trim().is_empty()
         {
@@ -12091,13 +12396,19 @@ async fn api_face_enroll(
                 .map(|p| p.name.clone())
                 .unwrap_or_else(|| clean_name.clone());
             let sample_count = matched_profile.map(|p| p.sample_count).unwrap_or(1);
-            if let Some(ev_id) = event_to_assign {
+            mirror_face_sample_to_clips(&state.media_dir, &canonical_name, &saved_path);
+            if let Some(ref ev_id) = event_to_assign {
                 let _ = state.db.set_event_sub_label_with_score(
-                    &ev_id,
+                    ev_id,
                     Some(&canonical_name),
                     Some(1.0),
                 );
             }
+            let backfilled_events = if should_backfill {
+                backfill_face_gallery_events(&state, &faces_dir, event_to_assign.as_deref()).await
+            } else {
+                0
+            };
             (
                 StatusCode::OK,
                 Json(json!({
@@ -12105,6 +12416,7 @@ async fn api_face_enroll(
                     "name": canonical_name,
                     "sample_count": sample_count,
                     "embedding_dim": emb.len(),
+                    "backfilled_events": backfilled_events,
                     "path": saved_path.to_string_lossy()
                 })),
             )
@@ -12163,6 +12475,7 @@ async fn api_face_delete(
         .detector
         .delete_face_profile(&faces_dir, &clean_name)
         .unwrap_or(false);
+    remove_face_profile_from_clips_mirror(&state.media_dir, &clean_name);
     let cleared_events = state
         .db
         .clear_face_profile_sub_labels(&clean_name)
@@ -20988,6 +21301,101 @@ pub fn generate_self_signed_tls_config_with_sans(
     Ok(Arc::new(server_config))
 }
 
+fn restore_persistent_clips_mirrors(media_dir: &Path, config_dir: &Path) {
+    // 1. Restore dataset samples from {media_dir}/clips/dataset -> {media_dir}/dataset
+    let clips_dataset_dir = media_dir.join("clips").join("dataset");
+    let dataset_dir = media_dir.join("dataset");
+    if std::fs::symlink_metadata(&clips_dataset_dir).is_ok_and(|m| m.file_type().is_dir())
+        && let Ok(entries) = std::fs::read_dir(&clips_dataset_dir)
+    {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if std::fs::symlink_metadata(&p)
+                .is_ok_and(|m| m.file_type().is_file() && m.len() <= 16 * 1024 * 1024)
+                && let Some(fname) = p.file_name().and_then(|s| s.to_str())
+                && is_safe_id(fname)
+                && !dataset_dir.join(fname).exists()
+                && let Ok(bytes) = std::fs::read(&p)
+            {
+                let _ = crate::pipeline::write_contained_media_file(
+                    media_dir,
+                    &dataset_dir,
+                    fname,
+                    &bytes,
+                );
+            }
+        }
+    }
+
+    // 2. Restore enrolled face profiles from {media_dir}/clips/faces/<profile>/<sample> -> {media_dir}/faces/<profile>/<sample>
+    let clips_faces_dir = media_dir.join("clips").join("faces");
+    let faces_dir = media_dir.join("faces");
+    if std::fs::symlink_metadata(&clips_faces_dir).is_ok_and(|m| m.file_type().is_dir())
+        && let Ok(prof_entries) = std::fs::read_dir(&clips_faces_dir)
+    {
+        for prof_entry in prof_entries.flatten() {
+            let prof_path = prof_entry.path();
+            if !std::fs::symlink_metadata(&prof_path).is_ok_and(|m| m.file_type().is_dir()) {
+                continue;
+            }
+            let Some(raw_prof) = prof_path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(clean_prof) = ninjanvr_infer::sanitize_face_profile_name(raw_prof) else {
+                continue;
+            };
+            if clean_prof != raw_prof {
+                continue;
+            }
+            let dst_prof_dir = faces_dir.join(&clean_prof);
+            if let Ok(files) = std::fs::read_dir(&prof_path) {
+                for file_entry in files.flatten() {
+                    let fp = file_entry.path();
+                    if std::fs::symlink_metadata(&fp)
+                        .is_ok_and(|m| m.file_type().is_file() && m.len() <= 16 * 1024 * 1024)
+                        && let Some(fname) = fp.file_name().and_then(|s| s.to_str())
+                        && is_safe_id(fname)
+                        && !dst_prof_dir.join(fname).exists()
+                        && let Ok(bytes) = std::fs::read(&fp)
+                    {
+                        let _ = crate::pipeline::write_contained_media_file(
+                            media_dir,
+                            &dst_prof_dir,
+                            fname,
+                            &bytes,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Restore uploaded models from {config_dir}/models -> {media_dir}/models
+    let cfg_models_dir = config_dir.join("models");
+    let media_models_dir = media_dir.join("models");
+    if std::fs::symlink_metadata(&cfg_models_dir).is_ok_and(|m| m.file_type().is_dir())
+        && let Ok(entries) = std::fs::read_dir(&cfg_models_dir)
+    {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if std::fs::symlink_metadata(&p)
+                .is_ok_and(|m| m.file_type().is_file() && m.len() <= 64 * 1024 * 1024)
+                && let Some(fname) = p.file_name().and_then(|s| s.to_str())
+                && is_safe_id(fname)
+                && !media_models_dir.join(fname).exists()
+                && let Ok(bytes) = std::fs::read(&p)
+            {
+                let _ = crate::pipeline::write_contained_media_file(
+                    media_dir,
+                    &media_models_dir,
+                    fname,
+                    &bytes,
+                );
+            }
+        }
+    }
+}
+
 pub async fn new_app_state(
     config_path: &Path,
     web_dir: PathBuf,
@@ -20995,6 +21403,8 @@ pub async fn new_app_state(
     spawn_go2rtc: bool,
 ) -> Result<AppState> {
     let cfg = NinjaConfig::load(config_path)?;
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("/config"));
+    restore_persistent_clips_mirrors(&media_dir, config_dir);
     let (init_degraded, init_err) = match probe_storage_writable(&media_dir) {
         Ok(()) => (false, None),
         Err(err) => {
@@ -21049,10 +21459,10 @@ pub async fn new_app_state(
         );
     }
 
-    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("/config"));
     let jwt_secret = load_or_create_jwt_secret(config_dir);
 
     let detector = Arc::new(AiDetectorEngine::new(&cfg));
+    let _ = detector.sync_face_gallery_from_dir(&media_dir.join("faces"));
     let comms = Arc::new(CommsHub::with_mqtt(&cfg.mqtt));
     comms.init_from_config(&cfg);
     let profile_file = config_dir.join(".active_profile");

@@ -2074,6 +2074,178 @@ async fn r3_p3b_cycle3_json_thumbnail_privacy_rbac_genai_two_step_zip_and_subdir
         "Scoped operator must not resolve global known_plates owner labels via PUT /api/events/{{id}}/license_plate"
     );
 
+    // =========================================================================
+    // 6. End-to-End Regression: xywh YOLO box preservation when w > x_min & h > y_min,
+    //    monochrome Night-IR detection, clips/dataset + clips/faces mirror recovery,
+    //    112x112 square face crop enrollment, and backfill_events + case-insensitive sub_labels
+    // =========================================================================
+    let mut ir_img = image::RgbImage::new(320, 180);
+    for y in 0..180u32 {
+        for x in 0..320u32 {
+            // Monochrome IR frame with a patterned bright head region inside the person box
+            let in_head = (20..80).contains(&x) && (72..105).contains(&y);
+            let luma = if in_head {
+                ((x * 3 + y * 5) % 180 + 60) as u8
+            } else {
+                ((x + y) % 40 + 20) as u8
+            };
+            ir_img.put_pixel(x, y, image::Rgb([luma, luma, luma]));
+        }
+    }
+    let ir_webp = ninjanvr_vision::encode_image_webp(&ir_img).unwrap();
+    std::fs::write(
+        state
+            .media_dir
+            .join("clips/front_door-ev_ir_xywh_1-clean.webp"),
+        &ir_webp,
+    )
+    .unwrap();
+    std::fs::write(
+        state
+            .media_dir
+            .join("clips/front_door-ev_ir_xywh_2-clean.webp"),
+        &ir_webp,
+    )
+    .unwrap();
+
+    for ev_id in ["ev_ir_xywh_1", "ev_ir_xywh_2"] {
+        state
+            .db
+            .upsert_event(&EventDto {
+                id: ev_id.to_string(),
+                camera: "front_door".to_string(),
+                label: "person".to_string(),
+                zones: json!([]),
+                start_time: 9600.0,
+                end_time: Some(9605.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.93),
+                false_positive: Some(false),
+                // x_min=0.06, y_min=0.40, w=0.20 (> x_min), h=0.50 (> y_min)
+                box_coords: Some(json!([0.06, 0.40, 0.20, 0.50])),
+                data: json!({
+                    "box": [0.06, 0.40, 0.20, 0.50],
+                    "region": [0.0, 0.20, 0.50, 0.80],
+                    "face_box": [0.08, 0.41, 0.12, 0.16],
+                    "provenance": {
+                        "norm_bbox": [0.06, 0.40, 0.20, 0.50],
+                        "score": 0.93
+                    }
+                }),
+                thumbnail: None,
+                area: Some(5760),
+                ratio: Some(0.4),
+                score: Some(0.93),
+                stationary: false,
+            })
+            .unwrap();
+    }
+
+    let sample_xywh = create_dataset_sample_from_event(
+        &state.db,
+        &state.media_dir,
+        "ev_ir_xywh_1",
+        "true_positive",
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        sample_xywh.night_mode,
+        "Monochrome IR snapshot must automatically set night_mode=true on dataset sample"
+    );
+    assert_eq!(
+        sample_xywh.annotations.len(),
+        2,
+        "Both person box and face_box must be extracted into dataset sample annotations"
+    );
+    let person_ann = &sample_xywh.annotations[0];
+    assert_eq!(person_ann.class_id, 0);
+    assert!(
+        (person_ann.w - 0.20).abs() < 1e-5,
+        "xywh width must be 0.20, not w - x_min"
+    );
+    assert!(
+        (person_ann.h - 0.50).abs() < 1e-5,
+        "xywh height must be 0.50, not h - y_min"
+    );
+    assert!((person_ann.cx - 0.16).abs() < 1e-5);
+    assert!((person_ann.cy - 0.65).abs() < 1e-5);
+    let face_ann = &sample_xywh.annotations[1];
+    assert_eq!(face_ann.class_id, 1);
+    assert_eq!(face_ann.label, "face");
+
+    // Simulate container ephemeral overlay wipe of media_dir/dataset and verify export.zip recovers real image
+    let _ = std::fs::remove_dir_all(state.media_dir.join("dataset"));
+    let r_zip = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/dataset/export.zip")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_zip.status(), StatusCode::OK);
+    let zip_bytes = to_bytes(r_zip.into_body(), 4 * 1024 * 1024).await.unwrap();
+    let entries = parse_zip_archive(&zip_bytes).unwrap();
+    let exported_img = entries
+        .get("images/train/ds_ev_ir_xywh_1.webp")
+        .or_else(|| entries.get("images/val/ds_ev_ir_xywh_1.webp"))
+        .expect("ds_ev_ir_xywh_1.webp must be present in export.zip");
+    assert!(
+        exported_img.len() > 64 && image::load_from_memory(exported_img).is_ok(),
+        "GET /api/dataset/export.zip must recover full valid WebP snapshot bytes from clips mirror when media_dir/dataset was wiped"
+    );
+
+    // Enroll face from ev_ir_xywh_1 with backfill_events=true and verify 112x112 crop + backfill of ev_ir_xywh_2
+    let r_enroll_backfill = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/faces/Erik/enroll")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "event_id": "ev_ir_xywh_1",
+                        "assign_sub_label": true,
+                        "backfill_events": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_enroll_backfill.status(), StatusCode::OK);
+    let enroll_bf_json: Value =
+        serde_json::from_slice(&to_bytes(r_enroll_backfill.into_body(), 4096).await.unwrap())
+            .unwrap();
+    assert_eq!(enroll_bf_json["success"], true);
+    assert_eq!(enroll_bf_json["name"], "Erik");
+    assert!(
+        enroll_bf_json["backfilled_events"].as_u64().unwrap_or(0) >= 1,
+        "backfill_events=true must match and label ev_ir_xywh_2"
+    );
+    let ev2_after = state.db.get_event("ev_ir_xywh_2").unwrap().unwrap();
+    assert_eq!(ev2_after["sub_label"], "Erik");
+    assert!(
+        state
+            .media_dir
+            .join("clips/faces/Erik/ev_ir_xywh_1.jpg")
+            .is_file(),
+        "Enrolled face crop must be mirrored into persistent clips/faces/Erik/"
+    );
+
     srv_handle.abort();
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

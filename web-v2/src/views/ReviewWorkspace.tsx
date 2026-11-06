@@ -370,19 +370,28 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     if (raw && raw.trim().length > 0 && !clean) return;
     const seq = ++reviewMutationSeqRef.current;
     try {
-      const res = await fetch(`/api/events/${encodeURIComponent(detId)}/sub_label`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ sub_label: clean }),
-      });
+      const allDets = (targetReview.data?.detections || [])
+        .map((d) => d.trim())
+        .filter((d) => d.length > 0);
+      const targetDetIds =
+        clean === null && allDets.length > 1 ? allDets : [detId];
+      let anyOk = false;
+      for (const did of targetDetIds) {
+        const res = await fetch(`/api/events/${encodeURIComponent(did)}/sub_label`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ sub_label: clean }),
+        });
+        if (res.ok) anyOk = true;
+      }
       if (
         isMountedRef.current &&
         seq === reviewMutationSeqRef.current &&
         shouldApplyReviewMutationResult(
           activeReviewIdRef.current,
           targetId,
-          res.ok
+          anyOk
         )
       ) {
         const [updated] = applyReviewSubLabelUpdate(

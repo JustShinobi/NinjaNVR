@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import shutil
 import tempfile
 import urllib.request
 import zipfile
@@ -132,6 +133,16 @@ def extract_and_validate_dataset_zip(
     yaml_text = data_yaml_path.read_text(encoding="utf-8")
     if "nc: 15" not in yaml_text:
         raise ValueError("data.yaml must declare 'nc: 15' for the 15-class NinjaNVR Security schema")
+
+    # Normalize 'path:' in data.yaml to the absolute extracted directory so Ultralytics YOLO
+    # resolves images/train and images/val regardless of current working directory.
+    resolved_lines = []
+    for line in yaml_text.splitlines():
+        if line.strip().startswith("path:"):
+            resolved_lines.append(f"path: {dest.resolve()}")
+        else:
+            resolved_lines.append(line)
+    data_yaml_path.write_text("\n".join(resolved_lines) + "\n", encoding="utf-8")
 
     train_images = sorted((dest / "images" / "train").glob("*.*")) if (dest / "images" / "train").exists() else []
     val_images = sorted((dest / "images" / "val").glob("*.*")) if (dest / "images" / "val").exists() else []
@@ -492,19 +503,37 @@ def run_training_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             if plan["freeze"] > 0:
                 train_kwargs["freeze"] = plan["freeze"]
             yolo.train(**train_kwargs)
-            yolo.export(
+            onnx_exported = yolo.export(
                 format="onnx",
                 imgsz=plan["imgsz"],
                 opset=DEFAULT_ONNX_OPSET,
                 dynamic=False,
                 simplify=True,
             )
-            yolo.export(
+            ov_exported = yolo.export(
                 format="openvino",
                 imgsz=plan["imgsz"],
                 half=True,
                 dynamic=False,
             )
+            out_dir = Path(plan["output_dir"])
+            out_dir.mkdir(parents=True, exist_ok=True)
+            target_onnx = Path(plan["export"]["onnx_path"])
+            target_xml = Path(plan["export"]["openvino_xml_path"])
+            target_bin = Path(plan["export"]["openvino_bin_path"])
+            if onnx_exported:
+                src_onnx = Path(str(onnx_exported))
+                if src_onnx.is_file() and src_onnx.resolve() != target_onnx.resolve():
+                    shutil.copy2(src_onnx, target_onnx)
+            if ov_exported:
+                ov_dir = Path(str(ov_exported))
+                if ov_dir.is_dir():
+                    xmls = list(ov_dir.glob("*.xml"))
+                    bins = list(ov_dir.glob("*.bin"))
+                    if xmls:
+                        shutil.copy2(xmls[0], target_xml)
+                    if bins:
+                        shutil.copy2(bins[0], target_bin)
         finally:
             if extract_ctx is not None:
                 extract_ctx.cleanup()

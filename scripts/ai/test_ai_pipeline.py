@@ -232,6 +232,11 @@ class TestAiModelFactoryPipeline(unittest.TestCase):
             self.assertEqual(extracted_info["num_classes"], 15)
             self.assertGreaterEqual(extracted_info["train_images"], 1)
             self.assertEqual(extracted_info["hard_negatives"], 1)
+            extracted_yaml_text = Path(extracted_info["data_yaml"]).read_text(encoding="utf-8")
+            self.assertIn(
+                f"path: {(tmp_path / 'extracted').resolve()}",
+                extracted_yaml_text,
+            )
 
             out_runs = tmp_path / "runs"
             cmd = [
