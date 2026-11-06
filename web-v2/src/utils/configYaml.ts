@@ -46,15 +46,35 @@ export function parseYamlScalarValue(rawField: string): string {
     return trimmed.slice(1).replace(/''/g, "'");
   }
 
+  if (trimmed.startsWith("#")) {
+    return "";
+  }
   return trimmed.replace(/\s+#.*$/, "").trim();
+}
+
+function isUnquotedYamlNullOrMask(rawField: string, parsedScalar: string): boolean {
+  if (!parsedScalar || parsedScalar === "***" || parsedScalar === "*") {
+    return true;
+  }
+  const trimmed = rawField.trim();
+  const isQuoted = trimmed.startsWith('"') || trimmed.startsWith("'");
+  if (!isQuoted && /^(?:null|~)$/i.test(parsedScalar)) {
+    return true;
+  }
+  return false;
 }
 
 /**
  * Extracts all raw `rtsp://...`, `rtsps://...`, `http://...`, `https://...`, `rtmp://...` URLs
- * from an existing raw YAML string so scrubbed `*:*@` URLs in `draftConfig` can be restored losslessly.
+ * from an existing raw YAML string (excluding `#` comment lines) so scrubbed `*:*@` URLs in
+ * `draftConfig` can be restored losslessly.
  */
 function extractOriginalUrls(rawYaml: string): string[] {
-  const matches = rawYaml.match(/(?:rtsps?|https?|rtmps?):\/\/[^\s"']+/gi);
+  const nonCommentYaml = rawYaml
+    .split(/\r?\n/)
+    .filter((line) => !line.trim().startsWith("#"))
+    .join("\n");
+  const matches = nonCommentYaml.match(/(?:rtsps?|https?|rtmps?):\/\/[^\s"']+/gi);
   if (!matches) return [];
   const cleaned = matches.map((u) =>
     u
@@ -129,7 +149,7 @@ function extractOriginalOnvifPasswords(rawYaml: string): Record<string, string> 
       const pwMatch = trimmed.match(/^password\s*:\s*(.+)$/);
       if (pwMatch) {
         const unquoted = parseYamlScalarValue(pwMatch[1]);
-        if (unquoted && unquoted !== "***" && unquoted !== "*" && unquoted !== "null") {
+        if (!isUnquotedYamlNullOrMask(pwMatch[1], unquoted)) {
           result[currentCam] = unquoted;
         }
       }
@@ -146,14 +166,14 @@ function extractOriginalGenAiApiKey(rawYaml: string): string | undefined {
     if (!trimmed || trimmed.startsWith("#")) continue;
     const indent = line.search(/\S/);
     if (indent === 0) {
-      inGenAi = /^genai\s*:/.test(trimmed);
+      inGenAi = /^(?:"genai"|'genai'|genai)\s*:/.test(trimmed);
       continue;
     }
-    if (inGenAi && indent >= 2) {
+    if (inGenAi && indent >= 1) {
       const m = trimmed.match(/^api_key\s*:\s*(.+)$/);
       if (m) {
         const unquoted = parseYamlScalarValue(m[1]);
-        if (unquoted && unquoted !== "***" && unquoted !== "*" && unquoted !== "null") {
+        if (!isUnquotedYamlNullOrMask(m[1], unquoted)) {
           return unquoted;
         }
       }
@@ -170,14 +190,14 @@ function extractOriginalMqttPassword(rawYaml: string): string | undefined {
     if (!trimmed || trimmed.startsWith("#")) continue;
     const indent = line.search(/\S/);
     if (indent === 0) {
-      inMqtt = /^mqtt\s*:/.test(trimmed);
+      inMqtt = /^(?:"mqtt"|'mqtt'|mqtt)\s*:/.test(trimmed);
       continue;
     }
-    if (inMqtt && indent >= 2) {
+    if (inMqtt && indent >= 1) {
       const m = trimmed.match(/^password\s*:\s*(.+)$/);
       if (m) {
         const unquoted = parseYamlScalarValue(m[1]);
-        if (unquoted && unquoted !== "***" && unquoted !== "*" && unquoted !== "null") {
+        if (!isUnquotedYamlNullOrMask(m[1], unquoted)) {
           return unquoted;
         }
       }
@@ -716,9 +736,14 @@ export function buildCleanYamlFromDraft(
 
     camerasOut[camName] = {
       enabled: cam.enabled,
+      ...(cam.indoor !== undefined ? { indoor: Boolean(cam.indoor) } : {}),
+      ...(cam.webui_url && cam.webui_url.trim()
+        ? { webui_url: restoreUrl(cam.webui_url.trim(), originals) }
+        : {}),
+      ...(cam.notes && cam.notes.trim() ? { notes: cam.notes.trim() } : {}),
       ffmpeg: {
         inputs,
-        output_args: {
+        output_args: cam.ffmpeg?.output_args || {
           record: "preset-record-generic-audio-aac",
         },
       },
@@ -730,10 +755,15 @@ export function buildCleanYamlFromDraft(
       },
       detect: {
         enabled: cam.detect?.enabled ?? true,
+        ...(cam.detect?.detector ? { detector: cam.detect.detector } : {}),
         width: finiteInt(cam.detect?.width, 1280),
         height: finiteInt(cam.detect?.height, 720),
         fps: finiteInt(cam.detect?.fps, 5),
         min_initialized: finiteInt(cam.detect?.min_initialized, 2),
+        ...(cam.detect?.min_initialized_night !== undefined &&
+        Number.isFinite(cam.detect.min_initialized_night)
+          ? { min_initialized_night: finiteInt(cam.detect.min_initialized_night, 2) }
+          : {}),
         max_disappeared: finiteInt(cam.detect?.max_disappeared, 25),
         stationary: {
           interval: finiteInt(cam.detect?.stationary?.interval, 50),
@@ -764,8 +794,38 @@ export function buildCleanYamlFromDraft(
         filters: cam.objects?.filters || {},
         mask: cam.objects?.mask || {},
       },
+      ...(cam.audio
+        ? {
+            audio: {
+              enabled: Boolean(cam.audio.enabled),
+              ...(cam.audio.min_volume_dbfs !== undefined &&
+              Number.isFinite(cam.audio.min_volume_dbfs)
+                ? { min_volume_dbfs: finiteRound(cam.audio.min_volume_dbfs, -40, 1) }
+                : {}),
+              ...(cam.audio.labels && cam.audio.labels.length > 0
+                ? { labels: cam.audio.labels }
+                : {}),
+            },
+          }
+        : {}),
       record: {
         enabled: cam.record?.enabled ?? true,
+        ...(cam.record?.continuous_substream !== undefined
+          ? { continuous_substream: Boolean(cam.record.continuous_substream) }
+          : {}),
+        ...(cam.record?.mode_tiering !== undefined
+          ? { mode_tiering: Boolean(cam.record.mode_tiering) }
+          : {}),
+        ...(cam.record?.max_size_gb !== undefined &&
+        cam.record.max_size_gb !== null &&
+        Number.isFinite(cam.record.max_size_gb)
+          ? { max_size_gb: finiteRound(cam.record.max_size_gb, 0, 2) }
+          : {}),
+        ...(cam.record?.min_free_gb !== undefined &&
+        cam.record.min_free_gb !== null &&
+        Number.isFinite(cam.record.min_free_gb)
+          ? { min_free_gb: finiteRound(cam.record.min_free_gb, 0, 2) }
+          : {}),
         continuous: { days: finiteInt(cam.record?.continuous?.days, 14) },
         motion: { days: finiteInt(cam.record?.motion?.days, 0) },
         alerts: cam.record?.alerts || {
@@ -779,6 +839,12 @@ export function buildCleanYamlFromDraft(
           retain: { days: 14, mode: "motion" },
         },
         preview: cam.record?.preview || { quality: "medium" },
+        ...(cam.record?.storage_tiers
+          ? { storage_tiers: cam.record.storage_tiers }
+          : {}),
+        ...(cam.record?.alert_backup
+          ? { alert_backup: cam.record.alert_backup }
+          : {}),
         ...(cam.record?.cold_compaction
           ? { cold_compaction: cam.record.cold_compaction }
           : {}),
@@ -789,6 +855,12 @@ export function buildCleanYamlFromDraft(
         bounding_box: cam.snapshots?.bounding_box ?? true,
         crop: cam.snapshots?.crop ?? false,
         quality: finiteInt(cam.snapshots?.quality, 70),
+        ...(cam.snapshots?.high_res !== undefined
+          ? { high_res: Boolean(cam.snapshots.high_res) }
+          : {}),
+        ...(cam.snapshots?.from_main_stream !== undefined
+          ? { from_main_stream: Boolean(cam.snapshots.from_main_stream) }
+          : {}),
         selection:
           cam.snapshots?.selection ||
           draft.snapshots?.selection ||
@@ -901,11 +973,16 @@ export function buildCleanYamlFromDraft(
           })()
         : {}),
       ...(cam.ui &&
-      (cam.ui.order !== undefined || cam.ui.dashboard !== undefined)
+      (cam.ui.order !== undefined ||
+        cam.ui.dashboard !== undefined ||
+        cam.ui.review !== undefined)
         ? {
             ui: {
               order: finiteInt(cam.ui.order, 0),
               dashboard: cam.ui.dashboard ?? true,
+              ...(cam.ui.review !== undefined
+                ? { review: Boolean(cam.ui.review) }
+                : {}),
             },
           }
         : {}),
@@ -960,11 +1037,84 @@ export function buildCleanYamlFromDraft(
     },
     auth: {
       enabled: draft.auth?.enabled ?? true,
+      ...(draft.auth?.local_login_enabled !== undefined
+        ? { local_login_enabled: Boolean(draft.auth.local_login_enabled) }
+        : {}),
+      ...(draft.auth?.reset_admin_password
+        ? { reset_admin_password: true }
+        : {}),
       cookie_name: draft.auth?.cookie_name || "ninjanvr_token",
       cookie_secure: draft.auth?.cookie_secure ?? false,
       session_length: finiteInt(draft.auth?.session_length, 86400),
       refresh_time: finiteInt(draft.auth?.refresh_time, 1800),
       hash_iterations: finiteInt(draft.auth?.hash_iterations, 600000),
+      ...(draft.auth?.trusted_proxies && draft.auth.trusted_proxies.length > 0
+        ? { trusted_proxies: draft.auth.trusted_proxies }
+        : {}),
+      ...(draft.auth?.oidc
+        ? {
+            oidc: {
+              enabled: Boolean(draft.auth.oidc.enabled),
+              ...(draft.auth.oidc.provider_name
+                ? { provider_name: draft.auth.oidc.provider_name }
+                : {}),
+              ...(draft.auth.oidc.issuer_url
+                ? {
+                    issuer_url: restoreUrl(
+                      draft.auth.oidc.issuer_url,
+                      originals
+                    ),
+                  }
+                : {}),
+              ...(draft.auth.oidc.client_id
+                ? { client_id: draft.auth.oidc.client_id }
+                : {}),
+              ...(draft.auth.oidc.client_secret_env
+                ? { client_secret_env: draft.auth.oidc.client_secret_env }
+                : {}),
+              ...(draft.auth.oidc.scopes && draft.auth.oidc.scopes.length > 0
+                ? { scopes: draft.auth.oidc.scopes }
+                : {}),
+              ...(draft.auth.oidc.auto_redirect !== undefined
+                ? { auto_redirect: Boolean(draft.auth.oidc.auto_redirect) }
+                : {}),
+              ...(draft.auth.oidc.username_claim
+                ? { username_claim: draft.auth.oidc.username_claim }
+                : {}),
+              ...(draft.auth.oidc.groups_claim
+                ? { groups_claim: draft.auth.oidc.groups_claim }
+                : {}),
+              ...(draft.auth.oidc.default_role
+                ? { default_role: draft.auth.oidc.default_role }
+                : {}),
+            },
+          }
+        : {}),
+      ...(draft.auth?.proxy
+        ? {
+            proxy: {
+              enabled: Boolean(draft.auth.proxy.enabled),
+              ...(draft.auth.proxy.trusted_proxies &&
+              draft.auth.proxy.trusted_proxies.length > 0
+                ? { trusted_proxies: draft.auth.proxy.trusted_proxies }
+                : {}),
+              ...(draft.auth.proxy.user_header
+                ? { user_header: draft.auth.proxy.user_header }
+                : {}),
+              ...(draft.auth.proxy.groups_header
+                ? { groups_header: draft.auth.proxy.groups_header }
+                : {}),
+              ...(draft.auth.proxy.logout_url
+                ? {
+                    logout_url: restoreUrl(
+                      draft.auth.proxy.logout_url,
+                      originals
+                    ),
+                  }
+                : {}),
+            },
+          }
+        : {}),
     },
     tls: {
       enabled: draft.tls?.enabled ?? true,
@@ -1084,9 +1234,39 @@ export function buildCleanYamlFromDraft(
           },
         }
       : {}),
+    ...(draft.audio
+      ? {
+          audio: {
+            enabled: Boolean(draft.audio.enabled),
+            ...(draft.audio.min_volume_dbfs !== undefined &&
+            Number.isFinite(draft.audio.min_volume_dbfs)
+              ? { min_volume_dbfs: finiteRound(draft.audio.min_volume_dbfs, -40, 1) }
+              : {}),
+            ...(draft.audio.labels && draft.audio.labels.length > 0
+              ? { labels: draft.audio.labels }
+              : {}),
+          },
+        }
+      : {}),
     record: {
       enabled: draft.record?.enabled ?? true,
       expire_interval: finiteInt(draft.record?.expire_interval, 60),
+      ...(draft.record?.continuous_substream !== undefined
+        ? { continuous_substream: Boolean(draft.record.continuous_substream) }
+        : {}),
+      ...(draft.record?.mode_tiering !== undefined
+        ? { mode_tiering: Boolean(draft.record.mode_tiering) }
+        : {}),
+      ...(draft.record?.max_size_gb !== undefined &&
+      draft.record.max_size_gb !== null &&
+      Number.isFinite(draft.record.max_size_gb)
+        ? { max_size_gb: finiteRound(draft.record.max_size_gb, 0, 2) }
+        : {}),
+      ...(draft.record?.min_free_gb !== undefined &&
+      draft.record.min_free_gb !== null &&
+      Number.isFinite(draft.record.min_free_gb)
+        ? { min_free_gb: finiteRound(draft.record.min_free_gb, 0, 2) }
+        : {}),
       continuous: { days: finiteInt(draft.record?.continuous?.days, 14) },
       motion: { days: finiteInt(draft.record?.motion?.days, 0) },
       alerts: draft.record?.alerts || {
@@ -1099,6 +1279,12 @@ export function buildCleanYamlFromDraft(
         post_capture: 5,
         retain: { days: 14, mode: "motion" },
       },
+      ...(draft.record?.storage_tiers
+        ? { storage_tiers: draft.record.storage_tiers }
+        : {}),
+      ...(draft.record?.alert_backup
+        ? { alert_backup: draft.record.alert_backup }
+        : {}),
       ...(draft.record?.cold_compaction
         ? { cold_compaction: draft.record.cold_compaction }
         : {}),
@@ -1109,6 +1295,12 @@ export function buildCleanYamlFromDraft(
       bounding_box: draft.snapshots?.bounding_box ?? true,
       crop: draft.snapshots?.crop ?? false,
       quality: finiteInt(draft.snapshots?.quality, 70),
+      ...(draft.snapshots?.high_res !== undefined
+        ? { high_res: Boolean(draft.snapshots.high_res) }
+        : {}),
+      ...(draft.snapshots?.from_main_stream !== undefined
+        ? { from_main_stream: Boolean(draft.snapshots.from_main_stream) }
+        : {}),
       ...(draft.snapshots?.selection
         ? { selection: draft.snapshots.selection }
         : {}),
@@ -1116,6 +1308,20 @@ export function buildCleanYamlFromDraft(
     go2rtc: {
       streams: streamsOut,
     },
+    ...(draft.peers && Object.keys(draft.peers).length > 0
+      ? {
+          peers: Object.fromEntries(
+            Object.entries(draft.peers).map(([peerId, peerCfg]) => [
+              peerId,
+              {
+                enabled: Boolean(peerCfg.enabled),
+                url: restoreUrl(peerCfg.url || "", originals),
+                ...(peerCfg.token_env ? { token_env: peerCfg.token_env } : {}),
+              },
+            ])
+          ),
+        }
+      : {}),
     ...(draft.camera_groups && Object.keys(draft.camera_groups).length > 0
       ? { camera_groups: draft.camera_groups }
       : {}),
@@ -1221,10 +1427,16 @@ export function resolveKnownPlateLabel(
   knownPlates?: Record<string, string> | null
 ): string | null {
   const norm = normalizeLicensePlate(plate);
-  if (!norm || !knownPlates) return null;
-  if (knownPlates[norm]) return knownPlates[norm];
+  if (!norm || !knownPlates || typeof knownPlates !== "object") return null;
+  if (
+    Object.prototype.hasOwnProperty.call(knownPlates, norm) &&
+    typeof knownPlates[norm] === "string" &&
+    knownPlates[norm]
+  ) {
+    return knownPlates[norm];
+  }
   for (const [k, v] of Object.entries(knownPlates)) {
-    if (normalizeLicensePlate(k) === norm) {
+    if (typeof v === "string" && normalizeLicensePlate(k) === norm) {
       return v;
     }
   }

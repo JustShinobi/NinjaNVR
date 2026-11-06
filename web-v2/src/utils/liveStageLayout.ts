@@ -335,14 +335,19 @@ export function resolvePersistentTileStyle(
     };
   }
   if (descriptor.role === "dock") {
-    if (descriptor.dockIndex >= DEFAULT_MAX_DOCK_LIVE_DECODERS) {
+    if (
+      typeof descriptor.dockIndex !== "number" ||
+      !Number.isFinite(descriptor.dockIndex) ||
+      descriptor.dockIndex < 0 ||
+      descriptor.dockIndex >= DEFAULT_MAX_DOCK_LIVE_DECODERS
+    ) {
       return {
         display: "none",
       };
     }
     return {
       gridColumn: 2,
-      gridRow: descriptor.dockIndex + 1,
+      gridRow: Math.floor(descriptor.dockIndex) + 1,
       minHeight: 0,
       opacity: liveLayout === "spotlight" ? 0.84 : 1,
       cursor: "pointer",

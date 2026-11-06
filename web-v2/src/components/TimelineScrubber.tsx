@@ -131,7 +131,9 @@ export function sanitizeTimelineThumbUrl(
     stripped.startsWith("//") ||
     stripped.includes("..") ||
     /%2e/i.test(stripped) ||
-    /%5c/i.test(stripped)
+    /%2f/i.test(stripped) ||
+    /%5c/i.test(stripped) ||
+    /%00/i.test(stripped)
   ) {
     return fallbackUrl;
   }
@@ -699,13 +701,13 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
   // Jump to a specific Day from the Multi-Day Calendar
   const handleSelectDay = (dayObj: RecordingDaySummary) => {
-    const parts = (dayObj.day || "").split("-").map(Number);
-    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return;
+    const parts = parseStrictYmd(dayObj.day || "");
+    if (!parts) return;
     const localDayStart = Math.floor(
       new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0).getTime() / 1000
     );
     if (!Number.isFinite(localDayStart)) return;
-    setSelectedDay(dayObj.day);
+    setSelectedDay(dayObj.day.trim());
     setSelectedHour(null);
     const localDayEnd = Math.min(nowSec, localDayStart + 86400);
 
@@ -739,8 +741,8 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
   // Jump to a specific Hour (`00`..`23`) within the selected Day
   const handleSelectHour = (dayStr: string, hourStr: string, hourMeta?: RecordingHourSummary) => {
-    const parts = (dayStr || "").split("-").map(Number);
-    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return;
+    const parts = parseStrictYmd(dayStr || "");
+    if (!parts) return;
     const hNum = parseInt(hourStr, 10) || 0;
     const localHourStart =
       hourMeta?.start_ts && hourMeta.start_ts > 0
@@ -761,11 +763,10 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
   // Jump directly to a user-typed Date + Time (`YYYY-MM-DD` + `HH:MM:SS`)
   const handleDirectDateTimeJump = (dateStr: string, timeStr: string) => {
-    const dParts = (dateStr || "").split("-").map(Number);
+    const dParts = parseStrictYmd(dateStr || "");
     const tParts = (timeStr || "").split(":").map(Number);
     if (
-      dParts.length !== 3 ||
-      dParts.some((n) => !Number.isFinite(n)) ||
+      !dParts ||
       tParts.length < 2 ||
       tParts.some((n) => !Number.isFinite(n))
     ) {
@@ -781,7 +782,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
     );
     const ts = Math.floor(dt.getTime() / 1000);
     if (!Number.isFinite(ts) || ts <= 0) return;
-    setSelectedDay(dateStr);
+    setSelectedDay(dateStr.trim());
     setSelectedHour(String(tParts[0] || 0).padStart(2, "0"));
     setCustomWinEnd(Math.min(nowSec, ts + Math.round(windowSpanSec * 0.5)));
     onSeek(ts >= nowSec - 3 ? null : ts);
@@ -1139,7 +1140,9 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
           !candidate.startsWith("//") &&
           !candidate.includes("..") &&
           !/%2e/i.test(candidate) &&
+          !/%2f/i.test(candidate) &&
           !/%5c/i.test(candidate) &&
+          !/%00/i.test(candidate) &&
           (candidate.startsWith("/exports/") ||
             candidate.startsWith("/api/") ||
             candidate.startsWith("/vod/") ||

@@ -404,10 +404,22 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
     set((s) => {
       const next =
         typeof camsOrFn === "function" ? camsOrFn(s.syncQuadCameras) : camsOrFn;
-      return { syncQuadCameras: Array.from(new Set(next)).slice(0, 4) };
+      const clean = Array.isArray(next)
+        ? next
+            .filter((c): c is string => typeof c === "string")
+            .map((c) => c.trim())
+            .filter(Boolean)
+        : [];
+      return { syncQuadCameras: Array.from(new Set(clean)).slice(0, 4) };
     }),
   setSpotlightFilter: (spotlightFilter) => set({ spotlightFilter }),
-  setSpotlightHoldSec: (spotlightHoldSec) => set({ spotlightHoldSec }),
+  setSpotlightHoldSec: (spotlightHoldSec) =>
+    set({
+      spotlightHoldSec: Math.max(
+        3,
+        Number.isFinite(spotlightHoldSec) ? Math.floor(spotlightHoldSec) : 15
+      ),
+    }),
   setSpotlightTimelineMode: (spotlightTimelineMode) => {
     safeStorageSet("ninjanvr_spotlight_timeline_mode", spotlightTimelineMode);
     set({ spotlightTimelineMode });
@@ -466,10 +478,24 @@ export const useNvrStore = create<NvrRealtimeState>((set, get) => ({
       applyThemeToDocument(s.themeMode, next);
       return { highContrast: next };
     }),
-  setTimeShiftTs: (timeShiftTs) => set({ timeShiftTs }),
+  setTimeShiftTs: (timeShiftTs) =>
+    set({
+      timeShiftTs:
+        typeof timeShiftTs === "number" &&
+        Number.isFinite(timeShiftTs) &&
+        timeShiftTs > 0
+          ? timeShiftTs
+          : null,
+    }),
   setPlaybackSpeed: (playbackSpeed) => {
-    safeStorageSet("ninjanvr_playback_speed", String(playbackSpeed));
-    set({ playbackSpeed });
+    const safeSpeed =
+      typeof playbackSpeed === "number" &&
+      Number.isFinite(playbackSpeed) &&
+      playbackSpeed > 0
+        ? Math.min(16, Math.max(0.1, playbackSpeed))
+        : 1;
+    safeStorageSet("ninjanvr_playback_speed", String(safeSpeed));
+    set({ playbackSpeed: safeSpeed });
   },
   setSimulatedFleetCount: (simulatedFleetCount) => {
     if (simulatedFleetCount > 0) {

@@ -17,6 +17,7 @@ import {
 import {
   buildCleanYamlFromDraft,
   parseYamlScalarValue,
+  resolveKnownPlateLabel,
   validateLicensePlateFormat,
 } from "../utils/configYaml";
 import {
@@ -40,12 +41,15 @@ import {
   resolvePersistentTileStyle,
 } from "../utils/liveStageLayout";
 import {
+  computeLiveEdgeSeekTarget,
   DualSlotMachine,
+  LiveFrameBridge,
   StreamPrewarmCoordinator,
 } from "../utils/msePlayerEngine";
 import {
   buildSharePublicUrl,
   computeShareLinkRotationParams,
+  computeShareLinkStatus,
   formatShareLinkViews,
   isValidShareTokenSegment,
 } from "../utils/shareLinks";
@@ -56,7 +60,11 @@ import {
   simulateGamma24Transfer,
   srgbChannelToLinear,
 } from "../utils/themeTokens";
-import { createPushToTalkController } from "../components/VideoPlayers";
+import {
+  coordStringToPoints,
+  createPushToTalkController,
+  parsePolygonPoints,
+} from "../components/VideoPlayers";
 import {
   computeClientXTimestamp,
   parseLocalDayBounds,
@@ -64,6 +72,7 @@ import {
 } from "../components/TimelineScrubber";
 import { formatReadableDate } from "../components/RecordingCalendarPopover";
 import {
+  filterPickerCameras,
   getCameraPickerStatus,
   resolvePickerMode,
 } from "../components/TacticalCameraPicker";
@@ -955,5 +964,313 @@ cameras:
         1700000020
       )
     ).toBeNull();
+  });
+
+  test("[R3-P1-YAML-01] buildCleanYamlFromDraft preserves auth.oidc, auth.proxy, auth.local_login_enabled, peers, audio, and ignores comment-only/null secrets & commented-out URLs", () => {
+    expect(parseYamlScalarValue("# comment only")).toBe("");
+
+    const rawYamlWithCommentsAndNulls = `
+# Old commented-out credentials must never override active camera credentials:
+# - rtsp://stale_user:stale_pass@192.0.2.10:554/stream1
+mqtt:
+  enabled: true
+  host: 127.0.0.1
+  password: # optional comment
+genai:
+  enabled: true
+  api_key: ~
+go2rtc:
+  streams:
+    cam1:
+      - rtsp://active_user:active_pass@192.0.2.10:554/stream1
+peers:
+  branch_east:
+    enabled: true
+    url: https://peer_op:peer_secret@192.0.2.200:8971
+cameras:
+  cam1:
+    enabled: true
+    onvif:
+      host: 192.0.2.10
+      password: NULL
+`;
+
+    const draft: NinjaConfigResponse = {
+      version: "0.18-0",
+      safe_mode: false,
+      mqtt: {
+        enabled: true,
+        host: "127.0.0.1",
+        port: 1883,
+        topic_prefix: "ninjanvr",
+        client_id: "ninjanvr",
+        stats_interval: 60,
+      },
+      auth: {
+        enabled: true,
+        local_login_enabled: false,
+        reset_admin_password: false,
+        cookie_name: "ninjanvr_token",
+        cookie_secure: true,
+        session_length: 86400,
+        refresh_time: 1800,
+        hash_iterations: 600000,
+        trusted_proxies: ["10.0.0.0/8"],
+        oidc: {
+          enabled: true,
+          provider_name: "Keycloak",
+          issuer_url: "https://sso.example.test/realms/nvr",
+          client_id: "ninjanvr-web",
+          client_secret_env: "OIDC_SECRET",
+          scopes: ["openid", "profile"],
+          auto_redirect: true,
+          default_role: "operator",
+        },
+        proxy: {
+          enabled: true,
+          trusted_proxies: ["127.0.0.1/32"],
+          user_header: "X-Forwarded-User",
+          groups_header: "X-Forwarded-Groups",
+        },
+      },
+      genai: {
+        enabled: true,
+        provider: "gemini",
+        api_key_env: "GEMINI_API_KEY",
+        model: "gemini-2.5-flash",
+        verify_ambiguous_alerts: false,
+        ambiguous_score_min: 0.45,
+        ambiguous_score_max: 0.72,
+        auto_suppress_false_positives: true,
+      },
+      audio: {
+        enabled: true,
+        min_volume_dbfs: -38.5,
+        labels: ["glass_break", "scream"],
+      },
+      peers: {
+        branch_east: {
+          enabled: true,
+          url: "https://*:*@192.0.2.200:8971",
+          token_env: "PEER_EAST_TOKEN",
+        },
+      },
+      go2rtc: {
+        streams: {
+          cam1: ["rtsp://*:*@192.0.2.10:554/stream1_sub"],
+        },
+      },
+      cameras: {
+        cam1: {
+          enabled: true,
+          indoor: true,
+          notes: "Lobby entry",
+          onvif: {
+            host: "192.0.2.10",
+            port: 80,
+            user: "admin",
+          },
+          audio: {
+            enabled: true,
+            min_volume_dbfs: -42,
+            labels: ["bark"],
+          },
+          detect: {
+            enabled: true,
+            detector: "detector01",
+            width: 1280,
+            height: 720,
+            fps: 5,
+            min_initialized_night: 4,
+          },
+          motion: { enabled: true, threshold: 30, contour_area: 10, mask: {} },
+          zones: {},
+          record: {
+            enabled: true,
+            continuous_substream: true,
+            max_size_gb: 500,
+          },
+          snapshots: {
+            enabled: true,
+            high_res: true,
+            from_main_stream: true,
+          },
+        },
+      },
+    };
+
+    const yaml = buildCleanYamlFromDraft(draft, rawYamlWithCommentsAndNulls);
+    // Active URL credentials restored, not commented-out stale_user:stale_pass
+    expect(yaml).toContain("rtsp://active_user:active_pass@192.0.2.10:554/stream1_sub");
+    expect(yaml).not.toContain("stale_user");
+    // Peer node config and scrubbed peer URL credentials restored
+    expect(yaml).toContain("peers:");
+    expect(yaml).toContain("branch_east:");
+    expect(yaml).toContain('url: "https://peer_op:peer_secret@192.0.2.200:8971"');
+    expect(yaml).toContain("token_env: PEER_EAST_TOKEN");
+    // OIDC and Proxy auth preserved
+    expect(yaml).toContain("local_login_enabled: false");
+    expect(yaml).toContain("oidc:");
+    expect(yaml).toContain("provider_name: Keycloak");
+    expect(yaml).toContain("client_secret_env: OIDC_SECRET");
+    expect(yaml).toContain("proxy:");
+    expect(yaml).toContain("user_header: X-Forwarded-User");
+    // Audio and extended camera/record/snapshot fields preserved
+    expect(yaml).toContain("min_volume_dbfs: -38.5");
+    expect(yaml).toContain("- glass_break");
+    expect(yaml).toContain("indoor: true");
+    expect(yaml).toContain("min_initialized_night: 4");
+    expect(yaml).toContain("continuous_substream: true");
+    expect(yaml).toContain("max_size_gb: 500");
+    expect(yaml).toContain("high_res: true");
+    expect(yaml).toContain("from_main_stream: true");
+    // Comment-only password and YAML null (~ / NULL) must not be injected as literal secrets
+    expect(yaml).not.toContain("optional comment");
+    expect(yaml).not.toContain("api_key:");
+    expect(yaml).not.toContain("password:");
+
+    expect(resolveKnownPlateLabel("toString", {})).toBeNull();
+  });
+
+  test("[R3-P1-PLAYERS-STORE-01] guards store numeric bounds, LiveFrameBridge dataUrl validation, DualSlotMachine idle markSlotError, polygon Infinity, and %00/%2f URLs", () => {
+    // 1. Store numeric bounds for timeShiftTs, playbackSpeed, spotlightHoldSec, and syncQuadCameras
+    useNvrStore.getState().setTimeShiftTs(Number.NaN);
+    expect(useNvrStore.getState().timeShiftTs).toBeNull();
+    useNvrStore.getState().setTimeShiftTs(-50);
+    expect(useNvrStore.getState().timeShiftTs).toBeNull();
+    useNvrStore.getState().setTimeShiftTs(1700000500);
+    expect(useNvrStore.getState().timeShiftTs).toBe(1700000500);
+    useNvrStore.getState().setTimeShiftTs(null);
+
+    useNvrStore.getState().setPlaybackSpeed(Number.NaN);
+    expect(useNvrStore.getState().playbackSpeed).toBe(1);
+    useNvrStore.getState().setPlaybackSpeed(-2);
+    expect(useNvrStore.getState().playbackSpeed).toBe(1);
+
+    useNvrStore.getState().setSpotlightHoldSec(Number.NaN);
+    expect(useNvrStore.getState().spotlightHoldSec).toBe(15);
+    useNvrStore.getState().setSpotlightHoldSec(1);
+    expect(useNvrStore.getState().spotlightHoldSec).toBe(3);
+
+    useNvrStore.getState().setSyncQuadCameras([" cam1 ", "", "cam1", "cam2"]);
+    expect(useNvrStore.getState().syncQuadCameras).toEqual(["cam1", "cam2"]);
+
+    // 2. LiveFrameBridge rejects non-data:image/ URLs and invalid dimensions
+    const bridge = new LiveFrameBridge(4, 10_000);
+    expect(
+      bridge.store("cam1", {
+        dataUrl: "javascript:alert(1)",
+        width: 640,
+        height: 360,
+        capturedAtMs: 1000,
+      })
+    ).toBeNull();
+    expect(
+      bridge.store("cam1", {
+        dataUrl: "data:text/html,<script>alert(1)</script>",
+        width: 640,
+        height: 360,
+        capturedAtMs: 1000,
+      })
+    ).toBeNull();
+    expect(
+      bridge.store("cam1", {
+        dataUrl: "data:image/jpeg;base64,/9j/4AAQ",
+        width: Number.NaN,
+        height: 360,
+        capturedAtMs: 1000,
+      })
+    ).toBeNull();
+    expect(
+      bridge.store("cam1", {
+        dataUrl: "data:image/jpeg;base64,/9j/4AAQ",
+        width: 640,
+        height: 360,
+        capturedAtMs: 1000,
+      })
+    ).not.toBeNull();
+    expect(bridge.getFresh("cam1", Number.NaN)).toBeNull();
+
+    // 3. DualSlotMachine.markSlotError ignores idle slots and computeLiveEdgeSeekTarget recovers NaN currentTime
+    const machine = new DualSlotMachine();
+    machine.markSlotError(0);
+    expect(machine.getState().slots[0].status).toBe("idle");
+    expect(computeLiveEdgeSeekTarget(0, 5, Number.NaN, false)).toBe(4.85);
+
+    // 4. parsePolygonPoints and coordStringToPoints guard Infinity and NaN detector dimensions
+    expect(
+      parsePolygonPoints("0.1,0.2,Infinity,0.5,0.8,0.9", Number.NaN, Number.NaN)
+    ).toBe("100,200 800,900");
+    expect(
+      coordStringToPoints("0.1,0.2,Infinity,0.5,0.8,0.9", Number.NaN, Number.NaN)
+    ).toEqual([
+      [0.1, 0.2],
+      [0.8, 0.9],
+    ]);
+
+    // 5. sanitizeExportVideoUrl and sanitizeTimelineThumbUrl reject %00 and %2f
+    expect(
+      sanitizeExportVideoUrl("/exports/clip%00.mp4", "cam1", 100, 110)
+    ).toBe("/exports/cam1_100_110.mp4");
+    expect(
+      sanitizeExportVideoUrl("/exports/..%2fsecret.mp4", "cam1", 100, 110)
+    ).toBe("/exports/cam1_100_110.mp4");
+    expect(
+      sanitizeTimelineThumbUrl("/clips/thumb%00.webp", "cam1")
+    ).toBe("/api/cam1/latest.webp");
+    expect(
+      sanitizeTimelineThumbUrl("/clips/sub%2fthumb.webp", "cam1")
+    ).toBe("/api/cam1/latest.webp");
+
+    // 6. resolvePersistentTileStyle, filterPickerCameras, and computeShareLinkStatus guards
+    expect(
+      resolvePersistentTileStyle("focus", {
+        camera: "cam2",
+        role: "dock",
+        renderMode: "mse",
+        useMainStream: false,
+        dockIndex: -1,
+        dockTotal: 2,
+        isTimelineSelected: false,
+        isSpotlightHeld: false,
+      })
+    ).toEqual({ display: "none" });
+    expect(
+      resolvePersistentTileStyle("focus", {
+        camera: "cam2",
+        role: "dock",
+        renderMode: "mse",
+        useMainStream: false,
+        dockIndex: Number.NaN,
+        dockTotal: 2,
+        isTimelineSelected: false,
+        isSpotlightHeld: false,
+      })
+    ).toEqual({ display: "none" });
+
+    expect(
+      filterPickerCameras(["cam1", "cam2"], {
+        groupFilter: "toString",
+        cameraGroups: {},
+      })
+    ).toEqual(["cam1", "cam2"]);
+
+    expect(
+      computeShareLinkStatus(
+        {
+          id: "shr_inf",
+          kind: "export",
+          target_id: "exp_1",
+          camera: "cam1",
+          created_by: "admin",
+          created_at: 1000,
+          expires_at: 2000,
+          revoked: false,
+          access_count: Number.POSITIVE_INFINITY,
+          max_views: 5,
+        },
+        1500
+      )
+    ).toBe("active");
   });
 });

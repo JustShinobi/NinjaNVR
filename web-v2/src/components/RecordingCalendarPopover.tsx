@@ -487,7 +487,8 @@ export const RecordingCalendarPopover: React.FC<RecordingCalendarPopoverProps> =
                   ).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
                   const targetDate =
                     selectedDate || daysSummary[0]?.day || localToday;
-                  onSelectDateTime?.(targetDate, timeInput);
+                  const safeTime = timeInput.trim() || selectedTime || "12:00:00";
+                  onSelectDateTime?.(targetDate, safeTime);
                   setIsOpen(false);
                 }}
               >

@@ -85,7 +85,8 @@ export function filterPickerCameras(
     groupFilter &&
     groupFilter !== "all" &&
     cameraGroups &&
-    cameraGroups[groupFilter]?.cameras
+    Object.prototype.hasOwnProperty.call(cameraGroups, groupFilter) &&
+    Array.isArray(cameraGroups[groupFilter]?.cameras)
       ? new Set(cameraGroups[groupFilter].cameras)
       : null;
 
@@ -397,7 +398,10 @@ export const TacticalCameraPicker: React.FC<TacticalCameraPickerProps> = ({
                 const st = getCameraPickerStatus(cam, cameraStats, cameraActivity);
                 const itemDot =
                   st === "alert" ? "motion" : st === "offline" ? "alert" : "live";
-                const fps = cameraStats?.[cam]?.camera_fps;
+                const fps =
+                  cameraStats && Object.prototype.hasOwnProperty.call(cameraStats, cam)
+                    ? cameraStats[cam]?.camera_fps
+                    : undefined;
                 return (
                   <button
                     key={cam}

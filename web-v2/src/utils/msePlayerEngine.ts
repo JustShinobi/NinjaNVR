@@ -219,7 +219,10 @@ export class DualSlotMachine {
 
   public markSlotError(slot: VideoSlotIndex, sessionId?: number): DualSlotSnapshot {
     const slotState = this.slots[slot];
-    if (sessionId !== undefined && slotState.sessionId !== sessionId) {
+    if (
+      slotState.status === "idle" ||
+      (sessionId !== undefined && slotState.sessionId !== sessionId)
+    ) {
       return this.getState();
     }
     this.slots[slot] = {
@@ -324,15 +327,28 @@ export class LiveFrameBridge {
     }
   ): CapturedFrameEntry | null {
     const key = camera.trim();
-    if (!key || !payload.dataUrl) {
+    if (
+      !key ||
+      !payload.dataUrl ||
+      !payload.dataUrl.startsWith("data:image/") ||
+      /[\u0000-\u0020\u007f]/.test(payload.dataUrl) ||
+      !Number.isFinite(payload.width) ||
+      !Number.isFinite(payload.height) ||
+      payload.width <= 0 ||
+      payload.height <= 0
+    ) {
       return null;
     }
+    const safeCapturedAt =
+      typeof payload.capturedAtMs === "number" && Number.isFinite(payload.capturedAtMs)
+        ? payload.capturedAtMs
+        : Date.now();
     const entry: CapturedFrameEntry = {
       camera: key,
       dataUrl: payload.dataUrl,
-      width: payload.width,
-      height: payload.height,
-      capturedAtMs: payload.capturedAtMs ?? Date.now(),
+      width: Math.round(payload.width),
+      height: Math.round(payload.height),
+      capturedAtMs: safeCapturedAt,
     };
 
     if (this.entries.has(key)) {
@@ -355,7 +371,11 @@ export class LiveFrameBridge {
     if (!entry) {
       return null;
     }
-    if (nowMs - entry.capturedAtMs > this.ttlMs) {
+    if (
+      !Number.isFinite(nowMs) ||
+      !Number.isFinite(entry.capturedAtMs) ||
+      nowMs - entry.capturedAtMs > this.ttlMs
+    ) {
       this.entries.delete(key);
       return null;
     }
@@ -517,12 +537,13 @@ export function computeLiveEdgeSeekTarget(
     return null;
   }
   if (isInitialBurst) {
-    if (bufferedEnd > 0.25 || currentTime < bufferedStart) {
+    if (!Number.isFinite(currentTime) || bufferedEnd > 0.25 || currentTime < bufferedStart) {
       return Math.max(bufferedStart, Number((bufferedEnd - 0.08).toFixed(3)));
     }
     return null;
   }
   if (
+    !Number.isFinite(currentTime) ||
     bufferedEnd - currentTime > 1.8 ||
     currentTime < bufferedStart - 0.5 ||
     currentTime > bufferedEnd + 0.5

@@ -844,17 +844,28 @@ export function parsePolygonPoints(
   detWidth: number,
   detHeight: number
 ): string {
-  const nums = coordStr
-    .split(",")
-    .map((s) => parseFloat(s.trim()))
-    .filter((n) => !Number.isNaN(n));
+  if (typeof coordStr !== "string" || !coordStr.trim()) {
+    return "";
+  }
+  const safeW =
+    typeof detWidth === "number" && Number.isFinite(detWidth) && detWidth > 0
+      ? detWidth
+      : 1280;
+  const safeH =
+    typeof detHeight === "number" && Number.isFinite(detHeight) && detHeight > 0
+      ? detHeight
+      : 720;
+  const nums = coordStr.split(",").map((s) => parseFloat(s.trim()));
   const pairs: string[] = [];
   for (let i = 0; i + 1 < nums.length; i += 2) {
     let x = nums[i];
     let y = nums[i + 1];
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      continue;
+    }
     if (x > 1.0 || y > 1.0) {
-      x = x / Math.max(1, detWidth);
-      y = y / Math.max(1, detHeight);
+      x = x / safeW;
+      y = y / safeH;
     }
     const sx = Math.round(Math.max(0, Math.min(1, x)) * 1000);
     const sy = Math.round(Math.max(0, Math.min(1, y)) * 1000);
@@ -871,17 +882,28 @@ export function coordStringToPoints(
   detWidth: number,
   detHeight: number
 ): Array<[number, number]> {
-  const nums = coordStr
-    .split(",")
-    .map((s) => parseFloat(s.trim()))
-    .filter((n) => !Number.isNaN(n));
+  if (typeof coordStr !== "string" || !coordStr.trim()) {
+    return [];
+  }
+  const safeW =
+    typeof detWidth === "number" && Number.isFinite(detWidth) && detWidth > 0
+      ? detWidth
+      : 1280;
+  const safeH =
+    typeof detHeight === "number" && Number.isFinite(detHeight) && detHeight > 0
+      ? detHeight
+      : 720;
+  const nums = coordStr.split(",").map((s) => parseFloat(s.trim()));
   const out: Array<[number, number]> = [];
   for (let i = 0; i + 1 < nums.length; i += 2) {
     let x = nums[i];
     let y = nums[i + 1];
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      continue;
+    }
     if (x > 1.0 || y > 1.0) {
-      x = x / Math.max(1, detWidth);
-      y = y / Math.max(1, detHeight);
+      x = x / safeW;
+      y = y / safeH;
     }
     out.push([Math.max(0, Math.min(1, x)), Math.max(0, Math.min(1, y))]);
   }
@@ -1996,6 +2018,12 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
     return muted;
   });
 
+  const safePlaybackRate =
+    typeof playbackRate === "number" &&
+    Number.isFinite(playbackRate) &&
+    playbackRate > 0
+      ? Math.min(16, Math.max(0.1, playbackRate))
+      : 1;
   const finiteStart =
     typeof startTime === "number" && Number.isFinite(startTime)
       ? startTime
@@ -2040,7 +2068,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       hls.loadSource(hlsUrl);
       hls.attachMedia(videoEl);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        videoEl.playbackRate = playbackRate;
+        videoEl.playbackRate = safePlaybackRate;
         videoEl.muted = userMuted;
         if (autoPlay) {
           videoEl.play().catch(() => {
@@ -2075,7 +2103,7 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
       });
     } else if (videoEl.canPlayType("application/vnd.apple.mpegurl")) {
       videoEl.src = hlsUrl;
-      videoEl.playbackRate = playbackRate;
+      videoEl.playbackRate = safePlaybackRate;
       if (autoPlay) {
         videoEl.play().catch(() => {});
       }
@@ -2103,22 +2131,27 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
 
   useEffect(() => {
     if (videoRef.current) {
-      videoRef.current.playbackRate = playbackRate;
+      videoRef.current.playbackRate = safePlaybackRate;
     }
-  }, [playbackRate]);
+  }, [safePlaybackRate, useFallbackMp4]);
 
   const stepVodFrame = (dir: -1 | 1) => {
     const vid = videoRef.current;
     if (!vid) return;
     vid.pause();
     const frameDur = 1 / 15;
-    vid.currentTime = Math.max(0, vid.currentTime + dir * frameDur);
+    const cur = Number.isFinite(vid.currentTime) ? vid.currentTime : 0;
+    vid.currentTime = Math.max(0, cur + dir * frameDur);
   };
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase();
-      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) {
+        return;
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === ",") {
         e.preventDefault();
         stepVodFrame(-1);

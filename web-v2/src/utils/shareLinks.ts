@@ -26,11 +26,15 @@ export function computeShareLinkStatus(
   if (!Number.isFinite(link.expires_at) || link.expires_at <= now) {
     return "expired";
   }
+  const safeAccessCount =
+    typeof link.access_count === "number" && Number.isFinite(link.access_count)
+      ? Math.max(0, Math.floor(link.access_count))
+      : 0;
   if (
     typeof link.max_views === "number" &&
     Number.isFinite(link.max_views) &&
     link.max_views > 0 &&
-    (link.access_count ?? 0) >= link.max_views
+    safeAccessCount >= link.max_views
   ) {
     return "exhausted";
   }

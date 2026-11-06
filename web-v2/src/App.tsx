@@ -117,7 +117,9 @@ export function sanitizeExportVideoUrl(
     candidate.startsWith("//") ||
     candidate.includes("..") ||
     /%2e/i.test(candidate) ||
-    /%5c/i.test(candidate)
+    /%2f/i.test(candidate) ||
+    /%5c/i.test(candidate) ||
+    /%00/i.test(candidate)
   ) {
     return fallbackPath;
   }
@@ -633,7 +635,10 @@ export const App: React.FC = () => {
                 "Notification" in window &&
                 Notification.permission === "granted"
               ) {
-                const objs = (alertItem.data?.objects || ["person"]).join(", ").toUpperCase();
+                const rawObjs = alertItem.data?.objects;
+                const objList =
+                  Array.isArray(rawObjs) && rawObjs.length > 0 ? rawObjs : ["person"];
+                const objs = objList.join(", ").toUpperCase();
                 const n = new Notification(
                   `NinjaNVR Alert // ${alertItem.camera.toUpperCase()}`,
                   {
@@ -909,8 +914,15 @@ export const App: React.FC = () => {
       label?: string,
       includeAudio: boolean = true
     ): Promise<{ exportId?: string; videoUrl?: string } | void> => {
-      const s = Math.floor(startSec);
-      const e = Math.ceil(Math.max(endSec, startSec + 5));
+      const nowFallback = Math.floor(Date.now() / 1000);
+      const s =
+        typeof startSec === "number" && Number.isFinite(startSec) && startSec > 0
+          ? Math.floor(startSec)
+          : nowFallback - 60;
+      const e =
+        typeof endSec === "number" && Number.isFinite(endSec)
+          ? Math.ceil(Math.max(endSec, s + 5))
+          : s + 30;
       const res = await fetch(`/api/export/${encodeURIComponent(camera)}/start/${s}/end/${e}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
