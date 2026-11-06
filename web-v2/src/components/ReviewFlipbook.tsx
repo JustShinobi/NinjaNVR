@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 
 /** Milliseconds each flipbook frame stays on screen. */
 export const FLIPBOOK_FRAME_MS = 450;
@@ -57,29 +57,48 @@ interface ReviewFlipbookProps {
  * or while the page is hidden.
  */
 export const ReviewFlipbook: React.FC<ReviewFlipbookProps> = ({ reviewId, fallbackSrc, alt }) => {
-  const [frames, setFrames] = useState<string[]>([]);
-  const [failed, setFailed] = useState<Set<string>>(() => new Set());
+  // Frames that finished loading, in order. Frames are preloaded one at a time per
+  // card so a page of cards never floods the server's bounded extraction queue.
+  const [ready, setReady] = useState<string[]>([]);
   const [index, setIndex] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
-    setFrames([]);
-    setFailed(new Set());
+    let pending: HTMLImageElement | null = null;
+    setReady([]);
     setIndex(0);
+
+    const preloadSequentially = (urls: string[], at: number) => {
+      if (cancelled || at >= urls.length || typeof Image === "undefined") return;
+      const img = new Image();
+      pending = img;
+      img.onload = () => {
+        if (cancelled) return;
+        setReady((prev) => [...prev, urls[at]]);
+        preloadSequentially(urls, at + 1);
+      };
+      // A missing or throttled frame is skipped; the loop keeps the ones that loaded.
+      img.onerror = () => preloadSequentially(urls, at + 1);
+      img.src = urls[at];
+    };
+
     fetch(`/api/review/${encodeURIComponent(reviewId)}/frames`, { credentials: "include" })
       .then((res) => (res.ok ? res.json() : null))
       .then((payload) => {
-        if (!cancelled) setFrames(sanitizeReviewFrameUrls(reviewId, payload));
+        if (!cancelled) preloadSequentially(sanitizeReviewFrameUrls(reviewId, payload), 0);
       })
-      .catch(() => {
-        if (!cancelled) setFrames([]);
-      });
+      .catch(() => undefined);
     return () => {
       cancelled = true;
+      if (pending) {
+        pending.onload = null;
+        pending.onerror = null;
+        pending.src = "";
+      }
     };
   }, [reviewId]);
 
-  const usable = useMemo(() => frames.filter((f) => !failed.has(f)), [frames, failed]);
+  const usable = ready;
 
   useEffect(() => {
     if (usable.length <= 1 || prefersReducedMotion()) return;
@@ -95,16 +114,7 @@ export const ReviewFlipbook: React.FC<ReviewFlipbookProps> = ({ reviewId, fallba
 
   return (
     <>
-      <img
-        src={current ?? fallbackSrc}
-        alt={alt}
-        width={166}
-        height={94}
-        loading="lazy"
-        onError={() => {
-          if (current) setFailed((prev) => new Set(prev).add(current));
-        }}
-      />
+      <img src={current ?? fallbackSrc} alt={alt} width={166} height={94} loading="lazy" />
       {progress > 0 && (
         <span className="nvr-event-progress" aria-hidden="true">
           <span style={{ width: `${Math.round(progress * 100)}%` }} />
