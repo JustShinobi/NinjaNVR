@@ -4606,8 +4606,8 @@ async fn api_config_save(
         )
             .into_response();
     }
-    let mut cfg_guard = state.config.write().await;
-    let path = cfg_guard.config_path.clone();
+    let prev_cfg = state.config.read().await.clone();
+    let path = prev_cfg.config_path.clone();
     match NinjaConfig::from_yaml_str(&body, path.clone()) {
         Ok(mut new_cfg) => {
             if let Err(msg) = validate_config_labelmap_paths(&new_cfg) {
@@ -4617,7 +4617,7 @@ async fn api_config_save(
                 )
                     .into_response();
             }
-            new_cfg.restore_scrubbed_from_previous(&cfg_guard);
+            new_cfg.restore_scrubbed_from_previous(&prev_cfg);
             if let Err(msg) = validate_config_labelmap_paths(&new_cfg) {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -4625,22 +4625,50 @@ async fn api_config_save(
                 )
                     .into_response();
             }
-            if let Err(err) = std::fs::write(&path, &new_cfg.raw_yaml) {
-                error!("Failed to persist config.yml: {err:#}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "success": false, "message": err.to_string() })),
-                )
-                    .into_response();
-            }
-            let _ = new_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH);
-            state.detector.reload(&new_cfg);
-            let rec_dir = state.media_dir.join("recordings");
-            let rec_mount = stat_mount_mb(&rec_dir, "ext4");
-            let heuristics =
-                evaluate_system_heuristics(&new_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
+            let state_for_io = state.clone();
+            let io_res = tokio::task::spawn_blocking(
+                move || -> std::result::Result<(NinjaConfig, Vec<HeuristicAlertDto>), String> {
+                    if let Err(err) = std::fs::write(&path, &new_cfg.raw_yaml) {
+                        error!("Failed to persist config.yml: {err:#}");
+                        return Err(err.to_string());
+                    }
+                    if let Err(err) = new_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH) {
+                        warn!(
+                            "Failed to write go2rtc config to {DEFAULT_GO2RTC_SHM_PATH}: {err:#}"
+                        );
+                    }
+                    state_for_io.detector.reload(&new_cfg);
+                    let rec_dir = state_for_io.media_dir.join("recordings");
+                    let rec_mount = stat_mount_mb(&rec_dir, "ext4");
+                    let heuristics = evaluate_system_heuristics(
+                        &new_cfg,
+                        &serde_json::Map::new(),
+                        &rec_mount,
+                        14.0,
+                    );
+                    Ok((new_cfg, heuristics))
+                },
+            )
+            .await;
+            let (new_cfg, heuristics) = match io_res {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(err_msg)) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "success": false, "message": err_msg })),
+                    )
+                        .into_response();
+                }
+                Err(join_err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "success": false, "message": join_err.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
             emit_heuristics_to_logs(&state.log_hub, &heuristics);
-            *cfg_guard = new_cfg;
+            *state.config.write().await = new_cfg;
             Json(json!({ "success": true, "message": "Config saved successfully" })).into_response()
         }
         Err(err) => (
@@ -4667,8 +4695,7 @@ async fn api_config_structured(
         )
             .into_response();
     }
-    let mut cfg_guard = state.config.write().await;
-    let mut next_cfg = cfg_guard.clone();
+    let mut next_cfg = state.config.read().await.clone();
     if let Err(err) = next_cfg.apply_structured_json(&body) {
         return (
             StatusCode::BAD_REQUEST,
@@ -4683,24 +4710,46 @@ async fn api_config_structured(
         )
             .into_response();
     }
-    if let Err(err) = std::fs::write(&next_cfg.config_path, &next_cfg.raw_yaml) {
-        error!("Failed to persist structured config.yml: {err:#}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "message": err.to_string() })),
-        )
-            .into_response();
-    }
-    let _ = next_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH);
-    state.detector.reload(&next_cfg);
-    let rec_dir = state.media_dir.join("recordings");
-    let rec_mount = stat_mount_mb(&rec_dir, "ext4");
-    let heuristics =
-        evaluate_system_heuristics(&next_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
+    let state_for_io = state.clone();
+    let io_res = tokio::task::spawn_blocking(
+        move || -> std::result::Result<(NinjaConfig, Vec<HeuristicAlertDto>, Value, String), String> {
+            if let Err(err) = std::fs::write(&next_cfg.config_path, &next_cfg.raw_yaml) {
+                error!("Failed to persist structured config.yml: {err:#}");
+                return Err(err.to_string());
+            }
+            if let Err(err) = next_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH) {
+                warn!("Failed to write go2rtc config to {DEFAULT_GO2RTC_SHM_PATH}: {err:#}");
+            }
+            state_for_io.detector.reload(&next_cfg);
+            let rec_dir = state_for_io.media_dir.join("recordings");
+            let rec_mount = stat_mount_mb(&rec_dir, "ext4");
+            let heuristics =
+                evaluate_system_heuristics(&next_cfg, &serde_json::Map::new(), &rec_mount, 14.0);
+            let api_cfg = next_cfg.to_api_config();
+            let raw_yaml = scrub_raw_yaml_secrets_strict(&next_cfg.raw_yaml, &next_cfg);
+            Ok((next_cfg, heuristics, api_cfg, raw_yaml))
+        },
+    )
+    .await;
+    let (next_cfg, heuristics, api_cfg, raw_yaml) = match io_res {
+        Ok(Ok(quad)) => quad,
+        Ok(Err(err_msg)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": err_msg })),
+            )
+                .into_response();
+        }
+        Err(join_err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": join_err.to_string() })),
+            )
+                .into_response();
+        }
+    };
     emit_heuristics_to_logs(&state.log_hub, &heuristics);
-    let api_cfg = next_cfg.to_api_config();
-    let raw_yaml = scrub_raw_yaml_secrets_strict(&next_cfg.raw_yaml, &next_cfg);
-    *cfg_guard = next_cfg;
+    *state.config.write().await = next_cfg;
     Json(json!({
         "success": true,
         "message": "Structured configuration saved",
@@ -5540,6 +5589,9 @@ pub struct DebugReprocessBody {
     pub max_area: Option<f64>,
 }
 
+static DEBUG_REPROCESS_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+
 async fn api_debug_reprocess(
     State(state): State<AppState>,
     uri: Uri,
@@ -5556,6 +5608,9 @@ async fn api_debug_reprocess(
             })),
         )
             .into_response();
+    }
+    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
+        return err_resp;
     }
     if !is_safe_go2rtc_stream_name(&body.camera) {
         return (
@@ -5580,6 +5635,16 @@ async fn api_debug_reprocess(
         )
             .into_response();
     }
+    let Ok(_reprocess_permit) = DEBUG_REPROCESS_SEMAPHORE.try_acquire() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "success": false,
+                "message": "A debug reprocess job is already in progress"
+            })),
+        )
+            .into_response();
+    };
 
     let start_ts = body.start_time;
     let end_ts = body.end_time.min(start_ts + 120.0).max(start_ts + 1.0);
@@ -5620,30 +5685,35 @@ async fn api_debug_reprocess(
         raw_max_area.max(1.0).round() as u32
     };
 
-    let recs = state
-        .db
-        .query_recordings(&body.camera, start_ts - 5.0, end_ts + 5.0)
+    let state_for_recs = state.clone();
+    let cam_for_recs = body.camera.clone();
+    let (segments_analyzed, rec_paths): (usize, Vec<(f64, PathBuf)>) =
+        tokio::task::spawn_blocking(move || {
+            let recs = state_for_recs
+                .db
+                .query_recordings(&cam_for_recs, start_ts - 5.0, end_ts + 5.0)
+                .unwrap_or_default();
+            let total_len = recs.len();
+            let paths = recs
+                .into_iter()
+                .take(4)
+                .filter_map(|rec| {
+                    let disk_path = ensure_path_within_media_dir(
+                        &state_for_recs.media_dir,
+                        &resolve_recording_disk_path(&state_for_recs.media_dir, &rec.path),
+                    )
+                    .filter(|p| p.is_file())?;
+                    Some((rec.start_time, disk_path))
+                })
+                .collect();
+            (total_len, paths)
+        })
+        .await
         .unwrap_or_default();
 
-    let mut frames_trace = Vec::new();
-
-    // 1. Decode recorded MP4 segments via FFmpeg rawvideo pipe through an isolated
-    // SimdMotionDetector + AiDetectorEngine + ByteTracker instance when segments exist on disk.
     let frame_bytes_len = ((det_w as usize) * (det_h as usize) * 3) / 2;
-    let mut motion_detector =
-        ninjanvr_vision::SimdMotionDetector::new(det_w, det_h, cam_cfg.motion.clone());
-    let mut tracker = ninjanvr_track::ByteTracker::new(&body.camera, det_w, det_h, &cam_cfg);
-    let (model_w, model_h, bgr_order) = state.detector.model_dimensions();
-    let mut tensor_buf = vec![0u8; (model_w * model_h * 3) as usize];
-
-    for rec in recs.iter().take(4) {
-        let Some(disk_path) = ensure_path_within_media_dir(
-            &state.media_dir,
-            &resolve_recording_disk_path(&state.media_dir, &rec.path),
-        )
-        .filter(|p| p.is_file()) else {
-            continue;
-        };
+    let mut decoded_segments: Vec<(f64, Vec<u8>)> = Vec::with_capacity(rec_paths.len());
+    for (rec_start_time, disk_path) in rec_paths {
         let mut cmd = tokio::process::Command::new("ffmpeg");
         cmd.kill_on_drop(true).args([
             "-hide_banner",
@@ -5668,178 +5738,199 @@ async fn api_debug_reprocess(
         if !output.status.success() || output.stdout.len() < frame_bytes_len {
             continue;
         }
-        for (f_idx, chunk) in output.stdout.chunks_exact(frame_bytes_len).enumerate() {
-            let f_ts = rec.start_time + (f_idx as f64);
-            let yuv = ninjanvr_media::YuvFrame {
-                camera: Arc::from(body.camera.as_str()),
-                timestamp: f_ts,
-                width: det_w,
-                height: det_h,
-                data: Arc::new(chunk.to_vec()),
-            };
-            let m_boxes = motion_detector.detect(&yuv);
-            let tracked_boxes = tracker.non_stationary_boxes(&m_boxes);
-            let regions = ninjanvr_vision::compute_inference_regions(
-                det_w,
-                det_h,
-                model_w.max(model_h),
-                &m_boxes,
-                &tracked_boxes,
-            );
-            let mut raw_dets = Vec::new();
-            for reg in &regions {
-                ninjanvr_vision::crop_yuv420p_to_tensor_nhwc(
-                    &yuv,
-                    reg,
-                    model_w,
-                    model_h,
-                    bgr_order,
-                    &mut tensor_buf,
-                );
-                let dets = state
-                    .detector
-                    .detect_region(&tensor_buf, *reg, det_w, det_h, 0.25);
-                raw_dets.extend(dets);
-            }
-            let (active_trks, _) = tracker.update(f_ts, &raw_dets, &regions, &cam_cfg);
-            let mut rejected = Vec::new();
-            for d in &raw_dets {
-                let area = d.bbox.area();
-                if (d.score as f64) < eff_min_score {
-                    rejected.push(json!({
-                        "label": d.label,
-                        "score": d.score,
-                        "area_px": area,
-                        "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
-                        "reason": "below_min_score"
-                    }));
-                } else if area < eff_min_area_px {
-                    rejected.push(json!({
-                        "label": d.label,
-                        "score": d.score,
-                        "area_px": area,
-                        "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
-                        "reason": "below_min_area"
-                    }));
-                } else if area > eff_max_area_px {
-                    rejected.push(json!({
-                        "label": d.label,
-                        "score": d.score,
-                        "area_px": area,
-                        "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
-                        "reason": "above_max_area"
-                    }));
-                }
-            }
-            frames_trace.push(json!({
-                "ts": f_ts,
-                "motion_boxes": m_boxes.iter().map(|b| json!([b.x_min, b.y_min, b.x_max, b.y_max])).collect::<Vec<_>>(),
-                "raw_detections": raw_dets.iter().map(|d| json!({
-                    "label": d.label,
-                    "score": d.score,
-                    "area_px": d.bbox.area(),
-                    "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max]
-                })).collect::<Vec<_>>(),
-                "active_tracks": active_trks.iter().map(|t| json!({
-                    "id": t.id,
-                    "label": t.label,
-                    "score": t.score,
-                    "area_px": t.bbox.area(),
-                    "bbox": [t.bbox.x_min, t.bbox.y_min, t.bbox.x_max, t.bbox.y_max],
-                    "zones": t.entered_zones
-                })).collect::<Vec<_>>(),
-                "filtered_reasons": rejected
-            }));
-        }
+        decoded_segments.push((rec_start_time, output.stdout));
     }
 
-    // 2. Also evaluate recorded events inside the requested replay window against the effective filter parameters
-    let events = state
-        .db
-        .query_events(&EventFilter {
-            cameras: Some(vec![body.camera.clone()]),
-            after: Some(start_ts - 5.0),
-            before: Some(end_ts + 5.0),
-            limit: Some(100),
-            ..Default::default()
-        })
-        .unwrap_or_default();
+    let state_for_infer = state.clone();
+    let cam_name_for_infer = body.camera.clone();
+    let mut frames_trace = tokio::task::spawn_blocking(move || {
+        let mut trace = Vec::new();
+        // 1. Decode recorded MP4 segments via FFmpeg rawvideo pipe through an isolated
+        // SimdMotionDetector + AiDetectorEngine + ByteTracker instance when segments exist on disk.
+        let mut motion_detector =
+            ninjanvr_vision::SimdMotionDetector::new(det_w, det_h, cam_cfg.motion.clone());
+        let mut tracker =
+            ninjanvr_track::ByteTracker::new(&cam_name_for_infer, det_w, det_h, &cam_cfg);
+        let (model_w, model_h, bgr_order) = state_for_infer.detector.model_dimensions();
+        let mut tensor_buf = vec![0u8; (model_w * model_h * 3) as usize];
 
-    for ev in &events {
-        let ts = ev["start_time"].as_f64().unwrap_or(start_ts);
-        let label = ev["label"].as_str().unwrap_or("person");
-        let score = ev["top_score"]
-            .as_f64()
-            .or_else(|| ev["data"]["score"].as_f64())
-            .unwrap_or(0.85);
-        let area_px = ev["data"]["provenance"]["area_px"]
-            .as_u64()
-            .unwrap_or(12000) as u32;
-        let bbox = ev["data"]["provenance"]
-            .get("bbox")
-            .cloned()
-            .unwrap_or_else(|| json!([100, 100, 220, 300]));
+        for (rec_start_time, stdout_bytes) in decoded_segments {
+            for (f_idx, chunk) in stdout_bytes.chunks_exact(frame_bytes_len).enumerate() {
+                let f_ts = rec_start_time + (f_idx as f64);
+                let yuv = ninjanvr_media::YuvFrame {
+                    camera: Arc::from(cam_name_for_infer.as_str()),
+                    timestamp: f_ts,
+                    width: det_w,
+                    height: det_h,
+                    data: Arc::new(chunk.to_vec()),
+                };
+                let m_boxes = motion_detector.detect(&yuv);
+                let tracked_boxes = tracker.non_stationary_boxes(&m_boxes);
+                let regions = ninjanvr_vision::compute_inference_regions(
+                    det_w,
+                    det_h,
+                    model_w.max(model_h),
+                    &m_boxes,
+                    &tracked_boxes,
+                );
+                let mut raw_dets = Vec::new();
+                for reg in &regions {
+                    ninjanvr_vision::crop_yuv420p_to_tensor_nhwc(
+                        &yuv,
+                        reg,
+                        model_w,
+                        model_h,
+                        bgr_order,
+                        &mut tensor_buf,
+                    );
+                    let dets = state_for_infer
+                        .detector
+                        .detect_region(&tensor_buf, *reg, det_w, det_h, 0.25);
+                    raw_dets.extend(dets);
+                }
+                let (active_trks, _) = tracker.update(f_ts, &raw_dets, &regions, &cam_cfg);
+                let mut rejected = Vec::new();
+                for d in &raw_dets {
+                    let area = d.bbox.area();
+                    if (d.score as f64) < eff_min_score {
+                        rejected.push(json!({
+                            "label": d.label,
+                            "score": d.score,
+                            "area_px": area,
+                            "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
+                            "reason": "below_min_score"
+                        }));
+                    } else if area < eff_min_area_px {
+                        rejected.push(json!({
+                            "label": d.label,
+                            "score": d.score,
+                            "area_px": area,
+                            "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
+                            "reason": "below_min_area"
+                        }));
+                    } else if area > eff_max_area_px {
+                        rejected.push(json!({
+                            "label": d.label,
+                            "score": d.score,
+                            "area_px": area,
+                            "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max],
+                            "reason": "above_max_area"
+                        }));
+                    }
+                }
+                trace.push(json!({
+                    "ts": f_ts,
+                    "motion_boxes": m_boxes.iter().map(|b| json!([b.x_min, b.y_min, b.x_max, b.y_max])).collect::<Vec<_>>(),
+                    "raw_detections": raw_dets.iter().map(|d| json!({
+                        "label": d.label,
+                        "score": d.score,
+                        "area_px": d.bbox.area(),
+                        "bbox": [d.bbox.x_min, d.bbox.y_min, d.bbox.x_max, d.bbox.y_max]
+                    })).collect::<Vec<_>>(),
+                    "active_tracks": active_trks.iter().map(|t| json!({
+                        "id": t.id,
+                        "label": t.label,
+                        "score": t.score,
+                        "area_px": t.bbox.area(),
+                        "bbox": [t.bbox.x_min, t.bbox.y_min, t.bbox.x_max, t.bbox.y_max],
+                        "zones": t.entered_zones
+                    })).collect::<Vec<_>>(),
+                    "filtered_reasons": rejected
+                }));
+            }
+        }
 
-        let mut filtered_reasons = Vec::new();
-        let mut active_tracks = Vec::new();
-        if score < eff_min_score {
+        // 2. Also evaluate recorded events inside the requested replay window against the effective filter parameters
+        let events = state_for_infer
+            .db
+            .query_events(&EventFilter {
+                cameras: Some(vec![cam_name_for_infer]),
+                after: Some(start_ts - 5.0),
+                before: Some(end_ts + 5.0),
+                limit: Some(100),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+
+        for ev in &events {
+            let ts = ev["start_time"].as_f64().unwrap_or(start_ts);
+            let label = ev["label"].as_str().unwrap_or("person");
+            let score = ev["top_score"]
+                .as_f64()
+                .or_else(|| ev["data"]["score"].as_f64())
+                .unwrap_or(0.85);
+            let area_px = ev["data"]["provenance"]["area_px"]
+                .as_u64()
+                .unwrap_or(12000) as u32;
+            let bbox = ev["data"]["provenance"]
+                .get("bbox")
+                .cloned()
+                .unwrap_or_else(|| json!([100, 100, 220, 300]));
+
+            let mut filtered_reasons = Vec::new();
+            let mut active_tracks = Vec::new();
+            if score < eff_min_score {
+                filtered_reasons.push(json!({
+                    "label": label,
+                    "score": score,
+                    "area_px": area_px,
+                    "bbox": bbox,
+                    "reason": "below_min_score"
+                }));
+            } else if area_px < eff_min_area_px {
+                filtered_reasons.push(json!({
+                    "label": label,
+                    "score": score,
+                    "area_px": area_px,
+                    "bbox": bbox,
+                    "reason": "below_min_area"
+                }));
+            } else if area_px > eff_max_area_px {
+                filtered_reasons.push(json!({
+                    "label": label,
+                    "score": score,
+                    "area_px": area_px,
+                    "bbox": bbox,
+                    "reason": "above_max_area"
+                }));
+            } else {
+                active_tracks.push(json!({
+                    "id": ev["id"],
+                    "label": label,
+                    "score": score,
+                    "area_px": area_px,
+                    "bbox": bbox,
+                    "zones": ev["zones"],
+                    "attributes": ev["data"]["attributes"]
+                }));
+            }
+
+            // Also include sub-threshold candidate diagnostics so operators can see what the pipeline rejected
             filtered_reasons.push(json!({
                 "label": label,
-                "score": score,
-                "area_px": area_px,
-                "bbox": bbox,
+                "score": (eff_min_score * 0.65 * 100.0).round() / 100.0,
+                "area_px": eff_min_area_px.saturating_sub(50),
+                "bbox": [12, 18, 42, 58],
                 "reason": "below_min_score"
             }));
-        } else if area_px < eff_min_area_px {
-            filtered_reasons.push(json!({
-                "label": label,
-                "score": score,
-                "area_px": area_px,
-                "bbox": bbox,
-                "reason": "below_min_area"
-            }));
-        } else if area_px > eff_max_area_px {
-            filtered_reasons.push(json!({
-                "label": label,
-                "score": score,
-                "area_px": area_px,
-                "bbox": bbox,
-                "reason": "above_max_area"
-            }));
-        } else {
-            active_tracks.push(json!({
-                "id": ev["id"],
-                "label": label,
-                "score": score,
-                "area_px": area_px,
-                "bbox": bbox,
-                "zones": ev["zones"],
-                "attributes": ev["data"]["attributes"]
+
+            trace.push(json!({
+                "ts": ts,
+                "motion_boxes": [bbox],
+                "raw_detections": [{
+                    "label": label,
+                    "score": score,
+                    "area_px": area_px,
+                    "bbox": bbox
+                }],
+                "active_tracks": active_tracks,
+                "filtered_reasons": filtered_reasons
             }));
         }
-
-        // Also include sub-threshold candidate diagnostics so operators can see what the pipeline rejected
-        filtered_reasons.push(json!({
-            "label": label,
-            "score": (eff_min_score * 0.65 * 100.0).round() / 100.0,
-            "area_px": eff_min_area_px.saturating_sub(50),
-            "bbox": [12, 18, 42, 58],
-            "reason": "below_min_score"
-        }));
-
-        frames_trace.push(json!({
-            "ts": ts,
-            "motion_boxes": [bbox],
-            "raw_detections": [{
-                "label": label,
-                "score": score,
-                "area_px": area_px,
-                "bbox": bbox
-            }],
-            "active_tracks": active_tracks,
-            "filtered_reasons": filtered_reasons
-        }));
-    }
+        trace
+    })
+    .await
+    .unwrap_or_default();
 
     if frames_trace.is_empty() {
         frames_trace.push(json!({
@@ -5871,7 +5962,7 @@ async fn api_debug_reprocess(
         "camera": body.camera,
         "start_time": start_ts,
         "end_time": end_ts,
-        "segments_analyzed": recs.len(),
+        "segments_analyzed": segments_analyzed,
         "effective_filters": {
             "min_score": eff_min_score,
             "min_area_px": eff_min_area_px,
@@ -6908,291 +6999,305 @@ async fn api_stats(
 }
 
 async fn compute_stats_snapshot(state: &AppState) -> Value {
-    let cfg = state.config.read().await;
-    let metrics_map = state.camera_metrics.read().await;
-    let pid = std::process::id();
-    let go2rtc_pid = state.go2rtc_supervisor.pid().max(1);
-
-    let (ninjanvr_cpu, ninjanvr_mem) = state.cpu_tracker.sample_pid(pid, 8.5, 19.4);
-    let (go2rtc_cpu, go2rtc_mem) = state.cpu_tracker.sample_pid(go2rtc_pid, 2.8, 3.6);
-
-    let mut cameras_stats = serde_json::Map::new();
-    let mut total_cam_fps = 0.0;
-    let mut total_det_fps = 0.0;
-    let num_cams = cfg.cameras.len().max(1) as f64;
-    let per_cam_detect_cpu = ((ninjanvr_cpu * 0.65) / num_cams * 10.0).round() / 10.0;
-    let per_cam_capture_cpu = ((ninjanvr_cpu * 0.15) / num_cams * 10.0).round() / 10.0;
-
-    for (cam_name, cam_cfg) in &cfg.cameras {
-        let m = metrics_map.get(cam_name);
-        let fps = m.map(|x| x.camera_fps).unwrap_or(if cam_cfg.enabled {
-            cam_cfg.detect.fps as f64
-        } else {
-            0.0
-        });
-        let det_fps = m.map(|x| x.detection_fps).unwrap_or(0.0);
-        let cam_pid = m.map(|x| x.pid).unwrap_or(pid);
-        let night_mode = m.map(|x| x.night_mode).unwrap_or(false);
-        let last_frame_ts = m
-            .map(|x| x.last_frame_ts)
-            .filter(|&ts| ts > 0.0)
-            .unwrap_or_else(|| {
-                let disk_latest = state
-                    .media_dir
-                    .join("clips")
-                    .join(format!("latest_{cam_name}.jpg"));
-                std::fs::metadata(&disk_latest)
-                    .ok()
-                    .and_then(|meta| meta.modified().ok())
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0)
-            });
-        let (ff_cpu, _) = if cam_pid != pid {
-            state.cpu_tracker.sample_pid(cam_pid, 1.8, 4.5)
-        } else {
-            (1.8, 4.5)
-        };
-
-        let mut roi_states = BTreeMap::new();
-        for (roi_name, roi_cfg) in &cam_cfg.state_rois {
-            let default_state = roi_cfg
-                .classes
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "closed".to_string());
-            roi_states.insert(roi_name.clone(), default_state);
-        }
-        for (roi_name, live_state) in state.comms.get_camera_roi_states(cam_name) {
-            roi_states.insert(roi_name, live_state);
-        }
-
-        total_cam_fps += fps;
-        total_det_fps += det_fps;
-        cameras_stats.insert(
-            cam_name.clone(),
-            json!({
-                "camera_fps": fps,
-                "process_fps": fps,
-                "skipped_fps": 0.0,
-                "detection_fps": det_fps,
-                "detection_enabled": cam_cfg.detect.enabled,
-                "last_frame_ts": last_frame_ts,
-                "night_mode": night_mode,
-                "states": roi_states,
-                "pid": pid,
-                "capture_pid": pid,
-                "ffmpeg_pid": cam_pid,
-                "audio_rms": 0,
-                "audio_dBFS": 0,
-                "connection_quality": "excellent",
-                "expected_fps": cam_cfg.detect.fps,
-                "reconnects_last_hour": 0,
-                "stalls_last_hour": 0,
-                "ffmpeg_cpu": format!("{ff_cpu:.1}"),
-                "capture_cpu": format!("{per_cam_capture_cpu:.1}"),
-                "detect_cpu": format!("{per_cam_detect_cpu:.1}")
-            }),
-        );
-    }
-
-    let det_cpu = state
-        .cpu_tracker
-        .sample_infer_cpu(state.detector.cumulative_infer_us(), 3.2);
-    let det_mem = (ninjanvr_mem * 0.55).clamp(4.0, 95.0);
-    let rec_cpu = (ninjanvr_cpu * 0.25).clamp(1.2, 40.0);
-    let rec_mem = (ninjanvr_mem * 0.25).clamp(2.5, 95.0);
-    let rev_cpu = (ninjanvr_cpu * 0.20).clamp(0.9, 30.0);
-    let rev_mem = (ninjanvr_mem * 0.20).clamp(1.8, 95.0);
-
-    let mut detectors_stats = serde_json::Map::new();
-    for det_name in cfg.detectors.keys() {
-        let det_infer_ms = (state.detector.avg_inference_ms_for(det_name) * 100.0).round() / 100.0;
-        detectors_stats.insert(
-            det_name.clone(),
-            json!({
-                "inference_speed": det_infer_ms,
-                "detection_start": 0.0,
-                "pid": pid,
-                "cpu": format!("{det_cpu:.1}"),
-                "mem": format!("{det_mem:.1}")
-            }),
-        );
-    }
-
-    let mut cpu_usages = serde_json::Map::new();
-    cpu_usages.insert(
-        "ninjanvr.full_system".to_string(),
-        json!({
-            "cpu": format!("{:.1}", ninjanvr_cpu + go2rtc_cpu),
-            "mem": format!("{:.1}", ninjanvr_mem + go2rtc_mem)
-        }),
-    );
-    cpu_usages.insert(
-        pid.to_string(),
-        json!({
-            "cpu": format!("{ninjanvr_cpu:.1}"),
-            "cpu_average": format!("{ninjanvr_cpu:.1}"),
-            "mem": format!("{ninjanvr_mem:.1}"),
-            "cmdline": "ninjanvr"
-        }),
-    );
-    if go2rtc_pid > 1 {
-        cpu_usages.insert(
-            go2rtc_pid.to_string(),
-            json!({
-                "cpu": format!("{go2rtc_cpu:.1}"),
-                "cpu_average": format!("{go2rtc_cpu:.1}"),
-                "mem": format!("{go2rtc_mem:.1}"),
-                "cmdline": "go2rtc"
-            }),
-        );
-    }
-
-    let rec_dir = state.media_dir.join("recordings");
-    let clips_dir = state.media_dir.join("clips");
-    let mut shm_stat = stat_mount_mb(Path::new("/dev/shm"), "tmpfs");
-    if let Some(obj) = shm_stat.as_object_mut() {
-        obj.insert("available".to_string(), json!(64.0));
-        obj.insert("camera_frame_size".to_string(), json!(0.8));
-        obj.insert("shm_frame_count".to_string(), json!(50));
-        obj.insert("min_shm".to_string(), json!(16));
-    }
-
-    let (storage_degraded_val, storage_error_val) = match probe_storage_writable(&state.media_dir) {
-        Ok(()) => {
-            state
-                .storage_degraded
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-            if let Ok(mut g) = state.storage_error.lock() {
-                *g = None;
-            }
-            (false, Value::Null)
-        }
-        Err(err) => {
-            state
-                .storage_degraded
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            if let Ok(mut g) = state.storage_error.lock() {
-                *g = Some(err.clone());
-            }
-            (true, json!(err))
-        }
+    let (cfg, metrics_map) = {
+        let cfg_guard = state.config.read().await;
+        let metrics_guard = state.camera_metrics.read().await;
+        let mut slim_cfg = cfg_guard.clone();
+        slim_cfg.raw_yaml = String::new();
+        let metrics_snap = metrics_guard.clone();
+        (slim_cfg, metrics_snap)
     };
+    let state_clone = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let state = &state_clone;
+        let pid = std::process::id();
+        let go2rtc_pid = state.go2rtc_supervisor.pid().max(1);
 
-    let rec_mount = stat_mount_mb(&rec_dir, "ext4");
-    let free_mb = rec_mount["free"].as_f64().unwrap_or(20_000.0).max(1.0);
-    let mut cam_storage = state
-        .db
-        .query_recordings_storage_usage()
-        .unwrap_or_else(|_| json!({}));
-    let mut total_bw_mb_hr = 0.0;
-    if let Some(obj) = cam_storage.as_object() {
-        for v in obj.values() {
-            total_bw_mb_hr += v["bandwidth"].as_f64().unwrap_or(0.0);
-        }
-    }
-    let global_quota_mb = cfg
-        .record
-        .max_size_gb
-        .or(cfg.record.alerts.retain.max_size_gb)
-        .map(|g| g * 1024.0);
-    let effective_pool_mb = global_quota_mb.map(|q| q.min(free_mb)).unwrap_or(free_mb);
-    let estimated_retention_days = if total_bw_mb_hr > 0.1 {
-        ((effective_pool_mb / (total_bw_mb_hr * 24.0)) * 10.0).round() / 10.0
-    } else {
-        14.0
-    };
-    if let Some(obj) = cam_storage.as_object_mut() {
-        for (cam_key, v) in obj.iter_mut() {
-            let bw = v["bandwidth"].as_f64().unwrap_or(0.0);
-            let cam_quota_mb = cfg
-                .cameras
-                .get(cam_key)
-                .and_then(|c| {
-                    c.record
-                        .max_size_gb
-                        .or(c.record.alerts.retain.max_size_gb)
-                        .or(c.record.detections.retain.max_size_gb)
-                })
-                .map(|g| g * 1024.0);
-            let runway = if let Some(cq_mb) = cam_quota_mb {
-                if bw > 0.1 {
-                    ((cq_mb.min(free_mb) / (bw * 24.0)) * 10.0).round() / 10.0
-                } else {
-                    14.0
-                }
+        let (ninjanvr_cpu, ninjanvr_mem) = state.cpu_tracker.sample_pid(pid, 8.5, 19.4);
+        let (go2rtc_cpu, go2rtc_mem) = state.cpu_tracker.sample_pid(go2rtc_pid, 2.8, 3.6);
+
+        let mut cameras_stats = serde_json::Map::new();
+        let mut total_cam_fps = 0.0;
+        let mut total_det_fps = 0.0;
+        let num_cams = cfg.cameras.len().max(1) as f64;
+        let per_cam_detect_cpu = ((ninjanvr_cpu * 0.65) / num_cams * 10.0).round() / 10.0;
+        let per_cam_capture_cpu = ((ninjanvr_cpu * 0.15) / num_cams * 10.0).round() / 10.0;
+
+        for (cam_name, cam_cfg) in &cfg.cameras {
+            let m = metrics_map.get(cam_name);
+            let fps = m.map(|x| x.camera_fps).unwrap_or(if cam_cfg.enabled {
+                cam_cfg.detect.fps as f64
             } else {
-                estimated_retention_days
+                0.0
+            });
+            let det_fps = m.map(|x| x.detection_fps).unwrap_or(0.0);
+            let cam_pid = m.map(|x| x.pid).unwrap_or(pid);
+            let night_mode = m.map(|x| x.night_mode).unwrap_or(false);
+            let last_frame_ts = m
+                .map(|x| x.last_frame_ts)
+                .filter(|&ts| ts > 0.0)
+                .unwrap_or_else(|| {
+                    let disk_latest = state
+                        .media_dir
+                        .join("clips")
+                        .join(format!("latest_{cam_name}.jpg"));
+                    std::fs::metadata(&disk_latest)
+                        .ok()
+                        .and_then(|meta| meta.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0)
+                });
+            let (ff_cpu, _) = if cam_pid != pid {
+                state.cpu_tracker.sample_pid(cam_pid, 1.8, 4.5)
+            } else {
+                (1.8, 4.5)
             };
-            if let Some(m) = v.as_object_mut() {
-                m.insert("estimated_retention_days".to_string(), json!(runway));
+
+            let mut roi_states = BTreeMap::new();
+            for (roi_name, roi_cfg) in &cam_cfg.state_rois {
+                let default_state = roi_cfg
+                    .classes
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "closed".to_string());
+                roi_states.insert(roi_name.clone(), default_state);
             }
+            for (roi_name, live_state) in state.comms.get_camera_roi_states(cam_name) {
+                roi_states.insert(roi_name, live_state);
+            }
+
+            total_cam_fps += fps;
+            total_det_fps += det_fps;
+            cameras_stats.insert(
+                cam_name.clone(),
+                json!({
+                    "camera_fps": fps,
+                    "process_fps": fps,
+                    "skipped_fps": 0.0,
+                    "detection_fps": det_fps,
+                    "detection_enabled": cam_cfg.detect.enabled,
+                    "last_frame_ts": last_frame_ts,
+                    "night_mode": night_mode,
+                    "states": roi_states,
+                    "pid": pid,
+                    "capture_pid": pid,
+                    "ffmpeg_pid": cam_pid,
+                    "audio_rms": 0,
+                    "audio_dBFS": 0,
+                    "connection_quality": "excellent",
+                    "expected_fps": cam_cfg.detect.fps,
+                    "reconnects_last_hour": 0,
+                    "stalls_last_hour": 0,
+                    "ffmpeg_cpu": format!("{ff_cpu:.1}"),
+                    "capture_cpu": format!("{per_cam_capture_cpu:.1}"),
+                    "detect_cpu": format!("{per_cam_detect_cpu:.1}")
+                }),
+            );
         }
-    }
 
-    let heuristics =
-        evaluate_system_heuristics(&cfg, &cameras_stats, &rec_mount, estimated_retention_days);
+        let det_cpu = state
+            .cpu_tracker
+            .sample_infer_cpu(state.detector.cumulative_infer_us(), 3.2);
+        let det_mem = (ninjanvr_mem * 0.55).clamp(4.0, 95.0);
+        let rec_cpu = (ninjanvr_cpu * 0.25).clamp(1.2, 40.0);
+        let rec_mem = (ninjanvr_mem * 0.25).clamp(2.5, 95.0);
+        let rev_cpu = (ninjanvr_cpu * 0.20).clamp(0.9, 30.0);
+        let rev_mem = (ninjanvr_mem * 0.20).clamp(1.8, 95.0);
 
-    let mut storage_map = serde_json::Map::new();
-    storage_map.insert("/media/ninjanvr/recordings".to_string(), rec_mount);
-    if cfg.record.storage_tiers.enabled
-        && let Some(ref cold_dir) = cfg.record.storage_tiers.cold_dir
-    {
-        storage_map.insert(
-            cold_dir.to_string_lossy().to_string(),
-            stat_mount_mb(cold_dir, "ext4"),
+        let mut detectors_stats = serde_json::Map::new();
+        for det_name in cfg.detectors.keys() {
+            let det_infer_ms =
+                (state.detector.avg_inference_ms_for(det_name) * 100.0).round() / 100.0;
+            detectors_stats.insert(
+                det_name.clone(),
+                json!({
+                    "inference_speed": det_infer_ms,
+                    "detection_start": 0.0,
+                    "pid": pid,
+                    "cpu": format!("{det_cpu:.1}"),
+                    "mem": format!("{det_mem:.1}")
+                }),
+            );
+        }
+
+        let mut cpu_usages = serde_json::Map::new();
+        cpu_usages.insert(
+            "ninjanvr.full_system".to_string(),
+            json!({
+                "cpu": format!("{:.1}", ninjanvr_cpu + go2rtc_cpu),
+                "mem": format!("{:.1}", ninjanvr_mem + go2rtc_mem)
+            }),
         );
-    }
-    storage_map.insert(
-        "/media/ninjanvr/clips".to_string(),
-        stat_mount_mb(&clips_dir, "ext4"),
-    );
-    storage_map.insert(
-        "/tmp/cache".to_string(),
-        stat_mount_mb(Path::new("/tmp"), "tmpfs"),
-    );
-    storage_map.insert("/dev/shm".to_string(), shm_stat);
+        cpu_usages.insert(
+            pid.to_string(),
+            json!({
+                "cpu": format!("{ninjanvr_cpu:.1}"),
+                "cpu_average": format!("{ninjanvr_cpu:.1}"),
+                "mem": format!("{ninjanvr_mem:.1}"),
+                "cmdline": "ninjanvr"
+            }),
+        );
+        if go2rtc_pid > 1 {
+            cpu_usages.insert(
+                go2rtc_pid.to_string(),
+                json!({
+                    "cpu": format!("{go2rtc_cpu:.1}"),
+                    "cpu_average": format!("{go2rtc_cpu:.1}"),
+                    "mem": format!("{go2rtc_mem:.1}"),
+                    "cmdline": "go2rtc"
+                }),
+            );
+        }
 
-    json!({
-        "cameras": cameras_stats,
-        "detectors": detectors_stats,
-        "camera_fps": (total_cam_fps * 10.0).round() / 10.0,
-        "process_fps": (total_cam_fps * 10.0).round() / 10.0,
-        "skipped_fps": 0.0,
-        "detection_fps": (total_det_fps * 10.0).round() / 10.0,
-        "embeddings": {},
-        "cpu_usages": cpu_usages,
-        "service": {
-            "uptime": state.start_instant.elapsed().as_secs(),
-            "version": NINJANVR_VERSION,
-            "latest_version": NINJANVR_VERSION,
-            "storage_degraded": storage_degraded_val,
-            "storage_error": storage_error_val,
-            "estimated_retention_days": estimated_retention_days,
-            "camera_storage": cam_storage,
-            "storage": Value::Object(storage_map),
-            "heuristics": heuristics,
-            "last_updated": unix_now()
-        },
-        "processes": {
-            "recording": {
-                "pid": pid,
-                "cpu": format!("{rec_cpu:.1}"),
-                "mem": format!("{rec_mem:.1}")
-            },
-            "review_segment": {
-                "pid": pid,
-                "cpu": format!("{rev_cpu:.1}"),
-                "mem": format!("{rev_mem:.1}")
-            },
-            "go2rtc": {
-                "pid": go2rtc_pid,
-                "cpu": format!("{go2rtc_cpu:.1}"),
-                "mem": format!("{go2rtc_mem:.1}")
+        let rec_dir = state.media_dir.join("recordings");
+        let clips_dir = state.media_dir.join("clips");
+        let mut shm_stat = stat_mount_mb(Path::new("/dev/shm"), "tmpfs");
+        if let Some(obj) = shm_stat.as_object_mut() {
+            obj.insert("available".to_string(), json!(64.0));
+            obj.insert("camera_frame_size".to_string(), json!(0.8));
+            obj.insert("shm_frame_count".to_string(), json!(50));
+            obj.insert("min_shm".to_string(), json!(16));
+        }
+
+        let (storage_degraded_val, storage_error_val) =
+            match probe_storage_writable(&state.media_dir) {
+                Ok(()) => {
+                    state
+                        .storage_degraded
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(mut g) = state.storage_error.lock() {
+                        *g = None;
+                    }
+                    (false, Value::Null)
+                }
+                Err(err) => {
+                    state
+                        .storage_degraded
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(mut g) = state.storage_error.lock() {
+                        *g = Some(err.clone());
+                    }
+                    (true, json!(err))
+                }
+            };
+
+        let rec_mount = stat_mount_mb(&rec_dir, "ext4");
+        let free_mb = rec_mount["free"].as_f64().unwrap_or(20_000.0).max(1.0);
+        let mut cam_storage = state
+            .db
+            .query_recordings_storage_usage()
+            .unwrap_or_else(|_| json!({}));
+        let mut total_bw_mb_hr = 0.0;
+        if let Some(obj) = cam_storage.as_object() {
+            for v in obj.values() {
+                total_bw_mb_hr += v["bandwidth"].as_f64().unwrap_or(0.0);
             }
         }
+        let global_quota_mb = cfg
+            .record
+            .max_size_gb
+            .or(cfg.record.alerts.retain.max_size_gb)
+            .map(|g| g * 1024.0);
+        let effective_pool_mb = global_quota_mb.map(|q| q.min(free_mb)).unwrap_or(free_mb);
+        let estimated_retention_days = if total_bw_mb_hr > 0.1 {
+            ((effective_pool_mb / (total_bw_mb_hr * 24.0)) * 10.0).round() / 10.0
+        } else {
+            14.0
+        };
+        if let Some(obj) = cam_storage.as_object_mut() {
+            for (cam_key, v) in obj.iter_mut() {
+                let bw = v["bandwidth"].as_f64().unwrap_or(0.0);
+                let cam_quota_mb = cfg
+                    .cameras
+                    .get(cam_key)
+                    .and_then(|c| {
+                        c.record
+                            .max_size_gb
+                            .or(c.record.alerts.retain.max_size_gb)
+                            .or(c.record.detections.retain.max_size_gb)
+                    })
+                    .map(|g| g * 1024.0);
+                let runway = if let Some(cq_mb) = cam_quota_mb {
+                    if bw > 0.1 {
+                        ((cq_mb.min(free_mb) / (bw * 24.0)) * 10.0).round() / 10.0
+                    } else {
+                        14.0
+                    }
+                } else {
+                    estimated_retention_days
+                };
+                if let Some(m) = v.as_object_mut() {
+                    m.insert("estimated_retention_days".to_string(), json!(runway));
+                }
+            }
+        }
+
+        let heuristics =
+            evaluate_system_heuristics(&cfg, &cameras_stats, &rec_mount, estimated_retention_days);
+
+        let mut storage_map = serde_json::Map::new();
+        storage_map.insert("/media/ninjanvr/recordings".to_string(), rec_mount);
+        if cfg.record.storage_tiers.enabled
+            && let Some(ref cold_dir) = cfg.record.storage_tiers.cold_dir
+        {
+            storage_map.insert(
+                cold_dir.to_string_lossy().to_string(),
+                stat_mount_mb(cold_dir, "ext4"),
+            );
+        }
+        storage_map.insert(
+            "/media/ninjanvr/clips".to_string(),
+            stat_mount_mb(&clips_dir, "ext4"),
+        );
+        storage_map.insert(
+            "/tmp/cache".to_string(),
+            stat_mount_mb(Path::new("/tmp"), "tmpfs"),
+        );
+        storage_map.insert("/dev/shm".to_string(), shm_stat);
+
+        json!({
+            "cameras": cameras_stats,
+            "detectors": detectors_stats,
+            "camera_fps": (total_cam_fps * 10.0).round() / 10.0,
+            "process_fps": (total_cam_fps * 10.0).round() / 10.0,
+            "skipped_fps": 0.0,
+            "detection_fps": (total_det_fps * 10.0).round() / 10.0,
+            "embeddings": {},
+            "cpu_usages": cpu_usages,
+            "service": {
+                "uptime": state.start_instant.elapsed().as_secs(),
+                "version": NINJANVR_VERSION,
+                "latest_version": NINJANVR_VERSION,
+                "storage_degraded": storage_degraded_val,
+                "storage_error": storage_error_val,
+                "estimated_retention_days": estimated_retention_days,
+                "camera_storage": cam_storage,
+                "storage": Value::Object(storage_map),
+                "heuristics": heuristics,
+                "last_updated": unix_now()
+            },
+            "processes": {
+                "recording": {
+                    "pid": pid,
+                    "cpu": format!("{rec_cpu:.1}"),
+                    "mem": format!("{rec_mem:.1}")
+                },
+                "review_segment": {
+                    "pid": pid,
+                    "cpu": format!("{rev_cpu:.1}"),
+                    "mem": format!("{rev_mem:.1}")
+                },
+                "go2rtc": {
+                    "pid": go2rtc_pid,
+                    "cpu": format!("{go2rtc_cpu:.1}"),
+                    "mem": format!("{go2rtc_mem:.1}")
+                }
+            }
+        })
     })
+    .await
+    .unwrap_or_else(|_| json!({}))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7723,7 +7828,24 @@ async fn redact_dataset_sample_file_if_masked(
         let (redacted, _) =
             redact_image_bytes_with_privacy_mask(&raw_bytes, priv_mask.as_ref(), false);
         if let Some(fname) = safe_path.file_name().and_then(|s| s.to_str()) {
-            let _ = atomic_write_within_media_subdir(media_dir, "dataset", fname, &redacted).await;
+            if let Err(err) =
+                atomic_write_within_media_subdir(media_dir, "dataset", fname, &redacted).await
+            {
+                warn!("Failed to persist redacted dataset sample '{fname}': {err:#}");
+                let _ = tokio::fs::remove_file(&safe_path).await;
+                let clips_mirror = media_dir.join("clips").join("dataset").join(fname);
+                if let Some(safe_mirror) = ensure_clips_artifact_path(media_dir, &clips_mirror) {
+                    let _ = tokio::fs::remove_file(&safe_mirror).await;
+                }
+            } else {
+                let clips_dataset_dir = media_dir.join("clips").join("dataset");
+                let _ = crate::pipeline::write_contained_media_file(
+                    media_dir,
+                    &clips_dataset_dir,
+                    fname,
+                    &redacted,
+                );
+            }
         }
     }
 }
@@ -7734,6 +7856,7 @@ fn split_csv_opt(raw: &Option<String>) -> Option<Vec<String>> {
             s.split(',')
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty())
+                .take(64)
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())
@@ -7974,7 +8097,17 @@ async fn api_review_unview_one(
                 .into_response();
         }
     }
-    let _ = state.db.mark_reviews_viewed(&[id], false);
+    if let Err(err) = state.db.mark_reviews_viewed(&[id], false) {
+        warn!("Failed to mark review unviewed: {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to update review state"
+            })),
+        )
+            .into_response();
+    }
     Json(json!({ "success": true })).into_response()
 }
 
@@ -8029,7 +8162,17 @@ async fn api_reviews_viewed(
             }
         }
     }
-    let _ = state.db.mark_reviews_viewed(&body.ids, body.reviewed);
+    if let Err(err) = state.db.mark_reviews_viewed(&body.ids, body.reviewed) {
+        warn!("Failed to mark reviews viewed: {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to update review state"
+            })),
+        )
+            .into_response();
+    }
     Json(json!({ "success": true })).into_response()
 }
 
@@ -8562,7 +8705,17 @@ async fn api_event_retain_on(
                 .into_response();
         }
     }
-    let _ = state.db.set_event_retain(&id, true);
+    if let Err(err) = state.db.set_event_retain(&id, true) {
+        warn!("Failed to set event '{id}' retain_indefinitely=true: {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to update event retention state"
+            })),
+        )
+            .into_response();
+    }
     Json(json!({ "success": true })).into_response()
 }
 
@@ -8612,7 +8765,17 @@ async fn api_event_retain_off(
                 .into_response();
         }
     }
-    let _ = state.db.set_event_retain(&id, false);
+    if let Err(err) = state.db.set_event_retain(&id, false) {
+        warn!("Failed to set event '{id}' retain_indefinitely=false: {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to update event retention state"
+            })),
+        )
+            .into_response();
+    }
     Json(json!({ "success": true })).into_response()
 }
 
@@ -8670,9 +8833,20 @@ async fn api_event_false_positive(
         }
     }
     let fp = body.map(|b| b.0.false_positive).unwrap_or(true);
-    let _ = state.db.set_event_false_positive(&id, fp);
+    if let Err(err) = state.db.set_event_false_positive(&id, fp) {
+        warn!("Failed to set event '{id}' false_positive={fp}: {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to update event false_positive state"
+            })),
+        )
+            .into_response();
+    }
     if fp {
-        if let Ok(sample) = create_dataset_sample_from_event(
+        if let Ok(sample) = create_dataset_sample_from_event_with_config(
+            Some(&state.config),
             &state.db,
             &state.media_dir,
             &id,
@@ -9954,8 +10128,15 @@ pub async fn verify_event_with_genai_components(
     let auto_suppressed = !is_true_positive && genai.auto_suppress_false_positives;
     if auto_suppressed {
         let _ = db.set_event_false_positive(event_id, true)?;
-        if let Ok(sample) =
-            create_dataset_sample_from_event(&db, &media_dir, event_id, "hard_negative", None).await
+        if let Ok(sample) = create_dataset_sample_from_event_with_config(
+            Some(&config),
+            &db,
+            &media_dir,
+            event_id,
+            "hard_negative",
+            None,
+        )
+        .await
         {
             redact_dataset_sample_file_if_masked(&config, &media_dir, &sample).await;
         }
@@ -10149,6 +10330,25 @@ pub async fn create_dataset_sample_from_event(
     sample_kind: &str,
     override_annotations: Option<Vec<ninjanvr_db::DatasetAnnotationBox>>,
 ) -> Result<ninjanvr_db::DatasetSampleDto> {
+    create_dataset_sample_from_event_with_config(
+        None,
+        db,
+        media_dir,
+        event_id,
+        sample_kind,
+        override_annotations,
+    )
+    .await
+}
+
+async fn create_dataset_sample_from_event_with_config(
+    config: Option<&Arc<RwLock<NinjaConfig>>>,
+    db: &NinjaDatabase,
+    media_dir: &Path,
+    event_id: &str,
+    sample_kind: &str,
+    override_annotations: Option<Vec<ninjanvr_db::DatasetAnnotationBox>>,
+) -> Result<ninjanvr_db::DatasetSampleDto> {
     if !is_safe_id(event_id) {
         anyhow::bail!("Invalid event_id '{event_id}'");
     }
@@ -10163,8 +10363,20 @@ pub async fn create_dataset_sample_from_event(
         .or_else(|| ev["score"].as_f64())
         .unwrap_or(0.9);
 
-    let (img_bytes, width, height, inferred_night_ir) =
+    let (raw_img_bytes, width, height, inferred_night_ir) =
         resolve_event_clean_snapshot_with_ir(media_dir, &ev, event_id).await;
+    let priv_mask = if let Some(cfg_lock) = config {
+        camera_privacy_mask_value(cfg_lock, &camera).await
+    } else if let Some(m) = ev["data"].get("privacy_mask") {
+        Some(m.clone())
+    } else {
+        db.path()
+            .parent()
+            .and_then(|dir| NinjaConfig::load(dir.join("config.yml")).ok())
+            .and_then(|loaded| loaded.cameras.get(&camera).map(|c| c.privacy_mask.clone()))
+    };
+    let (img_bytes, _) =
+        redact_image_bytes_with_privacy_mask(&raw_img_bytes, priv_mask.as_ref(), false);
     let night_mode = ev["data"]["night_mode"]
         .as_bool()
         .unwrap_or(inferred_night_ir);
@@ -10528,7 +10740,8 @@ async fn api_dataset_sample_from_event(
         ),
         None => ("true_positive".to_string(), None),
     };
-    match create_dataset_sample_from_event(
+    match create_dataset_sample_from_event_with_config(
+        Some(&state.config),
         &state.db,
         &state.media_dir,
         &event_id,
@@ -10733,14 +10946,43 @@ async fn api_dataset_sample_delete(
     Json(json!({ "success": true, "deleted": deleted, "id": id })).into_response()
 }
 
-async fn load_dataset_sample_image_bytes(
+const MAX_DATASET_SAMPLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_DATASET_EXPORT_ZIP_BYTES: usize = 64 * 1024 * 1024;
+
+static DATASET_EXPORT_ZIP_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+
+fn read_bounded_dataset_file_sync(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_DATASET_SAMPLE_FILE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_DATASET_SAMPLE_FILE_BYTES {
+        return None;
+    }
+    Some(bytes)
+}
+
+async fn read_bounded_dataset_file(path: &Path) -> Option<Vec<u8>> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_DATASET_SAMPLE_FILE_BYTES {
+        return None;
+    }
+    let bytes = tokio::fs::read(path).await.ok()?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_DATASET_SAMPLE_FILE_BYTES {
+        return None;
+    }
+    Some(bytes)
+}
+
+fn load_dataset_sample_image_bytes_sync(
     state: &AppState,
     sample: &ninjanvr_db::DatasetSampleDto,
 ) -> Vec<u8> {
     let direct_path = PathBuf::from(&sample.image_path);
     if let Some(safe_direct) = ensure_dataset_sample_path(&state.media_dir, &direct_path)
-        && let Ok(bytes) = tokio::fs::read(&safe_direct).await
-        && !bytes.is_empty()
+        && let Some(bytes) = read_bounded_dataset_file_sync(&safe_direct)
     {
         return bytes;
     }
@@ -10748,8 +10990,7 @@ async fn load_dataset_sample_image_bytes(
         let sample_fname = format!("{}.webp", sample.id);
         let dataset_fallback = state.media_dir.join("dataset").join(&sample_fname);
         if let Some(safe_fallback) = ensure_dataset_sample_path(&state.media_dir, &dataset_fallback)
-            && let Ok(bytes) = tokio::fs::read(&safe_fallback).await
-            && !bytes.is_empty()
+            && let Some(bytes) = read_bounded_dataset_file_sync(&safe_fallback)
         {
             return bytes;
         }
@@ -10759,8 +11000,75 @@ async fn load_dataset_sample_image_bytes(
             .join("dataset")
             .join(&sample_fname);
         if let Some(safe_mirror) = ensure_clips_artifact_path(&state.media_dir, &clips_mirror)
-            && let Ok(bytes) = tokio::fs::read(&safe_mirror).await
+            && let Some(bytes) = read_bounded_dataset_file_sync(&safe_mirror)
+        {
+            let dataset_dir = state.media_dir.join("dataset");
+            let _ = crate::pipeline::write_contained_media_file(
+                &state.media_dir,
+                &dataset_dir,
+                &sample_fname,
+                &bytes,
+            );
+            return bytes;
+        }
+    }
+    if let Some(ref ev_id) = sample.event_id
+        && is_safe_id(ev_id)
+        && let Ok(Some(ev)) = state.db.get_event(ev_id)
+        && ev["camera"].as_str() == Some(sample.camera.as_str())
+    {
+        let clips_dir = state.media_dir.join("clips");
+        for cand in [
+            clips_dir.join(format!("{}-{ev_id}-clean.webp", sample.camera)),
+            clips_dir.join(format!("{}-{ev_id}.webp", sample.camera)),
+            clips_dir.join(format!("{ev_id}-clean.jpg")),
+            clips_dir.join(format!("{ev_id}.jpg")),
+        ] {
+            if let Some(safe_cand) = ensure_clips_artifact_path(&state.media_dir, &cand)
+                && let Some(bytes) = read_bounded_dataset_file_sync(&safe_cand)
+            {
+                return bytes;
+            }
+        }
+        if let Some(b64) = ev["thumbnail"].as_str()
+            && !b64.is_empty()
+            && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64)
             && !bytes.is_empty()
+            && (bytes.len() as u64) <= MAX_DATASET_SAMPLE_FILE_BYTES
+        {
+            return bytes;
+        }
+    }
+    let img = image::RgbImage::from_pixel(64, 36, image::Rgb([24, 24, 24]));
+    ninjanvr_vision::encode_image_webp(&img)
+        .unwrap_or_else(|_| b"RIFF\x1a\x00\x00\x00WEBPVP8 ".to_vec())
+}
+
+async fn load_dataset_sample_image_bytes(
+    state: &AppState,
+    sample: &ninjanvr_db::DatasetSampleDto,
+) -> Vec<u8> {
+    let direct_path = PathBuf::from(&sample.image_path);
+    if let Some(safe_direct) = ensure_dataset_sample_path(&state.media_dir, &direct_path)
+        && let Some(bytes) = read_bounded_dataset_file(&safe_direct).await
+    {
+        return bytes;
+    }
+    if is_safe_id(&sample.id) {
+        let sample_fname = format!("{}.webp", sample.id);
+        let dataset_fallback = state.media_dir.join("dataset").join(&sample_fname);
+        if let Some(safe_fallback) = ensure_dataset_sample_path(&state.media_dir, &dataset_fallback)
+            && let Some(bytes) = read_bounded_dataset_file(&safe_fallback).await
+        {
+            return bytes;
+        }
+        let clips_mirror = state
+            .media_dir
+            .join("clips")
+            .join("dataset")
+            .join(&sample_fname);
+        if let Some(safe_mirror) = ensure_clips_artifact_path(&state.media_dir, &clips_mirror)
+            && let Some(bytes) = read_bounded_dataset_file(&safe_mirror).await
         {
             let _ = atomic_write_within_media_subdir(
                 &state.media_dir,
@@ -11348,77 +11656,144 @@ fn is_safe_zip_entry_name(name: &str) -> bool {
     })
 }
 
-pub fn build_zip_archive(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut central_records: Vec<(String, u32, u32, u32)> = Vec::with_capacity(entries.len());
+struct ZipArchiveBuilder {
+    buf: Vec<u8>,
+    central_records: Vec<(String, u32, u32, u32)>,
+    central_dir_bytes: usize,
+}
 
-    for (name, data) in entries {
-        if !is_safe_zip_entry_name(name)
-            || central_records.len() >= u16::MAX as usize
-            || data.len() > u32::MAX as usize
-            || buf.len() > u32::MAX as usize
-        {
-            continue;
+impl ZipArchiveBuilder {
+    fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            central_records: Vec::new(),
+            central_dir_bytes: 0,
         }
-        let crc = crc32_ieee(data);
-        let size = data.len() as u32;
-        let offset = buf.len() as u32;
+    }
+
+    fn can_fit_entry(&self, name: &str, data_len: usize) -> bool {
+        if !is_safe_zip_entry_name(name)
+            || self.central_records.len() >= u16::MAX as usize
+            || u32::try_from(data_len).is_err()
+            || u32::try_from(self.buf.len()).is_err()
+        {
+            return false;
+        }
+        let name_bytes = name.as_bytes();
+        if u16::try_from(name_bytes.len()).is_err() {
+            return false;
+        }
+        let Some(local_entry_bytes) = 30usize
+            .checked_add(name_bytes.len())
+            .and_then(|v| v.checked_add(data_len))
+        else {
+            return false;
+        };
+        let Some(cd_record_bytes) = 46usize.checked_add(name_bytes.len()) else {
+            return false;
+        };
+        let Some(next_cd_bytes) = self.central_dir_bytes.checked_add(cd_record_bytes) else {
+            return false;
+        };
+        self.buf
+            .len()
+            .checked_add(local_entry_bytes)
+            .and_then(|v| v.checked_add(next_cd_bytes))
+            .and_then(|v| v.checked_add(22))
+            .is_some_and(|total| total <= u32::MAX as usize)
+    }
+
+    fn push_entry(&mut self, name: &str, data: &[u8]) -> bool {
+        if !self.can_fit_entry(name, data.len()) {
+            return false;
+        }
+        let Ok(size) = u32::try_from(data.len()) else {
+            return false;
+        };
+        let Ok(offset) = u32::try_from(self.buf.len()) else {
+            return false;
+        };
         let name_bytes = name.as_bytes();
         let Ok(name_len_u16) = u16::try_from(name_bytes.len()) else {
-            continue;
+            return false;
         };
+        let crc = crc32_ieee(data);
 
-        buf.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
-        buf.extend_from_slice(&20u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0x5421u16.to_le_bytes());
-        buf.extend_from_slice(&crc.to_le_bytes());
-        buf.extend_from_slice(&size.to_le_bytes());
-        buf.extend_from_slice(&size.to_le_bytes());
-        buf.extend_from_slice(&name_len_u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(name_bytes);
-        buf.extend_from_slice(data);
+        self.buf.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        self.buf.extend_from_slice(&20u16.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes());
+        self.buf.extend_from_slice(&0x5421u16.to_le_bytes());
+        self.buf.extend_from_slice(&crc.to_le_bytes());
+        self.buf.extend_from_slice(&size.to_le_bytes());
+        self.buf.extend_from_slice(&size.to_le_bytes());
+        self.buf.extend_from_slice(&name_len_u16.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes());
+        self.buf.extend_from_slice(name_bytes);
+        self.buf.extend_from_slice(data);
 
-        central_records.push((name.clone(), crc, size, offset));
+        self.central_dir_bytes = self.central_dir_bytes.saturating_add(46 + name_bytes.len());
+        self.central_records
+            .push((name.to_string(), crc, size, offset));
+        true
     }
 
-    let central_dir_offset = buf.len() as u32;
-    for (name, crc, size, local_offset) in &central_records {
-        let name_bytes = name.as_bytes();
-        buf.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
-        buf.extend_from_slice(&20u16.to_le_bytes());
-        buf.extend_from_slice(&20u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0x5421u16.to_le_bytes());
-        buf.extend_from_slice(&crc.to_le_bytes());
-        buf.extend_from_slice(&size.to_le_bytes());
-        buf.extend_from_slice(&size.to_le_bytes());
-        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&local_offset.to_le_bytes());
-        buf.extend_from_slice(name_bytes);
+    fn finish(mut self) -> Vec<u8> {
+        let central_dir_start = self.buf.len();
+        let Ok(central_dir_offset) = u32::try_from(central_dir_start) else {
+            return Vec::new();
+        };
+        for (name, crc, size, local_offset) in &self.central_records {
+            let name_bytes = name.as_bytes();
+            let Ok(name_len_u16) = u16::try_from(name_bytes.len()) else {
+                continue;
+            };
+            self.buf.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            self.buf.extend_from_slice(&20u16.to_le_bytes());
+            self.buf.extend_from_slice(&20u16.to_le_bytes());
+            self.buf.extend_from_slice(&0u16.to_le_bytes());
+            self.buf.extend_from_slice(&0u16.to_le_bytes());
+            self.buf.extend_from_slice(&0u16.to_le_bytes());
+            self.buf.extend_from_slice(&0x5421u16.to_le_bytes());
+            self.buf.extend_from_slice(&crc.to_le_bytes());
+            self.buf.extend_from_slice(&size.to_le_bytes());
+            self.buf.extend_from_slice(&size.to_le_bytes());
+            self.buf.extend_from_slice(&name_len_u16.to_le_bytes());
+            self.buf.extend_from_slice(&0u16.to_le_bytes());
+            self.buf.extend_from_slice(&0u16.to_le_bytes());
+            self.buf.extend_from_slice(&0u16.to_le_bytes());
+            self.buf.extend_from_slice(&0u16.to_le_bytes());
+            self.buf.extend_from_slice(&0u32.to_le_bytes());
+            self.buf.extend_from_slice(&local_offset.to_le_bytes());
+            self.buf.extend_from_slice(name_bytes);
+        }
+        let central_dir_len = self.buf.len().saturating_sub(central_dir_start);
+        let Ok(central_dir_size) = u32::try_from(central_dir_len) else {
+            return Vec::new();
+        };
+        let entry_count_u16 = u16::try_from(self.central_records.len()).unwrap_or(u16::MAX);
+
+        self.buf.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes());
+        self.buf.extend_from_slice(&entry_count_u16.to_le_bytes());
+        self.buf.extend_from_slice(&entry_count_u16.to_le_bytes());
+        self.buf.extend_from_slice(&central_dir_size.to_le_bytes());
+        self.buf
+            .extend_from_slice(&central_dir_offset.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes());
+
+        self.buf
     }
-    let central_dir_size = (buf.len() as u32).saturating_sub(central_dir_offset);
+}
 
-    buf.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&(central_records.len() as u16).to_le_bytes());
-    buf.extend_from_slice(&(central_records.len() as u16).to_le_bytes());
-    buf.extend_from_slice(&central_dir_size.to_le_bytes());
-    buf.extend_from_slice(&central_dir_offset.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-
-    buf
+pub fn build_zip_archive(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut builder = ZipArchiveBuilder::new();
+    for (name, data) in entries {
+        let _ = builder.push_entry(name, data);
+    }
+    builder.finish()
 }
 
 const MAX_ZIP_ARCHIVE_ENTRIES: usize = 4096;
@@ -11646,58 +12021,105 @@ async fn api_dataset_export_zip(
     jar: CookieJar,
     headers: HeaderMap,
 ) -> Response {
-    let mut samples = state
-        .db
-        .list_dataset_samples(None, None, None)
-        .unwrap_or_default();
-    if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await {
-        samples.retain(|s| allowed.iter().any(|a| a == &s.camera));
-    }
-    samples.sort_by(|a, b| a.id.cmp(&b.id));
-
-    let mut yaml = String::from(
-        "# NinjaNVR Active Learning YOLO Dataset\npath: .\ntrain: images/train\nval: images/val\nnc: 15\nnames:\n",
-    );
-    for (idx, cls_name) in ninjanvr_db::NINJANVR_SECURITY_CLASSES.iter().enumerate() {
-        yaml.push_str(&format!("  {idx}: {cls_name}\n"));
-    }
-
-    let mut entries: Vec<(String, Vec<u8>)> = vec![("data.yaml".to_string(), yaml.into_bytes())];
-
-    for sample in samples {
-        if !is_safe_id(&sample.id) {
-            continue;
+    let Ok(_export_permit) = DATASET_EXPORT_ZIP_SEMAPHORE.try_acquire() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "success": false,
+                "message": "Too many dataset export requests in progress"
+            })),
+        )
+            .into_response();
+    };
+    let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let privacy_masks: HashMap<String, Value> = {
+        let cfg = state.config.read().await;
+        cfg.cameras
+            .iter()
+            .map(|(k, v)| (k.clone(), v.privacy_mask.clone()))
+            .collect()
+    };
+    let state_for_zip = state.clone();
+    let Ok(zip_bytes) = tokio::task::spawn_blocking(move || {
+        let mut samples = state_for_zip
+            .db
+            .list_dataset_samples(None, None, None)
+            .unwrap_or_default();
+        if let Some(ref allow_list) = allowed {
+            samples.retain(|s| allow_list.iter().any(|a| a == &s.camera));
         }
-        let split = if sample.split == "val" {
-            "val"
-        } else {
-            "train"
-        };
-        let raw_img_bytes = load_dataset_sample_image_bytes(&state, &sample).await;
-        let priv_mask = camera_privacy_mask_value(&state.config, &sample.camera).await;
-        let (img_bytes, _) =
-            redact_image_bytes_with_privacy_mask(&raw_img_bytes, priv_mask.as_ref(), false);
-        entries.push((format!("images/{split}/{}.webp", sample.id), img_bytes));
+        samples.sort_by(|a, b| a.id.cmp(&b.id));
 
-        let label_txt = if sample.sample_kind == "hard_negative" || sample.annotations.is_empty() {
-            String::new()
-        } else {
-            let mut lines = Vec::with_capacity(sample.annotations.len());
-            for ann in &sample.annotations {
-                lines.push(format!(
-                    "{} {:.6} {:.6} {:.6} {:.6}",
-                    ann.class_id, ann.cx, ann.cy, ann.w, ann.h
-                ));
+        let mut yaml = String::from(
+            "# NinjaNVR Active Learning YOLO Dataset\npath: .\ntrain: images/train\nval: images/val\nnc: 15\nnames:\n",
+        );
+        for (idx, cls_name) in ninjanvr_db::NINJANVR_SECURITY_CLASSES.iter().enumerate() {
+            yaml.push_str(&format!("  {idx}: {cls_name}\n"));
+        }
+
+        let mut zip_builder = ZipArchiveBuilder::new();
+        let yaml_bytes = yaml.into_bytes();
+        let mut cumulative_bytes = yaml_bytes.len();
+        let _ = zip_builder.push_entry("data.yaml", &yaml_bytes);
+        drop(yaml_bytes);
+
+        for sample in samples {
+            if !is_safe_id(&sample.id) {
+                continue;
             }
-            format!("{}\n", lines.join("\n"))
-        };
-        entries.push((
-            format!("labels/{split}/{}.txt", sample.id),
-            label_txt.into_bytes(),
-        ));
-    }
+            let split = if sample.split == "val" {
+                "val"
+            } else {
+                "train"
+            };
+            let raw_img_bytes = load_dataset_sample_image_bytes_sync(&state_for_zip, &sample);
+            let priv_mask = privacy_masks.get(&sample.camera);
+            let (img_bytes, _) =
+                redact_image_bytes_with_privacy_mask(&raw_img_bytes, priv_mask, false);
+            drop(raw_img_bytes);
 
-    let zip_bytes = build_zip_archive(&entries);
+            let label_txt = if sample.sample_kind == "hard_negative" || sample.annotations.is_empty()
+            {
+                String::new()
+            } else {
+                let mut lines = Vec::with_capacity(sample.annotations.len());
+                for ann in &sample.annotations {
+                    lines.push(format!(
+                        "{} {:.6} {:.6} {:.6} {:.6}",
+                        ann.class_id, ann.cx, ann.cy, ann.w, ann.h
+                    ));
+                }
+                format!("{}\n", lines.join("\n"))
+            };
+            let label_bytes = label_txt.into_bytes();
+            let Some(next_total) = cumulative_bytes
+                .checked_add(img_bytes.len())
+                .and_then(|v| v.checked_add(label_bytes.len()))
+            else {
+                break;
+            };
+            if next_total > MAX_DATASET_EXPORT_ZIP_BYTES {
+                break;
+            }
+            let img_entry_name = format!("images/{split}/{}.webp", sample.id);
+            let lbl_entry_name = format!("labels/{split}/{}.txt", sample.id);
+            if !zip_builder.push_entry(&img_entry_name, &img_bytes) {
+                break;
+            }
+            drop(img_bytes);
+            if !zip_builder.push_entry(&lbl_entry_name, &label_bytes) {
+                break;
+            }
+            drop(label_bytes);
+            cumulative_bytes = next_total;
+        }
+
+        zip_builder.finish()
+    })
+    .await
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     (
         [
             (header::CONTENT_TYPE, "application/zip"),
@@ -12149,7 +12571,7 @@ async fn api_detector_model_upload(
         }
     }
 
-    {
+    let cfg_clone = {
         let mut cfg = state.config.write().await;
         cfg.model.path = saved_model_path.to_string_lossy().to_string();
         cfg.model.labelmap_path = saved_labelmap_path.to_string_lossy().to_string();
@@ -12158,11 +12580,17 @@ async fn api_detector_model_upload(
         cfg.model.model_type = model_type.clone();
         cfg.model.input_tensor = input_tensor.clone();
         cfg.model.input_pixel_format = input_pixel_format.clone();
-        state.detector.reload(&cfg);
-        state.detector.set_labelmap(labelmap_btree);
-    }
+        cfg.clone()
+    };
 
-    let catalog = build_detector_catalog_value(&state);
+    let state_for_reload = state.clone();
+    let catalog = tokio::task::spawn_blocking(move || {
+        state_for_reload.detector.reload(&cfg_clone);
+        state_for_reload.detector.set_labelmap(labelmap_btree);
+        build_detector_catalog_value(&state_for_reload)
+    })
+    .await
+    .unwrap_or_else(|_| json!({}));
     Json(json!({
         "success": true,
         "filename": safe_filename,
@@ -12290,15 +12718,13 @@ fn remove_face_profile_from_clips_mirror(media_dir: &Path, profile_name: &str) {
     }
 }
 
-async fn backfill_face_gallery_events(
+fn backfill_face_gallery_events(
     state: &AppState,
     faces_dir: &Path,
+    similarity_threshold: f32,
+    privacy_masks: &HashMap<String, Value>,
     exclude_event_id: Option<&str>,
 ) -> usize {
-    let similarity_threshold = {
-        let cfg = state.config.read().await;
-        cfg.face_recognition.similarity_threshold
-    };
     let candidates = state
         .db
         .query_events(&EventFilter {
@@ -12323,7 +12749,7 @@ async fn backfill_face_gallery_events(
         if existing_sub.is_some() {
             continue;
         }
-        let sample_bytes = load_event_face_sample_bytes(state, ev_id).await;
+        let sample_bytes = load_event_face_sample_bytes_sync(state, privacy_masks, ev_id);
         if let Some(m) =
             state
                 .detector
@@ -12339,6 +12765,54 @@ async fn backfill_face_gallery_events(
         }
     }
     matched_count
+}
+
+fn load_event_face_sample_bytes_sync(
+    state: &AppState,
+    privacy_masks: &HashMap<String, Value>,
+    event_id: &str,
+) -> Vec<u8> {
+    if !is_safe_id(event_id) {
+        return format!("event-face-sample:{event_id}").into_bytes();
+    }
+    let clips_dir = state.media_dir.join("clips");
+    if let Ok(Some(ev)) = state.db.get_event(event_id) {
+        let cam_opt = ev["camera"].as_str().filter(|c| is_safe_id(c));
+        let priv_mask = cam_opt.and_then(|cam| privacy_masks.get(cam));
+        if let Some(cam) = cam_opt {
+            for (candidate, is_jpeg) in [
+                (
+                    clips_dir.join(format!("{cam}-{event_id}-clean.webp")),
+                    false,
+                ),
+                (clips_dir.join(format!("{event_id}-clean.jpg")), true),
+                (clips_dir.join(format!("{cam}-{event_id}.webp")), false),
+                (clips_dir.join(format!("{event_id}.jpg")), true),
+            ] {
+                if let Some(safe_p) = ensure_clips_artifact_path(&state.media_dir, &candidate)
+                    && let Ok(bytes) = std::fs::read(&safe_p)
+                    && !bytes.is_empty()
+                {
+                    let (out, _) = redact_image_bytes_with_privacy_mask(&bytes, priv_mask, is_jpeg);
+                    if let Some(cropped) = crop_event_face_square_from_bytes(&ev, &out) {
+                        return cropped;
+                    }
+                    return out;
+                }
+            }
+        }
+        if let Some(thumb_b64) = ev["thumbnail"].as_str()
+            && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(thumb_b64.trim())
+            && !decoded.is_empty()
+        {
+            let (out, _) = redact_image_bytes_with_privacy_mask(&decoded, priv_mask, false);
+            if let Some(cropped) = crop_event_face_square_from_bytes(&ev, &out) {
+                return cropped;
+            }
+            return out;
+        }
+    }
+    format!("event-face-sample:{event_id}").into_bytes()
 }
 
 async fn load_event_face_sample_bytes(state: &AppState, event_id: &str) -> Vec<u8> {
@@ -12670,49 +13144,85 @@ async fn api_face_enroll(
         body_bytes.to_vec()
     };
 
+    let (similarity_threshold, privacy_masks) = {
+        let cfg = state.config.read().await;
+        let masks: HashMap<String, Value> = cfg
+            .cameras
+            .iter()
+            .map(|(k, v)| (k.clone(), v.privacy_mask.clone()))
+            .collect();
+        (cfg.face_recognition.similarity_threshold, masks)
+    };
     let faces_dir = state.media_dir.join("faces");
-    match state
-        .detector
-        .enroll_face_profile(&faces_dir, &clean_name, &sample_id, &payload_bytes)
-    {
-        Ok((saved_path, emb)) => {
-            let profiles = state.detector.list_face_profiles(&faces_dir);
-            let matched_profile = profiles
-                .iter()
-                .find(|p| p.name.eq_ignore_ascii_case(&clean_name));
-            let canonical_name = matched_profile
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| clean_name.clone());
-            let sample_count = matched_profile.map(|p| p.sample_count).unwrap_or(1);
-            mirror_face_sample_to_clips(&state.media_dir, &canonical_name, &saved_path);
-            if let Some(ref ev_id) = event_to_assign {
-                let _ = state.db.set_event_sub_label_with_score(
-                    ev_id,
-                    Some(&canonical_name),
-                    Some(1.0),
+    let state_for_enroll = state.clone();
+    let enroll_res = tokio::task::spawn_blocking(move || {
+        state_for_enroll
+            .detector
+            .enroll_face_profile(&faces_dir, &clean_name, &sample_id, &payload_bytes)
+            .map(|(saved_path, emb)| {
+                let profiles = state_for_enroll.detector.list_face_profiles(&faces_dir);
+                let matched_profile = profiles
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(&clean_name));
+                let canonical_name = matched_profile
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| clean_name.clone());
+                let sample_count = matched_profile.map(|p| p.sample_count).unwrap_or(1);
+                mirror_face_sample_to_clips(
+                    &state_for_enroll.media_dir,
+                    &canonical_name,
+                    &saved_path,
                 );
-            }
-            let backfilled_events = if should_backfill {
-                backfill_face_gallery_events(&state, &faces_dir, event_to_assign.as_deref()).await
-            } else {
-                0
-            };
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "success": true,
-                    "name": canonical_name,
-                    "sample_count": sample_count,
-                    "embedding_dim": emb.len(),
-                    "backfilled_events": backfilled_events,
-                    "path": saved_path.to_string_lossy()
-                })),
-            )
-                .into_response()
-        }
-        Err(err) => (
+                if let Some(ref ev_id) = event_to_assign {
+                    let _ = state_for_enroll.db.set_event_sub_label_with_score(
+                        ev_id,
+                        Some(&canonical_name),
+                        Some(1.0),
+                    );
+                }
+                let backfilled_events = if should_backfill {
+                    backfill_face_gallery_events(
+                        &state_for_enroll,
+                        &faces_dir,
+                        similarity_threshold,
+                        &privacy_masks,
+                        event_to_assign.as_deref(),
+                    )
+                } else {
+                    0
+                };
+                (
+                    canonical_name,
+                    sample_count,
+                    emb.len(),
+                    backfilled_events,
+                    saved_path,
+                )
+            })
+    })
+    .await;
+
+    match enroll_res {
+        Ok(Ok((canonical_name, sample_count, emb_dim, backfilled_events, saved_path))) => (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "name": canonical_name,
+                "sample_count": sample_count,
+                "embedding_dim": emb_dim,
+                "backfilled_events": backfilled_events,
+                "path": saved_path.to_string_lossy()
+            })),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "success": false, "message": err.to_string() })),
+        )
+            .into_response(),
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": join_err.to_string() })),
         )
             .into_response(),
     }
@@ -13035,7 +13545,17 @@ async fn api_event_description(
                 .into_response();
         }
     }
-    let _ = state.db.set_event_description(&id, &body.description);
+    if let Err(err) = state.db.set_event_description(&id, &body.description) {
+        warn!("Failed to set event '{id}' description: {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to update event description"
+            })),
+        )
+            .into_response();
+    }
     Json(json!({ "success": true })).into_response()
 }
 
@@ -13932,15 +14452,50 @@ async fn api_camera_recordings(
         )
             .into_response();
     }
+    if let Some(a) = q.after
+        && (!a.is_finite() || a < 0.0)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Invalid 'after' timestamp parameter" })),
+        )
+            .into_response();
+    }
+    if let Some(b) = q.before
+        && (!b.is_finite() || b < 0.0)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Invalid 'before' timestamp parameter" })),
+        )
+            .into_response();
+    }
     let now = unix_now() as f64;
     let before = q.before.unwrap_or(now);
-    let after = q.after.unwrap_or(before - 3600.0);
-    let recs = state
-        .db
-        .query_recordings(&camera, after, before)
-        .unwrap_or_default();
+    let raw_after = q.after.unwrap_or_else(|| (before - 3600.0).max(0.0));
+    if before < raw_after {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": "Invalid recordings time range: 'before' must be >= 'after'"
+            })),
+        )
+            .into_response();
+    }
+    let after = raw_after.max((before - MAX_VOD_WINDOW_SEC).max(0.0));
+    let state_for_recs = state.clone();
+    let cam_for_recs = camera.clone();
+    let recs = tokio::task::spawn_blocking(move || {
+        state_for_recs
+            .db
+            .query_recordings(&cam_for_recs, after, before)
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
     let dto: Vec<Value> = recs
         .into_iter()
+        .take(MAX_VOD_SEGMENTS)
         .map(|r| {
             json!({
                 "id": r.id,
@@ -14080,33 +14635,36 @@ async fn api_recordings_sync(
     }
     let started = Instant::now();
     let media_dir = state.media_dir.clone();
-    let removed_orphans = state
-        .db
-        .prune_missing_recording_files(|db_path| {
-            let disk_path = resolve_recording_disk_path(&media_dir, db_path);
-            ensure_recording_segment_path(&media_dir, None, &disk_path).is_some_and(|p| p.is_file())
-        })
-        .unwrap_or(0);
-    let legacy_dbfs = state
-        .db
-        .list_recordings_by_dbfs(-5, 500)
-        .unwrap_or_default();
-    let mut repaired_dbfs = 0usize;
-    for (id, db_path) in legacy_dbfs {
-        let disk_path = resolve_recording_disk_path(&media_dir, &db_path);
-        let next_dbfs = if let Some(safe_path) =
-            ensure_recording_segment_path(&media_dir, None, &disk_path)
-            && safe_path.is_file()
-        {
-            let d = ninjanvr_media::probe_mp4_audio_dbfs_fast(&safe_path);
-            if d == -5 { 0 } else { d }
-        } else {
-            0
-        };
-        if state.db.update_recording_dbfs(&id, next_dbfs).is_ok() {
-            repaired_dbfs += 1;
+    let db = state.db.clone();
+    let (removed_orphans, repaired_dbfs) = tokio::task::spawn_blocking(move || {
+        let removed_orphans = db
+            .prune_missing_recording_files(|db_path| {
+                let disk_path = resolve_recording_disk_path(&media_dir, db_path);
+                ensure_recording_segment_path(&media_dir, None, &disk_path)
+                    .is_some_and(|p| p.is_file())
+            })
+            .unwrap_or(0);
+        let legacy_dbfs = db.list_recordings_by_dbfs(-5, 500).unwrap_or_default();
+        let mut repaired_dbfs = 0usize;
+        for (id, db_path) in legacy_dbfs {
+            let disk_path = resolve_recording_disk_path(&media_dir, &db_path);
+            let next_dbfs = if let Some(safe_path) =
+                ensure_recording_segment_path(&media_dir, None, &disk_path)
+                && safe_path.is_file()
+            {
+                let d = ninjanvr_media::probe_mp4_audio_dbfs_fast(&safe_path);
+                if d == -5 { 0 } else { d }
+            } else {
+                0
+            };
+            if db.update_recording_dbfs(&id, next_dbfs).is_ok() {
+                repaired_dbfs += 1;
+            }
         }
-    }
+        (removed_orphans, repaired_dbfs)
+    })
+    .await
+    .unwrap_or((0, 0));
     let duration_ms = started.elapsed().as_millis() as u64;
     Json(json!({
         "removed_orphans": removed_orphans,
@@ -16094,10 +16652,9 @@ fn has_active_privacy_mask(mask: Option<&Value>) -> bool {
     }
 }
 
-pub fn ensure_path_within_media_dir(media_dir: &Path, candidate: &Path) -> Option<PathBuf> {
-    let media_dir_canon = std::fs::canonicalize(media_dir).ok()?;
+fn ensure_path_within_canon_media_dir(media_dir_canon: &Path, candidate: &Path) -> Option<PathBuf> {
     let candidate_canon = std::fs::canonicalize(candidate).ok()?;
-    let rel = candidate_canon.strip_prefix(&media_dir_canon).ok()?;
+    let rel = candidate_canon.strip_prefix(media_dir_canon).ok()?;
     if rel.as_os_str().is_empty()
         || rel
             .components()
@@ -16106,6 +16663,11 @@ pub fn ensure_path_within_media_dir(media_dir: &Path, candidate: &Path) -> Optio
         return None;
     }
     Some(candidate_canon)
+}
+
+pub fn ensure_path_within_media_dir(media_dir: &Path, candidate: &Path) -> Option<PathBuf> {
+    let media_dir_canon = std::fs::canonicalize(media_dir).ok()?;
+    ensure_path_within_canon_media_dir(&media_dir_canon, candidate)
 }
 
 fn compute_privacy_mask_hash(privacy_mask: Option<&Value>) -> String {
@@ -18327,7 +18889,17 @@ async fn api_export_rename(
                 .into_response();
         }
     }
-    let _ = state.db.rename_export(&id, &body.name);
+    if let Err(err) = state.db.rename_export(&id, &body.name) {
+        warn!("Failed to rename export '{id}': {err}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "message": "Failed to rename export"
+            })),
+        )
+            .into_response();
+    }
     Json(json!({ "success": true })).into_response()
 }
 
@@ -18914,9 +19486,21 @@ pub fn build_onvif_continuous_move_soap(
     user: Option<&str>,
     password: Option<&str>,
 ) -> String {
-    let p = pan.clamp(-1.0, 1.0);
-    let t = tilt.clamp(-1.0, 1.0);
-    let z = zoom.clamp(-1.0, 1.0);
+    let p = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let t = if tilt.is_finite() {
+        tilt.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let z = if zoom.is_finite() {
+        zoom.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
     let t_sec = timeout_sec.clamp(1, 60);
     let body = format!(
         "<tptz:ContinuousMove><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:Velocity><tt:PanTilt x=\"{p:.4}\" y=\"{t:.4}\"/><tt:Zoom x=\"{z:.4}\"/></tptz:Velocity><tptz:Timeout>PT{t_sec}S</tptz:Timeout></tptz:ContinuousMove>",
@@ -18934,11 +19518,27 @@ pub fn build_onvif_relative_move_soap(
     user: Option<&str>,
     password: Option<&str>,
 ) -> String {
-    let p = pan.clamp(-1.0, 1.0);
-    let t = tilt.clamp(-1.0, 1.0);
-    let z = zoom.clamp(-1.0, 1.0);
+    let p = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let t = if tilt.is_finite() {
+        tilt.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let z = if zoom.is_finite() {
+        zoom.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
     let speed_xml = if let Some(spd) = speed {
-        let s = spd.clamp(0.05, 1.0);
+        let s = if spd.is_finite() {
+            spd.clamp(0.05, 1.0)
+        } else {
+            0.5
+        };
         format!(
             "<tptz:Speed><tt:PanTilt x=\"{s:.4}\" y=\"{s:.4}\"/><tt:Zoom x=\"{s:.4}\"/></tptz:Speed>"
         )
@@ -18974,7 +19574,11 @@ pub fn build_onvif_goto_preset_soap(
     password: Option<&str>,
 ) -> String {
     let speed_xml = if let Some(spd) = speed {
-        let s = spd.clamp(0.05, 1.0);
+        let s = if spd.is_finite() {
+            spd.clamp(0.05, 1.0)
+        } else {
+            0.5
+        };
         format!(
             "<tptz:Speed><tt:PanTilt x=\"{s:.4}\" y=\"{s:.4}\"/><tt:Zoom x=\"{s:.4}\"/></tptz:Speed>"
         )
@@ -19124,16 +19728,17 @@ fn extract_xml_element_text<'a>(xml: &'a str, local_name: &str) -> Option<&'a st
             .unwrap_or(tag_clean);
         if candidate_local.eq_ignore_ascii_case(local_name) && !header.ends_with('/') {
             let content_start = tag_end + 1;
-            if let Some((close_rel, close_end_rel)) =
+            let Some((close_rel, close_end_rel)) =
                 find_closing_xml_tag_offset(&xml[content_start..], candidate_local)
-            {
-                let trimmed = xml[content_start..content_start + close_rel].trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed);
-                }
-                cursor = (content_start + close_end_rel).min(xml.len());
-                continue;
+            else {
+                break;
+            };
+            let trimmed = xml[content_start..content_start + close_rel].trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
             }
+            cursor = (content_start + close_end_rel).min(xml.len());
+            continue;
         }
         cursor = tag_end + 1;
     }
@@ -19427,7 +20032,11 @@ pub struct PtzMoveBody {
 
 impl PtzMoveBody {
     pub fn resolve_vectors(&self) -> (f32, f32, f32) {
-        let spd = self.speed.unwrap_or(0.5).clamp(0.05, 1.0);
+        let spd = self
+            .speed
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.5)
+            .clamp(0.05, 1.0);
         let dir = self
             .action
             .as_deref()
@@ -19446,9 +20055,21 @@ impl PtzMoveBody {
             Some("zoom_out" | "out") => (0.0, 0.0, -spd),
             _ => (0.0, 0.0, 0.0),
         };
-        let pan = self.pan.unwrap_or(dir_pan).clamp(-1.0, 1.0);
-        let tilt = self.tilt.unwrap_or(dir_tilt).clamp(-1.0, 1.0);
-        let zoom = self.zoom.unwrap_or(dir_zoom).clamp(-1.0, 1.0);
+        let pan = self
+            .pan
+            .filter(|v| v.is_finite())
+            .unwrap_or(dir_pan)
+            .clamp(-1.0, 1.0);
+        let tilt = self
+            .tilt
+            .filter(|v| v.is_finite())
+            .unwrap_or(dir_tilt)
+            .clamp(-1.0, 1.0);
+        let zoom = self
+            .zoom
+            .filter(|v| v.is_finite())
+            .unwrap_or(dir_zoom)
+            .clamp(-1.0, 1.0);
         (pan, tilt, zoom)
     }
 
@@ -21438,6 +22059,8 @@ fn resolve_recording_disk_path(media_dir: &Path, db_path: &str) -> PathBuf {
     }
 }
 
+const MAX_VOD_WINDOW_SEC: f64 = 86_400.0;
+
 async fn vod_master_m3u8(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -21452,7 +22075,12 @@ async fn vod_master_m3u8(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !start.is_finite() || !end.is_finite() || start < 0.0 || end < start {
+    if !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end < start
+        || (end - start) > MAX_VOD_WINDOW_SEC
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     (
@@ -21474,9 +22102,13 @@ fn existing_recordings_for_vod(
         || !end.is_finite()
         || start < 0.0
         || end < start
+        || (end - start) > MAX_VOD_WINDOW_SEC
     {
         return Vec::new();
     }
+    let Ok(media_dir_canon) = std::fs::canonicalize(&state.media_dir) else {
+        return Vec::new();
+    };
     state
         .db
         .query_recordings(camera, start, end)
@@ -21484,7 +22116,8 @@ fn existing_recordings_for_vod(
         .into_iter()
         .filter(|r| {
             let disk_path = resolve_recording_disk_path(&state.media_dir, &r.path);
-            ensure_path_within_media_dir(&state.media_dir, &disk_path).is_some_and(|p| p.is_file())
+            ensure_path_within_canon_media_dir(&media_dir_canon, &disk_path)
+                .is_some_and(|p| p.is_file())
         })
         .take(MAX_VOD_SEGMENTS)
         .collect()
@@ -21502,6 +22135,7 @@ async fn vod_index_m3u8(
         || !end.is_finite()
         || start < 0.0
         || end < start
+        || (end - start) > MAX_VOD_WINDOW_SEC
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -21515,17 +22149,31 @@ async fn vod_index_m3u8(
     let cam_for_vod = camera.clone();
     let Ok((recs, resolutions)) = tokio::task::spawn_blocking(move || {
         let recs = existing_recordings_for_vod(&state_for_vod, &cam_for_vod, start, end);
+        let media_dir_canon = std::fs::canonicalize(&media_dir).ok();
+        let mut cached_res: Option<(u32, u32)> = None;
+        let mut probes_done = 0usize;
         let resolutions: Vec<(u32, u32)> = recs
             .iter()
             .map(|r| {
-                let disk_path = resolve_recording_disk_path(&media_dir, &r.path);
-                ensure_path_within_media_dir(&media_dir, &disk_path)
-                    .and_then(|safe_p| ninjanvr_vod::probe_mp4_resolution(&safe_p))
-                    .unwrap_or(if r.objects > 0 {
-                        (1920, 1080)
-                    } else {
-                        (640, 360)
-                    })
+                if probes_done < 16 {
+                    probes_done += 1;
+                    let disk_path = resolve_recording_disk_path(&media_dir, &r.path);
+                    let probed = media_dir_canon
+                        .as_deref()
+                        .and_then(|mc| ensure_path_within_canon_media_dir(mc, &disk_path))
+                        .and_then(|safe_p| ninjanvr_vod::probe_mp4_resolution(&safe_p));
+                    if let Some(res) = probed {
+                        cached_res = Some(res);
+                        return res;
+                    }
+                }
+                if let Some(res) = cached_res {
+                    res
+                } else if r.objects > 0 {
+                    (1920, 1080)
+                } else {
+                    (640, 360)
+                }
             })
             .collect();
         (recs, resolutions)
@@ -21565,6 +22213,7 @@ async fn vod_init_mp4(
         || !end.is_finite()
         || start < 0.0
         || end < start
+        || (end - start) > MAX_VOD_WINDOW_SEC
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -21578,22 +22227,30 @@ async fn vod_init_mp4(
     {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let recs = existing_recordings_for_vod(&state, &camera, start, end);
     let start_idx = q.seg.unwrap_or(1).saturating_sub(1);
-    for rec in recs.into_iter().skip(start_idx).take(8) {
-        let Some(disk_path) = ensure_path_within_media_dir(
-            &state.media_dir,
-            &resolve_recording_disk_path(&state.media_dir, &rec.path),
-        ) else {
-            continue;
-        };
-        if let Ok(Ok(init_bytes)) =
-            tokio::task::spawn_blocking(move || ninjanvr_vod::build_init_mp4(&disk_path)).await
-        {
-            return ([(header::CONTENT_TYPE, "video/mp4")], init_bytes).into_response();
+    let state_for_vod = state.clone();
+    let cam_for_vod = camera.clone();
+    let Ok(Some(init_bytes)) = tokio::task::spawn_blocking(move || {
+        let recs = existing_recordings_for_vod(&state_for_vod, &cam_for_vod, start, end);
+        let media_dir_canon = std::fs::canonicalize(&state_for_vod.media_dir).ok()?;
+        for rec in recs.into_iter().skip(start_idx).take(8) {
+            let raw_disk_path = resolve_recording_disk_path(&state_for_vod.media_dir, &rec.path);
+            let Some(disk_path) =
+                ensure_path_within_canon_media_dir(&media_dir_canon, &raw_disk_path)
+            else {
+                continue;
+            };
+            if let Ok(init_bytes) = ninjanvr_vod::build_init_mp4(&disk_path) {
+                return Some(init_bytes);
+            }
         }
-    }
-    StatusCode::NOT_FOUND.into_response()
+        None
+    })
+    .await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    ([(header::CONTENT_TYPE, "video/mp4")], init_bytes).into_response()
 }
 
 async fn vod_segment_m4s(
@@ -21608,6 +22265,7 @@ async fn vod_segment_m4s(
         || !end.is_finite()
         || start < 0.0
         || end < start
+        || (end - start) > MAX_VOD_WINDOW_SEC
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -21635,38 +22293,39 @@ async fn vod_segment_m4s(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let recs = existing_recordings_for_vod(&state, &camera, start, end);
-    let Some(rec) = recs.get(seq_num - 1).cloned() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    let base_time = recs
-        .iter()
-        .take(seq_num - 1)
-        .map(|r| {
-            if r.duration.is_finite() && r.duration > 0.0 {
-                r.duration.clamp(0.1, 3600.0)
-            } else {
-                10.0
-            }
-        })
-        .sum::<f64>();
-    let Some(disk_path) = ensure_path_within_media_dir(
-        &state.media_dir,
-        &resolve_recording_disk_path(&state.media_dir, &rec.path),
-    ) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    match tokio::task::spawn_blocking(move || {
-        ninjanvr_vod::build_media_segment_m4s(&disk_path, seq_u32, base_time)
+    let state_for_vod = state.clone();
+    let cam_for_vod = camera.clone();
+    match tokio::task::spawn_blocking(move || -> Option<Result<Vec<u8>>> {
+        let recs = existing_recordings_for_vod(&state_for_vod, &cam_for_vod, start, end);
+        let rec = recs.get(seq_num - 1).cloned()?;
+        let base_time = recs
+            .iter()
+            .take(seq_num - 1)
+            .map(|r| {
+                if r.duration.is_finite() && r.duration > 0.0 {
+                    r.duration.clamp(0.1, 3600.0)
+                } else {
+                    10.0
+                }
+            })
+            .sum::<f64>();
+        let media_dir_canon = std::fs::canonicalize(&state_for_vod.media_dir).ok()?;
+        let raw_disk_path = resolve_recording_disk_path(&state_for_vod.media_dir, &rec.path);
+        let disk_path = ensure_path_within_canon_media_dir(&media_dir_canon, &raw_disk_path)?;
+        Some(ninjanvr_vod::build_media_segment_m4s(
+            &disk_path, seq_u32, base_time,
+        ))
     })
     .await
     {
-        Ok(Ok(bytes)) => ([(header::CONTENT_TYPE, "video/iso.segment")], bytes).into_response(),
-        Ok(Err(err)) => {
+        Ok(Some(Ok(bytes))) => {
+            ([(header::CONTENT_TYPE, "video/iso.segment")], bytes).into_response()
+        }
+        Ok(Some(Err(err))) => {
             warn!("Failed to build fMP4 segment {segment} for {camera}: {err:#}");
             StatusCode::NOT_FOUND.into_response()
         }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -21894,7 +22553,13 @@ pub async fn new_app_state(
     let jwt_secret = load_or_create_jwt_secret(config_dir);
 
     let detector = Arc::new(AiDetectorEngine::new(&cfg));
-    let _ = detector.sync_face_gallery_from_dir(&media_dir.join("faces"));
+    let faces_dir = media_dir.join("faces");
+    if let Err(err) = detector.sync_face_gallery_from_dir(&faces_dir) {
+        warn!(
+            "Failed to sync face gallery from {}: {err:#}",
+            faces_dir.display()
+        );
+    }
     let comms = Arc::new(CommsHub::with_mqtt(&cfg.mqtt));
     comms.init_from_config(&cfg);
     let profile_file = config_dir.join(".active_profile");
@@ -39594,5 +40259,172 @@ cameras:
             .await
             .unwrap();
         assert_eq!(r_login_extreme.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn security_p3a_server_io_dos_mutations_regression() {
+        // 1. RESEXHAUST-002 & FLOATEDGE-004: extract_xml_element_text on 40,000 unclosed <Fault> tags
+        //    completes in < 20ms (O(N)); ONVIF SOAP builders clamp NaN to finite defaults.
+        let unclosed_faults = "<Fault>".repeat(40_000);
+        let t0 = Instant::now();
+        assert_eq!(extract_xml_element_text(&unclosed_faults, "Fault"), None);
+        let elapsed_xml = t0.elapsed();
+        assert!(
+            elapsed_xml < Duration::from_millis(20),
+            "extract_xml_element_text on 40,000 unclosed <Fault> tags must run in < 20ms (took {elapsed_xml:?})"
+        );
+
+        let cont_soap = build_onvif_continuous_move_soap(
+            "MainProfile",
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            10,
+            None,
+            None,
+        );
+        assert!(!cont_soap.contains("NaN") && !cont_soap.contains("inf"));
+        assert!(cont_soap.contains("x=\"0.0000\" y=\"0.0000\""));
+        assert!(cont_soap.contains("<tt:Zoom x=\"0.0000\"/>"));
+
+        let rel_soap = build_onvif_relative_move_soap(
+            "MainProfile",
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            Some(f32::NAN),
+            None,
+            None,
+        );
+        assert!(!rel_soap.contains("NaN") && !rel_soap.contains("inf"));
+        assert!(rel_soap.contains("x=\"0.0000\" y=\"0.0000\""));
+        assert!(rel_soap.contains("x=\"0.5000\" y=\"0.5000\""));
+
+        let preset_soap =
+            build_onvif_goto_preset_soap("MainProfile", "Preset1", Some(f32::NAN), None, None);
+        assert!(!preset_soap.contains("NaN") && !preset_soap.contains("inf"));
+        assert!(preset_soap.contains("x=\"0.5000\" y=\"0.5000\""));
+
+        let ptz_nan = PtzMoveBody {
+            action: Some("left".to_string()),
+            direction: None,
+            mode: None,
+            pan: Some(f32::NAN),
+            tilt: Some(f32::NAN),
+            zoom: Some(f32::NAN),
+            speed: Some(f32::NAN),
+            timeout_sec: None,
+            timeout_ms: None,
+            profile_token: None,
+        };
+        let (v_pan, v_tilt, v_zoom) = ptz_nan.resolve_vectors();
+        assert!(v_pan.is_finite() && v_tilt.is_finite() && v_zoom.is_finite());
+        assert!((v_pan - (-0.5)).abs() < 1e-5);
+        assert_eq!(v_tilt, 0.0);
+        assert_eq!(v_zoom, 0.0);
+
+        // 2. RESEXHAUST-005: split_csv_opt caps > 64 tokens at 64.
+        let many_csv = Some(
+            (0..200)
+                .map(|i| format!("tok_{i}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        let parsed_csv = split_csv_opt(&many_csv).unwrap();
+        assert_eq!(parsed_csv.len(), 64);
+        assert_eq!(parsed_csv[0], "tok_0");
+        assert_eq!(parsed_csv[63], "tok_63");
+
+        // 3. ARITHOFL-003: build_zip_archive boundary check and non-duplicating incremental builder.
+        let mut zb = ZipArchiveBuilder::new();
+        assert!(zb.push_entry("data.yaml", b"nc: 15\n"));
+        assert!(zb.push_entry("images/train/s1.webp", b"WEBP_DATA"));
+        // Entry whose projected archive size would exceed u32::MAX is rejected by can_fit_entry
+        assert!(!zb.can_fit_entry("images/train/huge.webp", u32::MAX as usize - 10));
+        let zip_out = zb.finish();
+        let parsed_zip = parse_zip_archive(&zip_out).unwrap();
+        assert_eq!(parsed_zip.get("data.yaml").unwrap(), b"nc: 15\n");
+        assert_eq!(
+            parsed_zip.get("images/train/s1.webp").unwrap(),
+            b"WEBP_DATA"
+        );
+
+        // 4. RESEXHAUST-006 & RESEXHAUST-007: viewer calling POST /api/debug/reprocess is rejected with 403 Forbidden;
+        //    existing_recordings_for_vod and VOD endpoints reject (end - start) > 86400.0.
+        let ctx = setup_test_app().await;
+        let state = ctx.state.clone();
+        let auth_app = build_router_with_auth(state.clone(), true);
+        let now = unix_now();
+        let mint_jwt = |sub: &str, role: &str, cams: Option<&str>| -> String {
+            jsonwebtoken::encode(
+                &Header::new(Algorithm::HS256),
+                &JwtClaims {
+                    sub: sub.to_string(),
+                    role: role.to_string(),
+                    allowed_cameras: cams.map(str::to_string),
+                    iat: now,
+                    exp: now + 3600,
+                },
+                &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+            )
+            .unwrap()
+        };
+        state
+            .db
+            .create_user_with_cameras("viewer_p3a", "pass1234", "viewer", "*", 1000)
+            .unwrap();
+        let viewer_bearer = format!("Bearer {}", mint_jwt("viewer_p3a", "viewer", Some("*")));
+        let admin_bearer = format!("Bearer {}", mint_jwt("admin", "admin", Some("*")));
+
+        let r_viewer_reproc = auth_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/debug/reprocess")
+                    .header(header::AUTHORIZATION, &viewer_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"camera":"front_door","start_time":1000.0,"end_time":1010.0}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_viewer_reproc.status(),
+            StatusCode::FORBIDDEN,
+            "viewer calling POST /api/debug/reprocess must be rejected with 403 Forbidden"
+        );
+
+        assert!(
+            existing_recordings_for_vod(&state, "front_door", 0.0, 86_401.0).is_empty(),
+            "existing_recordings_for_vod must reject (end - start) > 86400.0"
+        );
+        for vod_uri in [
+            "/vod/front_door/start/0/end/86401/master.m3u8",
+            "/vod/front_door/start/0/end/86401/index.m3u8",
+            "/vod/front_door/start/0/end/86401/init-v1-a1.mp4",
+            "/vod/front_door/start/0/end/86401/seg-1-v1-a1.m4s",
+            "/api/front_door/recordings?after=NaN",
+            "/api/front_door/recordings?after=500&before=100",
+        ] {
+            let r_vod = auth_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(vod_uri)
+                        .header(header::AUTHORIZATION, &admin_bearer)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_vod.status(),
+                StatusCode::BAD_REQUEST,
+                "Expected 400 BAD_REQUEST on {vod_uri}"
+            );
+        }
     }
 }
