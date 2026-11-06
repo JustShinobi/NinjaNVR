@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,7 +11,37 @@ use rumqttc::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
+const O_NOFOLLOW_FLAG: i32 = 0o100000;
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "arm", target_arch = "aarch64"))
+))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
+const O_NOFOLLOW_FLAG: i32 = 0;
+
+static PROFILE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 const MAX_TRACKED_CAMERAS: usize = 256;
 const MAX_ROI_STATES_PER_CAMERA: usize = 64;
@@ -528,12 +558,7 @@ impl CommsHub {
     }
 
     pub fn set_profile_persist_path(&self, path: std::path::PathBuf) {
-        if let Ok(meta) = std::fs::symlink_metadata(&path)
-            && !meta.file_type().is_symlink()
-            && meta.is_file()
-            && meta.len() <= 256
-            && let Ok(saved) = std::fs::read_to_string(&path)
-        {
+        if let Some(saved) = read_persisted_profile_file(&path) {
             let trimmed = saved.trim().to_ascii_lowercase();
             if !trimmed.is_empty() {
                 let norm = if trimmed == "off" {
@@ -579,34 +604,13 @@ impl CommsHub {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if let Some(ref p) = persist_path {
-            let is_symlink = std::fs::symlink_metadata(p)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false);
-            if !is_symlink {
-                if let Some(parent) = p.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                #[cfg(unix)]
-                {
-                    use std::io::Write;
-                    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open(p)
-                    {
-                        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-                        let _ = file.write_all(norm.as_bytes());
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    let _ = std::fs::write(p, &norm);
-                }
-            }
+        if let Some(ref p) = persist_path
+            && let Err(err) = persist_active_profile_atomically(p, &norm)
+        {
+            warn!(
+                "Failed to persist active security profile to {}: {err}",
+                p.display()
+            );
         }
         self.publish_topic("profile/state", norm.clone());
         norm
@@ -812,6 +816,152 @@ impl CommsHub {
     }
 }
 
+fn read_persisted_profile_file(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let sym_meta = std::fs::symlink_metadata(path).ok()?;
+    if sym_meta.file_type().is_symlink() || !sym_meta.is_file() || sym_meta.len() > 256 {
+        return None;
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW_FLAG)
+            .open(path)
+            .ok()?;
+        let fd_meta = f.metadata().ok()?;
+        if !fd_meta.is_file()
+            || fd_meta.file_type().is_symlink()
+            || fd_meta.len() > 256
+            || fd_meta.dev() != sym_meta.dev()
+            || fd_meta.ino() != sym_meta.ino()
+        {
+            return None;
+        }
+        f
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let f = std::fs::File::open(path).ok()?;
+        let fd_meta = f.metadata().ok()?;
+        if !fd_meta.is_file() || fd_meta.file_type().is_symlink() || fd_meta.len() > 256 {
+            return None;
+        }
+        f
+    };
+    let mut saved = String::with_capacity(sym_meta.len() as usize);
+    file.take(257).read_to_string(&mut saved).ok()?;
+    if saved.len() > 256 {
+        return None;
+    }
+    Some(saved)
+}
+
+fn persist_active_profile_atomically(
+    target_path: &std::path::Path,
+    norm: &str,
+) -> std::io::Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(target_path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to write active profile through symlink",
+            ));
+        }
+        if meta.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to write active profile over directory",
+            ));
+        }
+    }
+    let parent = target_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    if let Ok(pmeta) = std::fs::symlink_metadata(parent)
+        && pmeta.file_type().is_symlink()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to write active profile in symlinked directory",
+        ));
+    }
+    std::fs::create_dir_all(parent)?;
+
+    let base_name = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(".active_profile");
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = PROFILE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!("{base_name}.tmp.{pid}.{nanos}.{seq}"));
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW_FLAG)
+            .open(&tmp_path)?;
+        let write_res = (|| -> std::io::Result<()> {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(norm.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        drop(file);
+        if let Err(err) = write_res {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(target_path)
+            && (meta.file_type().is_symlink() || meta.is_dir())
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to replace symlink or directory at active profile path",
+            ));
+        }
+        if let Err(err) = std::fs::rename(&tmp_path, target_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        let write_res = (|| -> std::io::Result<()> {
+            file.write_all(norm.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        drop(file);
+        if let Err(err) = write_res {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+        if let Err(err) = std::fs::rename(&tmp_path, target_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
 fn read_bounded_tls_file(path: &std::path::Path) -> Option<Vec<u8>> {
     use std::io::Read;
     if !is_safe_tls_path(path) {
@@ -821,11 +971,41 @@ fn read_bounded_tls_file(path: &std::path::Path) -> Option<Vec<u8>> {
     if !is_safe_tls_path(&canon) {
         return None;
     }
-    let file = std::fs::File::open(&canon).ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() > MAX_TLS_FILE_BYTES {
-        return None;
-    }
+    #[cfg(unix)]
+    let (file, meta) = {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let sym_meta = std::fs::symlink_metadata(&canon).ok()?;
+        if sym_meta.file_type().is_symlink()
+            || !sym_meta.is_file()
+            || sym_meta.len() > MAX_TLS_FILE_BYTES
+        {
+            return None;
+        }
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW_FLAG)
+            .open(&canon)
+            .ok()?;
+        let fd_meta = f.metadata().ok()?;
+        if !fd_meta.is_file()
+            || fd_meta.file_type().is_symlink()
+            || fd_meta.len() > MAX_TLS_FILE_BYTES
+            || fd_meta.dev() != sym_meta.dev()
+            || fd_meta.ino() != sym_meta.ino()
+        {
+            return None;
+        }
+        (f, fd_meta)
+    };
+    #[cfg(not(unix))]
+    let (file, meta) = {
+        let f = std::fs::File::open(&canon).ok()?;
+        let m = f.metadata().ok()?;
+        if !m.is_file() || m.len() > MAX_TLS_FILE_BYTES {
+            return None;
+        }
+        (f, m)
+    };
     let mut buf = Vec::with_capacity(meta.len() as usize);
     let mut reader = file.take(MAX_TLS_FILE_BYTES + 1);
     reader.read_to_end(&mut buf).ok()?;
@@ -901,7 +1081,10 @@ async fn run_mqtt_loop(
     let prefix = sanitize_mqtt_prefix(&cfg.topic_prefix);
     let mut backoff_secs = 2u64;
     loop {
-        let mqtt_opts = build_mqtt_options(&cfg);
+        let cfg_for_opts = cfg.clone();
+        let mqtt_opts = tokio::task::spawn_blocking(move || build_mqtt_options(&cfg_for_opts))
+            .await
+            .unwrap_or_else(|_| build_mqtt_options(&cfg));
         let (client, mut eventloop) = AsyncClient::new(mqtt_opts, 256);
         let mut connected_at: Option<tokio::time::Instant> = None;
 
@@ -1261,7 +1444,10 @@ fn redact_share_path(path: &str) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let trimmed = clean.trim_start_matches('/');
-    if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("share/") {
+    if trimmed
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("share/"))
+    {
         let rest = &trimmed[6..];
         let (token_and_path, query_suffix) = match rest.find('?') {
             Some(q) => (&rest[..q], &rest[q..]),
@@ -2033,5 +2219,79 @@ cameras:
         ledger.record_sample("cam1", 1000.0, 99, 9, 9); // stale out-of-order sample (< 1500 - 300)
         assert_eq!(ledger.sample_count("cam1"), 1);
         assert_eq!(ledger.samples("cam1")[0].timestamp, 1500.0);
+    }
+
+    #[test]
+    fn active_profile_persistence_blocks_symlinks_and_redact_share_path_handles_multibyte_utf8() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_comms_sec_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let profile_path = tmp_dir.join(".active_profile");
+        let hub = CommsHub::new();
+        hub.set_profile_persist_path(profile_path.clone());
+        assert_eq!(hub.set_active_profile("home"), "home");
+        assert_eq!(
+            std::fs::read_to_string(&profile_path).unwrap().trim(),
+            "home"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&profile_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+
+            // Replace .active_profile with a symlink to victim.txt and verify neither read nor write follows it
+            let victim = tmp_dir.join("victim.txt");
+            std::fs::write(&victim, "disarmed").unwrap();
+            let _ = std::fs::remove_file(&profile_path);
+            std::os::unix::fs::symlink(&victim, &profile_path).unwrap();
+
+            let hub_sym_read = CommsHub::new();
+            hub_sym_read.set_profile_persist_path(profile_path.clone());
+            assert_eq!(
+                hub_sym_read.get_active_profile(),
+                "armed",
+                "set_profile_persist_path must refuse reading through a symlink"
+            );
+
+            assert_eq!(hub_sym_read.set_active_profile("home"), "home");
+            assert_eq!(
+                std::fs::read_to_string(&victim).unwrap(),
+                "disarmed",
+                "set_active_profile must not overwrite symlink target"
+            );
+        }
+
+        // Oversized (> 256 bytes) .active_profile is ignored on load
+        let oversized_profile = tmp_dir.join(".oversized_profile");
+        std::fs::write(&oversized_profile, format!("home{}", " ".repeat(300))).unwrap();
+        let hub_oversized = CommsHub::new();
+        hub_oversized.set_profile_persist_path(oversized_profile);
+        assert_eq!(hub_oversized.get_active_profile(), "armed");
+
+        // Multi-byte UTF-8 characters straddling byte index 6 in redact_share_path / push_nginx must not panic
+        let log_hub = LogBufferHub::with_capacity(16);
+        for multibyte_path in [
+            "a€€",
+            "/a€€",
+            "/äöü",
+            "///€€€",
+            "/share/secret_tok_utf8/äöü.mp4",
+        ] {
+            log_hub.push_nginx("GET", multibyte_path, 200);
+        }
+        let nginx_logs = log_hub.get_logs("nginx");
+        assert_eq!(nginx_logs.len(), 5);
+        assert!(nginx_logs[0].contains("GET a€€ HTTP/1.1"));
+        assert!(!nginx_logs[4].contains("secret_tok_utf8"));
+        assert!(nginx_logs[4].contains("/share/<redacted>/äöü.mp4"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

@@ -4,7 +4,38 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
+const O_NOFOLLOW_FLAG: i32 = 0o100000;
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "arm", target_arch = "aarch64"))
+))]
+const O_NOFOLLOW_FLAG: i32 = 0o400000;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
+const O_NOFOLLOW_FLAG: i32 = 0x0100;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))
+))]
+const O_NOFOLLOW_FLAG: i32 = 0;
+
+static GO2RTC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -2016,6 +2047,7 @@ impl NinjaConfig {
                 }
             }
         }
+        sanitize_config_floats(&mut cfg);
 
         let extra_keys: Vec<String> = cfg.go2rtc.extra.keys().cloned().collect();
         for k in extra_keys {
@@ -2050,33 +2082,69 @@ impl NinjaConfig {
 
     /// Writes `/dev/shm/go2rtc.yaml` compatible with go2rtc.
     pub fn write_go2rtc_config(&self, target_path: impl AsRef<Path>) -> Result<()> {
+        let target_path = target_path.as_ref();
+        let overlay = if target_path == Path::new(DEFAULT_GO2RTC_SHM_PATH) {
+            Some(Path::new(DEFAULT_GO2RTC_HOMEKIT_PATH))
+        } else {
+            None
+        };
+        self.write_go2rtc_config_with_overlay(target_path, overlay)
+    }
+
+    /// Writes `target_path` compatible with go2rtc, optionally merging a validated overlay YAML
+    /// file (such as `go2rtc_homekit.yml`) read once via an `O_NOFOLLOW` file descriptor.
+    pub fn write_go2rtc_config_with_overlay(
+        &self,
+        target_path: impl AsRef<Path>,
+        overlay_path: Option<&Path>,
+    ) -> Result<()> {
         validate_go2rtc_streams_map(&self.go2rtc.streams)?;
         validate_go2rtc_extra_map(&self.go2rtc.extra)?;
         let target_path = target_path.as_ref();
-        if let Ok(meta) = std::fs::symlink_metadata(target_path)
-            && meta.file_type().is_symlink()
+        if let Ok(meta) = std::fs::symlink_metadata(target_path) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to write go2rtc config through symlink {}",
+                    target_path.display()
+                );
+            }
+            if meta.is_dir() {
+                anyhow::bail!(
+                    "refusing to write go2rtc config over directory {}",
+                    target_path.display()
+                );
+            }
+        }
+        let parent = target_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if let Ok(pmeta) = std::fs::symlink_metadata(parent)
+            && pmeta.file_type().is_symlink()
         {
             anyhow::bail!(
-                "refusing to write go2rtc config through symlink {}",
-                target_path.display()
+                "refusing to write go2rtc config in symlinked directory {}",
+                parent.display()
             );
         }
-        if let Some(parent) = target_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)?;
+
+        let validated_overlay = overlay_path.and_then(read_validated_go2rtc_overlay);
+        let mut streams_map = self.go2rtc.streams.clone();
+        if let Some(ref overlay) = validated_overlay {
+            for (sk, sv) in &overlay.streams {
+                streams_map.entry(sk.clone()).or_insert_with(|| sv.clone());
+            }
         }
 
         let mut root = serde_json::Map::new();
-        root.insert(
-            "streams".to_string(),
-            serde_json::to_value(&self.go2rtc.streams)?,
-        );
+        root.insert("streams".to_string(), serde_json::to_value(&streams_map)?);
         root.insert("api".to_string(), json!({ "origin": "*" }));
         root.insert("log".to_string(), json!({ "format": "text" }));
         root.insert("webrtc".to_string(), json!({ "candidates": ["stun:8555"] }));
-        for (k, v) in &self.go2rtc.extra {
-            let k_norm = k.trim().to_ascii_lowercase();
-            if matches!(
-                k_norm.as_str(),
+        let is_blocked_extra_key = |k_norm: &str| {
+            matches!(
+                k_norm,
                 "exec"
                     | "expr"
                     | "echo"
@@ -2090,7 +2158,11 @@ impl NinjaConfig {
                     | "webtorrent"
                     | "roborock"
                     | "dvrip"
-            ) {
+            )
+        };
+        for (k, v) in &self.go2rtc.extra {
+            let k_norm = k.trim().to_ascii_lowercase();
+            if is_blocked_extra_key(&k_norm) {
                 continue;
             }
             if !root
@@ -2100,24 +2172,90 @@ impl NinjaConfig {
                 root.insert(k.clone(), v.clone());
             }
         }
+        if let Some(ref overlay) = validated_overlay {
+            for (k, v) in &overlay.extra {
+                let k_norm = k.trim().to_ascii_lowercase();
+                if is_blocked_extra_key(&k_norm) {
+                    continue;
+                }
+                if !root
+                    .keys()
+                    .any(|rk| rk.trim().eq_ignore_ascii_case(&k_norm))
+                {
+                    root.insert(k.clone(), v.clone());
+                }
+            }
+        }
 
         let yaml_str = serde_yaml::to_string(&Value::Object(root))?;
+        let base_name = target_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("go2rtc.yaml");
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = GO2RTC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = parent.join(format!(".{base_name}.tmp.{pid}.{nanos}.{seq}"));
+
         #[cfg(unix)]
         {
             use std::io::Write;
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             let mut file = std::fs::OpenOptions::new()
-                .create(true)
                 .write(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
-                .open(target_path)?;
-            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-            file.write_all(yaml_str.as_bytes())?;
+                .custom_flags(O_NOFOLLOW_FLAG)
+                .open(&tmp_path)?;
+            let write_res = (|| -> Result<()> {
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                file.write_all(yaml_str.as_bytes())?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            drop(file);
+            if let Err(err) = write_res {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+            if let Ok(meta) = std::fs::symlink_metadata(target_path)
+                && (meta.file_type().is_symlink() || meta.is_dir())
+            {
+                let _ = std::fs::remove_file(&tmp_path);
+                anyhow::bail!(
+                    "refusing to write go2rtc config through symlink or directory {}",
+                    target_path.display()
+                );
+            }
+            if let Err(err) = std::fs::rename(&tmp_path, target_path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err.into());
+            }
         }
         #[cfg(not(unix))]
         {
-            std::fs::write(target_path, yaml_str)?;
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            let write_res = (|| -> Result<()> {
+                file.write_all(yaml_str.as_bytes())?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            drop(file);
+            if let Err(err) = write_res {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+            if let Err(err) = std::fs::rename(&tmp_path, target_path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err.into());
+            }
         }
         Ok(())
     }
@@ -2129,10 +2267,7 @@ impl NinjaConfig {
             candidates.push(PathBuf::from(env_path));
         }
         for candidate in candidates {
-            if !is_safe_labelmap_path(&candidate) {
-                continue;
-            }
-            if let Ok(content) = std::fs::read_to_string(&candidate) {
+            if let Some(content) = read_safe_labelmap_file(&candidate) {
                 for (idx, line) in content.lines().enumerate() {
                     if map.len() >= 256 {
                         break;
@@ -3124,6 +3259,7 @@ impl NinjaConfig {
         let Some(obj) = patch.as_object() else {
             anyhow::bail!("structured config payload must be a JSON object");
         };
+        sanitize_config_floats(self);
         let stream_and_cam_originals = self.collect_camera_and_stream_urls();
         let prev_oidc_originals = if self.auth.oidc.issuer_url.contains("://") {
             vec![self.auth.oidc.issuer_url.clone()]
@@ -3619,6 +3755,7 @@ impl NinjaConfig {
             }
             self.cameras = next_cams;
         }
+        sanitize_config_floats(self);
 
         let clean_yaml = self.to_clean_yaml()?;
         // Verify the generated YAML can be parsed back cleanly
@@ -3763,6 +3900,229 @@ fn sanitize_floorplan_config(fp: &mut FloorplanConfig) {
     } else {
         default_floorplan_height_m()
     };
+    for room in &mut fp.rooms {
+        if !room.x.is_finite() {
+            room.x = 0.0;
+        }
+        if !room.y.is_finite() {
+            room.y = 0.0;
+        }
+        if !room.w.is_finite() || room.w <= 0.0 {
+            room.w = default_floorplan_room_dim();
+        }
+        if !room.h.is_finite() || room.h <= 0.0 {
+            room.h = default_floorplan_room_dim();
+        }
+    }
+    for wall in &mut fp.walls {
+        for pt in &mut wall.points {
+            if !pt.is_finite() {
+                *pt = 0.0;
+            }
+        }
+    }
+}
+
+fn is_valid_storage_quota_gb(v: f64) -> bool {
+    v.is_finite() && v > 0.0 && (v * 1024.0).is_finite()
+}
+
+fn sanitize_record_config(rec: &mut RecordConfig) {
+    if let Some(v) = rec.max_size_gb
+        && !is_valid_storage_quota_gb(v)
+    {
+        rec.max_size_gb = None;
+    }
+    if let Some(v) = rec.min_free_gb
+        && !is_valid_storage_quota_gb(v)
+    {
+        rec.min_free_gb = None;
+    }
+    if !rec.continuous.days.is_finite()
+        || rec.continuous.days < 0.0
+        || !(rec.continuous.days * 86400.0).is_finite()
+    {
+        rec.continuous.days = default_retain_days();
+    }
+    if !rec.motion.days.is_finite()
+        || rec.motion.days < 0.0
+        || !(rec.motion.days * 86400.0).is_finite()
+    {
+        rec.motion.days = 0.0;
+    }
+    if !rec.alerts.retain.days.is_finite()
+        || rec.alerts.retain.days <= 0.0
+        || !(rec.alerts.retain.days * 86400.0).is_finite()
+    {
+        rec.alerts.retain.days = default_retain_days();
+    }
+    if let Some(v) = rec.alerts.retain.max_size_gb
+        && !is_valid_storage_quota_gb(v)
+    {
+        rec.alerts.retain.max_size_gb = None;
+    }
+    if let Some(v) = rec.alerts.retain.min_free_gb
+        && !is_valid_storage_quota_gb(v)
+    {
+        rec.alerts.retain.min_free_gb = None;
+    }
+    if !rec.detections.retain.days.is_finite()
+        || rec.detections.retain.days <= 0.0
+        || !(rec.detections.retain.days * 86400.0).is_finite()
+    {
+        rec.detections.retain.days = default_retain_days();
+    }
+    if let Some(v) = rec.detections.retain.max_size_gb
+        && !is_valid_storage_quota_gb(v)
+    {
+        rec.detections.retain.max_size_gb = None;
+    }
+    if let Some(v) = rec.detections.retain.min_free_gb
+        && !is_valid_storage_quota_gb(v)
+    {
+        rec.detections.retain.min_free_gb = None;
+    }
+}
+
+fn sanitize_motion_config(m: &mut MotionConfig) {
+    if !m.lightning_threshold.is_finite() {
+        m.lightning_threshold = default_lightning_threshold();
+    }
+    if !m.delta_alpha.is_finite() {
+        m.delta_alpha = default_delta_alpha();
+    }
+    if !m.frame_alpha.is_finite() {
+        m.frame_alpha = default_frame_alpha();
+    }
+}
+
+fn sanitize_objects_config(obj: &mut ObjectsConfig) {
+    for f in obj.filters.values_mut() {
+        if !f.min_area.is_finite() || f.min_area < 0.0 {
+            f.min_area = 0.0;
+        }
+        if !f.max_area.is_finite() || f.max_area <= 0.0 {
+            f.max_area = default_max_area();
+        }
+        if !f.min_ratio.is_finite() || f.min_ratio < 0.0 {
+            f.min_ratio = 0.0;
+        }
+        if !f.max_ratio.is_finite() || f.max_ratio <= 0.0 {
+            f.max_ratio = default_max_ratio();
+        }
+        if !f.threshold.is_finite() {
+            f.threshold = default_filter_threshold();
+        }
+        if let Some(nt) = f.night_threshold
+            && !nt.is_finite()
+        {
+            f.night_threshold = None;
+        }
+        if !f.min_score.is_finite() {
+            f.min_score = default_filter_min_score();
+        }
+    }
+}
+
+fn sanitize_config_floats(cfg: &mut NinjaConfig) {
+    sanitize_floorplan_config(&mut cfg.ui.floorplan);
+    sanitize_record_config(&mut cfg.record);
+    sanitize_motion_config(&mut cfg.motion);
+    sanitize_objects_config(&mut cfg.objects);
+    if !cfg.genai.ambiguous_score_min.is_finite() {
+        cfg.genai.ambiguous_score_min = default_ambiguous_score_min();
+    }
+    if !cfg.genai.ambiguous_score_max.is_finite() {
+        cfg.genai.ambiguous_score_max = default_ambiguous_score_max();
+    }
+    if !cfg.face_recognition.similarity_threshold.is_finite() {
+        cfg.face_recognition.similarity_threshold = default_face_similarity_threshold();
+    }
+    if !cfg.lpr.min_confidence.is_finite() {
+        cfg.lpr.min_confidence = default_lpr_min_confidence();
+    }
+    for cam in cfg.cameras.values_mut() {
+        sanitize_record_config(&mut cam.record);
+        sanitize_motion_config(&mut cam.motion);
+        sanitize_objects_config(&mut cam.objects);
+        if !cam.map.x.is_finite() {
+            cam.map.x = default_map_coord();
+        }
+        if !cam.map.y.is_finite() {
+            cam.map.y = default_map_coord();
+        }
+        if !cam.map.angle_deg.is_finite() {
+            cam.map.angle_deg = 0.0;
+        }
+        if !cam.map.fov_deg.is_finite() {
+            cam.map.fov_deg = default_map_fov_deg();
+        }
+        if !cam.map.range.is_finite() {
+            cam.map.range = default_map_range();
+        }
+        for line in cam.lines.values_mut() {
+            for pt in &mut line.points {
+                if !pt.is_finite() {
+                    *pt = 0.0;
+                }
+            }
+        }
+        for zone in cam.zones.values_mut() {
+            if let Some(v) = zone.min_area
+                && (!v.is_finite() || v < 0.0)
+            {
+                zone.min_area = None;
+            }
+            if let Some(v) = zone.max_area
+                && (!v.is_finite() || v <= 0.0)
+            {
+                zone.max_area = None;
+            }
+            if let Some(v) = zone.min_score
+                && !v.is_finite()
+            {
+                zone.min_score = None;
+            }
+        }
+        let def_crop = default_state_roi_crop();
+        for roi in cam.state_rois.values_mut() {
+            for (idx, c) in roi.crop.iter_mut().enumerate() {
+                if !c.is_finite() {
+                    *c = def_crop[idx];
+                }
+            }
+        }
+    }
+}
+
+fn json_contains_null(val: &Value) -> bool {
+    match val {
+        Value::Null => true,
+        Value::Array(arr) => arr.iter().any(json_contains_null),
+        Value::Object(map) => map.values().any(json_contains_null),
+        _ => false,
+    }
+}
+
+fn sanitize_null_floats_from_yaml(base: &mut Value, yaml_val: &serde_yaml::Value) {
+    match (base, yaml_val) {
+        (slot @ Value::Null, serde_yaml::Value::Number(_)) => {
+            *slot = json!(0.0);
+        }
+        (Value::Array(arr), serde_yaml::Value::Sequence(seq)) => {
+            for (v, yv) in arr.iter_mut().zip(seq.iter()) {
+                sanitize_null_floats_from_yaml(v, yv);
+            }
+        }
+        (Value::Object(map), serde_yaml::Value::Mapping(ymap)) => {
+            for (k, v) in map.iter_mut() {
+                if let Some(yv) = ymap.get(serde_yaml::Value::String(k.clone())) {
+                    sanitize_null_floats_from_yaml(v, yv);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn merge_section_json<T: Serialize>(
@@ -3773,6 +4133,11 @@ fn merge_section_json<T: Serialize>(
     let Ok(mut base) = serde_json::to_value(current) else {
         return patch.clone();
     };
+    if json_contains_null(&base)
+        && let Ok(yaml_val) = serde_yaml::to_value(current)
+    {
+        sanitize_null_floats_from_yaml(&mut base, &yaml_val);
+    }
     merge_json_values(&mut base, patch, replace_map_keys);
     base
 }
@@ -3883,6 +4248,7 @@ fn validate_go2rtc_extra_map(extra: &BTreeMap<String, Value>) -> Result<()> {
                         anyhow::bail!("go2rtc.ffmpeg.{fk} must be a string");
                     };
                     let arg_lc = arg_str.to_ascii_lowercase();
+                    let rest = arg_lc.replacen("-i {input}", "", 1);
                     if arg_str.chars().any(|c| c.is_control())
                         || arg_lc.contains("..")
                         || arg_lc.contains("://")
@@ -3896,11 +4262,16 @@ fn validate_go2rtc_extra_map(extra: &BTreeMap<String, Value>) -> Result<()> {
                         || arg_lc.contains("protocol_whitelist")
                         || arg_lc.contains("filter_complex")
                         || arg_lc.contains("-filter")
+                        || arg_lc.contains("-vf")
+                        || arg_lc.contains("-af")
                         || arg_lc.contains("lavfi")
                         || arg_lc.contains("movie=")
                         || arg_lc.contains("amovie=")
                         || arg_lc.contains("textfile=")
-                        || (arg_lc.contains("-i ") && !arg_lc.contains("-i {input}"))
+                        || rest.contains("-i ")
+                        || rest
+                            .split_whitespace()
+                            .any(|t| t == "-i" || t.starts_with("-i"))
                         || arg_lc.contains("/etc")
                         || arg_lc.contains("/proc")
                         || arg_lc.contains("/sys")
@@ -4276,13 +4647,16 @@ fn validate_existing_or_ancestor_canonical_path(
     allowed_exts: &[&str],
     max_file_bytes: Option<u64>,
 ) -> bool {
-    if path.exists() || std::fs::symlink_metadata(path).is_ok() {
+    if let Ok(sym_meta) = std::fs::symlink_metadata(path) {
+        if sym_meta.file_type().is_symlink() || !sym_meta.is_file() {
+            return false;
+        }
         let Ok(canon) = std::fs::canonicalize(path) else {
             return false;
         };
         if has_forbidden_path_components_or_prefix(&canon) {
             return false;
-        };
+        }
         if !canon
             .extension()
             .and_then(|e| e.to_str())
@@ -4296,17 +4670,30 @@ fn validate_existing_or_ancestor_canonical_path(
         if !meta.is_file() {
             return false;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if sym_meta.dev() != meta.dev() || sym_meta.ino() != meta.ino() {
+                return false;
+            }
+        }
         if let Some(limit) = max_file_bytes
-            && meta.len() > limit
+            && (sym_meta.len() > limit || meta.len() > limit)
         {
             return false;
         }
     } else {
+        if !path.is_absolute() {
+            return false;
+        }
         for ancestor in path.ancestors().skip(1) {
             if ancestor.as_os_str().is_empty() {
                 break;
             }
-            if ancestor.exists() || std::fs::symlink_metadata(ancestor).is_ok() {
+            if let Ok(anc_meta) = std::fs::symlink_metadata(ancestor) {
+                if anc_meta.file_type().is_symlink() || !anc_meta.is_dir() {
+                    return false;
+                }
                 let Ok(canon_anc) = std::fs::canonicalize(ancestor) else {
                     return false;
                 };
@@ -4333,10 +4720,71 @@ pub fn is_safe_labelmap_path(path: &Path) -> bool {
     {
         return false;
     }
-    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink() || !m.is_file()) {
         return false;
     }
     validate_existing_or_ancestor_canonical_path(path, &["txt"], Some(256 * 1024))
+}
+
+/// Safely reads a labelmap `.txt` file (up to 256 KiB) from `path` using a single `O_NOFOLLOW`
+/// file descriptor and verifying that `(dev, ino)` match the pre-open `symlink_metadata`.
+pub fn read_safe_labelmap_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+    if !is_safe_labelmap_path(path) {
+        return None;
+    }
+    let sym_meta = std::fs::symlink_metadata(path).ok()?;
+    if sym_meta.file_type().is_symlink() || !sym_meta.is_file() || sym_meta.len() > 256 * 1024 {
+        return None;
+    }
+    let canon = std::fs::canonicalize(path).ok()?;
+    if !is_safe_labelmap_path(&canon) {
+        return None;
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let canon_sym_meta = std::fs::symlink_metadata(&canon).ok()?;
+        if canon_sym_meta.file_type().is_symlink()
+            || !canon_sym_meta.is_file()
+            || canon_sym_meta.dev() != sym_meta.dev()
+            || canon_sym_meta.ino() != sym_meta.ino()
+        {
+            return None;
+        }
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW_FLAG)
+            .open(&canon)
+            .ok()?;
+        let fd_meta = f.metadata().ok()?;
+        if !fd_meta.is_file()
+            || fd_meta.file_type().is_symlink()
+            || fd_meta.len() > 256 * 1024
+            || fd_meta.dev() != sym_meta.dev()
+            || fd_meta.ino() != sym_meta.ino()
+        {
+            return None;
+        }
+        f
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let f = std::fs::File::open(&canon).ok()?;
+        let fd_meta = f.metadata().ok()?;
+        if !fd_meta.is_file() || fd_meta.file_type().is_symlink() || fd_meta.len() > 256 * 1024 {
+            return None;
+        }
+        f
+    };
+    let mut content = String::with_capacity(sym_meta.len() as usize);
+    file.take(256 * 1024 + 1)
+        .read_to_string(&mut content)
+        .ok()?;
+    if content.len() > 256 * 1024 {
+        return None;
+    }
+    Some(content)
 }
 
 /// Validates that a candidate AI model path is a safe `.xml`, `.onnx`, `.bin`, or `.tflite` path
@@ -4766,10 +5214,29 @@ fn scrub_url_query_params(url_after_authority: &str) -> String {
     format!("{prefix}{}{frag_part}", scrubbed_pairs.join("&"))
 }
 
-fn restore_url_query_params(
+const MAX_URL_RESTORE_DEPTH: usize = 2;
+
+fn extract_query_params_into<'a>(after_scheme: &'a str, out: &mut BTreeMap<String, &'a str>) {
+    if let Some(orig_q_idx) = after_scheme.find('?') {
+        let orig_after_q = &after_scheme[orig_q_idx + 1..];
+        let orig_query = orig_after_q.split('#').next().unwrap_or(orig_after_q);
+        for pair in orig_query.split('&') {
+            if let Some((k, v)) = pair.split_once('=')
+                && !v.is_empty()
+                && v != "***"
+                && v != "*"
+            {
+                out.entry(k.to_ascii_lowercase()).or_insert(v);
+            }
+        }
+    }
+}
+
+fn restore_url_query_params_with_depth(
     scrubbed_rest: &str,
-    orig_after_scheme: &str,
+    orig_params: &BTreeMap<String, &str>,
     originals: &[String],
+    depth: usize,
 ) -> String {
     if !is_url_scrubbed(scrubbed_rest) {
         return scrubbed_rest.to_string();
@@ -4777,16 +5244,6 @@ fn restore_url_query_params(
     let Some(q_idx) = scrubbed_rest.find('?') else {
         return scrubbed_rest.to_string();
     };
-    let mut orig_params = BTreeMap::new();
-    if let Some(orig_q_idx) = orig_after_scheme.find('?') {
-        let orig_after_q = &orig_after_scheme[orig_q_idx + 1..];
-        let orig_query = orig_after_q.split('#').next().unwrap_or(orig_after_q);
-        for pair in orig_query.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                orig_params.insert(k.to_ascii_lowercase(), v);
-            }
-        }
-    }
 
     let prefix = &scrubbed_rest[..q_idx + 1];
     let after_q = &scrubbed_rest[q_idx + 1..];
@@ -4805,7 +5262,7 @@ fn restore_url_query_params(
                 } else {
                     restored_pairs.push(pair.to_string());
                 }
-            } else if is_url_scrubbed(v) {
+            } else if depth < MAX_URL_RESTORE_DEPTH && is_url_scrubbed(v) {
                 let mut nested_candidates = Vec::new();
                 if let Some(orig_v) = orig_params.get(&k.to_ascii_lowercase()) {
                     nested_candidates.push((*orig_v).to_string());
@@ -4815,7 +5272,7 @@ fn restore_url_query_params(
                         nested_candidates.push(u.clone());
                     }
                 }
-                let restored_v = restore_scrubbed_url(v, &nested_candidates);
+                let restored_v = restore_scrubbed_url_with_depth(v, &nested_candidates, depth + 1);
                 restored_pairs.push(format!("{k}={restored_v}"));
             } else {
                 restored_pairs.push(pair.to_string());
@@ -4829,7 +5286,11 @@ fn restore_url_query_params(
 
 /// Restores credentials into a scrubbed RTSP/HTTP URL (`rtsp://*:*@host/path` or `?password=***`) if a matching original exists.
 pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
-    if !is_url_scrubbed(input) {
+    restore_scrubbed_url_with_depth(input, originals, 0)
+}
+
+fn restore_scrubbed_url_with_depth(input: &str, originals: &[String], depth: usize) -> String {
+    if depth > MAX_URL_RESTORE_DEPTH || !is_url_scrubbed(input) {
         return input.to_string();
     }
     // 1. Exact scrubbed match
@@ -4838,7 +5299,9 @@ pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
             return orig.clone();
         }
     }
-    // 2. Match by scheme + host:port (falling back to host) if path or query was edited
+    // 2. Match by scheme + host:port (falling back to host) if path or query was edited.
+    // Resolve the best matching credentials and combined query parameters across tiers 0..4 first,
+    // then invoke restore_url_query_params_with_depth at most once per depth level.
     if let Some(scheme_idx) = input.find("://") {
         let input_scheme = &input[..scheme_idx];
         let after_scheme = &input[scheme_idx + 3..];
@@ -4848,7 +5311,13 @@ pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
             let rest = &after_scheme[at_idx + 1..];
             let target_host_port = extract_authority_host_port(rest);
             let target_host = extract_authority_host(rest);
-            let mut partial_match: Option<String> = None;
+            let mut best_creds: Option<&str> = if userinfo_is_masked {
+                None
+            } else {
+                Some(input_userinfo)
+            };
+            let mut orig_params = BTreeMap::new();
+            let mut matched_any = false;
             for tier in 0..4 {
                 for orig in originals {
                     let Some(orig_scheme_idx) = orig.find("://") else {
@@ -4864,42 +5333,44 @@ pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
                     let orig_host_port = extract_authority_host_port(orig_host_part);
                     let orig_host = extract_authority_host(orig_host_part);
                     let scheme_matches = input_scheme.eq_ignore_ascii_case(orig_scheme);
-                    let matched = match tier {
-                        0 => scheme_matches && orig_host_port == target_host_port,
-                        1 => orig_host_port == target_host_port,
-                        2 => scheme_matches && orig_host == target_host,
-                        _ => orig_host == target_host,
+                    let exact_tier = if scheme_matches && orig_host_port == target_host_port {
+                        0
+                    } else if orig_host_port == target_host_port {
+                        1
+                    } else if scheme_matches && orig_host == target_host {
+                        2
+                    } else if orig_host == target_host {
+                        3
+                    } else {
+                        continue;
                     };
-                    if matched {
-                        let effective_creds = if userinfo_is_masked {
-                            orig_creds
-                        } else {
-                            input_userinfo
-                        };
-                        let restored_rest = restore_url_query_params(rest, orig_after, originals);
-                        let candidate = format!(
-                            "{}{}@{}",
-                            &input[..scheme_idx + 3],
-                            effective_creds,
-                            restored_rest
-                        );
-                        if candidate != input {
-                            if !is_url_scrubbed(&candidate) {
-                                return candidate;
-                            }
-                            if partial_match.is_none() {
-                                partial_match = Some(candidate);
-                            }
+                    if exact_tier == tier {
+                        matched_any = true;
+                        if best_creds.is_none() {
+                            best_creds = Some(orig_creds);
                         }
+                        extract_query_params_into(orig_after, &mut orig_params);
                     }
                 }
             }
-            if let Some(partial) = partial_match {
-                return partial;
+            if matched_any && let Some(effective_creds) = best_creds {
+                let restored_rest =
+                    restore_url_query_params_with_depth(rest, &orig_params, originals, depth);
+                let candidate = format!(
+                    "{}{}@{}",
+                    &input[..scheme_idx + 3],
+                    effective_creds,
+                    restored_rest
+                );
+                if candidate != input {
+                    return candidate;
+                }
             }
         } else if is_url_scrubbed(after_scheme) {
             let target_host_port = extract_authority_host_port(after_scheme);
             let target_host = extract_authority_host(after_scheme);
+            let mut orig_params = BTreeMap::new();
+            let mut matched_any = false;
             for tier in 0..4 {
                 for orig in originals {
                     let Some(orig_scheme_idx) = orig.find("://") else {
@@ -4914,19 +5385,32 @@ pub fn restore_scrubbed_url(input: &str, originals: &[String]) -> String {
                     let orig_host_port = extract_authority_host_port(orig_host_part);
                     let orig_host = extract_authority_host(orig_host_part);
                     let scheme_matches = input_scheme.eq_ignore_ascii_case(orig_scheme);
-                    let matched = match tier {
-                        0 => scheme_matches && orig_host_port == target_host_port,
-                        1 => orig_host_port == target_host_port,
-                        2 => scheme_matches && orig_host == target_host,
-                        _ => orig_host == target_host,
+                    let exact_tier = if scheme_matches && orig_host_port == target_host_port {
+                        0
+                    } else if orig_host_port == target_host_port {
+                        1
+                    } else if scheme_matches && orig_host == target_host {
+                        2
+                    } else if orig_host == target_host {
+                        3
+                    } else {
+                        continue;
                     };
-                    if matched {
-                        let restored_after =
-                            restore_url_query_params(after_scheme, orig_after, originals);
-                        if restored_after != after_scheme {
-                            return format!("{}{}", &input[..scheme_idx + 3], restored_after);
-                        }
+                    if exact_tier == tier {
+                        matched_any = true;
+                        extract_query_params_into(orig_after, &mut orig_params);
                     }
+                }
+            }
+            if matched_any {
+                let restored_after = restore_url_query_params_with_depth(
+                    after_scheme,
+                    &orig_params,
+                    originals,
+                    depth,
+                );
+                if restored_after != after_scheme {
+                    return format!("{}{}", &input[..scheme_idx + 3], restored_after);
                 }
             }
         }
@@ -5406,16 +5890,18 @@ fn scrub_inline_key_equals_secrets(line: &str) -> String {
     if !line.contains('=') {
         return line.to_string();
     }
-    let mut current = line.to_string();
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut copy_from = 0usize;
     let mut search_from = 0usize;
-    while search_from < current.len() {
-        let Some(rel_eq) = current[search_from..].find('=') else {
+    while search_from < line.len() {
+        let Some(rel_eq) = line[search_from..].find('=') else {
             break;
         };
         let eq_pos = search_from + rel_eq;
-        let bytes = current.as_bytes();
+        let scan_floor = search_from.max(eq_pos.saturating_sub(64));
         let mut k_start = eq_pos;
-        while k_start > search_from
+        while k_start > scan_floor
             && (bytes[k_start - 1].is_ascii_alphanumeric()
                 || bytes[k_start - 1] == b'_'
                 || bytes[k_start - 1] == b'-')
@@ -5427,7 +5913,11 @@ fn scrub_inline_key_equals_secrets(line: &str) -> String {
             continue;
         }
         if k_start > 0 {
-            let prev = bytes[k_start - 1];
+            let prev = if k_start == copy_from {
+                b'*'
+            } else {
+                bytes[k_start - 1]
+            };
             if !matches!(
                 prev,
                 b'?' | b'&' | b';' | b' ' | b'\t' | b'"' | b'\'' | b',' | b'{' | b'[' | b'('
@@ -5436,99 +5926,130 @@ fn scrub_inline_key_equals_secrets(line: &str) -> String {
                 continue;
             }
         }
-        let key_name = &current[k_start..eq_pos];
+        let Some(key_name) = line.get(k_start..eq_pos) else {
+            search_from = eq_pos + 1;
+            continue;
+        };
         if !is_sensitive_query_param_key(key_name) {
             search_from = eq_pos + 1;
             continue;
         }
         let val_start = eq_pos + 1;
-        let rest = &current[val_start..];
+        let rest = &line[val_start..];
         let val_end_rel = rest
             .find(['&', ';', ' ', '\t', '"', '\'', '#', ',', '}', ']', ')'])
             .unwrap_or(rest.len());
+        let val_end = val_start + val_end_rel;
         let val_slice = &rest[..val_end_rel];
         if !val_slice.is_empty() && val_slice != "***" && val_slice != "*" {
-            current.replace_range(val_start..val_start + val_end_rel, "***");
-            search_from = val_start + 3;
-        } else {
-            search_from = val_start + val_end_rel;
+            out.push_str(&line[copy_from..val_start]);
+            out.push_str("***");
+            copy_from = val_end;
         }
+        search_from = val_end;
     }
-    current
+    if copy_from == 0 {
+        return line.to_string();
+    }
+    out.push_str(&line[copy_from..]);
+    out
 }
 
 fn scrub_inline_yaml_secret_keys(line: &str) -> String {
     if !line.contains(':') && !line.contains('=') {
         return line.to_string();
     }
-    let mut current = line.to_string();
-    let mut search_from = 0usize;
-    while search_from < current.len() {
-        let Some(rel_colon) = current[search_from..].find(':') else {
-            break;
-        };
-        let colon_pos = search_from + rel_colon;
-        let bytes = current.as_bytes();
-        // Walk backwards across optional whitespace and an optional quote + identifier
-        let mut k_end = colon_pos;
-        while k_end > search_from && bytes[k_end - 1].is_ascii_whitespace() {
-            k_end -= 1;
-        }
-        let mut k_start = k_end;
-        if k_start > search_from && (bytes[k_start - 1] == b'"' || bytes[k_start - 1] == b'\'') {
-            let q = bytes[k_start - 1];
-            k_start -= 1;
-            while k_start > search_from && bytes[k_start - 1] != q {
-                k_start -= 1;
+    let colon_scrubbed = if line.contains(':') {
+        let bytes = line.as_bytes();
+        let mut out = String::with_capacity(line.len());
+        let mut copy_from = 0usize;
+        let mut search_from = 0usize;
+        while search_from < line.len() {
+            let Some(rel_colon) = line[search_from..].find(':') else {
+                break;
+            };
+            let colon_pos = search_from + rel_colon;
+            let scan_floor = search_from.max(colon_pos.saturating_sub(64));
+            // Walk backwards across optional whitespace and an optional quote + identifier
+            let mut k_end = colon_pos;
+            while k_end > scan_floor && bytes[k_end - 1].is_ascii_whitespace() {
+                k_end -= 1;
             }
-            if k_start > search_from && bytes[k_start - 1] == q {
+            let mut k_start = k_end;
+            if k_start > scan_floor && (bytes[k_start - 1] == b'"' || bytes[k_start - 1] == b'\'') {
+                let q = bytes[k_start - 1];
                 k_start -= 1;
+                while k_start > scan_floor && bytes[k_start - 1] != q {
+                    k_start -= 1;
+                }
+                if k_start > scan_floor && bytes[k_start - 1] == q {
+                    k_start -= 1;
+                } else {
+                    search_from = colon_pos + 1;
+                    continue;
+                }
+            } else {
+                while k_start > scan_floor
+                    && (bytes[k_start - 1].is_ascii_alphanumeric()
+                        || bytes[k_start - 1] == b'_'
+                        || bytes[k_start - 1] == b'-')
+                {
+                    k_start -= 1;
+                }
             }
-        } else {
-            while k_start > search_from
-                && (bytes[k_start - 1].is_ascii_alphanumeric()
-                    || bytes[k_start - 1] == b'_'
-                    || bytes[k_start - 1] == b'-')
-            {
-                k_start -= 1;
+            if k_start > 0 {
+                let prev = if k_start == copy_from {
+                    b'"'
+                } else {
+                    bytes[k_start - 1]
+                };
+                if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-' || prev == b':' {
+                    search_from = colon_pos + 1;
+                    continue;
+                }
             }
-        }
-        if k_start > 0 {
-            let prev = bytes[k_start - 1];
-            if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-' || prev == b':' {
+            let Some(candidate_key) = line.get(k_start..k_end) else {
+                search_from = colon_pos + 1;
+                continue;
+            };
+            if !is_sensitive_yaml_key_name(candidate_key) {
                 search_from = colon_pos + 1;
                 continue;
             }
-        }
-        let candidate_key = &current[k_start..k_end];
-        if !is_sensitive_yaml_key_name(candidate_key) {
-            search_from = colon_pos + 1;
-            continue;
-        }
-        let val_start = colon_pos + 1;
-        let rest = &current[val_start..];
-        let ws_len = rest.len() - rest.trim_start().len();
-        let val_trimmed = &rest[ws_len..];
-        let val_end_rel = find_flow_value_end(val_trimmed);
-        let raw_val = strip_yaml_inline_comment(&val_trimmed[..val_end_rel]);
-        let unquoted = raw_val.trim_matches('"').trim_matches('\'').trim();
-        if !unquoted.is_empty()
-            && !unquoted.eq_ignore_ascii_case("null")
-            && unquoted != "~"
-            && unquoted != "***"
-            && !unquoted.starts_with('#')
-        {
+            let val_start = colon_pos + 1;
+            let rest = &line[val_start..];
+            let ws_len = rest.len() - rest.trim_start().len();
+            let val_trimmed = &rest[ws_len..];
+            let val_end_rel = find_flow_value_end(val_trimmed);
             let replace_end = val_start + ws_len + val_end_rel;
-            current.replace_range(val_start..replace_end, " \"***\"");
-            search_from = val_start + 6;
-        } else {
-            search_from = val_start + ws_len + val_end_rel;
+            let raw_val = strip_yaml_inline_comment(&val_trimmed[..val_end_rel]);
+            let unquoted = raw_val.trim_matches('"').trim_matches('\'').trim();
+            if !unquoted.is_empty()
+                && !unquoted.eq_ignore_ascii_case("null")
+                && unquoted != "~"
+                && unquoted != "***"
+                && !unquoted.starts_with('#')
+            {
+                out.push_str(&line[copy_from..val_start]);
+                out.push_str(" \"***\"");
+                copy_from = replace_end;
+            }
+            search_from = replace_end;
         }
+        if copy_from == 0 {
+            line.to_string()
+        } else {
+            out.push_str(&line[copy_from..]);
+            out
+        }
+    } else {
+        line.to_string()
+    };
+    if colon_scrubbed.contains('=') {
+        scrub_inline_key_equals_secrets(&colon_scrubbed)
+    } else {
+        colon_scrubbed
     }
-    if current.contains('=') {
-        current = scrub_inline_key_equals_secrets(&current);
-    }
-    current
 }
 
 fn is_sensitive_json_key(key: &str) -> bool {
@@ -5571,35 +6092,69 @@ pub fn scrub_json_value(val: &Value) -> Value {
     }
 }
 
-/// Validates that a `go2rtc` overlay YAML file (such as `go2rtc_homekit.yml`) is a regular,
-/// non-symlink file containing only safe streams and extra keys before passing `-config=` to `go2rtc`.
-pub fn is_safe_go2rtc_overlay_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > 256 * 1024 {
-        return false;
+fn read_validated_go2rtc_overlay(path: &Path) -> Option<Go2RtcConfig> {
+    use std::io::Read;
+    let sym_meta = std::fs::symlink_metadata(path).ok()?;
+    if !sym_meta.is_file() || sym_meta.file_type().is_symlink() || sym_meta.len() > 256 * 1024 {
+        return None;
     }
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return false;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW_FLAG)
+            .open(path)
+            .ok()?;
+        let fd_meta = f.metadata().ok()?;
+        if !fd_meta.is_file()
+            || fd_meta.file_type().is_symlink()
+            || fd_meta.len() > 256 * 1024
+            || fd_meta.dev() != sym_meta.dev()
+            || fd_meta.ino() != sym_meta.ino()
+        {
+            return None;
+        }
+        f
     };
+    #[cfg(not(unix))]
+    let file = {
+        let f = std::fs::File::open(path).ok()?;
+        let fd_meta = f.metadata().ok()?;
+        if !fd_meta.is_file() || fd_meta.file_type().is_symlink() || fd_meta.len() > 256 * 1024 {
+            return None;
+        }
+        f
+    };
+    let mut raw = String::with_capacity(sym_meta.len() as usize);
+    file.take(256 * 1024 + 1).read_to_string(&mut raw).ok()?;
+    if raw.len() > 256 * 1024 {
+        return None;
+    }
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return true;
+        return Some(Go2RtcConfig::default());
     }
-    let Ok(doc) = serde_yaml::from_str::<Value>(trimmed) else {
-        return false;
-    };
+    let doc = serde_yaml::from_str::<Value>(trimmed).ok()?;
     if doc.is_null() {
-        return true;
+        return Some(Go2RtcConfig::default());
     }
-    let Ok(overlay) = serde_json::from_value::<Go2RtcConfig>(doc) else {
-        return false;
-    };
+    let mut overlay = serde_json::from_value::<Go2RtcConfig>(doc).ok()?;
+    let extra_keys: Vec<String> = overlay.extra.keys().cloned().collect();
+    for k in extra_keys {
+        if k.trim().eq_ignore_ascii_case("streams")
+            && let Some(val) = overlay.extra.remove(&k)
+        {
+            let extra_streams: BTreeMap<String, Value> = serde_json::from_value(val).ok()?;
+            for (sk, sv) in extra_streams {
+                overlay.streams.entry(sk).or_insert(sv);
+            }
+        }
+    }
     if validate_go2rtc_streams_map(&overlay.streams).is_err()
         || validate_go2rtc_extra_map(&overlay.extra).is_err()
     {
-        return false;
+        return None;
     }
     for k in overlay.extra.keys() {
         let k_norm = k.trim().to_ascii_lowercase();
@@ -5615,10 +6170,16 @@ pub fn is_safe_go2rtc_overlay_file(path: &Path) -> bool {
                 | "roborock"
                 | "dvrip"
         ) {
-            return false;
+            return None;
         }
     }
-    true
+    Some(overlay)
+}
+
+/// Validates that a `go2rtc` overlay YAML file (such as `go2rtc_homekit.yml`) is a regular,
+/// non-symlink file containing only safe streams and extra keys.
+pub fn is_safe_go2rtc_overlay_file(path: &Path) -> bool {
+    read_validated_go2rtc_overlay(path).is_some()
 }
 
 /// Supervises the go2rtc child process, ensuring `/dev/shm/go2rtc.yaml` is written
@@ -5674,22 +6235,32 @@ impl Go2RtcSupervisor {
         }
         tokio::spawn(async move {
             loop {
-                let config_ok = {
-                    let cfg = self.config.read().await;
-                    match cfg.write_go2rtc_config(&self.shm_config_path) {
-                        Ok(()) => true,
-                        Err(err) => {
-                            error!("Failed to write go2rtc config: {err:#}");
-                            false
-                        }
+                let cfg_snapshot = self.config.read().await.clone();
+                let shm_path = self.shm_config_path.clone();
+                let hk_path = self.homekit_config_path.clone();
+                let bin_path = self.go2rtc_bin.clone();
+                let prep_res = tokio::task::spawn_blocking(move || {
+                    let write_res =
+                        cfg_snapshot.write_go2rtc_config_with_overlay(&shm_path, Some(&hk_path));
+                    let bin_ok = bin_path.is_absolute() && bin_path.is_file();
+                    (write_res, bin_ok)
+                })
+                .await;
+                let (write_res, bin_ok) = match prep_res {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        error!("go2rtc config writer task panicked: {err:#}");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
                     }
                 };
-                if !config_ok {
+                if let Err(err) = write_res {
+                    error!("Failed to write go2rtc config: {err:#}");
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
 
-                if !self.go2rtc_bin.is_absolute() || !self.go2rtc_bin.is_file() {
+                if !bin_ok {
                     warn!(
                         "go2rtc binary not found at {}, retrying in 15s",
                         self.go2rtc_bin.display()
@@ -5699,9 +6270,6 @@ impl Go2RtcSupervisor {
                 }
 
                 let mut cmd = Command::new(&self.go2rtc_bin);
-                if is_safe_go2rtc_overlay_file(&self.homekit_config_path) {
-                    cmd.arg(format!("-config={}", self.homekit_config_path.display()));
-                }
                 cmd.arg(format!("-config={}", self.shm_config_path.display()));
                 cmd.stdout(Stdio::inherit())
                     .stderr(Stdio::inherit())
@@ -8977,5 +9545,327 @@ cameras:
         std::fs::write(&evil_extra_hk, "exec:\n  allow: true\n").unwrap();
         assert!(!is_safe_go2rtc_overlay_file(&evil_extra_hk));
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn url_restore_bounds_nested_query_depth_and_avoids_exponential_branching() {
+        let originals: Vec<String> = (0..8)
+            .map(|i| {
+                format!(
+                    "rtsp://cam_user_{i}:cam_pass_{i}@192.0.2.50:554/stream_{i}?token=secret_tok_{i}"
+                )
+            })
+            .collect();
+
+        // 8-level nested query URL with an unmatched leaf marker previously triggered O((4*M)^D) recursion
+        let mut nested_bomb = "rtsp://*:*@192.0.2.50:554/leaf?unmatched=***".to_string();
+        for depth in 0..8 {
+            nested_bomb = format!("rtsp://*:*@192.0.2.50:554/lvl_{depth}?a={nested_bomb}");
+        }
+        let start = std::time::Instant::now();
+        let out_bomb = restore_scrubbed_url(&nested_bomb, &originals);
+        let elapsed_bomb = start.elapsed();
+        assert!(
+            elapsed_bomb < std::time::Duration::from_millis(50),
+            "nested URL restore bomb took {:?} (>= 50ms)",
+            elapsed_bomb
+        );
+        assert!(out_bomb.starts_with("rtsp://cam_user_0:cam_pass_0@192.0.2.50:554/lvl_7?a="));
+
+        // 500-level nested query chain must not overflow the call stack
+        let mut deep_chain = "rtsp://*:*@192.0.2.50:554/leaf?unmatched=***".to_string();
+        for _ in 0..500 {
+            deep_chain = format!("http://192.0.2.50:554/p?u={deep_chain}");
+        }
+        let start_deep = std::time::Instant::now();
+        let _ = restore_scrubbed_url(&deep_chain, &originals);
+        assert!(
+            start_deep.elapsed() < std::time::Duration::from_millis(50),
+            "deeply nested URL chain took {:?}",
+            start_deep.elapsed()
+        );
+
+        // 2-level nested legitimate query URLs still restore within MAX_URL_RESTORE_DEPTH
+        let two_level_orig = vec![
+            "http://192.0.2.60/outer?inner=http://192.0.2.61/mid?stream=rtsp://u2:p2@192.0.2.62:554/live"
+                .to_string(),
+            "http://192.0.2.61/mid?stream=rtsp://u2:p2@192.0.2.62:554/live".to_string(),
+            "rtsp://u2:p2@192.0.2.62:554/live".to_string(),
+        ];
+        let two_level_scrubbed = "http://192.0.2.60/outer_v2?inner=http://192.0.2.61/mid_v2?stream=rtsp://*:*@192.0.2.62:554/live_v2";
+        assert_eq!(
+            restore_scrubbed_url(two_level_scrubbed, &two_level_orig),
+            "http://192.0.2.60/outer_v2?inner=http://192.0.2.61/mid_v2?stream=rtsp://u2:p2@192.0.2.62:554/live_v2"
+        );
+    }
+
+    #[test]
+    fn inline_secret_scrubbers_run_in_linear_time_on_large_single_line_payloads() {
+        let query_pairs = "key=ab&pwd=cd&".repeat(15_000);
+        let start_eq = std::time::Instant::now();
+        let scrubbed_eq = scrub_rtsp_credentials(&query_pairs);
+        assert!(
+            start_eq.elapsed() < std::time::Duration::from_millis(200),
+            "scrub_rtsp_credentials on large inline key=value string took {:?}",
+            start_eq.elapsed()
+        );
+        assert!(!scrubbed_eq.contains("key=ab"));
+        assert!(!scrubbed_eq.contains("pwd=cd"));
+        assert!(scrubbed_eq.starts_with("key=***&pwd=***&"));
+
+        let flow_yaml = format!("flow: {{ {} }}\n", "pwd: a, token: bc, ".repeat(10_000));
+        let start_yaml = std::time::Instant::now();
+        let scrubbed_yaml = scrub_yaml_credentials(&flow_yaml);
+        assert!(
+            start_yaml.elapsed() < std::time::Duration::from_millis(200),
+            "scrub_yaml_credentials on large inline flow map took {:?}",
+            start_yaml.elapsed()
+        );
+        assert!(!scrubbed_yaml.contains("pwd: a"));
+        assert!(!scrubbed_yaml.contains("token: bc"));
+        assert!(scrubbed_yaml.contains("pwd: \"***\""));
+        assert!(scrubbed_yaml.contains("token: \"***\""));
+
+        // Unmatched quote preceding colon across multi-byte UTF-8 characters must not slice mid-codepoint
+        let multibyte_unmatched_quote = format!(
+            "flow: {{ {}a\": val, \"pwd\": secret_mb }}\n",
+            "€".repeat(25)
+        );
+        let scrubbed_mb = scrub_yaml_credentials(&multibyte_unmatched_quote);
+        assert!(!scrubbed_mb.contains("secret_mb"));
+        assert!(scrubbed_mb.contains("\"pwd\": \"***\""));
+    }
+
+    #[test]
+    fn go2rtc_ffmpeg_validator_rejects_secondary_input_flags_and_short_filter_flags() {
+        let valid_yaml = r#"
+go2rtc:
+  ffmpeg:
+    rtsp: "-fflags nobuffer -flags low_delay -rtsp_transport tcp -i {input}"
+"#;
+        assert!(NinjaConfig::from_yaml_str(valid_yaml, PathBuf::from("/tmp/ok.yml")).is_ok());
+
+        for bad_arg in [
+            "-hide_banner -i {input} -i /media/ninjanvr/other.mp4",
+            "-i {input} -i relative_file.mp4",
+            "-i {input} -i",
+            "-i {input} -vf scale=320:240",
+            "-i {input} -af volume=2.0",
+        ] {
+            let bad_yaml = format!("go2rtc:\n  ffmpeg:\n    rtsp: \"{bad_arg}\"\n");
+            assert!(
+                NinjaConfig::from_yaml_str(&bad_yaml, PathBuf::from("/tmp/bad_ff.yml")).is_err(),
+                "go2rtc.ffmpeg preset with disallowed flag '{bad_arg}' must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn write_go2rtc_config_and_labelmap_reader_enforce_atomic_writes_and_nofollow_fds() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_toctou_cfg_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let cfg = NinjaConfig::from_yaml_str(
+            r#"
+go2rtc:
+  streams:
+    driveway:
+      - rtsp://cam_u:cam_p@192.0.2.25:554/main
+"#,
+            tmp_dir.join("config.yml"),
+        )
+        .unwrap();
+
+        // 1. write_go2rtc_config_with_overlay merges safe overlay streams into target file atomically
+        let overlay_path = tmp_dir.join("go2rtc_homekit.yml");
+        std::fs::write(
+            &overlay_path,
+            "streams:\n  hk_cam:\n    - rtsp://192.0.2.26:554/live\nhomekit:\n  pin: \"12345678\"\n",
+        )
+        .unwrap();
+        let target_go2rtc = tmp_dir.join("go2rtc.yaml");
+        cfg.write_go2rtc_config_with_overlay(&target_go2rtc, Some(&overlay_path))
+            .unwrap();
+        let merged_yaml: Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&target_go2rtc).unwrap()).unwrap();
+        assert!(merged_yaml["streams"]["driveway"].is_array());
+        assert!(merged_yaml["streams"]["hk_cam"].is_array());
+        assert_eq!(merged_yaml["homekit"]["pin"], "12345678");
+
+        // No leftover temporary files remain in tmp_dir
+        let leftover_tmps: Vec<_> = std::fs::read_dir(&tmp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover_tmps.is_empty());
+
+        // Directory target must be rejected
+        let dir_target = tmp_dir.join("dir_target");
+        std::fs::create_dir_all(&dir_target).unwrap();
+        assert!(cfg.write_go2rtc_config(&dir_target).is_err());
+
+        #[cfg(unix)]
+        {
+            // Symlinked overlay file must be rejected by is_safe_go2rtc_overlay_file and ignored during merge
+            let sym_overlay = tmp_dir.join("sym_homekit.yml");
+            std::os::unix::fs::symlink(&overlay_path, &sym_overlay).unwrap();
+            assert!(!is_safe_go2rtc_overlay_file(&sym_overlay));
+
+            // Symlinked target_path must be rejected without modifying the symlink target
+            let victim_file = tmp_dir.join("victim.txt");
+            std::fs::write(&victim_file, "UNCHANGED_VICTIM").unwrap();
+            let sym_target = tmp_dir.join("sym_go2rtc.yaml");
+            std::os::unix::fs::symlink(&victim_file, &sym_target).unwrap();
+            assert!(cfg.write_go2rtc_config(&sym_target).is_err());
+            assert_eq!(
+                std::fs::read_to_string(&victim_file).unwrap(),
+                "UNCHANGED_VICTIM"
+            );
+
+            // read_safe_labelmap_file reads regular .txt files and rejects symlinks or oversized files
+            let real_labels = tmp_dir.join("real_labels.txt");
+            std::fs::write(&real_labels, "person\ncar\n").unwrap();
+            assert_eq!(
+                read_safe_labelmap_file(&real_labels).as_deref(),
+                Some("person\ncar\n")
+            );
+
+            let sym_labels = tmp_dir.join("sym_labels.txt");
+            std::os::unix::fs::symlink(&real_labels, &sym_labels).unwrap();
+            assert!(read_safe_labelmap_file(&sym_labels).is_none());
+
+            // Non-existent file under a symlinked parent directory is rejected by is_safe_labelmap_path
+            let sym_dir = tmp_dir.join("sym_dir");
+            std::os::unix::fs::symlink(&tmp_dir, &sym_dir).unwrap();
+            assert!(!is_safe_labelmap_path(&sym_dir.join("future_labels.txt")));
+        }
+
+        let oversized_labels = tmp_dir.join("oversized.txt");
+        std::fs::write(&oversized_labels, "a\n".repeat(140_000)).unwrap();
+        assert!(read_safe_labelmap_file(&oversized_labels).is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn non_finite_yaml_floats_and_merge_section_json_sanitize_to_finite_defaults() {
+        let yaml = r#"
+record:
+  max_size_gb: .nan
+  min_free_gb: 1e308
+  continuous:
+    days: .nan
+  motion:
+    days: .inf
+  alerts:
+    retain:
+      days: -.inf
+      max_size_gb: .inf
+      min_free_gb: -.inf
+  detections:
+    retain:
+      days: .nan
+motion:
+  lightning_threshold: .nan
+  delta_alpha: .inf
+  frame_alpha: -.inf
+genai:
+  ambiguous_score_min: .nan
+  ambiguous_score_max: .inf
+face_recognition:
+  similarity_threshold: .nan
+lpr:
+  min_confidence: -.inf
+ui:
+  floorplan:
+    opacity: .nan
+    width_m: .inf
+    height_m: -.inf
+    rooms:
+      - id: r1
+        label: Room 1
+        x: .nan
+        y: .inf
+        w: -.inf
+        h: .nan
+    walls:
+      - points: [.nan, .inf, -.inf, 0.5]
+cameras:
+  cam1:
+    enabled: true
+    map:
+      x: .nan
+      y: .inf
+      angle_deg: -.inf
+      fov_deg: .nan
+      range: .inf
+    lines:
+      l1:
+        points: [.nan, 0.2, .inf, 0.8]
+    state_rois:
+      gate:
+        crop: [.nan, .inf, -.inf, 0.9]
+    record:
+      min_free_gb: .inf
+      continuous:
+        days: -.inf
+      motion:
+        days: .nan
+      alerts:
+        retain:
+          days: .nan
+      detections:
+        retain:
+          days: .inf
+"#;
+        let mut cfg =
+            NinjaConfig::from_yaml_str(yaml, PathBuf::from("/tmp/non_finite.yml")).unwrap();
+
+        assert!(cfg.record.max_size_gb.is_none());
+        assert!(cfg.record.min_free_gb.is_none());
+        assert_eq!(cfg.record.continuous.days, 14.0);
+        assert_eq!(cfg.record.motion.days, 0.0);
+        assert_eq!(cfg.record.alerts.retain.days, 14.0);
+        assert_eq!(cfg.record.detections.retain.days, 14.0);
+        assert!(cfg.motion.lightning_threshold.is_finite());
+        assert!(cfg.motion.delta_alpha.is_finite());
+        assert!(cfg.motion.frame_alpha.is_finite());
+        assert!(cfg.genai.ambiguous_score_min.is_finite());
+        assert!(cfg.genai.ambiguous_score_max.is_finite());
+        assert!(cfg.face_recognition.similarity_threshold.is_finite());
+        assert!(cfg.lpr.min_confidence.is_finite());
+        assert!(cfg.ui.floorplan.rooms[0].x.is_finite());
+        assert!(cfg.ui.floorplan.rooms[0].w > 0.0 && cfg.ui.floorplan.rooms[0].w.is_finite());
+        assert!(
+            cfg.ui.floorplan.walls[0]
+                .points
+                .iter()
+                .all(|p| p.is_finite())
+        );
+        let cam = &cfg.cameras["cam1"];
+        assert!(cam.map.x.is_finite() && cam.map.fov_deg.is_finite() && cam.map.range.is_finite());
+        assert!(cam.lines["l1"].points.iter().all(|p| p.is_finite()));
+        assert!(cam.state_rois["gate"].crop.iter().all(|c| c.is_finite()));
+        assert!(cam.record.min_free_gb.is_none());
+        assert_eq!(cam.record.continuous.days, 14.0);
+        assert_eq!(cam.record.motion.days, 0.0);
+        assert_eq!(cam.record.alerts.retain.days, 14.0);
+        assert_eq!(cam.record.detections.retain.days, 14.0);
+
+        // Direct in-memory NaN mutation before merge_section_json / apply_structured_json must not fail with null
+        cfg.motion.lightning_threshold = f32::NAN;
+        let merged_motion =
+            merge_section_json(&cfg.motion, &json!({ "enabled": false }), &["mask"]);
+        assert!(merged_motion["lightning_threshold"].is_number());
+        cfg.apply_structured_json(&json!({
+            "motion": { "enabled": false },
+            "record": { "enabled": true }
+        }))
+        .expect("partial structured JSON update must succeed even after non-finite float mutation");
+        assert!(!cfg.motion.enabled);
+        assert!(cfg.motion.lightning_threshold.is_finite());
     }
 }
