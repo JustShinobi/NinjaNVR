@@ -5,10 +5,12 @@ import {
   buildLocalFinetuneCliCommand,
   buildModelUploadPayload,
   COLAB_MODEL_FACTORY_URL,
+  computeBatchProgressMetrics,
   computeDatasetReadinessMetrics,
   formatYoloAnnotationLine,
   NINJANVR_SECURITY_15CL_LABELMAP_PATH,
   NINJANVR_SECURITY_CLASSES,
+  selectBatchAutoAnnotateCandidates,
   xyxyToYoloNormalized,
   yoloNormalizedToXyxy,
 } from "../views/settings/VisionAndAiPanels";
@@ -184,5 +186,99 @@ describe("Dataset Studio Sample Queue filter options", () => {
     );
     expect(inconsistent[0].count).toBe(5);
     expect(inconsistent[0].label).toBe("TODAS AS AMOSTRAS");
+  });
+
+  test("selectBatchAutoAnnotateCandidates and computeBatchProgressMetrics track batch AI annotation progress and ETA", () => {
+    const mockSamples = [
+      {
+        id: "ds_1",
+        camera: "escritorio",
+        split: "train" as const,
+        sample_kind: "true_positive" as const,
+        image_path: "/media/ninjanvr/dataset/ds_1.webp",
+        width: 1920,
+        height: 1080,
+        annotations: [
+          {
+            class_id: 0,
+            label: "person",
+            cx: 0.5,
+            cy: 0.5,
+            w: 0.2,
+            h: 0.4,
+            score: 0.9,
+            source: "event",
+          },
+        ],
+        verified: false,
+        night_mode: false,
+        created_at: 1000,
+      },
+      {
+        id: "ds_2",
+        camera: "sala",
+        split: "train" as const,
+        sample_kind: "ai_annotated" as const,
+        image_path: "/media/ninjanvr/dataset/ds_2.webp",
+        width: 1920,
+        height: 1080,
+        annotations: [
+          {
+            class_id: 0,
+            label: "person",
+            cx: 0.5,
+            cy: 0.5,
+            w: 0.2,
+            h: 0.4,
+            score: 0.95,
+            source: "ai_teacher",
+          },
+        ],
+        verified: true,
+        night_mode: false,
+        created_at: 1001,
+      },
+      {
+        id: "ds_3",
+        camera: "sala",
+        split: "val" as const,
+        sample_kind: "hard_negative" as const,
+        image_path: "/media/ninjanvr/dataset/ds_3.webp",
+        width: 1920,
+        height: 1080,
+        annotations: [],
+        verified: true,
+        night_mode: false,
+        created_at: 1002,
+      },
+    ];
+
+    const pending = selectBatchAutoAnnotateCandidates(mockSamples, "pending");
+    expect(pending.map((s) => s.id)).toEqual(["ds_1"]);
+
+    const allPos = selectBatchAutoAnnotateCandidates(mockSamples, "all_positives");
+    expect(allPos.map((s) => s.id)).toEqual(["ds_1", "ds_2"]);
+
+    const metricsRunning = computeBatchProgressMetrics(
+      {
+        active: true,
+        mode: "all_positives",
+        total: 10,
+        completed: 4,
+        succeeded: 4,
+        failed: 0,
+        boxesGenerated: 16,
+        currentSampleId: "ds_5",
+        currentCamera: "escritorio",
+        startedAtMs: 10_000,
+        finishedAtMs: null,
+        cancelled: false,
+      },
+      18_000
+    );
+    expect(metricsRunning.pct).toBe(40);
+    expect(metricsRunning.remaining).toBe(6);
+    expect(metricsRunning.elapsedSec).toBe(8);
+    expect(metricsRunning.etaSec).toBe(12);
   });
 });

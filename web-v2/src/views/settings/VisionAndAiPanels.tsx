@@ -249,6 +249,70 @@ export function computeDatasetReadinessMetrics(
   };
 }
 
+export interface BatchAutoAnnotateProgress {
+  active: boolean;
+  mode: "pending" | "all_positives";
+  total: number;
+  completed: number;
+  succeeded: number;
+  failed: number;
+  boxesGenerated: number;
+  currentSampleId: string | null;
+  currentCamera: string | null;
+  startedAtMs: number;
+  finishedAtMs: number | null;
+  cancelled: boolean;
+}
+
+export function selectBatchAutoAnnotateCandidates(
+  samples: DatasetSampleItem[],
+  mode: "pending" | "all_positives" = "pending"
+): DatasetSampleItem[] {
+  if (!Array.isArray(samples)) return [];
+  const positives = samples.filter(
+    (s) => s && typeof s.id === "string" && s.sample_kind !== "hard_negative"
+  );
+  if (mode === "all_positives") {
+    return positives;
+  }
+  return positives.filter(
+    (s) =>
+      !s.verified ||
+      s.sample_kind !== "ai_annotated" ||
+      !Array.isArray(s.annotations) ||
+      s.annotations.length === 0
+  );
+}
+
+export function computeBatchProgressMetrics(
+  progress: BatchAutoAnnotateProgress | null | undefined,
+  nowMs: number = Date.now()
+): {
+  pct: number;
+  remaining: number;
+  elapsedSec: number;
+  etaSec: number | null;
+} {
+  if (!progress || progress.total <= 0) {
+    return { pct: 0, remaining: 0, elapsedSec: 0, etaSec: null };
+  }
+  const total = Math.max(1, toSafeCount(progress.total));
+  const completed = Math.min(total, toSafeCount(progress.completed));
+  const pct = Math.max(0, Math.min(100, Math.round((completed / total) * 100)));
+  const remaining = Math.max(0, total - completed);
+  const endRef =
+    typeof progress.finishedAtMs === "number" && Number.isFinite(progress.finishedAtMs)
+      ? progress.finishedAtMs
+      : nowMs;
+  const elapsedMs = Math.max(0, endRef - (progress.startedAtMs || endRef));
+  const elapsedSec = Math.round(elapsedMs / 1000);
+  const etaSec =
+    progress.active && completed > 0 && remaining > 0
+      ? Math.max(1, Math.round(((elapsedMs / completed) * remaining) / 1000))
+      : null;
+  return { pct, remaining, elapsedSec, etaSec };
+}
+
 const VISION_RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 function extractEmbeddedIpv4Vision(hostClean: string): string | null {
@@ -6920,6 +6984,9 @@ export const DatasetStudioSection: React.FC<{
 
   const datasetLoadSeqRef = React.useRef(0);
   const isMountedRef = React.useRef(true);
+  const batchCancelRef = React.useRef(false);
+  const [batchProgress, setBatchProgress] =
+    useState<BatchAutoAnnotateProgress | null>(null);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -7049,22 +7116,192 @@ export const DatasetStudioSection: React.FC<{
     }
   };
 
-  const handleBatchAutoAnnotate = async () => {
+  const pendingBatchCount = selectBatchAutoAnnotateCandidates(
+    samples,
+    "pending"
+  ).length;
+  const allPositiveBatchCount = selectBatchAutoAnnotateCandidates(
+    samples,
+    "all_positives"
+  ).length;
+  const batchMetrics = computeBatchProgressMetrics(batchProgress);
+
+  const handleStopBatchAutoAnnotate = () => {
+    batchCancelRef.current = true;
+  };
+
+  const handleBatchAutoAnnotate = async (
+    requestedMode?: "pending" | "all_positives"
+  ) => {
     setBusyAction("batch-auto");
+    batchCancelRef.current = false;
     try {
-      const res = await fetch("/api/dataset/auto-annotate", {
-        method: "POST",
-        credentials: "include",
-      });
-      const data = await res.json().catch(() => null);
-      if (!isMountedRef.current) return;
-      if (res.ok && data) {
+      let currentList = samples;
+      try {
+        const listRes = await fetch("/api/dataset/samples", {
+          credentials: "include",
+        });
+        if (listRes.ok) {
+          const listData = await listRes.json().catch(() => null);
+          const rows: DatasetSampleItem[] = Array.isArray(listData)
+            ? listData
+            : Array.isArray(listData?.items)
+            ? listData.items
+            : [];
+          if (rows.length > 0) {
+            currentList = rows;
+          }
+        }
+      } catch {
+        // fallback to in-memory samples
+      }
+
+      const pendingCandidates = selectBatchAutoAnnotateCandidates(
+        currentList,
+        "pending"
+      );
+      const effectiveMode: "pending" | "all_positives" =
+        requestedMode ||
+        (pendingCandidates.length > 0 ? "pending" : "all_positives");
+      const candidates = selectBatchAutoAnnotateCandidates(
+        currentList,
+        effectiveMode
+      );
+
+      if (candidates.length === 0) {
+        const res = await fetch("/api/dataset/auto-annotate", {
+          method: "POST",
+          credentials: "include",
+        });
+        const data = await res.json().catch(() => null);
+        if (!isMountedRef.current) return;
+        if (res.ok && data) {
+          notify(
+            `Batch AI Teacher auto-annotated ${data.annotated_count ?? 0} unverified samples`
+          );
+          void loadDatasetState();
+        } else {
+          notify(data?.message || "Batch AI auto-annotation failed");
+        }
+        return;
+      }
+
+      const startedAtMs = Date.now();
+      let completed = 0;
+      let succeeded = 0;
+      let failed = 0;
+      let boxesGenerated = 0;
+
+      if (isMountedRef.current) {
+        setBatchProgress({
+          active: true,
+          mode: effectiveMode,
+          total: candidates.length,
+          completed: 0,
+          succeeded: 0,
+          failed: 0,
+          boxesGenerated: 0,
+          currentSampleId: candidates[0].id,
+          currentCamera: candidates[0].camera,
+          startedAtMs,
+          finishedAtMs: null,
+          cancelled: false,
+        });
+      }
+
+      for (const cand of candidates) {
+        if (!isMountedRef.current || batchCancelRef.current) {
+          break;
+        }
+        setSelectedSampleId(cand.id);
+        setBatchProgress((prev) =>
+          prev
+            ? {
+                ...prev,
+                currentSampleId: cand.id,
+                currentCamera: cand.camera,
+              }
+            : null
+        );
+        try {
+          const res = await fetch(
+            `/api/dataset/samples/${encodeURIComponent(cand.id)}/auto-annotate`,
+            {
+              method: "POST",
+              credentials: "include",
+            }
+          );
+          const data = await res.json().catch(() => null);
+          if (res.ok && data) {
+            const item: DatasetSampleItem = data.sample || data;
+            const anns = Array.isArray(item.annotations) ? item.annotations : [];
+            boxesGenerated += anns.length;
+            succeeded += 1;
+            await fetch(
+              `/api/dataset/samples/${encodeURIComponent(cand.id)}`,
+              {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                credentials: "include",
+                body: JSON.stringify({ verified: true }),
+              }
+            ).catch(() => null);
+            const verifiedItem: DatasetSampleItem = {
+              ...item,
+              verified: true,
+            };
+            if (isMountedRef.current) {
+              setSamples((prev) =>
+                prev.map((s) => (s.id === verifiedItem.id ? verifiedItem : s))
+              );
+            }
+          } else {
+            failed += 1;
+          }
+        } catch {
+          failed += 1;
+        }
+        completed += 1;
+        if (isMountedRef.current) {
+          setBatchProgress({
+            active: true,
+            mode: effectiveMode,
+            total: candidates.length,
+            completed,
+            succeeded,
+            failed,
+            boxesGenerated,
+            currentSampleId: cand.id,
+            currentCamera: cand.camera,
+            startedAtMs,
+            finishedAtMs: null,
+            cancelled: batchCancelRef.current,
+          });
+        }
+      }
+
+      const wasCancelled = batchCancelRef.current;
+      if (isMountedRef.current) {
+        setBatchProgress({
+          active: false,
+          mode: effectiveMode,
+          total: candidates.length,
+          completed,
+          succeeded,
+          failed,
+          boxesGenerated,
+          currentSampleId: null,
+          currentCamera: null,
+          startedAtMs,
+          finishedAtMs: Date.now(),
+          cancelled: wasCancelled,
+        });
         notify(
-          `Batch AI Teacher auto-annotated ${data.annotated_count ?? 0} unverified samples`
+          wasCancelled
+            ? `Batch AI stopped at ${completed}/${candidates.length} (${succeeded} annotated, +${boxesGenerated} boxes)`
+            : `Batch AI Teacher completed: ${succeeded}/${candidates.length} samples annotated (+${boxesGenerated} YOLO boxes)`
         );
         void loadDatasetState();
-      } else {
-        notify(data?.message || "Batch AI auto-annotation failed");
       }
     } catch {
       if (isMountedRef.current) {
@@ -7193,13 +7430,46 @@ export const DatasetStudioSection: React.FC<{
               type="button"
               className="nvr-btn mono sm"
               disabled={busyAction === "batch-auto"}
-              onClick={() => void handleBatchAutoAnnotate()}
+              onClick={() =>
+                void handleBatchAutoAnnotate(
+                  pendingBatchCount > 0 ? "pending" : "all_positives"
+                )
+              }
             >
               <Sparkles size={11} />
-              {busyAction === "batch-auto"
-                ? "Auto-Annotating..."
-                : "Batch Auto-Annotate Unverified"}
+              {busyAction === "batch-auto" && batchProgress?.active
+                ? `${isPt ? "Anotando" : "Auto-Annotating"} ${batchProgress.completed}/${batchProgress.total} (${batchMetrics.pct}%)...`
+                : pendingBatchCount > 0
+                ? isPt
+                  ? `Auto-Annotate Pendentes (${pendingBatchCount})`
+                  : `Batch Auto-Annotate Unverified (${pendingBatchCount})`
+                : isPt
+                ? `Re-Anotar Positivas com IA (${allPositiveBatchCount})`
+                : `Batch Auto-Annotate Unverified`}
             </button>
+            {pendingBatchCount > 0 &&
+              allPositiveBatchCount > pendingBatchCount &&
+              busyAction !== "batch-auto" && (
+                <button
+                  type="button"
+                  className="nvr-btn mono sm"
+                  onClick={() => void handleBatchAutoAnnotate("all_positives")}
+                >
+                  <Sparkles size={11} />
+                  {isPt
+                    ? `Re-Anotar Todas (${allPositiveBatchCount})`
+                    : `Re-Annotate All (${allPositiveBatchCount})`}
+                </button>
+              )}
+            {busyAction === "batch-auto" && batchProgress?.active && (
+              <button
+                type="button"
+                className="nvr-btn danger mono sm"
+                onClick={handleStopBatchAutoAnnotate}
+              >
+                {isPt ? "Parar Lote" : "Stop Batch"}
+              </button>
+            )}
             <a
               href="/api/dataset/export.zip"
               download="ninjanvr-yolo-dataset.zip"
@@ -7211,6 +7481,106 @@ export const DatasetStudioSection: React.FC<{
         </div>
 
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
+          {batchProgress && (
+            <div
+              className="nvr-subcard mono"
+              aria-live="polite"
+              style={{
+                padding: "8px 10px",
+                gap: 6,
+                fontSize: "var(--text-xs)",
+                border: `1px solid ${
+                  batchProgress.active
+                    ? "var(--signal-accent)"
+                    : batchProgress.cancelled
+                    ? "var(--signal-motion)"
+                    : "var(--signal-live)"
+                }`,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 8,
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span
+                    className={`nvr-badge ${
+                      batchProgress.active
+                        ? "live"
+                        : batchProgress.cancelled
+                        ? "motion"
+                        : "live"
+                    }`}
+                  >
+                    {batchProgress.active
+                      ? isPt
+                        ? "LOTE EM EXECUÇÃO"
+                        : "BATCH RUNNING"
+                      : batchProgress.cancelled
+                      ? isPt
+                        ? "LOTE INTERROMPIDO"
+                        : "BATCH STOPPED"
+                      : isPt
+                      ? "LOTE CONCLUÍDO"
+                      : "BATCH COMPLETE"}
+                  </span>
+                  <span style={{ fontWeight: 700, color: "var(--text-primary)" }}>
+                    {batchProgress.completed} / {batchProgress.total} ({batchMetrics.pct}%)
+                  </span>
+                  <span style={{ color: "var(--signal-accent-text)" }}>
+                    +{batchProgress.boxesGenerated} YOLO BOXES
+                  </span>
+                  <span style={{ color: "var(--text-secondary)" }}>
+                    OK: {batchProgress.succeeded} · ERR: {batchProgress.failed} ·{" "}
+                    {batchMetrics.elapsedSec}s
+                    {batchMetrics.etaSec !== null
+                      ? ` · ETA ~${batchMetrics.etaSec}s`
+                      : ""}
+                  </span>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  {batchProgress.active && batchProgress.currentSampleId && (
+                    <span style={{ color: "var(--text-muted)" }}>
+                      {isPt ? "Processando:" : "Processing:"}{" "}
+                      <strong style={{ color: "var(--text-primary)" }}>
+                        {(batchProgress.currentCamera || "cam").toUpperCase()}
+                      </strong>{" "}
+                      · {batchProgress.currentSampleId}
+                    </span>
+                  )}
+                  {!batchProgress.active && (
+                    <button
+                      type="button"
+                      className="nvr-btn mono sm"
+                      onClick={() => setBatchProgress(null)}
+                    >
+                      {isPt ? "Fechar" : "Dismiss"}
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="nvr-util-bar" style={{ width: "100%", height: 6 }}>
+                <div
+                  className="nvr-util-fill"
+                  style={{
+                    width: `${batchMetrics.pct}%`,
+                    background: batchProgress.active
+                      ? "var(--signal-accent)"
+                      : batchProgress.cancelled
+                      ? "var(--signal-motion)"
+                      : "var(--signal-live)",
+                    transition: "width 180ms ease-out",
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
           {/* 4 Readiness Gauges */}
           <div
             style={{
