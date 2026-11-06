@@ -359,6 +359,8 @@ export interface DatasetSampleItem {
   night_mode: boolean;
   created_at: number;
   image_url?: string;
+  /** "ai" (Teacher auto-annotation) or "manual" (operator); null while unverified. */
+  verified_by?: "ai" | "manual" | string | null;
 }
 
 export interface DatasetSummaryResponse {
@@ -370,6 +372,9 @@ export interface DatasetSummaryResponse {
   train_count: number;
   val_count: number;
   verified_count: number;
+  ai_verified_count?: number;
+  manual_verified_count?: number;
+  pending_count?: number;
   unverified_count: number;
   night_mode_count: number;
   total_annotations: number;

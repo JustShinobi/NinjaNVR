@@ -30,9 +30,9 @@ import {
 } from "./settings/ConsoleAndStreamsPanels";
 import {
   AiDetectionObjectsSection,
-  DatasetStudioSection,
   VisionZonesMotionSection,
 } from "./settings/VisionAndAiPanels";
+import { DatasetStudioSection } from "./settings/DatasetStudio";
 import {
   CommsAuthUsersSection,
   RecordingReviewSection,
