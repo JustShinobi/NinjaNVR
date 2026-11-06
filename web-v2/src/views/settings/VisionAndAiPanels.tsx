@@ -152,6 +152,39 @@ export interface DatasetReadinessMetrics {
   isBalanced: boolean;
 }
 
+export type DatasetSampleFilterKind =
+  | "all"
+  | "true_positive"
+  | "ai_annotated"
+  | "hard_negative";
+
+export interface DatasetSampleFilterOption {
+  value: DatasetSampleFilterKind;
+  label: string;
+  count: number;
+}
+
+/**
+ * Builds the Sample Queue filter options with per-kind counts taken from the
+ * dataset summary, so every option shows its own total regardless of which
+ * filter is currently applied to the loaded list.
+ */
+export function buildDatasetSampleFilterOptions(
+  summary: Partial<DatasetSummaryResponse> | null | undefined,
+  isPt: boolean
+): DatasetSampleFilterOption[] {
+  const tp = toSafeCount(summary?.true_positive_count);
+  const ai = toSafeCount(summary?.ai_annotated_count);
+  const hn = toSafeCount(summary?.hard_negative_count);
+  const total = Math.max(toSafeCount(summary?.total_samples), tp + ai + hn);
+  return [
+    { value: "all", label: isPt ? "TODAS AS AMOSTRAS" : "ALL SAMPLES", count: total },
+    { value: "true_positive", label: isPt ? "VERDADEIROS POSITIVOS" : "TRUE POSITIVES", count: tp },
+    { value: "ai_annotated", label: isPt ? "ANOTADAS POR IA" : "AI ANNOTATED", count: ai },
+    { value: "hard_negative", label: isPt ? "NEGATIVOS DIFÍCEIS (BG)" : "HARD NEGATIVES (BG)", count: hn },
+  ];
+}
+
 export function computeDatasetReadinessMetrics(
   summary?: Partial<DatasetSummaryResponse> | null
 ): DatasetReadinessMetrics {
@@ -6866,7 +6899,7 @@ export const DatasetStudioSection: React.FC<{
   const [summary, setSummary] = useState<DatasetSummaryResponse | null>(null);
   const [samples, setSamples] = useState<DatasetSampleItem[]>([]);
   const [selectedSampleId, setSelectedSampleId] = useState<string | null>(null);
-  const [filterKind, setFilterKind] = useState<string>("all");
+  const [filterKind, setFilterKind] = useState<DatasetSampleFilterKind>("all");
   const [activeClassId, setActiveClassId] = useState<number>(0);
   const [drawStart, setDrawStart] = useState<[number, number] | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -6943,6 +6976,8 @@ export const DatasetStudioSection: React.FC<{
   const selectedSample =
     samples.find((s) => s.id === selectedSampleId) || samples[0] || null;
   const readiness = computeDatasetReadinessMetrics(summary);
+  const filterOptions = buildDatasetSampleFilterOptions(summary, isPt);
+  const queueVerifiedCount = samples.filter((s) => s.verified).length;
 
   const handleUpdateSample = async (
     sample: DatasetSampleItem,
@@ -7342,6 +7377,7 @@ export const DatasetStudioSection: React.FC<{
               style={{
                 padding: "8px 10px",
                 gap: 8,
+                minHeight: 0,
               }}
             >
               <div className="nvr-subcard-header">
@@ -7349,7 +7385,7 @@ export const DatasetStudioSection: React.FC<{
                   {isPt ? "FILA DE AMOSTRAS" : "SAMPLE QUEUE"} ({samples.length})
                 </span>
                 <span style={{ color: "var(--signal-accent-text)" }}>
-                  {readiness.verifiedCount} VERIFIED
+                  {queueVerifiedCount} {isPt ? "VERIFICADAS" : "VERIFIED"}
                 </span>
               </div>
 
@@ -7357,17 +7393,31 @@ export const DatasetStudioSection: React.FC<{
                 className="nvr-select mono sm"
                 aria-label="Filter dataset samples by kind" style={{ width: "100%" }}
                 value={filterKind}
-                onChange={(e) => setFilterKind(e.target.value)}
+                onChange={(e) => {
+                  const next = filterOptions.find((o) => o.value === e.target.value);
+                  if (next) setFilterKind(next.value);
+                }}
               >
-                <option value="all">ALL SAMPLES ({samples.length})</option>
-                <option value="true_positive">TRUE POSITIVES</option>
-                <option value="ai_annotated">AI ANNOTATED</option>
-                <option value="hard_negative">HARD NEGATIVES (BG)</option>
+                {filterOptions.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label} ({opt.count})
+                  </option>
+                ))}
               </select>
 
+              {/* flex-basis 0 lets the queue fill the column height set by the
+                  editor stage without its own content stretching the grid row. */}
               <div
                 className="nvr-scroll-y"
-                style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1, maxHeight: 280 }}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 4,
+                  flex: "1 1 0",
+                  height: 0,
+                  minHeight: 220,
+                  paddingRight: 2,
+                }}
               >
                 {samples.map((s) => {
                   const isSel = selectedSample?.id === s.id;
@@ -7398,6 +7448,7 @@ export const DatasetStudioSection: React.FC<{
                         alignItems: "center",
                         justifyContent: "space-between",
                         gap: 6,
+                        flexShrink: 0,
                         fontSize: "var(--text-xs)",
                       }}
                     >
@@ -7432,13 +7483,31 @@ export const DatasetStudioSection: React.FC<{
                       gap: 6,
                     }}
                   >
-                    <div style={{ fontWeight: 700, color: "var(--signal-accent-text)" }}>
-                      DATASET QUEUE EMPTY
-                    </div>
-                    <div style={{ color: "var(--text-muted)", lineHeight: 1.45 }}>
-                      Mark events as False Positive or click &quot;Add to Training Dataset&quot; in
-                      Explore to populate frames.
-                    </div>
+                    {filterKind !== "all" ? (
+                      <>
+                        <div style={{ fontWeight: 700, color: "var(--signal-accent-text)" }}>
+                          {isPt ? "NENHUMA AMOSTRA NESTE FILTRO" : "NO SAMPLES MATCH THIS FILTER"}
+                        </div>
+                        <button
+                          type="button"
+                          className="nvr-btn mono sm"
+                          style={{ alignSelf: "flex-start" }}
+                          onClick={() => setFilterKind("all")}
+                        >
+                          {isPt ? "MOSTRAR TODAS" : "SHOW ALL SAMPLES"}
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <div style={{ fontWeight: 700, color: "var(--signal-accent-text)" }}>
+                          DATASET QUEUE EMPTY
+                        </div>
+                        <div style={{ color: "var(--text-muted)", lineHeight: 1.45 }}>
+                          Mark events as False Positive or click &quot;Add to Training Dataset&quot; in
+                          Explore to populate frames.
+                        </div>
+                      </>
+                    )}
                   </div>
                 )}
               </div>

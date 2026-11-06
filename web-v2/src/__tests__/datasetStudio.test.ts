@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   applySecurity15ClassPreset,
+  buildDatasetSampleFilterOptions,
   buildLocalFinetuneCliCommand,
   buildModelUploadPayload,
   COLAB_MODEL_FACTORY_URL,
@@ -152,5 +153,36 @@ describe("Dataset Studio YOLO Normalization & Readiness Gauges", () => {
       "python3 scripts/ai/train_ninjanvr_model.py --mode finetune --dataset ninjanvr-dataset.zip --model yolo11s.pt --imgsz 640 --epochs 30 --freeze 10 --nvr-url https://nvr.example.com:8971 --nvr-token $NINJANVR_API_TOKEN"
     );
     expect(COLAB_MODEL_FACTORY_URL).toContain("notebooks/NinjaNVR_Model_Factory.ipynb");
+  });
+});
+
+describe("Dataset Studio Sample Queue filter options", () => {
+  test("every option carries its own summary count, independent of the active filter", () => {
+    const opts = buildDatasetSampleFilterOptions(
+      {
+        total_samples: 60,
+        true_positive_count: 12,
+        ai_annotated_count: 40,
+        hard_negative_count: 8,
+      },
+      false
+    );
+    expect(opts.map((o) => [o.value, o.count])).toEqual([
+      ["all", 60],
+      ["true_positive", 12],
+      ["ai_annotated", 40],
+      ["hard_negative", 8],
+    ]);
+    expect(opts[0].label).toBe("ALL SAMPLES");
+  });
+
+  test("falls back to zero counts and never reports a total below the kind sum", () => {
+    expect(buildDatasetSampleFilterOptions(null, false).every((o) => o.count === 0)).toBe(true);
+    const inconsistent = buildDatasetSampleFilterOptions(
+      { total_samples: 3, true_positive_count: 2, ai_annotated_count: 2, hard_negative_count: 1 },
+      true
+    );
+    expect(inconsistent[0].count).toBe(5);
+    expect(inconsistent[0].label).toBe("TODAS AS AMOSTRAS");
   });
 });
