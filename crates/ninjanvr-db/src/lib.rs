@@ -322,7 +322,7 @@ fn value_to_f64(val: &rusqlite::types::ValueRef<'_>) -> Option<f64> {
         rusqlite::types::ValueRef::Real(f) => (*f).is_finite().then_some(*f),
         rusqlite::types::ValueRef::Integer(i) => Some(*i as f64),
         rusqlite::types::ValueRef::Text(bytes) => {
-            let s = std::str::from_utf8(bytes).ok()?;
+            let s = std::str::from_utf8(bytes).ok()?.trim();
             if let Ok(f) = s.parse::<f64>() {
                 return f.is_finite().then_some(f);
             }
@@ -440,7 +440,9 @@ pub fn compute_norm_box_iou(a: [f64; 4], b: [f64; 4]) -> f64 {
     if !a.iter().all(|v| v.is_finite()) || !b.iter().all(|v| v.is_finite()) {
         return 0.0;
     }
-    let both_valid_xyxy = a[2] > a[0] && a[3] > a[1] && b[2] > b[0] && b[3] > b[1];
+    let a_valid_xyxy = a[2] > a[0] && a[3] > a[1];
+    let b_valid_xyxy = b[2] > b[0] && b[3] > b[1];
+    let both_valid_xyxy = a_valid_xyxy && b_valid_xyxy;
     let xyxy = iou_corners(a, b);
     if both_valid_xyxy {
         let aw = a[2] - a[0];
@@ -449,33 +451,45 @@ pub fn compute_norm_box_iou(a: [f64; 4], b: [f64; 4]) -> f64 {
         let bh = b[3] - b[1];
         let y_fixed_xywh_shift = (a[1] - b[1]).abs() < 1e-6
             && (a[3] - b[3]).abs() < 1e-6
+            && a[0] <= 0.25
             && a[1] < 2.5 * ah
             && (bw < aw * 0.9 || aw < bw * 0.9);
         let x_fixed_xywh_shift = (a[0] - b[0]).abs() < 1e-6
             && (a[2] - b[2]).abs() < 1e-6
+            && a[1] <= 0.25
             && a[0] < 2.5 * aw
             && (bh < ah * 0.9 || ah < bh * 0.9);
-        if ((aw < a[0] && ah < a[1]) || (bw < b[0] && bh < b[1]))
+        if ((aw < a[0] && ah < a[1])
+            || (bw < b[0] && bh < b[1])
+            || (aw < a[0] && bw < b[0])
+            || (ah < a[1] && bh < b[1]))
             && !y_fixed_xywh_shift
             && !x_fixed_xywh_shift
         {
             return xyxy;
         }
     }
-    let can_be_xywh = a[2] > 0.0
-        && a[3] > 0.0
-        && b[2] > 0.0
-        && b[3] > 0.0
-        && a[0] + a[2] <= 1.0001
-        && a[1] + a[3] <= 1.0001
-        && b[0] + b[2] <= 1.0001
-        && b[1] + b[3] <= 1.0001;
+    let a_valid_xywh = a[2] > 0.0 && a[3] > 0.0 && a[0] + a[2] <= 1.0001 && a[1] + a[3] <= 1.0001;
+    let b_valid_xywh = b[2] > 0.0 && b[3] > 0.0 && b[0] + b[2] <= 1.0001 && b[1] + b[3] <= 1.0001;
+    let can_be_xywh = a_valid_xywh && b_valid_xywh;
     if can_be_xywh {
         let xywh = iou_corners(
             [a[0], a[1], a[0] + a[2], a[1] + a[3]],
             [b[0], b[1], b[0] + b[2], b[1] + b[3]],
         );
         xyxy.max(xywh)
+    } else if !both_valid_xyxy {
+        let a_corners = if !a_valid_xyxy && a_valid_xywh {
+            [a[0], a[1], a[0] + a[2], a[1] + a[3]]
+        } else {
+            a
+        };
+        let b_corners = if !b_valid_xyxy && b_valid_xywh {
+            [b[0], b[1], b[0] + b[2], b[1] + b[3]]
+        } else {
+            b
+        };
+        xyxy.max(iou_corners(a_corners, b_corners))
     } else {
         xyxy
     }
@@ -912,7 +926,7 @@ impl NinjaDatabase {
                 .optional()?;
 
             if let Some((_, ref hash)) = existing
-                && !hash.is_empty()
+                && !hash.trim().is_empty()
             {
                 return Ok(None);
             }
@@ -933,7 +947,7 @@ impl NinjaDatabase {
             )
             .optional()?;
         if let Some((_, ref hash)) = existing
-            && !hash.is_empty()
+            && !hash.trim().is_empty()
         {
             return Ok(None);
         }
@@ -1912,6 +1926,12 @@ impl NinjaDatabase {
     pub fn insert_review_segment(&self, item: &ReviewItemDto) -> Result<()> {
         let conn = self.lock_conn();
         let data_str = serde_json::to_string(&item.data)?;
+        let safe_start = if item.start_time.is_finite() {
+            item.start_time
+        } else {
+            0.0
+        };
+        let safe_end = item.end_time.filter(|v| v.is_finite());
         conn.execute(
             r#"
             INSERT INTO reviewsegment (id, camera, start_time, end_time, severity, thumb_path, data)
@@ -1925,8 +1945,8 @@ impl NinjaDatabase {
             params![
                 item.id,
                 item.camera,
-                item.start_time,
-                item.end_time,
+                safe_start,
+                safe_end,
                 item.severity,
                 item.thumb_path,
                 data_str
@@ -2645,11 +2665,11 @@ impl NinjaDatabase {
                 value_to_f64(&r.get_ref(4)?).unwrap_or(0.0),
                 value_to_f64(&r.get_ref(5)?).unwrap_or(0.0),
                 value_to_f64(&r.get_ref(6)?).unwrap_or(0.0),
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-                r.get(10)?,
-                r.get(11)?,
+                r.get::<_, Option<i64>>(7).ok().flatten(),
+                r.get::<_, Option<String>>(8).ok().flatten(),
+                r.get::<_, i64>(9).unwrap_or(1),
+                r.get::<_, Option<String>>(10).ok().flatten(),
+                r.get::<_, Option<String>>(11).ok().flatten(),
                 value_to_f64(&r.get_ref(12)?).unwrap_or(0.0),
                 value_to_f64(&r.get_ref(13)?).unwrap_or(0.0),
             ))
@@ -2741,7 +2761,7 @@ impl NinjaDatabase {
             let ny1 = value_to_f64(&r.get_ref(4)?).unwrap_or(0.0);
             let nx2 = value_to_f64(&r.get_ref(5)?).unwrap_or(0.0);
             let ny2 = value_to_f64(&r.get_ref(6)?).unwrap_or(0.0);
-            let dhash_i64: Option<i64> = r.get(7)?;
+            let dhash_i64: Option<i64> = r.get::<_, Option<i64>>(7).ok().flatten();
             Ok(json!({
                 "id": r.get::<_, i64>(0)?,
                 "camera": r.get::<_, String>(1)?,
@@ -2752,10 +2772,10 @@ impl NinjaDatabase {
                 "norm_x2": nx2,
                 "norm_y2": ny2,
                 "dhash64": dhash_i64.map(|v| v as u64),
-                "dominant_color": r.get::<_, Option<String>>(8)?,
-                "hit_count": r.get::<_, i64>(9)?,
-                "source_event_id": r.get::<_, Option<String>>(10)?,
-                "reason": r.get::<_, Option<String>>(11)?,
+                "dominant_color": r.get::<_, Option<String>>(8).ok().flatten(),
+                "hit_count": r.get::<_, i64>(9).unwrap_or(1),
+                "source_event_id": r.get::<_, Option<String>>(10).ok().flatten(),
+                "reason": r.get::<_, Option<String>>(11).ok().flatten(),
                 "created_at": value_to_f64(&r.get_ref(12)?).unwrap_or(0.0),
                 "last_seen_at": value_to_f64(&r.get_ref(13)?).unwrap_or(0.0),
             }))
@@ -2782,7 +2802,7 @@ impl NinjaDatabase {
             .query_row(
                 "SELECT source_event_id FROM false_positive_signature WHERE id = ?1",
                 params![id],
-                |r| r.get::<_, Option<String>>(0),
+                |r| Ok(r.get::<_, Option<String>>(0).ok().flatten()),
             )
             .optional()?
             .flatten();
@@ -2870,7 +2890,12 @@ impl NinjaDatabase {
                         .collect()
                 })
                 .unwrap_or_default();
-            if !det_ids.iter().any(|d| d == id) {
+            let matches_event = det_ids.iter().any(|d| d == id || d == clean_id)
+                || obj
+                    .get("event_id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|eid| eid == id || eid == clean_id);
+            if !matches_event {
                 continue;
             }
             let mut sub_labels: Vec<String> = obj
@@ -2891,7 +2916,7 @@ impl NinjaDatabase {
                 let sibling_still_has_old =
                     det_ids
                         .iter()
-                        .filter(|d| d.as_str() != id)
+                        .filter(|d| d.as_str() != id && d.as_str() != clean_id)
                         .any(|sibling_id| {
                             tx.query_row(
                                 "SELECT COALESCE(NULLIF(TRIM(sub_label), ''), json_extract(CASE WHEN json_valid(data) AND json_type(data) = 'object' THEN data ELSE '{}' END, '$.sub_label')) FROM event WHERE id = ?1",
@@ -2905,7 +2930,7 @@ impl NinjaDatabase {
                 if !sibling_still_has_old {
                     sub_labels.retain(|x| !x.trim().eq_ignore_ascii_case(old_sl));
                 }
-            } else if normalized_sub.is_none() && det_ids.len() == 1 {
+            } else if normalized_sub.is_none() && det_ids.len() <= 1 {
                 sub_labels.clear();
             }
 
@@ -3612,7 +3637,7 @@ impl NinjaDatabase {
             if !ts.is_finite() {
                 continue;
             }
-            let dur = if raw_dur.is_finite() && raw_dur > 0.0 {
+            let dur = if raw_dur.is_finite() && raw_dur > 0.0 && raw_dur < 1.0e12 {
                 raw_dur
             } else {
                 0.0
@@ -3837,32 +3862,30 @@ impl NinjaDatabase {
                         (COALESCE(r.motion, 0) = 0 AND r.end_time < ?2)
                         OR r.end_time < ?6
                       )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM event e
+                        WHERE e.camera = r.camera
+                          AND e.start_time >= (r.start_time - ?5 - 86400.0)
+                          AND e.start_time <= (r.end_time + ?4)
+                          AND COALESCE(e.end_time, e.start_time + 15.0) >= (r.start_time - ?5)
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM reviewsegment rv
+                        WHERE rv.camera = r.camera
+                          AND rv.start_time >= (r.start_time - ?5 - 86400.0)
+                          AND rv.start_time <= (r.end_time + ?4)
+                          AND COALESCE(rv.end_time, rv.start_time + 15.0) >= (r.start_time - ?5)
+                      )
                       AND (
                         (?4 <= 0.0 AND ?5 <= 0.0)
-                        OR (
-                          NOT EXISTS (
-                            SELECT 1 FROM event e
-                            WHERE e.camera = r.camera
-                              AND e.start_time >= (r.start_time - ?5 - 86400.0)
-                              AND e.start_time <= (r.end_time + ?4)
-                              AND COALESCE(e.end_time, e.start_time + 15.0) >= (r.start_time - ?5)
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1 FROM reviewsegment rv
-                            WHERE rv.camera = r.camera
-                              AND rv.start_time >= (r.start_time - ?5 - 86400.0)
-                              AND rv.start_time <= (r.end_time + ?4)
-                              AND COALESCE(rv.end_time, rv.start_time + 15.0) >= (r.start_time - ?5)
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1 FROM recordings r2
-                            WHERE r2.camera = r.camera
-                              AND r2.start_time >= (r.start_time - ?5 - 300.0)
-                              AND r2.start_time <= (r.end_time + ?4)
-                              AND r2.end_time >= (r.start_time - ?5)
-                              AND COALESCE(r2.objects, 0) > 0
-                              AND r2.id != r.id
-                          )
+                        OR NOT EXISTS (
+                          SELECT 1 FROM recordings r2
+                          WHERE r2.camera = r.camera
+                            AND r2.start_time >= (r.start_time - ?5 - 300.0)
+                            AND r2.start_time <= (r.end_time + ?4)
+                            AND r2.end_time >= (r.start_time - ?5)
+                            AND COALESCE(r2.objects, 0) > 0
+                            AND r2.id != r.id
                         )
                       )
                     )
@@ -4160,7 +4183,7 @@ impl NinjaDatabase {
             })?;
             for r in rows {
                 let (id, path, sz) = r?;
-                let safe_sz = if sz.is_finite() && sz > 0.0 {
+                let safe_sz = if sz.is_finite() && sz > 0.0 && sz < 1.0e12 {
                     sz
                 } else {
                     0.001
@@ -4227,7 +4250,7 @@ impl NinjaDatabase {
             })?;
             for r in rows {
                 let (id, path, sz) = r?;
-                let safe_sz = if sz.is_finite() && sz > 0.0 {
+                let safe_sz = if sz.is_finite() && sz > 0.0 && sz < 1.0e12 {
                     sz
                 } else {
                     0.001
@@ -4322,12 +4345,17 @@ impl NinjaDatabase {
     ) -> Result<()> {
         let conn = self.lock_conn();
         let data_str = serde_json::to_string(data)?;
+        let safe_ts = if timestamp.is_finite() {
+            timestamp
+        } else {
+            0.0
+        };
         conn.execute(
             r#"
             INSERT INTO timeline (timestamp, camera, source, source_id, class_type, data)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
-            params![timestamp, camera, source, source_id, class_type, data_str],
+            params![safe_ts, camera, source, source_id, class_type, data_str],
         )?;
         Ok(())
     }
@@ -4537,7 +4565,9 @@ impl NinjaDatabase {
             r#"
             UPDATE share_link
             SET last_accessed_at = CASE
-                WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
+                WHEN typeof(last_accessed_at) NOT IN ('real', 'integer')
+                  OR last_accessed_at >= 1.0e300
+                  OR last_accessed_at < ?2 THEN ?2
                 ELSE last_accessed_at
             END
             WHERE id = ?1
@@ -4573,9 +4603,17 @@ impl NinjaDatabase {
             r#"
             SELECT DISTINCT target_id
             FROM share_link
-            WHERE expires_at <= ?1
+            WHERE typeof(revoked) != 'integer'
                OR revoked != 0
-               OR (max_views IS NOT NULL AND access_count >= max_views)
+               OR typeof(expires_at) NOT IN ('real', 'integer')
+               OR expires_at >= 1.0e300
+               OR expires_at <= ?1
+               OR typeof(access_count) != 'integer'
+               OR access_count < 0
+               OR (
+                 max_views IS NOT NULL
+                 AND (typeof(max_views) != 'integer' OR max_views <= 0 OR access_count >= max_views)
+               )
             LIMIT 5000
             "#,
         )?;
@@ -4664,11 +4702,12 @@ impl NinjaDatabase {
 
     pub fn revoke_share_links_by_creator(&self, created_by: &str) -> Result<usize> {
         let trimmed = created_by.trim();
-        let ext_creator = format!("ext:{trimmed}");
+        let base = trimmed.strip_prefix("ext:").unwrap_or(trimmed).trim();
+        let ext_creator = format!("ext:{base}");
         let conn = self.lock_conn();
         let updated = conn.execute(
             "UPDATE share_link SET revoked = 1 WHERE created_by = ?1 OR created_by = ?2",
-            params![trimmed, ext_creator],
+            params![base, ext_creator],
         )?;
         Ok(updated)
     }
@@ -4690,25 +4729,23 @@ impl NinjaDatabase {
             return Ok(false);
         }
         let conn = self.lock_conn();
-        let row: Option<(i64, Option<f64>)> = conn
-            .query_row(
-                "SELECT revoked, expires_at FROM share_link WHERE id = ?1",
-                params![id],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0).unwrap_or(1),
-                        value_to_f64(&r.get_ref(1)?),
-                    ))
-                },
-            )
-            .optional()?;
-        Ok(row.is_some_and(|(revoked, expires_at)| {
-            revoked == 0 && expires_at.is_some_and(|exp| exp > now_ts)
-        }))
+        let count: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM share_link
+            WHERE id = ?1
+              AND typeof(revoked) = 'integer' AND revoked = 0
+              AND typeof(expires_at) IN ('real', 'integer') AND expires_at < 1.0e300 AND expires_at > ?2
+            "#,
+            params![id, now_ts],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn insert_export(&self, exp: &ExportRow) -> Result<()> {
         let conn = self.lock_conn();
+        let safe_date = if exp.date.is_finite() { exp.date } else { 0.0 };
         conn.execute(
             r#"
             INSERT INTO export (id, camera, name, date, video_path, thumb_path, in_progress)
@@ -4722,7 +4759,7 @@ impl NinjaDatabase {
                 exp.id,
                 exp.camera,
                 exp.name,
-                exp.date,
+                safe_date,
                 exp.video_path,
                 exp.thumb_path,
                 if exp.in_progress { 1 } else { 0 }
@@ -4922,6 +4959,21 @@ impl NinjaDatabase {
         duration: f64,
     ) -> Result<()> {
         let conn = self.lock_conn();
+        let safe_start = if start_time.is_finite() {
+            start_time
+        } else {
+            0.0
+        };
+        let safe_end = if end_time.is_finite() {
+            end_time
+        } else {
+            safe_start
+        };
+        let safe_dur = if duration.is_finite() && duration >= 0.0 {
+            duration
+        } else {
+            0.0
+        };
         conn.execute(
             r#"
             INSERT INTO previews (id, camera, path, start_time, end_time, duration)
@@ -4932,7 +4984,7 @@ impl NinjaDatabase {
                 end_time = excluded.end_time,
                 duration = excluded.duration
             "#,
-            params![id, camera, path, start_time, end_time, duration],
+            params![id, camera, path, safe_start, safe_end, safe_dur],
         )?;
         Ok(())
     }
@@ -9884,6 +9936,344 @@ mod tests {
         let loaded = db.get_dataset_sample("ds_nan_box").unwrap().unwrap();
         assert_eq!(loaded.annotations.len(), 1);
         assert_eq!(loaded.annotations[0].score, 1.0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cycle3_p0_01_compute_norm_box_iou_across_all_quadrants_aspect_ratios_and_mixed_formats() {
+        // 1. Disjoint [x1, y1, x2, y2] boxes in upper-right quadrant (aw < a[0] && bw < b[0], ah >= a[1])
+        assert_eq!(
+            compute_norm_box_iou([0.40, 0.05, 0.45, 0.25], [0.45, 0.05, 0.50, 0.25]),
+            0.0
+        );
+        // Upper-right disjoint with different widths (bw < aw * 0.9)
+        assert_eq!(
+            compute_norm_box_iou([0.40, 0.10, 0.45, 0.30], [0.45, 0.10, 0.49, 0.30]),
+            0.0
+        );
+
+        // 2. Disjoint [x1, y1, x2, y2] boxes in lower-left quadrant (ah < a[1] && bh < b[1], aw >= a[0])
+        assert_eq!(
+            compute_norm_box_iou([0.05, 0.40, 0.25, 0.45], [0.05, 0.45, 0.25, 0.50]),
+            0.0
+        );
+        // Lower-left disjoint with different heights (bh < ah * 0.9)
+        assert_eq!(
+            compute_norm_box_iou([0.10, 0.40, 0.30, 0.45], [0.10, 0.45, 0.30, 0.49]),
+            0.0
+        );
+
+        // 3. Tall standing-person and wide vehicle disjoint [x1, y1, x2, y2] boxes
+        assert_eq!(
+            compute_norm_box_iou([0.35, 0.10, 0.45, 0.45], [0.45, 0.10, 0.55, 0.45]),
+            0.0
+        );
+        assert_eq!(
+            compute_norm_box_iou([0.10, 0.35, 0.45, 0.45], [0.10, 0.45, 0.45, 0.55]),
+            0.0
+        );
+
+        // 4. Mixed [x1, y1, x2, y2] signature and [x, y, w, h] live detection in bottom-right quadrant
+        let mixed_iou_1 = compute_norm_box_iou([0.75, 0.75, 0.85, 0.85], [0.75, 0.75, 0.10, 0.10]);
+        assert!((mixed_iou_1 - 1.0).abs() < 1e-6);
+        let mixed_iou_2 = compute_norm_box_iou([0.75, 0.75, 0.10, 0.10], [0.75, 0.75, 0.85, 0.85]);
+        assert!((mixed_iou_2 - 1.0).abs() < 1e-6);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_cycle3_p0_01_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+        db.upsert_event(&EventDto {
+            id: "ev_fp_upper_right".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 1000.0,
+            end_time: Some(1005.0),
+            has_clip: false,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.85),
+            false_positive: Some(false),
+            box_coords: Some(json!([0.40, 0.05, 0.45, 0.25])),
+            data: json!({"box": [0.40, 0.05, 0.45, 0.25]}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.85),
+            stationary: true,
+        })
+        .unwrap();
+        assert_eq!(
+            db.set_event_false_positive("ev_fp_upper_right", true)
+                .unwrap(),
+            1
+        );
+        // Adjacent disjoint person in upper-right quadrant must NOT be suppressed
+        assert!(
+            db.match_false_positive_signature(
+                "front_door",
+                "person",
+                [0.45, 0.05, 0.50, 0.25],
+                None
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cycle3_p0_02_zero_pre_post_capture_retention_still_protects_active_events_and_reviews() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_cycle3_p0_02_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // Recording segments with objects = 0:
+        // - seg_idle_old [800, 810]: no overlapping event/review -> should be pruned at continuous_before_ts (2000.0)
+        // - seg_ev_zero_win [1000, 1010]: overlaps active event (event_before_ts = 500.0) -> must be preserved even when pre=0, post=0
+        // - seg_rv_zero_win [1100, 1110]: overlaps active reviewsegment -> must be preserved even when pre=0, post=0
+        for (id, start, end) in [
+            ("seg_idle_old", 800.0, 810.0),
+            ("seg_ev_zero_win", 1000.0, 1010.0),
+            ("seg_rv_zero_win", 1100.0, 1110.0),
+        ] {
+            db.insert_recording(&RecordingRow {
+                id: id.to_string(),
+                camera: "front_door".to_string(),
+                path: format!("/media/ninjanvr/recordings/front_door/{id}.mp4"),
+                start_time: start,
+                end_time: end,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 2.0,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        }
+
+        db.upsert_event(&EventDto {
+            id: "ev_active_1000".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 1002.0,
+            end_time: Some(1008.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.9),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.9),
+            stationary: false,
+        })
+        .unwrap();
+
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rv_active_1100".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 1101.0,
+            end_time: Some(1109.0),
+            severity: "alert".to_string(),
+            thumb_path: "/clips/rv_active_1100.webp".to_string(),
+            data: json!({}),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+        let pruned = db
+            .delete_expired_recordings("front_door", 2000.0, 500.0)
+            .unwrap();
+        assert_eq!(
+            pruned,
+            vec!["/media/ninjanvr/recordings/front_door/seg_idle_old.mp4"]
+        );
+        let remaining = db.query_recordings("front_door", 700.0, 1200.0).unwrap();
+        assert_eq!(remaining.len(), 2);
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cycle3_p1_01_share_link_type_affinity_consistency_and_ext_creator_revocation() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_cycle3_p1_01_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        db.insert_share_link_with_options(
+            "sl_type_1",
+            "event",
+            "ev_type_target",
+            Some("front_door"),
+            "alice",
+            1000.0,
+            5000.0,
+            Some(3),
+        )
+        .unwrap();
+        db.insert_share_link_with_options(
+            "sl_type_ext",
+            "event",
+            "ev_type_target_2",
+            Some("front_door"),
+            "ext:alice",
+            1000.0,
+            5000.0,
+            Some(3),
+        )
+        .unwrap();
+
+        // 1. Corrupt expires_at to ISO-8601 TEXT '2099-01-01T00:00:00Z' -> is_share_link_active must fail closed
+        //    and list_expired_or_revoked_share_link_targets must include the corrupted link's target
+        db.execute_batch(
+            "UPDATE share_link SET expires_at = '2099-01-01T00:00:00Z', last_accessed_at = 'corrupted' WHERE id = 'sl_type_1';",
+        )
+        .unwrap();
+        assert!(!db.is_share_link_active("sl_type_1", 2000.0).unwrap());
+        let bad_targets = db
+            .list_expired_or_revoked_share_link_targets(2000.0)
+            .unwrap();
+        assert!(bad_targets.contains(&"ev_type_target".to_string()));
+
+        // Repair expires_at and verify touch_share_link_last_accessed overwrites corrupted last_accessed_at
+        db.execute_batch("UPDATE share_link SET expires_at = 5000.0 WHERE id = 'sl_type_1';")
+            .unwrap();
+        assert!(
+            db.touch_share_link_last_accessed("sl_type_1", 2100.0)
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_share_link("sl_type_1").unwrap().unwrap()["last_accessed_at"],
+            2100.0
+        );
+
+        // 2. revoke_share_links_by_creator("ext:alice") revokes both "alice" and "ext:alice"
+        assert_eq!(
+            db.revoke_share_links_by_creator("  ext:alice  ").unwrap(),
+            2
+        );
+        assert!(db.is_share_link_revoked("sl_type_1").unwrap());
+        assert!(db.is_share_link_revoked("sl_type_ext").unwrap());
+
+        drop(db);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn cycle3_p1_02_non_finite_timestamps_in_reviews_timeline_exports_previews_and_huge_quota_rows()
+    {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_cycle3_p1_02_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // 1. insert_review_segment, insert_timeline_entry, insert_export, insert_preview sanitize NaN/Inf
+        db.insert_review_segment(&ReviewItemDto {
+            id: "rev_nan_1".to_string(),
+            camera: "front_door".to_string(),
+            start_time: f64::NAN,
+            end_time: Some(f64::INFINITY),
+            severity: "alert".to_string(),
+            thumb_path: "/clips/rev_nan_1.webp".to_string(),
+            data: json!({}),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+        let rev = db.get_review_by_id("rev_nan_1").unwrap().unwrap();
+        assert_eq!(rev.start_time, 0.0);
+        assert!(rev.end_time.is_none());
+
+        db.insert_timeline_entry(f64::NAN, "front_door", "motion", None, "active", &json!({}))
+            .unwrap();
+        let tl = db.query_timeline(Some("front_door"), None, 10).unwrap();
+        assert_eq!(tl.len(), 1);
+        assert_eq!(tl[0]["timestamp"], 0.0);
+
+        db.insert_export(&ExportRow {
+            id: "exp_nan_1".to_string(),
+            camera: "front_door".to_string(),
+            name: "NaN Export".to_string(),
+            date: f64::NAN,
+            video_path: "/media/ninjanvr/exports/exp_nan_1.mp4".to_string(),
+            thumb_path: "/media/ninjanvr/clips/exp_nan_1.webp".to_string(),
+            in_progress: false,
+        })
+        .unwrap();
+        let exp = db.get_export("exp_nan_1").unwrap().unwrap();
+        assert_eq!(exp["date"], 0.0);
+
+        db.insert_preview(
+            "prev_nan_1",
+            "front_door",
+            "/media/ninjanvr/previews/front_door/p_nan.mp4",
+            f64::NAN,
+            f64::INFINITY,
+            f64::NAN,
+        )
+        .unwrap();
+        let prevs = db.query_previews("front_door", -1.0, 10.0).unwrap();
+        assert_eq!(prevs.len(), 1);
+        assert_eq!(prevs[0]["start"], 0.0);
+        assert_eq!(prevs[0]["end"], 0.0);
+        assert_eq!(prevs[0]["duration"], 0.0);
+
+        // 2. Corrupted huge finite segment_size (>= 1.0e12) does not short-circuit quota eviction
+        db.execute_batch(
+            "INSERT INTO recordings (id, camera, path, start_time, end_time, duration, segment_size)
+             VALUES ('rec_huge_corrupt', 'front_door', '/media/ninjanvr/recordings/front_door/rec_huge.mp4', 500.0, 510.0, 10.0, 2.0e12);",
+        )
+        .unwrap();
+        for i in 0..3 {
+            db.insert_recording(&RecordingRow {
+                id: format!("rec_real_{i}"),
+                camera: "front_door".to_string(),
+                path: format!("/media/ninjanvr/recordings/front_door/rec_real_{i}.mp4"),
+                start_time: 1000.0 + (i as f64) * 10.0,
+                end_time: 1010.0 + (i as f64) * 10.0,
+                duration: 10.0,
+                motion: 0,
+                objects: 0,
+                dbfs: 0,
+                segment_size: 100.0,
+                regions: 0,
+                motion_heatmap: None,
+            })
+            .unwrap();
+        }
+        let evicted = db
+            .delete_recordings_over_quota_mb("front_door", 150.0)
+            .unwrap();
+        assert_eq!(
+            evicted,
+            vec![
+                "/media/ninjanvr/recordings/front_door/rec_huge.mp4",
+                "/media/ninjanvr/recordings/front_door/rec_real_0.mp4",
+                "/media/ninjanvr/recordings/front_door/rec_real_1.mp4",
+            ]
+        );
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);
