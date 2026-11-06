@@ -19,7 +19,9 @@ import {
   resizeWallToLengthMeters,
   resolveSafeAlertThumbSrc,
   rotateWallToAngleDegrees,
+  sanitizeFloorplanRoom,
   sanitizeFloorplanUrl,
+  sanitizeFloorplanWall,
   sanitizeMapPlacement,
   sanitizeTimeShiftSeek,
   snapFloorplanCoord,
@@ -811,5 +813,200 @@ describe("Phase 4B ZonesWorkspace — Pixel-to-Normalized Clamping & Degenerate 
     expect(
       fullSanitized.cleaned.cameras.front_door.objects?.filters?.person.mask
     ).toEqual(["0.000,0.000,0.500,0.000,0.500,0.500,0.000,0.500"]);
+  });
+
+  test("Cycle 3: sanitizeFloorplanRoom & sanitizeFloorplanWall preserve width/height when x/y is NaN or negative, sanitize CSS colors/wall kinds, and preserve wall angle on boundary clamping", () => {
+    // 1. Negative or NaN x/y on a room preserves its width/height instead of collapsing w/h via r.x + r.w
+    const negXRoom = sanitizeFloorplanRoom(
+      {
+        id: "r_neg",
+        label: "GARAGEM",
+        x: -0.2,
+        y: 0.1,
+        w: 0.5,
+        h: 0.4,
+        color: "#10b981",
+      },
+      0
+    );
+    expect(negXRoom.x).toBe(0);
+    expect(negXRoom.w).toBe(0.5);
+    expect(negXRoom.h).toBe(0.4);
+    expect(negXRoom.color).toBe("#10b981");
+
+    const nanXRoom = sanitizeFloorplanRoom(
+      {
+        id: "",
+        label: "   ",
+        x: Number.NaN,
+        y: Number.NaN,
+        w: 0.45,
+        h: 0.35,
+        color: "url(javascript:alert(1))",
+      },
+      2
+    );
+    expect(nanXRoom.id).toBe("room_3");
+    expect(nanXRoom.label).toBe("ROOM");
+    expect(nanXRoom.x).toBe(0);
+    expect(nanXRoom.y).toBe(0);
+    expect(nanXRoom.w).toBe(0.45);
+    expect(nanXRoom.h).toBe(0.35);
+    expect(nanXRoom.color).toBeNull();
+
+    // 2. Malformed wall missing points array or with invalid kind is safely normalized
+    const badWall = sanitizeFloorplanWall({
+      points: undefined as unknown as [number, number, number, number],
+      kind: "<script>",
+    });
+    expect(badWall.points).toEqual([0.2, 0.2, 0.4, 0.2]);
+    expect(badWall.kind).toBe("wall");
+
+    // 3. Directional box bound on resizeWallToLengthMeters & rotateWallToAngleDegrees preserves angle
+    const horizontalOversize = resizeWallToLengthMeters(
+      [0.2, 0.5, 0.4, 0.5],
+      23, // > 20m width, < 23.32m diagonal
+      20,
+      12
+    );
+    expect(horizontalOversize).toEqual([0, 0.5, 1, 0.5]);
+
+    const verticalRotated = rotateWallToAngleDegrees(
+      [0.1, 0.2, 0.9, 0.2], // 16m horizontal wall rotated to 90 deg on a 20m x 12m floorplan
+      90,
+      20,
+      12
+    );
+    expect(verticalRotated).toEqual([0.1, 0, 0.1, 1]);
+
+    // 4. computeFovConeTipSvgPoint caps extreme radius to 1000 matching buildFovConeSvgPath
+    expect(computeFovConeTipSvgPoint(500, 300, 0, 999999)).toEqual({
+      x: 1500,
+      y: 300,
+    });
+  });
+
+  test("Cycle 3: URL & SVG sanitizers block SMIL <set>/<animate>, XXE <!ENTITY, obfuscated javascript:, credentialed URLs, and encoded // or double-encoded traversal", () => {
+    // SVG SMIL <set> / <animate> / <style> / <!ENTITY> payloads blocked
+    const smilSvgB64 = globalThis.btoa(
+      '<svg xmlns="http://www.w3.org/2000/svg"><a id="a"><rect width="10" height="10"/></a><set href="#a" attributeName="href" to="https://evil.example"/></svg>'
+    );
+    expect(sanitizeFloorplanUrl(`data:image/svg+xml;base64,${smilSvgB64}`)).toBe("");
+
+    const xxeSvgB64 = globalThis.btoa(
+      '<!DOCTYPE svg [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><svg xmlns="http://www.w3.org/2000/svg"><text>&xxe;</text></svg>'
+    );
+    expect(sanitizeFloorplanUrl(`data:image/svg+xml;base64,${xxeSvgB64}`)).toBe("");
+
+    const obfuscatedJsSvgB64 = globalThis.btoa(
+      '<svg xmlns="http://www.w3.org/2000/svg"><a href="java\tscript:alert(1)"><rect width="10" height="10"/></a></svg>'
+    );
+    expect(
+      sanitizeFloorplanUrl(`data:image/svg+xml;base64,${obfuscatedJsSvgB64}`)
+    ).toBe("");
+
+    // Credentialed or quote-injected HTTP(S) URLs blocked
+    expect(sanitizeFloorplanUrl("https://user:pass@example.com/map.png")).toBe("");
+    expect(sanitizeFloorplanUrl('https://example.com/map.png" onload="alert(1)')).toBe("");
+
+    // Encoded protocol-relative /%2fevil.example and double-encoded traversal blocked
+    expect(sanitizeFloorplanUrl("/%2fevil.example/map.png")).toBe("");
+    expect(sanitizeFloorplanUrl("/assets/%252e%252e/secret")).toBe("");
+    expect(resolveSafeAlertThumbSrc("/%2fevil.example/x.webp", "cam_1")).toBe(
+      "/api/cam_1/latest.webp"
+    );
+    expect(resolveSafeAlertThumbSrc("/clips/%252e%252e/secret.webp", "cam_1")).toBe(
+      "/api/cam_1/latest.webp"
+    );
+    expect(resolveSafeSyncThumbSrc("/%2fevil.example/x.webp", "cam_1")).toBe(
+      "/api/cam_1/latest.webp"
+    );
+    expect(resolveSafeSyncThumbSrc("/clips/%252e%252e/secret.webp", "cam_1")).toBe(
+      "/api/cam_1/latest.webp"
+    );
+  });
+
+  test("Cycle 3: SyncWorkspace caps oversized VOD windows to 3600s, deduplicates cameras, and handles inverted review end_time", () => {
+    const now = 1700010000;
+    const hugeWin = computeSyncVodWindow(now - 10000, 999999, now);
+    expect(hugeWin.startTime).toBe(now - 10000);
+    expect(hugeWin.endTime).toBe(now - 10000 + 3600);
+
+    const dupCams = ["cam_1", "cam_1", "cam_2", "cam_3"];
+    const invertedReviews: ReviewItem[] = [
+      {
+        id: "rev_inverted",
+        camera: "cam_3",
+        start_time: 1700000000,
+        end_time: 1699990000, // inverted end_time < start_time
+        severity: "alert",
+        thumb_path: "",
+        has_been_reviewed: false,
+        data: { objects: ["person"] },
+      },
+    ];
+    const picked = autoPickActiveCamerasAtTimestamp(
+      dupCams,
+      invertedReviews,
+      1700000000,
+      60
+    );
+    expect(picked).toEqual(["cam_3", "cam_1", "cam_2"]);
+  });
+
+  test("Cycle 3: ZonesWorkspace rejects pinched figure-8 polygons, T-junctions, and 180-degree folded spikes, and counts non-polygon mask entries", () => {
+    // 1. Pinched figure-8 polygon sharing non-adjacent vertex [0.5, 0.5]
+    const figureEight: Array<[number, number]> = [
+      [0.1, 0.1],
+      [0.5, 0.1],
+      [0.5, 0.5],
+      [0.9, 0.5],
+      [0.9, 0.9],
+      [0.5, 0.5],
+      [0.1, 0.5],
+    ];
+    expect(hasSelfIntersectingEdges(figureEight)).toBe(true);
+    expect(isNonDegeneratePolygon(figureEight)).toBe(false);
+    expect(
+      sanitizePolygonCoordString(
+        "0.1,0.1,0.5,0.1,0.5,0.5,0.9,0.5,0.9,0.9,0.5,0.5,0.1,0.5"
+      )
+    ).toBeNull();
+
+    // 2. T-junction where a vertex touches the interior of a non-adjacent edge
+    const tJunction: Array<[number, number]> = [
+      [0.1, 0.1],
+      [0.9, 0.1],
+      [0.9, 0.9],
+      [0.5, 0.1], // touches top edge [0.1,0.1]->[0.9,0.1]
+      [0.1, 0.9],
+    ];
+    expect(hasSelfIntersectingEdges(tJunction)).toBe(true);
+    expect(isNonDegeneratePolygon(tJunction)).toBe(false);
+
+    // 3. 180-degree folded-back collinear spike attached to a valid triangle
+    const foldedSpike: Array<[number, number]> = [
+      [0.1, 0.1],
+      [0.6, 0.1],
+      [0.9, 0.1], // extends along y=0.1
+      [0.6, 0.1], // folds 180 deg back to [0.6, 0.1]
+      [0.1, 0.6],
+    ];
+    expect(hasSelfIntersectingEdges(foldedSpike)).toBe(true);
+    expect(isNonDegeneratePolygon(foldedSpike)).toBe(false);
+
+    // 4. Non-polygon primitive items in mask array increment rejectedCount
+    expect(
+      sanitizeMaskPolygonsValue([
+        null,
+        123,
+        true,
+        {},
+        "0.1,0.1,0.6,0.1,0.6,0.6",
+      ])
+    ).toEqual({
+      sanitized: ["0.100,0.100,0.600,0.100,0.600,0.600"],
+      rejectedCount: 4,
+    });
   });
 });

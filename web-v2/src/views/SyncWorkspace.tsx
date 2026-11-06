@@ -32,7 +32,7 @@ export function computeSyncVodWindow(
 ): { startTime: number; endTime: number } {
   const startTime = clampSyncTimestamp(masterTs, nowSec);
   const safeDur = Number.isFinite(windowSec)
-    ? Math.max(12, Math.floor(windowSec))
+    ? Math.max(12, Math.min(3600, Math.floor(windowSec)))
     : 120;
   const safeNow =
     Number.isFinite(nowSec) && nowSec > 60
@@ -60,9 +60,24 @@ export function resolveSafeSyncThumbSrc(
     !stripped ||
     !stripped.startsWith("/") ||
     stripped.startsWith("//") ||
+    /^\/%2f/i.test(stripped) ||
     stripped.includes("..") ||
-    /%2e%2e|%5c/i.test(stripped)
+    /%2e%2e|%5c|%252e|%255c|%00/i.test(stripped)
   ) {
+    return fallback;
+  }
+  try {
+    const decoded = decodeURIComponent(stripped);
+    if (
+      !decoded.startsWith("/") ||
+      decoded.startsWith("//") ||
+      decoded.includes("\\") ||
+      decoded.includes("..") ||
+      /[\u0000-\u001F\u007F]/.test(decoded)
+    ) {
+      return fallback;
+    }
+  } catch {
     return fallback;
   }
   return stripped;
@@ -119,22 +134,30 @@ export function autoPickActiveCamerasAtTimestamp(
   timestampSec: number,
   windowSec: number = 60
 ): string[] {
+  const uniqueCams: string[] = [];
+  for (const cam of Array.isArray(cameraNames) ? cameraNames : []) {
+    if (typeof cam === "string" && cam && !uniqueCams.includes(cam)) {
+      uniqueCams.push(cam);
+    }
+  }
   if (!Number.isFinite(timestampSec)) {
-    return cameraNames.slice(0, MAX_SYNC_QUAD_SLOTS);
+    return uniqueCams.slice(0, MAX_SYNC_QUAD_SLOTS);
   }
   const safeWindow = Number.isFinite(windowSec) ? Math.max(1, windowSec) : 60;
   const scores = new Map<string, number>();
-  for (const cam of cameraNames) {
+  for (const cam of uniqueCams) {
     scores.set(cam, 0);
   }
-  for (const rev of reviews) {
-    if (!scores.has(rev.camera) || !Number.isFinite(rev.start_time)) continue;
+  for (const rev of Array.isArray(reviews) ? reviews : []) {
+    if (!rev || !scores.has(rev.camera) || !Number.isFinite(rev.start_time)) {
+      continue;
+    }
     const revStart = rev.start_time;
     const revEnd =
       rev.end_time !== undefined &&
       rev.end_time !== null &&
       Number.isFinite(rev.end_time)
-        ? rev.end_time
+        ? Math.max(revStart, rev.end_time)
         : revStart + 15;
     if (
       revStart <= timestampSec + safeWindow &&
@@ -154,9 +177,9 @@ export function autoPickActiveCamerasAtTimestamp(
   }
 
   const indexMap = new Map<string, number>();
-  cameraNames.forEach((cam, idx) => indexMap.set(cam, idx));
+  uniqueCams.forEach((cam, idx) => indexMap.set(cam, idx));
 
-  const sorted = [...cameraNames].sort((a, b) => {
+  const sorted = [...uniqueCams].sort((a, b) => {
     const scoreDiff = (scores.get(b) || 0) - (scores.get(a) || 0);
     if (scoreDiff !== 0) return scoreDiff;
     return (indexMap.get(a) ?? 0) - (indexMap.get(b) ?? 0);

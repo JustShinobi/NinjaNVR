@@ -118,6 +118,19 @@ export function computePolygonSignedArea(
   return sum / 2;
 }
 
+function pointOnSegment(
+  p: [number, number],
+  q: [number, number],
+  r: [number, number]
+): boolean {
+  return (
+    r[0] >= Math.min(p[0], q[0]) - 1e-9 &&
+    r[0] <= Math.max(p[0], q[0]) + 1e-9 &&
+    r[1] >= Math.min(p[1], q[1]) - 1e-9 &&
+    r[1] <= Math.max(p[1], q[1]) + 1e-9
+  );
+}
+
 function segmentsProperlyIntersect(
   a: [number, number],
   b: [number, number],
@@ -133,18 +146,43 @@ function segmentsProperlyIntersect(
   const o2 = cross(a, b, d);
   const o3 = cross(c, d, a);
   const o4 = cross(c, d, b);
-  return o1 * o2 < -1e-9 && o3 * o4 < -1e-9;
+  if (o1 * o2 < -1e-9 && o3 * o4 < -1e-9) {
+    return true;
+  }
+  if (Math.abs(o1) <= 1e-9 && pointOnSegment(a, b, c)) return true;
+  if (Math.abs(o2) <= 1e-9 && pointOnSegment(a, b, d)) return true;
+  if (Math.abs(o3) <= 1e-9 && pointOnSegment(c, d, a)) return true;
+  if (Math.abs(o4) <= 1e-9 && pointOnSegment(c, d, b)) return true;
+  return false;
 }
 
 export function hasSelfIntersectingEdges(
   points: Array<[number, number]>
 ): boolean {
-  if (!Array.isArray(points) || points.length < 4) return false;
+  if (!Array.isArray(points) || points.length < 3) return false;
   const n = points.length;
   for (let i = 0; i < n; i++) {
     const a = points[i];
     const b = points[(i + 1) % n];
+    const cAdj = points[(i + 2) % n];
+    const ux = b[0] - a[0];
+    const uy = b[1] - a[1];
+    const vx = cAdj[0] - b[0];
+    const vy = cAdj[1] - b[1];
+    const uLen = Math.hypot(ux, uy);
+    const vLen = Math.hypot(vx, vy);
+    if (uLen > 1e-7 && vLen > 1e-7) {
+      const adjCross = (ux * vy - uy * vx) / (uLen * vLen);
+      const adjDot = (ux * vx + uy * vy) / (uLen * vLen);
+      if (Math.abs(adjCross) <= 1e-6 && adjDot < -1e-6) {
+        return true;
+      }
+    }
+    if (n < 4) continue;
     for (let j = i + 2; j < n; j++) {
+      if (Math.hypot(a[0] - points[j][0], a[1] - points[j][1]) <= 1e-4) {
+        return true;
+      }
       if (i === 0 && j === n - 1) continue;
       const c = points[j];
       const d = points[(j + 1) % n];
@@ -229,6 +267,9 @@ export function sanitizeMaskPolygonsValue(
   detectWidth: number = 1280,
   detectHeight: number = 720
 ): { sanitized: unknown; rejectedCount: number } {
+  const isUnsafeObjectKey = (k: string) =>
+    k === "__proto__" || k === "constructor" || k === "prototype";
+
   if (maskVal === null || maskVal === undefined) {
     return { sanitized: maskVal, rejectedCount: 0 };
   }
@@ -297,6 +338,8 @@ export function sanitizeMaskPolygonsValue(
         } else {
           rejectedCount += 1;
         }
+      } else {
+        rejectedCount += 1;
       }
     }
     return { sanitized: out, rejectedCount };
@@ -307,6 +350,7 @@ export function sanitizeMaskPolygonsValue(
     let rejectedCount = 0;
     const metaKeys = new Set(["mode", "style", "pixelate", "block_size"]);
     for (const [k, v] of Object.entries(objVal)) {
+      if (isUnsafeObjectKey(k)) continue;
       if (metaKeys.has(k)) {
         nextObj[k] = v;
         continue;
@@ -438,6 +482,8 @@ export function sanitizeCameraGeometryDraft(camCfg: CameraConfig): {
   cleaned: CameraConfig;
   rejectedCount: number;
 } {
+  const isUnsafeKey = (k: string) =>
+    k === "__proto__" || k === "constructor" || k === "prototype";
   const detW = camCfg?.detect?.width || 1280;
   const detH = camCfg?.detect?.height || 720;
   let rejectedCount = 0;
@@ -446,6 +492,7 @@ export function sanitizeCameraGeometryDraft(camCfg: CameraConfig): {
   if (cleaned.zones && typeof cleaned.zones === "object") {
     const nextZones: Record<string, CameraConfig["zones"][string]> = {};
     for (const [zName, zCfg] of Object.entries(cleaned.zones)) {
+      if (isUnsafeKey(zName)) continue;
       const cleanCoords = sanitizePolygonCoordString(
         zCfg?.coordinates || "",
         detW,
@@ -476,6 +523,7 @@ export function sanitizeCameraGeometryDraft(camCfg: CameraConfig): {
     if (nextObjects.filters && typeof nextObjects.filters === "object") {
       const nextFilters: NonNullable<CameraConfig["objects"]>["filters"] = {};
       for (const [fLabel, fCfg] of Object.entries(nextObjects.filters)) {
+        if (isUnsafeKey(fLabel)) continue;
         if (fCfg && fCfg.mask !== undefined) {
           const fRes = sanitizeMaskPolygonsValue(fCfg.mask, detW, detH);
           rejectedCount += fRes.rejectedCount;
@@ -498,6 +546,7 @@ export function sanitizeCameraGeometryDraft(camCfg: CameraConfig): {
   if (cleaned.lines && typeof cleaned.lines === "object") {
     const nextLines: Record<string, LineConfig> = {};
     for (const [lName, lCfg] of Object.entries(cleaned.lines)) {
+      if (isUnsafeKey(lName)) continue;
       const cleanLine = sanitizeTripwireLine(lCfg, detW, detH);
       if (cleanLine) {
         nextLines[lName] = cleanLine;
@@ -511,6 +560,7 @@ export function sanitizeCameraGeometryDraft(camCfg: CameraConfig): {
   if (cleaned.state_rois && typeof cleaned.state_rois === "object") {
     const nextRois: Record<string, StateRoiConfig> = {};
     for (const [rName, rCfg] of Object.entries(cleaned.state_rois)) {
+      if (isUnsafeKey(rName)) continue;
       nextRois[rName] = sanitizeStateRoiConfig(rCfg, detW, detH);
     }
     cleaned.state_rois = nextRois;
@@ -522,6 +572,8 @@ export function sanitizeCameraGeometryDraft(camCfg: CameraConfig): {
 export function sanitizeConfigGeometryDraft(
   cfg: NinjaConfigResponse
 ): { cleaned: NinjaConfigResponse; rejectedCount: number } {
+  const isUnsafeKey = (k: string) =>
+    k === "__proto__" || k === "constructor" || k === "prototype";
   const cloned: NinjaConfigResponse = JSON.parse(JSON.stringify(cfg));
   let rejectedCount = 0;
   const globalW = cloned.detect?.width || 1280;
@@ -556,6 +608,7 @@ export function sanitizeConfigGeometryDraft(
         NinjaConfigResponse["objects"]
       >["filters"] = {};
       for (const [fLabel, fCfg] of Object.entries(nextGlobalObjects.filters)) {
+        if (isUnsafeKey(fLabel)) continue;
         if (fCfg && fCfg.mask !== undefined) {
           const gfRes = sanitizeMaskPolygonsValue(
             fCfg.mask,
@@ -575,6 +628,7 @@ export function sanitizeConfigGeometryDraft(
 
   if (cloned.cameras && typeof cloned.cameras === "object") {
     for (const [camName, camCfg] of Object.entries(cloned.cameras)) {
+      if (isUnsafeKey(camName)) continue;
       const res = sanitizeCameraGeometryDraft(camCfg);
       cloned.cameras[camName] = res.cleaned;
       rejectedCount += res.rejectedCount;
@@ -779,6 +833,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
           }
           if (restartAfter) {
             await fetch("/api/restart", { method: "POST", credentials: "include" });
+            if (!isMountedRef.current) return;
           }
           notify(
             restartAfter
@@ -798,23 +853,27 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
       const data = await res.json().catch(() => ({}));
       if (!isMountedRef.current) return;
       if (res.ok && data.success !== false) {
-        if (data.config) {
-          setConfig(data.config);
-          if (draftRevisionRef.current === saveRev) {
-            setDraftConfig(JSON.parse(JSON.stringify(data.config)));
-          }
-        }
-        if (typeof data.raw_yaml === "string") {
-          setBaselineYaml(data.raw_yaml);
-          if (draftRevisionRef.current === saveRev) {
-            setRawYaml(data.raw_yaml);
-          }
-        }
+        const nextSavedConfig: NinjaConfigResponse =
+          data.config || payloadConfig;
+        setConfig(JSON.parse(JSON.stringify(nextSavedConfig)));
         if (draftRevisionRef.current === saveRev) {
+          setDraftConfig(JSON.parse(JSON.stringify(nextSavedConfig)));
+        }
+        const nextSavedYaml =
+          typeof data.raw_yaml === "string" && data.raw_yaml.trim()
+            ? data.raw_yaml
+            : buildCleanYamlFromDraft(
+                nextSavedConfig,
+                baselineYaml || rawYaml
+              );
+        setBaselineYaml(nextSavedYaml);
+        if (draftRevisionRef.current === saveRev) {
+          setRawYaml(nextSavedYaml);
           setIsDirty(false);
         }
         if (restartAfter) {
           await fetch("/api/restart", { method: "POST", credentials: "include" });
+          if (!isMountedRef.current) return;
           notify(
             isPt
               ? "Configuração salva e pipeline reiniciado"

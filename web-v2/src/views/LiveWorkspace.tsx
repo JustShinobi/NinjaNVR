@@ -314,8 +314,8 @@ export function computeCameraAimFromTip(
   tipX: number,
   tipY: number
 ): { angle_deg: number; range: number } {
-  const sx = finiteOr(camX, 0.5);
-  const sy = finiteOr(camY, 0.5);
+  const sx = Math.max(0, Math.min(1, finiteOr(camX, 0.5)));
+  const sy = Math.max(0, Math.min(1, finiteOr(camY, 0.5)));
   const tx = finiteOr(tipX, sx + 0.25);
   const ty = finiteOr(tipY, sy);
   const dx = tx - sx;
@@ -338,7 +338,7 @@ export function computeFovConeTipSvgPoint(
   const safeCx = finiteOr(cx, 500);
   const safeCy = finiteOr(cy, 300);
   const safeAngle = finiteOr(angleDeg, 0);
-  const safeRadius = Math.max(0, finiteOr(radius, 100));
+  const safeRadius = Math.max(0, Math.min(1000, finiteOr(radius, 100)));
   const rad = (safeAngle * Math.PI) / 180;
   return {
     x: Number((safeCx + safeRadius * Math.cos(rad)).toFixed(1)),
@@ -521,11 +521,18 @@ export function resizeWallToLengthMeters(
   const safeH = Math.max(1, finiteOr(floorplanHeightM, DEFAULT_FLOORPLAN_HEIGHT_M));
   const maxPossibleM = Math.hypot(safeW, safeH);
   const safeTargetM = finiteOr(targetLengthM, 1.0);
-  const clampedLen = Math.max(0.1, Math.min(maxPossibleM, safeTargetM));
   const dxM = (x2 - x1) * safeW;
   const dyM = (y2 - y1) * safeH;
   const currentLen = Math.hypot(dxM, dyM);
   const angleRad = currentLen > 1e-4 ? Math.atan2(dyM, dxM) : 0;
+  const absCos = Math.abs(Math.cos(angleRad));
+  const absSin = Math.abs(Math.sin(angleRad));
+  const maxFitM = Math.min(
+    maxPossibleM,
+    absCos > 1e-6 ? safeW / absCos : maxPossibleM,
+    absSin > 1e-6 ? safeH / absSin : maxPossibleM
+  );
+  const clampedLen = Math.max(0.1, Math.min(maxFitM, safeTargetM));
   const nextDxNorm = (clampedLen * Math.cos(angleRad)) / safeW;
   const nextDyNorm = (clampedLen * Math.sin(angleRad)) / safeH;
   let nx1 = x1;
@@ -570,9 +577,18 @@ export function rotateWallToAngleDegrees(
   const y2 = Math.max(0, Math.min(1, finiteOr(points?.[3], 0.2)));
   const safeW = Math.max(1, finiteOr(floorplanWidthM, DEFAULT_FLOORPLAN_WIDTH_M));
   const safeH = Math.max(1, finiteOr(floorplanHeightM, DEFAULT_FLOORPLAN_HEIGHT_M));
-  const lenM = Math.max(0.2, Math.hypot((x2 - x1) * safeW, (y2 - y1) * safeH));
+  const maxPossibleM = Math.hypot(safeW, safeH);
+  const rawLenM = Math.max(0.2, Math.hypot((x2 - x1) * safeW, (y2 - y1) * safeH));
   const safeDeg = finiteOr(targetAngleDeg, 0);
   const rad = (safeDeg * Math.PI) / 180;
+  const absCos = Math.abs(Math.cos(rad));
+  const absSin = Math.abs(Math.sin(rad));
+  const maxFitM = Math.min(
+    maxPossibleM,
+    absCos > 1e-6 ? safeW / absCos : maxPossibleM,
+    absSin > 1e-6 ? safeH / absSin : maxPossibleM
+  );
+  const lenM = Math.min(maxFitM, rawLenM);
   let nx1 = x1;
   let ny1 = y1;
   let nx2 = x1 + (lenM * Math.cos(rad)) / safeW;
@@ -749,14 +765,42 @@ export function sanitizeFloorplanUrl(
     if (
       trimmed.includes("\\") ||
       trimmed.includes("..") ||
-      /%2e%2e|%5c/i.test(trimmed)
+      /^\/%2f/i.test(trimmed) ||
+      /%2e%2e|%5c|%252e|%255c|%00/i.test(trimmed)
     ) {
+      return "";
+    }
+    try {
+      const decoded = decodeURIComponent(trimmed);
+      if (
+        !decoded.startsWith("/") ||
+        decoded.startsWith("//") ||
+        decoded.includes("\\") ||
+        decoded.includes("..") ||
+        /[\u0000-\u001F\u007F]/.test(decoded)
+      ) {
+        return "";
+      }
+    } catch {
       return "";
     }
     return trimmed;
   }
   if (/^https?:\/\//i.test(trimmed)) {
-    return trimmed;
+    if (/[\s<>"'`\\]/.test(trimmed)) return "";
+    try {
+      const parsed = new URL(trimmed);
+      if (
+        (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+        parsed.username ||
+        parsed.password
+      ) {
+        return "";
+      }
+      return trimmed;
+    } catch {
+      return "";
+    }
   }
   if (/^data:image\/(png|jpeg|jpg|webp|gif);base64,[a-z0-9+/=\s]+$/i.test(trimmed)) {
     return trimmed;
@@ -766,7 +810,7 @@ export function sanitizeFloorplanUrl(
     try {
       const decoded = globalThis.atob(b64);
       if (
-        /<script|<iframe|<object|<embed|<use\b|<foreignobject|javascript:|vbscript:|data:\s*text\/html|\bon[a-z]+\s*=|&#/i.test(
+        /<script|<iframe|<object|<embed|<use\b|<foreignobject|<set\b|<animate|<handler\b|<listener\b|<link\b|<meta\b|<base\b|<style|@import|<!entity|<!doctype|j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:|v\s*b\s*s\s*c\s*r\s*i\s*p\s*t\s*:|data:\s*text\/html|(?:xlink:)?href\s*=\s*["']?\s*(?:javascript|vbscript|data)\s*:|\bon[a-z]+\s*=|&#/i.test(
           decoded
         )
       ) {
@@ -778,6 +822,69 @@ export function sanitizeFloorplanUrl(
     }
   }
   return "";
+}
+
+export function sanitizeFloorplanRoom(
+  room: Partial<FloorplanRoom> | null | undefined,
+  index: number = 0
+): FloorplanRoom {
+  const safeIdx = Number.isFinite(index) ? Math.max(0, Math.trunc(index)) : 0;
+  const rawW = finiteOr(room?.w ?? NaN, 0.2);
+  const rawH = finiteOr(room?.h ?? NaN, 0.2);
+  const w = Number(Math.max(0.01, Math.min(1, Math.abs(rawW) || 0.2)).toFixed(3));
+  const h = Number(Math.max(0.01, Math.min(1, Math.abs(rawH) || 0.2)).toFixed(3));
+  const rawX = finiteOr(room?.x ?? NaN, 0);
+  const rawY = finiteOr(room?.y ?? NaN, 0);
+  const x = Number(Math.max(0, Math.min(1 - w, rawX)).toFixed(3));
+  const y = Number(Math.max(0, Math.min(1 - h, rawY)).toFixed(3));
+  const id =
+    typeof room?.id === "string" && room.id.trim()
+      ? room.id.trim()
+      : `room_${safeIdx + 1}`;
+  const label =
+    typeof room?.label === "string" && room.label.trim()
+      ? room.label.trim()
+      : "ROOM";
+  const cleanColor =
+    typeof room?.color === "string" && /^#[0-9a-fA-F]{3,8}$/.test(room.color.trim())
+      ? room.color.trim()
+      : undefined;
+
+  const out: FloorplanRoom = {
+    ...(room as FloorplanRoom),
+    id,
+    label,
+    x,
+    y,
+    w,
+    h,
+  };
+  if (room?.color !== undefined) {
+    out.color = cleanColor ?? null;
+  }
+  return out;
+}
+
+export function sanitizeFloorplanWall(
+  wall: Partial<FloorplanWall> | null | undefined
+): FloorplanWall {
+  const p = Array.isArray(wall?.points) ? wall.points : [0.2, 0.2, 0.4, 0.2];
+  const x1 = Number(Math.max(0, Math.min(1, finiteOr(p[0], 0.2))).toFixed(3));
+  const y1 = Number(Math.max(0, Math.min(1, finiteOr(p[1], 0.2))).toFixed(3));
+  const x2 = Number(Math.max(0, Math.min(1, finiteOr(p[2], 0.4))).toFixed(3));
+  const y2 = Number(Math.max(0, Math.min(1, finiteOr(p[3], 0.2))).toFixed(3));
+  const validKinds = new Set(["wall", "door", "window"]);
+  const out: FloorplanWall = {
+    ...(wall as FloorplanWall),
+    points: [x1, y1, x2, y2],
+  };
+  if (wall?.kind !== undefined) {
+    out.kind =
+      typeof wall.kind === "string" && validKinds.has(wall.kind)
+        ? wall.kind
+        : "wall";
+  }
+  return out;
 }
 
 export function sanitizeMapPlacement(
@@ -843,7 +950,9 @@ export function buildFloorplanSavePayload(params: {
     floorplanWalls,
   } = params;
 
-  const camNames = Object.keys(existingCameras || {});
+  const camNames = Object.keys(existingCameras || {}).filter(
+    (k) => k !== "__proto__" && k !== "constructor" && k !== "prototype"
+  );
   const camerasPatch: Record<string, { map: CameraMapPlacement }> = {};
   camNames.forEach((cam, idx) => {
     const fallback =
@@ -855,38 +964,13 @@ export function buildFloorplanSavePayload(params: {
     };
   });
 
-  const sanitizedRooms: FloorplanRoom[] = (floorplanRooms || []).map(
-    (r, idx) => {
-      const norm = normalizeFloorplanRoomRect(
-        r.x,
-        r.y,
-        r.x + r.w,
-        r.y + r.h,
-        0.01
-      );
-      return {
-        ...r,
-        id: r.id || `room_${idx + 1}`,
-        label: (r.label || "ROOM").trim() || "ROOM",
-        x: norm.x,
-        y: norm.y,
-        w: norm.w,
-        h: norm.h,
-      };
-    }
-  );
+  const sanitizedRooms: FloorplanRoom[] = (
+    Array.isArray(floorplanRooms) ? floorplanRooms : []
+  ).map((r, idx) => sanitizeFloorplanRoom(r, idx));
 
-  const sanitizedWalls: FloorplanWall[] = (floorplanWalls || []).map((w) => {
-    const p = w.points || [0.2, 0.2, 0.4, 0.2];
-    const x1 = Number(Math.max(0, Math.min(1, finiteOr(p[0], 0.2))).toFixed(3));
-    const y1 = Number(Math.max(0, Math.min(1, finiteOr(p[1], 0.2))).toFixed(3));
-    const x2 = Number(Math.max(0, Math.min(1, finiteOr(p[2], 0.4))).toFixed(3));
-    const y2 = Number(Math.max(0, Math.min(1, finiteOr(p[3], 0.2))).toFixed(3));
-    return {
-      ...w,
-      points: [x1, y1, x2, y2],
-    };
-  });
+  const sanitizedWalls: FloorplanWall[] = (
+    Array.isArray(floorplanWalls) ? floorplanWalls : []
+  ).map((w) => sanitizeFloorplanWall(w));
 
   const cleanUrl = sanitizeFloorplanUrl(floorplanUrl);
   const safeOp = Number(
@@ -936,9 +1020,24 @@ export function resolveSafeAlertThumbSrc(
     !stripped ||
     !stripped.startsWith("/") ||
     stripped.startsWith("//") ||
+    /^\/%2f/i.test(stripped) ||
     stripped.includes("..") ||
-    /%2e%2e|%5c/i.test(stripped)
+    /%2e%2e|%5c|%252e|%255c|%00/i.test(stripped)
   ) {
+    return fallback;
+  }
+  try {
+    const decoded = decodeURIComponent(stripped);
+    if (
+      !decoded.startsWith("/") ||
+      decoded.startsWith("//") ||
+      decoded.includes("\\") ||
+      decoded.includes("..") ||
+      /[\u0000-\u001F\u007F]/.test(decoded)
+    ) {
+      return fallback;
+    }
+  } catch {
     return fallback;
   }
   return stripped;
@@ -1163,12 +1262,13 @@ export const TacticalPtzHudOverlay: React.FC<{
   onPtzUpdateRef.current = onPtzUpdate;
   const ptzInfoRef = useRef(ptzInfo);
   ptzInfoRef.current = ptzInfo;
-  const activeCameraRef = useRef<string | null>(camera);
-  activeCameraRef.current = camera;
+  const activeCameraRef = useRef<string | null>((camera || "").trim());
+  activeCameraRef.current = (camera || "").trim();
   const lifecycleRef = useRef<PtzMoveLifecycleController | null>(null);
 
   useEffect(() => {
-    activeCameraRef.current = camera;
+    const cleanCam = (camera || "").trim();
+    activeCameraRef.current = cleanCam;
     if (!ptzEnabled) {
       if (lifecycleRef.current) {
         void lifecycleRef.current.dispose();
@@ -1177,7 +1277,7 @@ export const TacticalPtzHudOverlay: React.FC<{
       return;
     }
     const ctrl = createPtzMoveLifecycle({
-      camera,
+      camera: cleanCam,
       speed: 0.5,
       onMoveStarted: (cam) => {
         if (onPtzUpdateRef.current) {
@@ -1215,7 +1315,7 @@ export const TacticalPtzHudOverlay: React.FC<{
     }
 
     return () => {
-      if (activeCameraRef.current === camera) {
+      if (activeCameraRef.current === cleanCam) {
         activeCameraRef.current = null;
       }
       if (typeof window !== "undefined") {
@@ -1571,6 +1671,33 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const ptzInFlightCamsRef = useRef<Set<string>>(new Set());
   const isMountedRef = useRef<boolean>(true);
   const mapSaveTimerRef = useRef<number | null>(null);
+  const mapSaveSeqRef = useRef<number>(0);
+  const latestFloorplanDraftRef = useRef<{
+    mapPlacements: Record<string, CameraMapPlacement>;
+    mapFloorplanUrl: string;
+    floorplanOpacity: number;
+    floorplanWidthM: number;
+    floorplanHeightM: number;
+    floorplanRooms: FloorplanRoom[];
+    floorplanWalls: FloorplanWall[];
+  }>({
+    mapPlacements,
+    mapFloorplanUrl,
+    floorplanOpacity,
+    floorplanWidthM,
+    floorplanHeightM,
+    floorplanRooms,
+    floorplanWalls,
+  });
+  latestFloorplanDraftRef.current = {
+    mapPlacements,
+    mapFloorplanUrl,
+    floorplanOpacity,
+    floorplanWidthM,
+    floorplanHeightM,
+    floorplanRooms,
+    floorplanWalls,
+  };
   const activeFileReaderRef = useRef<FileReader | null>(null);
   const mapSvgRef = useRef<SVGSVGElement | null>(null);
   const floorplanFileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1629,15 +1756,25 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       activePttCamerasRef.current.clear();
       setPttResetEpoch((n) => n + 1);
     }
-  }, [liveLayout, selectedCamera, matrixPage, activeCameraGroup, timeShiftTs]);
+  }, [
+    liveLayout,
+    selectedCamera,
+    matrixPage,
+    matrixDensity,
+    activeCameraGroup,
+    timeShiftTs,
+    simulatedFleetCount,
+  ]);
 
   const snapVertices = useMemo(() => {
     const pts: Array<{ x: number; y: number }> = [];
-    for (const w of floorplanWalls) {
+    for (const rawW of floorplanWalls) {
+      const w = sanitizeFloorplanWall(rawW);
       pts.push({ x: w.points[0], y: w.points[1] });
       pts.push({ x: w.points[2], y: w.points[3] });
     }
-    for (const r of floorplanRooms) {
+    for (let i = 0; i < floorplanRooms.length; i++) {
+      const r = sanitizeFloorplanRoom(floorplanRooms[i], i);
       pts.push({ x: r.x, y: r.y });
       pts.push({ x: r.x + r.w, y: r.y });
       pts.push({ x: r.x, y: r.y + r.h });
@@ -1700,16 +1837,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
         setFloorplanHeightM(Math.min(500, fp.height_m));
       }
       if (Array.isArray(fp.rooms)) {
-        setFloorplanRooms(fp.rooms);
+        setFloorplanRooms(
+          fp.rooms.map((r, idx) => sanitizeFloorplanRoom(r, idx))
+        );
       }
       if (Array.isArray(fp.walls)) {
-        setFloorplanWalls(fp.walls);
+        setFloorplanWalls(fp.walls.map((w) => sanitizeFloorplanWall(w)));
       }
-      if (fp.background_data_url) {
-        const cleanBg = sanitizeFloorplanUrl(fp.background_data_url);
-        if (cleanBg) {
-          setMapFloorplanUrl(cleanBg);
-        }
+      if (typeof fp.background_data_url === "string") {
+        setMapFloorplanUrl(sanitizeFloorplanUrl(fp.background_data_url));
       }
     }
   }, [config?.ui?.floorplan, mapEditMode]);
@@ -1818,22 +1954,30 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   };
 
   const handleSaveMapPlacements = async () => {
+    const mySaveSeq = ++mapSaveSeqRef.current;
     try {
       const cfgRes = await fetch("/api/config", { credentials: "include" });
-      if (!cfgRes.ok || !isMountedRef.current) return;
+      if (
+        !cfgRes.ok ||
+        !isMountedRef.current ||
+        mySaveSeq !== mapSaveSeqRef.current
+      ) {
+        return;
+      }
       const currentCfg = await cfgRes.json();
-      if (!isMountedRef.current) return;
+      if (!isMountedRef.current || mySaveSeq !== mapSaveSeqRef.current) return;
       if (currentCfg && currentCfg.cameras) {
+        const latestDraft = latestFloorplanDraftRef.current;
         const payload = buildFloorplanSavePayload({
           existingCameras: currentCfg.cameras,
-          mapPlacements,
+          mapPlacements: latestDraft.mapPlacements,
           existingUi: currentCfg.ui,
-          floorplanUrl: mapFloorplanUrl,
-          floorplanOpacity,
-          floorplanWidthM,
-          floorplanHeightM,
-          floorplanRooms,
-          floorplanWalls,
+          floorplanUrl: latestDraft.mapFloorplanUrl,
+          floorplanOpacity: latestDraft.floorplanOpacity,
+          floorplanWidthM: latestDraft.floorplanWidthM,
+          floorplanHeightM: latestDraft.floorplanHeightM,
+          floorplanRooms: latestDraft.floorplanRooms,
+          floorplanWalls: latestDraft.floorplanWalls,
         });
         const saveRes = await fetch("/api/config/structured?save_option=saveonly", {
           method: "POST",
@@ -1841,9 +1985,18 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           credentials: "include",
           body: JSON.stringify(payload),
         });
-        if (saveRes.ok && isMountedRef.current) {
+        if (
+          saveRes.ok &&
+          isMountedRef.current &&
+          mySaveSeq === mapSaveSeqRef.current
+        ) {
           const savedData = await saveRes.json().catch(() => ({}));
-          if (!isMountedRef.current) return;
+          if (!isMountedRef.current || mySaveSeq !== mapSaveSeqRef.current) {
+            return;
+          }
+          if (savedData.success === false) {
+            return;
+          }
           if (savedData.config) {
             setConfig(savedData.config);
           }
@@ -3047,14 +3200,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       </button>
                     ) : !isTimeShifted ? (
                       <PushToTalkButton
-                        key={`ptt-${realCam}-${pttResetEpoch}`}
+                        key={`ptt-${cam}-${realCam}-${pttResetEpoch}`}
                         camera={realCam}
                         height={22}
                         onStateChange={(state) => {
                           if (state === "connecting" || state === "talking") {
-                            activePttCamerasRef.current.add(realCam);
+                            activePttCamerasRef.current.add(cam);
                           } else {
-                            activePttCamerasRef.current.delete(realCam);
+                            activePttCamerasRef.current.delete(cam);
                           }
                         }}
                       />
