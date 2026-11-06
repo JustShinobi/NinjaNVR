@@ -42,13 +42,20 @@ import {
   validateFederationPeerUrl,
 } from "../views/settings/RecordingAndSecurityPanels";
 import {
+  AI_SETTINGS_SUBSECTIONS,
+  AiDetectionObjectsSection,
   buildLocalFinetuneCliCommand,
   buildModelUploadPayload,
   computeDatasetReadinessMetrics,
+  filterFalsePositiveSignaturesByScope,
   formatDhash64Hex,
+  formatFalsePositiveReason,
   formatSignatureBbox,
   formatYoloAnnotationLine,
+  isAiSubSectionVisible,
+  isBundledCocoSsdModel,
   isSafeGenAiCustomBaseUrl,
+  resolveSettingsScopeBadge,
   xyxyToYoloNormalized,
 } from "../views/settings/VisionAndAiPanels";
 import { useNvrStore } from "../store/useNvrStore";
@@ -1039,5 +1046,256 @@ describe("Phase 4C Cycle-2 — Review, Explore, Exports, System & Settings panel
     expect(isSafeGenAiCustomBaseUrl("http://169.254.169.254/latest")).toBe(false);
     expect(isSafeGenAiCustomBaseUrl("http://user:pass@openrouter.ai")).toBe(false);
     expect(isSafeGenAiCustomBaseUrl("javascript:alert(1)")).toBe(false);
+  });
+
+  test("VisionAndAiPanels Settings UI/UX: standardizes scope badges, sub-navigation, SSD attribute warnings, FP filtering, disabled zones, and i18n strings", () => {
+    // 1. Sub-navigation pills & visibility helper
+    expect(AI_SETTINGS_SUBSECTIONS.map((s) => s.id)).toEqual([
+      "all",
+      "engine",
+      "objects",
+      "genai",
+      "faces",
+      "lpr",
+      "state_rois",
+    ]);
+    expect(isAiSubSectionVisible("all", "engine")).toBe(true);
+    expect(isAiSubSectionVisible("all", "state_rois")).toBe(true);
+    expect(isAiSubSectionVisible("faces", "faces")).toBe(true);
+    expect(isAiSubSectionVisible("faces", "lpr")).toBe(false);
+
+    // 2. Scope badge standardization (Global vs Camera vs Camera-Only)
+    expect(
+      resolveSettingsScopeBadge("global_only", "escritorio", "escritorio", false)
+    ).toEqual({
+      label: "SCOPE: GLOBAL",
+      isCameraScope: false,
+      effectiveCamera: "escritorio",
+    });
+    expect(
+      resolveSettingsScopeBadge("camera_or_global", "global", "escritorio", false)
+    ).toEqual({
+      label: "SCOPE: GLOBAL DEFAULTS",
+      isCameraScope: false,
+      effectiveCamera: "escritorio",
+    });
+    expect(
+      resolveSettingsScopeBadge("camera_or_global", "escritorio", "escritorio", true)
+    ).toEqual({
+      label: "ESCOPO: ESCRITORIO",
+      isCameraScope: true,
+      effectiveCamera: "escritorio",
+    });
+    expect(
+      resolveSettingsScopeBadge("camera_only", "global", "sala", false)
+    ).toEqual({
+      label: "SCOPE: CAMERA (SALA)",
+      isCameraScope: true,
+      effectiveCamera: "sala",
+    });
+
+    // 3. Bundled COCO SSD model detection for child attribute warning
+    expect(
+      isBundledCocoSsdModel({
+        model_type: "ssd",
+        path: "/openvino-model/ssdlite_mobilenet_v2.xml",
+      })
+    ).toBe(true);
+    expect(
+      isBundledCocoSsdModel({
+        model_type: "yolo-generic",
+        path: "/config/models/ninjanvr_security_15cl.onnx",
+      })
+    ).toBe(false);
+
+    // 4. False-positive signature camera scope filtering & reason formatting
+    const sampleSigs = [
+      {
+        id: 1,
+        camera: "sala",
+        label: "person",
+        norm_bbox: [0.58, 0.08, 0.42, 0.95] as [number, number, number, number],
+        dhash64: 12345,
+        hit_count: 1,
+        created_at: 1700000000,
+        last_seen_at: 1700000000,
+        reason: "The room is empty",
+      },
+      {
+        id: 2,
+        camera: "escritorio",
+        label: "person",
+        norm_bbox: [0.73, 0.37, 0.19, 0.49] as [number, number, number, number],
+        dhash64: 67890,
+        hit_count: 2,
+        created_at: 1700000100,
+        last_seen_at: 1700000100,
+        reason: "color:gray",
+      },
+    ];
+    expect(
+      filterFalsePositiveSignaturesByScope(
+        sampleSigs,
+        "escritorio",
+        "escritorio",
+        "scope"
+      ).map((s) => s.id)
+    ).toEqual([2]);
+    expect(
+      filterFalsePositiveSignaturesByScope(
+        sampleSigs,
+        "escritorio",
+        "escritorio",
+        "all"
+      ).map((s) => s.id)
+    ).toEqual([1, 2]);
+    expect(
+      filterFalsePositiveSignaturesByScope(
+        sampleSigs,
+        "global",
+        "escritorio",
+        "scope"
+      ).map((s) => s.id)
+    ).toEqual([1, 2]);
+
+    expect(formatFalsePositiveReason("color:gray", null, false)).toEqual({
+      text: "Static region signature (dominant color: gray)",
+      isTechnicalFallback: true,
+    });
+    expect(formatFalsePositiveReason("operator_marked", null, true)).toEqual({
+      text: "Marcado manualmente pelo operador",
+      isTechnicalFallback: true,
+    });
+    expect(
+      formatFalsePositiveReason("No person is visible in the kitchen scene.", null, false)
+    ).toEqual({
+      text: "No person is visible in the kitchen scene.",
+      isTechnicalFallback: false,
+    });
+
+    // 5. SSR render verification of AiDetectionObjectsSection
+    const html = renderToStaticMarkup(
+      React.createElement(AiDetectionObjectsSection, {
+        draftConfig: {
+          version: "2.6.7",
+          safe_mode: false,
+          mqtt: {
+            enabled: false,
+            host: "localhost",
+            port: 1883,
+            topic_prefix: "ninjanvr",
+            client_id: "ninjanvr",
+            stats_interval: 60,
+          },
+          record: {
+            enabled: true,
+            expire_interval: 60,
+            continuous: { days: 7 },
+            motion: { days: 14 },
+            alerts: { pre_capture: 5, post_capture: 5, retain: { days: 30, mode: "motion" } },
+            detections: { pre_capture: 5, post_capture: 5, retain: { days: 14, mode: "motion" } },
+            preview: { quality: "medium" },
+          },
+          snapshots: { enabled: true, selection: "best_in_zone" },
+          go2rtc: { streams: {} },
+          detectors: { detector01: { type: "openvino", device: "CPU" } },
+          model: {
+            path: "/openvino-model/ssdlite_mobilenet_v2.xml",
+            labelmap_path: "/openvino-model/coco_91cl_bkgr.txt",
+            width: 300,
+            height: 300,
+            input_tensor: "nhwc",
+            input_pixel_format: "bgr",
+            model_type: "ssd",
+          },
+          detect: {
+            enabled: true,
+            width: 1280,
+            height: 720,
+            fps: 5,
+            min_initialized: 2,
+            max_disappeared: 25,
+          },
+          motion: {
+            enabled: true,
+            threshold: 30,
+            contour_area: 10,
+            mask: [],
+          },
+          objects: { track: ["person"], filters: {} },
+          genai: {
+            enabled: true,
+            provider: "gemini",
+            base_url: null,
+            api_key: null,
+            has_api_key: true,
+            api_key_env: "GEMINI_API_KEY",
+            model: "gemini-3.8-flash",
+            verify_ambiguous_alerts: false,
+            ambiguous_score_min: 0.45,
+            ambiguous_score_max: 0.72,
+            auto_suppress_false_positives: true,
+            timeout_ms: 30000,
+          },
+          face_recognition: {
+            enabled: false,
+            model_path: "/config/models/arcface_r50.onnx",
+            similarity_threshold: 0.68,
+            min_face_area: 750,
+            unknown_alert: false,
+          },
+          lpr: {
+            enabled: false,
+            min_confidence: 0.75,
+            format_regex: "^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$",
+            known_plates: {},
+          },
+          cameras: {
+            escritorio: {
+              enabled: true,
+              ffmpeg: { inputs: [] },
+              detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+              motion: { enabled: true, threshold: 30, contour_area: 10, mask: [] },
+              record: {
+                enabled: true,
+                expire_interval: 60,
+                continuous: { days: 7 },
+                motion: { days: 14 },
+                alerts: {
+                  pre_capture: 5,
+                  post_capture: 5,
+                  retain: { days: 30, mode: "motion" },
+                },
+                detections: {
+                  pre_capture: 5,
+                  post_capture: 5,
+                  retain: { days: 14, mode: "motion" },
+                },
+                preview: { quality: "medium" },
+              },
+              snapshots: { enabled: true },
+              objects: { track: ["person"], filters: {} },
+              zones: {},
+              state_rois: {},
+            },
+          },
+        },
+        updateDraft: () => {},
+        scope: "escritorio",
+        inspectorCam: "escritorio",
+        notify: () => {},
+      })
+    );
+
+    expect(html).toContain("nvr-settings-subnav");
+    expect(html).toContain("nvr-scope-pill");
+    expect(html).toContain("nvr-yaml-key-tag");
+    expect(html).toContain("nvr-cfg-disabled-zone");
+    expect(html).toContain("nvr-file-picker");
+    expect(html).toContain("nvr-diag-drawer");
+    expect(html).toContain("REQUIRES 15-CLASS YOLO MODEL");
+    expect(html).toContain("ROI Crop Viewport Preview");
+    expect(html).not.toContain("Advanced Technical Tuning / Coordenadas");
+    expect(html).not.toContain("e.g. Porta do Escritório");
   });
 });

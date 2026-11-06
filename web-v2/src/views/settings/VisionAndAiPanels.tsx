@@ -722,6 +722,136 @@ export function parseFacesApiResponse(payload: unknown): EnrolledFaceProfileItem
   return out;
 }
 
+export type AiSettingsSubSectionId =
+  | "all"
+  | "engine"
+  | "objects"
+  | "genai"
+  | "faces"
+  | "lpr"
+  | "state_rois";
+
+export interface AiSettingsSubSectionMeta {
+  id: AiSettingsSubSectionId;
+  labelEn: string;
+  labelPt: string;
+}
+
+export const AI_SETTINGS_SUBSECTIONS: AiSettingsSubSectionMeta[] = [
+  { id: "all", labelEn: "All Modules", labelPt: "Todos os Módulos" },
+  { id: "engine", labelEn: "1. Engine & Tracking", labelPt: "1. Motor & Rastreamento" },
+  { id: "objects", labelEn: "2. Classes & Confidence", labelPt: "2. Classes & Confiança" },
+  { id: "genai", labelEn: "3. Vision AI Judge & FP", labelPt: "3. Juiz IA & Falsos Positivos" },
+  { id: "faces", labelEn: "4. Face Recognition", labelPt: "4. Reconhecimento Facial" },
+  { id: "lpr", labelEn: "5. License Plates (LPR)", labelPt: "5. Leitura de Placas (LPR)" },
+  { id: "state_rois", labelEn: "6. State Monitor (ROI)", labelPt: "6. Estado de Área (ROI)" },
+];
+
+export function isAiSubSectionVisible(
+  activeSection: AiSettingsSubSectionId,
+  targetSection: Exclude<AiSettingsSubSectionId, "all">
+): boolean {
+  return activeSection === "all" || activeSection === targetSection;
+}
+
+export function resolveSettingsScopeBadge(
+  kind: "global_only" | "camera_or_global" | "camera_only",
+  scope: "global" | string,
+  inspectorCam: string,
+  isPt = false
+): { label: string; isCameraScope: boolean; effectiveCamera: string } {
+  const cleanCam = (inspectorCam || "escritorio").trim() || "escritorio";
+  if (kind === "global_only") {
+    return {
+      label: isPt ? "ESCOPO: GLOBAL" : "SCOPE: GLOBAL",
+      isCameraScope: false,
+      effectiveCamera: cleanCam,
+    };
+  }
+  if (kind === "camera_only") {
+    return {
+      label: isPt
+        ? `ESCOPO: CÂMERA (${cleanCam.toUpperCase()})`
+        : `SCOPE: CAMERA (${cleanCam.toUpperCase()})`,
+      isCameraScope: true,
+      effectiveCamera: cleanCam,
+    };
+  }
+  if (scope === "global") {
+    return {
+      label: isPt ? "ESCOPO: PADRÃO GLOBAL" : "SCOPE: GLOBAL DEFAULTS",
+      isCameraScope: false,
+      effectiveCamera: cleanCam,
+    };
+  }
+  return {
+    label: isPt
+      ? `ESCOPO: ${cleanCam.toUpperCase()}`
+      : `SCOPE: ${cleanCam.toUpperCase()}`,
+    isCameraScope: true,
+    effectiveCamera: cleanCam,
+  };
+}
+
+export function isBundledCocoSsdModel(
+  model?: Partial<ModelConfig> | null
+): boolean {
+  const modelType = (model?.model_type || "ssd").trim().toLowerCase();
+  const modelPath = (
+    model?.path || "/openvino-model/ssdlite_mobilenet_v2.xml"
+  )
+    .trim()
+    .toLowerCase();
+  return modelType === "ssd" && modelPath.includes("ssdlite_mobilenet_v2");
+}
+
+export function filterFalsePositiveSignaturesByScope(
+  signatures: FalsePositiveSignatureItem[],
+  scope: "global" | string,
+  inspectorCam: string,
+  filterMode: "scope" | "all"
+): FalsePositiveSignatureItem[] {
+  if (!Array.isArray(signatures)) return [];
+  if (scope === "global" || filterMode === "all") {
+    return signatures;
+  }
+  const target = (inspectorCam || "").trim().toLowerCase();
+  if (!target) return signatures;
+  return signatures.filter(
+    (sig) => (sig.camera || "").trim().toLowerCase() === target
+  );
+}
+
+export function formatFalsePositiveReason(
+  reason?: string | null,
+  dominantColor?: string | null,
+  isPt = false
+): { text: string; isTechnicalFallback: boolean } {
+  const raw = (reason || dominantColor || "").trim();
+  if (!raw || raw.toLowerCase() === "operator_marked") {
+    return {
+      text: isPt
+        ? "Marcado manualmente pelo operador"
+        : "Marked manually by operator",
+      isTechnicalFallback: true,
+    };
+  }
+  const colorMatch = /^color\s*:\s*(.+)$/i.exec(raw);
+  if (colorMatch) {
+    const colorName = colorMatch[1].trim();
+    return {
+      text: isPt
+        ? `Assinatura estática (cor dominante: ${colorName})`
+        : `Static region signature (dominant color: ${colorName})`,
+      isTechnicalFallback: true,
+    };
+  }
+  return {
+    text: raw,
+    isTechnicalFallback: false,
+  };
+}
+
 export const VisionZonesMotionSection: React.FC<{
   draftConfig: NinjaConfigResponse;
   updateDraft: (updater: (next: NinjaConfigResponse) => void) => void;
@@ -2448,10 +2578,20 @@ export const AiDetectionObjectsSection: React.FC<{
   scope: "global" | string;
   inspectorCam: string;
   notify: (msg: string) => void;
-}> = ({ draftConfig, updateDraft, scope, inspectorCam, notify }) => {
+  onOpenVectorStudio?: () => void;
+}> = ({
+  draftConfig,
+  updateDraft,
+  scope,
+  inspectorCam,
+  notify,
+  onOpenVectorStudio,
+}) => {
   const { locale } = useI18n();
   const isPt = locale === "pt";
   const stats = useNvrStore((s) => s.stats);
+  const [activeSubSection, setActiveSubSection] =
+    useState<AiSettingsSubSectionId>("all");
   const [customLabel, setCustomLabel] = useState("");
   const [selectedFilterLabel, setSelectedFilterLabel] = useState("person");
   const [showAdvancedModel, setShowAdvancedModel] = useState(false);
@@ -2460,6 +2600,7 @@ export const AiDetectionObjectsSection: React.FC<{
   const [isCustomResolution, setIsCustomResolution] = useState(false);
   const [fpSignatures, setFpSignatures] = useState<FalsePositiveSignatureItem[]>([]);
   const [fpLoading, setFpLoading] = useState(false);
+  const [fpFilterMode, setFpFilterMode] = useState<"scope" | "all">("scope");
 
   const loadFpSignatures = async () => {
     setFpLoading(true);
@@ -2666,6 +2807,7 @@ export const AiDetectionObjectsSection: React.FC<{
   const [enrolledProfiles, setEnrolledProfiles] = useState<EnrolledFaceProfileItem[]>([]);
   const [enrollNameInput, setEnrollNameInput] = useState("");
   const [enrollImageB64, setEnrollImageB64] = useState<string>("");
+  const [enrollFileName, setEnrollFileName] = useState<string>("");
   const [enrollBusy, setEnrollBusy] = useState(false);
   const [excludeSubLabelInput, setExcludeSubLabelInput] = useState("");
   const [newKnownPlate, setNewKnownPlate] = useState("");
@@ -2701,7 +2843,7 @@ export const AiDetectionObjectsSection: React.FC<{
     format_regex: DEFAULT_LPR_FORMAT_REGEX,
     known_plates: {},
   };
-  const updateLpr = (patch: Partial<LprConfig>, persistImmediately = true) => {
+  const updateLpr = (patch: Partial<LprConfig>, persistImmediately = false) => {
     const mergedLpr: LprConfig = {
       enabled: draftConfig.lpr?.enabled ?? false,
       min_confidence: draftConfig.lpr?.min_confidence ?? 0.75,
@@ -2835,6 +2977,7 @@ export const AiDetectionObjectsSection: React.FC<{
       if (res.ok) {
         setEnrollNameInput("");
         setEnrollImageB64("");
+        setEnrollFileName("");
         await refreshEnrolledFaces();
         notify(`Enrolled face profile '${cleanName}' into local gallery`);
       } else {
@@ -2883,6 +3026,9 @@ export const AiDetectionObjectsSection: React.FC<{
   const [newRoiAnomalyState, setNewRoiAnomalyState] = useState("open");
   const [newRoiAnomalyTimeoutSec, setNewRoiAnomalyTimeoutSec] = useState(300);
   const [newRoiScenario, setNewRoiScenario] = useState<StateRoiPresetId>("door_gate");
+  const [roiTargetCam, setRoiTargetCam] = useState<string>(
+    inspectorCam || "escritorio"
+  );
 
   const [simLprCamera, setSimLprCamera] = useState<string>(inspectorCam || "escritorio");
   const [simLprPlate, setSimLprPlate] = useState<string>("BRA2E19");
@@ -2897,8 +3043,11 @@ export const AiDetectionObjectsSection: React.FC<{
   useEffect(() => {
     if (inspectorCam) {
       setSimLprCamera(inspectorCam);
+      if (scope !== "global") {
+        setRoiTargetCam(inspectorCam);
+      }
     }
-  }, [inspectorCam]);
+  }, [inspectorCam, scope]);
 
   const handleSimulateLprPass = async () => {
     if (simLprBusy) return;
@@ -3260,21 +3409,96 @@ export const AiDetectionObjectsSection: React.FC<{
     },
   ];
 
+  const globalScopeBadge = resolveSettingsScopeBadge(
+    "global_only",
+    scope,
+    inspectorCam,
+    isPt
+  );
+  const camOrGlobalBadge = resolveSettingsScopeBadge(
+    "camera_or_global",
+    scope,
+    inspectorCam,
+    isPt
+  );
+  const effectiveRoiCam =
+    scope === "global"
+      ? roiTargetCam || inspectorCam || "escritorio"
+      : inspectorCam || "escritorio";
+  const roiCamBadge = resolveSettingsScopeBadge(
+    "camera_only",
+    scope,
+    effectiveRoiCam,
+    isPt
+  );
+  const isCocoSsdActive = isBundledCocoSsdModel(modelCfg);
+  const filteredFpSignatures = filterFalsePositiveSignaturesByScope(
+    fpSignatures,
+    scope,
+    inspectorCam,
+    fpFilterMode
+  );
+  const previewRoiCrop = parseRoiCropInput(newRoiCrop);
+
   return (
     <div className="nvr-card-grid" style={{ gap: 10 }}>
+      {/* Tactical Sub-Navigation Bar to Eliminate Vertical Scroll Overload */}
+      <div
+        className="nvr-settings-subnav"
+        role="navigation"
+        aria-label={
+          isPt
+            ? "Sub-navegação de módulos de IA e Filtros"
+            : "AI & Object Filters Module Navigation"
+        }
+      >
+        <div className="nvr-settings-subnav-pills">
+          {AI_SETTINGS_SUBSECTIONS.map((sec) => {
+            const isActive = activeSubSection === sec.id;
+            return (
+              <button
+                key={sec.id}
+                type="button"
+                className={`nvr-btn mono ${isActive ? "active" : ""}`}
+                style={{ height: 24, padding: "0 9px", fontSize: "var(--text-xs)" }}
+                onClick={() => setActiveSubSection(sec.id)}
+              >
+                {isPt ? sec.labelPt : sec.labelEn}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          <span
+            className={`nvr-scope-pill ${
+              camOrGlobalBadge.isCameraScope ? "is-camera" : "is-global"
+            }`}
+          >
+            {camOrGlobalBadge.label}
+          </span>
+        </div>
+      </div>
+
       {/* Guided OpenVINO AI Detector & Model Card */}
+      {isAiSubSectionVisible(activeSubSection, "engine") && (
       <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
-          <span>
-            {isPt
-              ? "MOTOR DE IA & PERFIL DO MODELO (GLOBAL)"
-              : "AI DETECTION ENGINE & MODEL PROFILE (GLOBAL)"}
-          </span>
-          <span className="nvr-badge live">
-            <CheckCircle2 size={11} />
-            {(primaryDet.type || "openvino").toUpperCase()} ·{" "}
-            {primaryDet.device || "CPU"} ACTIVE · {liveInferMs}ms
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>
+              {isPt
+                ? "MOTOR DE IA & PERFIL DO MODELO"
+                : "AI DETECTION ENGINE & MODEL PROFILE"}
+            </span>
+            <span className="nvr-yaml-key-tag">detectors · model</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span className="nvr-scope-pill is-global">{globalScopeBadge.label}</span>
+            <span className="nvr-badge live">
+              <CheckCircle2 size={11} />
+              {(primaryDet.type || "openvino").toUpperCase()} ·{" "}
+              {primaryDet.device || "CPU"} ACTIVE · {liveInferMs}ms
+            </span>
+          </div>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 7 }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -3585,34 +3809,49 @@ export const AiDetectionObjectsSection: React.FC<{
           )}
         </div>
       </div>
+      )}
 
       {/* Guided Detect & ByteTrack Behavior Card */}
+      {isAiSubSectionVisible(activeSubSection, "engine") && (
       <div className="nvr-cfg-card">
         <div className="nvr-cfg-card-header">
-          <span>
-            {isPt ? "DETECÇÃO & RASTREAMENTO" : "CAMERA DETECTION & TRACKING"} (
-            {scope === "global"
-              ? isPt
-                ? "PADRÃO GLOBAL"
-                : "GLOBAL"
-              : inspectorCam.toUpperCase()}
-            )
-          </span>
-          <button
-            type="button"
-            className="nvr-btn"
-            style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
-            onClick={() => {
-              updateDraft((next) => {
-                Object.values(next.cameras).forEach((cam) => {
-                  cam.detect = { ...activeDetect };
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>
+              {isPt ? "DETECÇÃO & RASTREAMENTO" : "CAMERA DETECTION & TRACKING"}
+            </span>
+            <span className="nvr-yaml-key-tag">detect</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span
+              className={`nvr-scope-pill ${
+                camOrGlobalBadge.isCameraScope ? "is-camera" : "is-global"
+              }`}
+            >
+              {camOrGlobalBadge.label}
+            </span>
+            <span className={`nvr-badge ${activeDetect.enabled ? "live" : ""}`}>
+              {activeDetect.enabled
+                ? `${detFps} FPS · ACTIVE`
+                : isPt
+                ? "DESATIVADO"
+                : "STANDBY (OFF)"}
+            </span>
+            <button
+              type="button"
+              className="nvr-btn"
+              style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+              onClick={() => {
+                updateDraft((next) => {
+                  Object.values(next.cameras).forEach((cam) => {
+                    cam.detect = { ...activeDetect };
+                  });
                 });
-              });
-              notify("Applied detection & tracking settings to all cameras");
-            }}
-          >
-            {isPt ? "Aplicar a Todas" : "Apply to All Cameras"}
-          </button>
+                notify("Applied detection & tracking settings to all cameras");
+              }}
+            >
+              {isPt ? "Aplicar a Todas" : "Apply to All Cameras"}
+            </button>
+          </div>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
           <div className="nvr-field-row" style={{ padding: "4px 0" }}>
@@ -3633,389 +3872,407 @@ export const AiDetectionObjectsSection: React.FC<{
             />
           </div>
 
-          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
-            <div className="nvr-field-meta">
-              <div className="nvr-field-label">
-                {isPt
-                  ? "Roteamento de Detector IA"
-                  : "Assigned AI Detector Instance"}
+          <div
+            className={!activeDetect.enabled ? "nvr-cfg-disabled-zone" : ""}
+            style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1 }}
+          >
+            <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? "Roteamento de Detector IA"
+                    : "Assigned AI Detector Instance"}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Atribui esta câmera a um detector dedicado ou ao pool padrão."
+                    : "Routes this camera to a dedicated detector instance or the default pool."}
+                </div>
               </div>
-              <div className="nvr-field-desc">
-                {isPt
-                  ? "Atribui esta câmera a um detector dedicado ou ao pool padrão."
-                  : "Routes this camera to a dedicated detector instance or the default pool."}
+              <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0, maxWidth: "100%" }}>
+                <select
+                  className="nvr-select mono"
+                  style={{ width: 220, maxWidth: "100%" }}
+                  aria-label="Assigned AI Detector Instance"
+                  value={activeDetect.detector || ""}
+                  onChange={(e) =>
+                    updateDetect({ detector: e.target.value ? e.target.value : null })
+                  }
+                >
+                  <option value="">
+                    {isPt ? "Pool Padrão (Auto)" : "Default Pool (Auto)"}
+                  </option>
+                  {detKeys.map((dk) => (
+                    <option key={dk} value={dk}>
+                      {dk} (
+                      {(draftConfig.detectors?.[dk]?.type || "openvino").toUpperCase()}{" "}
+                      · {draftConfig.detectors?.[dk]?.device || "CPU"})
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="nvr-btn mono"
+                  style={{ height: 28, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  title="Add another detector worker instance to the pool"
+                  onClick={() => {
+                    const nextIdx = detKeys.length + 1;
+                    const newKey = `detector0${nextIdx}`;
+                    updateDraft((next) => {
+                      if (!next.detectors) next.detectors = {};
+                      next.detectors[newKey] = {
+                        type: "openvino",
+                        device: "CPU",
+                      };
+                    });
+                    updateDetect({ detector: newKey });
+                    notify(`Added detector instance '${newKey}'`);
+                  }}
+                >
+                  + Detector
+                </button>
               </div>
             </div>
-            <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0, maxWidth: "100%" }}>
+
+            <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+              <div className="nvr-field-meta">
+                <div className="nvr-field-label">
+                  {isPt
+                    ? "Resolução do Substream de Detecção"
+                    : "Substream Detection Resolution"}
+                </div>
+                <div className="nvr-field-desc">
+                  {isPt
+                    ? "Resolução de decodificação para movimento e detecção de objetos."
+                    : "Decode resolution for motion and AI object detection pipeline."}
+                </div>
+              </div>
               <select
                 className="nvr-select mono"
-                style={{ width: 220, maxWidth: "100%" }}
-                aria-label="Assigned AI Detector Instance"
-                value={activeDetect.detector || ""}
-                onChange={(e) =>
-                  updateDetect({ detector: e.target.value ? e.target.value : null })
-                }
-              >
-                <option value="">
-                  {isPt ? "Pool Padrão (Auto)" : "Default Pool (Auto)"}
-                </option>
-                {detKeys.map((dk) => (
-                  <option key={dk} value={dk}>
-                    {dk} (
-                    {(draftConfig.detectors?.[dk]?.type || "openvino").toUpperCase()}{" "}
-                    · {draftConfig.detectors?.[dk]?.device || "CPU"})
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="nvr-btn mono"
-                style={{ height: 28, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                title="Add another detector worker instance to the pool"
-                onClick={() => {
-                  const nextIdx = detKeys.length + 1;
-                  const newKey = `detector0${nextIdx}`;
-                  updateDraft((next) => {
-                    if (!next.detectors) next.detectors = {};
-                    next.detectors[newKey] = {
-                      type: "openvino",
-                      device: "CPU",
-                    };
-                  });
-                  updateDetect({ detector: newKey });
-                  notify(`Added detector instance '${newKey}'`);
+                style={{ width: 310, maxWidth: "100%" }}
+                aria-label="Substream Detection Resolution"
+                value={isCustomResolution || !isStandardRes ? "custom" : currentResPreset}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "custom") {
+                    setIsCustomResolution(true);
+                  } else {
+                    setIsCustomResolution(false);
+                    if (v === "1280x720") updateDetect({ width: 1280, height: 720 });
+                    else if (v === "640x480") updateDetect({ width: 640, height: 480 });
+                    else if (v === "640x360") updateDetect({ width: 640, height: 360 });
+                    else if (v === "1920x1080") updateDetect({ width: 1920, height: 1080 });
+                  }
                 }}
               >
-                + Detector
+                <option value="1280x720">
+                  {isPt
+                    ? "720p HD (1280×720 · 16:9 Recomendado)"
+                    : "720p HD (1280×720 · 16:9 Recommended)"}
+                </option>
+                <option value="640x480">
+                  {isPt ? "480p SD (640×480 · 4:3 Baixa CPU)" : "480p SD (640×480 · 4:3 Low CPU)"}
+                </option>
+                <option value="640x360">
+                  {isPt
+                    ? "360p Compacto (640×360 · 16:9 Ultra-Leve)"
+                    : "360p Compact (640×360 · 16:9 Ultra-Low CPU)"}
+                </option>
+                <option value="1920x1080">
+                  {isPt ? "1080p Full HD (1920×1080 · Alta CPU)" : "1080p Full HD (1920×1080 · High CPU)"}
+                </option>
+                <option value="custom">
+                  {isPt
+                    ? `Resolução Customizada (${activeDetect.width}×${activeDetect.height})...`
+                    : `Custom Resolution (${activeDetect.width}×${activeDetect.height})...`}
+                </option>
+              </select>
+            </div>
+
+            {(isCustomResolution || !isStandardRes) && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
+                <div>
+                  <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    {isPt ? "Largura (px)" : "Width (px)"}
+                  </div>
+                  <input
+                    type="number"
+                    min={160}
+                    max={3840}
+                    step={4}
+                    className="nvr-input mono"
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={activeDetect.width}
+                    onChange={(e) => updateDetect({ width: Number(e.target.value) })}
+                  />
+                </div>
+                <div>
+                  <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    {isPt ? "Altura (px)" : "Height (px)"}
+                  </div>
+                  <input
+                    type="number"
+                    min={120}
+                    max={2160}
+                    step={4}
+                    className="nvr-input mono"
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={activeDetect.height}
+                    onChange={(e) => updateDetect({ height: Number(e.target.value) })}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* 1-Click Tracking Sensitivity Presets */}
+            <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", fontWeight: 700 }}>
+              {isPt ? "PERFIL DE RESPOSTA DO RASTREADOR" : "TRACKING RESPONSIVENESS PRESET"}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6 }}>
+              <button
+                type="button"
+                className={`nvr-btn ${activeTrackPreset === "balanced" ? "active" : ""}`}
+                style={{
+                  height: "auto",
+                  minWidth: 0,
+                  padding: "6px 8px",
+                  flexDirection: "column",
+                  alignItems: "flex-start",
+                  textAlign: "left",
+                  whiteSpace: "normal",
+                  gap: 2,
+                }}
+                onClick={() =>
+                  updateDetect({
+                    fps: 5,
+                    min_initialized: 2,
+                    max_disappeared: 25,
+                    stationary: { interval: 50, threshold: 50, classifier: true },
+                  })
+                }
+              >
+                <span style={{ fontWeight: 700, fontSize: "var(--text-xs)" }}>
+                  {isPt ? "Equilibrado" : "Balanced (Default)"}
+                </span>
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                  5 FPS · 0.4s confirm
+                </span>
+              </button>
+
+              <button
+                type="button"
+                className={`nvr-btn ${activeTrackPreset === "fast" ? "active" : ""}`}
+                style={{
+                  height: "auto",
+                  minWidth: 0,
+                  padding: "6px 8px",
+                  flexDirection: "column",
+                  alignItems: "flex-start",
+                  textAlign: "left",
+                  whiteSpace: "normal",
+                  gap: 2,
+                }}
+                onClick={() =>
+                  updateDetect({
+                    fps: 8,
+                    min_initialized: 1,
+                    max_disappeared: 40,
+                    stationary: { interval: 50, threshold: 50, classifier: true },
+                  })
+                }
+              >
+                <span style={{ fontWeight: 700, fontSize: "var(--text-xs)" }}>
+                  {isPt ? "Entrada Rápida" : "Fast Entryway"}
+                </span>
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                  8 FPS · Instant hit
+                </span>
+              </button>
+
+              <button
+                type="button"
+                className={`nvr-btn ${activeTrackPreset === "strict" ? "active" : ""}`}
+                style={{
+                  height: "auto",
+                  minWidth: 0,
+                  padding: "6px 8px",
+                  flexDirection: "column",
+                  alignItems: "flex-start",
+                  textAlign: "left",
+                  whiteSpace: "normal",
+                  gap: 2,
+                }}
+                onClick={() =>
+                  updateDetect({
+                    fps: 5,
+                    min_initialized: 4,
+                    max_disappeared: 20,
+                    stationary: { interval: 40, threshold: 40, classifier: true },
+                  })
+                }
+              >
+                <span style={{ fontWeight: 700, fontSize: "var(--text-xs)" }}>
+                  {isPt ? "Externo Rigoroso" : "Strict Outdoor"}
+                </span>
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                  5 FPS · 4-hit filter
+                </span>
               </button>
             </div>
-          </div>
 
-          <div className="nvr-field-row" style={{ padding: "4px 0" }}>
-            <div className="nvr-field-meta">
-              <div className="nvr-field-label">
-                {isPt
-                  ? "Resolução do Substream de Detecção"
-                  : "Substream Detection Resolution"}
-              </div>
-              <div className="nvr-field-desc">
-                {isPt
-                  ? "Resolução de decodificação para movimento e detecção de objetos."
-                  : "Decode resolution for motion and AI object detection pipeline."}
-              </div>
-            </div>
-            <select
-              className="nvr-select mono"
-              style={{ width: 310, maxWidth: "100%" }}
-              aria-label="Substream Detection Resolution"
-              value={isCustomResolution || !isStandardRes ? "custom" : currentResPreset}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (v === "custom") {
-                  setIsCustomResolution(true);
-                } else {
-                  setIsCustomResolution(false);
-                  if (v === "1280x720") updateDetect({ width: 1280, height: 720 });
-                  else if (v === "640x480") updateDetect({ width: 640, height: 480 });
-                  else if (v === "640x360") updateDetect({ width: 640, height: 360 });
-                  else if (v === "1920x1080") updateDetect({ width: 1920, height: 1080 });
-                }
-              }}
-            >
-              <option value="1280x720">
-                {isPt
-                  ? "720p HD (1280×720 · 16:9 Recomendado)"
-                  : "720p HD (1280×720 · 16:9 Recommended)"}
-              </option>
-              <option value="640x480">
-                {isPt ? "480p SD (640×480 · 4:3 Baixa CPU)" : "480p SD (640×480 · 4:3 Low CPU)"}
-              </option>
-              <option value="640x360">
-                {isPt
-                  ? "360p Compacto (640×360 · 16:9 Ultra-Leve)"
-                  : "360p Compact (640×360 · 16:9 Ultra-Low CPU)"}
-              </option>
-              <option value="1920x1080">
-                {isPt ? "1080p Full HD (1920×1080 · Alta CPU)" : "1080p Full HD (1920×1080 · High CPU)"}
-              </option>
-              <option value="custom">
-                {isPt
-                  ? `Resolução Customizada (${activeDetect.width}×${activeDetect.height})...`
-                  : `Custom Resolution (${activeDetect.width}×${activeDetect.height})...`}
-              </option>
-            </select>
-          </div>
-
-          {(isCustomResolution || !isStandardRes) && (
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
-              <div>
-                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  {isPt ? "Largura (px)" : "Width (px)"}
-                </div>
-                <input
-                  type="number"
-                  min={160}
-                  max={3840}
-                  step={4}
-                  className="nvr-input mono"
-                  style={{ width: "100%", marginTop: 2 }}
-                  value={activeDetect.width}
-                  onChange={(e) => updateDetect({ width: Number(e.target.value) })}
-                />
-              </div>
-              <div>
-                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  {isPt ? "Altura (px)" : "Height (px)"}
-                </div>
-                <input
-                  type="number"
-                  min={120}
-                  max={2160}
-                  step={4}
-                  className="nvr-input mono"
-                  style={{ width: "100%", marginTop: 2 }}
-                  value={activeDetect.height}
-                  onChange={(e) => updateDetect({ height: Number(e.target.value) })}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* 1-Click Tracking Sensitivity Presets */}
-          <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)", fontWeight: 700 }}>
-            {isPt ? "PERFIL DE RESPOSTA DO RASTREADOR" : "TRACKING RESPONSIVENESS PRESET"}
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 6 }}>
+            {/* Collapsible Advanced ByteTrack Frame Parameters */}
             <button
               type="button"
-              className={`nvr-btn ${activeTrackPreset === "balanced" ? "active" : ""}`}
+              className="nvr-btn mono"
               style={{
-                height: "auto",
-                minWidth: 0,
-                padding: "6px 8px",
-                flexDirection: "column",
-                alignItems: "flex-start",
-                textAlign: "left",
-                whiteSpace: "normal",
-                gap: 2,
+                width: "100%",
+                justifyContent: "space-between",
+                height: 24,
+                fontSize: "var(--text-xs)",
+                marginTop: "auto",
               }}
-              onClick={() =>
-                updateDetect({
-                  fps: 5,
-                  min_initialized: 2,
-                  max_disappeared: 25,
-                  stationary: { interval: 50, threshold: 50, classifier: true },
-                })
-              }
+              onClick={() => setShowAdvancedByteTrack((v) => !v)}
             >
-              <span style={{ fontWeight: 700, fontSize: "var(--text-xs)" }}>
-                {isPt ? "Equilibrado" : "Balanced (Default)"}
+              <span>
+                {isPt
+                  ? `AVANÇADO: BYTETRACK (${detFps} FPS · ${detHits} HITS)`
+                  : `ADVANCED BYTETRACK PARAMETERS (${detFps} FPS · ${detHits} HITS)`}
               </span>
-              <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                5 FPS · 0.4s confirm
-              </span>
+              {showAdvancedByteTrack ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
             </button>
 
-            <button
-              type="button"
-              className={`nvr-btn ${activeTrackPreset === "fast" ? "active" : ""}`}
-              style={{
-                height: "auto",
-                minWidth: 0,
-                padding: "6px 8px",
-                flexDirection: "column",
-                alignItems: "flex-start",
-                textAlign: "left",
-                whiteSpace: "normal",
-                gap: 2,
-              }}
-              onClick={() =>
-                updateDetect({
-                  fps: 8,
-                  min_initialized: 1,
-                  max_disappeared: 40,
-                  stationary: { interval: 50, threshold: 50, classifier: true },
-                })
-              }
-            >
-              <span style={{ fontWeight: 700, fontSize: "var(--text-xs)" }}>
-                {isPt ? "Entrada Rápida" : "Fast Entryway"}
-              </span>
-              <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                8 FPS · Instant hit
-              </span>
-            </button>
-
-            <button
-              type="button"
-              className={`nvr-btn ${activeTrackPreset === "strict" ? "active" : ""}`}
-              style={{
-                height: "auto",
-                minWidth: 0,
-                padding: "6px 8px",
-                flexDirection: "column",
-                alignItems: "flex-start",
-                textAlign: "left",
-                whiteSpace: "normal",
-                gap: 2,
-              }}
-              onClick={() =>
-                updateDetect({
-                  fps: 5,
-                  min_initialized: 4,
-                  max_disappeared: 20,
-                  stationary: { interval: 40, threshold: 40, classifier: true },
-                })
-              }
-            >
-              <span style={{ fontWeight: 700, fontSize: "var(--text-xs)" }}>
-                {isPt ? "Externo Rigoroso" : "Strict Outdoor"}
-              </span>
-              <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                5 FPS · 4-hit filter
-              </span>
-            </button>
+            {showAdvancedByteTrack && (
+              <div
+                className="nvr-subcard"
+                style={{
+                  padding: 8,
+                  display: "grid",
+                  gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
+                  gap: 6,
+                }}
+              >
+                <div>
+                  <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    FPS
+                  </div>
+                  <input
+                    type="number"
+                    min={1}
+                    max={30}
+                    className="nvr-input mono"
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={activeDetect.fps}
+                    onChange={(e) => updateDetect({ fps: Number(e.target.value) })}
+                  />
+                </div>
+                <div>
+                  <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    Min Hits
+                  </div>
+                  <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    className="nvr-input mono"
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={activeDetect.min_initialized ?? 2}
+                    onChange={(e) =>
+                      updateDetect({ min_initialized: Number(e.target.value) })
+                    }
+                  />
+                </div>
+                <div>
+                  <div
+                    className="mono"
+                    style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                    title="Minimum consecutive hits required when camera is in Night IR mode (Spider/Insect flash filter)"
+                  >
+                    Night IR Hits
+                  </div>
+                  <input
+                    type="number"
+                    min={1}
+                    max={25}
+                    className="nvr-input mono"
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={
+                      activeDetect.min_initialized_night ??
+                      (activeDetect.min_initialized ?? 2) + 2
+                    }
+                    onChange={(e) =>
+                      updateDetect({ min_initialized_night: Number(e.target.value) })
+                    }
+                  />
+                </div>
+                <div>
+                  <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    Max Gone
+                  </div>
+                  <input
+                    type="number"
+                    min={5}
+                    max={200}
+                    className="nvr-input mono"
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={activeDetect.max_disappeared ?? 25}
+                    onChange={(e) =>
+                      updateDetect({ max_disappeared: Number(e.target.value) })
+                    }
+                  />
+                </div>
+                <div>
+                  <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                    Stat. Frames
+                  </div>
+                  <input
+                    type="number"
+                    min={10}
+                    max={500}
+                    className="nvr-input mono"
+                    style={{ width: "100%", marginTop: 2 }}
+                    value={activeDetect.stationary?.threshold ?? 50}
+                    onChange={(e) =>
+                      updateDetect({
+                        stationary: {
+                          interval: activeDetect.stationary?.interval ?? 50,
+                          threshold: Number(e.target.value),
+                          classifier: activeDetect.stationary?.classifier ?? true,
+                        },
+                      })
+                    }
+                  />
+                </div>
+              </div>
+            )}
           </div>
-
-          {/* Collapsible Advanced ByteTrack Frame Parameters */}
-          <button
-            type="button"
-            className="nvr-btn mono"
-            style={{
-              width: "100%",
-              justifyContent: "space-between",
-              height: 24,
-              fontSize: "var(--text-xs)",
-              marginTop: "auto",
-            }}
-            onClick={() => setShowAdvancedByteTrack((v) => !v)}
-          >
-            <span>
-              {isPt
-                ? `AVANÇADO: BYTETRACK (${detFps} FPS · ${detHits} HITS)`
-                : `ADVANCED BYTETRACK PARAMETERS (${detFps} FPS · ${detHits} HITS)`}
-            </span>
-            {showAdvancedByteTrack ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-          </button>
-
-          {showAdvancedByteTrack && (
-            <div
-              className="nvr-subcard"
-              style={{
-                padding: 8,
-                display: "grid",
-                gridTemplateColumns: "repeat(5, minmax(0, 1fr))",
-                gap: 6,
-              }}
-            >
-              <div>
-                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  FPS
-                </div>
-                <input
-                  type="number"
-                  min={1}
-                  max={30}
-                  className="nvr-input mono"
-                  style={{ width: "100%", marginTop: 2 }}
-                  value={activeDetect.fps}
-                  onChange={(e) => updateDetect({ fps: Number(e.target.value) })}
-                />
-              </div>
-              <div>
-                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  Min Hits
-                </div>
-                <input
-                  type="number"
-                  min={1}
-                  max={20}
-                  className="nvr-input mono"
-                  style={{ width: "100%", marginTop: 2 }}
-                  value={activeDetect.min_initialized ?? 2}
-                  onChange={(e) =>
-                    updateDetect({ min_initialized: Number(e.target.value) })
-                  }
-                />
-              </div>
-              <div>
-                <div
-                  className="mono"
-                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
-                  title="Minimum consecutive hits required when camera is in Night IR mode (Spider/Insect flash filter)"
-                >
-                  Night IR Hits
-                </div>
-                <input
-                  type="number"
-                  min={1}
-                  max={25}
-                  className="nvr-input mono"
-                  style={{ width: "100%", marginTop: 2 }}
-                  value={
-                    activeDetect.min_initialized_night ??
-                    (activeDetect.min_initialized ?? 2) + 2
-                  }
-                  onChange={(e) =>
-                    updateDetect({ min_initialized_night: Number(e.target.value) })
-                  }
-                />
-              </div>
-              <div>
-                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  Max Gone
-                </div>
-                <input
-                  type="number"
-                  min={5}
-                  max={200}
-                  className="nvr-input mono"
-                  style={{ width: "100%", marginTop: 2 }}
-                  value={activeDetect.max_disappeared ?? 25}
-                  onChange={(e) =>
-                    updateDetect({ max_disappeared: Number(e.target.value) })
-                  }
-                />
-              </div>
-              <div>
-                <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  Stat. Frames
-                </div>
-                <input
-                  type="number"
-                  min={10}
-                  max={500}
-                  className="nvr-input mono"
-                  style={{ width: "100%", marginTop: 2 }}
-                  value={activeDetect.stationary?.threshold ?? 50}
-                  onChange={(e) =>
-                    updateDetect({
-                      stationary: {
-                        interval: activeDetect.stationary?.interval ?? 50,
-                        threshold: Number(e.target.value),
-                        classifier: activeDetect.stationary?.classifier ?? true,
-                      },
-                    })
-                  }
-                />
-              </div>
-            </div>
-          )}
         </div>
       </div>
+      )}
 
       {/* Tracked Objects & Intuitive Confidence Sliders */}
+      {isAiSubSectionVisible(activeSubSection, "objects") && (
       <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
         <div className="nvr-cfg-card-header">
-          <span>
-            {isPt
-              ? "CLASSES DE OBJETOS MONITORADAS & SENSIBILIDADE DE CONFIANÇA"
-              : "OBJECTS TO DETECT & CONFIDENCE SENSITIVITY"}{" "}
-            ({scope === "global" ? "GLOBAL" : inspectorCam.toUpperCase()})
-          </span>
-          <span className="mono">
-            {trackedLabels.length} {isPt ? "CLASSES ATIVAS" : "ACTIVE CLASSES"}
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>
+              {isPt
+                ? "CLASSES DE OBJETOS MONITORADAS & SENSIBILIDADE DE CONFIANÇA"
+                : "OBJECTS TO DETECT & CONFIDENCE SENSITIVITY"}
+            </span>
+            <span className="nvr-yaml-key-tag">objects.track · objects.filters</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span
+              className={`nvr-scope-pill ${
+                camOrGlobalBadge.isCameraScope ? "is-camera" : "is-global"
+              }`}
+            >
+              {camOrGlobalBadge.label}
+            </span>
+            <span className="nvr-badge live">
+              {trackedLabels.length} {isPt ? "CLASSES ATIVAS" : "ACTIVE CLASSES"}
+            </span>
+          </div>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
@@ -4038,7 +4295,7 @@ export const AiDetectionObjectsSection: React.FC<{
             })}
             <input
               className="nvr-input mono"
-              style={{ width: 140, height: 24, fontSize: "var(--text-xs)" }}
+              style={{ width: 155, height: 24, fontSize: "var(--text-xs)" }}
               placeholder={isPt ? "Outra classe COCO..." : "Custom COCO label..."}
               value={customLabel}
               onChange={(e) => setCustomLabel(e.target.value)}
@@ -4071,20 +4328,34 @@ export const AiDetectionObjectsSection: React.FC<{
               }}
             >
               <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                <span
-                  className="mono"
-                  style={{
-                    fontSize: "var(--text-xs)",
-                    fontWeight: 700,
-                    color: "var(--signal-accent-text)",
-                  }}
-                >
-                  {isPt
-                    ? "ATRIBUTOS FILHOS EM PASSE ÚNICO (FACE, PLACA & LOGOS DE ENTREGA)"
-                    : "ATTRIBUTE LABELS (SINGLE-PASS CHILD BOXES)"}
-                </span>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  <span
+                    className="mono"
+                    style={{
+                      fontSize: "var(--text-xs)",
+                      fontWeight: 700,
+                      color: "var(--signal-accent-text)",
+                    }}
+                  >
+                    {isPt
+                      ? "ATRIBUTOS FILHOS EM PASSE ÚNICO (FACE, PLACA & LOGOS DE ENTREGA)"
+                      : "ATTRIBUTE LABELS (SINGLE-PASS CHILD BOXES)"}
+                  </span>
+                  <span className="nvr-yaml-key-tag">objects.attribute_labels</span>
+                  {isCocoSsdActive && (
+                    <span className="nvr-badge motion">
+                      {isPt
+                        ? "REQUER MODELO YOLO 15 CLASSES"
+                        : "REQUIRES 15-CLASS YOLO MODEL"}
+                    </span>
+                  )}
+                </div>
                 <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  {isPt
+                  {isCocoSsdActive
+                    ? isPt
+                      ? "O modelo atual (MobileNetV2 SSD COCO) detecta objetos primários (person, car). Atributos filhos (face, placa e logos de entrega) entram em operação ao ativar o modelo YOLO de 15 classes."
+                      : "Active model (MobileNetV2 SSD COCO) detects primary classes (person, car). Child attributes (face, license_plate, courier logos) activate when using a 15-Class Security YOLO model."
+                    : isPt
                     ? "Vincula face → person e license_plate/logos → veículos sem criar trilhas avulsas."
                     : "Binds face → person and license_plate/delivery logos → vehicles without spawning standalone tracks."}
                 </span>
@@ -4130,7 +4401,10 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
             </div>
 
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            <div
+              className={isCocoSsdActive ? "nvr-cfg-disabled-zone" : ""}
+              style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}
+            >
               {Array.from(
                 new Set([...DEFAULT_ATTRIBUTE_LABELS, ...attributeLabels])
               ).map((attrLbl) => {
@@ -4140,7 +4414,12 @@ export const AiDetectionObjectsSection: React.FC<{
                     key={attrLbl}
                     type="button"
                     className={`nvr-btn mono ${isActive ? "active" : ""}`}
-                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    style={{
+                      height: 24,
+                      padding: "0 8px",
+                      fontSize: "var(--text-xs)",
+                      borderStyle: isCocoSsdActive ? "dashed" : "solid",
+                    }}
                     onClick={() => toggleAttributeLabel(attrLbl)}
                   >
                     {isActive ? `✓ ${attrLbl}` : `+ ${attrLbl}`}
@@ -4157,17 +4436,33 @@ export const AiDetectionObjectsSection: React.FC<{
                   <Sparkles size={12} />
                   {isPt ? "2. CALIBRAR CLASSE ATIVA:" : "2. TUNE ACTIVE CLASS:"}
                 </span>
-                {trackedLabels.map((lbl) => (
-                  <button
-                    key={lbl}
-                    type="button"
-                    className={`nvr-btn mono ${selectedFilterLabel === lbl ? "active" : ""}`}
-                    style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
-                    onClick={() => setSelectedFilterLabel(lbl)}
-                  >
-                    {lbl}
-                  </button>
-                ))}
+                {trackedLabels.map((lbl) => {
+                  const clsFilter =
+                    (scope === "global"
+                      ? draftConfig.objects?.filters?.[lbl]
+                      : draftConfig.cameras?.[inspectorCam]?.objects?.filters?.[lbl]) || {
+                      threshold: 0.7,
+                    };
+                  const pct = Math.round((clsFilter.threshold ?? 0.7) * 100);
+                  return (
+                    <button
+                      key={lbl}
+                      type="button"
+                      className={`nvr-btn mono ${selectedFilterLabel === lbl ? "active" : ""}`}
+                      style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                      onClick={() => setSelectedFilterLabel(lbl)}
+                    >
+                      {lbl} ({pct}%)
+                    </button>
+                  );
+                })}
+                {trackedLabels.length === 1 && (
+                  <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
+                    {isPt
+                      ? "(Ative mais classes no Passo 1 para calibrá-las individualmente)"
+                      : "(Enable additional classes in Step 1 to tune them individually)"}
+                  </span>
+                )}
               </div>
 
               <div style={{ display: "flex", gap: 5, alignItems: "center", flexWrap: "wrap" }}>
@@ -4355,29 +4650,50 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
         </div>
       </div>
+      )}
 
       {/* Vision AI Judge (genai) Configuration Card */}
+      {isAiSubSectionVisible(activeSubSection, "genai") && (
       <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
         <div className="nvr-cfg-card-header">
-          <span>
-            {isPt
-              ? "JUIZ DE IA VISUAL (GENAI) — AUDITORIA DE ALERTAS AMBÍGUOS & FALSOS POSITIVOS"
-              : "VISION AI JUDGE (GENAI) — AMBIGUOUS ALERT VERIFICATION & AUTO-SUPPRESSION"}
-          </span>
-          <span
-            className={`nvr-badge ${
-              genaiCfg.enabled && Boolean(genaiCfg.model) ? "live" : ""
-            }`}
-          >
-            <Sparkles size={11} />
-            {(genaiCfg.provider || "gemini").toUpperCase()} ·{" "}
-            {genaiCfg.model
-              ? genaiCfg.model
-              : isPt
-              ? "MODELO NÃO SELECIONADO"
-              : "NO MODEL SELECTED"}{" "}
-            · {genaiCfg.enabled ? "ACTIVE" : "STANDBY"}
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>
+              {isPt
+                ? "JUIZ DE IA VISUAL (GENAI) — AUDITORIA DE ALERTAS AMBÍGUOS & AUTO-SUPRESSÃO"
+                : "VISION AI JUDGE (GENAI) — AMBIGUOUS ALERT VERIFICATION & AUTO-SUPPRESSION"}
+            </span>
+            <span className="nvr-yaml-key-tag">genai</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span className="nvr-scope-pill is-global">{globalScopeBadge.label}</span>
+            <span
+              className={`nvr-badge ${
+                genaiCfg.enabled && Boolean(genaiCfg.model)
+                  ? "live"
+                  : genaiCfg.enabled
+                  ? "motion"
+                  : ""
+              }`}
+            >
+              <Sparkles size={11} />
+              {(genaiCfg.provider || "gemini").toUpperCase()} ·{" "}
+              {genaiCfg.model
+                ? genaiCfg.model
+                : isPt
+                ? "MODELO NÃO SELECIONADO"
+                : "NO MODEL SELECTED"}{" "}
+              ·{" "}
+              {genaiCfg.enabled
+                ? genaiCfg.verify_ambiguous_alerts
+                  ? "ACTIVE"
+                  : isPt
+                  ? "ATIVO (AUTO-VERIFICAÇÃO OFF)"
+                  : "ACTIVE (AUTO-VERIFY OFF)"
+                : isPt
+                ? "EM ESPERA (OFF)"
+                : "STANDBY (OFF)"}
+            </span>
+          </div>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 8 }}>
           <div className="nvr-field-row" style={{ padding: "4px 0" }}>
@@ -4389,8 +4705,8 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
               <div className="nvr-field-desc">
                 {isPt
-                  ? "Fluxo guiado: 1. Escolha o provedor → 2. Configure a API → 3. Valide a API → 4. Selecione o Vision Model carregado."
-                  : "Guided flow: 1. Choose provider → 2. Configure API → 3. Validate API → 4. Select available Vision Model from dropdown."}
+                  ? "Fluxo guiado: 1. Provedor → 2. Credencial API (Chave direta ou Variável Env) → 3. Validar API → 4. Modelo Visual."
+                  : "Guided flow: 1. Provider → 2. API Credential (Direct Key or Env Var fallback) → 3. Validate API → 4. Vision Model."}
               </div>
             </div>
             <ToggleSwitch
@@ -4401,402 +4717,493 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
 
           <div
-            style={{
-              display: "grid",
-              gridTemplateColumns:
-                "minmax(0, 1fr) minmax(0, 1.15fr) minmax(0, 0.9fr) minmax(0, 1.35fr)",
-              gap: 8,
-              alignItems: "end",
-            }}
+            className={!genaiCfg.enabled ? "nvr-cfg-disabled-zone" : ""}
+            style={{ display: "flex", flexDirection: "column", gap: 8 }}
           >
-            <div>
-              <div
-                className="mono"
-                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
-              >
-                {isPt ? "1. Provedor (provider)" : "1. Provider"}
-              </div>
-              <select
-                className="nvr-select mono"
-                aria-label="Vision AI Judge Provider"
-                style={{ width: "100%", marginTop: 2 }}
-                value={genaiCfg.provider || "gemini"}
-                onChange={(e) => {
-                  updateGenAi(
-                    buildGenAiProviderChangePatch(e.target.value, genaiCfg.base_url)
-                  );
-                  setGenaiModels([]);
-                  setGenaiValidationState({ status: "idle" });
-                }}
-              >
-                <option value="gemini">Google Gemini (gemini)</option>
-                <option value="openai">OpenAI / Compatible (openai)</option>
-                <option value="ollama">Local Ollama (ollama)</option>
-              </select>
-            </div>
-
-            <div>
-              <div
-                className="mono"
-                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
-              >
-                {isPt ? "2. Chave da API (api_key)" : "2. API Key"}
-                {genaiCfg.has_api_key ? " (Saved)" : ""}
-              </div>
-              <div style={{ display: "flex", gap: 4, marginTop: 2 }}>
-                <input
-                  type="password"
-                  className="nvr-input mono"
-                  aria-label="Vision AI Judge API Key"
-                  style={{ flex: 1, minWidth: 0, width: "100%" }}
-                  placeholder={
-                    genaiCfg.has_api_key
-                      ? "•••••••• (saved key)"
-                      : genaiCfg.provider === "ollama"
-                      ? isPt
-                        ? "Opcional (Ollama local)"
-                        : "Optional (Local Ollama)"
-                      : isPt
-                      ? `Cole a chave ou use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
-                      : `Paste key or use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
-                  }
-                  value={
-                    genaiCfg.api_key === "***" ? "" : genaiCfg.api_key || ""
-                  }
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns:
+                  "minmax(0, 1fr) minmax(0, 1.15fr) minmax(0, 0.95fr) minmax(0, 1.3fr)",
+                gap: 8,
+                alignItems: "end",
+              }}
+            >
+              <div>
+                <div
+                  className="mono"
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                >
+                  {isPt ? "1. Provedor LLM" : "1. Provider"}
+                </div>
+                <select
+                  className="nvr-select mono"
+                  aria-label="Vision AI Judge Provider"
+                  style={{ width: "100%", marginTop: 2 }}
+                  value={genaiCfg.provider || "gemini"}
                   onChange={(e) => {
-                    const val = e.target.value;
-                    updateGenAi({
-                      api_key: val || (genaiCfg.has_api_key ? "***" : null),
-                      clear_api_key: false,
-                      model: "",
-                    });
+                    updateGenAi(
+                      buildGenAiProviderChangePatch(e.target.value, genaiCfg.base_url)
+                    );
                     setGenaiModels([]);
                     setGenaiValidationState({ status: "idle" });
                   }}
-                />
-                {(genaiCfg.has_api_key ||
-                  (genaiCfg.api_key && genaiCfg.api_key !== "")) && (
-                  <button
-                    type="button"
-                    className="nvr-btn danger mono"
-                    style={{ padding: "0 7px", fontSize: "var(--text-xs)" }}
-                    title="Clear saved Vision AI Judge API key"
-                    aria-label="Clear Vision AI Judge API Key"
-                    onClick={() => {
+                >
+                  <option value="gemini">Google Gemini (gemini)</option>
+                  <option value="openai">OpenAI / Compatible (openai)</option>
+                  <option value="ollama">Local Ollama (ollama)</option>
+                </select>
+              </div>
+
+              <div>
+                <div
+                  className="mono"
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                >
+                  {isPt ? "2A. Chave da API Direta" : "2A. Direct API Key"}
+                  {genaiCfg.has_api_key
+                    ? isPt
+                      ? " (Salva)"
+                      : " (Saved)"
+                    : ""}
+                </div>
+                <div style={{ display: "flex", gap: 4, marginTop: 2 }}>
+                  <input
+                    type="password"
+                    className="nvr-input mono"
+                    aria-label="Vision AI Judge API Key"
+                    style={{ flex: 1, minWidth: 0, width: "100%" }}
+                    placeholder={
+                      genaiCfg.has_api_key
+                        ? isPt
+                          ? "•••••••• (chave salva)"
+                          : "•••••••• (saved key)"
+                        : genaiCfg.provider === "ollama"
+                        ? isPt
+                          ? "Opcional (Ollama local)"
+                          : "Optional (Local Ollama)"
+                        : isPt
+                        ? `Cole a chave ou use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
+                        : `Paste key or use ${genaiCfg.api_key_env || "GEMINI_API_KEY"}`
+                    }
+                    value={
+                      genaiCfg.api_key === "***" ? "" : genaiCfg.api_key || ""
+                    }
+                    onChange={(e) => {
+                      const val = e.target.value;
                       updateGenAi({
-                        api_key: null,
-                        has_api_key: false,
-                        clear_api_key: true,
+                        api_key: val || (genaiCfg.has_api_key ? "***" : null),
+                        clear_api_key: false,
                         model: "",
                       });
                       setGenaiModels([]);
                       setGenaiValidationState({ status: "idle" });
                     }}
-                  >
-                    ×
-                  </button>
-                )}
+                  />
+                  {(genaiCfg.has_api_key ||
+                    (genaiCfg.api_key && genaiCfg.api_key !== "")) && (
+                    <button
+                      type="button"
+                      className="nvr-btn danger mono"
+                      style={{ padding: "0 7px", fontSize: "var(--text-xs)" }}
+                      title={
+                        isPt
+                          ? "Limpar chave da API salva"
+                          : "Clear saved Vision AI Judge API key"
+                      }
+                      aria-label="Clear Vision AI Judge API Key"
+                      onClick={() => {
+                        updateGenAi({
+                          api_key: null,
+                          has_api_key: false,
+                          clear_api_key: true,
+                          model: "",
+                        });
+                        setGenaiModels([]);
+                        setGenaiValidationState({ status: "idle" });
+                      }}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div>
+                <div
+                  className="mono"
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                >
+                  {isPt ? "2B. Variável Env (Fallback)" : "2B. Fallback Env Var"}
+                </div>
+                <input
+                  className="nvr-input mono"
+                  aria-label="Vision AI Judge API Key Env"
+                  style={{ width: "100%", marginTop: 2 }}
+                  placeholder={
+                    genaiCfg.provider === "openai"
+                      ? "OPENAI_API_KEY"
+                      : genaiCfg.provider === "ollama"
+                      ? "OLLAMA_API_KEY"
+                      : "GEMINI_API_KEY"
+                  }
+                  value={genaiCfg.api_key_env}
+                  onChange={(e) => {
+                    updateGenAi({ api_key_env: e.target.value });
+                    setGenaiValidationState({ status: "idle" });
+                  }}
+                />
+              </div>
+
+              <div>
+                <div
+                  className="mono"
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                >
+                  {isPt
+                    ? "2C. Endpoint Base URL (Opcional)"
+                    : "2C. Endpoint Base URL (Optional)"}
+                </div>
+                <input
+                  className="nvr-input mono"
+                  aria-label="Vision AI Judge Base URL"
+                  style={{ width: "100%", marginTop: 2 }}
+                  placeholder={
+                    genaiCfg.provider === "ollama"
+                      ? "http://127.0.0.1:11434"
+                      : isPt
+                      ? "Opcional (Proxy LLM / OpenRouter)..."
+                      : "Optional endpoint override (LLM proxy)..."
+                  }
+                  value={genaiCfg.base_url || ""}
+                  onChange={(e) => {
+                    updateGenAi({
+                      base_url: e.target.value.trim() ? e.target.value.trim() : null,
+                    });
+                    setGenaiValidationState({ status: "idle" });
+                  }}
+                />
               </div>
             </div>
 
-            <div>
-              <div
-                className="mono"
-                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
-              >
-                {isPt ? "Variável Env (api_key_env)" : "API Key Env Var"}
-              </div>
-              <input
-                className="nvr-input mono"
-                aria-label="Vision AI Judge API Key Env"
-                style={{ width: "100%", marginTop: 2 }}
-                placeholder={
-                  genaiCfg.provider === "openai"
-                    ? "OPENAI_API_KEY"
-                    : genaiCfg.provider === "ollama"
-                    ? "OLLAMA_API_KEY"
-                    : "GEMINI_API_KEY"
-                }
-                value={genaiCfg.api_key_env}
-                onChange={(e) => {
-                  updateGenAi({ api_key_env: e.target.value });
-                  setGenaiValidationState({ status: "idle" });
-                }}
-              />
-            </div>
-
-            <div>
-              <div
-                className="mono"
-                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
-              >
-                {isPt
-                  ? "Custom Endpoint Base URL (LLM Proxy)"
-                  : "Custom Endpoint Base URL"}
-              </div>
-              <input
-                className="nvr-input mono"
-                aria-label="Vision AI Judge Base URL"
-                style={{ width: "100%", marginTop: 2 }}
-                placeholder={
-                  genaiCfg.provider === "ollama"
-                    ? "http://127.0.0.1:11434"
-                    : isPt
-                    ? "Opcional (Proxy LLM / OpenRouter / LiteLLM)..."
-                    : "Optional endpoint override (LLM proxy)..."
-                }
-                value={genaiCfg.base_url || ""}
-                onChange={(e) => {
-                  updateGenAi({
-                    base_url: e.target.value.trim() ? e.target.value.trim() : null,
-                  });
-                  setGenaiValidationState({ status: "idle" });
-                }}
-              />
-            </div>
-          </div>
-
-          <div
-            className="nvr-subcard"
-            style={{
-              padding: "8px 10px",
-              display: "grid",
-              gridTemplateColumns: "auto minmax(0, 1fr)",
-              gap: 10,
-              alignItems: "end",
-            }}
-          >
-            <div>
-              <div
-                className="mono"
-                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
-              >
-                {isPt ? "3. Validar API & Buscar Modelos" : "3. Validate API & Fetch Models"}
-              </div>
-              <button
-                type="button"
-                className={`nvr-btn mono ${
-                  genaiValidationState.status === "valid" ? "success" : "primary"
-                }`}
-                aria-label="Validate Vision AI Judge API"
-                style={{
-                  marginTop: 2,
-                  height: 28,
-                  padding: "0 12px",
-                  whiteSpace: "nowrap",
-                  fontSize: "var(--text-xs)",
-                }}
-                disabled={genaiValidating}
-                onClick={() => void handleValidateGenAiApi()}
-              >
-                <CheckCircle2 size={12} />
-                {genaiValidating
-                  ? isPt
-                    ? "Validando API..."
-                    : "Validating API..."
-                  : genaiValidationState.status === "valid"
-                  ? isPt
-                    ? `API Validada (${genaiModels.length} modelos)`
-                    : `API Validated (${genaiModels.length} models)`
-                  : isPt
-                  ? "Validar API & Carregar Modelos"
-                  : "Validate API & Load Models"}
-              </button>
-            </div>
-
-            <div>
-              <div
-                className="mono"
-                style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
-              >
-                {isPt
-                  ? "4. Modelo Visual (selecione após validar)"
-                  : "4. Vision Model (select after API validation)"}
-              </div>
-              <select
-                className="nvr-select mono"
-                aria-label="Vision AI Judge Model"
-                style={{ width: "100%", marginTop: 2 }}
-                disabled={genaiModelOptions.length === 0}
-                value={
-                  genaiModelOptions.includes(genaiCfg.model)
-                    ? genaiCfg.model
-                    : ""
-                }
-                onChange={(e) => updateGenAi({ model: e.target.value })}
-              >
-                <option value="">
-                  {genaiModelOptions.length === 0
+            <div
+              className="nvr-subcard"
+              style={{
+                padding: "8px 10px",
+                display: "grid",
+                gridTemplateColumns: "auto minmax(0, 1fr)",
+                gap: 10,
+                alignItems: "end",
+              }}
+            >
+              <div>
+                <div
+                  className="mono"
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                >
+                  {isPt ? "3. Validar API & Buscar Modelos" : "3. Validate API & Fetch Models"}
+                </div>
+                <button
+                  type="button"
+                  className={`nvr-btn mono ${
+                    genaiValidationState.status === "valid" || Boolean(genaiCfg.model)
+                      ? "success"
+                      : "primary"
+                  }`}
+                  aria-label="Validate Vision AI Judge API"
+                  style={{
+                    marginTop: 2,
+                    height: 28,
+                    padding: "0 12px",
+                    whiteSpace: "nowrap",
+                    fontSize: "var(--text-xs)",
+                  }}
+                  disabled={genaiValidating}
+                  onClick={() => void handleValidateGenAiApi()}
+                >
+                  <CheckCircle2 size={12} />
+                  {genaiValidating
                     ? isPt
-                      ? "— Valide a API para carregar os modelos disponíveis —"
-                      : "— Validate API to load available models —"
+                      ? "Validando API..."
+                      : "Validating API..."
+                    : genaiValidationState.status === "valid"
+                    ? isPt
+                      ? `API Validada (${genaiModels.length} modelos)`
+                      : `API Validated (${genaiModels.length} models)`
+                    : genaiCfg.model
+                    ? isPt
+                      ? "Revalidar API & Atualizar Lista"
+                      : "Re-Validate API & Refresh List"
                     : isPt
-                    ? `— Escolha o Vision Model na lista (${genaiModelOptions.length} disponíveis) —`
-                    : `— Select Vision Model from list (${genaiModelOptions.length} available) —`}
-                </option>
-                {genaiModelOptions.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
+                    ? "Validar API & Carregar Modelos"
+                    : "Validate API & Load Models"}
+                </button>
+              </div>
+
+              <div>
+                <div
+                  className="mono"
+                  style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
+                >
+                  {isPt
+                    ? "4. Modelo Visual Ativo"
+                    : "4. Active Vision Model"}
+                </div>
+                <select
+                  className="nvr-select mono"
+                  aria-label="Vision AI Judge Model"
+                  style={{ width: "100%", marginTop: 2 }}
+                  disabled={genaiModelOptions.length === 0}
+                  value={
+                    genaiModelOptions.includes(genaiCfg.model)
+                      ? genaiCfg.model
+                      : ""
+                  }
+                  onChange={(e) => updateGenAi({ model: e.target.value })}
+                >
+                  <option value="">
+                    {genaiModelOptions.length === 0
+                      ? isPt
+                        ? "— Valide a API no Passo 3 para carregar os modelos —"
+                        : "— Validate API in Step 3 to load available models —"
+                      : isPt
+                      ? `— Escolha o Vision Model na lista (${genaiModelOptions.length} disponíveis) —`
+                      : `— Select Vision Model from list (${genaiModelOptions.length} available) —`}
                   </option>
-                ))}
-              </select>
+                  {genaiModelOptions.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
-          </div>
 
-          {genaiValidationState.status !== "idle" &&
-            genaiValidationState.message && (
+            {genaiValidationState.status !== "idle" &&
+              genaiValidationState.message && (
+                <div
+                  className="mono"
+                  style={{
+                    padding: "5px 8px",
+                    borderRadius: 3,
+                    fontSize: "var(--text-xs)",
+                    background:
+                      genaiValidationState.status === "valid"
+                        ? "rgba(16, 185, 129, 0.12)"
+                        : "rgba(239, 68, 68, 0.12)",
+                    border:
+                      genaiValidationState.status === "valid"
+                        ? "1px solid rgba(16, 185, 129, 0.4)"
+                        : "1px solid rgba(239, 68, 68, 0.4)",
+                    color:
+                      genaiValidationState.status === "valid"
+                        ? "var(--signal-live-text)"
+                        : "var(--signal-alert-text)",
+                  }}
+                >
+                  {genaiValidationState.message}
+                </div>
+              )}
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                gap: 12,
+                paddingTop: 4,
+              }}
+            >
+              <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+                <div className="nvr-field-meta">
+                  <div className="nvr-field-label">
+                    {isPt
+                      ? "Auditar Alertas Ambíguos Automaticamente"
+                      : "Auto-Verify Ambiguous Alerts"}
+                  </div>
+                  <div className="nvr-field-desc">
+                    {isPt
+                      ? `Aciona o Juiz de IA quando a pontuação cair na faixa [${Math.round(
+                          (genaiCfg.ambiguous_score_min ?? 0.45) * 100
+                        )}%, ${Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}%].`
+                      : `Triggers Vision AI Judge when score falls in [${Math.round(
+                          (genaiCfg.ambiguous_score_min ?? 0.45) * 100
+                        )}%, ${Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}%].`}
+                  </div>
+                </div>
+                <ToggleSwitch
+                  checked={genaiCfg.verify_ambiguous_alerts}
+                  label="Verify Ambiguous Alerts"
+                  onChange={(v) => updateGenAi({ verify_ambiguous_alerts: v })}
+                />
+              </div>
+
               <div
-                className="mono"
-                style={{
-                  padding: "5px 8px",
-                  borderRadius: 3,
-                  fontSize: "var(--text-xs)",
-                  background:
-                    genaiValidationState.status === "valid"
-                      ? "rgba(16, 185, 129, 0.12)"
-                      : "rgba(239, 68, 68, 0.12)",
-                  border:
-                    genaiValidationState.status === "valid"
-                      ? "1px solid rgba(16, 185, 129, 0.4)"
-                      : "1px solid rgba(239, 68, 68, 0.4)",
-                  color:
-                    genaiValidationState.status === "valid"
-                      ? "var(--signal-live-text)"
-                      : "var(--signal-alert-text)",
-                }}
+                className={`nvr-field-row ${
+                  !genaiCfg.verify_ambiguous_alerts ? "nvr-cfg-disabled-zone" : ""
+                }`}
+                style={{ borderBottom: "none", padding: "2px 0" }}
               >
-                {genaiValidationState.message}
-              </div>
-            )}
-
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-              gap: 12,
-              paddingTop: 4,
-            }}
-          >
-            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
-              <div className="nvr-field-meta">
-                <div className="nvr-field-label">
-                  {isPt
-                    ? "Auditar Alertas Ambíguos Automaticamente"
-                    : "Auto-Verify Ambiguous Alerts"}
+                <div className="nvr-field-meta">
+                  <div className="nvr-field-label">
+                    {isPt
+                      ? "Auto-Suprimir Falsos Positivos Rejeitados"
+                      : "Auto-Suppress Rejected False Positives"}
+                  </div>
+                  <div className="nvr-field-desc">
+                    {isPt
+                      ? "Grava assinatura espacial + dhash64 no SQLite quando a IA rejeita o alerta."
+                      : "Persists spatial IoU + dhash64 signature in SQLite when AI rejects a detection."}
+                  </div>
                 </div>
-                <div className="nvr-field-desc">
-                  {isPt
-                    ? `Aciona o Juiz de IA quando a pontuação cair na faixa [${Math.round(
-                        (genaiCfg.ambiguous_score_min ?? 0.45) * 100
-                      )}%, ${Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}%].`
-                    : `Triggers Vision AI Judge when score falls in [${Math.round(
-                        (genaiCfg.ambiguous_score_min ?? 0.45) * 100
-                      )}%, ${Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}%].`}
-                </div>
+                <ToggleSwitch
+                  checked={genaiCfg.auto_suppress_false_positives}
+                  label="Auto-Suppress False Positives"
+                  onChange={(v) => updateGenAi({ auto_suppress_false_positives: v })}
+                />
               </div>
-              <ToggleSwitch
-                checked={genaiCfg.verify_ambiguous_alerts}
-                label="Verify Ambiguous Alerts"
-                onChange={(v) => updateGenAi({ verify_ambiguous_alerts: v })}
-              />
             </div>
 
-            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
-              <div className="nvr-field-meta">
-                <div className="nvr-field-label">
-                  {isPt
-                    ? "Auto-Suprimir Falsos Positivos Rejeitados"
-                    : "Auto-Suppress Rejected False Positives"}
+            <div
+              className={!genaiCfg.verify_ambiguous_alerts ? "nvr-cfg-disabled-zone" : ""}
+              style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}
+            >
+              <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+                <div className="nvr-field-meta">
+                  <div className="nvr-field-label mono">
+                    {isPt ? "Pontuação Ambígua Mín" : "Ambiguous Score Min"} (
+                    {Math.round((genaiCfg.ambiguous_score_min ?? 0.45) * 100)}%)
+                    {!genaiCfg.verify_ambiguous_alerts && (
+                      <span className="nvr-yaml-key-tag">
+                        {isPt ? "Auto-Verify desligado" : "Auto-Verify OFF"}
+                      </span>
+                    )}
+                  </div>
                 </div>
-                <div className="nvr-field-desc">
-                  {isPt
-                    ? "Grava assinatura espacial + dhash64 no SQLite quando a IA rejeita o alerta."
-                    : "Persists spatial IoU + dhash64 signature in SQLite when AI rejects a detection."}
-                </div>
+                <input
+                  type="range"
+                  min={25}
+                  max={80}
+                  disabled={!genaiCfg.verify_ambiguous_alerts}
+                  aria-label="Ambiguous Score Minimum"
+                  value={Math.round((genaiCfg.ambiguous_score_min ?? 0.45) * 100)}
+                  onChange={(e) =>
+                    updateGenAi({
+                      ambiguous_score_min: Number(
+                        (Number(e.target.value) / 100).toFixed(2)
+                      ),
+                    })
+                  }
+                />
               </div>
-              <ToggleSwitch
-                checked={genaiCfg.auto_suppress_false_positives}
-                label="Auto-Suppress False Positives"
-                onChange={(v) => updateGenAi({ auto_suppress_false_positives: v })}
-              />
-            </div>
-          </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
-            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
-              <div className="nvr-field-meta">
-                <div className="nvr-field-label mono">
-                  Ambiguous Score Min ({Math.round((genaiCfg.ambiguous_score_min ?? 0.45) * 100)}%)
+              <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+                <div className="nvr-field-meta">
+                  <div className="nvr-field-label mono">
+                    {isPt ? "Pontuação Ambígua Máx" : "Ambiguous Score Max"} (
+                    {Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}%)
+                    {!genaiCfg.verify_ambiguous_alerts && (
+                      <span className="nvr-yaml-key-tag">
+                        {isPt ? "Auto-Verify desligado" : "Auto-Verify OFF"}
+                      </span>
+                    )}
+                  </div>
                 </div>
+                <input
+                  type="range"
+                  min={40}
+                  max={95}
+                  disabled={!genaiCfg.verify_ambiguous_alerts}
+                  aria-label="Ambiguous Score Maximum"
+                  value={Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}
+                  onChange={(e) =>
+                    updateGenAi({
+                      ambiguous_score_max: Number(
+                        (Number(e.target.value) / 100).toFixed(2)
+                      ),
+                    })
+                  }
+                />
               </div>
-              <input
-                type="range"
-                min={25}
-                max={80}
-                aria-label="Ambiguous Score Minimum"
-                value={Math.round((genaiCfg.ambiguous_score_min ?? 0.45) * 100)}
-                onChange={(e) =>
-                  updateGenAi({
-                    ambiguous_score_min: Number(
-                      (Number(e.target.value) / 100).toFixed(2)
-                    ),
-                  })
-                }
-              />
-            </div>
-
-            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
-              <div className="nvr-field-meta">
-                <div className="nvr-field-label mono">
-                  Ambiguous Score Max ({Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}%)
-                </div>
-              </div>
-              <input
-                type="range"
-                min={40}
-                max={95}
-                aria-label="Ambiguous Score Maximum"
-                value={Math.round((genaiCfg.ambiguous_score_max ?? 0.72) * 100)}
-                onChange={(e) =>
-                  updateGenAi({
-                    ambiguous_score_max: Number(
-                      (Number(e.target.value) / 100).toFixed(2)
-                    ),
-                  })
-                }
-              />
             </div>
           </div>
         </div>
       </div>
+      )}
 
       {/* Active False-Positive Memory Signatures Table */}
+      {isAiSubSectionVisible(activeSubSection, "genai") && (
       <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
         <div className="nvr-cfg-card-header">
-          <span>
-            {isPt
-              ? "MEMÓRIA DE FALSOS POSITIVOS ATIVA (ASSINATURAS ESPACIAIS + DHASH64)"
-              : "ACTIVE FALSE-POSITIVE MEMORY SIGNATURES (SPATIAL IOU >= 0.72 + DHASH64 <= 12)"}
-          </span>
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span className="mono">{fpSignatures.length} SIGNATURES</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>
+              {isPt
+                ? "MEMÓRIA DE FALSOS POSITIVOS ATIVA"
+                : "ACTIVE FALSE-POSITIVE MEMORY SIGNATURES"}
+            </span>
+            <span className="nvr-yaml-key-tag">IoU &gt;= 0.72 · dhash64 &lt;= 12</span>
+            <span className="nvr-yaml-key-tag">SQLite Live DB</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            {scope !== "global" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <button
+                  type="button"
+                  className={`nvr-btn mono ${fpFilterMode === "scope" ? "active" : ""}`}
+                  style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                  onClick={() => setFpFilterMode("scope")}
+                >
+                  {inspectorCam.toUpperCase()} (
+                  {
+                    filterFalsePositiveSignaturesByScope(
+                      fpSignatures,
+                      scope,
+                      inspectorCam,
+                      "scope"
+                    ).length
+                  }
+                  )
+                </button>
+                <button
+                  type="button"
+                  className={`nvr-btn mono ${fpFilterMode === "all" ? "active" : ""}`}
+                  style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                  onClick={() => setFpFilterMode("all")}
+                >
+                  {isPt ? "TODAS" : "ALL CAMERAS"} ({fpSignatures.length})
+                </button>
+              </div>
+            )}
+            <span className="mono">
+              {filteredFpSignatures.length}{" "}
+              {isPt ? "ASSINATURAS" : "SIGNATURES"}
+            </span>
             <button
               type="button"
               className="nvr-btn mono"
               style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
               onClick={() => void loadFpSignatures()}
             >
-              {fpLoading ? "Refreshing..." : "Refresh"}
+              {fpLoading
+                ? isPt
+                  ? "Atualizando..."
+                  : "Refreshing..."
+                : isPt
+                ? "Atualizar"
+                : "Refresh"}
             </button>
           </div>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 6 }}>
-          {fpSignatures.length === 0 ? (
+          {filteredFpSignatures.length === 0 ? (
             <div
               className="mono"
               style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}
             >
-              {isPt
+              {fpSignatures.length > 0 && scope !== "global" && fpFilterMode === "scope"
+                ? isPt
+                  ? `Nenhuma assinatura de falso positivo em ${inspectorCam.toUpperCase()}. Clique em "TODAS (${fpSignatures.length})" acima para ver assinaturas de outras câmeras.`
+                  : `No false-positive signatures recorded on ${inspectorCam.toUpperCase()}. Click "ALL CAMERAS (${fpSignatures.length})" above to view signatures across other cameras.`
+                : isPt
                 ? "Nenhuma assinatura de falso positivo aprendida ainda. Marque um evento como Falso Positivo na aba Explorar para suprimir recorrências instantaneamente."
                 : "No learned false-positive signatures yet. Mark an event as False Positive in Explore or via the Vision AI Judge to suppress recurring static triggers at 0ms."}
             </div>
@@ -4819,79 +5226,157 @@ export const AiDetectionObjectsSection: React.FC<{
                       borderBottom: "1px solid var(--border-hairline)",
                     }}
                   >
-                    <th style={{ padding: "4px 6px" }}>CAMERA</th>
-                    <th style={{ padding: "4px 6px" }}>LABEL</th>
-                    <th style={{ padding: "4px 6px" }}>NORM BBOX</th>
+                    <th style={{ padding: "4px 6px" }}>
+                      {isPt ? "CÂMERA" : "CAMERA"}
+                    </th>
+                    <th style={{ padding: "4px 6px" }}>
+                      {isPt ? "CLASSE" : "LABEL"}
+                    </th>
+                    <th style={{ padding: "4px 6px" }}>
+                      {isPt ? "REGIÃO (NORM BBOX)" : "SPATIAL BBOX"}
+                    </th>
                     <th style={{ padding: "4px 6px" }}>DHASH64</th>
                     <th style={{ padding: "4px 6px" }}>HITS</th>
-                    <th style={{ padding: "4px 6px" }}>LAST SEEN</th>
-                    <th style={{ padding: "4px 6px" }}>REASON</th>
-                    <th style={{ padding: "4px 6px", textAlign: "right" }}>ACTION</th>
+                    <th style={{ padding: "4px 6px" }}>
+                      {isPt ? "ÚLTIMA VEZ" : "LAST SEEN"}
+                    </th>
+                    <th style={{ padding: "4px 6px" }}>
+                      {isPt ? "MOTIVO / AUDITORIA" : "REASON"}
+                    </th>
+                    <th style={{ padding: "4px 6px", textAlign: "right" }}>
+                      {isPt ? "AÇÃO" : "ACTION"}
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {fpSignatures.map((sig) => (
-                    <tr
-                      key={sig.id}
-                      style={{ borderBottom: "1px solid var(--border-hairline)" }}
-                    >
-                      <td style={{ padding: "5px 6px", fontWeight: 700 }}>
-                        {sig.camera.toUpperCase()}
-                      </td>
-                      <td style={{ padding: "5px 6px" }}>{sig.label.toUpperCase()}</td>
-                      <td style={{ padding: "5px 6px" }}>
-                        {formatSignatureBbox(sig.norm_bbox)}
-                      </td>
-                      <td style={{ padding: "5px 6px" }}>
-                        {formatDhash64Hex(sig.dhash64)}
-                      </td>
-                      <td style={{ padding: "5px 6px" }}>{sig.hit_count}</td>
-                      <td style={{ padding: "5px 6px" }}>
-                        {formatDateTime(sig.last_seen_at)}
-                      </td>
-                      <td
-                        style={{
-                          padding: "5px 6px",
-                          color: "var(--text-secondary)",
-                          maxWidth: 260,
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                        }}
+                  {filteredFpSignatures.map((sig) => {
+                    const bx = Number.isFinite(sig.norm_bbox?.[0])
+                      ? Math.max(0, Math.min(0.95, sig.norm_bbox[0]))
+                      : 0;
+                    const by = Number.isFinite(sig.norm_bbox?.[1])
+                      ? Math.max(0, Math.min(0.95, sig.norm_bbox[1]))
+                      : 0;
+                    const bw = Number.isFinite(sig.norm_bbox?.[2])
+                      ? Math.max(0.05, Math.min(1 - bx, sig.norm_bbox[2]))
+                      : 0.2;
+                    const bh = Number.isFinite(sig.norm_bbox?.[3])
+                      ? Math.max(0.05, Math.min(1 - by, sig.norm_bbox[3]))
+                      : 0.2;
+                    const formattedReason = formatFalsePositiveReason(
+                      sig.reason,
+                      sig.dominant_color,
+                      isPt
+                    );
+                    return (
+                      <tr
+                        key={sig.id}
+                        style={{ borderBottom: "1px solid var(--border-hairline)" }}
                       >
-                        {sig.reason || sig.dominant_color || "operator_marked"}
-                      </td>
-                      <td style={{ padding: "5px 6px", textAlign: "right" }}>
-                        <button
-                          type="button"
-                          className="nvr-btn danger mono"
-                          style={{ height: 22, padding: "0 6px" }}
-                          aria-label={`Delete false-positive signature ${sig.id}`}
-                          onClick={() => void handleDeleteFpSignature(sig.id)}
+                        <td style={{ padding: "5px 6px", fontWeight: 700, whiteSpace: "nowrap" }}>
+                          {sig.camera.toUpperCase()}
+                        </td>
+                        <td style={{ padding: "5px 6px", whiteSpace: "nowrap" }}>
+                          {sig.label.toUpperCase()}
+                        </td>
+                        <td style={{ padding: "5px 6px", whiteSpace: "nowrap" }}>
+                          <div style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                            <svg
+                              width="32"
+                              height="18"
+                              viewBox="0 0 32 18"
+                              aria-hidden="true"
+                              style={{
+                                background: "var(--bg-input)",
+                                border: "1px solid var(--border-strong)",
+                                borderRadius: 2,
+                                flexShrink: 0,
+                              }}
+                            >
+                              <rect
+                                x={bx * 32}
+                                y={by * 18}
+                                width={Math.max(2, bw * 32)}
+                                height={Math.max(2, bh * 18)}
+                                fill="rgba(245, 158, 11, 0.35)"
+                                stroke="var(--signal-motion)"
+                                strokeWidth="1"
+                              />
+                            </svg>
+                            <span>{formatSignatureBbox(sig.norm_bbox)}</span>
+                          </div>
+                        </td>
+                        <td style={{ padding: "5px 6px", whiteSpace: "nowrap" }}>
+                          {formatDhash64Hex(sig.dhash64)}
+                        </td>
+                        <td style={{ padding: "5px 6px", whiteSpace: "nowrap" }}>
+                          {sig.hit_count}
+                        </td>
+                        <td style={{ padding: "5px 6px", whiteSpace: "nowrap" }}>
+                          {formatDateTime(sig.last_seen_at)}
+                        </td>
+                        <td
+                          title={formattedReason.text}
+                          style={{
+                            padding: "5px 6px",
+                            color: formattedReason.isTechnicalFallback
+                              ? "var(--text-muted)"
+                              : "var(--text-secondary)",
+                            maxWidth: 440,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
                         >
-                          <Trash2 size={11} />
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                          {formattedReason.text}
+                        </td>
+                        <td style={{ padding: "5px 6px", textAlign: "right" }}>
+                          <button
+                            type="button"
+                            className="nvr-btn danger mono"
+                            style={{ height: 22, padding: "0 6px" }}
+                            aria-label={`Delete false-positive signature ${sig.id}`}
+                            onClick={() => void handleDeleteFpSignature(sig.id)}
+                          >
+                            <Trash2 size={11} />
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
           )}
         </div>
       </div>
+      )}
 
       {/* Face Recognition & Enrolled Gallery Card */}
+      {isAiSubSectionVisible(activeSubSection, "faces") && (
       <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
         <div className="nvr-cfg-card-header">
-          <span>
-            {isPt
-              ? "RECONHECIMENTO FACIAL LOCAL & GALERIA CADASTRADA (ARCFACE / ADAFACE 512-D)"
-              : "FACE RECOGNITION & ENROLLED GALLERY (ARCFACE / ADAFACE 512-D)"}
-          </span>
-          <span className="mono">
-            {enrolledProfiles.length} {isPt ? "PERFIS CADASTRADOS" : "ENROLLED PROFILES"}
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>
+              {isPt
+                ? "RECONHECIMENTO FACIAL LOCAL & GALERIA CADASTRADA (ARCFACE / ADAFACE 512-D)"
+                : "FACE RECOGNITION & ENROLLED GALLERY (ARCFACE / ADAFACE 512-D)"}
+            </span>
+            <span className="nvr-yaml-key-tag">face_recognition</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span className="nvr-scope-pill is-global">{globalScopeBadge.label}</span>
+            <span className={`nvr-badge ${faceCfg.enabled ? "live" : ""}`}>
+              {faceCfg.enabled
+                ? isPt
+                  ? "ATIVO"
+                  : "ACTIVE"
+                : isPt
+                ? "EM ESPERA (OFF)"
+                : "STANDBY (OFF)"}{" "}
+              · {enrolledProfiles.length}{" "}
+              {isPt ? "PERFIS CADASTRADOS" : "ENROLLED PROFILES"}
+            </span>
+          </div>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
           <div
@@ -4921,7 +5406,12 @@ export const AiDetectionObjectsSection: React.FC<{
               />
             </div>
 
-            <div className="nvr-field-row" style={{ padding: "4px 0" }}>
+            <div
+              className={`nvr-field-row ${
+                !faceCfg.enabled ? "nvr-cfg-disabled-zone" : ""
+              }`}
+              style={{ padding: "4px 0" }}
+            >
               <div className="nvr-field-meta">
                 <div className="nvr-field-label">
                   {isPt
@@ -4943,6 +5433,7 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
 
           <div
+            className={!faceCfg.enabled ? "nvr-cfg-disabled-zone" : ""}
             style={{
               display: "grid",
               gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 0.8fr) minmax(0, 1.4fr)",
@@ -4965,6 +5456,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 type="range"
                 min={40}
                 max={95}
+                disabled={!faceCfg.enabled}
                 style={{ width: "100%", marginTop: 4 }}
                 aria-label="Face Recognition Similarity Threshold"
                 value={Math.round((faceCfg.similarity_threshold ?? 0.68) * 100)}
@@ -4990,6 +5482,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 min={100}
                 max={50000}
                 step={50}
+                disabled={!faceCfg.enabled}
                 className="nvr-input mono"
                 style={{ width: "100%", marginTop: 2 }}
                 aria-label="Minimum Face Crop Area"
@@ -5011,6 +5504,7 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
               <input
                 className="nvr-input mono"
+                disabled={!faceCfg.enabled}
                 style={{ width: "100%", marginTop: 2 }}
                 aria-label="Face Recognition Model Path"
                 value={faceCfg.model_path || "/config/models/arcface_r50.onnx"}
@@ -5029,26 +5523,38 @@ export const AiDetectionObjectsSection: React.FC<{
                 alignItems: "center",
                 justifyContent: "space-between",
                 flexWrap: "wrap",
-                gap: 6,
+                gap: 8,
               }}
             >
-              <span
-                className="mono"
-                style={{
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 700,
-                  color: "var(--signal-accent-text)",
-                }}
-              >
-                {isPt
-                  ? "REGRA DE ALERTA: MORADORES CONHECIDOS (EXCLUDE_SUB_LABELS → DOWNGRADE P/ DETECÇÃO)"
-                  : "RESIDENT ALERT SUPPRESSION (EXCLUDE_SUB_LABELS → DOWNGRADE ALERT TO DETECTION)"}
-              </span>
-              <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: "var(--text-xs)",
+                    fontWeight: 700,
+                    color: "var(--signal-accent-text)",
+                  }}
+                >
+                  {isPt
+                    ? "SUPRESSÃO DE ALERTA PARA MORADORES CONHECIDOS"
+                    : "RESIDENT ALERT SUPPRESSION — DOWNGRADE TO DETECTION"}
+                </span>
+                <span className="nvr-yaml-key-tag">review.alerts.exclude_sub_labels</span>
+                <span
+                  className={`nvr-scope-pill ${
+                    camOrGlobalBadge.isCameraScope ? "is-camera" : "is-global"
+                  }`}
+                >
+                  {camOrGlobalBadge.label}
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
                 <input
                   className="nvr-input mono"
-                  style={{ width: 150, height: 24, fontSize: "var(--text-xs)" }}
-                  placeholder="Resident name (e.g. Bruno)..."
+                  style={{ width: 220, height: 24, fontSize: "var(--text-xs)" }}
+                  placeholder={
+                    isPt ? "Nome do morador (ex: Bruno)" : "Resident name (e.g. Bruno)"
+                  }
                   aria-label="Exclude sub-label resident name"
                   value={excludeSubLabelInput}
                   onChange={(e) => setExcludeSubLabelInput(e.target.value)}
@@ -5064,7 +5570,7 @@ export const AiDetectionObjectsSection: React.FC<{
                     setExcludeSubLabelInput("");
                   }}
                 >
-                  + Suppress Alert
+                  {isPt ? "+ Suprimir Alerta" : "+ Suppress Alert"}
                 </button>
               </div>
             </div>
@@ -5085,17 +5591,27 @@ export const AiDetectionObjectsSection: React.FC<{
                     className={`nvr-btn mono ${isExcluded ? "active" : ""}`}
                     style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
                     onClick={() => handleToggleExcludeSubLabel(personName)}
-                    title="Toggle alert downgrade (alert -> detection) when this resident is recognized"
+                    title={
+                      isPt
+                        ? "Alternar rebaixamento de alerta (alerta -> detecção) quando este morador for reconhecido"
+                        : "Toggle alert downgrade (alert -> detection) when this resident is recognized"
+                    }
                   >
                     {isExcluded
-                      ? `✓ ${personName} (Downgraded to Detection)`
+                      ? isPt
+                        ? `✓ ${personName} (Rebaixado p/ Detecção)`
+                        : `✓ ${personName} (Downgraded to Detection)`
+                      : isPt
+                      ? `${personName} (Gera Alerta)`
                       : `${personName} (Triggers Alert)`}
                   </button>
                 );
               })}
               {enrolledProfiles.length === 0 && activeExcludeSubLabels.length === 0 && (
                 <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                  No resident sub_labels excluded yet. Enroll a profile below or add a name above.
+                  {isPt
+                    ? "Nenhum morador configurado para supressão de alerta. Cadastre um perfil abaixo ou adicione o nome acima."
+                    : "No resident sub_labels excluded yet. Enroll a profile below or add a name above."}
                 </span>
               )}
             </div>
@@ -5112,38 +5628,69 @@ export const AiDetectionObjectsSection: React.FC<{
                 gap: 8,
               }}
             >
-              <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700 }}>
-                {isPt ? "CADASTRAR NOVO PERFIL FACIAL:" : "ENROLL NEW FACE PROFILE:"}
-              </span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700 }}>
+                  {isPt ? "CADASTRAR NOVO PERFIL FACIAL:" : "ENROLL NEW FACE PROFILE:"}
+                </span>
+                <span className="nvr-yaml-key-tag">/media/ninjanvr/faces (Live Gallery)</span>
+              </div>
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                 <input
                   className="nvr-input mono"
-                  style={{ width: 160, height: 26, fontSize: "var(--text-xs)" }}
-                  placeholder="Profile name (e.g. Bruno)"
+                  style={{ width: 220, height: 26, fontSize: "var(--text-xs)" }}
+                  placeholder={
+                    isPt ? "Nome do perfil (ex: Bruno)" : "Profile name (e.g. Bruno)"
+                  }
                   aria-label="Face profile name to enroll"
                   value={enrollNameInput}
                   onChange={(e) => setEnrollNameInput(e.target.value)}
                 />
-                <input
-                  type="file"
-                  accept="image/*"
-                  aria-label="Upload face crop image"
-                  style={{ fontSize: "var(--text-xs)", maxWidth: 210 }}
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    if (!file) {
-                      setEnrollImageB64("");
-                      return;
-                    }
-                    const reader = new FileReader();
-                    reader.onload = () => {
-                      if (typeof reader.result === "string") {
-                        setEnrollImageB64(reader.result);
+                <label className="nvr-file-picker">
+                  <span
+                    className="nvr-btn mono"
+                    style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  >
+                    {isPt ? "Escolher Foto..." : "Choose Photo..."}
+                  </span>
+                  <span
+                    className="mono"
+                    style={{
+                      maxWidth: 150,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      paddingRight: 4,
+                      color: enrollFileName
+                        ? "var(--text-primary)"
+                        : "var(--text-muted)",
+                    }}
+                  >
+                    {enrollFileName ||
+                      (isPt ? "Nenhum arquivo" : "No file selected")}
+                  </span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    aria-label="Upload face crop image"
+                    style={{ display: "none" }}
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (!file) {
+                        setEnrollImageB64("");
+                        setEnrollFileName("");
+                        return;
                       }
-                    };
-                    reader.readAsDataURL(file);
-                  }}
-                />
+                      setEnrollFileName(file.name);
+                      const reader = new FileReader();
+                      reader.onload = () => {
+                        if (typeof reader.result === "string") {
+                          setEnrollImageB64(reader.result);
+                        }
+                      };
+                      reader.readAsDataURL(file);
+                    }}
+                  />
+                </label>
                 <button
                   type="button"
                   className="nvr-btn primary mono"
@@ -5152,7 +5699,13 @@ export const AiDetectionObjectsSection: React.FC<{
                   onClick={handleEnrollProfile}
                 >
                   <Plus size={11} />
-                  {enrollBusy ? "Enrolling..." : "Enroll Face"}
+                  {enrollBusy
+                    ? isPt
+                      ? "Cadastrando..."
+                      : "Enrolling..."
+                    : isPt
+                    ? "Cadastrar Face"
+                    : "Enroll Face"}
                 </button>
               </div>
             </div>
@@ -5190,26 +5743,43 @@ export const AiDetectionObjectsSection: React.FC<{
               ))}
               {enrolledProfiles.length === 0 && (
                 <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
-                  No faces enrolled in /media/ninjanvr/faces yet.
+                  {isPt
+                    ? "Nenhuma face cadastrada em /media/ninjanvr/faces ainda."
+                    : "No faces enrolled in /media/ninjanvr/faces yet."}
                 </span>
               )}
             </div>
           </div>
         </div>
       </div>
+      )}
 
       {/* License Plate Recognition (LPR) & Known Plates Card */}
+      {isAiSubSectionVisible(activeSubSection, "lpr") && (
       <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
         <div className="nvr-cfg-card-header">
-          <span>
-            {isPt
-              ? "RECONHECIMENTO DE PLACAS (LPR / ANPR) & PLACAS CONHECIDAS"
-              : "LICENSE PLATE RECOGNITION (LPR) & KNOWN PLATES"}
-          </span>
-          <span className="mono">
-            {Object.keys(lprCfg.known_plates || {}).length}{" "}
-            {isPt ? "PLACAS REGISTRADAS" : "KNOWN PLATES"}
-          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>
+              {isPt
+                ? "RECONHECIMENTO DE PLACAS (LPR / ANPR) & PLACAS CONHECIDAS"
+                : "LICENSE PLATE RECOGNITION (LPR) & KNOWN PLATES"}
+            </span>
+            <span className="nvr-yaml-key-tag">lpr</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span className="nvr-scope-pill is-global">{globalScopeBadge.label}</span>
+            <span className={`nvr-badge ${lprCfg.enabled ? "live" : ""}`}>
+              {lprCfg.enabled
+                ? isPt
+                  ? "ATIVO"
+                  : "ACTIVE"
+                : isPt
+                ? "EM ESPERA (OFF)"
+                : "STANDBY (OFF)"}{" "}
+              · {Object.keys(lprCfg.known_plates || {}).length}{" "}
+              {isPt ? "PLACAS REGISTRADAS" : "KNOWN PLATES"}
+            </span>
+          </div>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
           <div
@@ -5235,11 +5805,17 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
               <ToggleSwitch
                 checked={Boolean(lprCfg.enabled)}
+                label="Enable Multi-Frame License Plate Recognition"
                 onChange={(val) => updateLpr({ enabled: val })}
               />
             </div>
 
-            <div className="nvr-field-row" style={{ borderBottom: "none", padding: "2px 0" }}>
+            <div
+              className={`nvr-field-row ${
+                !lprCfg.enabled ? "nvr-cfg-disabled-zone" : ""
+              }`}
+              style={{ borderBottom: "none", padding: "2px 0" }}
+            >
               <div className="nvr-field-meta">
                 <div className="nvr-field-label">
                   {isPt
@@ -5256,6 +5832,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 type="range"
                 min={50}
                 max={98}
+                disabled={!lprCfg.enabled}
                 aria-label="Minimum LPR Confidence"
                 value={Math.round((lprCfg.min_confidence ?? 0.75) * 100)}
                 onChange={(e) =>
@@ -5268,6 +5845,7 @@ export const AiDetectionObjectsSection: React.FC<{
           </div>
 
           <div
+            className={!lprCfg.enabled ? "nvr-cfg-disabled-zone" : ""}
             style={{
               display: "grid",
               gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr)",
@@ -5296,15 +5874,18 @@ export const AiDetectionObjectsSection: React.FC<{
                   className="nvr-btn mono"
                   style={{ height: 18, padding: "0 6px", fontSize: "var(--text-xs)" }}
                   onClick={() =>
-                    updateLpr({ format_regex: "^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$" })
+                    updateLpr({ format_regex: DEFAULT_LPR_FORMAT_REGEX })
                   }
                 >
-                  Mercosul + Legacy
+                  {isPt
+                    ? "Restaurar Padrão (Mercosul + Legado)"
+                    : "Reset Default (Mercosul + Legacy)"}
                 </button>
               </div>
               <input
                 className="nvr-input mono"
                 aria-label="LPR Format Regex"
+                disabled={!lprCfg.enabled}
                 style={{ width: "100%", marginTop: 3, fontFamily: "var(--font-mono)" }}
                 placeholder={DEFAULT_LPR_FORMAT_REGEX}
                 value={lprCfg.format_regex ?? ""}
@@ -5321,6 +5902,7 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
               <input
                 className="nvr-input mono"
+                disabled={!lprCfg.enabled}
                 style={{ width: "100%", marginTop: 3, fontFamily: "var(--font-mono)" }}
                 placeholder="/config/models/lpr_det.onnx"
                 value={lprCfg.detector_model_path ?? ""}
@@ -5344,6 +5926,7 @@ export const AiDetectionObjectsSection: React.FC<{
               </div>
               <input
                 className="nvr-input mono"
+                disabled={!lprCfg.enabled}
                 style={{ width: "100%", marginTop: 3, fontFamily: "var(--font-mono)" }}
                 placeholder="/config/models/lpr_ocr.onnx"
                 value={lprCfg.ocr_model_path ?? ""}
@@ -5369,18 +5952,21 @@ export const AiDetectionObjectsSection: React.FC<{
                 gap: 8,
               }}
             >
-              <span
-                className="mono"
-                style={{
-                  fontSize: "var(--text-xs)",
-                  fontWeight: 700,
-                  color: "var(--signal-accent-text)",
-                }}
-              >
-                {isPt
-                  ? "DIRETÓRIO DE PLACAS CONHECIDAS (KNOWN_PLATES → SUB_LABEL)"
-                  : "KNOWN PLATES REGISTRY (KNOWN_PLATES → SUB_LABEL MAPPING)"}
-              </span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: "var(--text-xs)",
+                    fontWeight: 700,
+                    color: "var(--signal-accent-text)",
+                  }}
+                >
+                  {isPt
+                    ? "DIRETÓRIO DE PLACAS CONHECIDAS"
+                    : "KNOWN PLATES REGISTRY"}
+                </span>
+                <span className="nvr-yaml-key-tag">lpr.known_plates</span>
+              </div>
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                 <input
                   className="nvr-input mono"
@@ -5398,7 +5984,7 @@ export const AiDetectionObjectsSection: React.FC<{
                 <input
                   className="nvr-input"
                   aria-label="Known plate vehicle label"
-                  style={{ width: 170, height: 24, fontSize: "var(--text-xs)" }}
+                  style={{ width: 190, height: 24, fontSize: "var(--text-xs)" }}
                   placeholder={isPt ? "Ex: SUV da Família" : "e.g. Family SUV"}
                   value={newKnownPlateLabel}
                   onChange={(e) => setNewKnownPlateLabel(e.target.value)}
@@ -5435,8 +6021,8 @@ export const AiDetectionObjectsSection: React.FC<{
                     setNewKnownPlateLabel("");
                     notify(
                       isPt
-                        ? `Placa conhecida registrada e salva: ${norm} → ${vehicleLabel}`
-                        : `Saved known plate: ${norm} → ${vehicleLabel}`
+                        ? `Placa conhecida adicionada ao rascunho: ${norm} → ${vehicleLabel}`
+                        : `Staged known plate: ${norm} → ${vehicleLabel}`
                     );
                   }}
                 >
@@ -5560,8 +6146,8 @@ export const AiDetectionObjectsSection: React.FC<{
                             });
                             notify(
                               isPt
-                                ? `Placa ${dp} cadastrada como '${label}'`
-                                : `Registered ${dp} as '${label}'`
+                                ? `Placa ${dp} adicionada ao rascunho como '${label}'`
+                                : `Staged ${dp} as '${label}'`
                             );
                           }}
                         >
@@ -5575,130 +6161,184 @@ export const AiDetectionObjectsSection: React.FC<{
             )}
           </div>
 
-          {/* Test LPR Scenario (Simulate Vehicle Pass) */}
-          <div className="nvr-subcard" style={{ padding: "8px 10px", gap: 8 }}>
+          {/* Collapsible Diagnostic Drawer: Test LPR Scenario (Simulate Vehicle Pass) */}
+          <details className="nvr-diag-drawer">
+            <summary>
+              <span>
+                {isPt
+                  ? "▸ FERRAMENTA DE DIAGNÓSTICO: SIMULAR PASSAGEM DE VEÍCULO (TESTE DE PIPELINE LPR)"
+                  : "▸ DIAGNOSTIC TOOL: SIMULATE VEHICLE PASS (TEST LPR PIPELINE)"}
+              </span>
+              <span className="nvr-yaml-key-tag">/api/debug/lpr-simulate</span>
+            </summary>
             <div
               style={{
                 display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                flexWrap: "wrap",
+                flexDirection: "column",
                 gap: 8,
+                marginTop: 8,
+                paddingTop: 8,
+                borderTop: "1px solid var(--border-divider)",
               }}
             >
-              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                <span
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  flexWrap: "wrap",
+                  gap: 8,
+                }}
+              >
+                <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt
+                    ? "Gera um frame sintético Mercosul, executa votação multi-frame LprTrackVoter + lookup known_plates e grava um evento de teste."
+                    : "Generates a synthetic Mercosul plate frame, runs LprTrackVoter multi-frame consensus + known_plates lookup, and persists a test event."}
+                </span>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  <select
+                    className="nvr-select mono"
+                    aria-label="Simulate LPR Camera"
+                    style={{ height: 26, fontSize: "var(--text-xs)" }}
+                    value={simLprCamera}
+                    onChange={(e) => setSimLprCamera(e.target.value)}
+                  >
+                    {(Object.keys(draftConfig.cameras || {}).length > 0
+                      ? Object.keys(draftConfig.cameras || {})
+                      : [inspectorCam || "escritorio"]
+                    ).map((c) => (
+                      <option key={c} value={c}>
+                        {c.toUpperCase()}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    className="nvr-input mono"
+                    aria-label="Simulate LPR Plate"
+                    style={{
+                      width: 110,
+                      height: 26,
+                      fontSize: "var(--text-xs)",
+                      fontFamily: "var(--font-mono)",
+                    }}
+                    placeholder="BRA2E19"
+                    value={simLprPlate}
+                    onChange={(e) => setSimLprPlate(e.target.value.toUpperCase())}
+                  />
+                  {(["BRA2E19", "ABC1D23", "XYZ9876"] as const).map((presetPlate) => (
+                    <button
+                      key={presetPlate}
+                      type="button"
+                      className={`nvr-btn mono ${
+                        normalizeLicensePlate(simLprPlate) === presetPlate ? "active" : ""
+                      }`}
+                      style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                      onClick={() => setSimLprPlate(presetPlate)}
+                    >
+                      {presetPlate}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    className="nvr-btn success mono"
+                    style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                    disabled={simLprBusy}
+                    onClick={() => void handleSimulateLprPass()}
+                  >
+                    {simLprBusy
+                      ? isPt
+                        ? "Simulando..."
+                        : "Simulating..."
+                      : isPt
+                      ? "Simular Detecção de Placa Agora"
+                      : "Simulate Plate Detection Now"}
+                  </button>
+                </div>
+              </div>
+              {simLprLastResult && (
+                <div
                   className="mono"
                   style={{
                     fontSize: "var(--text-xs)",
-                    fontWeight: 700,
                     color: "var(--signal-live-text)",
                   }}
                 >
-                  {isPt
-                    ? "TESTAR CENÁRIO LPR (SIMULAR PASSAGEM DE VEÍCULO)"
-                    : "TEST LPR SCENARIO (SIMULATE VEHICLE PASS)"}
-                </span>
-                <span style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
-                  {isPt
-                    ? "Gera um frame sintético Mercosul, executa votação multi-frame LprTrackVoter + lookup known_plates e grava o evento no Explore/Review."
-                    : "Generates a synthetic Mercosul plate frame, runs LprTrackVoter multi-frame consensus + known_plates lookup, and persists the event."}
-                </span>
-              </div>
+                  ✓ Simulated Event #{simLprLastResult.eventId.slice(-8)} on{" "}
+                  {simLprLastResult.camera.toUpperCase()} · Plate:{" "}
+                  <strong>{simLprLastResult.plate}</strong>
+                  {simLprLastResult.subLabel
+                    ? ` · Matched Known Vehicle: ${simLprLastResult.subLabel}`
+                    : ""}
+                </div>
+              )}
+            </div>
+          </details>
+        </div>
+      </div>
+      )}
 
-              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+      {/* ROI State Classifier Card (Gate Open/Closed, Parking Spot Occupied, Anomaly Mode) */}
+      {isAiSubSectionVisible(activeSubSection, "state_rois") && (
+      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
+        <div className="nvr-cfg-card-header">
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <span>
+              {isPt
+                ? "MONITOR DE ESTADO DE ROI (PORTÃO ABERTO/FECHADO, VAGA & OBJETO FIXO)"
+                : "ROI STATE MONITOR (GATE OPEN/CLOSED, PARKING & FIXED OBJECTS)"}
+            </span>
+            <span className="nvr-yaml-key-tag">
+              cameras.{effectiveRoiCam}.state_rois
+            </span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            {scope === "global" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "Câmera Alvo:" : "Target Camera:"}
+                </span>
                 <select
                   className="nvr-select mono"
-                  aria-label="Simulate LPR Camera"
-                  style={{ height: 26, fontSize: "var(--text-xs)" }}
-                  value={simLprCamera}
-                  onChange={(e) => setSimLprCamera(e.target.value)}
+                  aria-label="ROI Target Camera"
+                  style={{ height: 22, fontSize: "var(--text-xs)", padding: "0 6px" }}
+                  value={effectiveRoiCam}
+                  onChange={(e) => setRoiTargetCam(e.target.value)}
                 >
                   {(Object.keys(draftConfig.cameras || {}).length > 0
                     ? Object.keys(draftConfig.cameras || {})
-                    : [inspectorCam || "escritorio"]
-                  ).map((c) => (
-                    <option key={c} value={c}>
-                      {c.toUpperCase()}
+                    : [effectiveRoiCam]
+                  ).map((camKey) => (
+                    <option key={camKey} value={camKey}>
+                      {camKey.toUpperCase()}
                     </option>
                   ))}
                 </select>
-                <input
-                  className="nvr-input mono"
-                  aria-label="Simulate LPR Plate"
-                  style={{
-                    width: 110,
-                    height: 26,
-                    fontSize: "var(--text-xs)",
-                    fontFamily: "var(--font-mono)",
-                  }}
-                  placeholder="BRA2E19"
-                  value={simLprPlate}
-                  onChange={(e) => setSimLprPlate(e.target.value.toUpperCase())}
-                />
-                {(["BRA2E19", "ABC1D23", "XYZ9876"] as const).map((presetPlate) => (
-                  <button
-                    key={presetPlate}
-                    type="button"
-                    className={`nvr-btn mono ${
-                      normalizeLicensePlate(simLprPlate) === presetPlate ? "active" : ""
-                    }`}
-                    style={{ height: 24, padding: "0 7px", fontSize: "var(--text-xs)" }}
-                    onClick={() => setSimLprPlate(presetPlate)}
-                  >
-                    {presetPlate}
-                  </button>
-                ))}
-                <button
-                  type="button"
-                  className="nvr-btn success mono"
-                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                  disabled={simLprBusy}
-                  onClick={() => void handleSimulateLprPass()}
-                >
-                  {simLprBusy
-                    ? isPt
-                      ? "Simulando..."
-                      : "Simulating..."
-                    : isPt
-                    ? "Simular Detecção de Placa Agora"
-                    : "Simulate Plate Detection Now"}
-                </button>
-              </div>
-            </div>
-            {simLprLastResult && (
-              <div
-                className="mono"
-                style={{
-                  fontSize: "var(--text-xs)",
-                  color: "var(--signal-live-text)",
-                }}
-              >
-                ✓ Simulated Event #{simLprLastResult.eventId.slice(-8)} on{" "}
-                {simLprLastResult.camera.toUpperCase()} · Plate:{" "}
-                <strong>{simLprLastResult.plate}</strong>
-                {simLprLastResult.subLabel
-                  ? ` · Matched Known Vehicle: ${simLprLastResult.subLabel}`
-                  : ""}
               </div>
             )}
+            <span className="nvr-scope-pill is-camera">{roiCamBadge.label}</span>
+            <span className="nvr-badge">
+              {Object.keys(draftConfig.cameras?.[effectiveRoiCam]?.state_rois || {}).length}{" "}
+              {isPt ? "ROIS CONFIGURADOS" : "CONFIGURED ROIS"}
+            </span>
+            {onOpenVectorStudio && (
+              <button
+                type="button"
+                className="nvr-btn mono"
+                style={{ height: 22, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                onClick={onOpenVectorStudio}
+                title={
+                  isPt
+                    ? "Abrir Estúdio Vetorial (Aba 03) para desenhar o ROI diretamente sobre o vídeo ao vivo"
+                    : "Open Vector Studio (Tab 03) to draw the ROI directly on the live camera video"
+                }
+              >
+                {isPt
+                  ? "Desenhar no Vídeo Ao Vivo (Aba 03) ↗"
+                  : "Plot on Live Video (Tab 03) ↗"}
+              </button>
+            )}
           </div>
-        </div>
-      </div>
-
-      {/* ROI State Classifier Card (Gate Open/Closed, Parking Spot Occupied, Anomaly Mode) */}
-      <div className="nvr-cfg-card" style={{ gridColumn: "1 / -1" }}>
-        <div className="nvr-cfg-card-header">
-          <span>
-            {isPt
-              ? "CLASSIFICADOR DE ESTADO DE ROI (PORTÃO ABERTO/FECHADO, VAGA OCUPADA & ANOMALIA)"
-              : "ROI STATE CLASSIFIER (STATE_ROIS — GATE OPEN/CLOSED, PARKING & ANOMALY MODE)"}{" "}
-            ({inspectorCam.toUpperCase()})
-          </span>
-          <span className="mono">
-            {Object.keys(draftConfig.cameras?.[inspectorCam]?.state_rois || {}).length}{" "}
-            {isPt ? "ROIS CONFIGURADOS" : "CONFIGURED ROIS"}
-          </span>
         </div>
         <div className="nvr-cfg-card-body" style={{ padding: 10, gap: 10 }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -5799,7 +6439,7 @@ export const AiDetectionObjectsSection: React.FC<{
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 1.8fr) auto",
+              gridTemplateColumns: "minmax(0, 1.1fr) minmax(0, 1.4fr) minmax(0, 1.3fr) auto",
               gap: 10,
               alignItems: "end",
             }}
@@ -5828,11 +6468,63 @@ export const AiDetectionObjectsSection: React.FC<{
                 placeholder={
                   isPt
                     ? "Ex: Porta do Escritório, Portão da Garagem"
-                    : "e.g. Porta do Escritório, Portão da Garagem"
+                    : "e.g. Office Door, Garage Gate"
                 }
                 value={newRoiName}
                 onChange={(e) => setNewRoiName(e.target.value)}
               />
+            </div>
+
+            {/* Visual 16:9 Viewport Crop Preview & Region Presets */}
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <svg
+                width="64"
+                height="36"
+                viewBox="0 0 64 36"
+                aria-label="ROI Crop Viewport Preview"
+                style={{
+                  background: "var(--bg-input)",
+                  border: "1px solid var(--border-strong)",
+                  borderRadius: 2,
+                  flexShrink: 0,
+                }}
+              >
+                <rect
+                  x={previewRoiCrop[0] * 64}
+                  y={previewRoiCrop[1] * 36}
+                  width={Math.max(3, (previewRoiCrop[2] - previewRoiCrop[0]) * 64)}
+                  height={Math.max(3, (previewRoiCrop[3] - previewRoiCrop[1]) * 36)}
+                  fill="rgba(245, 158, 11, 0.3)"
+                  stroke="var(--signal-motion)"
+                  strokeWidth="1.2"
+                />
+              </svg>
+              <div style={{ display: "flex", flexDirection: "column", gap: 3, minWidth: 0 }}>
+                <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
+                  {isPt ? "PASSO 3 — REGIÃO NO QUADRO:" : "STEP 3 — FRAME REGION:"}{" "}
+                  <strong>[{previewRoiCrop.map((v) => v.toFixed(2)).join(", ")}]</strong>
+                </span>
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  {(
+                    [
+                      ["0.200,0.300,0.650,0.850", isPt ? "Centro" : "Center"],
+                      ["0.050,0.200,0.450,0.900", isPt ? "Esquerda" : "Left"],
+                      ["0.550,0.200,0.950,0.900", isPt ? "Direita" : "Right"],
+                      ["0.150,0.500,0.850,0.950", isPt ? "Piso/Vaga" : "Lower/Spot"],
+                    ] as const
+                  ).map(([cropPreset, label]) => (
+                    <button
+                      key={cropPreset}
+                      type="button"
+                      className={`nvr-btn mono ${newRoiCrop === cropPreset ? "active" : ""}`}
+                      style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                      onClick={() => setNewRoiCrop(cropPreset)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
 
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -5843,7 +6535,7 @@ export const AiDetectionObjectsSection: React.FC<{
                   color: "var(--text-secondary)",
                 }}
               >
-                {isPt ? "REGRA DE ALERTA:" : "ALERT RULE:"}
+                {isPt ? "PASSO 4 — REGRA DE ALERTA:" : "STEP 4 — ALERT RULE:"}
               </div>
               <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
                 <button
@@ -5907,12 +6599,12 @@ export const AiDetectionObjectsSection: React.FC<{
                   anomalyTimeoutSec: newRoiAnomalyTimeoutSec,
                 });
                 updateDraft((next) => {
-                  const cam = next.cameras[inspectorCam];
+                  const cam = next.cameras[effectiveRoiCam];
                   if (!cam) return;
                   if (!cam.state_rois) cam.state_rois = {};
                   cam.state_rois[slug] = roiCfg;
                 });
-                notify(`Added ROI state classifier '${slug}' on ${inspectorCam}`);
+                notify(`Added ROI state classifier '${slug}' on ${effectiveRoiCam}`);
               }}
             >
               {isPt ? "+ Salvar Monitoramento de Área" : "+ Save State Monitor"}
@@ -5955,7 +6647,9 @@ export const AiDetectionObjectsSection: React.FC<{
                 color: "var(--text-secondary)",
               }}
             >
-              Advanced Technical Tuning / Coordenadas &amp; Histerese
+              {isPt
+                ? "Ajustes Técnicos Avançados (Coordenadas & Histerese)"
+                : "Advanced Technical Tuning (Coordinates & Hysteresis)"}
             </summary>
             <div
               style={{
@@ -6056,9 +6750,9 @@ export const AiDetectionObjectsSection: React.FC<{
             </div>
           </details>
 
-          {Object.entries(draftConfig.cameras?.[inspectorCam]?.state_rois || {}).length > 0 && (
+          {Object.entries(draftConfig.cameras?.[effectiveRoiCam]?.state_rois || {}).length > 0 && (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {Object.entries(draftConfig.cameras?.[inspectorCam]?.state_rois || {}).map(
+              {Object.entries(draftConfig.cameras?.[effectiveRoiCam]?.state_rois || {}).map(
                 ([rName, rCfg]) => (
                   <div
                     key={rName}
@@ -6084,21 +6778,47 @@ export const AiDetectionObjectsSection: React.FC<{
                           }s)`
                         : ""}
                     </div>
-                    <button
-                      type="button"
-                      className="nvr-btn danger"
-                      style={{ height: 22, padding: "0 6px" }}
-                      title={`Remove ROI ${rName}`}
-                      onClick={() =>
-                        updateDraft((next) => {
-                          if (next.cameras[inspectorCam]?.state_rois) {
-                            delete next.cameras[inspectorCam].state_rois![rName];
-                          }
-                        })
-                      }
-                    >
-                      <Trash2 size={11} />
-                    </button>
+                    <div style={{ display: "flex", gap: 4 }}>
+                      <button
+                        type="button"
+                        className="nvr-btn"
+                        style={{ height: 22, padding: "0 6px" }}
+                        title={
+                          isPt
+                            ? `Carregar ROI ${rName} para edição`
+                            : `Load ROI ${rName} into editor`
+                        }
+                        onClick={() => {
+                          setNewRoiName(rName);
+                          const c = rCfg.crop || [0.25, 0.25, 0.75, 0.75];
+                          setNewRoiCrop(c.map((v) => Number(v).toFixed(3)).join(","));
+                          setNewRoiClasses(
+                            (rCfg.classes || ["closed", "open"]).join(", ")
+                          );
+                          setNewRoiIntervalSec(rCfg.interval_sec ?? 5);
+                          setNewRoiHysteresis(rCfg.hysteresis ?? 3);
+                          setNewRoiAnomalyState(rCfg.anomaly_state || "");
+                          setNewRoiAnomalyTimeoutSec(rCfg.anomaly_timeout_sec ?? 300);
+                        }}
+                      >
+                        <Edit3 size={11} />
+                      </button>
+                      <button
+                        type="button"
+                        className="nvr-btn danger"
+                        style={{ height: 22, padding: "0 6px" }}
+                        title={`Remove ROI ${rName}`}
+                        onClick={() =>
+                          updateDraft((next) => {
+                            if (next.cameras[effectiveRoiCam]?.state_rois) {
+                              delete next.cameras[effectiveRoiCam].state_rois![rName];
+                            }
+                          })
+                        }
+                      >
+                        <Trash2 size={11} />
+                      </button>
+                    </div>
                   </div>
                 )
               )}
@@ -6106,6 +6826,7 @@ export const AiDetectionObjectsSection: React.FC<{
           )}
         </div>
       </div>
+      )}
     </div>
   );
 };

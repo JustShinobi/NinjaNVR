@@ -1245,6 +1245,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 scope={scope === "global" ? "global" : effectiveInspectorCam}
                 inspectorCam={effectiveInspectorCam}
                 notify={notify}
+                onOpenVectorStudio={() => selectCategory("vision")}
               />
             )}
 
