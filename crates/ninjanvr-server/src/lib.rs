@@ -1847,7 +1847,7 @@ async fn api_auth_providers(State(state): State<AppState>) -> Json<Value> {
         },
         "proxy": {
             "enabled": cfg.auth.proxy.enabled,
-            "logout_url": cfg.auth.proxy.logout_url
+            "logout_url": scrub_rtsp_credentials(&cfg.auth.proxy.logout_url)
         }
     }))
 }
@@ -2012,6 +2012,32 @@ pub fn resolve_oidc_role(claims: &Value, oidc_cfg: &ninjanvr_config::OidcAuthCon
             "viewer".to_string()
         }
     }
+}
+
+fn role_privilege_rank(role: &str) -> u8 {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "admin" => 2,
+        "operator" => 1,
+        _ => 0,
+    }
+}
+
+fn cap_external_role_by_db(external_role: &str, db_role: &str) -> String {
+    if role_privilege_rank(db_role) < role_privilege_rank(external_role) {
+        db_role.trim().to_ascii_lowercase()
+    } else {
+        external_role.trim().to_ascii_lowercase()
+    }
+}
+
+fn is_reserved_token_principal_prefix(username: &str) -> bool {
+    let trimmed = username.trim();
+    trimmed
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("token:"))
+        || trimmed
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("ext:"))
 }
 
 fn generate_pkce_pair() -> (String, String, String) {
@@ -2728,7 +2754,9 @@ async fn api_auth_oidc_callback(
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty())
                         });
-                    let Some(username_str) = identity_opt else {
+                    let Some(username_str) =
+                        identity_opt.filter(|u| !is_reserved_token_principal_prefix(u))
+                    else {
                         return (
                             StatusCode::UNAUTHORIZED,
                             Json(json!({ "message": "OIDC claims missing valid subject/username identity" })),
@@ -2736,12 +2764,13 @@ async fn api_auth_oidc_callback(
                             .into_response();
                     };
                     let username = username_str.to_string();
+                    let oidc_role = resolve_oidc_role(&merged_claims, &oidc_cfg);
                     let (role, allowed_cameras) = match state.db.get_user(&username) {
-                        Ok(Some(db_u)) => (db_u.role, Some(db_u.allowed_cameras)),
-                        _ => (
-                            resolve_oidc_role(&merged_claims, &oidc_cfg),
-                            Some("*".to_string()),
+                        Ok(Some(db_u)) => (
+                            cap_external_role_by_db(&oidc_role, &db_u.role),
+                            Some(db_u.allowed_cameras),
                         ),
+                        _ => (oidc_role, Some("*".to_string())),
                     };
                     let now = unix_now();
                     let jwt_claims = JwtClaims {
@@ -3125,18 +3154,15 @@ fn extract_authenticated_user_with_cfg(
                 .get(user_hdr_name.as_str())
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && !is_reserved_token_principal_prefix(s))
             {
-                if let Ok(Some(db_u)) = state.db.get_user(remote_user) {
-                    return Some((remote_user.to_string(), db_u.role));
-                }
                 let groups_hdr_trimmed = auth_cfg.proxy.groups_header.trim();
                 let groups_hdr_name = if groups_hdr_trimmed.is_empty() {
                     "remote-groups".to_string()
                 } else {
                     groups_hdr_trimmed.to_ascii_lowercase()
                 };
-                let role = if let Some(groups_str) = headers
+                let proxy_role = if let Some(groups_str) = headers
                     .get(groups_hdr_name.as_str())
                     .and_then(|v| v.to_str().ok())
                 {
@@ -3144,7 +3170,13 @@ fn extract_authenticated_user_with_cfg(
                 } else {
                     "viewer".to_string()
                 };
-                return Some((remote_user.to_string(), role));
+                if let Ok(Some(db_u)) = state.db.get_user(remote_user) {
+                    return Some((
+                        remote_user.to_string(),
+                        cap_external_role_by_db(&proxy_role, &db_u.role),
+                    ));
+                }
+                return Some((remote_user.to_string(), proxy_role));
             }
         }
     }
@@ -3179,9 +3211,12 @@ fn extract_authenticated_user_with_cfg(
         &validation,
     )
     .ok()?;
+    if is_reserved_token_principal_prefix(&decoded.claims.sub) {
+        return None;
+    }
 
     let role = match state.db.get_user(&decoded.claims.sub) {
-        Ok(Some(db_u)) => db_u.role,
+        Ok(Some(db_u)) => cap_external_role_by_db(&decoded.claims.role, &db_u.role),
         Ok(None) => {
             if !decoded.claims.sub.eq_ignore_ascii_case("admin")
                 && decoded.claims.role.eq_ignore_ascii_case("admin")
@@ -3773,10 +3808,39 @@ fn resolve_user_allowed_cameras(
     match state.db.get_user(user) {
         Ok(Some(db_u)) => {
             if db_u.role.eq_ignore_ascii_case("admin") {
+                if !role.eq_ignore_ascii_case("admin")
+                    && let Some(jwt_raw) =
+                        extract_jwt_allowed_cameras(state, jar, headers, &auth_cfg.cookie_name)
+                    && !jwt_raw.trim().is_empty()
+                    && jwt_raw.trim() != "*"
+                {
+                    let jwt_list: Vec<String> = jwt_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !jwt_list.is_empty() && !jwt_list.iter().any(|c| c == "*") {
+                        return Some(jwt_list);
+                    }
+                }
                 return None;
             }
             let raw = db_u.allowed_cameras.trim();
             if raw.is_empty() || raw == "*" {
+                if let Some(jwt_raw) =
+                    extract_jwt_allowed_cameras(state, jar, headers, &auth_cfg.cookie_name)
+                    && !jwt_raw.trim().is_empty()
+                    && jwt_raw.trim() != "*"
+                {
+                    let jwt_list: Vec<String> = jwt_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !jwt_list.is_empty() && !jwt_list.iter().any(|c| c == "*") {
+                        return Some(jwt_list);
+                    }
+                }
                 return None;
             }
             let list: Vec<String> = raw
@@ -3791,7 +3855,13 @@ fn resolve_user_allowed_cameras(
             }
         }
         Ok(None) => {
-            if user.starts_with("token:")
+            let has_non_api_jwt =
+                extract_jwt_allowed_cameras(state, jar, headers, &auth_cfg.cookie_name).is_some();
+            let is_token_principal = user
+                .trim()
+                .get(..6)
+                .is_some_and(|p| p.eq_ignore_ascii_case("token:"));
+            if (is_token_principal && !has_non_api_jwt)
                 || (user.eq_ignore_ascii_case("admin") && role.eq_ignore_ascii_case("admin"))
             {
                 return None;
@@ -4076,20 +4146,32 @@ fn collect_yaml_sensitive_secrets(val: &serde_yaml::Value, out: &mut Vec<String>
             for (k, v) in map {
                 if let Some(k_str) = k.as_str()
                     && is_sensitive_yaml_secret_key_name(k_str)
-                    && let Some(s) = v.as_str()
                 {
-                    let t = s.trim();
-                    if !t.is_empty()
-                        && !t.eq_ignore_ascii_case("null")
-                        && t != "~"
-                        && t != "***"
-                        && t != "*"
-                    {
-                        out.push(t.to_string());
-                        for line in s.lines() {
-                            let lt = line.trim();
-                            if lt.len() >= 3 && lt != "***" {
-                                out.push(lt.to_string());
+                    let scalar_opt = match v {
+                        serde_yaml::Value::String(s) => Some(s.clone()),
+                        serde_yaml::Value::Number(n) => Some(n.to_string()),
+                        _ => None,
+                    };
+                    if let Some(s) = scalar_opt {
+                        let t = s.trim();
+                        if !t.is_empty()
+                            && !t.eq_ignore_ascii_case("null")
+                            && t != "~"
+                            && t != "***"
+                            && t != "*"
+                        {
+                            out.push(t.to_string());
+                            if t.contains('"') {
+                                out.push(t.replace('"', "\\\""));
+                            }
+                            if t.contains('\'') {
+                                out.push(t.replace('\'', "''"));
+                            }
+                            for line in s.lines() {
+                                let lt = line.trim();
+                                if lt.len() >= 3 && lt != "***" {
+                                    out.push(lt.to_string());
+                                }
                             }
                         }
                     }
@@ -4141,7 +4223,11 @@ fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> String {
         {
             let val_trimmed = raw_v.trim();
             let unquoted = val_trimmed.trim_matches('"').trim_matches('\'').trim();
-            if unquoted.starts_with('|') || unquoted.starts_with('>') {
+            if unquoted.is_empty()
+                || unquoted.starts_with('#')
+                || unquoted.starts_with('|')
+                || unquoted.starts_with('>')
+            {
                 skip_block_scalar_indent = Some(line_indent);
                 out.push_str(leading_prefix);
                 out.push_str(raw_k.trim_end());
@@ -4149,12 +4235,7 @@ fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> String {
                 out.push_str(newline);
                 continue;
             }
-            if !unquoted.is_empty()
-                && !unquoted.eq_ignore_ascii_case("null")
-                && unquoted != "~"
-                && unquoted != "***"
-                && !unquoted.starts_with('#')
-            {
+            if !unquoted.eq_ignore_ascii_case("null") && unquoted != "~" && unquoted != "***" {
                 out.push_str(leading_prefix);
                 out.push_str(raw_k.trim_end());
                 out.push_str(": \"***\"");
@@ -4910,6 +4991,36 @@ async fn api_mcp_handler(
         )
             .into_response();
     }
+    let caller_role = {
+        let cfg = state.config.read().await;
+        let has_creds = headers.contains_key(header::AUTHORIZATION)
+            || jar.get(&cfg.auth.cookie_name).is_some()
+            || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(&headers).is_some());
+        match extract_authenticated_user_with_cfg(&state, &jar, &headers, &cfg.auth) {
+            Some((_, r)) => r.to_ascii_lowercase(),
+            None if cfg.auth.enabled && has_creds => "unauthorized".to_string(),
+            None => "admin".to_string(),
+        }
+    };
+    if caller_role == "unauthorized" || caller_role == "metrics" {
+        let status = if caller_role == "unauthorized" {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        return (
+            status,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32003,
+                    "message": "Unauthorized or insufficient token scope for MCP"
+                }
+            })),
+        )
+            .into_response();
+    }
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
 
     match req.method.as_str() {
@@ -5656,10 +5767,42 @@ fn render_synthetic_mercosul_vehicle_frame(plate: &str) -> image::RgbImage {
     img
 }
 
+fn is_disallowed_federation_peer_ip(ip: std::net::IpAddr) -> bool {
+    let canon = match ip {
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4() {
+                std::net::IpAddr::V4(v4)
+            } else {
+                ip.to_canonical()
+            }
+        }
+        _ => ip.to_canonical(),
+    };
+    match canon {
+        std::net::IpAddr::V4(v4) => {
+            let octs = v4.octets();
+            v4.is_unspecified()
+                || octs[0] == 0
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || octs == [100, 100, 100, 200]
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || (segs[0] == 0xfd00 && segs[1] == 0x0ec2 && segs[7] == 0x0254)
+        }
+    }
+}
+
 fn is_safe_federation_peer_base_url(raw_url: &str) -> bool {
     let trimmed = raw_url.trim().trim_end_matches('/');
     if trimmed.is_empty()
         || trimmed.contains("..")
+        || trimmed.to_ascii_lowercase().contains("%2e")
         || trimmed.contains(['\\', '?', '#'])
         || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
     {
@@ -5680,25 +5823,38 @@ fn is_safe_federation_peer_base_url(raw_url: &str) -> bool {
         .trim()
         .trim_end_matches('.');
     if host.is_empty()
-        || host.contains('@')
+        || host.contains(['@', '%'])
         || host.eq_ignore_ascii_case("metadata.google.internal")
+        || host.ends_with(".metadata.google.internal")
     {
         return false;
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let canon = ip.to_canonical();
-        match canon {
-            std::net::IpAddr::V4(v4) => {
-                if v4.is_unspecified() || v4.is_link_local() || v4.is_multicast() {
-                    return false;
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                if v6.is_unspecified() || v6.is_unicast_link_local() || v6.is_multicast() {
-                    return false;
-                }
-            }
-        }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>()
+        && is_disallowed_federation_peer_ip(ip)
+    {
+        return false;
+    }
+    let Ok(parsed_url) = reqwest::Url::parse(trimmed) else {
+        return false;
+    };
+    let Some(parsed_host) = parsed_url.host_str() else {
+        return false;
+    };
+    let norm_host = parsed_host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if norm_host.is_empty()
+        || norm_host.eq_ignore_ascii_case("metadata.google.internal")
+        || norm_host.ends_with(".metadata.google.internal")
+    {
+        return false;
+    }
+    if let Ok(ip) = norm_host.parse::<std::net::IpAddr>()
+        && is_disallowed_federation_peer_ip(ip)
+    {
+        return false;
     }
     true
 }
@@ -6195,8 +6351,12 @@ async fn api_federation_proxy(
         )
             .into_response();
     };
+    let decoded_sub_lc = decoded_sub.to_ascii_lowercase();
     if subpath.contains("..")
         || decoded_sub.contains("..")
+        || decoded_sub_lc.contains("%2e")
+        || decoded_sub_lc.contains("%2f")
+        || decoded_sub_lc.contains("%5c")
         || subpath.contains(['\\', '@', '?', '#'])
         || decoded_sub.contains(['\\', '@', '?', '#'])
         || subpath.chars().any(|c| c.is_control() || c.is_whitespace())
@@ -6357,8 +6517,12 @@ async fn handle_camera_webui_proxy(
         )
             .into_response();
     };
+    let decoded_sub_lc = decoded_sub.to_ascii_lowercase();
     if subpath.contains("..")
         || decoded_sub.contains("..")
+        || decoded_sub_lc.contains("%2e")
+        || decoded_sub_lc.contains("%2f")
+        || decoded_sub_lc.contains("%5c")
         || subpath.contains(['\\', '@', '?', '#'])
         || decoded_sub.contains(['\\', '@', '?', '#'])
         || subpath.chars().any(|c| c.is_control() || c.is_whitespace())

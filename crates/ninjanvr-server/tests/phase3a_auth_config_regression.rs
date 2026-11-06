@@ -9,7 +9,7 @@ use base64::Engine;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use ninjanvr_db::ExportRow;
 use ninjanvr_server::{
-    JwtClaims, LogBufferHub, build_router_with_auth, ip_matches_cidr, new_app_state,
+    JwtClaims, LogBufferHub, build_router, build_router_with_auth, ip_matches_cidr, new_app_state,
     resolve_static_media_camera, sanitize_logged_path,
 };
 use serde_json::{Value, json};
@@ -1507,6 +1507,486 @@ version: 0.18-0
         .await
         .unwrap();
     assert_eq!(r_tok_zero_exp.status(), StatusCode::BAD_REQUEST);
+
+    upstream_task.abort();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn phase3a_cycle3_oidc_proxy_role_cap_token_prefix_ssrf_and_yaml_scrub_regression_work() {
+    let tmp_dir = std::env::temp_dir().join(format!("ninjanvr-p3a-c3-{}", rand::random::<u64>()));
+    let web_dir = tmp_dir.join("web-v2");
+    let media_dir = tmp_dir.join("media");
+    std::fs::create_dir_all(&web_dir).unwrap();
+    std::fs::create_dir_all(&media_dir).unwrap();
+    std::fs::write(web_dir.join("index.html"), "<html>Console v2</html>").unwrap();
+
+    let oidc_mode = Arc::new(std::sync::Mutex::new("viewer_admin_collision".to_string()));
+    let oidc_mode_tok = oidc_mode.clone();
+
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+    let issuer = format!("http://{upstream_addr}");
+    let iss_disc = issuer.clone();
+    let iss_tok = issuer.clone();
+
+    let jwk_secret = b"oidc-c3-jwks-oct-signing-key-32b";
+    let jwk_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(jwk_secret);
+
+    let mock_upstream = Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let iss = iss_disc.clone();
+                async move {
+                    Json(json!({
+                        "issuer": iss,
+                        "token_endpoint": format!("{iss}/oauth/v2/token"),
+                        "jwks_uri": format!("{iss}/jwks.json")
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/jwks.json",
+            get(move || {
+                let k = jwk_b64.clone();
+                async move {
+                    Json(json!({
+                        "keys": [{ "kty": "oct", "alg": "HS256", "kid": "k1", "k": k }]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/oauth/v2/token",
+            post(move || {
+                let mode = oidc_mode_tok.lock().unwrap().clone();
+                let iss = iss_tok.clone();
+                let exp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600;
+                async move {
+                    let mut hdr = Header::new(Algorithm::HS256);
+                    hdr.kid = Some("k1".to_string());
+                    let claims = match mode.as_str() {
+                        "token_prefix_claim" => json!({
+                            "sub": "token:spoofed_bot",
+                            "preferred_username": "token:spoofed_bot",
+                            "iss": iss,
+                            "aud": "nvr-client",
+                            "exp": exp,
+                            "groups": ["nvr-admins"]
+                        }),
+                        "ext_prefix_claim" => json!({
+                            "sub": "EXT:spoofed_external",
+                            "preferred_username": "ext:spoofed_external",
+                            "iss": iss,
+                            "aud": "nvr-client",
+                            "exp": exp,
+                            "groups": ["nvr-admins"]
+                        }),
+                        _ => json!({
+                            "sub": "ext-sub-999",
+                            "preferred_username": "admin",
+                            "iss": iss,
+                            "aud": "nvr-client",
+                            "exp": exp,
+                            "groups": ["viewers"]
+                        }),
+                    };
+                    let tok =
+                        jsonwebtoken::encode(&hdr, &claims, &EncodingKey::from_secret(jwk_secret))
+                            .unwrap();
+                    Json(json!({ "id_token": tok })).into_response()
+                }
+            }),
+        );
+    let upstream_task = tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, mock_upstream).await;
+    });
+
+    let db_path = tmp_dir.join("ninjanvr.db");
+    let cfg_path = tmp_dir.join("config.yml");
+    let yaml = format!(
+        r#"
+database:
+  path: {}
+auth:
+  enabled: true
+  hash_iterations: 1000
+  proxy:
+    enabled: true
+    trusted_proxies:
+      - "10.42.0.0/16"
+    user_header: "Remote-User"
+    groups_header: "Remote-Groups"
+    logout_url: "https://sso_user:sso_secret_pw@sso.example.invalid/logout?token=logout_tok_999"
+  oidc:
+    enabled: true
+    issuer_url: "{}"
+    client_id: "nvr-client"
+    role_mapping:
+      admin: ["nvr-admins"]
+      operator: ["nvr-operators"]
+      viewer: ["viewers"]
+    default_role: "viewer"
+    client_secret:
+      next_line_plain_oidc_secret_445566
+notifications: {{ webhook_secret: 987654321 }}
+cameras:
+  front_door:
+    enabled: true
+  backyard:
+    enabled: true
+peers:
+  ssrf_dec_imds:
+    enabled: true
+    url: "http://2852039166"
+  ssrf_hex_imds:
+    enabled: true
+    url: "http://0xa9fea9fe"
+  ssrf_oct_imds:
+    enabled: true
+    url: "http://0251.0376.0251.0376"
+  ssrf_pct_imds:
+    enabled: true
+    url: "http://169.254.169.%32%35%34"
+  ssrf_ipv6_imds:
+    enabled: true
+    url: "http://[fd00:ec2::254]"
+  ssrf_alibaba_imds:
+    enabled: true
+    url: "http://100.100.100.200"
+  valid_peer:
+    enabled: true
+    url: "http://{}"
+version: 0.18-0
+"#,
+        db_path.display(),
+        issuer,
+        upstream_addr
+    );
+    std::fs::write(&cfg_path, yaml).unwrap();
+
+    let state = new_app_state(&cfg_path, web_dir, media_dir, false)
+        .await
+        .unwrap();
+    let _ = state.db.ensure_default_admin(1000).unwrap();
+    let (_, metrics_tok) = state
+        .db
+        .create_api_token("prom_c3", "metrics", None)
+        .unwrap();
+
+    let app = build_router_with_auth(state.clone(), true);
+    let direct_app = build_router(state.clone());
+    let admin_bearer = format!(
+        "Bearer {}",
+        mint_test_jwt(&state.jwt_secret, "admin", "admin", Some("*"))
+    );
+
+    // 1. OIDC user with preferred_username="admin" but groups=["viewers"] must NOT escalate to SQLite "admin" role
+    let r_oidc_collision = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/oidc/callback?code=c1&state=st1")
+                .header(
+                    header::COOKIE,
+                    "ninjanvr_oidc_pkce=st1:ver1:http://localhost:5000/api/auth/oidc/callback",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_oidc_collision.status(), StatusCode::SEE_OTHER);
+    let session_cookie = r_oidc_collision
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .find_map(|v| {
+            let s = v.to_str().ok()?;
+            if s.starts_with("ninjanvr_token=") {
+                Some(s.split(';').next().unwrap().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+
+    // Using that OIDC session cookie on admin-only /api/users must be rejected with 403 FORBIDDEN
+    let r_oidc_users_forbid = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/users")
+                .header(header::COOKIE, &session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r_oidc_users_forbid.status(),
+        StatusCode::FORBIDDEN,
+        "OIDC viewer with preferred_username='admin' must not inherit local SQLite admin role"
+    );
+
+    // 2. Trusted Proxy user with Remote-User: admin and Remote-Groups: viewers must NOT escalate to admin
+    let r_proxy_admin_collision = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/users")
+                .header("x-peer-ip", "10.42.0.50")
+                .header("remote-user", "admin")
+                .header("remote-groups", "viewers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r_proxy_admin_collision.status(),
+        StatusCode::FORBIDDEN,
+        "Trusted proxy viewer with Remote-User: admin must not escalate to admin via SQLite collision"
+    );
+
+    // 2b. Non-admin JWT with sub="admin" and allowed_cameras=Some("front_door") restricts cameras via JWT claims
+    let scoped_admin_sub_jwt = format!(
+        "Bearer {}",
+        mint_test_jwt(&state.jwt_secret, "admin", "operator", Some("front_door"))
+    );
+    let r_scoped_admin_sub_by = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/backyard/state")
+                .header(header::AUTHORIZATION, &scoped_admin_sub_jwt)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r_scoped_admin_sub_by.status(),
+        StatusCode::FORBIDDEN,
+        "Non-admin JWT colliding with SQLite admin user must enforce explicit JWT allowed_cameras"
+    );
+
+    // 3. Reserved 'token:' and 'ext:' prefix spoofing (case-insensitive) in JWT sub, OIDC claims, and Trusted Proxy Remote-User is rejected
+    for spoofed_sub in [
+        "token:spoofed_op",
+        "TOKEN:spoofed_op",
+        "ext:spoofed_op",
+        "EXT:spoofed_op",
+    ] {
+        let spoofed_jwt = format!(
+            "Bearer {}",
+            mint_test_jwt(
+                &state.jwt_secret,
+                spoofed_sub,
+                "operator",
+                Some("front_door")
+            )
+        );
+        let r_spoof_jwt = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header(header::AUTHORIZATION, &spoofed_jwt)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_spoof_jwt.status(),
+            StatusCode::UNAUTHORIZED,
+            "JWT sub '{spoofed_sub}' must be rejected as a reserved principal prefix"
+        );
+    }
+
+    for spoofed_remote_user in [
+        "token:spoofed_proxy",
+        "TOKEN:spoofed_proxy",
+        "ext:spoofed_proxy",
+        "EXT:spoofed_proxy",
+    ] {
+        let r_spoof_proxy = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .header("x-peer-ip", "10.42.0.50")
+                    .header("remote-user", spoofed_remote_user)
+                    .header("remote-groups", "nvr-operators")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_spoof_proxy.status(),
+            StatusCode::UNAUTHORIZED,
+            "Trusted-Proxy Remote-User '{spoofed_remote_user}' must be rejected as a reserved principal prefix"
+        );
+    }
+
+    for bad_oidc_mode in ["token_prefix_claim", "ext_prefix_claim"] {
+        *oidc_mode.lock().unwrap() = bad_oidc_mode.to_string();
+        let r_spoof_oidc = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/callback?code=c1&state=st1")
+                    .header(
+                        header::COOKIE,
+                        "ninjanvr_oidc_pkce=st1:ver1:http://localhost:5000/api/auth/oidc/callback",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_spoof_oidc.status(),
+            StatusCode::UNAUTHORIZED,
+            "OIDC callback mode '{bad_oidc_mode}' must be rejected as a reserved principal prefix"
+        );
+    }
+
+    // 4. Federation peer SSRF bypasses (decimal/hex/octal/percent-encoded IPv4, IPv6 IMDS, Alibaba IMDS) and double-encoded '%252e%252e' subpath are blocked
+    for ssrf_peer in [
+        "ssrf_dec_imds",
+        "ssrf_hex_imds",
+        "ssrf_oct_imds",
+        "ssrf_pct_imds",
+        "ssrf_ipv6_imds",
+        "ssrf_alibaba_imds",
+    ] {
+        let r_ssrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/federation/{ssrf_peer}/stats"))
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_ssrf.status(),
+            StatusCode::BAD_REQUEST,
+            "Federation peer '{ssrf_peer}' must be rejected as SSRF"
+        );
+    }
+
+    let r_triple_enc_subpath = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/federation/valid_peer/%25252e%25252e/secret")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_triple_enc_subpath.status(), StatusCode::BAD_REQUEST);
+
+    // 5. Public GET /api/auth/providers scrubs embedded credentials and token query params in proxy.logout_url
+    let r_prov = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/providers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_prov.status(), StatusCode::OK);
+    let prov_str =
+        String::from_utf8(to_bytes(r_prov.into_body(), 8192).await.unwrap().to_vec()).unwrap();
+    assert!(!prov_str.contains("sso_secret_pw"));
+    assert!(!prov_str.contains("logout_tok_999"));
+
+    // 6. GET /api/config/raw scrubs next-line indented plain scalar secrets and numeric flow mapping secrets
+    let r_raw = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/config/raw")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_raw.status(), StatusCode::OK);
+    let raw_str: String =
+        serde_json::from_slice(&to_bytes(r_raw.into_body(), 65536).await.unwrap()).unwrap();
+    assert!(
+        !raw_str.contains("next_line_plain_oidc_secret_445566"),
+        "GET /api/config/raw must scrub next-line indented plain scalar secrets"
+    );
+    assert!(
+        !raw_str.contains("987654321"),
+        "GET /api/config/raw must scrub numeric flow mapping secrets"
+    );
+
+    // 7. Direct POST /api/mcp on build_router(state) rejects metrics-scoped tokens (403) and invalid tokens (401)
+    let r_mcp_metrics = direct_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mcp")
+                .header(header::AUTHORIZATION, format!("Bearer {metrics_tok}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": { "name": "get_security_digest", "arguments": {} }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_mcp_metrics.status(), StatusCode::FORBIDDEN);
+
+    let r_mcp_bad_tok = direct_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/mcp")
+                .header(header::AUTHORIZATION, "Bearer nnvr_invalid_token_xyz")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": { "name": "get_camera_status", "arguments": {} }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_mcp_bad_tok.status(), StatusCode::UNAUTHORIZED);
 
     upstream_task.abort();
     let _ = std::fs::remove_dir_all(&tmp_dir);
