@@ -159,6 +159,11 @@ impl BoundingBox {
     }
 }
 
+const MAX_MASK_POLYGONS: usize = 64;
+const MAX_POLYGON_VERTICES: usize = 256;
+const MAX_MOTION_CANDIDATES: usize = 128;
+const MAX_INFERENCE_REGIONS: usize = 16;
+
 #[derive(Debug, Clone, Default)]
 pub struct PolygonMask {
     polygons: Vec<Vec<(f32, f32)>>,
@@ -174,7 +179,7 @@ impl PolygonMask {
                 }
             }
             Value::Array(arr) => {
-                for item in arr {
+                for item in arr.iter().take(MAX_MASK_POLYGONS) {
                     if let Some(s) = item.as_str() {
                         if let Some(poly) = Self::parse_coord_str(s, frame_w, frame_h) {
                             polygons.push(poly);
@@ -193,6 +198,9 @@ impl PolygonMask {
                     polygons.push(poly);
                 }
                 for (k, v) in map {
+                    if polygons.len() >= MAX_MASK_POLYGONS {
+                        break;
+                    }
                     if k == "coordinates" || k == "mode" || k == "style" {
                         continue;
                     }
@@ -219,6 +227,9 @@ impl PolygonMask {
         }
         let mut nums = Vec::new();
         for part in trimmed.split(',') {
+            if nums.len() >= MAX_POLYGON_VERTICES * 2 {
+                break;
+            }
             let v = part.trim().parse::<f32>().ok()?;
             if !v.is_finite() {
                 return None;
@@ -787,6 +798,10 @@ impl SimdMotionDetector {
                 }
             }
         }
+        if boxes.len() > MAX_MOTION_CANDIDATES {
+            boxes.sort_by_key(|b| std::cmp::Reverse(b.area()));
+            boxes.truncate(MAX_MOTION_CANDIDATES);
+        }
         boxes
     }
 }
@@ -813,17 +828,24 @@ pub fn compute_inference_regions(
             None
         }
     };
-    let mut candidates: Vec<BoundingBox> =
-        Vec::with_capacity(motion_boxes.len() + tracked_boxes.len());
-    for tb in tracked_boxes {
-        if let Some(cb) = clamp_box(tb) {
-            candidates.push(cb);
-        }
+    let mut clamped_motion: Vec<BoundingBox> = motion_boxes.iter().filter_map(clamp_box).collect();
+    if clamped_motion.len() > MAX_MOTION_CANDIDATES {
+        clamped_motion.sort_by_key(|b| std::cmp::Reverse(b.area()));
+        clamped_motion.truncate(MAX_MOTION_CANDIDATES);
     }
-    for mb in motion_boxes {
-        if let Some(cb) = clamp_box(mb)
-            && !candidates.iter().any(|c| cb.inside(c))
-        {
+    let mut clamped_tracked: Vec<BoundingBox> =
+        tracked_boxes.iter().filter_map(clamp_box).collect();
+    if clamped_tracked.len() > MAX_MOTION_CANDIDATES {
+        clamped_tracked.sort_by_key(|b| std::cmp::Reverse(b.area()));
+        clamped_tracked.truncate(MAX_MOTION_CANDIDATES);
+    }
+    let mut candidates: Vec<BoundingBox> =
+        Vec::with_capacity(clamped_motion.len() + clamped_tracked.len());
+    for cb in clamped_tracked {
+        candidates.push(cb);
+    }
+    for cb in clamped_motion {
+        if !candidates.iter().any(|c| cb.inside(c)) {
             candidates.push(cb);
         }
     }
@@ -831,13 +853,15 @@ pub fn compute_inference_regions(
         return Vec::new();
     }
 
-    // Iteratively merge overlapping or proximate boxes
+    // Merge overlapping or proximate boxes in bounded passes without restarting from i = 0 on every merge
     let pad = (model_size / 8).max(16);
     let mut merged = true;
     while merged {
         merged = false;
-        'outer: for i in 0..candidates.len() {
-            for j in (i + 1)..candidates.len() {
+        let mut i = 0;
+        while i < candidates.len() {
+            let mut j = i + 1;
+            while j < candidates.len() {
                 let a = candidates[i];
                 let b = candidates[j];
                 let expanded_a = BoundingBox::new(
@@ -850,9 +874,11 @@ pub fn compute_inference_regions(
                     candidates[i] = a.union(&b);
                     candidates.swap_remove(j);
                     merged = true;
-                    break 'outer;
+                } else {
+                    j += 1;
                 }
             }
+            i += 1;
         }
     }
 
@@ -860,7 +886,7 @@ pub fn compute_inference_regions(
 
     let min_dim = frame_w.min(frame_h).max(1);
     let safe_model_size = model_size.max(4);
-    let mut regions = Vec::with_capacity(candidates.len());
+    let mut regions = Vec::with_capacity(candidates.len().min(MAX_INFERENCE_REGIONS));
     for c in candidates {
         let raw_size = ((c.width().max(c.height()) as f64) * 1.2) as u32;
         let size = (raw_size.max(safe_model_size) / 4 * 4)
@@ -880,8 +906,12 @@ pub fn compute_inference_regions(
         );
         if !regions.iter().any(|r: &BoundingBox| reg.inside(r)) {
             regions.push(reg);
+            if regions.len() >= MAX_INFERENCE_REGIONS {
+                break;
+            }
         }
     }
+    regions.truncate(MAX_INFERENCE_REGIONS);
     regions
 }
 
@@ -3073,5 +3103,87 @@ mod tests {
         assert_eq!(tr_first_valid.anomaly_elapsed_sec, 0.0);
         let tr_after_timeout = roi_tracker.observe_state("open", 0.95, 1_700_000_031.0);
         assert!(tr_after_timeout.anomaly_triggered);
+    }
+
+    #[test]
+    fn res_exhaust_001_caps_motion_candidates_and_inference_regions_under_grid_motion() {
+        // 1. Pass 600 disconnected motion boxes across a 3840x2160 frame and verify
+        // compute_inference_regions caps candidates to top 128 by area and returns <= 16 regions.
+        let mut many_boxes = Vec::with_capacity(600);
+        for row in 0..20u32 {
+            for col in 0..30u32 {
+                let x0 = col * 120 + 10;
+                let y0 = row * 100 + 10;
+                // Give one box a large area so we can verify largest-area prioritization
+                let (w, h) = if row == 19 && col == 29 {
+                    (80, 70)
+                } else {
+                    (8, 8)
+                };
+                many_boxes.push(BoundingBox::new(x0, y0, x0 + w, y0 + h));
+            }
+        }
+        assert_eq!(many_boxes.len(), 600);
+
+        let regions = compute_inference_regions(3840, 2160, 160, &many_boxes, &[]);
+        assert!(!regions.is_empty());
+        assert!(
+            regions.len() <= 16,
+            "compute_inference_regions must cap returned regions to at most 16, got {}",
+            regions.len()
+        );
+        // The largest box at (row=19, col=29) -> x0=3490, y0=1910 must be covered by the top region
+        let largest = BoundingBox::new(3490, 1910, 3570, 1980);
+        assert!(
+            regions.iter().any(|r| largest.inside(r)),
+            "largest motion candidate must be retained when capping motion boxes"
+        );
+
+        // 2. High-frequency grid motion in SimdMotionDetector::detect caps extracted motion boxes at <= 128
+        let fw = 640u32;
+        let fh = 360u32;
+        let cfg = MotionConfig {
+            enabled: true,
+            threshold: 15,
+            contour_area: 1,
+            frame_height: 360,
+            lightning_threshold: 0.80,
+            improve_contrast: false,
+            delta_alpha: 1.0,
+            ..MotionConfig::default()
+        };
+        let mut det = SimdMotionDetector::new(fw, fh, cfg);
+        let dark = YuvFrame {
+            camera: "cam".into(),
+            width: fw,
+            height: fh,
+            timestamp: 0.0,
+            data: std::sync::Arc::new(vec![20u8; (fw * fh * 3 / 2) as usize]),
+        };
+        for _ in 0..31 {
+            assert!(det.detect(&dark).is_empty());
+        }
+        let mut grid_data = vec![20u8; (fw * fh * 3 / 2) as usize];
+        // Activate 1 pixel every 8x8 pixels in the middle rows (well below lightning_threshold
+        // and outside the top/bottom OSD clock bands) -> > 500 disconnected components
+        for y in (50..300).step_by(8) {
+            for x in (16..624).step_by(8) {
+                grid_data[(y * fw + x) as usize] = 220;
+            }
+        }
+        let grid_frame = YuvFrame {
+            camera: "cam".into(),
+            width: fw,
+            height: fh,
+            timestamp: 1.0,
+            data: std::sync::Arc::new(grid_data),
+        };
+        let detected_boxes = det.detect(&grid_frame);
+        assert!(!detected_boxes.is_empty());
+        assert!(
+            detected_boxes.len() <= 128,
+            "extract_connected_boxes must cap motion boxes at 128, got {}",
+            detected_boxes.len()
+        );
     }
 }

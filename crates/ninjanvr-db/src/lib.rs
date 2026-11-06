@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tracing::info;
+use tracing::{info, warn};
 
 const PASSWORD_HASH_ALGORITHM: &str = "pbkdf2_sha256";
 
@@ -548,12 +548,53 @@ impl NinjaDatabase {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let is_in_memory = path.as_os_str().is_empty() || path == Path::new(":memory:");
+        if !is_in_memory {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                if let Ok(pmeta) = std::fs::symlink_metadata(parent)
+                    && pmeta.file_type().is_symlink()
+                {
+                    anyhow::bail!(
+                        "refusing to open SQLite DB in symlinked parent directory {}",
+                        parent.display()
+                    );
+                }
+                std::fs::create_dir_all(parent)?;
+            }
+            for candidate in [
+                path.clone(),
+                PathBuf::from(format!("{}-wal", path.display())),
+                PathBuf::from(format!("{}-shm", path.display())),
+                PathBuf::from(format!("{}-journal", path.display())),
+            ] {
+                if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+                    if meta.file_type().is_symlink() {
+                        anyhow::bail!(
+                            "refusing to open SQLite DB through symlink {}",
+                            candidate.display()
+                        );
+                    }
+                    if meta.is_dir() {
+                        anyhow::bail!(
+                            "SQLite DB path {} is a directory, expected a regular file",
+                            candidate.display()
+                        );
+                    }
+                }
+            }
         }
 
         let conn = Connection::open(&path)
             .with_context(|| format!("failed to open SQLite DB at {}", path.display()))?;
+
+        #[cfg(unix)]
+        if !is_in_memory
+            && let Ok(meta) = std::fs::symlink_metadata(&path)
+            && meta.file_type().is_file()
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
 
         conn.execute_batch(
             r#"
@@ -774,51 +815,27 @@ impl NinjaDatabase {
             CREATE INDEX IF NOT EXISTS "idx_share_link_target" ON "share_link" ("kind", "target_id");
             "#,
         )?;
-        let _ = conn.execute(
+        for alter_sql in [
             "ALTER TABLE user ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'admin'",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE user ADD COLUMN allowed_cameras TEXT NOT NULL DEFAULT '*'",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE user ADD COLUMN password_changed_at DATETIME NULL",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE recordings ADD COLUMN motion_heatmap TEXT NULL",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE recordings ADD COLUMN stream_tier TEXT NOT NULL DEFAULT 'main'",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE export ADD COLUMN export_case_id VARCHAR(30) NULL",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE exportcase ADD COLUMN event_ids JSON NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE exportcase ADD COLUMN export_ids JSON NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE event ADD COLUMN sub_label_score REAL", []);
-        let _ = conn.execute(
+            "ALTER TABLE event ADD COLUMN sub_label_score REAL",
             "ALTER TABLE share_link ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE share_link ADD COLUMN last_accessed_at REAL NULL",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE share_link ADD COLUMN max_views INTEGER NULL",
-            [],
-        );
+        ] {
+            if let Err(err) = conn.execute(alter_sql, []) {
+                let msg = err.to_string().to_ascii_lowercase();
+                if !msg.contains("duplicate column name") {
+                    warn!("SQLite schema migration statement failed ({alter_sql}): {err}");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -4873,7 +4890,10 @@ impl NinjaDatabase {
 
     pub fn revoke_share_links_by_creator(&self, created_by: &str) -> Result<usize> {
         let trimmed = created_by.trim();
-        let base = if trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("ext:") {
+        let base = if trimmed
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ext:"))
+        {
             trimmed[4..].trim()
         } else {
             trimmed
@@ -10675,5 +10695,100 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn revoke_share_links_by_creator_handles_multibyte_utf8_and_db_open_rejects_symlinks() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_db_utf8_sec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("test.db");
+
+        let db = NinjaDatabase::open(&db_path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+
+            let victim = tmp_dir.join("victim.db");
+            std::fs::write(&victim, b"not_a_db").unwrap();
+            let sym_db = tmp_dir.join("sym.db");
+            std::os::unix::fs::symlink(&victim, &sym_db).unwrap();
+            assert!(
+                NinjaDatabase::open(&sym_db).is_err(),
+                "NinjaDatabase::open must refuse opening a symlinked database path"
+            );
+        }
+
+        // Creator strings where byte index 4 lands inside a multi-byte UTF-8 codepoint:
+        // "josé" -> bytes 0..3 = "jos", bytes 3..5 = 'é' (byte 4 is NOT a char boundary)
+        // "ab€"  -> bytes 0..2 = "ab",  bytes 2..5 = '€' (byte 4 is NOT a char boundary)
+        db.insert_share_link_with_options(
+            "sl_jose_plain",
+            "event",
+            "ev_1",
+            Some("front_door"),
+            "josé",
+            1000.0,
+            2000.0,
+            None,
+        )
+        .unwrap();
+        db.insert_share_link_with_options(
+            "sl_jose_ext",
+            "event",
+            "ev_1",
+            Some("front_door"),
+            "ext:josé",
+            1000.0,
+            2000.0,
+            None,
+        )
+        .unwrap();
+        db.insert_share_link_with_options(
+            "sl_abeuro_plain",
+            "event",
+            "ev_2",
+            Some("front_door"),
+            "ab€",
+            1000.0,
+            2000.0,
+            None,
+        )
+        .unwrap();
+        db.insert_share_link_with_options(
+            "sl_abeuro_ext",
+            "event",
+            "ev_2",
+            Some("front_door"),
+            "EXT:ab€",
+            1000.0,
+            2000.0,
+            None,
+        )
+        .unwrap();
+
+        // Revoking by "josé" must not panic and must revoke both "josé" and "ext:josé"
+        let revoked_jose = db.revoke_share_links_by_creator("josé").unwrap();
+        assert_eq!(revoked_jose, 2);
+        assert!(db.is_share_link_revoked("sl_jose_plain").unwrap());
+        assert!(db.is_share_link_revoked("sl_jose_ext").unwrap());
+        assert!(!db.is_share_link_revoked("sl_abeuro_plain").unwrap());
+
+        // Revoking by "ext:ab€" must not panic and must revoke both "ab€" and "EXT:ab€"
+        let revoked_euro = db.revoke_share_links_by_creator("ext:ab€").unwrap();
+        assert_eq!(revoked_euro, 2);
+        assert!(db.is_share_link_revoked("sl_abeuro_plain").unwrap());
+        assert!(db.is_share_link_revoked("sl_abeuro_ext").unwrap());
+
+        // Additional non-boundary multi-byte strings ("äö", "a€b", "🔥") must not panic
+        for s in ["äö", "a€b", "🔥", "  josé  ", "  EXT:josé  "] {
+            assert!(db.revoke_share_links_by_creator(s).is_ok());
+        }
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

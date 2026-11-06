@@ -73,6 +73,7 @@ struct ZonePresenceState {
 }
 
 const MAX_ACTIVE_TRACKS: usize = 256;
+const MAX_ATTRIBUTES_PER_TRACK: usize = 32;
 
 /// Multi-Object Tracker implementing 2-stage **ByteTrack** association
 /// (high-confidence pass + low-confidence occlusion recovery pass),
@@ -912,13 +913,15 @@ impl ByteTracker {
                         trk.inferred_sub_label = Some(attr_det.label.clone());
                     }
                 }
-                trk.attributes.push(TrackedAttribute {
-                    label: attr_det.label.clone(),
-                    score: attr_det.score,
-                    bbox: attr_det.bbox,
-                    norm_bbox,
-                    area_px,
-                });
+                if trk.attributes.len() < MAX_ATTRIBUTES_PER_TRACK {
+                    trk.attributes.push(TrackedAttribute {
+                        label: attr_det.label.clone(),
+                        score: attr_det.score,
+                        bbox: attr_det.bbox,
+                        norm_bbox,
+                        area_px,
+                    });
+                }
             }
         }
     }
@@ -2672,5 +2675,26 @@ mod tests {
             "currently-matched confirmed track must not be evicted by flood of new detections"
         );
         assert!(!flood_ended.iter().any(|t| t.id == car_id));
+
+        // 5. Attribute flood per parent track is capped at MAX_ATTRIBUTES_PER_TRACK (32)
+        let mut attr_flood = vec![DetectionResult {
+            label: "car".to_string(),
+            score: 0.96,
+            bbox: BoundingBox::new(100, 100, 900, 900),
+            region: reg,
+        }];
+        for i in 0..80u32 {
+            let ax = 120 + (i % 10) * 60;
+            let ay = 120 + (i / 10) * 60;
+            attr_flood.push(DetectionResult {
+                label: "license_plate".to_string(),
+                score: 0.90,
+                bbox: BoundingBox::new(ax, ay, ax + 40, ay + 20),
+                region: reg,
+            });
+        }
+        let (attr_active, _) = logo_tracker.update(3.0, &attr_flood, &[reg], &logo_cfg);
+        let car_trk = attr_active.iter().find(|t| t.id == car_id).unwrap();
+        assert_eq!(car_trk.attributes.len(), MAX_ATTRIBUTES_PER_TRACK);
     }
 }

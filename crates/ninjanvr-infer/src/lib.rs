@@ -403,6 +403,21 @@ impl DetectorPool {
 
 const MAX_LABELMAP_FILE_BYTES: u64 = 256 * 1024;
 
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(CString::new(path.as_os_str().as_bytes())?)
+    }
+    #[cfg(not(unix))]
+    {
+        let s = path
+            .to_str()
+            .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))?;
+        Ok(CString::new(s.as_bytes())?)
+    }
+}
+
 fn read_bounded_labelmap_file(path: &Path) -> Result<String> {
     if !ninjanvr_config::is_safe_labelmap_path(path) {
         bail!("unsafe labelmap path: {}", path.display());
@@ -1191,7 +1206,7 @@ impl AiDetectorEngine {
         // SAFETY: `lib_path` and `model_path` are validated local paths; `dlopen`/`dlsym` symbols
         // are checked for null before transmuting and invoking `OrtGetApiBase`.
         unsafe {
-            let c_lib = CString::new(lib_path.to_string_lossy().as_bytes())?;
+            let c_lib = path_to_cstring(&lib_path)?;
             let handle = libc::dlopen(c_lib.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
             if handle.is_null() {
                 let err_ptr = libc::dlerror();
@@ -1421,7 +1436,7 @@ impl AiDetectorEngine {
                 }
             }
 
-            let c_model = CString::new(model_path.to_string_lossy().as_bytes())?;
+            let c_model = path_to_cstring(model_path)?;
             let sess_st = create_session(
                 ctx.env,
                 c_model.as_ptr(),
@@ -1681,7 +1696,7 @@ impl AiDetectorEngine {
                 bail!("ov_core_create returned {rc}");
             }
 
-            let c_model = CString::new(model_path.to_string_lossy().as_bytes())?;
+            let c_model = path_to_cstring(model_path)?;
             let c_prop_key = CString::new("INFERENCE_NUM_THREADS")?;
             let c_prop_val = CString::new("1")?;
             let mut actual_device = device.to_string();
@@ -1811,12 +1826,12 @@ impl AiDetectorEngine {
         // every required `dlsym` symbol is checked for null before transmuting to its C ABI fn type.
         unsafe {
             for dep_path in Self::discover_openvino_preload_deps(lib_dir) {
-                if let Ok(c_dep) = CString::new(dep_path.to_string_lossy().as_bytes()) {
+                if let Ok(c_dep) = path_to_cstring(&dep_path) {
                     let _ = libc::dlopen(c_dep.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
                 }
             }
 
-            let c_lib = CString::new(lib_path.to_string_lossy().as_bytes())?;
+            let c_lib = path_to_cstring(&lib_path)?;
             let handle = libc::dlopen(c_lib.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
             if handle.is_null() {
                 let err_ptr = libc::dlerror();
@@ -3136,6 +3151,42 @@ fn is_real_bounded_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn read_bounded_face_sample_file(
+    path: &Path,
+    expected_meta: &std::fs::Metadata,
+) -> Result<Vec<u8>> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(path)?;
+    let fd_meta = file.metadata()?;
+    if fd_meta.file_type().is_symlink()
+        || !fd_meta.file_type().is_file()
+        || fd_meta.len() == 0
+        || fd_meta.len() > MAX_FACE_SAMPLE_BYTES
+    {
+        bail!("opened face sample descriptor is invalid or oversized");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if expected_meta.dev() != fd_meta.dev() || expected_meta.ino() != fd_meta.ino() {
+            bail!("face sample inode changed during open");
+        }
+    }
+    let mut buf = Vec::with_capacity((fd_meta.len() as usize).min(MAX_FACE_SAMPLE_BYTES as usize));
+    let mut limited = std::io::Read::take(file, MAX_FACE_SAMPLE_BYTES + 1);
+    std::io::Read::read_to_end(&mut limited, &mut buf)?;
+    if buf.is_empty() || (buf.len() as u64) > MAX_FACE_SAMPLE_BYTES {
+        bail!("face sample content is empty or exceeds maximum size");
+    }
+    Ok(buf)
+}
+
 impl FaceGallery {
     pub fn new() -> Self {
         Self::default()
@@ -3261,10 +3312,7 @@ impl FaceGallery {
                         .map(|(_, _, emb)| emb.clone());
                     let emb = if let Some(cached) = cached_emb {
                         cached
-                    } else if let Ok(bytes) = std::fs::read(&fp)
-                        && !bytes.is_empty()
-                        && (bytes.len() as u64) <= MAX_FACE_SAMPLE_BYTES
-                    {
+                    } else if let Ok(bytes) = read_bounded_face_sample_file(&fp, &meta) {
                         let computed = extract_face_embedding(&bytes);
                         self.file_cache
                             .insert(fp.clone(), (file_len, file_mtime, computed.clone()));
@@ -3485,9 +3533,14 @@ impl FaceGallery {
         let mut removed_disk = false;
         if let Some(dir) = faces_dir.or(self.loaded_dir.as_deref())
             && is_real_directory(dir)
+            && let Ok(canon_base) = std::fs::canonicalize(dir)
         {
             let target = dir.join(&clean_name);
-            if is_real_directory(&target) {
+            if is_real_directory(&target)
+                && let Ok(canon_target) = std::fs::canonicalize(&target)
+                && canon_target.starts_with(&canon_base)
+                && canon_target != canon_base
+            {
                 std::fs::remove_dir_all(&target)?;
                 removed_disk = true;
             }
@@ -3498,6 +3551,9 @@ impl FaceGallery {
                         && let Some(raw_name) = path.file_name().and_then(|s| s.to_str())
                         && sanitize_face_profile_name(raw_name).as_deref() == Some(raw_name)
                         && raw_name.eq_ignore_ascii_case(&clean_name)
+                        && let Ok(canon_path) = std::fs::canonicalize(&path)
+                        && canon_path.starts_with(&canon_base)
+                        && canon_path != canon_base
                     {
                         self.file_cache.retain(|k, _| !k.starts_with(&path));
                         std::fs::remove_dir_all(&path)?;
@@ -6915,6 +6971,41 @@ detectors:
             assert!(
                 read_bounded_labelmap_file(&symlink_labelmap).is_err(),
                 "symlinked labelmap must be rejected"
+            );
+
+            // 4. LOSSYSTR-001: path_to_cstring preserves exact raw Unix OsStr bytes without lossy U+FFFD replacement
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            let raw_non_utf8 = b"/tmp/libopenvino_\xff_test.so";
+            let non_utf8_path = Path::new(OsStr::from_bytes(raw_non_utf8));
+            let cstr = path_to_cstring(non_utf8_path).unwrap();
+            assert_eq!(cstr.as_bytes(), raw_non_utf8);
+
+            let interior_nul_path = Path::new(OsStr::from_bytes(b"/tmp/bad\0path.so"));
+            assert!(path_to_cstring(interior_nul_path).is_err());
+
+            // 5. TOCTOU-008: read_bounded_face_sample_file rejects symlinks and inode swaps
+            let real_sample = tmp.join("real_sample.jpg");
+            std::fs::write(&real_sample, b"face-bytes-123").unwrap();
+            let real_meta = std::fs::symlink_metadata(&real_sample).unwrap();
+            assert_eq!(
+                read_bounded_face_sample_file(&real_sample, &real_meta).unwrap(),
+                b"face-bytes-123"
+            );
+
+            let other_sample = tmp.join("other_sample.jpg");
+            std::fs::write(&other_sample, b"other-bytes-456").unwrap();
+            let other_meta = std::fs::symlink_metadata(&other_sample).unwrap();
+            assert!(
+                read_bounded_face_sample_file(&real_sample, &other_meta).is_err(),
+                "inode mismatch between expected_meta and opened FD must be rejected"
+            );
+
+            let sym_sample = tmp.join("sym_sample.jpg");
+            std::os::unix::fs::symlink(&real_sample, &sym_sample).unwrap();
+            assert!(
+                read_bounded_face_sample_file(&sym_sample, &real_meta).is_err(),
+                "O_NOFOLLOW must reject symlinked face sample path"
             );
         }
 

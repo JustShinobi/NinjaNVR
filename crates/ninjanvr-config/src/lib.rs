@@ -1958,11 +1958,92 @@ impl Default for CameraLiveConfig {
     }
 }
 
+const MAX_CONFIG_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
 impl NinjaConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        use std::io::Read;
         let path = path.as_ref();
-        let raw_yaml = std::fs::read_to_string(path)
+        let sym_meta = std::fs::symlink_metadata(path)
+            .with_context(|| format!("failed to stat config file at {}", path.display()))?;
+        if sym_meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "refusing to load configuration through symlink {}",
+                path.display()
+            );
+        }
+        if !sym_meta.is_file() {
+            anyhow::bail!(
+                "configuration path {} is not a regular file",
+                path.display()
+            );
+        }
+        if sym_meta.len() > MAX_CONFIG_FILE_BYTES {
+            anyhow::bail!(
+                "configuration file {} exceeds maximum size ({MAX_CONFIG_FILE_BYTES} bytes)",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW_FLAG)
+                .open(path)
+                .with_context(|| format!("failed to read config file at {}", path.display()))?;
+            let fd_meta = f.metadata().with_context(|| {
+                format!("failed to stat opened config file at {}", path.display())
+            })?;
+            if !fd_meta.is_file() || fd_meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "opened configuration descriptor at {} is not a regular file",
+                    path.display()
+                );
+            }
+            if fd_meta.len() > MAX_CONFIG_FILE_BYTES {
+                anyhow::bail!(
+                    "opened configuration descriptor at {} exceeds maximum size ({MAX_CONFIG_FILE_BYTES} bytes)",
+                    path.display()
+                );
+            }
+            if fd_meta.dev() != sym_meta.dev() || fd_meta.ino() != sym_meta.ino() {
+                anyhow::bail!(
+                    "configuration file {} changed inode during open",
+                    path.display()
+                );
+            }
+            f
+        };
+        #[cfg(not(unix))]
+        let file = {
+            let f = std::fs::File::open(path)
+                .with_context(|| format!("failed to read config file at {}", path.display()))?;
+            let fd_meta = f.metadata().with_context(|| {
+                format!("failed to stat opened config file at {}", path.display())
+            })?;
+            if !fd_meta.is_file()
+                || fd_meta.file_type().is_symlink()
+                || fd_meta.len() > MAX_CONFIG_FILE_BYTES
+            {
+                anyhow::bail!(
+                    "opened configuration descriptor at {} is invalid or oversized",
+                    path.display()
+                );
+            }
+            f
+        };
+        let mut raw_yaml =
+            String::with_capacity((sym_meta.len() as usize).min(MAX_CONFIG_FILE_BYTES as usize));
+        file.take(MAX_CONFIG_FILE_BYTES + 1)
+            .read_to_string(&mut raw_yaml)
             .with_context(|| format!("failed to read config file at {}", path.display()))?;
+        if (raw_yaml.len() as u64) > MAX_CONFIG_FILE_BYTES {
+            anyhow::bail!(
+                "configuration file {} exceeds maximum size ({MAX_CONFIG_FILE_BYTES} bytes)",
+                path.display()
+            );
+        }
         Self::from_yaml_str(&raw_yaml, path.to_path_buf())
     }
 
@@ -4823,6 +4904,18 @@ pub fn is_safe_tls_path(path: &Path) -> bool {
         return false;
     }
     if path.exists() || std::fs::symlink_metadata(path).is_ok() {
+        let is_system_pki = path.to_str().is_some_and(|s| {
+            let lc = s.trim().to_ascii_lowercase();
+            lc.starts_with("/etc/ssl/")
+                || lc.starts_with("/etc/pki/")
+                || lc.starts_with("/etc/ca-certificates/")
+        });
+        if !is_system_pki
+            && std::fs::symlink_metadata(path)
+                .is_ok_and(|m| m.file_type().is_symlink() || !m.is_file())
+        {
+            return false;
+        }
         let Ok(canon) = std::fs::canonicalize(path) else {
             return false;
         };
@@ -4843,6 +4936,9 @@ pub fn is_safe_tls_path(path: &Path) -> bool {
             return false;
         }
     } else {
+        if !path.is_absolute() {
+            return false;
+        }
         for ancestor in path.ancestors().skip(1) {
             if ancestor.as_os_str().is_empty() {
                 break;
@@ -9871,5 +9967,46 @@ cameras:
         .expect("partial structured JSON update must succeed even after non-finite float mutation");
         assert!(!cfg.motion.enabled);
         assert!(cfg.motion.lightning_threshold.is_finite());
+    }
+
+    #[test]
+    fn toctou_011_ninjaconfig_load_rejects_symlinks_and_directories() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ninjanvr_config_load_nofollow_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let real_cfg_path = tmp_dir.join("config.yml");
+        std::fs::write(
+            &real_cfg_path,
+            "cameras:\n  front_door:\n    enabled: true\n",
+        )
+        .unwrap();
+
+        // 1. Regular file loads cleanly
+        let loaded = NinjaConfig::load(&real_cfg_path).unwrap();
+        assert!(loaded.cameras.contains_key("front_door"));
+
+        // 2. Directory path is rejected
+        assert!(NinjaConfig::load(&tmp_dir).is_err());
+
+        // 3. Symlink path is rejected on Unix
+        #[cfg(unix)]
+        {
+            let sym_cfg_path = tmp_dir.join("symlink_config.yml");
+            std::os::unix::fs::symlink(&real_cfg_path, &sym_cfg_path).unwrap();
+            let err = NinjaConfig::load(&sym_cfg_path).unwrap_err();
+            assert!(
+                err.to_string().contains("symlink"),
+                "expected symlink rejection error, got: {err:#}"
+            );
+        }
+
+        // 4. Relative non-existent TLS path is rejected by is_safe_tls_path
+        assert!(!is_safe_tls_path(Path::new("certs/ca.pem")));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

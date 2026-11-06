@@ -117,6 +117,8 @@ pub struct CommsHub {
     initialized_from_config: Arc<AtomicBool>,
     active_profile: Arc<RwLock<String>>,
     profile_persist_path: Arc<RwLock<Option<std::path::PathBuf>>>,
+    profile_persisted_once: Arc<AtomicBool>,
+    profile_persist_lock: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for CommsHub {
@@ -195,6 +197,8 @@ impl CommsHub {
             initialized_from_config: Arc::new(AtomicBool::new(false)),
             active_profile: Arc::new(RwLock::new("armed".to_string())),
             profile_persist_path: Arc::new(RwLock::new(None)),
+            profile_persisted_once: Arc::new(AtomicBool::new(false)),
+            profile_persist_lock: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -208,6 +212,8 @@ impl CommsHub {
             initialized_from_config: Arc::new(AtomicBool::new(false)),
             active_profile: Arc::new(RwLock::new("armed".to_string())),
             profile_persist_path: Arc::new(RwLock::new(None)),
+            profile_persisted_once: Arc::new(AtomicBool::new(false)),
+            profile_persist_lock: Arc::new(Mutex::new(None)),
         };
         if mqtt_cfg.enabled {
             let cfg_clone = mqtt_cfg.clone();
@@ -560,6 +566,7 @@ impl CommsHub {
     }
 
     pub fn set_profile_persist_path(&self, path: std::path::PathBuf) {
+        let mut loaded_norm: Option<String> = None;
         if let Some(saved) = read_persisted_profile_file(&path) {
             let trimmed = saved.trim().to_ascii_lowercase();
             if !trimmed.is_empty() {
@@ -573,9 +580,19 @@ impl CommsHub {
                         .active_profile
                         .write()
                         .unwrap_or_else(|e| e.into_inner());
-                    *g = norm;
+                    *g = norm.clone();
+                    loaded_norm = Some(norm);
                 }
             }
+        }
+        self.profile_persisted_once
+            .store(loaded_norm.is_some(), Ordering::Release);
+        {
+            let mut last_written = self
+                .profile_persist_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *last_written = loaded_norm;
         }
         let mut g = self
             .profile_persist_path
@@ -594,25 +611,70 @@ impl CommsHub {
             other if is_valid_profile_name(other) => other.to_string(),
             _ => return self.get_active_profile(),
         };
-        {
+        let should_persist = {
             let mut g = self
                 .active_profile
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
+            let changed = *g != norm;
             *g = norm.clone();
-        }
+            changed || !self.profile_persisted_once.load(Ordering::Acquire)
+        };
         let persist_path = self
             .profile_persist_path
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if let Some(ref p) = persist_path
-            && let Err(err) = persist_active_profile_atomically(p, &norm)
-        {
-            warn!(
-                "Failed to persist active security profile to {}: {err}",
-                p.display()
-            );
+        if should_persist && let Some(p) = persist_path {
+            self.profile_persisted_once.store(true, Ordering::Release);
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let lock = self.profile_persist_lock.clone();
+                let active_profile = self.active_profile.clone();
+                let persisted_once = self.profile_persisted_once.clone();
+                handle.spawn_blocking(move || {
+                    let mut last_written = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let target_norm = active_profile
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    if last_written.as_deref() == Some(target_norm.as_str()) {
+                        return;
+                    }
+                    match persist_active_profile_atomically(&p, &target_norm) {
+                        Ok(()) => {
+                            *last_written = Some(target_norm);
+                            persisted_once.store(true, Ordering::Release);
+                        }
+                        Err(err) => {
+                            persisted_once.store(false, Ordering::Release);
+                            warn!(
+                                "Failed to persist active security profile to {}: {err}",
+                                p.display()
+                            );
+                        }
+                    }
+                });
+            } else {
+                let mut last_written = self
+                    .profile_persist_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if last_written.as_deref() != Some(norm.as_str()) {
+                    match persist_active_profile_atomically(&p, &norm) {
+                        Ok(()) => {
+                            *last_written = Some(norm.clone());
+                            self.profile_persisted_once.store(true, Ordering::Release);
+                        }
+                        Err(err) => {
+                            self.profile_persisted_once.store(false, Ordering::Release);
+                            warn!(
+                                "Failed to persist active security profile to {}: {err}",
+                                p.display()
+                            );
+                        }
+                    }
+                }
+            }
         }
         self.publish_topic("profile/state", norm.clone());
         norm
@@ -1075,76 +1137,107 @@ pub fn build_mqtt_options(cfg: &MqttConfig) -> MqttOptions {
     mqtt_opts
 }
 
+struct AbortTaskOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortTaskOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn run_mqtt_loop(
     cfg: MqttConfig,
     mut rx: mpsc::Receiver<(String, Vec<u8>, bool)>,
     hub: CommsHub,
 ) {
     let prefix = sanitize_mqtt_prefix(&cfg.topic_prefix);
+    let active_client: Arc<RwLock<Option<AsyncClient>>> = Arc::new(RwLock::new(None));
+    let active_client_for_tx = active_client.clone();
+    let prefix_for_tx = prefix.clone();
+    let (closed_tx, mut closed_rx) = tokio::sync::watch::channel(false);
+
+    // Forward outgoing internal messages from `rx` in a dedicated task so `eventloop.poll()`
+    // is never polled inside a `tokio::select!` competing with `rx.recv()` (preserving cancel-safety
+    // across TCP/TLS/CONNACK handshakes and outgoing packet socket flushes).
+    let _forwarder_guard = AbortTaskOnDrop(tokio::spawn(async move {
+        while let Some((sub_topic, payload, retain)) = rx.recv().await {
+            let clean_sub = sub_topic.trim_matches('/');
+            if is_valid_mqtt_publish_topic(clean_sub) {
+                let full_topic = format!("{prefix_for_tx}/{clean_sub}");
+                if is_valid_mqtt_publish_topic(&full_topic) {
+                    let maybe_client = active_client_for_tx
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    if let Some(client) = maybe_client {
+                        let _ = client.try_publish(full_topic, QoS::AtMostOnce, retain, payload);
+                    }
+                }
+            }
+        }
+        let _ = closed_tx.send(true);
+    }));
+
     let mut backoff_secs = 2u64;
     loop {
+        if *closed_rx.borrow() {
+            return;
+        }
         let cfg_for_opts = cfg.clone();
         let mqtt_opts = tokio::task::spawn_blocking(move || build_mqtt_options(&cfg_for_opts))
             .await
             .unwrap_or_else(|_| build_mqtt_options(&cfg));
         let (client, mut eventloop) = AsyncClient::new(mqtt_opts, 256);
+        *active_client.write().unwrap_or_else(|e| e.into_inner()) = Some(client.clone());
         let mut connected_at: Option<tokio::time::Instant> = None;
 
         loop {
-            tokio::select! {
-                maybe_msg = rx.recv() => {
-                    let Some((sub_topic, payload, retain)) = maybe_msg else {
-                        return;
-                    };
-                    let clean_sub = sub_topic.trim_matches('/');
-                    if is_valid_mqtt_publish_topic(clean_sub) {
-                        let full_topic = format!("{prefix}/{clean_sub}");
-                        if is_valid_mqtt_publish_topic(&full_topic) {
-                            let _ = client.try_publish(full_topic, QoS::AtMostOnce, retain, payload);
-                        }
+            if *closed_rx.borrow() {
+                return;
+            }
+            match eventloop.poll().await {
+                Ok(MqttEvent::Incoming(Packet::ConnAck(_))) => {
+                    connected_at = Some(tokio::time::Instant::now());
+                    info!("Connected to MQTT broker at {}:{}", cfg.host, cfg.port);
+                    let _ = client.try_publish(
+                        format!("{prefix}/available"),
+                        QoS::AtMostOnce,
+                        true,
+                        "online",
+                    );
+                    let _ = client.try_subscribe(format!("{prefix}/+/+/set"), QoS::AtMostOnce);
+                    let _ = client.try_subscribe(format!("{prefix}/profile/set"), QoS::AtMostOnce);
+                }
+                Ok(MqttEvent::Incoming(Packet::Publish(pub_pkt))) => {
+                    if let Some(rel) = pub_pkt.topic.strip_prefix(&format!("{prefix}/"))
+                        && rel.ends_with("/set")
+                    {
+                        let payload_str = String::from_utf8_lossy(&pub_pkt.payload).to_string();
+                        debug!("MQTT command on {}: {payload_str}", pub_pkt.topic);
+                        hub.apply_set_command(rel, &payload_str);
                     }
                 }
-                ev = eventloop.poll() => {
-                    match ev {
-                        Ok(MqttEvent::Incoming(Packet::ConnAck(_))) => {
-                            connected_at = Some(tokio::time::Instant::now());
-                            info!("Connected to MQTT broker at {}:{}", cfg.host, cfg.port);
-                            let _ = client.try_publish(
-                                format!("{prefix}/available"),
-                                QoS::AtMostOnce,
-                                true,
-                                "online",
-                            );
-                            let _ = client
-                                .try_subscribe(format!("{prefix}/+/+/set"), QoS::AtMostOnce);
-                            let _ = client
-                                .try_subscribe(format!("{prefix}/profile/set"), QoS::AtMostOnce);
-                        }
-                        Ok(MqttEvent::Incoming(Packet::Publish(pub_pkt))) => {
-                            if let Some(rel) = pub_pkt.topic.strip_prefix(&format!("{prefix}/"))
-                                && rel.ends_with("/set")
-                            {
-                                let payload_str = String::from_utf8_lossy(&pub_pkt.payload).to_string();
-                                debug!("MQTT command on {}: {payload_str}", pub_pkt.topic);
-                                hub.apply_set_command(rel, &payload_str);
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            if connected_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(10)) {
-                                backoff_secs = 2;
-                            }
-                            debug!("MQTT broker unreachable ({err}); retrying in {backoff_secs}s");
-                            break;
-                        }
+                Ok(_) => {}
+                Err(err) => {
+                    *active_client.write().unwrap_or_else(|e| e.into_inner()) = None;
+                    if connected_at.is_some_and(|t| t.elapsed() >= Duration::from_secs(10)) {
+                        backoff_secs = 2;
                     }
+                    debug!("MQTT broker unreachable ({err}); retrying in {backoff_secs}s");
+                    break;
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-        // Drain stale messages accumulated while the broker was unreachable to bound memory usage.
-        while rx.try_recv().is_ok() {}
-        if rx.is_closed() {
+        tokio::select! {
+            biased;
+            _ = closed_rx.changed() => {
+                if *closed_rx.borrow() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+        }
+        if *closed_rx.borrow() {
             return;
         }
         backoff_secs = (backoff_secs * 2).min(60);
@@ -2293,6 +2386,75 @@ cameras:
         assert!(nginx_logs[0].contains("GET a€€ HTTP/1.1"));
         assert!(!nginx_logs[4].contains("secret_tok_utf8"));
         assert!(nginx_logs[4].contains("/share/<redacted>/äöü.mp4"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn async_profile_persistence_offloads_to_spawn_blocking_and_skips_redundant_writes() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ninjanvr_comms_async_profile_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let profile_path = tmp_dir.join(".active_profile");
+
+        let hub = CommsHub::new();
+        hub.set_profile_persist_path(profile_path.clone());
+
+        // 1. Initial persistence of default profile ("armed") inside a Tokio runtime
+        assert_eq!(hub.set_active_profile("armed"), "armed");
+        for _ in 0..50 {
+            if profile_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&profile_path).unwrap().trim(),
+            "armed"
+        );
+        #[cfg(unix)]
+        let ino_after_initial = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&profile_path).unwrap().ino()
+        };
+
+        // 2. Redundant set_active_profile("armed") skips atomic rename / disk write
+        let seq_before = PROFILE_TMP_SEQ.load(Ordering::Relaxed);
+        assert_eq!(hub.set_active_profile("armed"), "armed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let seq_after = PROFILE_TMP_SEQ.load(Ordering::Relaxed);
+        assert_eq!(
+            seq_before, seq_after,
+            "redundant set_active_profile call must skip disk persistence"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&profile_path).unwrap().ino(),
+                ino_after_initial
+            );
+        }
+
+        // 3. Transitioning to a new profile ("home" -> "disarmed") persists the final state via spawn_blocking
+        assert_eq!(hub.set_active_profile("home"), "home");
+        assert_eq!(hub.set_active_profile("off"), "disarmed");
+        for _ in 0..50 {
+            if std::fs::read_to_string(&profile_path)
+                .map(|s| s.trim() == "disarmed")
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&profile_path).unwrap().trim(),
+            "disarmed"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
