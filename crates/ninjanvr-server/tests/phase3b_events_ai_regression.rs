@@ -1567,3 +1567,513 @@ async fn r2_p3b_cycle2_snapshot_privacy_genai_env_ssrf_symlink_zip_and_timeline_
     srv_handle.abort();
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[tokio::test]
+async fn r3_p3b_cycle3_json_thumbnail_privacy_rbac_genai_two_step_zip_and_subdir_regression() {
+    let (tmp_dir, state, app, admin_bearer, _scoped_admin_bearer, scoped_op_bearer) =
+        setup_phase3b_test_env().await;
+    let direct_app = build_router(state.clone());
+
+    // =========================================================================
+    // 1. [R3-P3B-01] Event JSON `thumbnail` base64 privacy-mask redaction
+    // =========================================================================
+    let mut white_img = image::RgbImage::new(64, 64);
+    for p in white_img.pixels_mut() {
+        *p = image::Rgb([250, 250, 250]);
+    }
+    let white_webp = ninjanvr_vision::encode_image_webp(&white_img).unwrap();
+    let unmasked_b64 = base64::engine::general_purpose::STANDARD.encode(&white_webp);
+
+    state
+        .db
+        .upsert_event(&EventDto {
+            id: "ev_json_thumb_mask".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 9100.0,
+            end_time: Some(9105.0),
+            has_clip: false,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.95),
+            false_positive: Some(false),
+            box_coords: Some(json!([0.1, 0.1, 0.5, 0.5])),
+            data: json!({}),
+            thumbnail: Some(unmasked_b64.clone()),
+            area: None,
+            ratio: None,
+            score: Some(0.95),
+            stationary: false,
+        })
+        .unwrap();
+
+    {
+        let mut cfg = state.config.write().await;
+        cfg.cameras.get_mut("front_door").unwrap().privacy_mask =
+            json!(["0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0"]);
+    }
+
+    for uri in [
+        "/api/events?cameras=front_door",
+        "/api/event_ids?ids=ev_json_thumb_mask",
+        "/api/events/explore?limit=5",
+    ] {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, &scoped_op_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let arr: Vec<Value> =
+            serde_json::from_slice(&to_bytes(r.into_body(), 65536).await.unwrap()).unwrap();
+        let ev_obj = arr
+            .iter()
+            .find(|e| e["id"] == "ev_json_thumb_mask")
+            .unwrap();
+        let thumb_b64 = ev_obj["thumbnail"].as_str().unwrap();
+        assert_ne!(
+            thumb_b64, unmasked_b64,
+            "{uri} must redact base64 thumbnail when privacy_mask is active"
+        );
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(thumb_b64)
+            .unwrap();
+        let rgb = image::load_from_memory(&decoded).unwrap().to_rgb8();
+        assert!(
+            rgb.get_pixel(32, 32).0[0] < 30,
+            "{uri} base64 thumbnail pixel must be masked"
+        );
+    }
+
+    let r_by_id = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/events/ev_json_thumb_mask")
+                .header(header::AUTHORIZATION, &scoped_op_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_by_id.status(), StatusCode::OK);
+    let ev_by_id: Value =
+        serde_json::from_slice(&to_bytes(r_by_id.into_body(), 65536).await.unwrap()).unwrap();
+    let thumb_by_id = ev_by_id["thumbnail"].as_str().unwrap();
+    let decoded_by_id = base64::engine::general_purpose::STANDARD
+        .decode(thumb_by_id)
+        .unwrap();
+    let rgb_by_id = image::load_from_memory(&decoded_by_id).unwrap().to_rgb8();
+    assert!(
+        rgb_by_id.get_pixel(32, 32).0[0] < 30,
+        "GET /api/events/{{id}} must redact base64 thumbnail when privacy_mask is active"
+    );
+
+    // =========================================================================
+    // 2. [R3-P3B-02] RBAC on POST /api/reviews/delete & read_only/metrics token isolation
+    // =========================================================================
+    state
+        .db
+        .insert_review_segment(&ReviewItemDto {
+            id: "rev_fd_r3".to_string(),
+            camera: "front_door".to_string(),
+            start_time: 9100.0,
+            end_time: Some(9105.0),
+            severity: "alert".to_string(),
+            thumb_path: String::new(),
+            data: json!({}),
+            has_been_reviewed: false,
+        })
+        .unwrap();
+
+    // Non-admin operator must receive 403 FORBIDDEN on POST /api/reviews/delete (matching DELETE /api/reviews)
+    let r_op_rev_del = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/reviews/delete")
+                .header(header::AUTHORIZATION, &scoped_op_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"ids":["rev_fd_r3"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_op_rev_del.status(), StatusCode::FORBIDDEN);
+    assert!(
+        state.db.get_review_by_id("rev_fd_r3").unwrap().is_some(),
+        "Non-admin operator must not delete review segments via POST /api/reviews/delete"
+    );
+
+    // read_only and metrics API tokens must be blocked from mutating endpoints even on direct_app,
+    // and metrics token must receive zero camera events on GET /api/events
+    let (_, ro_token) = state
+        .db
+        .create_api_token("r3_ro_tok", "read_only", None)
+        .unwrap();
+    let (_, metrics_token) = state
+        .db
+        .create_api_token("r3_metrics_tok", "metrics", None)
+        .unwrap();
+    let ro_bearer = format!("Bearer {ro_token}");
+    let metrics_bearer = format!("Bearer {metrics_token}");
+
+    for tok_hdr in [&ro_bearer, &metrics_bearer] {
+        let r_mut = direct_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/events/ev_json_thumb_mask/retain")
+                    .header(header::AUTHORIZATION, tok_hdr)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_mut.status(),
+            StatusCode::FORBIDDEN,
+            "Read-only or metrics token must receive 403 FORBIDDEN on mutations in direct_app"
+        );
+    }
+
+    let r_metrics_events = direct_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/events")
+                .header(header::AUTHORIZATION, &metrics_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let metrics_ev_arr: Vec<Value> =
+        serde_json::from_slice(&to_bytes(r_metrics_events.into_body(), 16384).await.unwrap())
+            .unwrap();
+    assert!(
+        metrics_ev_arr.is_empty(),
+        "metrics-scoped API token must not read camera events on direct_app"
+    );
+
+    // =========================================================================
+    // 3. [R3-P3B-03] Two-step GenAI env-var exfiltration, cross-provider key leak,
+    //    env-var existence oracle prevention, and query/fragment/SIIT/6to4 SSRF
+    // =========================================================================
+    let captured_auth: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let auth_clone = captured_auth.clone();
+    let mock_router = Router::new()
+        .route(
+            "/v1/models",
+            get(move |headers: axum::http::HeaderMap| {
+                let auth_hdr = headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                *auth_clone.lock().unwrap() = auth_hdr;
+                async move { Json(json!({ "data": [{ "id": "gpt-4o-mini" }] })).into_response() }
+            }),
+        )
+        .route(
+            "/v1beta/models",
+            get({
+                let auth_clone2 = captured_auth.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let auth_hdr = headers
+                        .get("x-goog-api-key")
+                        .or_else(|| headers.get(header::AUTHORIZATION))
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    *auth_clone2.lock().unwrap() = auth_hdr;
+                    async move {
+                        Json(json!({ "models": [{ "name": "models/gemini-2.5-flash" }] }))
+                            .into_response()
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_router).await;
+    });
+
+    // 3a. When saved.base_url is ALREADY set to a custom URL (so base_url_changed == false),
+    //     passing api_key: "$NINJANVR_TEST_GENAI_SECRET" or api_key_env must NOT exfiltrate the env var!
+    unsafe {
+        std::env::set_var("NINJANVR_TEST_GENAI_SECRET", "env-two-step-secret-999");
+    }
+    {
+        let mut cfg = state.config.write().await;
+        cfg.genai.provider = "openai".to_string();
+        cfg.genai.base_url = Some(format!("http://{addr}/v1"));
+        cfg.genai.api_key = Some("NINJANVR_TEST_GENAI_SECRET".to_string());
+        cfg.genai.api_key_env = "NINJANVR_TEST_GENAI_SECRET".to_string();
+    }
+    *captured_auth.lock().unwrap() = None;
+    let r_two_step = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/genai/validate")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "provider": "openai",
+                        "api_key": "$NINJANVR_TEST_GENAI_SECRET",
+                        "api_key_env": "NINJANVR_TEST_GENAI_SECRET"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_two_step.status(), StatusCode::OK);
+    assert!(
+        captured_auth.lock().unwrap().is_none(),
+        "Two-step /api/genai/validate must never exfiltrate allowlisted env vars to a saved custom base_url"
+    );
+    *captured_auth.lock().unwrap() = None;
+    let r_two_step_masked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/genai/validate")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "provider": "openai",
+                        "api_key": "***"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_two_step_masked.status(), StatusCode::OK);
+    assert!(
+        captured_auth.lock().unwrap().is_none(),
+        "Saved custom base_url with masked api_key must clear saved api_key_env and env-var api_key"
+    );
+
+    // 3b. Unset UPPER_SNAKE_CASE env-var identifier must NOT be treated as a literal API key (no existence oracle)
+    *captured_auth.lock().unwrap() = None;
+    let _ = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/genai/validate")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "provider": "openai",
+                        "api_key": "UNSET_SECRET_ENV_VAR_ORACLE_PROBE"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        captured_auth.lock().unwrap().is_none(),
+        "Unset UPPER_SNAKE_CASE env var identifier must not be sent as a literal Bearer token"
+    );
+
+    // 3c. Query/fragment/traversal in GenAI base_url and IPv6 SIIT/6to4/Teredo SSRF are rejected
+    for bad_genai_url in [
+        "https://api.openai.com/v1? hijack=1",
+        "https://api.openai.com/v1?x=1",
+        "https://api.openai.com/v1#frag",
+        "https://api.openai.com/v1/../admin",
+        "http://[::ffff:0:169.254.169.254]/v1",
+        "http://[2002:a9fe:a9fe::1]/v1",
+        "http://[2001:0000:4136:e378:8000:63bf:3fff:fdd2]/v1",
+    ] {
+        let r_ssrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/genai/validate")
+                    .header(header::AUTHORIZATION, &admin_bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "provider": "openai",
+                            "api_key": "sk-test",
+                            "base_url": bad_genai_url
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_ssrf.status(),
+            StatusCode::BAD_REQUEST,
+            "GenAI base_url '{bad_genai_url}' must be rejected with 400 BAD_REQUEST"
+        );
+    }
+
+    // =========================================================================
+    // 4. [R3-P3B-04] Cross-subdirectory & cross-camera file confinement on recordings/clips/dataset
+    // =========================================================================
+    let model_keep = state.media_dir.join("models/keep_detector.onnx");
+    std::fs::create_dir_all(state.media_dir.join("models")).unwrap();
+    std::fs::write(&model_keep, b"DO_NOT_DELETE_MODEL").unwrap();
+
+    let by_rec_dir = state.media_dir.join("recordings/2026-11-05/00/backyard");
+    std::fs::create_dir_all(&by_rec_dir).unwrap();
+    let by_rec_keep = by_rec_dir.join("00.00.mp4");
+    std::fs::write(&by_rec_keep, b"BACKYARD_RECORDING_BYTES").unwrap();
+
+    // Poison front_door recording rows pointing to models/keep_detector.onnx and backyard's recording
+    for (rec_id, path_buf, ts) in [
+        ("rec_poison_model", &model_keep, 9500.0),
+        ("rec_poison_by", &by_rec_keep, 9510.0),
+    ] {
+        state
+            .db
+            .insert_recording(&RecordingRow {
+                id: rec_id.to_string(),
+                camera: "front_door".to_string(),
+                path: path_buf.to_string_lossy().to_string(),
+                start_time: ts,
+                end_time: ts + 10.0,
+                duration: 10.0,
+                motion: 1,
+                objects: 1,
+                dbfs: -20,
+                segment_size: 0.1,
+                regions: 1,
+                motion_heatmap: None,
+            })
+            .unwrap();
+    }
+
+    let r_del_poison = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/front_door/recordings?after=9490&before=9530")
+                .header(header::AUTHORIZATION, &admin_bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_del_poison.status(), StatusCode::OK);
+    assert!(
+        model_keep.is_file(),
+        "DELETE /api/front_door/recordings must never unlink files in media_dir/models/"
+    );
+    assert!(
+        by_rec_keep.is_file(),
+        "DELETE /api/front_door/recordings must never unlink backyard recording segments"
+    );
+
+    // Toggling false_positive true -> false removes both DB row and dataset/ds_<id>.webp file
+    let r_fp_on = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/events/ev_json_thumb_mask/false_positive")
+                .header(header::AUTHORIZATION, &scoped_op_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"false_positive":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_fp_on.status(), StatusCode::OK);
+    let fp_sample_file = state.media_dir.join("dataset/ds_ev_json_thumb_mask.webp");
+    assert!(fp_sample_file.is_file());
+
+    let r_fp_off = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/events/ev_json_thumb_mask/false_positive")
+                .header(header::AUTHORIZATION, &scoped_op_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"false_positive":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_fp_off.status(), StatusCode::OK);
+    assert!(
+        !fp_sample_file.exists(),
+        "Unsetting false_positive must unlink the hard_negative dataset file from disk"
+    );
+
+    // =========================================================================
+    // 5. [R3-P3B-05] Chameleon ZIP rejection, scoped LPR known_plates isolation,
+    //    and scoped RTSP URL oracle rejection
+    // =========================================================================
+    let valid_zip = build_zip_archive(&[("data.yaml".to_string(), b"nc: 15\n".to_vec())]);
+    // Corrupt Local File Header compressed_size (offset 18..22) while keeping Central Directory unchanged
+    let mut chameleon_zip = valid_zip.clone();
+    chameleon_zip[18] = 99;
+    assert!(
+        parse_zip_archive(&chameleon_zip).is_err(),
+        "parse_zip_archive must reject Local File Header vs Central Directory size mismatch"
+    );
+    // Append trailing bytes after EOCD
+    let mut trailing_zip = valid_zip.clone();
+    trailing_zip.extend_from_slice(b"TRAILING_POLYGLOT_BYTES");
+    assert!(
+        parse_zip_archive(&trailing_zip).is_err(),
+        "parse_zip_archive must reject archives with trailing data after EOCD"
+    );
+
+    // Scoped operator assigning VIP9Z99 to front_door event must NOT resolve global known_plates ("Executive Car")
+    let r_scoped_plate = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/events/ev_json_thumb_mask/license_plate")
+                .header(header::AUTHORIZATION, &scoped_op_bearer)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"plate":"VIP9Z99"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_scoped_plate.status(), StatusCode::OK);
+    let scoped_plate_json: Value =
+        serde_json::from_slice(&to_bytes(r_scoped_plate.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(scoped_plate_json["recognized_license_plate"], "VIP9Z99");
+    assert!(
+        scoped_plate_json["sub_label"].is_null(),
+        "Scoped operator must not resolve global known_plates owner labels via PUT /api/events/{{id}}/license_plate"
+    );
+
+    srv_handle.abort();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
