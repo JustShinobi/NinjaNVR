@@ -80,6 +80,7 @@ pub fn alert_backup_semaphore() -> &'static Arc<Semaphore> {
 pub fn is_valid_rtsp_stream_url(url: &str) -> bool {
     let trimmed = url.trim();
     if trimmed.is_empty()
+        || !trimmed.is_ascii()
         || trimmed.starts_with('-')
         || trimmed
             .chars()
@@ -87,14 +88,25 @@ pub fn is_valid_rtsp_stream_url(url: &str) -> bool {
     {
         return false;
     }
-    let rest = if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("rtsp://") {
+    let rest = if trimmed
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"rtsp://"))
+    {
         &trimmed[7..]
-    } else if trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("rtsps://") {
+    } else if trimmed
+        .as_bytes()
+        .get(..8)
+        .is_some_and(|b| b.eq_ignore_ascii_case(b"rtsps://"))
+    {
         &trimmed[8..]
     } else {
         return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.starts_with('@') {
+        return false;
+    }
     let host_after_auth = authority.rsplit('@').next().unwrap_or(authority);
     if host_after_auth.is_empty() || host_after_auth.starts_with(':') {
         return false;
@@ -132,12 +144,15 @@ pub fn is_valid_rtsp_stream_url(url: &str) -> bool {
             && host.len() <= 253
             && !host.starts_with('.')
             && !host.ends_with('.')
-            && !host.starts_with('-')
-            && !host.ends_with('-')
-            && !host.contains("..")
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+            && host.split('.').all(|lbl| {
+                !lbl.is_empty()
+                    && lbl.len() <= 63
+                    && !lbl.starts_with('-')
+                    && !lbl.ends_with('-')
+                    && lbl
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
     }
 }
 
@@ -322,27 +337,31 @@ pub fn write_contained_media_file(
         ));
     }
     std::fs::create_dir_all(media_dir)?;
-    if let Ok(rel) = target_dir.strip_prefix(media_dir) {
-        let mut cur = media_dir.to_path_buf();
-        for comp in rel.components() {
-            match comp {
-                std::path::Component::Normal(part) => {
-                    cur.push(part);
-                    if let Ok(meta) = std::fs::symlink_metadata(&cur)
-                        && (meta.file_type().is_symlink() || !meta.file_type().is_dir())
-                    {
-                        return Err(Error::new(
-                            ErrorKind::PermissionDenied,
-                            "refusing to traverse symlinked or non-directory media subdirectory",
-                        ));
-                    }
-                }
-                _ => {
+    let Ok(rel) = target_dir.strip_prefix(media_dir) else {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "target directory must reside inside media_dir",
+        ));
+    };
+    let mut cur = media_dir.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(part) => {
+                cur.push(part);
+                if let Ok(meta) = std::fs::symlink_metadata(&cur)
+                    && (meta.file_type().is_symlink() || !meta.file_type().is_dir())
+                {
                     return Err(Error::new(
-                        ErrorKind::InvalidInput,
-                        "invalid path component in target media directory",
+                        ErrorKind::PermissionDenied,
+                        "refusing to traverse symlinked or non-directory media subdirectory",
                     ));
                 }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "invalid path component in target media directory",
+                ));
             }
         }
     }
@@ -369,9 +388,17 @@ pub fn write_contained_media_file(
     if std::fs::symlink_metadata(&tmp_path).is_ok() {
         let _ = std::fs::remove_file(&tmp_path);
     }
-    if let Err(err) = std::fs::write(&tmp_path, bytes) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err);
+    {
+        use std::io::Write;
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        if let Err(err) = tmp_file.write_all(bytes) {
+            drop(tmp_file);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
+        }
     }
     if let Err(err) = std::fs::rename(&tmp_path, &dst_path) {
         let _ = std::fs::remove_file(&tmp_path);
@@ -692,7 +719,7 @@ impl VisionPipeline {
                 continue;
             };
 
-            let child_pid = child.id().unwrap_or(std::process::id());
+            let child_pid = child.id().unwrap_or(0);
             info!(
                 "Started substream vision pipeline for {camera} ({}x{} @ {} FPS, pid={child_pid})",
                 width, height, fps
@@ -1057,6 +1084,7 @@ impl VisionPipeline {
                     m.camera_fps = 0.0;
                     m.process_fps = 0.0;
                     m.detection_fps = 0.0;
+                    m.pid = 0;
                 }
             }
             self.comms.publish_topic(&format!("{camera}/motion"), "OFF");
@@ -1256,6 +1284,20 @@ impl VisionPipeline {
                 "after": dto
             }),
         );
+    }
+
+    fn recompute_active_review_severity(&self, rev: &mut ActiveReviewState) {
+        let has_remaining_alert = rev.detections.iter().any(|det_id| {
+            self.db.get_event(det_id).ok().flatten().is_some_and(|ev| {
+                ev["false_positive"].as_bool() != Some(true)
+                    && ev["data"]["max_severity"].as_str() == Some("alert")
+            })
+        });
+        rev.severity = if has_remaining_alert {
+            "alert".to_string()
+        } else {
+            "detection".to_string()
+        };
     }
 
     pub async fn process_lifecycle_events(
@@ -1501,7 +1543,6 @@ impl VisionPipeline {
                 && let Some(pos) = rev.detections.iter().position(|d| d == &trk.id)
             {
                 rev.detections.remove(pos);
-                rev.severity = "detection".to_string();
                 rev.dirty = true;
                 if rev.detections.is_empty() {
                     if !rev.is_new {
@@ -1518,6 +1559,8 @@ impl VisionPipeline {
                         );
                     }
                     *active_review = None;
+                } else {
+                    self.recompute_active_review_severity(rev);
                 }
             }
             let mut ai_verify_triggered = prev.as_ref().is_some_and(|p| p.ai_verify_triggered);
@@ -2091,6 +2134,8 @@ impl VisionPipeline {
                         );
                     }
                     *active_review = None;
+                } else {
+                    self.recompute_active_review_severity(rev);
                 }
             }
             let crop_dhash64 = removed_snap
@@ -4101,6 +4146,177 @@ mod tests {
                 .get(&car_trk.id)
                 .is_some_and(|s| s.ai_verify_triggered),
             "active track snapshot state (ai_verify_triggered) must be preserved across eviction"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn cycle3_pipeline_multitrack_fp_severity_preservation_utf8_rtsp_bounds_and_media_prefix_guard()
+     {
+        let (pipeline, tmp_dir) = build_isolated_pipeline("cycle3-hardening");
+        let camera = "front_yard";
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.snapshots.enabled = true;
+        cam_cfg.review.alerts.enabled = true;
+        cam_cfg.review.alerts.labels = vec!["person".to_string()];
+        cam_cfg.review.detections.enabled = true;
+
+        // 1. PIPE-C3-01: Multi-byte UTF-8 characters spanning byte indices 7 or 8 must not panic in is_valid_rtsp_stream_url
+        for non_ascii_or_malformed in [
+            "123456\u{00e9}89",
+            "12345\u{00e9}789",
+            "\u{1f525}rtsp://192.0.2.1/sub",
+            "rtsp://@192.0.2.1/sub",
+            "rtsp://bad.-label.local/sub",
+            "rtsp://label-.bad.local/sub",
+        ] {
+            assert!(
+                !is_valid_rtsp_stream_url(non_ascii_or_malformed),
+                "malformed/UTF-8 URL '{non_ascii_or_malformed}' must be rejected without panicking"
+            );
+        }
+
+        // 2. PIPE-C3-02: write_contained_media_file rejects target_dir outside media_dir before creating directories
+        let outside_dir = tmp_dir.join("outside_uncreated_subdir");
+        assert!(
+            write_contained_media_file(&pipeline.media_dir, &outside_dir, "snap.jpg", b"test")
+                .is_err(),
+            "target_dir outside media_dir must be rejected"
+        );
+        assert!(
+            !outside_dir.exists(),
+            "write_contained_media_file must not create directories outside media_dir"
+        );
+
+        // 3. PIPE-C3-03: Suppressing one false-positive track in a multi-track review segment must NOT
+        //    downgrade the review segment to "detection" while a legitimate "alert" track remains in rev.detections,
+        //    whereas suppressing the sole "alert" track when only a "detection" ("cat") remains downgrades to "detection"
+        let w = 320u32;
+        let h = 180u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        let yuv_frame = YuvFrame {
+            camera: Arc::from(camera),
+            timestamp: 8000.0,
+            width: w,
+            height: h,
+            data: Arc::new(vec![128u8; y_len + uv_len * 2]),
+        };
+
+        let mut active_review: Option<ActiveReviewState> = None;
+        let mut track_snapshots: HashMap<String, TrackPersistSnapshot> = HashMap::new();
+
+        let mut trk_real_person = sample_track();
+        trk_real_person.id = "1730508000.000000-realperson".to_string();
+        trk_real_person.label = "person".to_string();
+        trk_real_person.score = 0.90;
+
+        let mut trk_fp_person = sample_track();
+        trk_fp_person.id = "1730508000.000000-fpperson".to_string();
+        trk_fp_person.label = "person".to_string();
+        trk_fp_person.score = 0.81;
+
+        // Frame 1: both person tracks are active -> active_review has severity "alert" and 2 detections
+        let ctx1 = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 8000.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx1,
+                &[trk_real_person.clone(), trk_fp_person.clone()],
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+        assert_eq!(
+            active_review.as_ref().map(|r| r.severity.as_str()),
+            Some("alert")
+        );
+        assert_eq!(active_review.as_ref().unwrap().detections.len(), 2);
+
+        // Operator / GenAI marks trk_fp_person as false_positive = true while trk_real_person remains valid
+        pipeline
+            .db
+            .set_event_false_positive(&trk_fp_person.id, true)
+            .unwrap();
+        trk_fp_person.score = 0.88;
+        let ctx2 = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 8002.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx2,
+                &[trk_real_person.clone(), trk_fp_person.clone()],
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+        let rev_after_fp = active_review
+            .as_ref()
+            .expect("review must remain open for trk_real_person");
+        assert_eq!(rev_after_fp.detections, vec![trk_real_person.id.clone()]);
+        assert_eq!(
+            rev_after_fp.severity, "alert",
+            "suppressing one FP track must preserve 'alert' severity when another alert track remains"
+        );
+
+        // Now add a non-alert detection track ("cat") and mark trk_real_person as false_positive on track end
+        let mut trk_cat = sample_track();
+        trk_cat.id = "1730508003.000000-catdet".to_string();
+        trk_cat.label = "cat".to_string();
+        trk_cat.score = 0.84;
+        let ctx3 = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 8003.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx3,
+                &[trk_real_person.clone(), trk_cat.clone()],
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+        assert_eq!(active_review.as_ref().unwrap().detections.len(), 2);
+
+        pipeline
+            .db
+            .set_event_false_positive(&trk_real_person.id, true)
+            .unwrap();
+        let ctx4 = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 8004.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx4,
+                std::slice::from_ref(&trk_cat),
+                std::slice::from_ref(&trk_real_person),
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+        let rev_cat_only = active_review
+            .as_ref()
+            .expect("review must remain open for cat detection");
+        assert_eq!(rev_cat_only.detections, vec![trk_cat.id.clone()]);
+        assert_eq!(
+            rev_cat_only.severity, "detection",
+            "when the last alert track ends as FP and only a detection track remains, review severity must downgrade to 'detection'"
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);

@@ -91,9 +91,16 @@ pub fn sanitize_san_hosts(raw_sans: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for raw in raw_sans {
         let mut s = raw.trim();
-        if s.len() >= 8 && s[..8].eq_ignore_ascii_case("https://") {
+        if s.as_bytes()
+            .get(..8)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"https://"))
+        {
             s = &s[8..];
-        } else if s.len() >= 7 && s[..7].eq_ignore_ascii_case("http://") {
+        } else if s
+            .as_bytes()
+            .get(..7)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"http://"))
+        {
             s = &s[7..];
         }
         if let Some((before_delim, _)) = s.split_once(['/', '?', '#']) {
@@ -107,6 +114,9 @@ pub fn sanitize_san_hosts(raw_sans: &[String]) -> Vec<String> {
             let Some((v6_host, port_rest)) = stripped_v6.split_once(']') else {
                 continue;
             };
+            if v6_host.parse::<std::net::Ipv6Addr>().is_err() {
+                continue;
+            }
             if !port_rest.is_empty() {
                 let Some(port_str) = port_rest.strip_prefix(':') else {
                     continue;
@@ -174,12 +184,31 @@ pub fn ensure_private_key_permissions(key_path: &Path) -> Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode() & 0o777;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let file = std::fs::File::open(key_path).with_context(|| {
+            format!(
+                "failed to open TLS private key handle {}",
+                key_path.display()
+            )
+        })?;
+        let f_meta = file.metadata().with_context(|| {
+            format!(
+                "failed to fstat TLS private key handle {}",
+                key_path.display()
+            )
+        })?;
+        if !f_meta.file_type().is_file() || (f_meta.dev(), f_meta.ino()) != (meta.dev(), meta.ino())
+        {
+            anyhow::bail!(
+                "refusing to use TLS private key whose inode changed or is not a regular file at {}",
+                key_path.display()
+            );
+        }
+        let mode = f_meta.permissions().mode() & 0o777;
         if mode != 0o600 {
-            let mut perms = meta.permissions();
+            let mut perms = f_meta.permissions();
             perms.set_mode(0o600);
-            std::fs::set_permissions(key_path, perms).with_context(|| {
+            file.set_permissions(perms).with_context(|| {
                 format!(
                     "failed to enforce 0600 permissions on TLS private key {}",
                     key_path.display()
@@ -251,41 +280,76 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut validate_only = false;
-    let mut args = raw_args.into_iter();
+    let mut args = raw_args.into_iter().peekable();
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        let trimmed_arg = arg.trim();
+        if let Some(v) = trimmed_arg.strip_prefix("--config=") {
+            if !v.trim().is_empty() && !v.trim().starts_with("--") {
+                config_path = PathBuf::from(v.trim());
+            }
+            continue;
+        }
+        if let Some(v) = trimmed_arg.strip_prefix("--web-dir=") {
+            if !v.trim().is_empty() && !v.trim().starts_with("--") {
+                web_dir = PathBuf::from(v.trim());
+            }
+            continue;
+        }
+        if let Some(v) = trimmed_arg.strip_prefix("--media-dir=") {
+            if !v.trim().is_empty() && !v.trim().starts_with("--") {
+                media_dir = PathBuf::from(v.trim());
+            }
+            continue;
+        }
+        if let Some(v) = trimmed_arg.strip_prefix("--http-port=") {
+            if let Ok(p) = v.trim().parse::<u16>()
+                && p > 0
+            {
+                http_port = p;
+            }
+            continue;
+        }
+        if let Some(v) = trimmed_arg.strip_prefix("--https-port=") {
+            if let Ok(p) = v.trim().parse::<u16>()
+                && p > 0
+            {
+                https_port = p;
+            }
+            continue;
+        }
+        match trimmed_arg {
             "--config" => {
-                if let Some(v) = args.next()
+                if let Some(v) = args.next_if(|next| !next.trim().starts_with("--"))
                     && !v.trim().is_empty()
                 {
                     config_path = PathBuf::from(v.trim());
                 }
             }
             "--web-dir" => {
-                if let Some(v) = args.next()
+                if let Some(v) = args.next_if(|next| !next.trim().starts_with("--"))
                     && !v.trim().is_empty()
                 {
                     web_dir = PathBuf::from(v.trim());
                 }
             }
             "--media-dir" => {
-                if let Some(v) = args.next()
+                if let Some(v) = args.next_if(|next| !next.trim().starts_with("--"))
                     && !v.trim().is_empty()
                 {
                     media_dir = PathBuf::from(v.trim());
                 }
             }
             "--http-port" => {
-                if let Some(v) = args.next()
-                    && let Ok(p) = v.parse::<u16>()
+                if let Some(v) = args.next_if(|next| !next.trim().starts_with("--"))
+                    && let Ok(p) = v.trim().parse::<u16>()
                     && p > 0
                 {
                     http_port = p;
                 }
             }
             "--https-port" => {
-                if let Some(v) = args.next()
-                    && let Ok(p) = v.parse::<u16>()
+                if let Some(v) = args.next_if(|next| !next.trim().starts_with("--"))
+                    && let Ok(p) = v.trim().parse::<u16>()
                     && p > 0
                 {
                     https_port = p;
@@ -325,10 +389,27 @@ pub fn cleanup_supervised_processes_and_shm(
             }
         }
     }
-    if std::fs::symlink_metadata(shm_config_path)
-        .is_ok_and(|m| m.file_type().is_file() && !m.file_type().is_symlink())
+    if let Ok(meta) = std::fs::symlink_metadata(shm_config_path)
+        && meta.file_type().is_file()
+        && !meta.file_type().is_symlink()
     {
-        let _ = std::fs::write(shm_config_path, b"");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .write(true)
+                .open(shm_config_path)
+                && let Ok(f_meta) = file.metadata()
+                && f_meta.file_type().is_file()
+                && (f_meta.dev(), f_meta.ino()) == (meta.dev(), meta.ino())
+            {
+                let _ = file.set_len(0);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::write(shm_config_path, b"");
+        }
         let _ = std::fs::remove_file(shm_config_path);
     }
 }
@@ -443,7 +524,7 @@ async fn main() -> Result<()> {
         (cfg.tls.san_hosts.clone(), cfg.mqtt.tls_client_key.clone())
     };
     if let Some(ref key_path) = mqtt_client_key
-        && key_path.exists()
+        && std::fs::symlink_metadata(key_path).is_ok()
         && let Err(err) = ensure_private_key_permissions(key_path)
     {
         warn!("MQTT TLS private key permission check warning: {err:#}");
@@ -781,5 +862,62 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn cycle3_main_utf8_san_bounds_bracketed_non_ipv6_rejection_and_cli_flag_guard() {
+        // 1. MAIN-C3-01: Multi-byte UTF-8 strings spanning byte indices 7 or 8 and bracketed non-IPv6
+        //    hosts ("[nvr.example.com]:8971", "[127.0.0.1]:8971") must be filtered without panicking
+        let raw_sans = vec![
+            "123456\u{00e9}89".to_string(),
+            "12345\u{00e9}789".to_string(),
+            "\u{1f525}https://nvr.local".to_string(),
+            "[nvr.example.com]:8971".to_string(),
+            "[127.0.0.1]:8971".to_string(),
+            "https://valid-nvr.example.com:8971/ui".to_string(),
+        ];
+        let cleaned = sanitize_san_hosts(&raw_sans);
+        assert_eq!(cleaned, vec!["valid-nvr.example.com".to_string()]);
+
+        // 2. MAIN-C3-02: "--config --validate-config" must not swallow "--validate-config" as the config path,
+        //    and "--config=/path" equals-syntax must be parsed properly
+        let cli_missing_val = parse_cli_args(
+            vec!["--config".to_string(), "--validate-config".to_string()],
+            PathBuf::from("/config/default.yml"),
+            PathBuf::from("/opt/ninjanvr/web-v2"),
+            PathBuf::from("/media/ninjanvr"),
+            5000,
+            8971,
+        );
+        assert!(
+            cli_missing_val.validate_only,
+            "--validate-config after bare --config must still set validate_only = true"
+        );
+        assert_eq!(
+            cli_missing_val.config_path,
+            PathBuf::from("/config/default.yml"),
+            "bare --config before another flag must retain default config_path"
+        );
+
+        let cli_eq = parse_cli_args(
+            vec![
+                "--config=/etc/ninjanvr/custom.yml".to_string(),
+                "--http-port=5090".to_string(),
+                "--https-port=8999".to_string(),
+                "--validate-config".to_string(),
+            ],
+            PathBuf::from("/config/default.yml"),
+            PathBuf::from("/opt/ninjanvr/web-v2"),
+            PathBuf::from("/media/ninjanvr"),
+            5000,
+            8971,
+        );
+        assert!(cli_eq.validate_only);
+        assert_eq!(
+            cli_eq.config_path,
+            PathBuf::from("/etc/ninjanvr/custom.yml")
+        );
+        assert_eq!(cli_eq.http_port, 5090);
+        assert_eq!(cli_eq.https_port, 8999);
     }
 }

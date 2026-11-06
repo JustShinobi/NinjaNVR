@@ -103,35 +103,45 @@ pub fn is_complete_fmp4_media_fragment(buf: &[u8]) -> bool {
     if has_ftyp_or_moov {
         return false;
     }
-    let has_mdat = top_boxes.iter().any(|(t, _)| t == b"mdat");
-    let Some((_, moof_body)) = top_boxes.iter().find(|(t, _)| t == b"moof") else {
-        return false;
-    };
+    let has_mdat = top_boxes
+        .iter()
+        .any(|(t, body)| t == b"mdat" && !body.is_empty());
     if !has_mdat {
         return false;
     }
-    let Some(moof_boxes) = parse_exact_iso_boxes(moof_body) else {
-        return false;
-    };
-    let mut valid_traf = false;
-    for (btype, bbody) in &moof_boxes {
-        if btype != b"traf" {
+    let mut saw_moof = false;
+    for (top_type, moof_body) in &top_boxes {
+        if top_type != b"moof" {
             continue;
         }
-        let Some(traf_boxes) = parse_exact_iso_boxes(bbody) else {
+        saw_moof = true;
+        let Some(moof_boxes) = parse_exact_iso_boxes(moof_body) else {
             return false;
         };
-        let has_tfhd = traf_boxes
-            .iter()
-            .any(|(t, body)| t == b"tfhd" && body.len() >= 8);
-        let has_trun = traf_boxes
-            .iter()
-            .any(|(t, body)| t == b"trun" && body.len() >= 8);
-        if has_tfhd && has_trun {
-            valid_traf = true;
+        let mut valid_traf_in_moof = false;
+        for (btype, bbody) in &moof_boxes {
+            if btype != b"traf" {
+                continue;
+            }
+            let Some(traf_boxes) = parse_exact_iso_boxes(bbody) else {
+                return false;
+            };
+            let has_tfhd = traf_boxes
+                .iter()
+                .any(|(t, body)| t == b"tfhd" && body.len() >= 8);
+            let has_trun = traf_boxes
+                .iter()
+                .any(|(t, body)| t == b"trun" && body.len() >= 8);
+            if !has_tfhd || !has_trun {
+                return false;
+            }
+            valid_traf_in_moof = true;
+        }
+        if !valid_traf_in_moof {
+            return false;
         }
     }
-    valid_traf
+    saw_moof
 }
 
 #[derive(Debug, Clone)]
@@ -362,14 +372,12 @@ impl MseStreamHub {
         if !is_valid_stream_name(stream_key) {
             return;
         }
-        let updated = {
-            let mut guard = self.caches.write().await;
-            Self::prune_stale_caches_locked(&mut guard, stream_key);
-            guard
-                .entry(stream_key.to_string())
-                .or_default()
-                .ingest_text(text)
-        };
+        let mut guard = self.caches.write().await;
+        Self::prune_stale_caches_locked(&mut guard, stream_key);
+        let updated = guard
+            .entry(stream_key.to_string())
+            .or_default()
+            .ingest_text(text);
         if updated && let Some(sess) = self.sessions.read().await.get(stream_key) {
             let _ = sess.tx.send(MseLivePacket::Codec(text.trim().to_string()));
         }
@@ -380,13 +388,11 @@ impl MseStreamHub {
         if !is_valid_stream_name(stream_key) {
             return false;
         }
-        let (is_sync, burst_ready, pkt_opt) = {
-            let mut guard = self.caches.write().await;
-            Self::prune_stale_caches_locked(&mut guard, stream_key);
-            let cache = guard.entry(stream_key.to_string()).or_default();
-            let (is_sync, pkt_opt) = cache.ingest_binary_with_seq(bytes);
-            (is_sync, cache.has_ready_burst(), pkt_opt)
-        };
+        let mut guard = self.caches.write().await;
+        Self::prune_stale_caches_locked(&mut guard, stream_key);
+        let cache = guard.entry(stream_key.to_string()).or_default();
+        let (is_sync, pkt_opt) = cache.ingest_binary_with_seq(bytes);
+        let burst_ready = cache.has_ready_burst();
         if let Some(sess) = self.sessions.read().await.get(stream_key) {
             if let Some(pkt) = pkt_opt {
                 let _ = sess.tx.send(pkt);
@@ -434,11 +440,11 @@ impl MseStreamHub {
         go2rtc_ws_base: &str,
         stream_key: &str,
         persistent: bool,
-    ) -> (
+    ) -> Option<(
         Arc<Notify>,
         broadcast::Receiver<MseLivePacket>,
         Arc<AtomicUsize>,
-    ) {
+    )> {
         let now = Instant::now();
         let new_expires = now + PREWARM_KEEPALIVE_TTL;
 
@@ -448,18 +454,18 @@ impl MseStreamHub {
             if persistent {
                 sess.persistent = true;
             }
-            return (
+            return Some((
                 sess.ready_notify.clone(),
                 sess.tx.subscribe(),
                 sess.active_clients.clone(),
-            );
+            ));
         }
 
         if sessions.len() >= MAX_CACHED_STREAMS {
             sessions.retain(|_, s| {
                 s.persistent || s.active_clients.load(Ordering::SeqCst) > 0 || now < s.expires_at
             });
-            while !persistent && sessions.len() >= MAX_CACHED_STREAMS {
+            while sessions.len() >= MAX_CACHED_STREAMS {
                 let Some(evict_key) = sessions
                     .iter()
                     .filter(|(_, s)| !s.persistent && s.active_clients.load(Ordering::SeqCst) == 0)
@@ -469,6 +475,9 @@ impl MseStreamHub {
                     break;
                 };
                 sessions.remove(&evict_key);
+            }
+            if !persistent && sessions.len() >= MAX_CACHED_STREAMS {
+                return None;
             }
         }
 
@@ -495,7 +504,7 @@ impl MseStreamHub {
             run_upstream_worker(hub, ws_base, stream_owned, notify_bg).await;
         });
 
-        (notify, rx, active_clients)
+        Some((notify, rx, active_clients))
     }
 
     /// Spawns or refreshes a shared background upstream `go2rtc` MSE consumer for `stream`
@@ -506,9 +515,12 @@ impl MseStreamHub {
             return false;
         }
 
-        let (notify, _rx, _clients) = self
+        let Some((notify, _rx, _clients)) = self
             .ensure_upstream_session(go2rtc_ws_base, stream_key, false)
-            .await;
+            .await
+        else {
+            return false;
+        };
 
         let notified = notify.notified();
         tokio::pin!(notified);
@@ -561,7 +573,7 @@ impl MseStreamHub {
 
         let (notify, initial_rx, active_clients) = self
             .ensure_upstream_session(go2rtc_ws_base, stream_key, false)
-            .await;
+            .await?;
         active_clients.fetch_add(1, Ordering::SeqCst);
         let mut sub = MseClientSubscription {
             burst: None,
@@ -1139,5 +1151,91 @@ mod tests {
             cache_count <= MAX_CACHED_STREAMS,
             "caches map len ({cache_count}) must never exceed MAX_CACHED_STREAMS ({MAX_CACHED_STREAMS})"
         );
+    }
+
+    #[tokio::test]
+    async fn cycle3_mse_enforces_active_session_cap_and_rejects_empty_mdat_or_partial_bad_traf() {
+        // 1. MSE-C3-01: Media fragments with empty mdat payload or a second malformed traf/moof must be rejected
+        let empty_mdat_frag = build_test_fragment(true, &[]);
+        assert!(
+            !is_complete_fmp4_media_fragment(&empty_mdat_frag),
+            "media fragment with 0-byte mdat payload must be rejected"
+        );
+
+        let valid_tfhd = make_full_box(b"tfhd", 0, 0x020000, &1u32.to_be_bytes());
+        let mut trun_body = Vec::new();
+        trun_body.extend_from_slice(&1u32.to_be_bytes());
+        trun_body.extend_from_slice(&64i32.to_be_bytes());
+        let valid_trun = make_full_box(b"trun", 0, 0x000001, &trun_body);
+        let mut good_traf_children = Vec::new();
+        good_traf_children.extend_from_slice(&valid_tfhd);
+        good_traf_children.extend_from_slice(&valid_trun);
+        let good_traf = make_box(b"traf", &good_traf_children);
+        // Second traf missing trun
+        let bad_traf = make_box(b"traf", &valid_tfhd);
+        let mut moof_children = Vec::new();
+        moof_children.extend_from_slice(&good_traf);
+        moof_children.extend_from_slice(&bad_traf);
+        let mixed_moof = make_box(b"moof", &moof_children);
+        let mdat = make_box(b"mdat", &[0xAB; 32]);
+        let mut mixed_frag = Vec::new();
+        mixed_frag.extend_from_slice(&mixed_moof);
+        mixed_frag.extend_from_slice(&mdat);
+        assert!(
+            !is_complete_fmp4_media_fragment(&mixed_frag),
+            "moof containing a second traf without trun must be rejected"
+        );
+
+        // 2. MSE-C3-02: Holding MAX_CACHED_STREAMS active client subscriptions must prevent a 65th
+        //    non-persistent subscription or prewarm from exceeding MAX_CACHED_STREAMS sessions
+        let hub = MseStreamHub::new();
+        let valid_codec = r#"{"type":"mse","value":"video/mp4; codecs=\"avc1.640029\""}"#;
+        let init = build_test_init_segment();
+        let keyframe = build_test_fragment(true, &[0x44; 48]);
+
+        let mut active_subs = Vec::with_capacity(MAX_CACHED_STREAMS);
+        for idx in 0..MAX_CACHED_STREAMS {
+            let s_name = format!("active_cam_{idx:03}");
+            hub.ingest_upstream_text(&s_name, valid_codec).await;
+            hub.ingest_upstream_binary(&s_name, init.clone()).await;
+            hub.ingest_upstream_binary(&s_name, keyframe.clone()).await;
+            let sub = hub
+                .subscribe_client("ws://127.0.0.1:9", &s_name)
+                .await
+                .expect("subscription within MAX_CACHED_STREAMS must succeed");
+            active_subs.push(sub);
+        }
+        assert_eq!(hub.sessions.read().await.len(), MAX_CACHED_STREAMS);
+
+        // 65th stream while all 64 sessions have active_clients == 1 must fail closed (None / false)
+        assert!(
+            !hub.prewarm_stream("ws://127.0.0.1:9", "overflow_stream_065")
+                .await,
+            "prewarm_stream must refuse to exceed MAX_CACHED_STREAMS when all slots have active clients"
+        );
+        assert!(
+            hub.subscribe_client("ws://127.0.0.1:9", "overflow_stream_065")
+                .await
+                .is_none(),
+            "subscribe_client must refuse to exceed MAX_CACHED_STREAMS when all slots have active clients"
+        );
+        assert_eq!(hub.sessions.read().await.len(), MAX_CACHED_STREAMS);
+
+        // Dropping one active subscription allows a new stream to evict the now-idle slot
+        active_subs.pop();
+        hub.ingest_upstream_text("overflow_stream_065", valid_codec)
+            .await;
+        hub.ingest_upstream_binary("overflow_stream_065", init)
+            .await;
+        hub.ingest_upstream_binary("overflow_stream_065", keyframe)
+            .await;
+        let sub_after_drop = hub
+            .subscribe_client("ws://127.0.0.1:9", "overflow_stream_065")
+            .await;
+        assert!(
+            sub_after_drop.is_some(),
+            "new stream must succeed by evicting the idle session once a client drops"
+        );
+        assert_eq!(hub.sessions.read().await.len(), MAX_CACHED_STREAMS);
     }
 }
