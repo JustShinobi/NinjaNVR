@@ -11038,6 +11038,9 @@ async fn create_dataset_sample_from_event_with_config(
         verified: sample_kind == "hard_negative",
         night_mode,
         created_at,
+        // A hard negative comes from an operator marking a false positive.
+        verified_by: (sample_kind == "hard_negative")
+            .then(|| ninjanvr_db::DATASET_VERIFIED_BY_MANUAL.to_string()),
     };
     db.upsert_dataset_sample(&dto)
 }
@@ -11073,79 +11076,7 @@ async fn api_dataset_summary(
             .into_iter()
             .filter(|s| allow_list.iter().any(|a| a == &s.camera))
             .collect();
-        let total_samples = samples.len();
-        let mut true_positive_count = 0usize;
-        let mut hard_negative_count = 0usize;
-        let mut ai_annotated_count = 0usize;
-        let mut train_count = 0usize;
-        let mut val_count = 0usize;
-        let mut verified_count = 0usize;
-        let mut night_mode_count = 0usize;
-        let mut total_annotations = 0usize;
-        let mut by_camera: BTreeMap<String, usize> = BTreeMap::new();
-        let mut by_class: BTreeMap<String, usize> = BTreeMap::new();
-        for &cls in &ninjanvr_db::NINJANVR_SECURITY_CLASSES {
-            by_class.insert(cls.to_string(), 0);
-        }
-        for s in &samples {
-            match s.sample_kind.as_str() {
-                "hard_negative" => hard_negative_count += 1,
-                "ai_annotated" => ai_annotated_count += 1,
-                _ => true_positive_count += 1,
-            }
-            if s.split == "val" {
-                val_count += 1;
-            } else {
-                train_count += 1;
-            }
-            if s.verified {
-                verified_count += 1;
-            }
-            if s.night_mode {
-                night_mode_count += 1;
-            }
-            *by_camera.entry(s.camera.clone()).or_insert(0) += 1;
-            total_annotations += s.annotations.len();
-            for ann in &s.annotations {
-                let cls_name = ninjanvr_db::security_class_label(ann.class_id)
-                    .map(String::from)
-                    .unwrap_or_else(|| ann.label.clone());
-                *by_class.entry(cls_name).or_insert(0) += 1;
-            }
-        }
-        let positive_samples = true_positive_count + ai_annotated_count;
-        let positive_ratio = if total_samples > 0 {
-            positive_samples as f64 / total_samples as f64
-        } else {
-            0.0
-        };
-        let hard_negative_ratio = if total_samples > 0 {
-            hard_negative_count as f64 / total_samples as f64
-        } else {
-            0.0
-        };
-        let unverified_count = total_samples.saturating_sub(verified_count);
-        return Json(json!({
-            "total_samples": total_samples,
-            "true_positive_count": true_positive_count,
-            "hard_negative_count": hard_negative_count,
-            "ai_annotated_count": ai_annotated_count,
-            "positive_samples": positive_samples,
-            "train_count": train_count,
-            "val_count": val_count,
-            "verified_count": verified_count,
-            "unverified_count": unverified_count,
-            "night_mode_count": night_mode_count,
-            "total_annotations": total_annotations,
-            "positive_ratio": positive_ratio,
-            "hard_negative_ratio": hard_negative_ratio,
-            "target_positive_ratio": 0.8,
-            "target_hard_negative_ratio": 0.2,
-            "by_camera": by_camera,
-            "by_class": by_class,
-            "classes": ninjanvr_db::NINJANVR_SECURITY_CLASSES,
-            "ready_for_export": total_samples > 0
-        }));
+        return Json(ninjanvr_db::summarize_dataset_samples(&samples));
     }
     let summary = state
         .db
@@ -11326,6 +11257,8 @@ pub struct UpdateDatasetSampleBody {
     pub annotations: Option<Vec<ninjanvr_db::DatasetAnnotationBox>>,
     pub sample_kind: Option<String>,
     pub verified: Option<bool>,
+    /// `"ai"` or `"manual"`; anything else (or absent) is attributed to an operator.
+    pub verified_by: Option<String>,
     pub split: Option<String>,
 }
 
@@ -11378,6 +11311,7 @@ async fn api_dataset_sample_update(
         body.annotations.as_deref(),
         body.sample_kind.as_deref(),
         body.verified,
+        body.verified_by.as_deref(),
         body.split.as_deref(),
     ) {
         Ok(Some(updated)) => Json(sample_dto_to_response_json(&updated)).into_response(),
@@ -12009,7 +11943,10 @@ pub async fn auto_annotate_dataset_sample(
             sample_id,
             Some(&annotations),
             Some("ai_annotated"),
-            None,
+            // Teacher output is trusted as verified, attributed to the AI so the
+            // console can tell it apart from operator-confirmed samples.
+            Some(true),
+            Some(ninjanvr_db::DATASET_VERIFIED_BY_AI),
             None,
         )?
         .context("dataset sample disappeared during auto-annotation")?;
@@ -27472,6 +27409,9 @@ version: 0.18-0
         let auto_json: Value =
             serde_json::from_slice(&to_bytes(resp_auto.into_body(), 16384).await.unwrap()).unwrap();
         assert_eq!(auto_json["sample_kind"], "ai_annotated");
+        // Teacher output is verified on the spot and attributed to the AI.
+        assert_eq!(auto_json["verified"], true);
+        assert_eq!(auto_json["verified_by"], "ai");
         let anns = auto_json["annotations"].as_array().unwrap();
         assert_eq!(anns.len(), 2);
         // [0.10, 0.20, 0.50, 0.80] -> cx=0.30, cy=0.50, w=0.40, h=0.60
@@ -27523,6 +27463,12 @@ version: 0.18-0
         assert_eq!(sum_json["total_samples"], 2);
         assert_eq!(sum_json["hard_negative_count"], 1);
         assert_eq!(sum_json["ai_annotated_count"], 1);
+        // The explicit PUT {"verified":true} above is an operator confirmation, so the
+        // AI-verified sample is now attributed to a person; the hard negative was
+        // operator-made from the start.
+        assert_eq!(sum_json["ai_verified_count"], 0);
+        assert_eq!(sum_json["manual_verified_count"], 1);
+        assert_eq!(sum_json["pending_count"], 0);
 
         let resp_img = app
             .clone()
@@ -27611,7 +27557,7 @@ version: 0.18-0
         // Mark ds_ev_tp_1 unverified and test batch auto-annotate with OpenAI & Ollama providers
         state
             .db
-            .update_dataset_sample_annotations("ds_ev_tp_1", None, None, Some(false), None)
+            .update_dataset_sample_annotations("ds_ev_tp_1", None, None, Some(false), None, None)
             .unwrap();
         {
             let mut cfg = state.config.write().await;

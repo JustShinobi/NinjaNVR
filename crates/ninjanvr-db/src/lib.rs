@@ -101,6 +101,22 @@ pub struct DatasetSampleDto {
     #[serde(default)]
     pub night_mode: bool,
     pub created_at: f64,
+    /// Who verified the sample: `"ai"` (Teacher auto-annotation) or `"manual"`
+    /// (an operator). `None` while the sample is unverified.
+    #[serde(default)]
+    pub verified_by: Option<String>,
+}
+
+pub const DATASET_VERIFIED_BY_AI: &str = "ai";
+pub const DATASET_VERIFIED_BY_MANUAL: &str = "manual";
+
+/// Normalizes a requested verifier to one of the two persisted values.
+/// Anything other than an explicit `"ai"` is attributed to an operator.
+pub fn normalize_dataset_verifier(requested: Option<&str>) -> &'static str {
+    match requested.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case(DATASET_VERIFIED_BY_AI) => DATASET_VERIFIED_BY_AI,
+        _ => DATASET_VERIFIED_BY_MANUAL,
+    }
 }
 
 #[derive(Clone)]
@@ -796,7 +812,8 @@ impl NinjaDatabase {
                 annotations TEXT NOT NULL DEFAULT '[]',
                 verified INTEGER NOT NULL DEFAULT 0,
                 night_mode INTEGER NOT NULL DEFAULT 0,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                verified_by TEXT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_dataset_sample_cam ON dataset_sample(camera, sample_kind);
             CREATE TABLE IF NOT EXISTS "share_link" (
@@ -833,6 +850,28 @@ impl NinjaDatabase {
                 let msg = err.to_string().to_ascii_lowercase();
                 if !msg.contains("duplicate column name") {
                     warn!("SQLite schema migration statement failed ({alter_sql}): {err}");
+                }
+            }
+        }
+        // verified_by provenance: on databases created before the column existed,
+        // backfill it once so verified AI-annotated samples read as AI-verified and
+        // every other verified sample as operator-verified.
+        match conn.execute(
+            "ALTER TABLE dataset_sample ADD COLUMN verified_by TEXT NULL",
+            [],
+        ) {
+            Ok(_) => {
+                if let Err(err) = conn.execute(
+                    "UPDATE dataset_sample SET verified_by = CASE WHEN sample_kind = 'ai_annotated' THEN 'ai' ELSE 'manual' END WHERE verified = 1",
+                    [],
+                ) {
+                    warn!("SQLite dataset_sample.verified_by backfill failed: {err}");
+                }
+            }
+            Err(err) => {
+                let msg = err.to_string().to_ascii_lowercase();
+                if !msg.contains("duplicate column name") {
+                    warn!("SQLite schema migration statement failed (dataset_sample.verified_by): {err}");
                 }
             }
         }
@@ -5358,6 +5397,9 @@ impl NinjaDatabase {
         let sanitized_anns = sanitize_annotation_boxes(&sample.annotations);
         let annotations_json = serde_json::to_string(&sanitized_anns)?;
         let verified_int = if sample.verified { 1 } else { 0 };
+        let verified_by = sample
+            .verified
+            .then(|| normalize_dataset_verifier(sample.verified_by.as_deref()).to_string());
         let night_int = if sample.night_mode { 1 } else { 0 };
         let created_at = if sample.created_at.is_finite() {
             sample.created_at
@@ -5369,8 +5411,8 @@ impl NinjaDatabase {
             r#"
             INSERT INTO dataset_sample (
                 id, event_id, camera, split, sample_kind, image_path,
-                width, height, annotations, verified, night_mode, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                width, height, annotations, verified, night_mode, created_at, verified_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(id) DO UPDATE SET
                 event_id = COALESCE(excluded.event_id, dataset_sample.event_id),
                 camera = excluded.camera,
@@ -5381,7 +5423,8 @@ impl NinjaDatabase {
                 height = CASE WHEN excluded.height > 0 THEN excluded.height ELSE dataset_sample.height END,
                 annotations = excluded.annotations,
                 verified = excluded.verified,
-                night_mode = excluded.night_mode
+                night_mode = excluded.night_mode,
+                verified_by = excluded.verified_by
             "#,
             params![
                 sample.id,
@@ -5395,10 +5438,12 @@ impl NinjaDatabase {
                 annotations_json,
                 verified_int,
                 night_int,
-                created_at
+                created_at,
+                verified_by
             ],
         )?;
         let mut out = sample.clone();
+        out.verified_by = verified_by;
         out.annotations = sanitized_anns;
         out.split = split;
         out.created_at = created_at;
@@ -5422,6 +5467,7 @@ impl NinjaDatabase {
             verified: r.get::<_, i64>(9)? != 0,
             night_mode: r.get::<_, i64>(10)? != 0,
             created_at: value_to_f64(&r.get_ref(11)?).unwrap_or(0.0),
+            verified_by: r.get::<_, Option<String>>(12)?,
         })
     }
 
@@ -5436,7 +5482,7 @@ impl NinjaDatabase {
             r#"
             SELECT
                 id, event_id, camera, split, sample_kind, image_path,
-                width, height, annotations, verified, night_mode, created_at
+                width, height, annotations, verified, night_mode, created_at, verified_by
             FROM dataset_sample
             WHERE 1=1
             "#,
@@ -5475,7 +5521,7 @@ impl NinjaDatabase {
                 r#"
                 SELECT
                     id, event_id, camera, split, sample_kind, image_path,
-                    width, height, annotations, verified, night_mode, created_at
+                    width, height, annotations, verified, night_mode, created_at, verified_by
                 FROM dataset_sample
                 WHERE id = ?1
                 "#,
@@ -5492,6 +5538,7 @@ impl NinjaDatabase {
         annotations: Option<&[DatasetAnnotationBox]>,
         sample_kind: Option<&str>,
         verified: Option<bool>,
+        verified_by: Option<&str>,
         split: Option<&str>,
     ) -> Result<Option<DatasetSampleDto>> {
         let mut conn = self.lock_conn();
@@ -5501,7 +5548,7 @@ impl NinjaDatabase {
                 r#"
                 SELECT
                     id, event_id, camera, split, sample_kind, image_path,
-                    width, height, annotations, verified, night_mode, created_at
+                    width, height, annotations, verified, night_mode, created_at, verified_by
                 FROM dataset_sample
                 WHERE id = ?1
                 "#,
@@ -5512,6 +5559,7 @@ impl NinjaDatabase {
         else {
             return Ok(None);
         };
+        let annotations_changed = annotations.is_some();
         if let Some(anns) = annotations {
             current.annotations = sanitize_annotation_boxes(anns);
         }
@@ -5520,8 +5568,21 @@ impl NinjaDatabase {
         {
             current.sample_kind = kind.trim().to_string();
         }
-        if let Some(ver) = verified {
-            current.verified = ver;
+        match verified {
+            Some(true) => {
+                current.verified = true;
+                current.verified_by = Some(normalize_dataset_verifier(verified_by).to_string());
+            }
+            Some(false) => {
+                current.verified = false;
+                current.verified_by = None;
+            }
+            // Editing the boxes of an already-verified sample re-attributes the
+            // verification to whoever made the edit (an operator by default).
+            None if annotations_changed && current.verified => {
+                current.verified_by = Some(normalize_dataset_verifier(verified_by).to_string());
+            }
+            None => {}
         }
         if let Some(sp) = split
             && (sp == "train" || sp == "val")
@@ -5533,7 +5594,7 @@ impl NinjaDatabase {
         tx.execute(
             r#"
             UPDATE dataset_sample
-            SET annotations = ?2, sample_kind = ?3, verified = ?4, split = ?5
+            SET annotations = ?2, sample_kind = ?3, verified = ?4, split = ?5, verified_by = ?6
             WHERE id = ?1
             "#,
             params![
@@ -5541,7 +5602,8 @@ impl NinjaDatabase {
                 annotations_json,
                 current.sample_kind,
                 verified_int,
-                current.split
+                current.split,
+                current.verified_by
             ],
         )?;
         tx.commit()?;
@@ -5555,83 +5617,105 @@ impl NinjaDatabase {
 
     pub fn get_dataset_summary(&self) -> Result<Value> {
         let samples = self.list_dataset_samples(None, None, None)?;
-        let total_samples = samples.len();
-        let mut true_positive_count = 0usize;
-        let mut hard_negative_count = 0usize;
-        let mut ai_annotated_count = 0usize;
-        let mut train_count = 0usize;
-        let mut val_count = 0usize;
-        let mut verified_count = 0usize;
-        let mut night_mode_count = 0usize;
-        let mut total_annotations = 0usize;
-        let mut by_camera: BTreeMap<String, usize> = BTreeMap::new();
-        let mut by_class: BTreeMap<String, usize> = BTreeMap::new();
-        for &cls in &NINJANVR_SECURITY_CLASSES {
-            by_class.insert(cls.to_string(), 0);
-        }
-
-        for s in &samples {
-            match s.sample_kind.as_str() {
-                "hard_negative" => hard_negative_count += 1,
-                "ai_annotated" => ai_annotated_count += 1,
-                _ => true_positive_count += 1,
-            }
-            if s.split == "val" {
-                val_count += 1;
-            } else {
-                train_count += 1;
-            }
-            if s.verified {
-                verified_count += 1;
-            }
-            if s.night_mode {
-                night_mode_count += 1;
-            }
-            *by_camera.entry(s.camera.clone()).or_insert(0) += 1;
-            total_annotations += s.annotations.len();
-            for ann in &s.annotations {
-                let cls_name = security_class_label(ann.class_id)
-                    .map(String::from)
-                    .unwrap_or_else(|| ann.label.clone());
-                *by_class.entry(cls_name).or_insert(0) += 1;
-            }
-        }
-
-        let positive_samples = true_positive_count + ai_annotated_count;
-        let positive_ratio = if total_samples > 0 {
-            positive_samples as f64 / total_samples as f64
-        } else {
-            0.0
-        };
-        let hard_negative_ratio = if total_samples > 0 {
-            hard_negative_count as f64 / total_samples as f64
-        } else {
-            0.0
-        };
-        let unverified_count = total_samples.saturating_sub(verified_count);
-
-        Ok(json!({
-            "total_samples": total_samples,
-            "true_positive_count": true_positive_count,
-            "hard_negative_count": hard_negative_count,
-            "ai_annotated_count": ai_annotated_count,
-            "positive_samples": positive_samples,
-            "train_count": train_count,
-            "val_count": val_count,
-            "verified_count": verified_count,
-            "unverified_count": unverified_count,
-            "night_mode_count": night_mode_count,
-            "total_annotations": total_annotations,
-            "positive_ratio": positive_ratio,
-            "hard_negative_ratio": hard_negative_ratio,
-            "target_positive_ratio": 0.8,
-            "target_hard_negative_ratio": 0.2,
-            "by_camera": by_camera,
-            "by_class": by_class,
-            "classes": NINJANVR_SECURITY_CLASSES,
-            "ready_for_export": total_samples > 0
-        }))
+        Ok(summarize_dataset_samples(&samples))
     }
+}
+
+/// Aggregates dataset readiness counters for the Dataset Studio. Shared by the
+/// unrestricted summary and the camera-scoped summary served to restricted users.
+pub fn summarize_dataset_samples(samples: &[DatasetSampleDto]) -> Value {
+    let total_samples = samples.len();
+    let mut true_positive_count = 0usize;
+    let mut hard_negative_count = 0usize;
+    let mut ai_annotated_count = 0usize;
+    let mut train_count = 0usize;
+    let mut val_count = 0usize;
+    let mut verified_count = 0usize;
+    let mut ai_verified_count = 0usize;
+    let mut manual_verified_count = 0usize;
+    let mut pending_count = 0usize;
+    let mut night_mode_count = 0usize;
+    let mut total_annotations = 0usize;
+    let mut by_camera: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_class: BTreeMap<String, usize> = BTreeMap::new();
+    for &cls in &NINJANVR_SECURITY_CLASSES {
+        by_class.insert(cls.to_string(), 0);
+    }
+
+    for s in samples {
+        let is_background = s.sample_kind == "hard_negative";
+        match s.sample_kind.as_str() {
+            "hard_negative" => hard_negative_count += 1,
+            "ai_annotated" => ai_annotated_count += 1,
+            _ => true_positive_count += 1,
+        }
+        if s.split == "val" {
+            val_count += 1;
+        } else {
+            train_count += 1;
+        }
+        if s.verified {
+            verified_count += 1;
+            if !is_background {
+                if s.verified_by.as_deref() == Some(DATASET_VERIFIED_BY_AI) {
+                    ai_verified_count += 1;
+                } else {
+                    manual_verified_count += 1;
+                }
+            }
+        } else if !is_background {
+            pending_count += 1;
+        }
+        if s.night_mode {
+            night_mode_count += 1;
+        }
+        *by_camera.entry(s.camera.clone()).or_insert(0) += 1;
+        total_annotations += s.annotations.len();
+        for ann in &s.annotations {
+            let cls_name = security_class_label(ann.class_id)
+                .map(String::from)
+                .unwrap_or_else(|| ann.label.clone());
+            *by_class.entry(cls_name).or_insert(0) += 1;
+        }
+    }
+
+    let positive_samples = true_positive_count + ai_annotated_count;
+    let positive_ratio = if total_samples > 0 {
+        positive_samples as f64 / total_samples as f64
+    } else {
+        0.0
+    };
+    let hard_negative_ratio = if total_samples > 0 {
+        hard_negative_count as f64 / total_samples as f64
+    } else {
+        0.0
+    };
+    let unverified_count = total_samples.saturating_sub(verified_count);
+
+    json!({
+        "total_samples": total_samples,
+        "true_positive_count": true_positive_count,
+        "hard_negative_count": hard_negative_count,
+        "ai_annotated_count": ai_annotated_count,
+        "positive_samples": positive_samples,
+        "train_count": train_count,
+        "val_count": val_count,
+        "verified_count": verified_count,
+        "ai_verified_count": ai_verified_count,
+        "manual_verified_count": manual_verified_count,
+        "pending_count": pending_count,
+        "unverified_count": unverified_count,
+        "night_mode_count": night_mode_count,
+        "total_annotations": total_annotations,
+        "positive_ratio": positive_ratio,
+        "hard_negative_ratio": hard_negative_ratio,
+        "target_positive_ratio": 0.8,
+        "target_hard_negative_ratio": 0.2,
+        "by_camera": by_camera,
+        "by_class": by_class,
+        "classes": NINJANVR_SECURITY_CLASSES,
+        "ready_for_export": total_samples > 0
+    })
 }
 
 #[cfg(test)]
@@ -7138,6 +7222,7 @@ mod tests {
                 verified: true,
                 night_mode: false,
                 created_at: 1000.0,
+                verified_by: None,
             })
             .unwrap();
         assert!(tp_sample.split == "train" || tp_sample.split == "val");
@@ -7155,6 +7240,7 @@ mod tests {
             verified: true,
             night_mode: true,
             created_at: 1005.0,
+            verified_by: None,
         })
         .unwrap();
 
@@ -7180,6 +7266,7 @@ mod tests {
             verified: false,
             night_mode: false,
             created_at: 1010.0,
+            verified_by: None,
         })
         .unwrap();
 
@@ -7222,11 +7309,16 @@ mod tests {
                 ]),
                 None,
                 Some(true),
+                None,
                 Some("train"),
             )
             .unwrap()
             .unwrap();
         assert!(updated.verified);
+        assert_eq!(
+            updated.verified_by.as_deref(),
+            Some(DATASET_VERIFIED_BY_MANUAL)
+        );
         assert_eq!(updated.annotations.len(), 2);
 
         // 4. Verify get_dataset_summary aggregation
@@ -7253,6 +7345,170 @@ mod tests {
         let summary_after = db.get_dataset_summary().unwrap();
         assert_eq!(summary_after["total_samples"], 2);
         assert_eq!(summary_after["hard_negative_count"], 0);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    fn provenance_sample(id: &str, kind: &str, verified: bool) -> DatasetSampleDto {
+        DatasetSampleDto {
+            id: id.to_string(),
+            event_id: None,
+            camera: "sala".to_string(),
+            split: "train".to_string(),
+            sample_kind: kind.to_string(),
+            image_path: format!("/media/ninjanvr/dataset/{id}.webp"),
+            width: 640,
+            height: 360,
+            annotations: vec![],
+            verified,
+            night_mode: false,
+            created_at: 1.0,
+            verified_by: None,
+        }
+    }
+
+    #[test]
+    fn dataset_verified_by_tracks_ai_and_manual_provenance() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_dataset_provenance_{}.db",
+            rand::random::<u32>()
+        ));
+        let db = NinjaDatabase::open(&tmp).unwrap();
+
+        // Unverified samples carry no verifier; a verified upsert without one is an operator.
+        let pending = db
+            .upsert_dataset_sample(&provenance_sample("ds_p", "true_positive", false))
+            .unwrap();
+        assert_eq!(pending.verified_by, None);
+        let bg = db
+            .upsert_dataset_sample(&provenance_sample("ds_bg", "hard_negative", true))
+            .unwrap();
+        assert_eq!(bg.verified_by.as_deref(), Some(DATASET_VERIFIED_BY_MANUAL));
+
+        // Teacher output is verified and attributed to the AI.
+        let ai = db
+            .update_dataset_sample_annotations(
+                "ds_p",
+                Some(&[DatasetAnnotationBox {
+                    class_id: 0,
+                    label: "person".to_string(),
+                    cx: 0.5,
+                    cy: 0.5,
+                    w: 0.2,
+                    h: 0.4,
+                    score: 0.41,
+                    source: "ai_teacher".to_string(),
+                }]),
+                Some("ai_annotated"),
+                Some(true),
+                Some("ai"),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(ai.verified);
+        assert_eq!(ai.verified_by.as_deref(), Some(DATASET_VERIFIED_BY_AI));
+        let reloaded = db.get_dataset_sample("ds_p").unwrap().unwrap();
+        assert_eq!(
+            reloaded.verified_by.as_deref(),
+            Some(DATASET_VERIFIED_BY_AI)
+        );
+
+        let summary = db.get_dataset_summary().unwrap();
+        assert_eq!(summary["ai_verified_count"], 1);
+        assert_eq!(summary["manual_verified_count"], 0);
+        assert_eq!(summary["pending_count"], 0);
+        assert_eq!(summary["verified_count"], 2);
+
+        // An operator editing the boxes of a verified sample takes over the verification.
+        let edited = db
+            .update_dataset_sample_annotations("ds_p", Some(&[]), None, None, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(edited.verified);
+        assert_eq!(
+            edited.verified_by.as_deref(),
+            Some(DATASET_VERIFIED_BY_MANUAL)
+        );
+
+        // Un-verifying clears the verifier; unknown verifier strings fall back to manual.
+        let cleared = db
+            .update_dataset_sample_annotations("ds_p", None, None, Some(false), Some("ai"), None)
+            .unwrap()
+            .unwrap();
+        assert!(!cleared.verified);
+        assert_eq!(cleared.verified_by, None);
+        let summary = db.get_dataset_summary().unwrap();
+        assert_eq!(summary["pending_count"], 1);
+        assert_eq!(
+            normalize_dataset_verifier(Some(" AI ")),
+            DATASET_VERIFIED_BY_AI
+        );
+        assert_eq!(
+            normalize_dataset_verifier(Some("robot")),
+            DATASET_VERIFIED_BY_MANUAL
+        );
+        assert_eq!(normalize_dataset_verifier(None), DATASET_VERIFIED_BY_MANUAL);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn dataset_verified_by_migration_backfills_legacy_rows_once() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ninjanvr_dataset_legacy_{}.db",
+            rand::random::<u32>()
+        ));
+        {
+            let legacy = Connection::open(&tmp).unwrap();
+            legacy
+                .execute_batch(
+                    r#"
+                    CREATE TABLE dataset_sample (
+                        id TEXT PRIMARY KEY,
+                        event_id TEXT,
+                        camera TEXT NOT NULL,
+                        split TEXT NOT NULL DEFAULT 'train',
+                        sample_kind TEXT NOT NULL,
+                        image_path TEXT NOT NULL,
+                        width INTEGER NOT NULL DEFAULT 0,
+                        height INTEGER NOT NULL DEFAULT 0,
+                        annotations TEXT NOT NULL DEFAULT '[]',
+                        verified INTEGER NOT NULL DEFAULT 0,
+                        night_mode INTEGER NOT NULL DEFAULT 0,
+                        created_at REAL NOT NULL
+                    );
+                    INSERT INTO dataset_sample (id, camera, sample_kind, image_path, verified, created_at)
+                    VALUES
+                        ('ai_ok', 'sala', 'ai_annotated', '/x/ai_ok.webp', 1, 1.0),
+                        ('tp_ok', 'sala', 'true_positive', '/x/tp_ok.webp', 1, 2.0),
+                        ('bg_ok', 'sala', 'hard_negative', '/x/bg_ok.webp', 1, 3.0),
+                        ('ai_todo', 'sala', 'ai_annotated', '/x/ai_todo.webp', 0, 4.0);
+                    "#,
+                )
+                .unwrap();
+        }
+
+        let db = NinjaDatabase::open(&tmp).unwrap();
+        let by = |id: &str| db.get_dataset_sample(id).unwrap().unwrap().verified_by;
+        assert_eq!(by("ai_ok").as_deref(), Some(DATASET_VERIFIED_BY_AI));
+        assert_eq!(by("tp_ok").as_deref(), Some(DATASET_VERIFIED_BY_MANUAL));
+        assert_eq!(by("bg_ok").as_deref(), Some(DATASET_VERIFIED_BY_MANUAL));
+        assert_eq!(by("ai_todo"), None);
+
+        // Re-opening must not re-run the backfill over operator decisions made since.
+        db.update_dataset_sample_annotations("ai_ok", Some(&[]), None, None, None, None)
+            .unwrap();
+        drop(db);
+        let db = NinjaDatabase::open(&tmp).unwrap();
+        assert_eq!(
+            db.get_dataset_sample("ai_ok")
+                .unwrap()
+                .unwrap()
+                .verified_by
+                .as_deref(),
+            Some(DATASET_VERIFIED_BY_MANUAL)
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -10125,6 +10381,7 @@ mod tests {
                 verified: true,
                 night_mode: false,
                 created_at: 1000.0,
+                verified_by: None,
             })
             .unwrap();
         assert_eq!(sample.annotations.len(), 1);

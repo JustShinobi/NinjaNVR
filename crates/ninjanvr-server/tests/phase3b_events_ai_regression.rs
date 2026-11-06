@@ -692,6 +692,7 @@ async fn p3b_06_07_zip_archive_hardening_and_dataset_scoping_containment_and_pri
             verified: false,
             night_mode: false,
             created_at: 4000.0,
+            verified_by: None,
         })
         .unwrap();
     let r_del_trav = app
@@ -1477,6 +1478,7 @@ async fn r2_p3b_cycle2_snapshot_privacy_genai_env_ssrf_symlink_zip_and_timeline_
             verified: false,
             night_mode: false,
             created_at: 8500.0,
+            verified_by: None,
         })
         .unwrap();
     let r_del_cross = app
