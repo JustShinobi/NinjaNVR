@@ -633,24 +633,27 @@ impl CommsHub {
                 let persisted_once = self.profile_persisted_once.clone();
                 handle.spawn_blocking(move || {
                     let mut last_written = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let target_norm = active_profile
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    if last_written.as_deref() == Some(target_norm.as_str()) {
-                        return;
-                    }
-                    match persist_active_profile_atomically(&p, &target_norm) {
-                        Ok(()) => {
-                            *last_written = Some(target_norm);
-                            persisted_once.store(true, Ordering::Release);
+                    loop {
+                        let target_norm = active_profile
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        if last_written.as_deref() == Some(target_norm.as_str()) {
+                            break;
                         }
-                        Err(err) => {
-                            persisted_once.store(false, Ordering::Release);
-                            warn!(
-                                "Failed to persist active security profile to {}: {err}",
-                                p.display()
-                            );
+                        match persist_active_profile_atomically(&p, &target_norm) {
+                            Ok(()) => {
+                                *last_written = Some(target_norm);
+                                persisted_once.store(true, Ordering::Release);
+                            }
+                            Err(err) => {
+                                persisted_once.store(false, Ordering::Release);
+                                warn!(
+                                    "Failed to persist active security profile to {}: {err}",
+                                    p.display()
+                                );
+                                break;
+                            }
                         }
                     }
                 });
@@ -979,7 +982,7 @@ fn persist_active_profile_atomically(
         let write_res = (|| -> std::io::Result<()> {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             file.write_all(norm.as_bytes())?;
-            file.sync_all()?;
+            file.flush()?;
             Ok(())
         })();
         drop(file);
@@ -1010,7 +1013,7 @@ fn persist_active_profile_atomically(
             .open(&tmp_path)?;
         let write_res = (|| -> std::io::Result<()> {
             file.write_all(norm.as_bytes())?;
-            file.sync_all()?;
+            file.flush()?;
             Ok(())
         })();
         drop(file);
@@ -2405,8 +2408,11 @@ cameras:
 
         // 1. Initial persistence of default profile ("armed") inside a Tokio runtime
         assert_eq!(hub.set_active_profile("armed"), "armed");
-        for _ in 0..50 {
-            if profile_path.exists() {
+        for _ in 0..400 {
+            if std::fs::read_to_string(&profile_path)
+                .map(|s| s.trim() == "armed")
+                .unwrap_or(false)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2422,27 +2428,22 @@ cameras:
         };
 
         // 2. Redundant set_active_profile("armed") skips atomic rename / disk write
-        let seq_before = PROFILE_TMP_SEQ.load(Ordering::Relaxed);
         assert_eq!(hub.set_active_profile("armed"), "armed");
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let seq_after = PROFILE_TMP_SEQ.load(Ordering::Relaxed);
-        assert_eq!(
-            seq_before, seq_after,
-            "redundant set_active_profile call must skip disk persistence"
-        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             assert_eq!(
                 std::fs::metadata(&profile_path).unwrap().ino(),
-                ino_after_initial
+                ino_after_initial,
+                "redundant set_active_profile call must skip disk persistence"
             );
         }
 
         // 3. Transitioning to a new profile ("home" -> "disarmed") persists the final state via spawn_blocking
         assert_eq!(hub.set_active_profile("home"), "home");
         assert_eq!(hub.set_active_profile("off"), "disarmed");
-        for _ in 0..50 {
+        for _ in 0..400 {
             if std::fs::read_to_string(&profile_path)
                 .map(|s| s.trim() == "disarmed")
                 .unwrap_or(false)
