@@ -803,6 +803,10 @@ interface LiveMsePlayerProps {
   onPlotPoint?: (nx: number, ny: number) => void;
   muted?: boolean;
   onClick?: () => void;
+  /** Stroke/fill color for the in-progress draft shape (defaults to amber). */
+  draftColor?: string;
+  /** Extra layer positioned exactly over the contained video picture (0..100% space). */
+  stageOverlay?: React.ReactNode;
 }
 
 /**
@@ -977,6 +981,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   onPlotPoint,
   muted = true,
   onClick,
+  draftColor = "#f59e0b",
+  stageOverlay,
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef0 = useRef<HTMLVideoElement | null>(null);
@@ -1948,8 +1954,9 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
                   points={draftPoints
                     .map(([x, y]) => `${Math.round(x * 1000)},${Math.round(y * 1000)}`)
                     .join(" ")}
-                  fill="rgba(245, 158, 11, 0.25)"
-                  stroke="#f59e0b"
+                  fill={draftColor}
+                  fillOpacity={0.22}
+                  stroke={draftColor}
                   strokeWidth="3"
                 />
                 {draftPoints.map(([x, y], idx) => (
@@ -1958,7 +1965,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
                     cx={Math.round(x * 1000)}
                     cy={Math.round(y * 1000)}
                     r="7"
-                    fill="#fbbf24"
+                    fill={draftColor}
                     stroke="#000"
                     strokeWidth="2"
                   />
@@ -1966,6 +1973,21 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
               </g>
             )}
           </svg>
+        )}
+        {stageOverlay && overlayBox && (
+          <div
+            style={{
+              position: "absolute",
+              left: `${overlayBox.left}px`,
+              top: `${overlayBox.top}px`,
+              width: `${overlayBox.width}px`,
+              height: `${overlayBox.height}px`,
+              pointerEvents: "none",
+              zIndex: 5,
+            }}
+          >
+            {stageOverlay}
+          </div>
         )}
       </ZoomableVideoStage>
     </div>

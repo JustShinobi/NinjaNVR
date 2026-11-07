@@ -51,6 +51,30 @@ describe("resolveScopeGroupLabel", () => {
   });
 });
 
+describe("countChangedSections geometry tolerance", () => {
+  test("f32 noise from the backend does not count as an unsaved section", () => {
+    const base = {
+      cameras: {
+        sala: {
+          lines: { portao: { points: [0.18000000715255737, 0.6200000047683716, 0.82, 0.41] } },
+          zones: { entrada: { coordinates: "0.1,0.546,0.399,0.5,0.44,0.92" } },
+        },
+      },
+    };
+    const draft = {
+      cameras: {
+        sala: {
+          lines: { portao: { points: [0.18, 0.62, 0.82, 0.41] } },
+          zones: { entrada: { coordinates: "0.100,0.546,0.399,0.500,0.440,0.920" } },
+        },
+      },
+    };
+    expect(countChangedSections(base, draft)).toBe(0);
+    draft.cameras.sala.zones.entrada.coordinates = "0.100,0.546,0.399,0.500,0.440,0.930";
+    expect(countChangedSections(base, draft)).toBe(1);
+  });
+});
+
 describe("countChangedSections", () => {
   const base = {
     mqtt: { host: "127.0.0.1", port: 1883 },

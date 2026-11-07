@@ -49,6 +49,29 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 const MAX_DIFF_DEPTH = 32;
 
+/**
+ * Canonical form of a leaf value for change detection. The backend serializes geometry as
+ * f32 (0.18000000715…) while the draft rounds it, so numbers and "x,y,…" coordinate strings
+ * compare at 4 decimals; otherwise saving one zone would mark every camera section as changed.
+ */
+function canonicalLeaf(value: unknown): unknown {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? Math.round(value * 10_000) / 10_000 : value;
+  }
+  if (typeof value === "string" && value.includes(",") && /^[\s\d.,eE+-]+$/.test(value)) {
+    const nums = value.split(",").map((x) => Number(x.trim()));
+    if (nums.every((n) => Number.isFinite(n))) {
+      return nums.map((n) => Math.round(n * 10_000) / 10_000).join(",");
+    }
+  }
+  if (Array.isArray(value)) return value.map(canonicalLeaf);
+  return value;
+}
+
+function leafKey(value: unknown): string | undefined {
+  return JSON.stringify(canonicalLeaf(value));
+}
+
 function collectChangedPaths(
   base: unknown,
   draft: unknown,
@@ -88,7 +111,7 @@ function collectChangedPaths(
     return;
   }
   if (base === undefined && draft === undefined) return;
-  if (JSON.stringify(base) !== JSON.stringify(draft)) out.push(path);
+  if (leafKey(base) !== leafKey(draft)) out.push(path);
 }
 
 /**

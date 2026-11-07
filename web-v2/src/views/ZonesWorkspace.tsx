@@ -28,10 +28,8 @@ import {
   ChannelsStreamsSection,
   ConsoleUiSection,
 } from "./settings/ConsoleAndStreamsPanels";
-import {
-  AiDetectionObjectsSection,
-  VisionZonesMotionSection,
-} from "./settings/VisionAndAiPanels";
+import { AiDetectionObjectsSection } from "./settings/VisionAndAiPanels";
+import { ZonesStudio } from "./settings/ZonesStudio";
 import { DatasetStudioSection } from "./settings/DatasetStudio";
 import {
   CommsAuthUsersSection,
@@ -682,6 +680,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   const [baselineYaml, setBaselineYaml] = useState<string>("");
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [visionReviewOpen, setVisionReviewOpen] = useState(false);
   const draftRevisionRef = useRef<number>(0);
   const isMountedRef = useRef<boolean>(true);
   const showYamlKeys = useNvrStore((s) => s.showYamlKeys);
@@ -930,6 +929,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
 
   const selectCategory = (cat: SettingsCategory) => {
     setActiveCategory(cat);
+    setVisionReviewOpen(false);
     setZonesSubTab(cat === "yaml" ? "yaml" : "visual");
     setDraftPoints([]);
   };
@@ -1209,6 +1209,24 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                   {t.zones.saveAndRestart}
                 </button>
               </>
+            ) : activeCategory === "vision" ? (
+              <>
+                {unsavedLabel && (
+                  <span className="nvr-badge motion" role="status">
+                    {unsavedLabel}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  className="nvr-btn primary"
+                  aria-pressed={visionReviewOpen}
+                  onClick={() => setVisionReviewOpen(true)}
+                  disabled={isSaving || !isDirty}
+                >
+                  <Save size={12} />
+                  {isPt ? "Revisar e salvar" : "Review and save"}
+                </button>
+              </>
             ) : (
               <>
                 <button
@@ -1278,14 +1296,20 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
             />
           </div>
         ) : activeCategory === "vision" && draftConfig ? (
-          <VisionZonesMotionSection
+          <ZonesStudio
             draftConfig={draftConfig}
+            savedConfig={config}
             updateDraft={updateDraft}
-            scope={effectiveInspectorCam}
             inspectorCam={effectiveInspectorCam}
             draftPoints={draftPoints}
             setDraftPoints={setSanitizedDraftPoints}
             notify={notify}
+            reviewOpen={visionReviewOpen}
+            onOpenReview={() => setVisionReviewOpen(true)}
+            onCloseReview={() => setVisionReviewOpen(false)}
+            onSave={() => handleSaveStructured(false)}
+            onDiscard={handleDiscardDraft}
+            isSaving={isSaving}
           />
         ) : (
           <div className="nvr-settings-body">
