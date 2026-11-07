@@ -27,11 +27,13 @@ import {
 } from "../views/ExportsWorkspace";
 import {
   buildClientFallbackHeuristics,
+  cameraUsesSharedMainLoopback,
   filterAndSortCameraHealth,
   normalizeRtspProducerEndpoint,
   SystemWorkspace,
   toFiniteNumber,
 } from "../views/SystemWorkspace";
+import { resolveDesiredLiveStreamSrc } from "../components/VideoPlayers";
 import {
   buildOnvifPasswordPatch,
   sanitizeConfigEntrySlug,
@@ -674,6 +676,123 @@ describe("Phase 4C — SystemWorkspace security & regression suite", () => {
     expect(storageAlert).toBeDefined();
     expect(storageAlert?.detail).not.toContain("NaN");
     expect(storageAlert?.detail).toContain("10.0 GB free");
+  });
+
+  test("cameraUsesSharedMainLoopback and resolveDesiredLiveStreamSrc suppress false-positive detect_ffmpeg_cpu alerts and alias _sub to main stream", () => {
+    const cfg = {
+      version: "0.18-0",
+      safe_mode: false,
+      go2rtc: {
+        streams: {
+          cozinha: ["rtsp://*:*@192.0.2.10:554/stream1"],
+          cozinha_sub: ["rtsp://*:*@192.0.2.10:554/stream2"],
+          sala: ["rtsp://*:*@192.0.2.11:554/cam/realmonitor?channel=1&subtype=0"],
+        },
+      },
+      cameras: {
+        cozinha: {
+          enabled: true,
+          ffmpeg: {
+            inputs: [
+              { path: "rtsp://127.0.0.1:8554/cozinha_sub", roles: ["detect"] },
+              { path: "rtsp://127.0.0.1:8554/cozinha", roles: ["record"] },
+            ],
+          },
+          live: {
+            streams: { "Stream 1": "cozinha_sub", "Stream 2": "cozinha" },
+            height: 1080,
+            quality: 10,
+          },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          record: { enabled: true },
+          snapshots: { enabled: true },
+          motion: { enabled: true, threshold: 25, contour_area: 10, mask: {} },
+          objects: { track: ["person"] },
+          zones: {},
+        },
+        sala: {
+          enabled: true,
+          ffmpeg: {
+            inputs: [
+              { path: "rtsp://127.0.0.1:8554/sala", roles: ["detect", "record", "audio"] },
+            ],
+          },
+          live: {
+            streams: { "Stream 1": "sala", "Stream 2": "sala" },
+            height: 1080,
+            quality: 10,
+          },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          record: { enabled: true },
+          snapshots: { enabled: true },
+          motion: { enabled: true, threshold: 25, contour_area: 10, mask: {} },
+          objects: { track: ["person"] },
+          zones: {},
+        },
+      },
+    };
+
+    expect(cameraUsesSharedMainLoopback(cfg, "cozinha")).toBe(false);
+    expect(cameraUsesSharedMainLoopback(cfg, "sala")).toBe(true);
+    expect(
+      resolveDesiredLiveStreamSrc("cozinha", false, cfg.cameras, cfg.go2rtc.streams)
+    ).toBe("cozinha_sub");
+    expect(
+      resolveDesiredLiveStreamSrc("sala", false, cfg.cameras, cfg.go2rtc.streams)
+    ).toBe("sala");
+
+    const alerts = buildClientFallbackHeuristics(cfg, {
+      cameras: {
+        cozinha: {
+          camera_fps: 5,
+          process_fps: 5,
+          skipped_fps: 0,
+          detection_fps: 0,
+          detection_enabled: true,
+          pid: 1,
+          capture_pid: 1,
+          ffmpeg_pid: 47,
+          ffmpeg_cpu: "0.9",
+        },
+        sala: {
+          camera_fps: 5,
+          process_fps: 5,
+          skipped_fps: 0,
+          detection_fps: 0,
+          detection_enabled: true,
+          pid: 1,
+          capture_pid: 1,
+          ffmpeg_pid: 46,
+          ffmpeg_cpu: "2.5",
+        },
+      },
+      detectors: {},
+      camera_fps: 10,
+      process_fps: 10,
+      skipped_fps: 0,
+      detection_fps: 0,
+      cpu_usages: {},
+      processes: {},
+      service: {
+        uptime: 600,
+        version: "3.0.6",
+        latest_version: "3.0.6",
+        last_updated: 1700000000,
+        storage: {},
+        heuristics: [
+          {
+            id: "detect_ffmpeg_cpu_sala",
+            severity: "optimization",
+            category: "vision",
+            target: "sala",
+            title: "Elevated FFmpeg decode/scale CPU on detect pipeline",
+            detail: "Camera 'sala' detect decoder uses 2.5% CPU",
+            recommendation: "Share a single go2rtc loopback producer",
+          },
+        ],
+      },
+    });
+    expect(alerts.find((a) => a.id === "detect_ffmpeg_cpu_sala")).toBeUndefined();
   });
 
   test("toFiniteNumber normalizes numbers, strings, NaN, and Infinity", () => {

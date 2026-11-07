@@ -972,6 +972,59 @@ export function computeContainedBox(
   };
 }
 
+export function resolveDesiredLiveStreamSrc(
+  realCamera: string,
+  useMainStream: boolean,
+  configuredCameras?: Record<string, CameraConfig> | null,
+  go2rtcStreams?: Record<string, unknown> | null
+): string {
+  const trimmed = realCamera.trim();
+  if (!trimmed || useMainStream) {
+    return trimmed;
+  }
+  const subName = `${trimmed}_sub`;
+  const camCfg = configuredCameras?.[trimmed];
+  const explicitStream1 = camCfg?.live?.streams?.["Stream 1"]?.trim();
+  if (explicitStream1 && explicitStream1 === trimmed) {
+    return trimmed;
+  }
+  if (go2rtcStreams && Object.keys(go2rtcStreams).length > 0) {
+    const subDef = go2rtcStreams[subName];
+    if (subDef === undefined) {
+      return go2rtcStreams[trimmed] !== undefined || camCfg !== undefined
+        ? trimmed
+        : subName;
+    }
+    const firstUrl = Array.isArray(subDef)
+      ? typeof subDef[0] === "string"
+        ? subDef[0]
+        : ""
+      : typeof subDef === "string"
+      ? subDef
+      : "";
+    const cleanUrl = firstUrl.split("#")[0]?.trim() || "";
+    if (
+      cleanUrl === `rtsp://127.0.0.1:8554/${trimmed}` ||
+      cleanUrl === `rtsp://localhost:8554/${trimmed}`
+    ) {
+      return trimmed;
+    }
+  }
+  const detectInput = camCfg?.ffmpeg?.inputs?.find((inp) =>
+    inp.roles?.includes("detect")
+  );
+  if (detectInput?.path) {
+    const cleanDet = detectInput.path.split("#")[0]?.trim() || "";
+    if (
+      cleanDet === `rtsp://127.0.0.1:8554/${trimmed}` ||
+      cleanDet === `rtsp://localhost:8554/${trimmed}`
+    ) {
+      return trimmed;
+    }
+  }
+  return subName;
+}
+
 export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   camera,
   useMainStream = false,
@@ -1013,11 +1066,17 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const [overlayBox, setOverlayBox] = useState<ContainedBox | null>(null);
   const [pttState, setPttState] = useState<PushToTalkState>("idle");
   const configuredCameras = useNvrStore((s) => s.config?.cameras);
+  const go2rtcStreams = useNvrStore((s) => s.config?.go2rtc?.streams);
   const wsOnline = useNvrStore((s) => s.wsOnline);
   const realCamera = resolveRealCameraSource(camera, configuredCameras);
   const realCameraRef = useRef<string>(realCamera);
   realCameraRef.current = realCamera;
-  const desiredStreamSrc = useMainStream ? realCamera : `${realCamera}_sub`;
+  const desiredStreamSrc = resolveDesiredLiveStreamSrc(
+    realCamera,
+    useMainStream,
+    configuredCameras,
+    go2rtcStreams
+  );
   const desiredStreamSrcRef = useRef<string>(desiredStreamSrc);
   desiredStreamSrcRef.current = desiredStreamSrc;
   const reconnectTimerRef = useRef<number | null>(null);
@@ -1556,13 +1615,12 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   );
   connectDesiredStreamRef.current = connectDesiredStream;
 
-  // Double-buffered ping-pong transition when realCamera or useMainStream changes
+  // Double-buffered ping-pong transition when realCamera or desiredStreamSrc changes
   useEffect(() => {
-    const streamSrc = useMainStream ? realCamera : `${realCamera}_sub`;
     reconnectAttemptRef.current = 0;
     clearReconnectTimer();
-    connectDesiredStream(streamSrc, true);
-  }, [realCamera, useMainStream, clearReconnectTimer, connectDesiredStream]);
+    connectDesiredStream(desiredStreamSrc, true);
+  }, [desiredStreamSrc, clearReconnectTimer, connectDesiredStream]);
 
   // Fast-path MSE recovery when global telemetry WebSocket (/ws) or camera FPS comes back online after pod rollout
   useEffect(() => {

@@ -558,20 +558,31 @@ impl MseStreamHub {
         go2rtc_ws_base: &str,
         cameras: Vec<String>,
     ) {
+        let mut streams = Vec::with_capacity(cameras.len() * 2);
         for cam in cameras {
             let trimmed = cam.trim();
+            if !is_valid_stream_name(trimmed) {
+                continue;
+            }
+            streams.push(trimmed.to_string());
+            let sub = format!("{trimmed}_sub");
+            if is_valid_stream_name(&sub) {
+                streams.push(sub);
+            }
+        }
+        self.start_persistent_streams(go2rtc_ws_base, streams).await;
+    }
+
+    /// Starts persistent background MSE GOP warmers for the exact deduplicated `streams` list.
+    pub async fn start_persistent_streams(&self, go2rtc_ws_base: &str, streams: Vec<String>) {
+        for stream in streams {
+            let trimmed = stream.trim();
             if !is_valid_stream_name(trimmed) {
                 continue;
             }
             let _ = self
                 .ensure_upstream_session(go2rtc_ws_base, trimmed, true)
                 .await;
-            let sub = format!("{trimmed}_sub");
-            if is_valid_stream_name(&sub) {
-                let _ = self
-                    .ensure_upstream_session(go2rtc_ws_base, &sub, true)
-                    .await;
-            }
         }
     }
 

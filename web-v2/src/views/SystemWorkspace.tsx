@@ -173,12 +173,76 @@ export function filterAndSortCameraHealth(
   });
 }
 
+export function cameraUsesSharedMainLoopback(
+  config: NinjaConfigResponse | null,
+  camName: string
+): boolean {
+  const trimmed = camName.trim();
+  if (!trimmed || !config) return false;
+  const camCfg = config.cameras?.[trimmed];
+  const stream1 = camCfg?.live?.streams?.["Stream 1"]?.trim();
+  if (stream1 && stream1 === trimmed) {
+    return true;
+  }
+  const loop127 = `rtsp://127.0.0.1:8554/${trimmed}`;
+  const loopLocal = `rtsp://localhost:8554/${trimmed}`;
+  const streamsMap = config.go2rtc?.streams;
+  if (streamsMap && Object.keys(streamsMap).length > 0) {
+    const subKey = `${trimmed}_sub`;
+    const subVal = streamsMap[subKey];
+    if (subVal === undefined) {
+      if (streamsMap[trimmed] !== undefined || camCfg !== undefined) {
+        return true;
+      }
+    } else {
+      const firstUrl = Array.isArray(subVal)
+        ? typeof subVal[0] === "string"
+          ? subVal[0]
+          : ""
+        : typeof subVal === "string"
+        ? subVal
+        : "";
+      const cleanSub = firstUrl.split("#")[0]?.trim() || "";
+      if (cleanSub === loop127 || cleanSub === loopLocal) {
+        return true;
+      }
+    }
+  }
+  const detectInput = camCfg?.ffmpeg?.inputs?.find((inp) =>
+    inp.roles?.includes("detect")
+  );
+  if (detectInput?.path) {
+    const cleanDet = detectInput.path.split("#")[0]?.trim() || "";
+    if (cleanDet === loop127 || cleanDet === loopLocal) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function buildClientFallbackHeuristics(
   config: NinjaConfigResponse | null,
   stats: NinjaStatsResponse | null
 ): HeuristicAlertItem[] {
   if (stats?.service?.heuristics && stats.service.heuristics.length > 0) {
-    return stats.service.heuristics;
+    return stats.service.heuristics.filter((alert) => {
+      if (alert.id.startsWith("detect_ffmpeg_cpu_")) {
+        const camName = alert.target.trim();
+        if (cameraUsesSharedMainLoopback(config, camName)) {
+          const ffVal = toFiniteNumber(
+            stats?.cameras?.[camName]?.ffmpeg_cpu,
+            0
+          );
+          const allCpus = Object.values(stats?.cameras || {})
+            .map((c) => toFiniteNumber(c?.ffmpeg_cpu, 0))
+            .filter((v) => v > 0);
+          const minFf =
+            allCpus.length > 0 ? Math.max(0.3, Math.min(...allCpus)) : 0.3;
+          return ffVal >= 3.5 && ffVal >= minFf * 3.5;
+        }
+      }
+      return true;
+    });
   }
   const out: HeuristicAlertItem[] = [];
   const cams = config?.cameras || {};
@@ -248,7 +312,10 @@ export function buildClientFallbackHeuristics(
   if (ffCpus.length >= 2) {
     const minFf = Math.max(0.3, Math.min(...ffCpus.map(([, v]) => v)));
     for (const [cName, ffVal] of ffCpus) {
-      if (ffVal >= 1.4 && ffVal >= minFf * 1.8) {
+      const isSharedLoopback = cameraUsesSharedMainLoopback(config, cName);
+      const minAbsCpu = isSharedLoopback ? 3.5 : 1.4;
+      const minRatio = isSharedLoopback ? 3.5 : 1.8;
+      if (ffVal >= minAbsCpu && ffVal >= minFf * minRatio) {
         out.push({
           id: `detect_ffmpeg_cpu_${cName}`,
           severity: "optimization",

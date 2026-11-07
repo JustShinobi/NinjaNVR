@@ -535,6 +535,13 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   };
   const [faceNameDraft, setFaceNameDraft] = React.useState("");
   const [enrolledFaces, setEnrolledFaces] = React.useState<EnrolledFaceProfileItem[]>([]);
+  const [selectedBatchEventIds, setSelectedBatchEventIds] = React.useState<string[]>([]);
+  const [batchFaceProgress, setBatchFaceProgress] = React.useState<{
+    active: boolean;
+    completed: number;
+    total: number;
+    name: string;
+  } | null>(null);
   const [eventPlateDraft, setEventPlateDraft] = React.useState("");
   const [plateFilter, setPlateFilter] = React.useState("");
   const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
@@ -641,17 +648,47 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     }
     const seq = ++eventMutationSeqRef.current;
     try {
-      const res = await fetch(
-        `/api/events/${encodeURIComponent(targetId)}/sub_label`,
-        {
+      let res: Response;
+      if (clean) {
+        res = await fetch(`/api/faces/${encodeURIComponent(clean)}/enroll`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify({ sub_label: clean }),
+          body: JSON.stringify({
+            event_id: targetId,
+            assign_sub_label: true,
+            backfill_events: true,
+          }),
+        });
+        if (!res.ok) {
+          res = await fetch(
+            `/api/events/${encodeURIComponent(targetId)}/sub_label`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              credentials: "include",
+              body: JSON.stringify({
+                sub_label: clean,
+                sub_label_score: 1.0,
+                enroll_face: true,
+              }),
+            }
+          );
         }
-      );
+      } else {
+        res = await fetch(
+          `/api/events/${encodeURIComponent(targetId)}/sub_label`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({ sub_label: null }),
+          }
+        );
+      }
       if (!isMountedRef.current) return;
       if (res.ok) {
+        const data = await res.json().catch(() => null);
         if (
           seq === eventMutationSeqRef.current &&
           shouldApplyEventMutationResult(
@@ -663,12 +700,21 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           const [updated] = applyEventSubLabelUpdate(
             [targetEvent],
             targetId,
-            clean
+            clean,
+            clean ? 1.0 : null
           );
           setSelectedEvent(updated);
         }
         bumpSubLabelsRefresh();
-        notify(clean ? `Assigned face name '${clean}' to event` : "Cleared event sub-label");
+        const backfilled = Number(data?.backfilled_events || 0);
+        const sampleCount = Number(data?.sample_count || 0);
+        notify(
+          clean
+            ? `Assigned & enrolled '${clean}' into Face Gallery${
+                sampleCount > 0 ? ` (${sampleCount} samples)` : ""
+              }${backfilled > 0 ? ` · +${backfilled} similar events matched` : ""}`
+            : "Cleared event sub-label"
+        );
       } else {
         const data = await res.json().catch(() => null);
         notify(data?.message || "Failed to update event face sub-label");
@@ -681,52 +727,92 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   };
 
   const handleEnrollFaceFromEvent = async () => {
-    if (!selectedEvent) return;
-    const cleanName = normalizeFaceProfileName(faceNameDraft);
+    await handleAssignFaceSubLabel();
+  };
+
+  const handleBatchAssignFace = async (overrideName?: string) => {
+    const raw = overrideName !== undefined ? overrideName : faceNameDraft;
+    const cleanName = normalizeFaceProfileName(raw || "");
     if (!cleanName) {
-      notify("Enter a person name (e.g. Bruno) before enrolling face crop");
+      notify("Enter or pick a person name (e.g. Erik) before batch face assignment");
       return;
     }
-    const targetEvent = selectedEvent;
-    const targetId = targetEvent.id;
-    const seq = ++eventMutationSeqRef.current;
+    const targetIds =
+      selectedBatchEventIds.length > 0
+        ? selectedBatchEventIds
+        : selectedEvent
+        ? [selectedEvent.id]
+        : [];
+    if (targetIds.length === 0) {
+      notify("Select one or more events to assign & enroll in batch");
+      return;
+    }
+    setFaceNameDraft(cleanName);
+    setBatchFaceProgress({
+      active: true,
+      completed: 0,
+      total: targetIds.length,
+      name: cleanName,
+    });
+    let okCount = 0;
+    let totalBackfilled = 0;
     try {
-      const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({
-          event_id: targetId,
-          assign_sub_label: true,
-        }),
-      });
-      if (!isMountedRef.current) return;
-      if (res.ok) {
-        if (
-          seq === eventMutationSeqRef.current &&
-          shouldApplyEventMutationResult(
-            selectedEventIdRef.current,
-            targetId,
-            true
-          )
-        ) {
-          const [updated] = applyEventSubLabelUpdate(
-            [targetEvent],
-            targetId,
-            cleanName,
-            1.0
-          );
-          setSelectedEvent(updated);
+      for (let i = 0; i < targetIds.length; i += 1) {
+        if (!isMountedRef.current) break;
+        const eid = targetIds[i];
+        const isLast = i === targetIds.length - 1;
+        const res = await fetch(
+          `/api/faces/${encodeURIComponent(cleanName)}/enroll`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({
+              event_id: eid,
+              assign_sub_label: true,
+              backfill_events: isLast,
+            }),
+          }
+        );
+        if (res.ok) {
+          okCount += 1;
+          const data = await res.json().catch(() => null);
+          totalBackfilled += Number(data?.backfilled_events || 0);
+          if (selectedEvent && selectedEvent.id === eid) {
+            const [updated] = applyEventSubLabelUpdate(
+              [selectedEvent],
+              eid,
+              cleanName,
+              1.0
+            );
+            setSelectedEvent(updated);
+          }
         }
+        if (isMountedRef.current) {
+          setBatchFaceProgress({
+            active: true,
+            completed: i + 1,
+            total: targetIds.length,
+            name: cleanName,
+          });
+        }
+      }
+      if (isMountedRef.current) {
         bumpSubLabelsRefresh();
-        notify(`Enrolled '${cleanName}' face crop into gallery and assigned sub-label`);
-      } else {
-        const data = await res.json().catch(() => null);
-        notify(data?.message || "Failed to enroll face crop from event");
+        setSelectedBatchEventIds([]);
+        notify(
+          `Batch assigned & enrolled '${cleanName}' on ${okCount}/${targetIds.length} events${
+            totalBackfilled > 0 ? ` (+${totalBackfilled} auto-matched)` : ""
+          }`
+        );
       }
     } catch {
       if (isMountedRef.current) {
-        notify("Network error while enrolling face crop from event");
+        notify("Network error during batch face assignment");
+      }
+    } finally {
+      if (isMountedRef.current) {
+        setBatchFaceProgress(null);
       }
     }
   };
@@ -1192,14 +1278,99 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 
       <div className="nvr-workbench">
         <div className="nvr-panel">
-          <div className="nvr-panel-header">
+          <div className="nvr-panel-header" style={{ gap: 6, flexWrap: "wrap" }}>
             <span>TRACKED OBJECTS</span>
-            <span className="mono">TOP 50</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <button
+                type="button"
+                className="nvr-btn mono sm"
+                style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                onClick={() => {
+                  const pageIds = visibleEvents.slice(0, 50).map((e) => e.id);
+                  setSelectedBatchEventIds((prev) =>
+                    prev.length === pageIds.length ? [] : pageIds
+                  );
+                }}
+              >
+                {selectedBatchEventIds.length > 0
+                  ? `Clear (${selectedBatchEventIds.length})`
+                  : "Select Page"}
+              </button>
+              <span className="mono">TOP 50</span>
+            </div>
           </div>
+          {selectedBatchEventIds.length > 0 && (
+            <div
+              style={{
+                padding: "6px 8px",
+                background: "var(--bg-card-header)",
+                borderBottom: "1px solid var(--border-hairline)",
+                display: "flex",
+                flexDirection: "column",
+                gap: 6,
+              }}
+            >
+              <div
+                className="mono"
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  fontSize: "var(--text-xs)",
+                  color: "var(--signal-accent-text)",
+                  fontWeight: 700,
+                }}
+              >
+                <span>BATCH FACE ID ({selectedBatchEventIds.length} SELECTED)</span>
+                {batchFaceProgress?.active && (
+                  <span>
+                    {batchFaceProgress.completed}/{batchFaceProgress.total}
+                  </span>
+                )}
+              </div>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+                <input
+                  className="nvr-input mono"
+                  style={{ flex: 1, minWidth: 95, height: 24, fontSize: "var(--text-xs)" }}
+                  placeholder="Name (e.g. Erik)..."
+                  value={faceNameDraft}
+                  onChange={(e) => setFaceNameDraft(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn primary mono sm"
+                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  disabled={Boolean(batchFaceProgress?.active)}
+                  onClick={() => void handleBatchAssignFace()}
+                >
+                  {batchFaceProgress?.active
+                    ? `${batchFaceProgress.completed}/${batchFaceProgress.total}...`
+                    : `Assign & Enroll (${selectedBatchEventIds.length})`}
+                </button>
+              </div>
+              {enrolledFaces.length > 0 && (
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  {enrolledFaces.map((p) => (
+                    <button
+                      key={`batch-chip-${p.name}`}
+                      type="button"
+                      className="nvr-btn mono sm"
+                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                      disabled={Boolean(batchFaceProgress?.active)}
+                      onClick={() => void handleBatchAssignFace(p.name)}
+                    >
+                      + {p.name} ({p.sample_count})
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <div className="nvr-scroll-y">
             {visibleEvents.slice(0, 50).map((ev) => {
               const topScore = Math.round(resolveFiniteEventScore(ev, 0.85) * 100);
               const isSelected = selectedEvent?.id === ev.id;
+              const isBatchChecked = selectedBatchEventIds.includes(ev.id);
               const matchedExport = findMatchingExport(
                 exportsList,
                 ev.camera,
@@ -1220,6 +1391,23 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                     }
                   }}
                 >
+                  <input
+                    type="checkbox"
+                    aria-label={`Select event ${ev.id} for batch face assignment`}
+                    checked={isBatchChecked}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setSelectedBatchEventIds((prev) =>
+                        checked
+                          ? prev.includes(ev.id)
+                            ? prev
+                            : [...prev, ev.id]
+                          : prev.filter((id) => id !== ev.id)
+                      );
+                    }}
+                    style={{ cursor: "pointer", flexShrink: 0 }}
+                  />
                   <img
                     src={`/api/events/${encodeURIComponent(ev.id)}/thumbnail.webp`}
                     alt={ev.label}
@@ -1970,20 +2158,33 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 )}
                 <button
                   type="button"
-                  className="nvr-btn mono"
-                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                  onClick={() => void handleAssignFaceSubLabel()}
-                >
-                  Assign Face Name
-                </button>
-                <button
-                  type="button"
                   className="nvr-btn primary mono"
                   style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                  onClick={() => void handleEnrollFaceFromEvent()}
+                  onClick={() => void handleAssignFaceSubLabel()}
+                  title="Assigns person name to event and automatically enrolls 112x112 face crop into Face Gallery"
                 >
-                  Enroll Face
+                  Assign &amp; Enroll Face
                 </button>
+                {enrolledFaces.map((p) => (
+                  <button
+                    key={`quick-face-${p.name}`}
+                    type="button"
+                    className={`nvr-btn mono ${
+                      (selectedEvent.sub_label || "").trim().toLowerCase() ===
+                      p.name.trim().toLowerCase()
+                        ? "active"
+                        : ""
+                    }`}
+                    style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    onClick={() => {
+                      setFaceNameDraft(p.name);
+                      void handleAssignFaceSubLabel(p.name);
+                    }}
+                    title={`1-click assign & enroll face sample into '${p.name}' gallery (${p.sample_count} samples)`}
+                  >
+                    + {p.name} ({p.sample_count})
+                  </button>
+                ))}
                 {(selectedEvent.sub_label || selectedEvent.data?.sub_label) && (
                   <button
                     type="button"

@@ -2162,6 +2162,75 @@ impl NinjaConfig {
         None
     }
 
+    /// Resolves a requested MSE/go2rtc stream name (`{cam}_sub`) to its canonical primary
+    /// stream (`{cam}`) when `{cam}_sub` is either absent from `go2rtc.streams`, mapped to
+    /// `{cam}` in `cameras.{cam}.live.streams["Stream 1"]`, or configured as a local loopback
+    /// alias (`rtsp://127.0.0.1:8554/{cam}` / `rtsp://localhost:8554/{cam}`).
+    pub fn resolve_mse_stream_alias<'a>(&'a self, stream: &'a str) -> &'a str {
+        let trimmed = stream.trim();
+        let Some(base_cam) = trimmed.strip_suffix("_sub") else {
+            return trimmed;
+        };
+        if base_cam.is_empty() {
+            return trimmed;
+        }
+        if let Some(cam_cfg) = self.cameras.get(base_cam)
+            && cam_cfg
+                .live
+                .streams
+                .get("Stream 1")
+                .is_some_and(|s| s.trim() == base_cam)
+        {
+            return base_cam;
+        }
+        if !self.go2rtc.streams.is_empty() {
+            let Some(sub_val) = self.go2rtc.streams.get(trimmed) else {
+                if self.go2rtc.streams.contains_key(base_cam) || self.cameras.contains_key(base_cam)
+                {
+                    return base_cam;
+                }
+                return trimmed;
+            };
+            let first_url = match sub_val {
+                Value::String(s) => Some(s.as_str()),
+                Value::Array(arr) => arr.first().and_then(|v| v.as_str()),
+                _ => None,
+            };
+            if let Some(raw_url) = first_url {
+                let clean = raw_url.split('#').next().unwrap_or(raw_url).trim();
+                let loop_127 = format!("rtsp://127.0.0.1:8554/{base_cam}");
+                let loop_local = format!("rtsp://localhost:8554/{base_cam}");
+                if clean == loop_127 || clean == loop_local {
+                    return base_cam;
+                }
+            }
+        }
+        trimmed
+    }
+
+    /// Returns `true` when `camera`'s `detect` pipeline shares its main `go2rtc` loopback
+    /// producer (`rtsp://127.0.0.1:8554/{camera}`), either directly via `ffmpeg.inputs` or
+    /// through a `{camera}_sub` loopback alias in `go2rtc.streams`.
+    pub fn camera_uses_shared_main_loopback(&self, camera: &str) -> bool {
+        let cam_trimmed = camera.trim();
+        if cam_trimmed.is_empty() {
+            return false;
+        }
+        let sub_name = format!("{cam_trimmed}_sub");
+        if self.resolve_mse_stream_alias(&sub_name) == cam_trimmed {
+            return true;
+        }
+        let loop_127 = format!("rtsp://127.0.0.1:8554/{cam_trimmed}");
+        let loop_local = format!("rtsp://localhost:8554/{cam_trimmed}");
+        if let Some(det_url) = self.camera_input_for_role(cam_trimmed, "detect") {
+            let clean = det_url.split('#').next().unwrap_or(&det_url).trim();
+            if clean == loop_127 || clean == loop_local {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Writes `/dev/shm/go2rtc.yaml` compatible with go2rtc.
     pub fn write_go2rtc_config(&self, target_path: impl AsRef<Path>) -> Result<()> {
         let target_path = target_path.as_ref();

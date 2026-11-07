@@ -2,7 +2,13 @@ import React from "react";
 import { Check, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
-import { ExportItem, RecordingDaySummary, RecordingSegment, ReviewItem } from "../types/nvr";
+import {
+  EnrolledFaceProfileItem,
+  ExportItem,
+  RecordingDaySummary,
+  RecordingSegment,
+  ReviewItem,
+} from "../types/nvr";
 import { WorkspaceTab, findMatchingExport, formatDateTime, formatRelTime } from "../utils/format";
 import { buildSharePublicUrl } from "../utils/shareLinks";
 import { VodHlsPlayer } from "../components/VideoPlayers";
@@ -21,7 +27,10 @@ import {
   MAX_EXPORT_WINDOW_SEC,
   validateExportTimeWindow,
 } from "./ExportsWorkspace";
-import { normalizeFaceProfileName } from "./settings/VisionAndAiPanels";
+import {
+  normalizeFaceProfileName,
+  parseFacesApiResponse,
+} from "./settings/VisionAndAiPanels";
 
 export interface SavedReviewFilterPreset {
   name: string;
@@ -272,8 +281,17 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [presetName, setPresetName] = React.useState("");
   const [reviewNoteDraft, setReviewNoteDraft] = React.useState("");
   const [reviewFaceDraft, setReviewFaceDraft] = React.useState("");
+  const [enrolledFaces, setEnrolledFaces] = React.useState<EnrolledFaceProfileItem[]>([]);
+  const [selectedBatchReviewIds, setSelectedBatchReviewIds] = React.useState<string[]>([]);
+  const [batchReviewFaceProgress, setBatchReviewFaceProgress] = React.useState<{
+    active: boolean;
+    completed: number;
+    total: number;
+    name: string;
+  } | null>(null);
   const [reviewPlateDraft, setReviewPlateDraft] = React.useState("");
   const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
+  const subLabelsRefreshTick = useNvrStore((s) => s.subLabelsRefreshTick);
   const bumpSubLabelsRefresh = useNvrStore((s) => s.bumpSubLabelsRefresh);
   const [shareTtlSec, setShareTtlSec] = React.useState<number>(86400);
   const [shareMaxViews, setShareMaxViews] = React.useState<number>(0);
@@ -356,6 +374,28 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     }
   }, [lastDeletedFaceProfile, activeReview, setActiveReview]);
 
+  React.useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    fetch("/api/faces", { credentials: "include", signal: controller.signal })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (cancelled || !d) return;
+        const parsed = parseFacesApiResponse(d);
+        const deletedLower = lastDeletedFaceProfile?.name?.trim().toLowerCase();
+        setEnrolledFaces(
+          deletedLower
+            ? parsed.filter((p) => p.name.trim().toLowerCase() !== deletedLower)
+            : parsed
+        );
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [subLabelsRefreshTick, lastDeletedFaceProfile]);
+
   const handleAssignReviewFace = async (overrideName?: string | null) => {
     if (!activeReview) return;
     const targetReview = activeReview;
@@ -370,20 +410,47 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     if (raw && raw.trim().length > 0 && !clean) return;
     const seq = ++reviewMutationSeqRef.current;
     try {
-      const allDets = (targetReview.data?.detections || [])
-        .map((d) => d.trim())
-        .filter((d) => d.length > 0);
-      const targetDetIds =
-        clean === null && allDets.length > 1 ? allDets : [detId];
       let anyOk = false;
-      for (const did of targetDetIds) {
-        const res = await fetch(`/api/events/${encodeURIComponent(did)}/sub_label`, {
+      if (clean) {
+        const res = await fetch(`/api/faces/${encodeURIComponent(clean)}/enroll`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify({ sub_label: clean }),
+          body: JSON.stringify({
+            event_id: detId,
+            assign_sub_label: true,
+            backfill_events: true,
+          }),
         });
-        if (res.ok) anyOk = true;
+        if (res.ok) {
+          anyOk = true;
+        } else {
+          const fbRes = await fetch(`/api/events/${encodeURIComponent(detId)}/sub_label`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({
+              sub_label: clean,
+              sub_label_score: 1.0,
+              enroll_face: true,
+            }),
+          });
+          if (fbRes.ok) anyOk = true;
+        }
+      } else {
+        const allDets = (targetReview.data?.detections || [])
+          .map((d) => d.trim())
+          .filter((d) => d.length > 0);
+        const targetDetIds = allDets.length > 1 ? allDets : [detId];
+        for (const did of targetDetIds) {
+          const res = await fetch(`/api/events/${encodeURIComponent(did)}/sub_label`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({ sub_label: null }),
+          });
+          if (res.ok) anyOk = true;
+        }
       }
       if (
         isMountedRef.current &&
@@ -408,40 +475,76 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   };
 
   const handleEnrollReviewFace = async () => {
-    if (!activeReview) return;
-    const cleanName = normalizeFaceProfileName(reviewFaceDraft);
+    await handleAssignReviewFace();
+  };
+
+  const handleBatchAssignReviewFace = async (overrideName?: string) => {
+    const raw = overrideName !== undefined ? overrideName : reviewFaceDraft;
+    const cleanName = normalizeFaceProfileName(raw || "");
     if (!cleanName) return;
-    const targetReview = activeReview;
-    const targetId = targetReview.id;
-    const detId = (targetReview.data?.detections?.[0] || targetId).trim();
-    if (!detId) return;
-    const seq = ++reviewMutationSeqRef.current;
+    const targetRevIds =
+      selectedBatchReviewIds.length > 0
+        ? selectedBatchReviewIds
+        : activeReview
+        ? [activeReview.id]
+        : [];
+    if (targetRevIds.length === 0) return;
+    setReviewFaceDraft(cleanName);
+    setBatchReviewFaceProgress({
+      active: true,
+      completed: 0,
+      total: targetRevIds.length,
+      name: cleanName,
+    });
     try {
-      const res = await fetch(`/api/faces/${encodeURIComponent(cleanName)}/enroll`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ event_id: detId, assign_sub_label: true }),
-      });
-      if (
-        isMountedRef.current &&
-        seq === reviewMutationSeqRef.current &&
-        shouldApplyReviewMutationResult(
-          activeReviewIdRef.current,
-          targetId,
-          res.ok
-        )
-      ) {
-        const [updated] = applyReviewSubLabelUpdate(
-          [targetReview],
-          targetId,
-          cleanName
-        );
-        setActiveReview(updated);
+      for (let i = 0; i < targetRevIds.length; i += 1) {
+        if (!isMountedRef.current) break;
+        const rid = targetRevIds[i];
+        const revObj = reviews.find((r) => r.id === rid);
+        const detId = (revObj?.data?.detections?.[0] || rid).trim();
+        const isLast = i === targetRevIds.length - 1;
+        if (detId) {
+          const res = await fetch(
+            `/api/faces/${encodeURIComponent(cleanName)}/enroll`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              credentials: "include",
+              body: JSON.stringify({
+                event_id: detId,
+                assign_sub_label: true,
+                backfill_events: isLast,
+              }),
+            }
+          );
+          if (res.ok && activeReview && activeReview.id === rid) {
+            const [updated] = applyReviewSubLabelUpdate(
+              [activeReview],
+              rid,
+              cleanName
+            );
+            setActiveReview(updated);
+          }
+        }
+        if (isMountedRef.current) {
+          setBatchReviewFaceProgress({
+            active: true,
+            completed: i + 1,
+            total: targetRevIds.length,
+            name: cleanName,
+          });
+        }
+      }
+      if (isMountedRef.current) {
         bumpSubLabelsRefresh();
+        setSelectedBatchReviewIds([]);
       }
     } catch {
-      // Preserve current review state on transient network failure
+      // ignore transient error
+    } finally {
+      if (isMountedRef.current) {
+        setBatchReviewFaceProgress(null);
+      }
     }
   };
 
@@ -830,27 +933,118 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
 
       <div className="nvr-workbench">
         <div className="nvr-panel">
-          <div className="nvr-panel-header">
+          <div className="nvr-panel-header" style={{ gap: 6, flexWrap: "wrap" }}>
             <span>REVIEW QUEUE</span>
-            {visibleFilteredReviews.length > 0 && (
-              <button
-                className="nvr-btn success"
-                style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
-                onClick={() =>
-                  handleMarkReviews(
-                    getVisibleReviewPageIds(visibleFilteredReviews, 40),
-                    true
-                  )
-                }
-              >
-                <Check size={11} />
-                Mark Page Viewed
-              </button>
-            )}
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              {visibleFilteredReviews.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    className="nvr-btn mono sm"
+                    style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                    onClick={() => {
+                      const pageIds = getVisibleReviewPageIds(visibleFilteredReviews, 40);
+                      setSelectedBatchReviewIds((prev) =>
+                        prev.length === pageIds.length ? [] : pageIds
+                      );
+                    }}
+                  >
+                    {selectedBatchReviewIds.length > 0
+                      ? `Clear (${selectedBatchReviewIds.length})`
+                      : "Select Page"}
+                  </button>
+                  <button
+                    className="nvr-btn success"
+                    style={{ height: 22, padding: "0 7px", fontSize: "var(--text-xs)" }}
+                    onClick={() =>
+                      handleMarkReviews(
+                        selectedBatchReviewIds.length > 0
+                          ? selectedBatchReviewIds
+                          : getVisibleReviewPageIds(visibleFilteredReviews, 40),
+                        true
+                      )
+                    }
+                  >
+                    <Check size={11} />
+                    {selectedBatchReviewIds.length > 0
+                      ? `Mark (${selectedBatchReviewIds.length}) Viewed`
+                      : "Mark Page Viewed"}
+                  </button>
+                </>
+              )}
+            </div>
           </div>
+          {selectedBatchReviewIds.length > 0 && (
+            <div
+              style={{
+                padding: "6px 8px",
+                background: "var(--bg-card-header)",
+                borderBottom: "1px solid var(--border-hairline)",
+                display: "flex",
+                flexDirection: "column",
+                gap: 6,
+              }}
+            >
+              <div
+                className="mono"
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  fontSize: "var(--text-xs)",
+                  color: "var(--signal-accent-text)",
+                  fontWeight: 700,
+                }}
+              >
+                <span>BATCH FACE ID ({selectedBatchReviewIds.length} SELECTED)</span>
+                {batchReviewFaceProgress?.active && (
+                  <span>
+                    {batchReviewFaceProgress.completed}/{batchReviewFaceProgress.total}
+                  </span>
+                )}
+              </div>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+                <input
+                  className="nvr-input mono"
+                  style={{ flex: 1, minWidth: 95, height: 24, fontSize: "var(--text-xs)" }}
+                  placeholder="Name (e.g. Erik)..."
+                  value={reviewFaceDraft}
+                  onChange={(e) => setReviewFaceDraft(e.target.value)}
+                />
+                <button
+                  type="button"
+                  className="nvr-btn primary mono sm"
+                  style={{ height: 24, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                  disabled={Boolean(batchReviewFaceProgress?.active)}
+                  onClick={() => void handleBatchAssignReviewFace()}
+                >
+                  {batchReviewFaceProgress?.active
+                    ? `${batchReviewFaceProgress.completed}/${batchReviewFaceProgress.total}...`
+                    : `Assign & Enroll (${selectedBatchReviewIds.length})`}
+                </button>
+              </div>
+              {enrolledFaces.length > 0 && (
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  {enrolledFaces.map((p) => (
+                    <button
+                      key={`rev-batch-chip-${p.name}`}
+                      type="button"
+                      className="nvr-btn mono sm"
+                      style={{ height: 22, padding: "0 6px", fontSize: "var(--text-xs)" }}
+                      disabled={Boolean(batchReviewFaceProgress?.active)}
+                      onClick={() => void handleBatchAssignReviewFace(p.name)}
+                    >
+                      + {p.name} ({p.sample_count})
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <div className="nvr-scroll-y">
             {visibleFilteredReviews.slice(0, 40).map((item) => {
               const isSelected = activeReview?.id === item.id;
+              const isBatchChecked = selectedBatchReviewIds.includes(item.id);
               const matchedExport = findMatchingExport(
                 exportsList,
                 item.camera,
@@ -888,6 +1082,23 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                         : "3px solid var(--signal-motion)" /* slop-lint-disable-line side-tab-border -- real detection severity indicator */,
                   }}
                 >
+                  <input
+                    type="checkbox"
+                    aria-label={`Select review ${item.id} for batch face assignment`}
+                    checked={isBatchChecked}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setSelectedBatchReviewIds((prev) =>
+                        checked
+                          ? prev.includes(item.id)
+                            ? prev
+                            : [...prev, item.id]
+                          : prev.filter((id) => id !== item.id)
+                      );
+                    }}
+                    style={{ cursor: "pointer", flexShrink: 0 }}
+                  />
                   <img
                     src={thumbUrl}
                     alt={item.camera}
@@ -1673,20 +1884,34 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 />
                 <button
                   type="button"
-                  className="nvr-btn mono"
-                  style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                  onClick={() => void handleAssignReviewFace()}
-                >
-                  Assign Face Name
-                </button>
-                <button
-                  type="button"
                   className="nvr-btn primary mono"
                   style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
-                  onClick={() => void handleEnrollReviewFace()}
+                  onClick={() => void handleAssignReviewFace()}
+                  title="Assigns person name to review and automatically enrolls 112x112 face crop into Face Gallery"
                 >
-                  Enroll Face
+                  Assign &amp; Enroll Face
                 </button>
+                {enrolledFaces.map((p) => (
+                  <button
+                    key={`rev-quick-face-${p.name}`}
+                    type="button"
+                    className={`nvr-btn mono ${
+                      (activeReview.data?.sub_labels || []).some(
+                        (s) => s.trim().toLowerCase() === p.name.trim().toLowerCase()
+                      )
+                        ? "active"
+                        : ""
+                    }`}
+                    style={{ height: 26, padding: "0 8px", fontSize: "var(--text-xs)" }}
+                    onClick={() => {
+                      setReviewFaceDraft(p.name);
+                      void handleAssignReviewFace(p.name);
+                    }}
+                    title={`1-click assign & enroll face sample into '${p.name}' gallery (${p.sample_count} samples)`}
+                  >
+                    + {p.name} ({p.sample_count})
+                  </button>
+                ))}
                 {(activeReview.data?.sub_labels?.length ?? 0) > 0 && (
                   <button
                     type="button"

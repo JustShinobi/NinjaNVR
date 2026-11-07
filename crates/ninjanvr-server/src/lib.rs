@@ -7693,7 +7693,10 @@ pub fn evaluate_system_heuristics(
             .fold(f64::INFINITY, f64::min)
             .max(0.3);
         for (cam_name, ff_val) in &ff_cpus {
-            if *ff_val >= 1.4 && *ff_val >= min_ff * 1.8 {
+            let is_shared_loopback = cfg.camera_uses_shared_main_loopback(cam_name);
+            let min_abs_cpu = if is_shared_loopback { 3.5 } else { 1.4 };
+            let min_ratio = if is_shared_loopback { 3.5 } else { 1.8 };
+            if *ff_val >= min_abs_cpu && *ff_val >= min_ff * min_ratio {
                 alerts.push(HeuristicAlertDto {
                     id: format!("detect_ffmpeg_cpu_{cam_name}"),
                     severity: "optimization".to_string(),
@@ -22087,9 +22090,13 @@ async fn api_go2rtc_stream_prewarm(
         )
             .into_response();
     }
+    let canonical_stream = {
+        let cfg = state.config.read().await;
+        cfg.resolve_mse_stream_alias(&stream).to_string()
+    };
     let warm = state
         .mse_hub
-        .prewarm_stream(&state.go2rtc_ws_base, &stream)
+        .prewarm_stream(&state.go2rtc_ws_base, &canonical_stream)
         .await;
     Json(json!({
         "success": true,
@@ -22778,8 +22785,11 @@ async fn bridge_go2rtc_ws_with_mode(
 ) {
     let stream_src = if is_webrtc_ws {
         None
+    } else if let Some(raw_src) = mse_hub::extract_stream_src_from_query(&query) {
+        let cfg = state.config.read().await;
+        Some(cfg.resolve_mse_stream_alias(&raw_src).to_string())
     } else {
-        mse_hub::extract_stream_src_from_query(&query)
+        None
     };
 
     // If a stream `src` is specified on `/live/mse/api/ws`, use MseStreamHub's shared single-upstream
@@ -23713,18 +23723,31 @@ pub async fn new_app_state(
     }
 
     if spawn_go2rtc {
-        let enabled_cams: Vec<String> = {
+        let persistent_streams: Vec<String> = {
             let cfg_guard = state.config.read().await;
-            cfg_guard
-                .cameras
-                .iter()
-                .filter(|(_, c)| c.enabled)
-                .map(|(k, _)| k.clone())
-                .collect()
+            let mut out = Vec::new();
+            for (cam_name, cam_cfg) in &cfg_guard.cameras {
+                if !cam_cfg.enabled {
+                    continue;
+                }
+                let trimmed = cam_name.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !out.iter().any(|s| s == trimmed) {
+                    out.push(trimmed.to_string());
+                }
+                let sub = format!("{trimmed}_sub");
+                let resolved_sub = cfg_guard.resolve_mse_stream_alias(&sub);
+                if !out.iter().any(|s| s == resolved_sub) {
+                    out.push(resolved_sub.to_string());
+                }
+            }
+            out
         };
         state
             .mse_hub
-            .start_persistent_camera_streams(&state.go2rtc_ws_base, enabled_cams)
+            .start_persistent_streams(&state.go2rtc_ws_base, persistent_streams)
             .await;
 
         let stats_state = state.clone();
@@ -27938,6 +27961,55 @@ cameras:
             logged
                 .iter()
                 .any(|l| l.contains("ERROR") && l.contains("storage_capacity_unbounded"))
+        );
+
+        // Shared main-stream loopback camera (e.g. 'sala' downscaling 1080p -> 720p at ~2.5% CPU)
+        // must not trigger a false-positive detect_ffmpeg_cpu alert and must alias sala_sub -> sala.
+        let shared_yaml = r#"
+version: 0.18-0
+go2rtc:
+  streams:
+    cozinha: "rtsp://admin:pass@192.0.2.20:554/stream1"
+    cozinha_sub: "rtsp://admin:pass@192.0.2.20:554/stream2"
+    sala: "rtsp://admin:pass@192.0.2.21:554/cam/realmonitor?channel=1&subtype=0"
+    sala_sub: "rtsp://127.0.0.1:8554/sala"
+cameras:
+  cozinha:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/cozinha_sub
+          roles: [detect]
+        - path: rtsp://127.0.0.1:8554/cozinha
+          roles: [record]
+  sala:
+    enabled: true
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/sala
+          roles: [detect, record, audio]
+"#;
+        let shared_cfg =
+            NinjaConfig::from_yaml_str(shared_yaml, PathBuf::from("/tmp/config.yml")).unwrap();
+        assert!(!shared_cfg.camera_uses_shared_main_loopback("cozinha"));
+        assert!(shared_cfg.camera_uses_shared_main_loopback("sala"));
+        assert_eq!(
+            shared_cfg.resolve_mse_stream_alias("cozinha_sub"),
+            "cozinha_sub"
+        );
+        assert_eq!(shared_cfg.resolve_mse_stream_alias("sala_sub"), "sala");
+
+        let mut shared_stats = serde_json::Map::new();
+        shared_stats.insert("cozinha".to_string(), json!({ "ffmpeg_cpu": "0.9" }));
+        shared_stats.insert("sala".to_string(), json!({ "ffmpeg_cpu": "2.5" }));
+        let healthy_mount = json!({ "total": 100_000.0, "used": 40_000.0, "free": 60_000.0 });
+        let shared_alerts =
+            evaluate_system_heuristics(&shared_cfg, &shared_stats, &healthy_mount, 14.0);
+        assert!(
+            !shared_alerts
+                .iter()
+                .any(|a| a.id == "detect_ffmpeg_cpu_sala"),
+            "shared main-stream loopback camera at 2.5% CPU must not trigger detect_ffmpeg_cpu_sala"
         );
     }
 

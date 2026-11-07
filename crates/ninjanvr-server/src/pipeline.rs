@@ -191,6 +191,10 @@ pub fn build_vision_decoder_ffmpeg_args(
         "500000".to_string(),
         "-threads".to_string(),
         "1".to_string(),
+        "-skip_loop_filter:v".to_string(),
+        "nokey".to_string(),
+        "-flags2:v".to_string(),
+        "fast".to_string(),
         "-protocol_whitelist".to_string(),
         "rtsp,rtsps,rtp,tcp,udp,tls,crypto".to_string(),
         "-rtsp_transport".to_string(),
@@ -199,10 +203,13 @@ pub fn build_vision_decoder_ffmpeg_args(
         "10000000".to_string(),
         "-i".to_string(),
         sub_url.trim().to_string(),
+        "-an".to_string(),
         "-r".to_string(),
         fps_str,
         "-vf".to_string(),
         vf_arg,
+        "-sws_flags".to_string(),
+        "fast_bilinear".to_string(),
         "-threads".to_string(),
         "1".to_string(),
         "-f".to_string(),
@@ -4265,6 +4272,11 @@ mod tests {
         assert!(args.contains(&"-nostdin".to_string()));
         assert!(args.contains(&"-protocol_whitelist".to_string()));
         assert!(args.contains(&"rtsp,rtsps,rtp,tcp,udp,tls,crypto".to_string()));
+        assert!(args.contains(&"-skip_loop_filter:v".to_string()));
+        assert!(args.contains(&"nokey".to_string()));
+        assert!(args.contains(&"-an".to_string()));
+        assert!(args.contains(&"-sws_flags".to_string()));
+        assert!(args.contains(&"fast_bilinear".to_string()));
         assert!(args.contains(&"fps=5,scale=640:360".to_string()));
         assert!(
             build_vision_decoder_ffmpeg_args("file:///etc/shadow", 640, 360, 5).is_none(),
