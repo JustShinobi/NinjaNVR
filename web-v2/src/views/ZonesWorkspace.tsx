@@ -29,7 +29,7 @@ import {
   ConsoleUiSection,
 } from "./settings/ConsoleAndStreamsPanels";
 import { AiDetectionObjectsSection } from "./settings/VisionAndAiPanels";
-import { ZonesStudio } from "./settings/ZonesStudio";
+import { ZonesStudio, type SaveOutcome } from "./settings/ZonesStudio";
 import { DatasetStudioSection } from "./settings/DatasetStudio";
 import {
   CommsAuthUsersSection,
@@ -681,6 +681,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [visionReviewOpen, setVisionReviewOpen] = useState(false);
+  const [saveOutcome, setSaveOutcome] = useState<SaveOutcome | null>(null);
   const draftRevisionRef = useRef<number>(0);
   const isMountedRef = useRef<boolean>(true);
   const showYamlKeys = useNvrStore((s) => s.showYamlKeys);
@@ -791,6 +792,11 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
 
   const handleSaveStructured = async (restartAfter = false) => {
     if (!draftConfig || isSaving) return;
+    const report = (ok: boolean, message: string) => {
+      notify(message);
+      setSaveOutcome({ ok, message, at: Date.now() });
+    };
+    setSaveOutcome(null);
     const saveRev = draftRevisionRef.current;
     const { cleaned: payloadConfig, rejectedCount } =
       sanitizeConfigGeometryDraft(draftConfig);
@@ -838,7 +844,8 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
             await fetch("/api/restart", { method: "POST", credentials: "include" });
             if (!isMountedRef.current) return;
           }
-          notify(
+          report(
+            true,
             restartAfter
               ? isPt
                 ? "Configuração salva e NVR reiniciado"
@@ -848,7 +855,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               : "Configuration saved to config.yml"
           );
         } else {
-          notify(saveData.message || "Failed to save configuration");
+          report(false, saveData.message || (isPt ? "Falha ao salvar a configuração" : "Failed to save configuration"));
         }
         return;
       }
@@ -877,24 +884,37 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
         if (restartAfter) {
           await fetch("/api/restart", { method: "POST", credentials: "include" });
           if (!isMountedRef.current) return;
-          notify(
+          report(
+            true,
             isPt
               ? "Configuração salva e pipeline reiniciado"
               : "Structured configuration saved and pipeline restart triggered"
           );
         } else {
-          notify(
+          report(
+            true,
             isPt
               ? "Configuração salva em config.yml"
               : "Structured configuration saved to config.yml"
           );
         }
       } else {
-        notify(data.message || "Failed to save structured configuration");
+        report(
+          false,
+          data.message ||
+            (isPt
+              ? `Falha ao salvar (HTTP ${res.status})`
+              : `Failed to save structured configuration (HTTP ${res.status})`)
+        );
       }
     } catch {
       if (isMountedRef.current) {
-        notify("Network error while saving structured configuration");
+        report(
+          false,
+          isPt
+            ? "Erro de rede ao salvar. Nada foi gravado."
+            : "Network error while saving. Nothing was written."
+        );
       }
     } finally {
       if (isMountedRef.current) {
@@ -1216,16 +1236,29 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                     {unsavedLabel}
                   </span>
                 )}
-                <button
-                  type="button"
-                  className="nvr-btn primary"
-                  aria-pressed={visionReviewOpen}
-                  onClick={() => setVisionReviewOpen(true)}
-                  disabled={isSaving || !isDirty}
-                >
-                  <Save size={12} />
-                  {isPt ? "Revisar e salvar" : "Review and save"}
-                </button>
+                {isDirty || isSaving ? (
+                  <button
+                    type="button"
+                    className="nvr-btn primary"
+                    aria-pressed={visionReviewOpen}
+                    onClick={() => setVisionReviewOpen(true)}
+                    disabled={isSaving}
+                  >
+                    <Save size={12} />
+                    {isSaving
+                      ? isPt
+                        ? "Salvando…"
+                        : "Saving…"
+                      : isPt
+                      ? "Revisar e salvar"
+                      : "Review and save"}
+                  </button>
+                ) : (
+                  <span className="nvr-badge live" role="status">
+                    <CheckCircle2 size={11} />
+                    {isPt ? "TUDO SALVO" : "ALL SAVED"}
+                  </span>
+                )}
               </>
             ) : (
               <>
@@ -1310,6 +1343,8 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
             onSave={() => handleSaveStructured(false)}
             onDiscard={handleDiscardDraft}
             isSaving={isSaving}
+            isDirty={isDirty}
+            saveOutcome={saveOutcome}
           />
         ) : (
           <div className="nvr-settings-body">

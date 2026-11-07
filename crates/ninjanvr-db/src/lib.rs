@@ -3065,10 +3065,11 @@ impl NinjaDatabase {
             return Ok(updated);
         }
         let like_pattern = format!("%\"{}\"%", escape_sql_like(clean_id));
-        let mut stmt =
-            tx.prepare("SELECT id, data FROM reviewsegment WHERE data LIKE ?1 ESCAPE '\\'")?;
+        let mut stmt = tx.prepare(
+            "SELECT id, data FROM reviewsegment WHERE id = ?1 OR data LIKE ?2 ESCAPE '\\'",
+        )?;
         let rev_rows: Vec<(String, String)> = stmt
-            .query_map(params![like_pattern], |r| {
+            .query_map(params![clean_id, like_pattern], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -3092,7 +3093,9 @@ impl NinjaDatabase {
                         .collect()
                 })
                 .unwrap_or_default();
-            let matches_event = det_ids.iter().any(|d| d == id || d == clean_id)
+            let matches_event = rev_id == id
+                || rev_id == clean_id
+                || det_ids.iter().any(|d| d == id || d == clean_id)
                 || obj
                     .get("event_id")
                     .and_then(|v| v.as_str())

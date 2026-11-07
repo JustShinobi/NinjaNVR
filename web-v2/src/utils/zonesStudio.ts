@@ -1032,3 +1032,26 @@ export function revertVisionChange(
 export function countChangedCameras(changes: VisionChange[]): number {
   return new Set(changes.map((c) => c.camera)).size;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Save status
+// ---------------------------------------------------------------------------------------------
+
+export type SaveStatusKind = "busy" | "error" | "pending" | "ok" | "none";
+
+/**
+ * Which save banner the studio shows. A failed save stays visible (even while the draft is
+ * still dirty) until the next attempt, so the operator never loses the error; a success is
+ * only shown once nothing else is pending.
+ */
+export function resolveSaveStatus(params: {
+  isSaving: boolean;
+  isDirty: boolean;
+  outcome: { ok: boolean } | null;
+}): SaveStatusKind {
+  if (params.isSaving) return "busy";
+  if (params.outcome && !params.outcome.ok) return "error";
+  if (params.isDirty) return "pending";
+  if (params.outcome?.ok) return "ok";
+  return "none";
+}

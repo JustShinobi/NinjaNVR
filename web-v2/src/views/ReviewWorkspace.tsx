@@ -283,6 +283,9 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [reviewFaceDraft, setReviewFaceDraft] = React.useState("");
   const [enrolledFaces, setEnrolledFaces] = React.useState<EnrolledFaceProfileItem[]>([]);
   const [selectedBatchReviewIds, setSelectedBatchReviewIds] = React.useState<string[]>([]);
+  const [localReviewSubLabels, setLocalReviewSubLabels] = React.useState<
+    Record<string, string | null>
+  >({});
   const [batchReviewFaceProgress, setBatchReviewFaceProgress] = React.useState<{
     active: boolean;
     completed: number;
@@ -397,17 +400,51 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   }, [subLabelsRefreshTick, lastDeletedFaceProfile]);
 
   const handleAssignReviewFace = async (overrideName?: string | null) => {
-    if (!activeReview) return;
-    const targetReview = activeReview;
-    const targetId = targetReview.id;
-    const detId = (targetReview.data?.detections?.[0] || targetId).trim();
-    if (!detId) return;
     const raw = overrideName !== undefined ? overrideName : reviewFaceDraft;
     const clean =
       raw && raw.trim().length > 0
         ? normalizeFaceProfileName(raw) || null
         : null;
     if (raw && raw.trim().length > 0 && !clean) return;
+    if (selectedBatchReviewIds.length > 0 && clean) {
+      await handleBatchAssignReviewFace(clean);
+      return;
+    }
+    if (selectedBatchReviewIds.length > 0 && clean === null) {
+      const targetRevIds = [...selectedBatchReviewIds];
+      for (const rid of targetRevIds) {
+        const revObj = reviews.find((r) => r.id === rid);
+        const allDets = (revObj?.data?.detections || [])
+          .map((d) => d.trim())
+          .filter((d) => d.length > 0);
+        const detIds = allDets.length > 0 ? allDets : [rid];
+        for (const did of detIds) {
+          await fetch(`/api/events/${encodeURIComponent(did)}/sub_label`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({ sub_label: null }),
+          }).catch(() => null);
+        }
+        setLocalReviewSubLabels((prev) => ({ ...prev, [rid]: null }));
+      }
+      if (activeReview && targetRevIds.includes(activeReview.id)) {
+        const [updated] = applyReviewSubLabelUpdate(
+          [activeReview],
+          activeReview.id,
+          null
+        );
+        setActiveReview(updated);
+      }
+      setSelectedBatchReviewIds([]);
+      bumpSubLabelsRefresh();
+      return;
+    }
+    if (!activeReview) return;
+    const targetReview = activeReview;
+    const targetId = targetReview.id;
+    const detId = (targetReview.data?.detections?.[0] || targetId).trim();
+    if (!detId) return;
     const seq = ++reviewMutationSeqRef.current;
     try {
       let anyOk = false;
@@ -451,6 +488,9 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
           });
           if (res.ok) anyOk = true;
         }
+      }
+      if (anyOk && isMountedRef.current) {
+        setLocalReviewSubLabels((prev) => ({ ...prev, [targetId]: clean }));
       }
       if (
         isMountedRef.current &&
@@ -517,13 +557,18 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
               }),
             }
           );
-          if (res.ok && activeReview && activeReview.id === rid) {
-            const [updated] = applyReviewSubLabelUpdate(
-              [activeReview],
-              rid,
-              cleanName
-            );
-            setActiveReview(updated);
+          if (res.ok) {
+            if (isMountedRef.current) {
+              setLocalReviewSubLabels((prev) => ({ ...prev, [rid]: cleanName }));
+            }
+            if (activeReview && activeReview.id === rid) {
+              const [updated] = applyReviewSubLabelUpdate(
+                [activeReview],
+                rid,
+                cleanName
+              );
+              setActiveReview(updated);
+            }
           }
         }
         if (isMountedRef.current) {
@@ -1156,15 +1201,21 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                       >
                         {formatEventLabelWithSubLabel(
                           (item.data?.objects || ["motion"]).join(", "),
-                          item.data?.sub_labels?.[0] ?? null,
+                          item.id in localReviewSubLabels
+                            ? localReviewSubLabels[item.id]
+                            : item.data?.sub_labels?.[0] ?? null,
                           item.data?.detected_attributes
                         )}
                       </span>
                       <div className="nvr-row-actions">
                         {(() => {
+                          const effSub =
+                            item.id in localReviewSubLabels
+                              ? localReviewSubLabels[item.id]
+                              : item.data?.sub_labels?.[0] ?? null;
                           const subBadge = formatSubLabelBadge(
-                            item.data?.sub_labels?.[0] ?? null,
-                            item.data?.sub_label_score
+                            effSub,
+                            item.data?.sub_label_score ?? (effSub ? 1.0 : null)
                           );
                           if (!subBadge) return null;
                           return (
@@ -1886,10 +1937,15 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                   type="button"
                   className="nvr-btn primary mono"
                   style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  disabled={Boolean(batchReviewFaceProgress?.active)}
                   onClick={() => void handleAssignReviewFace()}
-                  title="Assigns person name to review and automatically enrolls 112x112 face crop into Face Gallery"
+                  title="Assigns person name to selected review(s) and automatically enrolls 112x112 face crop into Face Gallery"
                 >
-                  Assign &amp; Enroll Face
+                  {batchReviewFaceProgress?.active
+                    ? `Enrolling ${batchReviewFaceProgress.completed}/${batchReviewFaceProgress.total}...`
+                    : selectedBatchReviewIds.length > 0
+                    ? `Assign & Enroll (${selectedBatchReviewIds.length} Selected)`
+                    : "Assign & Enroll Face"}
                 </button>
                 {enrolledFaces.map((p) => (
                   <button

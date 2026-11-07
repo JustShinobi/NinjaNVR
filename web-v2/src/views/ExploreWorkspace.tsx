@@ -536,6 +536,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const [faceNameDraft, setFaceNameDraft] = React.useState("");
   const [enrolledFaces, setEnrolledFaces] = React.useState<EnrolledFaceProfileItem[]>([]);
   const [selectedBatchEventIds, setSelectedBatchEventIds] = React.useState<string[]>([]);
+  const [localEventSubLabels, setLocalEventSubLabels] = React.useState<
+    Record<string, string | null>
+  >({});
   const [batchFaceProgress, setBatchFaceProgress] = React.useState<{
     active: boolean;
     completed: number;
@@ -634,9 +637,6 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   }, [lastDeletedFaceProfile, selectedEvent, setSelectedEvent]);
 
   const handleAssignFaceSubLabel = async (overrideName?: string | null) => {
-    if (!selectedEvent) return;
-    const targetEvent = selectedEvent;
-    const targetId = targetEvent.id;
     const raw = overrideName !== undefined ? overrideName : faceNameDraft;
     const clean =
       raw && raw.trim().length > 0
@@ -646,6 +646,37 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       notify("Enter a valid face name (letters, numbers, spaces, _ or -)");
       return;
     }
+    if (selectedBatchEventIds.length > 0 && clean) {
+      await handleBatchAssignFace(clean);
+      return;
+    }
+    if (selectedBatchEventIds.length > 0 && clean === null) {
+      const targetIds = [...selectedBatchEventIds];
+      for (const eid of targetIds) {
+        await fetch(`/api/events/${encodeURIComponent(eid)}/sub_label`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ sub_label: null }),
+        }).catch(() => null);
+        setLocalEventSubLabels((prev) => ({ ...prev, [eid]: null }));
+      }
+      if (selectedEvent && targetIds.includes(selectedEvent.id)) {
+        const [updated] = applyEventSubLabelUpdate(
+          [selectedEvent],
+          selectedEvent.id,
+          null
+        );
+        setSelectedEvent(updated);
+      }
+      setSelectedBatchEventIds([]);
+      bumpSubLabelsRefresh();
+      notify(`Cleared face sub-label on ${targetIds.length} selected events`);
+      return;
+    }
+    if (!selectedEvent) return;
+    const targetEvent = selectedEvent;
+    const targetId = targetEvent.id;
     const seq = ++eventMutationSeqRef.current;
     try {
       let res: Response;
@@ -689,6 +720,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       if (!isMountedRef.current) return;
       if (res.ok) {
         const data = await res.json().catch(() => null);
+        setLocalEventSubLabels((prev) => ({ ...prev, [targetId]: clean }));
         if (
           seq === eventMutationSeqRef.current &&
           shouldApplyEventMutationResult(
@@ -778,6 +810,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           okCount += 1;
           const data = await res.json().catch(() => null);
           totalBackfilled += Number(data?.backfilled_events || 0);
+          if (isMountedRef.current) {
+            setLocalEventSubLabels((prev) => ({ ...prev, [eid]: cleanName }));
+          }
           if (selectedEvent && selectedEvent.id === eid) {
             const [updated] = applyEventSubLabelUpdate(
               [selectedEvent],
@@ -1439,15 +1474,21 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                       >
                         {formatEventLabelWithSubLabel(
                           ev.label,
-                          ev.sub_label,
+                          ev.id in localEventSubLabels
+                            ? localEventSubLabels[ev.id]
+                            : ev.sub_label,
                           ev.data?.detected_attributes
                         )}{" "}
                         · {topScore}%
                       </span>
                       {(() => {
+                        const effSub =
+                          ev.id in localEventSubLabels
+                            ? localEventSubLabels[ev.id]
+                            : ev.sub_label;
                         const subBadge = formatSubLabelBadge(
-                          ev.sub_label,
-                          ev.sub_label_score ?? ev.data?.sub_label_score
+                          effSub,
+                          ev.sub_label_score ?? ev.data?.sub_label_score ?? (effSub ? 1.0 : null)
                         );
                         if (!subBadge) return null;
                         return (
@@ -2160,10 +2201,15 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                   type="button"
                   className="nvr-btn primary mono"
                   style={{ height: 26, padding: "0 10px", fontSize: "var(--text-xs)" }}
+                  disabled={Boolean(batchFaceProgress?.active)}
                   onClick={() => void handleAssignFaceSubLabel()}
-                  title="Assigns person name to event and automatically enrolls 112x112 face crop into Face Gallery"
+                  title="Assigns person name to selected event(s) and automatically enrolls 112x112 face crop into Face Gallery"
                 >
-                  Assign &amp; Enroll Face
+                  {batchFaceProgress?.active
+                    ? `Enrolling ${batchFaceProgress.completed}/${batchFaceProgress.total}...`
+                    : selectedBatchEventIds.length > 0
+                    ? `Assign & Enroll (${selectedBatchEventIds.length} Selected)`
+                    : "Assign & Enroll Face"}
                 </button>
                 {enrolledFaces.map((p) => (
                   <button

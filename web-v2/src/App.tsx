@@ -762,7 +762,16 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (!authChecked || authNeeded) return;
     let cancelled = false;
-    if (activeTab === "explore") {
+    if (activeTab === "review") {
+      fetch("/api/review?limit=80", { credentials: "include" })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((revJson: ReviewItem[] | null) => {
+          if (!cancelled && Array.isArray(revJson)) {
+            setReviews(revJson.slice(0, MAX_LIVE_REVIEWS));
+          }
+        })
+        .catch(() => {});
+    } else if (activeTab === "explore") {
       let evUrl = "/api/events?limit=120";
       if (reviewDateFilter) {
         const parts = reviewDateFilter.split("-").map(Number);

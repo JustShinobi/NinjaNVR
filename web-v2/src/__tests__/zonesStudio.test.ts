@@ -17,6 +17,7 @@ import {
   parseCoordPoints,
   readMasks,
   rectFromCorners,
+  resolveSaveStatus,
   revertVisionChange,
   tripwireGuide,
   tripwireSide,
@@ -303,5 +304,19 @@ describe("zones studio — save review diff and per-change undo", () => {
     expect(diffVisionConfig(saved, draft, true)).toEqual([]);
     expect(draft.cameras.sala.lines?.portao).toBeUndefined();
     expect(readMasks(draft.cameras.sala, "motion_mask")).toEqual(["0.6,0.3,0.9,0.3,0.9,0.5"]);
+  });
+});
+
+describe("zones studio — save status feedback", () => {
+  test("always tells the operator where the save stands", () => {
+    expect(resolveSaveStatus({ isSaving: true, isDirty: true, outcome: null })).toBe("busy");
+    expect(resolveSaveStatus({ isSaving: false, isDirty: true, outcome: null })).toBe("pending");
+    expect(resolveSaveStatus({ isSaving: false, isDirty: false, outcome: { ok: true } })).toBe("ok");
+    expect(resolveSaveStatus({ isSaving: false, isDirty: false, outcome: null })).toBe("none");
+  });
+
+  test("a failed save stays visible while the draft is still unsaved", () => {
+    expect(resolveSaveStatus({ isSaving: false, isDirty: true, outcome: { ok: false } })).toBe("error");
+    expect(resolveSaveStatus({ isSaving: true, isDirty: true, outcome: { ok: false } })).toBe("busy");
   });
 });

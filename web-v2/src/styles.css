@@ -3199,3 +3199,71 @@ input[type="range"] {
     min-height: 320px;
   }
 }
+
+/* Save status + outcome (zones studio) */
+.nvr-zs-status {
+  margin: 10px 12px 0;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  border: 1px solid var(--border-hairline);
+  border-radius: 3px;
+  background: var(--bg-subcard);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+}
+
+.nvr-zs-status.is-pending {
+  border-color: var(--signal-motion-border);
+  background: var(--signal-motion-tint);
+}
+
+.nvr-zs-status.is-ok {
+  border-color: var(--signal-live-border);
+  background: var(--signal-live-tint);
+  color: var(--signal-live-text);
+}
+
+.nvr-zs-status.is-error {
+  border-color: var(--signal-alert-border);
+  background: var(--signal-alert-tint);
+}
+
+.nvr-zs-status.is-error strong {
+  color: var(--signal-alert-text);
+}
+
+.nvr-zs-outcome {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 3px;
+  font-size: var(--text-sm);
+}
+
+.nvr-zs-outcome span {
+  color: var(--text-secondary);
+}
+
+.nvr-zs-outcome.is-ok {
+  border: 1px solid var(--signal-live-border);
+  background: var(--signal-live-tint);
+}
+
+.nvr-zs-outcome.is-ok strong {
+  color: var(--signal-live-text);
+}
+
+.nvr-zs-outcome.is-error {
+  border: 1px solid var(--signal-alert-border);
+  background: var(--signal-alert-tint);
+}
+
+.nvr-zs-outcome.is-error strong {
+  color: var(--signal-alert-text);
+}

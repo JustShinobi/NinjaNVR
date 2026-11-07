@@ -18,6 +18,7 @@ import {
   isMaskKind,
   listCameraVisionItems,
   readMasks,
+  resolveSaveStatus,
   maskKindLabel,
   measureBox,
   minPointsFor,
@@ -92,6 +93,16 @@ function clone<T>(v: T): T {
   return JSON.parse(JSON.stringify(v)) as T;
 }
 
+export interface SaveOutcome {
+  ok: boolean;
+  message: string;
+  at: number;
+}
+
+function formatClock(ts: number, pt: boolean): string {
+  return new Date(ts).toLocaleTimeString(pt ? "pt-BR" : "en-US", { hour: "2-digit", minute: "2-digit" });
+}
+
 export interface ZonesStudioProps {
   draftConfig: NinjaConfigResponse;
   savedConfig: NinjaConfigResponse | null;
@@ -106,6 +117,8 @@ export interface ZonesStudioProps {
   onSave: () => Promise<void> | void;
   onDiscard: () => void;
   isSaving: boolean;
+  isDirty: boolean;
+  saveOutcome: SaveOutcome | null;
 }
 
 export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
@@ -331,6 +344,8 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
         onSave={props.onSave}
         onDiscard={props.onDiscard}
         isSaving={props.isSaving}
+        isDirty={props.isDirty}
+        saveOutcome={props.saveOutcome}
         notify={notify}
       />
     );
@@ -371,6 +386,14 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
       <aside className="nvr-zs-panel" aria-label={tr("Configuração da câmera", "Camera configuration")}>
         {mode.name === "list" && (
           <>
+            <SaveStatus
+              pt={pt}
+              pending={changes.length}
+              isDirty={props.isDirty}
+              isSaving={props.isSaving}
+              outcome={props.saveOutcome}
+              onReview={props.onOpenReview}
+            />
             <div className="nvr-segmented nvr-zs-tabs" role="tablist">
               <button
                 type="button"
@@ -1666,6 +1689,71 @@ const MotionPanel: React.FC<{
 };
 
 // ------------------------------------------------------------------------------------------------
+// Save status (always visible above the list)
+// ------------------------------------------------------------------------------------------------
+
+const SaveStatus: React.FC<{
+  pt: boolean;
+  pending: number;
+  isDirty: boolean;
+  isSaving: boolean;
+  outcome: SaveOutcome | null;
+  onReview: () => void;
+}> = ({ pt, pending, isDirty, isSaving, outcome, onReview }) => {
+  const tr = (a: string, b: string) => (pt ? a : b);
+  const kind = resolveSaveStatus({ isSaving, isDirty, outcome });
+  if (kind === "busy") {
+    return (
+      <div className="nvr-zs-status is-busy" role="status">
+        <span>{tr("Salvando…", "Saving…")}</span>
+      </div>
+    );
+  }
+  if (kind === "error" && outcome) {
+    return (
+      <div className="nvr-zs-status is-error" role="alert">
+        <span>
+          <strong>{tr("Não foi salvo.", "Not saved.")}</strong> {outcome.message}
+        </span>
+        <button type="button" className="nvr-btn sm" onClick={onReview}>
+          {tr("Revisar e tentar de novo", "Review and retry")}
+        </button>
+      </div>
+    );
+  }
+  if (kind === "pending") {
+    return (
+      <div className="nvr-zs-status is-pending" role="status">
+        <span>
+          {pending > 0
+            ? tr(
+                `${pending} ${pending === 1 ? "alteração não salva" : "alterações não salvas"}. Ainda não vale nas câmeras.`,
+                `${pending} unsaved ${pending === 1 ? "change" : "changes"}. Not live on cameras yet.`
+              )
+            : tr("Há alterações não salvas em outras abas.", "There are unsaved changes in other tabs.")}
+        </span>
+        <button type="button" className="nvr-btn sm primary" onClick={onReview}>
+          {tr("Revisar e salvar", "Review and save")}
+        </button>
+      </div>
+    );
+  }
+  if (kind === "ok" && outcome) {
+    return (
+      <div className="nvr-zs-status is-ok" role="status">
+        <span>
+          {tr(
+            `Salvo às ${formatClock(outcome.at, pt)}. Aplicado nas câmeras.`,
+            `Saved at ${formatClock(outcome.at, pt)}. Applied to cameras.`
+          )}
+        </span>
+      </div>
+    );
+  }
+  return null;
+};
+
+// ------------------------------------------------------------------------------------------------
 // Review and save
 // ------------------------------------------------------------------------------------------------
 
@@ -1677,8 +1765,10 @@ const ReviewPanel: React.FC<{
   onSave: () => Promise<void> | void;
   onDiscard: () => void;
   isSaving: boolean;
+  isDirty: boolean;
+  saveOutcome: SaveOutcome | null;
   notify: (msg: string) => void;
-}> = ({ pt, changes, onUndo, onBack, onSave, onDiscard, isSaving, notify }) => {
+}> = ({ pt, changes, onUndo, onBack, onSave, onDiscard, isSaving, isDirty, saveOutcome, notify }) => {
   const tr = (a: string, b: string) => (pt ? a : b);
   const cams = countChangedCameras(changes);
   const yaml = changes.flatMap((c) => [...c.yaml, ""]).join("\n").trim();
@@ -1691,14 +1781,16 @@ const ReviewPanel: React.FC<{
             <span className="nvr-zs-kicker mono">{tr("REVISAR E SALVAR", "REVIEW AND SAVE")}</span>
             <strong>
               {changes.length === 0
-                ? tr("Nenhuma alteração de zonas, máscaras ou movimento", "No zone, mask or motion changes")
+                ? tr("Nenhuma alteração pendente", "No pending changes")
                 : tr(
                     `${changes.length} ${changes.length === 1 ? "alteração" : "alterações"} em ${cams} ${cams === 1 ? "câmera" : "câmeras"}`,
                     `${changes.length} ${changes.length === 1 ? "change" : "changes"} on ${cams} ${cams === 1 ? "camera" : "cameras"}`
                   )}
             </strong>
             <span className="nvr-zs-muted">
-              {tr("Nada disso está valendo ainda. Confira antes de salvar.", "None of this is live yet. Check before saving.")}
+              {changes.length === 0
+                ? tr("Zonas, máscaras e movimento estão iguais ao que está gravado.", "Zones, masks and motion match what is saved.")
+                : tr("Nada disso está valendo ainda. Confira antes de salvar.", "None of this is live yet. Check before saving.")}
             </span>
           </div>
           <button type="button" className="nvr-zs-link" onClick={onBack}>
@@ -1725,16 +1817,45 @@ const ReviewPanel: React.FC<{
           ))}
         </ul>
         <div className="nvr-zs-footer">
+          {saveOutcome && !isSaving && (
+            <div className={`nvr-zs-outcome ${saveOutcome.ok ? "is-ok" : "is-error"}`} role={saveOutcome.ok ? "status" : "alert"}>
+              <strong>
+                {saveOutcome.ok
+                  ? tr(`Salvo às ${formatClock(saveOutcome.at, pt)}`, `Saved at ${formatClock(saveOutcome.at, pt)}`)
+                  : tr("Não foi salvo", "Not saved")}
+              </strong>
+              <span>
+                {saveOutcome.ok
+                  ? tr(
+                      "Gravado no config.yml. As câmeras aplicam em cerca de 1 segundo.",
+                      "Written to config.yml. Cameras apply it within about a second."
+                    )
+                  : saveOutcome.message}
+              </span>
+              {saveOutcome.ok && !isDirty && (
+                <button type="button" className="nvr-btn sm" onClick={onBack}>
+                  {tr("Voltar para a câmera", "Back to the camera")}
+                </button>
+              )}
+            </div>
+          )}
           <button
             type="button"
             className="nvr-zs-save"
-            disabled={isSaving}
-            onClick={async () => {
-              await onSave();
-              onBack();
+            disabled={isSaving || !isDirty}
+            onClick={() => {
+              void onSave();
             }}
           >
-            <strong>{isSaving ? tr("Salvando…", "Saving…") : tr("Salvar e aplicar", "Save and apply")}</strong>
+            <strong>
+              {isSaving
+                ? tr("Salvando…", "Saving…")
+                : !isDirty
+                ? tr("Nada pendente", "Nothing pending")
+                : saveOutcome && !saveOutcome.ok
+                ? tr("Tentar salvar de novo", "Try saving again")
+                : tr("Salvar e aplicar", "Save and apply")}
+            </strong>
             <span>
               {tr(
                 "Grava o config.yml e aplica nas câmeras em cerca de 1 segundo, sem reiniciar e sem parar a gravação.",
@@ -1749,7 +1870,7 @@ const ReviewPanel: React.FC<{
             <button
               type="button"
               className="nvr-btn sm danger"
-              disabled={isSaving}
+              disabled={isSaving || !isDirty}
               onClick={() => {
                 onDiscard();
                 onBack();
