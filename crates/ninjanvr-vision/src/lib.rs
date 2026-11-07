@@ -164,7 +164,7 @@ const MAX_POLYGON_VERTICES: usize = 256;
 const MAX_MOTION_CANDIDATES: usize = 128;
 const MAX_INFERENCE_REGIONS: usize = 16;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PolygonMask {
     polygons: Vec<Vec<(f32, f32)>>,
 }
@@ -1961,6 +1961,20 @@ impl CameraRoiStateMonitor {
         Self { trackers }
     }
 
+    /// Applies an edited `state_rois` map from a live config change. Trackers whose
+    /// configuration is unchanged keep their confirmed state and hysteresis counters;
+    /// new or edited ROIs start fresh and removed ROIs are dropped.
+    pub fn reconfigure(&mut self, rois: &BTreeMap<String, StateRoiConfig>) {
+        let mut previous = std::mem::take(&mut self.trackers);
+        for (name, cfg) in rois {
+            let tracker = match previous.remove(name) {
+                Some(existing) if existing.config() == cfg => existing,
+                _ => RoiStateTracker::new(name.clone(), cfg.clone()),
+            };
+            self.trackers.insert(name.clone(), tracker);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.trackers.is_empty()
     }
@@ -2547,6 +2561,54 @@ mod tests {
         );
         // Subsequent frame at the new luminance level is also quiet because avg_frame was reset to the flash level
         assert!(detector.detect(&flash_frame).is_empty());
+    }
+
+    #[test]
+    fn roi_monitor_reconfigure_keeps_unchanged_state_and_resets_edited_rois() {
+        let cfg = |classes: [&str; 2], timeout: u32| StateRoiConfig {
+            crop: [0.25, 0.25, 0.75, 0.75],
+            classes: classes.iter().map(|c| c.to_string()).collect(),
+            interval_sec: 5,
+            hysteresis: 1,
+            anomaly_state: None,
+            anomaly_timeout_sec: timeout,
+        };
+        let mut rois = BTreeMap::new();
+        rois.insert("gate".to_string(), cfg(["closed", "open"], 300));
+        rois.insert("spot".to_string(), cfg(["empty", "occupied"], 300));
+        let mut monitor = CameraRoiStateMonitor::new(&rois);
+        monitor
+            .tracker_mut("gate")
+            .expect("gate tracker")
+            .observe_state("open", 0.99, 10.0);
+        monitor
+            .tracker_mut("spot")
+            .expect("spot tracker")
+            .observe_state("occupied", 0.99, 10.0);
+        assert_eq!(monitor.current_states()["gate"], "open");
+        assert_eq!(monitor.current_states()["spot"], "occupied");
+
+        let mut next = BTreeMap::new();
+        next.insert("gate".to_string(), cfg(["closed", "open"], 300));
+        next.insert("spot".to_string(), cfg(["empty", "occupied"], 60));
+        next.insert("bin".to_string(), cfg(["present", "missing"], 300));
+        monitor.reconfigure(&next);
+
+        let states = monitor.current_states();
+        assert_eq!(states.len(), 3);
+        assert_eq!(
+            states["gate"], "open",
+            "unchanged ROI keeps its confirmed state"
+        );
+        assert_eq!(
+            states["spot"], "empty",
+            "edited ROI restarts from its first class"
+        );
+        assert_eq!(states["bin"], "present");
+
+        next.remove("gate");
+        monitor.reconfigure(&next);
+        assert!(!monitor.current_states().contains_key("gate"));
     }
 
     #[test]

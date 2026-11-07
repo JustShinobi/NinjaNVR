@@ -659,6 +659,73 @@ impl ActiveReviewState {
     }
 }
 
+/// How often each camera vision loop re-reads the shared config to pick up edits saved
+/// from the console (zones, tripwires, state ROIs, masks and motion tuning).
+const LIVE_VISION_CONFIG_POLL_SEC: f64 = 1.0;
+
+/// Which live-editable parts of a camera's vision config changed between two snapshots.
+/// Decoder settings (`detect` resolution/fps, `ffmpeg` inputs) are intentionally excluded:
+/// those still need the process to restart.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LiveVisionConfigDelta {
+    pub motion: bool,
+    pub state_rois: bool,
+    pub regions: bool,
+    pub lines: bool,
+    pub privacy_mask: bool,
+}
+
+impl LiveVisionConfigDelta {
+    pub fn any(&self) -> bool {
+        self.motion || self.state_rois || self.regions || self.lines || self.privacy_mask
+    }
+}
+
+fn json_differs<T: serde::Serialize>(a: &T, b: &T) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(x), Ok(y)) => x != y,
+        _ => false,
+    }
+}
+
+pub fn diff_live_vision_config(
+    current: &CameraConfig,
+    next: &CameraConfig,
+) -> LiveVisionConfigDelta {
+    LiveVisionConfigDelta {
+        motion: json_differs(&current.motion, &next.motion),
+        state_rois: current.state_rois != next.state_rois,
+        regions: json_differs(&current.zones, &next.zones)
+            || current.objects.mask != next.objects.mask,
+        lines: json_differs(&current.lines, &next.lines),
+        privacy_mask: current.privacy_mask != next.privacy_mask,
+    }
+}
+
+/// Copies only the live-editable sections flagged in `delta` from `next` into `current`.
+pub fn apply_live_vision_config(
+    current: &mut CameraConfig,
+    next: &CameraConfig,
+    delta: &LiveVisionConfigDelta,
+) {
+    if delta.motion {
+        current.motion = next.motion.clone();
+    }
+    if delta.state_rois {
+        current.state_rois = next.state_rois.clone();
+    }
+    if delta.regions {
+        current.zones = next.zones.clone();
+        current.objects.mask = next.objects.mask.clone();
+    }
+    if delta.lines {
+        current.lines = next.lines.clone();
+    }
+    if delta.privacy_mask {
+        current.privacy_mask = next.privacy_mask.clone();
+    }
+}
+
 pub struct VisionPipeline {
     pub config: Arc<RwLock<NinjaConfig>>,
     pub db: NinjaDatabase,
@@ -698,7 +765,12 @@ impl VisionPipeline {
         }
     }
 
-    async fn run_camera_vision_loop(&self, camera: String, cam_cfg: CameraConfig, sub_url: String) {
+    async fn run_camera_vision_loop(
+        &self,
+        camera: String,
+        mut cam_cfg: CameraConfig,
+        sub_url: String,
+    ) {
         let (width, height, frame_byte_len) =
             sanitize_yuv420p_dimensions(cam_cfg.detect.width, cam_cfg.detect.height);
         let fps = cam_cfg.detect.fps.clamp(1, 30);
@@ -727,8 +799,9 @@ impl VisionPipeline {
         let ffmpeg_bin = resolve_ffmpeg_bin();
         let cam_arc: Arc<str> = Arc::from(camera.as_str());
         let safe_cam_file = sanitize_filename_component(&camera);
-        let normalized_priv_mask =
+        let mut normalized_priv_mask =
             normalize_privacy_mask_for_resolution(&cam_cfg.privacy_mask, width, height);
+        let mut last_live_config_check = unix_now_f64();
 
         loop {
             let mut cmd = Command::new(&ffmpeg_bin);
@@ -799,6 +872,43 @@ impl VisionPipeline {
                             &format!("ninjanvr.camera.{camera}"),
                             "Camera stream reconnected (ONLINE)",
                         );
+                    }
+
+                    if now - last_live_config_check >= LIVE_VISION_CONFIG_POLL_SEC {
+                        last_live_config_check = now;
+                        let next_cfg = self.config.read().await.cameras.get(&camera).cloned();
+                        if let Some(next_cfg) = next_cfg {
+                            let delta = diff_live_vision_config(&cam_cfg, &next_cfg);
+                            if delta.any() {
+                                apply_live_vision_config(&mut cam_cfg, &next_cfg, &delta);
+                                if delta.motion {
+                                    motion_detector = SimdMotionDetector::new(
+                                        width,
+                                        height,
+                                        cam_cfg.motion.clone(),
+                                    );
+                                }
+                                if delta.state_rois {
+                                    roi_monitor.reconfigure(&cam_cfg.state_rois);
+                                }
+                                if delta.regions {
+                                    tracker.reconfigure_regions(&cam_cfg);
+                                }
+                                if delta.privacy_mask {
+                                    normalized_priv_mask = normalize_privacy_mask_for_resolution(
+                                        &cam_cfg.privacy_mask,
+                                        width,
+                                        height,
+                                    );
+                                }
+                                info!("Applied live vision config to {camera}: {delta:?}");
+                                self.log_hub.push_ninjanvr(
+                                    "INFO",
+                                    &format!("ninjanvr.camera.{camera}"),
+                                    "Applied saved zones, masks and motion settings without restart",
+                                );
+                            }
+                        }
                     }
 
                     let rt_flags = self.comms.get_camera_flags(&camera);
@@ -2892,6 +3002,53 @@ pub fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_vision_config_delta_flags_and_applies_only_live_editable_sections() {
+        let current = CameraConfig::default();
+        let mut next = current.clone();
+        assert!(!diff_live_vision_config(&current, &next).any());
+
+        next.motion.threshold = current.motion.threshold + 15;
+        next.privacy_mask = json!(["0.1,0.1,0.3,0.1,0.3,0.3,0.1,0.3"]);
+        next.objects.mask = json!("0.0,0.5,0.5,0.5,0.5,0.7,0.0,0.7");
+        next.state_rois.insert(
+            "gate".to_string(),
+            ninjanvr_config::StateRoiConfig {
+                crop: [0.2, 0.2, 0.6, 0.6],
+                classes: vec!["closed".to_string(), "open".to_string()],
+                interval_sec: 5,
+                hysteresis: 3,
+                anomaly_state: Some("open".to_string()),
+                anomaly_timeout_sec: 300,
+            },
+        );
+        // Decoder settings are not live-editable and must not be copied.
+        next.detect.width = current.detect.width + 320;
+        next.detect.fps = current.detect.fps + 5;
+
+        let delta = diff_live_vision_config(&current, &next);
+        assert_eq!(
+            delta,
+            LiveVisionConfigDelta {
+                motion: true,
+                state_rois: true,
+                regions: true,
+                lines: false,
+                privacy_mask: true,
+            }
+        );
+
+        let mut applied = current.clone();
+        apply_live_vision_config(&mut applied, &next, &delta);
+        assert_eq!(applied.motion.threshold, next.motion.threshold);
+        assert_eq!(applied.privacy_mask, next.privacy_mask);
+        assert_eq!(applied.objects.mask, next.objects.mask);
+        assert!(applied.state_rois.contains_key("gate"));
+        assert_eq!(applied.detect.width, current.detect.width);
+        assert_eq!(applied.detect.fps, current.detect.fps);
+        assert!(!diff_live_vision_config(&applied, &next).any());
+    }
     use ninjanvr_comms::CommsHub;
     use ninjanvr_config::{ProfileOverrideConfig, SnapshotSelectionPolicy};
     use ninjanvr_db::ReviewFilter;

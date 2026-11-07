@@ -103,6 +103,41 @@ pub struct ByteTracker {
     has_finite_frame_time: bool,
 }
 
+type ZonePolygonMap = BTreeMap<String, (PolygonMask, Vec<String>, Option<String>)>;
+
+fn build_object_masks(
+    cfg: &CameraConfig,
+    frame_w: u32,
+    frame_h: u32,
+) -> (PolygonMask, BTreeMap<String, PolygonMask>) {
+    let global_object_mask = PolygonMask::from_config_value(&cfg.objects.mask, frame_w, frame_h);
+    let mut label_masks = BTreeMap::new();
+    for (label, f) in &cfg.objects.filters {
+        let m = PolygonMask::from_config_value(&f.mask, frame_w, frame_h);
+        if !m.is_empty() {
+            label_masks.insert(label.clone(), m);
+        }
+    }
+    (global_object_mask, label_masks)
+}
+
+fn build_zone_polygons(cfg: &CameraConfig, frame_w: u32, frame_h: u32) -> ZonePolygonMap {
+    let mut zones = BTreeMap::new();
+    for (zname, zcfg) in &cfg.zones {
+        let poly = PolygonMask::from_config_value(&zcfg.coordinates, frame_w, frame_h);
+        if !poly.is_empty() {
+            let preset = zcfg
+                .preset
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            zones.insert(zname.clone(), (poly, zcfg.objects.clone(), preset));
+        }
+    }
+    zones
+}
+
 impl ByteTracker {
     pub fn new(
         camera_name: impl Into<String>,
@@ -112,29 +147,8 @@ impl ByteTracker {
     ) -> Self {
         let frame_w = frame_w.max(1);
         let frame_h = frame_h.max(1);
-        let global_object_mask =
-            PolygonMask::from_config_value(&cfg.objects.mask, frame_w, frame_h);
-        let mut label_masks = BTreeMap::new();
-        for (label, f) in &cfg.objects.filters {
-            let m = PolygonMask::from_config_value(&f.mask, frame_w, frame_h);
-            if !m.is_empty() {
-                label_masks.insert(label.clone(), m);
-            }
-        }
-
-        let mut zones = BTreeMap::new();
-        for (zname, zcfg) in &cfg.zones {
-            let poly = PolygonMask::from_config_value(&zcfg.coordinates, frame_w, frame_h);
-            if !poly.is_empty() {
-                let preset = zcfg
-                    .preset
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
-                zones.insert(zname.clone(), (poly, zcfg.objects.clone(), preset));
-            }
-        }
+        let (global_object_mask, label_masks) = build_object_masks(cfg, frame_w, frame_h);
+        let zones = build_zone_polygons(cfg, frame_w, frame_h);
 
         let min_init = cfg.detect.min_initialized.max(1);
         let min_init_night = cfg
@@ -173,6 +187,29 @@ impl ByteTracker {
             last_frame_time: 0.0,
             has_finite_frame_time: false,
         }
+    }
+
+    /// Applies edited zone polygons and object masks from a live config change without
+    /// dropping active tracks. Zone presence for removed or redrawn zones is reset so the
+    /// inertia/loitering hysteresis restarts against the new geometry.
+    pub fn reconfigure_regions(&mut self, cfg: &CameraConfig) {
+        let (global_object_mask, label_masks) = build_object_masks(cfg, self.frame_w, self.frame_h);
+        let next_zones = build_zone_polygons(cfg, self.frame_w, self.frame_h);
+        let unchanged: BTreeSet<String> = next_zones
+            .iter()
+            .filter(|(name, (poly, _, _))| {
+                self.zones
+                    .get(*name)
+                    .is_some_and(|(old_poly, _, _)| old_poly == poly)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for presence in self.zone_presence.values_mut() {
+            presence.retain(|zone, _| unchanged.contains(zone));
+        }
+        self.global_object_mask = global_object_mask;
+        self.label_masks = label_masks;
+        self.zones = next_zones;
     }
 
     pub fn set_night_mode(&mut self, night_mode: bool) {
@@ -1513,6 +1550,77 @@ mod tests {
                 .iter()
                 .any(|t| t.zones.contains(&"foreground_driveway".to_string()))
         );
+    }
+
+    #[test]
+    fn reconfigure_regions_moves_zones_and_masks_without_dropping_tracks() {
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.detect.min_initialized = 1;
+        let zone = |coords: &str| ninjanvr_config::ZoneConfig {
+            coordinates: coords.into(),
+            objects: vec!["person".to_string()],
+            inertia: 1,
+            loitering_time: 0,
+            min_area: None,
+            max_area: None,
+            min_score: None,
+            preset: None,
+        };
+        cam_cfg
+            .zones
+            .insert("left".to_string(), zone("0.0,0.0,0.5,0.0,0.5,1.0,0.0,1.0"));
+        let mut tracker = ByteTracker::new("cam", 1000, 1000, &cam_cfg);
+        let reg = BoundingBox::new(0, 0, 1000, 1000);
+        let det = || DetectionResult {
+            label: "person".to_string(),
+            score: 0.9,
+            bbox: BoundingBox::new(100, 300, 250, 600),
+            region: reg,
+        };
+
+        let (first, _) = tracker.update(1.0, &[det()], &[reg], &cam_cfg);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].zones.contains(&"left".to_string()));
+        let track_id = first[0].id.clone();
+
+        // Live edit: the zone moves to the right half and a new zone covers the person.
+        cam_cfg.zones.clear();
+        cam_cfg
+            .zones
+            .insert("right".to_string(), zone("0.5,0.0,1.0,0.0,1.0,1.0,0.5,1.0"));
+        cam_cfg
+            .zones
+            .insert("porch".to_string(), zone("0.0,0.0,0.4,0.0,0.4,1.0,0.0,1.0"));
+        tracker.reconfigure_regions(&cam_cfg);
+        let (second, _) = tracker.update(1.2, &[det()], &[reg], &cam_cfg);
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0].id, track_id,
+            "active track must survive a live config edit"
+        );
+        assert!(!second[0].zones.contains(&"left".to_string()));
+        assert!(!second[0].zones.contains(&"right".to_string()));
+        assert!(second[0].zones.contains(&"porch".to_string()));
+
+        // Live edit: an object mask now covers the person's base point.
+        cam_cfg.objects.mask = "0.0,0.5,0.5,0.5,0.5,0.7,0.0,0.7".into();
+        tracker.reconfigure_regions(&cam_cfg);
+        let fresh = DetectionResult {
+            label: "person".to_string(),
+            score: 0.9,
+            bbox: BoundingBox::new(700, 300, 800, 600),
+            region: reg,
+        };
+        let masked = DetectionResult {
+            bbox: BoundingBox::new(100, 300, 250, 600),
+            ..fresh.clone()
+        };
+        let (third, _) = tracker.update(1.4, &[fresh, masked], &[reg], &cam_cfg);
+        assert!(
+            third.iter().all(|t| t.id != track_id || t.zones.is_empty()),
+            "masked detection must not refresh zone membership"
+        );
+        assert!(third.iter().any(|t| t.zones.contains(&"right".to_string())));
     }
 
     #[test]
