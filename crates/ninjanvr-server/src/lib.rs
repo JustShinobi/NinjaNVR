@@ -24011,7 +24011,22 @@ async fn api_camera_hardware_get(
     };
 
     // 2. Probe ONVIF PTZ GetStatus (with deduplicated ProfileToken + GetProfiles discovery; abort on network timeout/unreachable)
-    let initial_prof = default_camera_profile_token(&camera, &ptz_ep, &cam_cfg);
+    let initial_prof = cam_cfg
+        .hardware
+        .profile_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|t| sanitize_onvif_token(Some(t), ""))
+        .filter(|s| !s.is_empty())
+        .or_else(|| get_cached_onvif_profile(&camera, &ptz_ep))
+        .unwrap_or_else(|| {
+            if is_tapo {
+                "profile_1".to_string()
+            } else {
+                "Profile000".to_string()
+            }
+        });
     let mut discovered_profile = initial_prof.clone();
     let mut ptz_ok = false;
     let mut ptz_zoom = false;
