@@ -24,6 +24,7 @@ import {
   resolveValidCameraSelection,
   useNvrStore,
 } from "./store/useNvrStore";
+import { formatMeasured, parseMeasured, resolvePrimaryInferenceMs } from "./utils/detectorTelemetry";
 import { LiveWorkspace } from "./views/LiveWorkspace";
 import { SyncWorkspace } from "./views/SyncWorkspace";
 import { ReviewWorkspace } from "./views/ReviewWorkspace";
@@ -1193,10 +1194,10 @@ export const App: React.FC = () => {
   ]);
 
   // Telemetry summary values
-  const sysCpu = stats?.cpu_usages?.["ninjanvr.full_system"]?.cpu || "6.5";
-  const sysMem = stats?.cpu_usages?.["ninjanvr.full_system"]?.mem || "26.0";
-  const inferMs = stats?.detectors?.detector01?.inference_speed?.toFixed(1) || "7.0";
-  const totalFps = stats?.camera_fps?.toFixed(1) || "20.0";
+  const sysCpu = formatMeasured(parseMeasured(stats?.cpu_usages?.["ninjanvr.full_system"]?.cpu), 1, "%");
+  const sysMem = formatMeasured(parseMeasured(stats?.cpu_usages?.["ninjanvr.full_system"]?.mem), 1, "%");
+  const inferMs = formatMeasured(resolvePrimaryInferenceMs(stats), 1, "ms");
+  const totalFps = formatMeasured(parseMeasured(stats?.camera_fps), 1, " FPS");
   const displayVersion = formatDisplayVersion(stats?.service?.version, t.brand.release);
   const headerTelemetry = resolveHeaderTelemetryMeta(wsOnline, cameraNames.length);
 
@@ -1513,13 +1514,13 @@ export const App: React.FC = () => {
             <span className={`nvr-dot ${headerTelemetry.wsDotClass}`} />
             <span>{headerTelemetry.channelBadge}</span>
             <span className="nvr-divider" aria-hidden="true" />
-            <span>CPU {sysCpu}%</span>
+            <span>CPU {sysCpu}</span>
             <span className="nvr-divider nvr-telemetry-ext" aria-hidden="true" />
-            <span className="nvr-telemetry-ext">MEM {sysMem}%</span>
+            <span className="nvr-telemetry-ext">MEM {sysMem}</span>
             <span className="nvr-divider" aria-hidden="true" />
-            <span>OV {inferMs}ms</span>
+            <span>OV {inferMs}</span>
             <span className="nvr-divider" aria-hidden="true" />
-            <span>{totalFps} FPS</span>
+            <span>{totalFps}</span>
           </button>
           <button
             type="button"

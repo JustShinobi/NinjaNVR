@@ -1,4 +1,5 @@
 import React from "react";
+import { formatMeasured, parseMeasured, resolvePrimaryInferenceMs, sparklineCeiling } from "../utils/detectorTelemetry";
 import { AlertTriangle, CheckCircle2, Copy, Pause, Play } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
@@ -469,18 +470,10 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
   const stats = useNvrStore((s) => s.stats);
   const statsHistory = useNvrStore((s) => s.statsHistory);
 
-  const sysCpu = toFiniteNumber(
-    stats?.cpu_usages?.["ninjanvr.full_system"]?.cpu,
-    6.5
-  ).toFixed(1);
-  const sysMem = toFiniteNumber(
-    stats?.cpu_usages?.["ninjanvr.full_system"]?.mem,
-    26.0
-  ).toFixed(1);
-  const inferMs = toFiniteNumber(
-    stats?.detectors?.detector01?.inference_speed,
-    7.0
-  ).toFixed(1);
+  const sysCpu = formatMeasured(parseMeasured(stats?.cpu_usages?.["ninjanvr.full_system"]?.cpu), 1, "%");
+  const sysMem = formatMeasured(parseMeasured(stats?.cpu_usages?.["ninjanvr.full_system"]?.mem), 1, "%");
+  const inferMs = formatMeasured(resolvePrimaryInferenceMs(stats), 1, " ms");
+  const inferHistory = statsHistory.map((s) => resolvePrimaryInferenceMs(s));
   const [aiBriefText, setAiBriefText] = React.useState<string | null>(null);
   const [aiBriefBusy, setAiBriefBusy] = React.useState(false);
   const [syncStorageBusy, setSyncStorageBusy] = React.useState(false);
@@ -698,20 +691,22 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   whiteSpace: "nowrap",
                 }}
               >
-                <span style={{ color: "var(--text-secondary)" }}>OPENVINO</span>
+                <span style={{ color: "var(--text-secondary)" }}>
+                  {stats?.primary_detector?.device
+                    ? `INFERÊNCIA · ${stats.primary_detector.device}`
+                    : "INFERÊNCIA"}
+                </span>
                 <span
                   className="mono"
                   style={{ color: "var(--signal-accent-text)", fontWeight: 700 }}
                 >
-                  {inferMs} ms
+                  {inferMs}
                 </span>
               </div>
               <CanvasSparkline
-                values={statsHistory.map((s) =>
-                  toFiniteNumber(s.detectors?.detector01?.inference_speed, 7.0)
-                )}
+                values={inferHistory.map((v) => v ?? 0)}
                 color="#0ea5e9"
-                maxVal={20}
+                maxVal={sparklineCeiling(inferHistory)}
               />
             </div>
 
@@ -736,7 +731,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   className="mono"
                   style={{ color: "var(--signal-live-text)", fontWeight: 700 }}
                 >
-                  {sysCpu}%
+                  {sysCpu}
                 </span>
               </div>
               <CanvasSparkline
@@ -769,7 +764,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                   className="mono"
                   style={{ color: "var(--signal-motion-text)", fontWeight: 700 }}
                 >
-                  {sysMem}%
+                  {sysMem}
                 </span>
               </div>
               <CanvasSparkline

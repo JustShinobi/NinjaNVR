@@ -330,6 +330,8 @@ export interface DetectorRuntimeCatalog {
   in_bytes: number;
   out_floats: number;
   avg_inference_ms: number;
+  /** Inferences behind avg_inference_ms; 0 (or absent on older servers) means not measured. */
+  inference_samples?: number;
   devices: DetectorDeviceStatus[];
   discovered_models?: Array<{ path: string; arch: string }>;
 }
@@ -609,10 +611,26 @@ export type CameraStats = CameraRuntimeStats;
 
 export interface DetectorStats {
   inference_speed: number;
+  /** False when no loaded model has run yet; inference_speed is then not a measurement. */
+  measured?: boolean;
+  samples?: number;
+  /** True when an enabled camera routes to this named detector via detect.detector. */
+  in_use?: boolean;
   detection_start: number;
   pid: number;
   cpu: string;
   mem: string;
+}
+
+/** The detector cameras run when they do not name one in detect.detector. */
+export interface PrimaryDetectorStats {
+  inference_speed: number;
+  measured: boolean;
+  samples: number;
+  loaded: boolean;
+  model_path: string;
+  device: string;
+  cpu?: string;
 }
 
 export interface StorageStatItem {
@@ -641,6 +659,7 @@ export interface HeuristicAlertItem {
 export interface NinjaStatsResponse {
   cameras: Record<string, CameraRuntimeStats>;
   detectors: Record<string, DetectorStats>;
+  primary_detector?: PrimaryDetectorStats;
   camera_fps: number;
   process_fps: number;
   skipped_fps: number;

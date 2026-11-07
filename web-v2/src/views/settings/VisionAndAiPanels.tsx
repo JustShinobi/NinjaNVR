@@ -15,6 +15,7 @@ import {
   Sparkles,
   Trash2,
 } from "lucide-react";
+import { formatMeasured, resolvePrimaryInferenceMs } from "../../utils/detectorTelemetry";
 import { useI18n } from "../../i18n";
 import { useNvrStore } from "../../store/useNvrStore";
 import {
@@ -1626,8 +1627,7 @@ export const AiDetectionObjectsSection: React.FC<{
     type: "openvino",
     device: "CPU",
   };
-  const liveInferMs =
-    stats?.detectors?.[primaryDetKey]?.inference_speed?.toFixed(1) || "7.0";
+  const liveInferMs = formatMeasured(resolvePrimaryInferenceMs(stats), 1, "ms");
 
   const modelCfg = draftConfig.model || {
     path: "/openvino-model/ssdlite_mobilenet_v2.xml",
@@ -1992,7 +1992,7 @@ export const AiDetectionObjectsSection: React.FC<{
             <span className="nvr-badge live">
               <CheckCircle2 size={11} />
               {(primaryDet.type || "openvino").toUpperCase()} ·{" "}
-              {primaryDet.device || "CPU"} ACTIVE · {liveInferMs}ms
+              {primaryDet.device || "CPU"} ACTIVE · {liveInferMs}
             </span>
           </div>
         </div>

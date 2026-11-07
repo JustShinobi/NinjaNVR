@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Copy, ExternalLink, Sparkles, Trash2, Upload, X } from "lucide-react";
 import { computeContainedBox } from "../../components/VideoPlayers";
 import { useI18n } from "../../i18n";
+import { catalogInferenceMs, formatMeasured } from "../../utils/detectorTelemetry";
 import type {
   DetectorRuntimeCatalog,
   ModelConfig,
@@ -1817,10 +1818,14 @@ const ActiveModelTile: React.FC<{
       </span>
       <span className="nvr-ds-hint">
         {catalog && state === "loaded"
-          ? `${catalog.compiled_width || configW}×${catalog.compiled_height || configH} · ${catalog.active_device} · ${t(
-              `${catalog.avg_inference_ms.toFixed(1)} ms por inferência`,
-              `${catalog.avg_inference_ms.toFixed(1)} ms per inference`
-            )}`
+          ? `${catalog.compiled_width || configW}×${catalog.compiled_height || configH} · ${catalog.active_device} · ${
+              catalogInferenceMs(catalog) === null
+                ? t("aguardando a primeira inferência", "waiting for the first inference")
+                : t(
+                    `${formatMeasured(catalogInferenceMs(catalog), 1, " ms")} por inferência`,
+                    `${formatMeasured(catalogInferenceMs(catalog), 1, " ms")} per inference`
+                  )
+            }`
           : `${configW}×${configH} · ${modelType}`}
       </span>
       {state === "not_loaded" && (
