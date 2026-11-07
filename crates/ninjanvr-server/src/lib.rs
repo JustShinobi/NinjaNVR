@@ -13088,40 +13088,128 @@ async fn api_detector_model_upload(
         }
     }
 
-    let cfg_clone = {
-        let mut cfg = state.config.write().await;
-        cfg.model.path = saved_model_path.to_string_lossy().to_string();
-        cfg.model.labelmap_path = saved_labelmap_path.to_string_lossy().to_string();
-        cfg.model.width = width;
-        cfg.model.height = height;
-        cfg.model.model_type = model_type.clone();
-        cfg.model.input_tensor = input_tensor.clone();
-        cfg.model.input_pixel_format = input_pixel_format.clone();
-        cfg.clone()
-    };
+    let model_path_str = saved_model_path.to_string_lossy().to_string();
+    let labelmap_path_str = saved_labelmap_path.to_string_lossy().to_string();
+    let model_patch = json!({
+        "model": {
+            "path": model_path_str,
+            "labelmap_path": labelmap_path_str,
+            "width": width,
+            "height": height,
+            "model_type": model_type,
+            "input_tensor": input_tensor,
+            "input_pixel_format": input_pixel_format,
+        }
+    });
+
+    let commit_lock = acquire_state_config_commit_lock(&state);
+    let _commit_guard = commit_lock.lock().await;
+    let prev_cfg = state.config.read().await.clone();
+    let mut next_cfg = prev_cfg.clone();
+    if let Err(err) = next_cfg.apply_structured_json(&model_patch) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": format!("{err:#}") })),
+        )
+            .into_response();
+    }
 
     let state_for_reload = state.clone();
-    let catalog = tokio::task::spawn_blocking(move || {
-        state_for_reload.detector.reload(&cfg_clone);
+    let cfg_for_reload = next_cfg.clone();
+    let reload_res = tokio::task::spawn_blocking(move || {
+        let was_loaded = state_for_reload.detector.runtime_catalog().loaded;
+        state_for_reload.detector.reload(&cfg_for_reload);
         state_for_reload.detector.set_labelmap(labelmap_btree);
-        build_detector_catalog_value(&state_for_reload)
+        let now_loaded = state_for_reload.detector.runtime_catalog().loaded;
+        (was_loaded, now_loaded)
+    })
+    .await;
+    let Ok((was_loaded, now_loaded)) = reload_res else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": "Detector reload task failed" })),
+        )
+            .into_response();
+    };
+
+    if should_rollback_model_deploy(was_loaded, now_loaded) {
+        let state_for_rollback = state.clone();
+        let prev_for_rollback = prev_cfg.clone();
+        let catalog = tokio::task::spawn_blocking(move || {
+            state_for_rollback.detector.reload(&prev_for_rollback);
+            build_detector_catalog_value(&state_for_rollback)
+        })
+        .await
+        .unwrap_or_else(|_| json!({}));
+        warn!(
+            "Uploaded model {model_path_str} failed to load in the detector runtime; rolled back to {}",
+            prev_cfg.model.path
+        );
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "success": false,
+                "loaded": false,
+                "rolled_back": true,
+                "filename": safe_filename,
+                "model_path": model_path_str,
+                "previous_model_path": prev_cfg.model.path,
+                "message": "The detector could not load this model. The previous model is still active and config.yml was not changed.",
+                "catalog": catalog
+            })),
+        )
+            .into_response();
+    }
+
+    let path_for_persist = next_cfg.config_path.clone();
+    let yaml_for_persist = next_cfg.raw_yaml.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        persist_config_yaml_atomically(&path_for_persist, &yaml_for_persist)
     })
     .await
-    .unwrap_or_else(|_| json!({}));
+    .map_err(|e| anyhow::anyhow!(e.to_string()))
+    .and_then(|r| r);
+    let persisted_ok = match persisted {
+        Ok(()) => true,
+        Err(err) => {
+            warn!("Uploaded model is active but config.yml could not be updated: {err:#}");
+            false
+        }
+    };
+    *state.config.write().await = next_cfg;
+    info!(
+        "Deployed detector model {model_path_str} ({width}x{height}, loaded={now_loaded}, persisted={persisted_ok})"
+    );
+
+    let state_for_catalog = state.clone();
+    let catalog =
+        tokio::task::spawn_blocking(move || build_detector_catalog_value(&state_for_catalog))
+            .await
+            .unwrap_or_else(|_| json!({}));
     Json(json!({
         "success": true,
         "filename": safe_filename,
-        "model_path": saved_model_path.to_string_lossy().to_string(),
-        "labelmap_path": saved_labelmap_path.to_string_lossy().to_string(),
+        "model_path": model_path_str,
+        "labelmap_path": labelmap_path_str,
         "model_type": model_type,
         "width": width,
         "height": height,
         "input_tensor": input_tensor,
         "input_pixel_format": input_pixel_format,
         "reloaded": true,
+        "loaded": now_loaded,
+        "persisted": persisted_ok,
+        "deployed_at": unix_now(),
         "catalog": catalog
     }))
     .into_response()
+}
+
+/// A deploy is rolled back only when it would take a working detector offline: the new model
+/// failed to load while the previous one was running. When no model was loaded before (no
+/// OpenVINO runtime, first deploy) the new config is kept so a later runtime fix picks it up.
+fn should_rollback_model_deploy(was_loaded: bool, now_loaded: bool) -> bool {
+    was_loaded && !now_loaded
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -27780,6 +27868,14 @@ version: 0.18-0
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
+    #[test]
+    fn model_deploy_rolls_back_only_when_it_would_break_a_working_detector() {
+        assert!(should_rollback_model_deploy(true, false));
+        assert!(!should_rollback_model_deploy(true, true));
+        assert!(!should_rollback_model_deploy(false, true));
+        assert!(!should_rollback_model_deploy(false, false));
+    }
+
     #[tokio::test]
     async fn detector_model_upload_persists_and_hot_reloads() {
         let tmp_dir =
@@ -27833,6 +27929,40 @@ version: 0.18-0
         assert_eq!(upload_json["success"], true);
         assert_eq!(upload_json["reloaded"], true);
         assert_eq!(upload_json["filename"], "ninjanvr_custom_yolo11s.onnx");
+        // No OpenVINO runtime in tests: the response must say so instead of claiming success.
+        assert_eq!(upload_json["loaded"], false);
+        assert_eq!(upload_json["persisted"], true);
+        assert!(upload_json["deployed_at"].as_u64().unwrap_or(0) > 0);
+
+        // The deploy must survive a restart: config.yml on disk points at the new model.
+        let on_disk = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            on_disk.contains("ninjanvr_custom_yolo11s.onnx"),
+            "config.yml must be updated by the upload, got:\n{on_disk}"
+        );
+        let reparsed = ninjanvr_config::NinjaConfig::load(&cfg_path).unwrap();
+        assert!(
+            reparsed
+                .model
+                .path
+                .ends_with("models/ninjanvr_custom_yolo11s.onnx")
+        );
+        assert!(
+            reparsed
+                .model
+                .labelmap_path
+                .ends_with("models/ninjanvr_custom_yolo11s.txt")
+        );
+        assert_eq!((reparsed.model.width, reparsed.model.height), (640, 640));
+        assert!(
+            state
+                .config
+                .read()
+                .await
+                .model
+                .path
+                .ends_with("ninjanvr_custom_yolo11s.onnx")
+        );
 
         // Verify model and 15-class labelmap files were persisted in {media_dir}/models/
         let expected_model_file = media_dir.join("models/ninjanvr_custom_yolo11s.onnx");
