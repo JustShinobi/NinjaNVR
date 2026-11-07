@@ -31,6 +31,7 @@ import {
 import { AiDetectionObjectsSection } from "./settings/VisionAndAiPanels";
 import { ZonesStudio, type SaveOutcome } from "./settings/ZonesStudio";
 import { DatasetStudioSection } from "./settings/DatasetStudio";
+import { mergeDeployedModel } from "../utils/datasetStudio";
 import {
   CommsAuthUsersSection,
   RecordingReviewSection,
@@ -1377,6 +1378,14 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                 draftConfig={draftConfig}
                 updateDraft={updateDraft}
                 notify={notify}
+                onModelDeployed={(model) => {
+                  // The server already wrote config.yml; mirror it in the saved config and the
+                  // draft so a later "Save Config" does not send the previous model back.
+                  const patch = (cfg: NinjaConfigResponse | null): NinjaConfigResponse | null =>
+                    cfg && cfg.model ? { ...cfg, model: mergeDeployedModel(cfg.model, model) } : cfg;
+                  if (config) setConfig(patch(config));
+                  setDraftConfig((prev) => patch(prev));
+                }}
               />
             )}
 

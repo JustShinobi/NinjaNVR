@@ -1,4 +1,4 @@
-import type { DatasetSampleItem, DatasetSummaryResponse } from "../types/nvr";
+import type { DatasetSampleItem, DatasetSummaryResponse, ModelConfig } from "../types/nvr";
 
 /**
  * Pure domain logic for the AI Dataset Studio flow:
@@ -498,4 +498,84 @@ export function activeModelDisplayName(path: string | null | undefined): string 
   const base = String(path ?? "").split(/[/\\]/).pop() ?? "";
   const stem = base.replace(/\.(?:xml|onnx|bin)$/i, "");
   return stem || "—";
+}
+
+// ---------------------------------------------------------------------------------------------
+// Model deploy feedback
+// ---------------------------------------------------------------------------------------------
+
+export interface ModelDeployOutcome {
+  /** The new model is the configured model now (it may still have failed to load). */
+  ok: boolean;
+  /** The detector runtime actually loaded the model. */
+  loaded: boolean;
+  /** config.yml was updated, so the deploy survives a restart. */
+  persisted: boolean;
+  /** The model failed to load and the previous one was restored. */
+  rolledBack: boolean;
+  filename: string;
+  modelPath: string;
+  width: number;
+  height: number;
+  /** Epoch milliseconds of the deploy. */
+  at: number;
+  message: string;
+}
+
+function asRecord(v: unknown): Record<string, unknown> {
+  return v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+}
+
+/** Turns the /api/detectors/models/upload response into an outcome the UI can keep on screen. */
+export function parseModelDeployResponse(
+  status: number,
+  body: unknown,
+  nowMs: number
+): ModelDeployOutcome {
+  const d = asRecord(body);
+  const num = (v: unknown, fallback: number) => (typeof v === "number" && Number.isFinite(v) ? v : fallback);
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const ok = status >= 200 && status < 300 && d.success === true;
+  const deployedAt = num(d.deployed_at, 0);
+  return {
+    ok,
+    // Older servers do not report "loaded"; treat an explicit false as the only failure signal.
+    loaded: ok ? d.loaded !== false : false,
+    persisted: ok ? d.persisted !== false : false,
+    rolledBack: d.rolled_back === true,
+    filename: str(d.filename),
+    modelPath: str(d.model_path),
+    width: num(d.width, 0),
+    height: num(d.height, 0),
+    at: deployedAt > 0 ? deployedAt * 1000 : nowMs,
+    message: str(d.message) || (ok ? "" : `HTTP ${status}`),
+  };
+}
+
+export type ActiveModelState = "loaded" | "not_loaded" | "pending" | "unknown";
+
+/**
+ * What the detector is really running, from /api/detectors/catalog, compared with the model
+ * config.yml points at. "pending" means config and runtime disagree (saved but not reloaded).
+ */
+export function resolveActiveModelState(
+  catalog: { loaded?: boolean; active_model_path?: string } | null,
+  configModelPath: string
+): ActiveModelState {
+  if (!catalog) return "unknown";
+  const runtimePath = (catalog.active_model_path || "").trim();
+  if (runtimePath && configModelPath.trim() && runtimePath !== configModelPath.trim()) return "pending";
+  return catalog.loaded ? "loaded" : "not_loaded";
+}
+
+/** Applies the fields a deploy reported onto a model config, ignoring fields it did not send. */
+export function mergeDeployedModel(current: ModelConfig, patch: Partial<ModelConfig>): ModelConfig {
+  const next: ModelConfig = { ...current };
+  (Object.keys(patch) as Array<keyof ModelConfig>).forEach((k) => {
+    const v = patch[k];
+    if (v !== undefined && v !== null && v !== "") {
+      (next as unknown as Record<string, unknown>)[k] = v;
+    }
+  });
+  return next;
 }

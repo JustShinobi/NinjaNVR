@@ -3267,3 +3267,80 @@ input[type="range"] {
 .nvr-zs-outcome.is-error strong {
   color: var(--signal-alert-text);
 }
+
+/* Dataset studio: deploy outcome + running model */
+.nvr-ds-active-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+}
+
+.nvr-ds-active-badge {
+  padding: 1px 6px;
+  border-radius: 2px;
+  border: 1px solid var(--border-hairline);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.nvr-ds-active-badge.is-ok {
+  border-color: var(--signal-live-border);
+  color: var(--signal-live-text);
+}
+
+.nvr-ds-active-badge.is-warn {
+  border-color: var(--signal-motion-border);
+  color: var(--signal-motion-text);
+}
+
+.nvr-ds-active-badge.is-bad {
+  border-color: var(--signal-alert-border);
+  color: var(--signal-alert-text);
+}
+
+.nvr-ds-outcome {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 3px;
+  border: 1px solid var(--border-hairline);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.nvr-ds-outcome-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.nvr-ds-outcome.is-ok {
+  border-color: var(--signal-live-border);
+  background: var(--signal-live-tint);
+}
+
+.nvr-ds-outcome.is-ok strong {
+  color: var(--signal-live-text);
+}
+
+.nvr-ds-outcome.is-warn {
+  border-color: var(--signal-motion-border);
+  background: var(--signal-motion-tint);
+}
+
+.nvr-ds-outcome.is-warn strong {
+  color: var(--signal-motion-text);
+}
+
+.nvr-ds-outcome.is-bad {
+  border-color: var(--signal-alert-border);
+  background: var(--signal-alert-tint);
+}
+
+.nvr-ds-outcome.is-bad strong {
+  color: var(--signal-alert-text);
+}

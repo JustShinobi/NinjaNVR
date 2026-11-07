@@ -3,6 +3,8 @@ import { Copy, ExternalLink, Sparkles, Trash2, Upload, X } from "lucide-react";
 import { computeContainedBox } from "../../components/VideoPlayers";
 import { useI18n } from "../../i18n";
 import type {
+  DetectorRuntimeCatalog,
+  ModelConfig,
   DatasetAnnotationBox,
   DatasetSampleItem,
   DatasetSummaryResponse,
@@ -11,6 +13,9 @@ import type {
 import { formatDateTime, formatTs } from "../../utils/format";
 import {
   activeModelDisplayName,
+  parseModelDeployResponse,
+  resolveActiveModelState,
+  type ModelDeployOutcome,
   buildDatasetPipeline,
   canConfirmSample,
   buildDatasetReadinessReport,
@@ -82,7 +87,9 @@ export const DatasetStudioSection: React.FC<{
   draftConfig?: NinjaConfigResponse | null;
   updateDraft?: (updater: (next: NinjaConfigResponse) => void) => void;
   notify: (msg: string) => void;
-}> = ({ draftConfig, updateDraft, notify }) => {
+  /** Called after a deploy so the saved config and the draft follow the new model. */
+  onModelDeployed?: (model: Partial<ModelConfig>) => void;
+}> = ({ draftConfig, updateDraft, notify, onModelDeployed }) => {
   const { locale } = useI18n();
   const isPt = locale === "pt";
   const t = useCallback((pt: string, en: string) => (isPt ? pt : en), [isPt]);
@@ -111,6 +118,8 @@ export const DatasetStudioSection: React.FC<{
   const [uploadFilename, setUploadFilename] = useState("ninjanvr_yolo11s.onnx");
   const [uploadDims, setUploadDims] = useState("640x640");
   const [dragOver, setDragOver] = useState(false);
+  const [catalog, setCatalog] = useState<DetectorRuntimeCatalog | null>(null);
+  const [deployOutcome, setDeployOutcome] = useState<ModelDeployOutcome | null>(null);
   const [stageSize, setStageSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
   const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -628,6 +637,22 @@ export const DatasetStudioSection: React.FC<{
     setBoxes(selected, [...(selected.annotations || []), next]);
   };
 
+  // ---- detector runtime ----------------------------------------------------
+  const loadCatalog = useCallback(async () => {
+    try {
+      const res = await fetch("/api/detectors/catalog", { credentials: "include" });
+      if (!res.ok) return;
+      const data = (await res.json()) as DetectorRuntimeCatalog;
+      if (isMountedRef.current) setCatalog(data);
+    } catch {
+      // keep the last known state
+    }
+  }, []);
+
+  useEffect(() => {
+    if (step === "train") void loadCatalog();
+  }, [step, loadCatalog]);
+
   // ---- upload --------------------------------------------------------------
   const stageFile = (file: File | undefined) => {
     if (uploadFileReaderRef.current) {
@@ -665,6 +690,7 @@ export const DatasetStudioSection: React.FC<{
     if (!upload) return;
     const [w, h] = uploadDims.split("x").map(Number);
     setBusyAction("upload-model");
+    setDeployOutcome(null);
     try {
       const payload = buildModelUploadPayload({
         filename: uploadFilename,
@@ -680,19 +706,52 @@ export const DatasetStudioSection: React.FC<{
       });
       const data = await res.json().catch(() => null);
       if (!isMountedRef.current) return;
-      if (res.ok && data?.success) {
-        notify(
-          t(
-            `Modelo '${data.filename}' (${data.width}×${data.height}) implantado e detector recarregado`,
-            `Deployed '${data.filename}' (${data.width}×${data.height}) and reloaded the detector`
-          )
-        );
-        setUpload(null);
-      } else {
-        notify(data?.message || t("Falha ao implantar o modelo", "Model deploy failed"));
+      const outcome = parseModelDeployResponse(res.status, data, Date.now());
+      setDeployOutcome(outcome);
+      if (data && typeof data === "object" && "catalog" in data && data.catalog) {
+        setCatalog(data.catalog as DetectorRuntimeCatalog);
       }
+      if (outcome.ok) {
+        setUpload(null);
+        const d = data as Record<string, unknown>;
+        onModelDeployed?.({
+          path: outcome.modelPath,
+          labelmap_path: typeof d.labelmap_path === "string" ? d.labelmap_path : undefined,
+          width: outcome.width,
+          height: outcome.height,
+          model_type: typeof d.model_type === "string" ? d.model_type : undefined,
+          input_tensor: typeof d.input_tensor === "string" ? d.input_tensor : undefined,
+          input_pixel_format: typeof d.input_pixel_format === "string" ? d.input_pixel_format : undefined,
+        });
+        notify(
+          outcome.loaded
+            ? t(`Modelo '${outcome.filename}' ativo nas câmeras`, `Model '${outcome.filename}' is live on the cameras`)
+            : t("Modelo salvo, mas o detector não carregou", "Model saved, but the detector did not load it")
+        );
+      } else {
+        notify(
+          outcome.rolledBack
+            ? t("O modelo não carregou. O anterior continua ativo.", "The model did not load. The previous one is still active.")
+            : outcome.message || t("Falha ao implantar o modelo", "Model deploy failed")
+        );
+      }
+      void loadCatalog();
     } catch {
-      if (isMountedRef.current) notify(t("Erro de rede ao enviar o modelo", "Network error uploading the model"));
+      if (!isMountedRef.current) return;
+      const failed: ModelDeployOutcome = {
+        ok: false,
+        loaded: false,
+        persisted: false,
+        rolledBack: false,
+        filename: uploadFilename,
+        modelPath: "",
+        width: 0,
+        height: 0,
+        at: Date.now(),
+        message: t("Erro de rede ao enviar o modelo. Nada foi alterado.", "Network error uploading the model. Nothing changed."),
+      };
+      setDeployOutcome(failed);
+      notify(failed.message);
     } finally {
       if (isMountedRef.current) setBusyAction(null);
     }
@@ -1643,16 +1702,10 @@ export const DatasetStudioSection: React.FC<{
               </label>
             )}
 
+            {deployOutcome && <DeployOutcomeCard t={t} outcome={deployOutcome} isPt={isPt} onDismiss={() => setDeployOutcome(null)} />}
+
             <div className="nvr-ds-compare">
-              <div className="nvr-ds-tile" style={{ flexDirection: "column", alignItems: "flex-start", gap: 4 }}>
-                <span className="nvr-ds-hint">{t("ATUAL", "CURRENT")}</span>
-                <span className="mono" style={{ fontSize: "var(--text-sm)", overflowWrap: "anywhere" }}>
-                  {activeModelDisplayName(modelCfg.path)}
-                </span>
-                <span className="nvr-ds-hint">
-                  {modelCfg.width}×{modelCfg.height} · {modelCfg.model_type}
-                </span>
-              </div>
+              <ActiveModelTile t={t} catalog={catalog} configPath={modelCfg.path} configW={modelCfg.width} configH={modelCfg.height} modelType={modelCfg.model_type} onRefresh={() => void loadCatalog()} />
               <div className={`nvr-ds-tile ${upload ? "is-next" : ""}`} style={{ flexDirection: "column", alignItems: "flex-start", gap: 4 }}>
                 <span className="nvr-ds-hint" style={upload ? { color: "var(--signal-accent-text)" } : undefined}>
                   {t("NOVO", "NEW")}
@@ -1724,6 +1777,134 @@ export const DatasetStudioSection: React.FC<{
       )}
       {step === "readiness" && renderReadiness()}
       {step === "train" && renderTrainDeploy()}
+    </div>
+  );
+};
+
+type Tr = (pt: string, en: string) => string;
+
+function clock(ms: number, isPt: boolean): string {
+  return new Date(ms).toLocaleTimeString(isPt ? "pt-BR" : "en-US", { hour: "2-digit", minute: "2-digit" });
+}
+
+const ActiveModelTile: React.FC<{
+  t: Tr;
+  catalog: DetectorRuntimeCatalog | null;
+  configPath: string;
+  configW: number;
+  configH: number;
+  modelType: string;
+  onRefresh: () => void;
+}> = ({ t, catalog, configPath, configW, configH, modelType, onRefresh }) => {
+  const state = resolveActiveModelState(catalog, configPath);
+  const runtimePath = catalog?.active_model_path || configPath;
+  const badge =
+    state === "loaded"
+      ? { cls: "is-ok", text: t("CARREGADO", "LOADED") }
+      : state === "not_loaded"
+      ? { cls: "is-bad", text: t("NÃO CARREGADO", "NOT LOADED") }
+      : state === "pending"
+      ? { cls: "is-warn", text: t("CONFIG DIFERENTE", "CONFIG DIFFERS") }
+      : { cls: "", text: t("VERIFICANDO…", "CHECKING…") };
+  return (
+    <div className="nvr-ds-tile" style={{ flexDirection: "column", alignItems: "flex-start", gap: 4 }}>
+      <span className="nvr-ds-active-head">
+        <span className="nvr-ds-hint">{t("RODANDO AGORA", "RUNNING NOW")}</span>
+        <span className={`nvr-ds-active-badge mono ${badge.cls}`}>{badge.text}</span>
+      </span>
+      <span className="mono" style={{ fontSize: "var(--text-sm)", overflowWrap: "anywhere" }}>
+        {activeModelDisplayName(runtimePath)}
+      </span>
+      <span className="nvr-ds-hint">
+        {catalog && state === "loaded"
+          ? `${catalog.compiled_width || configW}×${catalog.compiled_height || configH} · ${catalog.active_device} · ${t(
+              `${catalog.avg_inference_ms.toFixed(1)} ms por inferência`,
+              `${catalog.avg_inference_ms.toFixed(1)} ms per inference`
+            )}`
+          : `${configW}×${configH} · ${modelType}`}
+      </span>
+      {state === "not_loaded" && (
+        <span className="nvr-ds-hint" style={{ color: "var(--signal-alert-text)" }}>
+          {t(
+            "O detector não conseguiu abrir este arquivo. As câmeras estão sem IA de objetos até um modelo válido ser implantado.",
+            "The detector could not open this file. Cameras have no object AI until a valid model is deployed."
+          )}
+        </span>
+      )}
+      {state === "pending" && (
+        <span className="nvr-ds-hint" style={{ color: "var(--signal-motion-text)" }}>
+          {t(
+            `O config.yml aponta para ${activeModelDisplayName(configPath)}, mas o detector ainda roda o modelo acima.`,
+            `config.yml points at ${activeModelDisplayName(configPath)}, but the detector still runs the model above.`
+          )}
+        </span>
+      )}
+      <button type="button" className="nvr-btn mono sm" onClick={onRefresh}>
+        {t("Verificar de novo", "Check again")}
+      </button>
+    </div>
+  );
+};
+
+const DeployOutcomeCard: React.FC<{
+  t: Tr;
+  isPt: boolean;
+  outcome: ModelDeployOutcome;
+  onDismiss: () => void;
+}> = ({ t, isPt, outcome, onDismiss }) => {
+  const tone = outcome.ok && outcome.loaded ? "is-ok" : outcome.ok ? "is-warn" : "is-bad";
+  const title = outcome.ok
+    ? outcome.loaded
+      ? t(`Implantado às ${clock(outcome.at, isPt)}`, `Deployed at ${clock(outcome.at, isPt)}`)
+      : t("Arquivo salvo, mas o detector não carregou", "File saved, but the detector did not load it")
+    : outcome.rolledBack
+    ? t("Não implantado: o modelo não carregou", "Not deployed: the model did not load")
+    : t("Não implantado", "Not deployed");
+  const lines: string[] = [];
+  if (outcome.ok) {
+    lines.push(
+      t(
+        `${outcome.filename} · ${outcome.width}×${outcome.height}`,
+        `${outcome.filename} · ${outcome.width}×${outcome.height}`
+      )
+    );
+    lines.push(
+      outcome.loaded
+        ? t("As câmeras já estão detectando com este modelo. Não precisa reiniciar.", "Cameras are already detecting with this model. No restart needed.")
+        : t(
+            "Confira o formato (.onnx exportado com opset compatível) e a entrada do modelo, depois implante de novo.",
+            "Check the format (.onnx exported with a compatible opset) and the model input, then deploy again."
+          )
+    );
+    lines.push(
+      outcome.persisted
+        ? t("Gravado no config.yml: continua ativo depois de reiniciar.", "Written to config.yml: stays active after a restart.")
+        : t(
+            "Atenção: não foi possível gravar no config.yml. Use Salvar config para manter depois de reiniciar.",
+            "Warning: config.yml could not be written. Use Save Config to keep it after a restart."
+          )
+    );
+  } else {
+    lines.push(
+      outcome.rolledBack
+        ? t(
+            "O modelo anterior continua ativo e o config.yml não mudou. Confira o arquivo e tente de novo.",
+            "The previous model is still active and config.yml did not change. Check the file and try again."
+          )
+        : outcome.message
+    );
+  }
+  return (
+    <div className={`nvr-ds-outcome ${tone}`} role={tone === "is-bad" ? "alert" : "status"}>
+      <div className="nvr-ds-outcome-head">
+        <strong>{title}</strong>
+        <button type="button" className="nvr-btn mono sm" onClick={onDismiss} aria-label={t("Fechar", "Dismiss")}>
+          <X size={12} />
+        </button>
+      </div>
+      {lines.map((l) => (
+        <span key={l}>{l}</span>
+      ))}
     </div>
   );
 };

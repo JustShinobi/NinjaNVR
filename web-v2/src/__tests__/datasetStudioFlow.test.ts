@@ -11,7 +11,10 @@ import {
   datasetQueueStatus,
   filterDatasetQueue,
   minAnnotationScore,
+  mergeDeployedModel,
   normalizeDragBox,
+  parseModelDeployResponse,
+  resolveActiveModelState,
   resolveDatasetNextAction,
   stepDatasetQueue,
   stepStickyDatasetQueue,
@@ -260,5 +263,73 @@ describe("Dataset Studio pipeline rail and next action", () => {
     expect(
       filterDatasetQueue(nanTimeSamples, { tab: "all", camera: "all", kind: "all" }).map((s) => s.id)
     ).toEqual(["b", "a"]);
+  });
+});
+
+describe("dataset studio — model deploy feedback", () => {
+  test("a loaded, persisted deploy keeps the server timestamp", () => {
+    const o = parseModelDeployResponse(
+      200,
+      { success: true, loaded: true, persisted: true, filename: "best.onnx", model_path: "/m/best.onnx", width: 640, height: 640, deployed_at: 1_700_000_000 },
+      5
+    );
+    expect(o.ok && o.loaded && o.persisted && !o.rolledBack).toBe(true);
+    expect(o.at).toBe(1_700_000_000_000);
+    expect([o.filename, o.width, o.height]).toEqual(["best.onnx", 640, 640]);
+  });
+
+  test("a model the runtime could not load is reported, never shown as success", () => {
+    const kept = parseModelDeployResponse(200, { success: true, loaded: false, persisted: true }, 1);
+    expect(kept.ok).toBe(true);
+    expect(kept.loaded).toBe(false);
+    const rolledBack = parseModelDeployResponse(
+      422,
+      { success: false, loaded: false, rolled_back: true, message: "could not load" },
+      1
+    );
+    expect(rolledBack.ok).toBe(false);
+    expect(rolledBack.rolledBack).toBe(true);
+    expect(rolledBack.message).toBe("could not load");
+    expect(parseModelDeployResponse(500, null, 1).message).toBe("HTTP 500");
+  });
+
+  test("active model state comes from the runtime, not only from config.yml", () => {
+    expect(resolveActiveModelState(null, "/m/a.onnx")).toBe("unknown");
+    expect(resolveActiveModelState({ loaded: true, active_model_path: "/m/a.onnx" }, "/m/a.onnx")).toBe("loaded");
+    expect(resolveActiveModelState({ loaded: false, active_model_path: "/m/a.onnx" }, "/m/a.onnx")).toBe("not_loaded");
+    expect(resolveActiveModelState({ loaded: true, active_model_path: "/m/old.xml" }, "/m/a.onnx")).toBe("pending");
+  });
+});
+
+describe("dataset studio — config follows a deployed model", () => {
+  test("only the fields the server reported replace the current model", () => {
+    const current = {
+      path: "/openvino-model/ssdlite_mobilenet_v2.xml",
+      labelmap_path: "/openvino-model/coco_91cl_bkgr.txt",
+      width: 300,
+      height: 300,
+      input_tensor: "nhwc",
+      input_pixel_format: "bgr",
+      model_type: "ssd",
+    };
+    const next = mergeDeployedModel(current, {
+      path: "/media/ninjanvr/models/best.onnx",
+      labelmap_path: "/media/ninjanvr/models/best.txt",
+      width: 640,
+      height: 640,
+      model_type: undefined,
+      input_tensor: "nchw",
+      input_pixel_format: "rgb",
+    });
+    expect(next).toEqual({
+      path: "/media/ninjanvr/models/best.onnx",
+      labelmap_path: "/media/ninjanvr/models/best.txt",
+      width: 640,
+      height: 640,
+      input_tensor: "nchw",
+      input_pixel_format: "rgb",
+      model_type: "ssd",
+    });
+    expect(current.path).toBe("/openvino-model/ssdlite_mobilenet_v2.xml");
   });
 });
