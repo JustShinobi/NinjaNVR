@@ -21104,7 +21104,8 @@ pub fn parse_onvif_status_xml(xml: &str) -> OnvifPtzStatus {
             .to_ascii_uppercase()
     };
     let error = extract_xml_element_text(xml, "Error")
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("NoError"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "0" && !s.eq_ignore_ascii_case("NoError"))
         .map(|s| scrub_rtsp_credentials(s).chars().take(512).collect());
 
     OnvifPtzStatus {
@@ -21275,6 +21276,7 @@ async fn send_onvif_soap_request_with_ns(
     let mut req = client
         .post(endpoint)
         .timeout(timeout)
+        .header(header::CONNECTION, "close")
         .header(
             header::CONTENT_TYPE,
             format!(
@@ -23175,7 +23177,10 @@ async fn send_http_digest_request(
         .unwrap_or_else(|| base_without_query.to_string());
 
     let build_req = |auth_header: Option<String>, include_body: bool| {
-        let mut r = client.request(method.clone(), url).timeout(timeout);
+        let mut r = client
+            .request(method.clone(), url)
+            .timeout(timeout)
+            .header(header::CONNECTION, "close");
         if let Some(ct) = content_type {
             r = r.header(header::CONTENT_TYPE, ct);
         }
