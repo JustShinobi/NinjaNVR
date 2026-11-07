@@ -15,8 +15,21 @@
 - `crates/ninjanvr-track`: 2-stage `ByteTracker` with stationary object classification and polygon zone entry hysteresis.
 - `crates/ninjanvr-vod`: Pure-Rust ISO-BMFF fMP4 HLS VOD remuxer (`init-v1-a1.mp4` + `seg-N-v1-a1.m4s`).
 - `crates/ninjanvr-comms`: Real-time `/ws` WebSocket broadcaster and `rumqttc` MQTT publisher.
-- `crates/ninjanvr-server`: Axum HTTP (`:5000`) & TLS (`:8971`) server, JWT auth gate, `/api/*` handlers, and static/SPA router.
+- `crates/ninjanvr-server`: Axum HTTP (`:5000`) & TLS (`:8971`) server, JWT auth gate, `/api/*` handlers, static/SPA router, and modular subsystems (`camera_protocols.rs`, `mse_hub.rs`, `pipeline.rs`, `preview_frames.rs`).
 - `web-v2/`: NinjaNVR Console (`v2`) React 19 + TypeScript + Vite SPA.
+
+## Modularity, Extensibility & Protocol Driver Guardrails
+- **Declarative Protocol & Driver Registry (Open/Closed Principle):**
+  - Never scatter vendor-specific `if is_tapo / else if is_dahua` conditionals across HTTP handlers or React views.
+  - **Backend (`crates/ninjanvr-server/src/camera_protocols.rs`):** Register every camera protocol family (`tapo`, `dahua_cgi`, `hikvision_isapi`, `reolink`, `axis_vapix`, `onvif`, `rtsp_only`, etc.) as a declarative `CameraProtocolSpec` entry in `CAMERA_PROTOCOL_REGISTRY` (specifying aliases, default ports, RTSP path markers, manufacturer/model hints, ONVIF endpoint paths, supported services, preferred `ProfileToken`/`VideoSourceToken` order, native substream templates, and default talkback mode).
+  - **Frontend (`web-v2/src/utils/cameraCapabilities.ts`):** Register protocol descriptors in `CAMERA_PROTOCOL_CATALOG` and quick-control schemas in `CAMERA_HUD_CONTROL_DESCRIPTORS`. Render Live View HUD hardware controls (`TacticalPtzHudOverlay`) and Settings protocol selectors declaratively from these catalogs gated by `hardwareInfo.capabilities`.
+- **No Process-Global Mutable State (`static LazyLock<Mutex<HashMap<...>>>`):**
+  - Never store runtime caches, discovered camera tokens, or HTTP Digest challenges in process-global `static` singletons. Encapsulate all mutable runtime state inside `AppState`-owned structs (such as `CameraDriverRuntime`, `MseStreamHub`, `PreviewFrameStore`) with explicit `.invalidate_camera(...)` lifecycle methods so state is isolated across server instances and parallel tests.
+- **Progressive Decomposition of Monolithic Files:**
+  - Keep `crates/ninjanvr-server/src/lib.rs` focused on HTTP routing and request orchestration. Extract cohesive domain logic (protocol drivers, codecs, crypto/auth helpers, media pipelines, share-link engines) into dedicated submodules under `crates/ninjanvr-server/src/` and `web-v2/src/utils/`.
+- **Embedded Camera Socket Hygiene & Self-Healing:**
+  - Always send `Connection: close` on ONVIF SOAP and CGI HTTP requests to embedded cameras so their small socket pools (`uhttpd`, `nvid`, `cet`) never exhaust file descriptors.
+  - Never probe unsupported ONVIF services (such as `GetImagingSettings` on Tapo `:2020`) when the protocol spec (`imaging_endpoints: &[]`) marks them unsupported, and apply bounded exponential backoff when upstream RTSP streams are offline.
 
 ## UI v2 (`web-v2/`) Design & Engineering Guardrails
 - **Dual-Theme Hardware-Safe Surface Engine (`dark` | `light` | `system` + `high-contrast`):**
