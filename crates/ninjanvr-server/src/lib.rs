@@ -5187,6 +5187,36 @@ async fn api_stats_history(
     Json(Value::Array(items))
 }
 
+/// Appends `ninjanvr_detector_inference_ms` samples. Only measured latencies are exported: an
+/// idle or unloaded detector has no latency, and a placeholder would make dashboards show
+/// inference that never happened.
+fn render_detector_inference_metrics(stats_val: &Value, out: &mut String) {
+    let measured_ms = |d_stat: &Value| -> Option<f64> {
+        if d_stat.get("measured").and_then(|v| v.as_bool()) == Some(false) {
+            return None;
+        }
+        d_stat.get("inference_speed").and_then(|v| v.as_f64())
+    };
+    if let Some(primary) = stats_val.get("primary_detector")
+        && let Some(ms) = measured_ms(primary)
+    {
+        out.push_str(&format!(
+            "ninjanvr_detector_inference_ms{{detector=\"primary\"}} {ms:.2}\n"
+        ));
+    }
+    if let Some(dets) = stats_val.get("detectors").and_then(|v| v.as_object()) {
+        for (det_name, d_stat) in dets {
+            let Some(ms) = measured_ms(d_stat) else {
+                continue;
+            };
+            let safe_det = escape_prom_label_value(det_name);
+            out.push_str(&format!(
+                "ninjanvr_detector_inference_ms{{detector=\"{safe_det}\"}} {ms:.2}\n"
+            ));
+        }
+    }
+}
+
 async fn api_prometheus_metrics(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -5241,18 +5271,7 @@ async fn api_prometheus_metrics(
         "# HELP ninjanvr_detector_inference_ms AI detector inference latency in milliseconds.\n",
     );
     out.push_str("# TYPE ninjanvr_detector_inference_ms gauge\n");
-    if let Some(dets) = stats_val.get("detectors").and_then(|v| v.as_object()) {
-        for (det_name, d_stat) in dets {
-            let safe_det = escape_prom_label_value(det_name);
-            let ms = d_stat
-                .get("inference_speed")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            out.push_str(&format!(
-                "ninjanvr_detector_inference_ms{{detector=\"{safe_det}\"}} {ms:.2}\n"
-            ));
-        }
-    }
+    render_detector_inference_metrics(&stats_val, &mut out);
 
     out.push_str("# HELP ninjanvr_storage_used_bytes Used bytes on storage mounts.\n");
     out.push_str("# TYPE ninjanvr_storage_used_bytes gauge\n");
@@ -7400,12 +7419,23 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
 
         let mut detectors_stats = serde_json::Map::new();
         for det_name in cfg.detectors.keys() {
-            let det_infer_ms =
-                (state.detector.avg_inference_ms_for(det_name) * 100.0).round() / 100.0;
+            let named = state.detector.named_detector(Some(det_name));
+            let (det_infer_ms, det_samples) = match named.as_ref() {
+                Some(d) => (d.avg_inference_ms(), d.inference_samples()),
+                None => (0.0, 0),
+            };
+            let in_use = cfg.cameras.values().any(|c| {
+                c.enabled
+                    && c.detect.enabled
+                    && c.detect.detector.as_deref() == Some(det_name.as_str())
+            });
             detectors_stats.insert(
                 det_name.clone(),
                 json!({
-                    "inference_speed": det_infer_ms,
+                    "inference_speed": (det_infer_ms * 100.0).round() / 100.0,
+                    "measured": det_samples > 0,
+                    "samples": det_samples,
+                    "in_use": in_use,
                     "detection_start": 0.0,
                     "pid": pid,
                     "cpu": format!("{det_cpu:.1}"),
@@ -7413,6 +7443,17 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
                 }),
             );
         }
+        // The detector cameras run when they do not name one in `detect.detector`.
+        let primary_samples = state.detector.inference_samples();
+        let primary_detector = json!({
+            "inference_speed": (state.detector.avg_inference_ms() * 100.0).round() / 100.0,
+            "measured": primary_samples > 0,
+            "samples": primary_samples,
+            "loaded": state.detector.is_model_loaded(),
+            "model_path": state.detector.active_model_path(),
+            "device": state.detector.active_device(),
+            "cpu": format!("{det_cpu:.1}"),
+        });
 
         let mut cpu_usages = serde_json::Map::new();
         cpu_usages.insert(
@@ -7552,6 +7593,7 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
         json!({
             "cameras": cameras_stats,
             "detectors": detectors_stats,
+            "primary_detector": primary_detector,
             "camera_fps": (total_cam_fps * 10.0).round() / 10.0,
             "process_fps": (total_cam_fps * 10.0).round() / 10.0,
             "skipped_fps": 0.0,
@@ -25055,6 +25097,10 @@ version: 0.18-0
         let rec_json: Value =
             serde_json::from_slice(&to_bytes(resp_rec.into_body(), 65536).await.unwrap()).unwrap();
         assert_eq!(rec_json["service"]["storage_degraded"], false);
+        // The detector cameras actually use is reported, and unmeasured latency is flagged.
+        assert_eq!(rec_json["primary_detector"]["measured"], false);
+        assert_eq!(rec_json["primary_detector"]["inference_speed"], 0.0);
+        assert!(rec_json["primary_detector"]["model_path"].is_string());
 
         state
             .db
@@ -25141,7 +25187,9 @@ version: 0.18-0
         .unwrap();
         assert!(prom_body.contains("ninjanvr_camera_fps{camera=\"front_door\",role=\"camera\"}"));
         assert!(prom_body.contains("ninjanvr_camera_online{camera=\"front_door\"}"));
-        assert!(prom_body.contains("ninjanvr_detector_inference_ms{detector=\"detector01\"}"));
+        // detector01 never ran a model in this test, so no latency sample may be invented for it.
+        assert!(prom_body.contains("# TYPE ninjanvr_detector_inference_ms gauge"));
+        assert!(!prom_body.contains("ninjanvr_detector_inference_ms{detector=\"detector01\"}"));
         assert!(prom_body.contains("ninjanvr_storage_used_bytes{mount=\"recordings\"}"));
         assert!(prom_body.contains("ninjanvr_cpu_usage_percent "));
         assert!(prom_body.contains("ninjanvr_memory_usage_bytes "));
@@ -27866,6 +27914,32 @@ version: 0.18-0
 
         mock_srv.abort();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn detector_inference_metrics_export_only_measured_latencies() {
+        let stats = json!({
+            "primary_detector": { "inference_speed": 85.8, "measured": true },
+            "detectors": {
+                "detector01": { "inference_speed": 0.0, "measured": false, "in_use": false },
+                "garage_gpu": { "inference_speed": 12.5, "measured": true, "in_use": true },
+                "legacy": { "inference_speed": 7.0 }
+            }
+        });
+        let mut out = String::new();
+        render_detector_inference_metrics(&stats, &mut out);
+        assert!(out.contains("ninjanvr_detector_inference_ms{detector=\"primary\"} 85.80\n"));
+        assert!(out.contains("ninjanvr_detector_inference_ms{detector=\"garage_gpu\"} 12.50\n"));
+        assert!(!out.contains("detector01"));
+        // Stats from servers without the "measured" flag keep their previous behaviour.
+        assert!(out.contains("ninjanvr_detector_inference_ms{detector=\"legacy\"} 7.00\n"));
+
+        let mut idle = String::new();
+        render_detector_inference_metrics(
+            &json!({ "primary_detector": { "inference_speed": 0.0, "measured": false } }),
+            &mut idle,
+        );
+        assert!(idle.is_empty());
     }
 
     #[test]

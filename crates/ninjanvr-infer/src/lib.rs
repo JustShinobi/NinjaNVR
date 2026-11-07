@@ -46,6 +46,8 @@ pub struct DetectorRuntimeCatalog {
     pub in_bytes: usize,
     pub out_floats: usize,
     pub avg_inference_ms: f32,
+    /// Inferences behind `avg_inference_ms`; 0 means the average is not a measurement yet.
+    pub inference_samples: u64,
     pub devices: Vec<DetectorDeviceStatus>,
     pub discovered_models: Vec<DiscoveredModelEntry>,
 }
@@ -124,6 +126,21 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 const MAX_MODEL_DIMENSION: u32 = 4096;
+
+/// Moving average of inference latency. The first real sample seeds the average so the
+/// reported value is a measurement from the start, not a placeholder easing toward reality.
+fn next_inference_average(prior_samples: u64, current_avg: f32, sample_ms: f32) -> f32 {
+    let sample = if sample_ms.is_finite() && sample_ms >= 0.0 {
+        sample_ms
+    } else {
+        current_avg
+    };
+    if prior_samples == 0 {
+        sample
+    } else {
+        (current_avg * 0.9) + (sample * 0.1)
+    }
+}
 const MAX_TENSOR_FLOATS: usize = 16 * 1024 * 1024;
 const MAX_TENSOR_BYTES: usize = MAX_TENSOR_FLOATS * std::mem::size_of::<f32>();
 
@@ -360,7 +377,10 @@ struct DetectorRuntimeState {
 
 pub struct AiDetectorEngine {
     inner: Mutex<DetectorRuntimeState>,
+    /// Exponential moving average of real model inference latency; 0.0 until measured.
     last_inference_ms: Mutex<f32>,
+    /// Number of inferences that actually ran a loaded model since the last (re)load.
+    inference_samples: AtomicU64,
     cumulative_infer_us: AtomicU64,
     pool: Mutex<BTreeMap<String, Arc<AiDetectorEngine>>>,
     face_gallery: Arc<Mutex<FaceGallery>>,
@@ -559,7 +579,8 @@ impl AiDetectorEngine {
         }
         Self {
             inner: Mutex::new(state),
-            last_inference_ms: Mutex::new(2.1),
+            last_inference_ms: Mutex::new(0.0),
+            inference_samples: AtomicU64::new(0),
             cumulative_infer_us: AtomicU64::new(0),
             pool: Mutex::new(pool_map),
             face_gallery: Arc::new(Mutex::new(FaceGallery::new())),
@@ -571,7 +592,8 @@ impl AiDetectorEngine {
         let state = Self::build_runtime_state(config, Some(entry));
         Self {
             inner: Mutex::new(state),
-            last_inference_ms: Mutex::new(2.1),
+            last_inference_ms: Mutex::new(0.0),
+            inference_samples: AtomicU64::new(0),
             cumulative_infer_us: AtomicU64::new(0),
             pool: Mutex::new(BTreeMap::new()),
             face_gallery: Arc::new(Mutex::new(FaceGallery::new())),
@@ -583,6 +605,9 @@ impl AiDetectorEngine {
     pub fn reload(&self, config: &NinjaConfig) {
         let next_state = Self::build_runtime_state(config, None);
         *lock_unpoisoned(&self.inner) = next_state;
+        // A new model has a new latency profile: forget the previous model's average.
+        *lock_unpoisoned(&self.last_inference_ms) = 0.0;
+        self.inference_samples.store(0, Ordering::Relaxed);
         let mut pool_map = BTreeMap::new();
         for (name, entry) in &config.detectors {
             pool_map.insert(name.clone(), Arc::new(Self::new_for_entry(config, entry)));
@@ -914,8 +939,23 @@ impl AiDetectorEngine {
         g.active_device.clone()
     }
 
+    /// Average real inference latency in ms, or 0.0 when no loaded model has run yet.
     pub fn avg_inference_ms(&self) -> f32 {
         *lock_unpoisoned(&self.last_inference_ms)
+    }
+
+    /// Inferences that ran a loaded model since the last (re)load; 0 means `avg_inference_ms`
+    /// is not a measurement.
+    pub fn inference_samples(&self) -> u64 {
+        self.inference_samples.load(Ordering::Relaxed)
+    }
+
+    pub fn is_model_loaded(&self) -> bool {
+        lock_unpoisoned(&self.inner).backend.is_some()
+    }
+
+    pub fn active_model_path(&self) -> String {
+        lock_unpoisoned(&self.inner).active_model_path.clone()
     }
 
     pub fn cumulative_infer_us(&self) -> u64 {
@@ -1042,6 +1082,7 @@ impl AiDetectorEngine {
             in_bytes,
             out_floats,
             avg_inference_ms: (self.avg_inference_ms() * 10.0).round() / 10.0,
+            inference_samples: self.inference_samples(),
             devices: vec![
                 DetectorDeviceStatus {
                     id: "CPU".to_string(),
@@ -1904,6 +1945,7 @@ impl AiDetectorEngine {
     ) -> Vec<DetectionResult> {
         let t0 = Instant::now();
         let mut out_results = Vec::new();
+        let mut ran_model = false;
 
         {
             let mut guard = lock_unpoisoned(&self.inner);
@@ -1919,6 +1961,7 @@ impl AiDetectorEngine {
                 && tensor_nhwc.len() >= expected_elems
             {
                 let tensor_nhwc = &tensor_nhwc[..expected_elems];
+                ran_model = guard.backend.is_some();
 
                 match guard.backend.as_mut() {
                     Some(InferenceRuntimeBackend::OpenVino(ctx)) => {
@@ -2342,9 +2385,12 @@ impl AiDetectorEngine {
         let elapsed_us = t0.elapsed().as_micros() as u64;
         self.cumulative_infer_us
             .fetch_add(elapsed_us, Ordering::Relaxed);
-        let elapsed_ms = (elapsed_us as f32) / 1000.0;
-        let mut avg = lock_unpoisoned(&self.last_inference_ms);
-        *avg = (*avg * 0.9) + (elapsed_ms.max(0.2) * 0.1);
+        if ran_model {
+            let elapsed_ms = (elapsed_us as f32) / 1000.0;
+            let prior = self.inference_samples.fetch_add(1, Ordering::Relaxed);
+            let mut avg = lock_unpoisoned(&self.last_inference_ms);
+            *avg = next_inference_average(prior, *avg, elapsed_ms);
+        }
 
         out_results
     }
@@ -4915,6 +4961,14 @@ version: 0.18-0
     }
 
     #[test]
+    fn inference_average_seeds_from_first_real_sample() {
+        assert_eq!(next_inference_average(0, 0.0, 85.8), 85.8);
+        let second = next_inference_average(1, 85.8, 95.8);
+        assert!((second - 86.8).abs() < 1e-3);
+        assert_eq!(next_inference_average(3, 40.0, f32::NAN), 40.0);
+    }
+
+    #[test]
     fn fallback_mode_covers_runtime_catalog_detect_region_reload_and_pool_routing() {
         let yaml = r#"
 detectors:
@@ -4943,6 +4997,7 @@ version: 0.18-0
         // 1. runtime_catalog() when OpenVINO model/library is not loaded
         let cat = engine.runtime_catalog();
         assert!(!cat.loaded);
+        assert_eq!(cat.inference_samples, 0);
         assert_eq!(cat.in_bytes, 0);
         assert_eq!(cat.out_floats, 0);
         assert_eq!(cat.active_backend, "openvino");
@@ -4957,7 +5012,10 @@ version: 0.18-0
         let region = BoundingBox::new(0, 0, 300, 300);
         let fallback_dets = engine.detect_region(&tensor, region, 1280, 720, 0.5);
         assert!(fallback_dets.is_empty());
-        assert!(engine.avg_inference_ms() > 0.0);
+        // Heuristic mode runs no model, so it must not be reported as an inference latency.
+        assert_eq!(engine.inference_samples(), 0);
+        assert_eq!(engine.avg_inference_ms(), 0.0);
+        assert!(!engine.is_model_loaded());
         let _ = engine.cumulative_infer_us();
 
         // 3. named_detector() and avg_inference_ms_for() on AiDetectorEngine
@@ -4968,7 +5026,7 @@ version: 0.18-0
         assert_eq!(aux.active_device(), "NPU");
         assert!(engine.named_detector(Some("missing_det")).is_none());
         assert!(engine.named_detector(None).is_none());
-        assert!(engine.avg_inference_ms_for("aux_npu") > 0.0);
+        assert_eq!(engine.avg_inference_ms_for("aux_npu"), 0.0);
         assert_eq!(
             engine.avg_inference_ms_for("missing_det"),
             engine.avg_inference_ms()
