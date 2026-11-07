@@ -17,6 +17,11 @@ import {
   isCameraHardwareControlsSupported,
   resolveCameraPushToTalkCapability,
 } from "../views/LiveWorkspace";
+import {
+  CAMERA_HUD_CONTROL_DESCRIPTORS,
+  CAMERA_PROTOCOL_CATALOG,
+  findCameraProtocolDescriptor,
+} from "../utils/cameraCapabilities";
 import { buildCloudPasswordPatch } from "../views/settings/ConsoleAndStreamsPanels";
 import type { CameraHardwareInfoResponse } from "../types/nvr";
 
@@ -449,5 +454,22 @@ describe("WebRTC Push-to-Talk (AU-05) session helpers and deterministic mic rele
     expect(videoMatches.length).toBe(2);
     expect(videoMatches[0]).toContain("muted");
     expect(videoMatches[1]).toContain("muted");
+
+    // Declarative protocol catalog resolves aliases and HUD control descriptors cover all quick actions
+    expect(findCameraProtocolDescriptor("intelbras")?.id).toBe("dahua_cgi");
+    expect(findCameraProtocolDescriptor("hikvision")?.id).toBe("hikvision_isapi");
+    expect(findCameraProtocolDescriptor("reolink")?.defaultOnvifPort).toBe(8000);
+    expect(CAMERA_PROTOCOL_CATALOG.length).toBeGreaterThanOrEqual(8);
+    expect(CAMERA_HUD_CONTROL_DESCRIPTORS.map((d) => d.id)).toEqual([
+      "day_night_mode",
+      "hardware_autotracking",
+      "status_led",
+      "mirror",
+      "flip",
+      "wdr",
+      "siren_on_motion",
+      "brightness",
+      "speaker_volume",
+    ]);
   });
 });

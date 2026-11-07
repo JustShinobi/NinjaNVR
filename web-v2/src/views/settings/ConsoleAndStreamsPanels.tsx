@@ -15,6 +15,10 @@ import {
   ThemeMode,
 } from "../../utils/format";
 import { SettingsScopeDivider } from "../../components/SettingsScopeDivider";
+import {
+  CAMERA_PROTOCOL_CATALOG,
+  findCameraProtocolDescriptor,
+} from "../../utils/cameraCapabilities";
 
 const RESERVED_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -1607,7 +1611,7 @@ export const ChannelsStreamsSection: React.FC<{
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "1.3fr 0.7fr",
+                    gridTemplateColumns: "1fr 0.6fr 0.6fr",
                     gap: 6,
                     marginTop: 2,
                   }}
@@ -1747,6 +1751,43 @@ export const ChannelsStreamsSection: React.FC<{
                       });
                     }}
                   />
+                  <select
+                    className="nvr-select mono sm"
+                    aria-label="Camera Hardware Protocol"
+                    value={
+                      activeCamCfg.onvif?.protocol ||
+                      activeCamCfg.hardware?.protocol ||
+                      ""
+                    }
+                    onChange={(e) => {
+                      const proto = e.target.value;
+                      const spec = findCameraProtocolDescriptor(proto);
+                      updateDraft((next) => {
+                        const cam = next.cameras[inspectorCam];
+                        if (!cam) return;
+                        const nextPort =
+                          spec && (!cam.onvif?.port || cam.onvif.port === 80 || cam.onvif.port === 2020)
+                            ? spec.defaultOnvifPort
+                            : cam.onvif?.port || 80;
+                        cam.onvif = {
+                          port: nextPort,
+                          timeout_sec: 5,
+                          ...(cam.onvif || {}),
+                          protocol: proto || undefined,
+                        };
+                        cam.hardware = {
+                          ...(cam.hardware || {}),
+                          protocol: proto || undefined,
+                        };
+                      });
+                    }}
+                  >
+                    {CAMERA_PROTOCOL_CATALOG.map((spec) => (
+                      <option key={spec.id || "auto"} value={spec.id}>
+                        {spec.label}
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
                 {/* Discovered Hardware Capabilities & Interactive Controls */}

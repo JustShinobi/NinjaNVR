@@ -39,6 +39,20 @@ import {
 } from "../utils/format";
 import { resolveCanvasThemePalette } from "../utils/themeTokens";
 import { LiveMsePlayer, PushToTalkButton, VodHlsPlayer } from "../components/VideoPlayers";
+import {
+  CAMERA_HUD_CONTROL_DESCRIPTORS,
+  isCameraHardwareControlsSupported,
+  isCameraPtzEnabled,
+  resolveCameraPushToTalkCapability,
+  resolveCameraZoomSupported,
+} from "../utils/cameraCapabilities";
+
+export {
+  isCameraHardwareControlsSupported,
+  isCameraPtzEnabled,
+  resolveCameraPushToTalkCapability,
+  resolveCameraZoomSupported,
+};
 import { TimelineScrubber, type TimelineClipRequest } from "../components/TimelineScrubber";
 import { ReviewFlipbook } from "../components/ReviewFlipbook";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
@@ -1091,115 +1105,6 @@ export function sanitizeTimeShiftSeek(
   return Math.floor(ts);
 }
 
-export function isCameraPtzEnabled(
-  camCfg?: CameraConfig,
-  ptzInfo?: CameraPtzInfoResponse | null,
-  hwInfo?: CameraHardwareInfoResponse | null
-): boolean {
-  if (
-    hwInfo?.online &&
-    hwInfo.capabilities &&
-    hwInfo.capabilities.ptz === false &&
-    ptzInfo?.online !== true
-  ) {
-    return false;
-  }
-  if (hwInfo?.online && hwInfo.capabilities?.ptz === true) {
-    return true;
-  }
-  if (ptzInfo?.enabled) return true;
-  return Boolean(camCfg?.onvif?.host && camCfg.onvif.host.trim().length > 0);
-}
-
-export function resolveCameraPushToTalkCapability(
-  camCfg?: CameraConfig,
-  hwInfo?: CameraHardwareInfoResponse | null,
-  go2rtcStreams?: Record<string, unknown> | null,
-  camName?: string
-): { supported: boolean; mode: "webrtc" | "cgi_alaw" | null } {
-  if (
-    camCfg?.onvif?.has_cloud_password ||
-    camCfg?.hardware?.has_cloud_password ||
-    Boolean(
-      camCfg?.onvif?.cloud_password &&
-        camCfg.onvif.cloud_password.trim() !== ""
-    ) ||
-    Boolean(
-      camCfg?.hardware?.cloud_password &&
-        camCfg.hardware.cloud_password.trim() !== ""
-    )
-  ) {
-    return { supported: true, mode: "webrtc" };
-  }
-  const hasTwoWayProducer = (rawUrl: string): boolean => {
-    const lc = rawUrl.trim().toLowerCase();
-    if (lc.includes("#backchannel=0")) return false;
-    return (
-      lc.startsWith("tapo://") ||
-      lc.startsWith("dvrip://") ||
-      lc.startsWith("isapi://") ||
-      lc.startsWith("roborock://") ||
-      lc.startsWith("ring://") ||
-      lc.startsWith("tuya://") ||
-      lc.startsWith("xiaomi://") ||
-      lc.startsWith("doorbird://") ||
-      lc.includes("#backchannel=1")
-    );
-  };
-  if (camName && go2rtcStreams && go2rtcStreams[camName] !== undefined) {
-    const entry = go2rtcStreams[camName];
-    if (typeof entry === "string" && hasTwoWayProducer(entry)) {
-      return { supported: true, mode: "webrtc" };
-    }
-    if (
-      Array.isArray(entry) &&
-      entry.some((item) => typeof item === "string" && hasTwoWayProducer(item))
-    ) {
-      return { supported: true, mode: "webrtc" };
-    }
-  }
-  if (hwInfo && hwInfo.capabilities) {
-    if (hwInfo.capabilities.push_to_talk) {
-      return {
-        supported: true,
-        mode: hwInfo.capabilities.push_to_talk_mode || "webrtc",
-      };
-    }
-    return { supported: false, mode: null };
-  }
-  const configuredProto = (
-    camCfg?.hardware?.protocol ||
-    camCfg?.onvif?.protocol ||
-    ""
-  )
-    .trim()
-    .toLowerCase();
-  if (configuredProto === "dahua_cgi" || configuredProto === "intelbras") {
-    return { supported: true, mode: "cgi_alaw" };
-  }
-  return { supported: false, mode: null };
-}
-
-export function isCameraHardwareControlsSupported(
-  hwInfo?: CameraHardwareInfoResponse | null
-): boolean {
-  if (!hwInfo?.online || !hwInfo.capabilities) return false;
-  const c = hwInfo.capabilities;
-  return Boolean(
-    c.imaging ||
-      c.hardware_autotracking ||
-      c.day_night_mode ||
-      c.ir_lighting ||
-      c.status_led ||
-      c.flip_mirror ||
-      c.wdr ||
-      c.siren_on_event ||
-      c.audio_anomaly_detect ||
-      c.audio_volume ||
-      c.reboot
-  );
-}
-
 export function resolveCameraPtzPresets(
   camCfg?: CameraConfig,
   ptzInfo?: CameraPtzInfoResponse | null
@@ -1507,22 +1412,7 @@ export const TacticalPtzHudOverlay: React.FC<{
       ? false
       : Boolean(ptzInfo?.features?.includes("presets_manage")) ||
         Boolean(hardwareInfo?.capabilities?.ptz_presets_manage);
-  const cfgProto = (
-    cameraConfig?.hardware?.protocol ||
-    cameraConfig?.onvif?.protocol ||
-    ""
-  )
-    .trim()
-    .toLowerCase();
-  const isKnownPanTiltOnly =
-    cameraConfig?.onvif?.port === 2020 ||
-    cfgProto === "tapo" ||
-    cfgProto === "dahua_cgi" ||
-    cfgProto === "intelbras";
-  const zoomSupported =
-    hardwareInfo?.capabilities?.ptz_zoom !== undefined
-      ? Boolean(hardwareInfo.capabilities.ptz_zoom)
-      : !isKnownPanTiltOnly;
+  const zoomSupported = resolveCameraZoomSupported(cameraConfig, hardwareInfo);
 
   const startContinuousMove = (dir: PtzMoveDirection) => {
     void lifecycleRef.current?.startMove(dir);
@@ -1887,190 +1777,64 @@ export const TacticalPtzHudOverlay: React.FC<{
                 borderLeft: "1px solid var(--border-strong)",
               }}
             >
-              {hardwareInfo.capabilities.day_night_mode && (
-                <select
-                  className="nvr-select mono sm"
-                  style={{ height: 20, fontSize: "var(--text-xs)", padding: "0 4px" }}
-                  aria-label={`Day Night IR Mode ${camera}`}
-                  disabled={hwBusy}
-                  value={hardwareInfo.state.day_night_mode || "auto"}
-                  onChange={(e) =>
-                    void handleApplyHardwareField({ day_night_mode: e.target.value })
-                  }
-                >
-                  <option value="auto">IR:AUTO</option>
-                  <option value="day">IR:DAY</option>
-                  <option value="night">IR:NIGHT</option>
-                </select>
-              )}
-              {hardwareInfo.capabilities.hardware_autotracking && (
-                <button
-                  type="button"
-                  disabled={hwBusy}
-                  aria-label={`Toggle SmartTrack ${camera}`}
-                  aria-pressed={Boolean(hardwareInfo.state.hardware_autotracking)}
-                  className={`nvr-btn nvr-tile-action mono sm ${
-                    hardwareInfo.state.hardware_autotracking ? "active" : ""
-                  }`}
-                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                  title="Toggle camera hardware SmartTrack"
-                  onClick={() =>
-                    void handleApplyHardwareField({
-                      hardware_autotracking: !hardwareInfo.state.hardware_autotracking,
-                    })
-                  }
-                >
-                  TRK
-                </button>
-              )}
-              {hardwareInfo.capabilities.status_led && (
-                <button
-                  type="button"
-                  disabled={hwBusy}
-                  aria-label={`Toggle Status LED ${camera}`}
-                  aria-pressed={Boolean(hardwareInfo.state.status_led)}
-                  className={`nvr-btn nvr-tile-action mono sm ${
-                    hardwareInfo.state.status_led ? "active" : ""
-                  }`}
-                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                  title="Toggle camera status indicator LED"
-                  onClick={() =>
-                    void handleApplyHardwareField({
-                      status_led: !hardwareInfo.state.status_led,
-                    })
-                  }
-                >
-                  LED
-                </button>
-              )}
-              {hardwareInfo.capabilities.flip_mirror && (
-                <>
+              {CAMERA_HUD_CONTROL_DESCRIPTORS.map((desc) => {
+                if (!hardwareInfo.capabilities[desc.capability]) {
+                  return null;
+                }
+                if (desc.kind === "select") {
+                  const options = desc.resolveSelectOptions
+                    ? desc.resolveSelectOptions(hardwareInfo.state)
+                    : [];
+                  const curVal = desc.resolveSelectValue
+                    ? desc.resolveSelectValue(hardwareInfo.state)
+                    : String(hardwareInfo.state[desc.id] ?? "");
+                  return (
+                    <select
+                      key={desc.id}
+                      className="nvr-select mono sm"
+                      style={{ height: 20, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                      aria-label={desc.ariaLabel(camera)}
+                      title={desc.title}
+                      disabled={hwBusy}
+                      value={curVal}
+                      onChange={(e) => {
+                        const patch = desc.parseSelectPatch
+                          ? desc.parseSelectPatch(e.target.value)
+                          : { [desc.id]: e.target.value };
+                        void handleApplyHardwareField(patch);
+                      }}
+                    >
+                      {options.map((opt) => (
+                        <option key={String(opt.value)} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  );
+                }
+                const isActive = Boolean(hardwareInfo.state[desc.id]);
+                return (
                   <button
+                    key={desc.id}
                     type="button"
                     disabled={hwBusy}
-                    aria-label={`Mirror Image ${camera}`}
-                    aria-pressed={Boolean(hardwareInfo.state.mirror)}
+                    aria-label={desc.ariaLabel(camera)}
+                    aria-pressed={isActive}
                     className={`nvr-btn nvr-tile-action mono sm ${
-                      hardwareInfo.state.mirror ? "active" : ""
+                      isActive ? "active" : ""
                     }`}
                     style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                    title="Mirror image horizontally"
+                    title={desc.title}
                     onClick={() =>
                       void handleApplyHardwareField({
-                        mirror: !hardwareInfo.state.mirror,
+                        [desc.id]: !isActive,
                       })
                     }
                   >
-                    MIR
+                    {desc.shortLabel || desc.id.toUpperCase()}
                   </button>
-                  <button
-                    type="button"
-                    disabled={hwBusy}
-                    aria-label={`Flip Image ${camera}`}
-                    aria-pressed={Boolean(hardwareInfo.state.flip)}
-                    className={`nvr-btn nvr-tile-action mono sm ${
-                      hardwareInfo.state.flip ? "active" : ""
-                    }`}
-                    style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                    title="Flip image 180° vertically"
-                    onClick={() =>
-                      void handleApplyHardwareField({
-                        flip: !hardwareInfo.state.flip,
-                      })
-                    }
-                  >
-                    FLP
-                  </button>
-                </>
-              )}
-              {hardwareInfo.capabilities.wdr && (
-                <button
-                  type="button"
-                  disabled={hwBusy}
-                  aria-label={`Toggle WDR ${camera}`}
-                  aria-pressed={Boolean(hardwareInfo.state.wdr)}
-                  className={`nvr-btn nvr-tile-action mono sm ${
-                    hardwareInfo.state.wdr ? "active" : ""
-                  }`}
-                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                  title="Toggle Wide Dynamic Range (WDR)"
-                  onClick={() =>
-                    void handleApplyHardwareField({
-                      wdr: !hardwareInfo.state.wdr,
-                    })
-                  }
-                >
-                  WDR
-                </button>
-              )}
-              {hardwareInfo.capabilities.siren_on_event && (
-                <button
-                  type="button"
-                  disabled={hwBusy}
-                  aria-label={`Toggle Motion Siren ${camera}`}
-                  aria-pressed={Boolean(hardwareInfo.state.siren_on_motion)}
-                  className={`nvr-btn nvr-tile-action mono sm ${
-                    hardwareInfo.state.siren_on_motion ? "active" : ""
-                  }`}
-                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
-                  title="Toggle camera audible alarm on motion"
-                  onClick={() =>
-                    void handleApplyHardwareField({
-                      siren_on_motion: !hardwareInfo.state.siren_on_motion,
-                    })
-                  }
-                >
-                  SRN
-                </button>
-              )}
-              {hardwareInfo.capabilities.imaging && (
-                <select
-                  className="nvr-select mono sm"
-                  style={{ height: 20, fontSize: "var(--text-xs)", padding: "0 4px" }}
-                  aria-label={`Brightness ${camera}`}
-                  disabled={hwBusy}
-                  value={String(hardwareInfo.state.brightness ?? 50)}
-                  onChange={(e) =>
-                    void handleApplyHardwareField({
-                      brightness: Number(e.target.value),
-                    })
-                  }
-                >
-                  {Array.from(
-                    new Set([25, 40, 50, 60, 75, 90, hardwareInfo.state.brightness ?? 50])
-                  )
-                    .sort((a, b) => a - b)
-                    .map((b) => (
-                      <option key={b} value={b}>
-                        BRI:{b}%
-                      </option>
-                    ))}
-                </select>
-              )}
-              {hardwareInfo.capabilities.audio_volume && (
-                <select
-                  className="nvr-select mono sm"
-                  style={{ height: 20, fontSize: "var(--text-xs)", padding: "0 4px" }}
-                  aria-label={`Speaker Volume ${camera}`}
-                  disabled={hwBusy}
-                  value={String(hardwareInfo.state.speaker_volume ?? 85)}
-                  onChange={(e) =>
-                    void handleApplyHardwareField({
-                      speaker_volume: Number(e.target.value),
-                    })
-                  }
-                >
-                  {Array.from(
-                    new Set([25, 50, 75, 85, 100, hardwareInfo.state.speaker_volume ?? 85])
-                  )
-                    .sort((a, b) => a - b)
-                    .map((v) => (
-                      <option key={v} value={v}>
-                        VOL:{v}%
-                      </option>
-                    ))}
-                </select>
-              )}
+                );
+              })}
             </span>
           )}
         </>
