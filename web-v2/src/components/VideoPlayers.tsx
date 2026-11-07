@@ -1225,6 +1225,11 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const [streamDisconnected, setStreamDisconnected] = useState(false);
   const [headerLastSeenTs, setHeaderLastSeenTs] = useState<number>(0);
   const [posterTick, setPosterTick] = useState(() => Date.now());
+  const mseReadyRef = useRef<boolean>(false);
+  mseReadyRef.current = mseReady;
+  const streamDisconnectedRef = useRef<boolean>(false);
+  streamDisconnectedRef.current = streamDisconnected;
+  const lastProbedFrameTsRef = useRef<number>(0);
   const [overlayBox, setOverlayBox] = useState<ContainedBox | null>(null);
   const [pttState, setPttState] = useState<PushToTalkState>("idle");
   const configuredCameras = useNvrStore((s) => s.config?.cameras);
@@ -1350,6 +1355,9 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       if (typeof navigator !== "undefined" && navigator.onLine === false) {
         return;
       }
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        return;
+      }
       fetch(`/api/${encodeURIComponent(realCamera)}/latest.jpg`, {
         method: "HEAD",
         credentials: "include",
@@ -1361,6 +1369,11 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             const parsed = Number(hdr);
             if (Number.isFinite(parsed) && parsed > 0) {
               setHeaderLastSeenTs(parsed);
+              if (parsed !== lastProbedFrameTsRef.current) {
+                lastProbedFrameTsRef.current = parsed;
+                setPosterTick(Date.now());
+              }
+              return;
             }
           }
           setPosterTick(Date.now());
@@ -1413,9 +1426,13 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         streamSrc
       )}`;
 
+      try {
+        videoEl.disableRemotePlayback = true;
+      } catch {
+        // ignore if readonly in synthetic test DOM
+      }
       mediaSource = new MediaSourceCtor();
       const objUrl = URL.createObjectURL(mediaSource);
-      videoEl.src = objUrl;
 
       let initialBurstSeekDone = false;
       let promotedOnce = false;
@@ -1620,6 +1637,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       };
 
       mediaSource.addEventListener("sourceopen", onSourceOpen);
+      videoEl.src = objUrl;
 
       const tryPromoteSlot = () => {
         if (closed || promotedOnce) return;
@@ -1804,7 +1822,14 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       if (typeof document !== "undefined" && document.visibilityState !== "visible") {
         return;
       }
-      if (slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)) {
+      if (
+        !mseReadyRef.current ||
+        streamDisconnectedRef.current ||
+        slotMachineRef.current.needsReconnect(desiredStreamSrcRef.current)
+      ) {
+        const snap = slotMachineRef.current.getState();
+        slotMachineRef.current.markSlotError(0, snap.slots[0].sessionId);
+        slotMachineRef.current.markSlotError(1, snap.slots[1].sessionId);
         scheduleReconnect(true);
         return;
       }
@@ -2062,7 +2087,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
           data-slot="0"
           autoPlay
           playsInline
-          muted={muted && activeSlot === 0}
+          disableRemotePlayback
+          muted={activeSlot === 0 ? muted : true}
           style={{
             position: "absolute",
             inset: 0,
@@ -2081,7 +2107,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
           data-slot="1"
           autoPlay
           playsInline
-          muted={muted && activeSlot === 1}
+          disableRemotePlayback
+          muted={activeSlot === 1 ? muted : true}
           style={{
             position: "absolute",
             inset: 0,

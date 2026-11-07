@@ -24124,7 +24124,7 @@ async fn api_camera_hardware_get(
     let mut discovered_vs = default_vs.clone();
     let mut imaging_ok = false;
     let mut img_tuple = (None, None, None, None);
-    if !host_timed_out {
+    if !host_timed_out && !is_tapo {
         let mut vs_candidates = vec![
             default_vs.clone(),
             "raw_vs1".to_string(),

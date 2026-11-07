@@ -655,6 +655,7 @@ async fn run_upstream_worker(
         .max_message_size(Some(MAX_GOP_BYTES))
         .max_frame_size(Some(MAX_GOP_BYTES));
 
+    let mut failed_cycles = 0u32;
     loop {
         let should_run = {
             let mut sessions = hub.sessions.write().await;
@@ -675,6 +676,7 @@ async fn run_upstream_worker(
             break;
         }
 
+        let mut received_media = false;
         if let Ok(Ok((ws_stream, _))) = tokio::time::timeout(
             UPSTREAM_CONNECT_TIMEOUT,
             tokio_tungstenite::connect_async_with_config(&ws_url, Some(ws_cfg), false),
@@ -682,7 +684,7 @@ async fn run_upstream_worker(
         .await
         {
             let (mut sink, mut stream_rx) = ws_stream.split();
-            let handshake = r#"{"type":"mse","value":"avc1.640029,avc1.64002A,avc1.640028,avc1.4D401F,avc1.4D0029,avc1.42E01E,hev1.1.6.L153.B0,mp4a.40.2,mp4a.40.5,flac,opus"}"#;
+            let handshake = r#"{"type":"mse","value":"avc1.640029,avc1.64002A,avc1.640028,avc1.4D401F,avc1.4D0029,avc1.42E01E,hev1.1.6.L153.B0,mp4a.40.2,mp4a.40.5"}"#;
             if tokio::time::timeout(
                 UPSTREAM_SEND_TIMEOUT,
                 sink.send(TungMsg::Text(handshake.into())),
@@ -718,6 +720,8 @@ async fn run_upstream_worker(
                         }
                         Ok(Some(Ok(TungMsg::Binary(b)))) => {
                             consecutive_timeouts = 0;
+                            received_media = true;
+                            failed_cycles = 0;
                             hub.ingest_upstream_binary(&stream, b).await;
                         }
                         Ok(Some(Ok(TungMsg::Ping(p)))) => {
@@ -734,7 +738,7 @@ async fn run_upstream_worker(
                         Ok(Some(Ok(TungMsg::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
                         Err(_) => {
                             consecutive_timeouts = consecutive_timeouts.saturating_add(1);
-                            if consecutive_timeouts >= 3 {
+                            if consecutive_timeouts >= 4 {
                                 break;
                             }
                         }
@@ -744,25 +748,44 @@ async fn run_upstream_worker(
             }
         }
 
-        let should_retry = {
+        let (should_retry, has_active_clients) = {
             let mut sessions = hub.sessions.write().await;
-            let active = sessions
-                .get(&stream)
-                .map(|s| {
-                    s.persistent
-                        || s.active_clients.load(Ordering::SeqCst) > 0
-                        || Instant::now() < s.expires_at
-                })
-                .unwrap_or(false);
+            let state = sessions.get(&stream).map(|s| {
+                let clients = s.active_clients.load(Ordering::SeqCst) > 0;
+                let active = s.persistent || clients || Instant::now() < s.expires_at;
+                (active, clients)
+            });
+            let (active, clients) = state.unwrap_or((false, false));
             if !active {
                 sessions.remove(&stream);
             }
-            active
+            (active, clients)
         };
         if !should_retry {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let backoff_ms = if received_media || failed_cycles == 0 {
+            failed_cycles = failed_cycles.saturating_add(1);
+            500
+        } else {
+            failed_cycles = failed_cycles.saturating_add(1);
+            if has_active_clients {
+                match failed_cycles {
+                    1 => 500,
+                    2 => 1_500,
+                    3 => 3_000,
+                    _ => 5_000,
+                }
+            } else {
+                match failed_cycles {
+                    1 => 1_000,
+                    2 => 3_000,
+                    3 => 6_000,
+                    _ => 10_000,
+                }
+            }
+        };
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
     }
 
     {

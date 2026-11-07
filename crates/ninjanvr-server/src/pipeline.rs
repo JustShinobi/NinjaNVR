@@ -837,18 +837,22 @@ impl VisionPipeline {
                 width, height, fps
             );
 
-            self.camera_metrics.write().await.insert(
-                camera.clone(),
-                CameraRuntimeMetrics {
-                    camera_fps: fps as f64,
-                    process_fps: fps as f64,
-                    detection_fps: 0.0,
-                    pid: child_pid,
-                    last_frame_ts: unix_now_f64(),
-                    night_mode: false,
-                },
-            );
+            {
+                let mut m_guard = self.camera_metrics.write().await;
+                let entry = m_guard
+                    .entry(camera.clone())
+                    .or_insert_with(|| CameraRuntimeMetrics {
+                        camera_fps: 0.0,
+                        process_fps: 0.0,
+                        detection_fps: 0.0,
+                        pid: child_pid,
+                        last_frame_ts: 0.0,
+                        night_mode: false,
+                    });
+                entry.pid = child_pid;
+            }
 
+            let mut received_any_frame = false;
             if let Some(mut stdout) = child.stdout.take() {
                 let mut frame_data: Arc<Vec<u8>> = Arc::new(vec![0u8; frame_byte_len]);
                 let mut frame_count = 0u64;
@@ -873,12 +877,23 @@ impl VisionPipeline {
                 {
                     let now = unix_now_f64();
                     frame_count += 1;
-                    if frame_count == 1 && self.comms.set_camera_availability(&camera, true) {
-                        self.log_hub.push_ninjanvr(
-                            "INFO",
-                            &format!("ninjanvr.camera.{camera}"),
-                            "Camera stream reconnected (ONLINE)",
-                        );
+                    if frame_count == 1 {
+                        received_any_frame = true;
+                        {
+                            let mut m_guard = self.camera_metrics.write().await;
+                            let entry = m_guard.entry(camera.clone()).or_default();
+                            entry.camera_fps = fps as f64;
+                            entry.process_fps = fps as f64;
+                            entry.pid = child_pid;
+                            entry.last_frame_ts = now;
+                        }
+                        if self.comms.set_camera_availability(&camera, true) {
+                            self.log_hub.push_ninjanvr(
+                                "INFO",
+                                &format!("ninjanvr.camera.{camera}"),
+                                "Camera stream reconnected (ONLINE)",
+                            );
+                        }
                     }
 
                     if now - last_live_config_check >= LIVE_VISION_CONFIG_POLL_SEC {
@@ -1401,7 +1416,8 @@ impl VisionPipeline {
             }
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            let retry_sec = if received_any_frame { 5 } else { 10 };
+            tokio::time::sleep(Duration::from_secs(retry_sec)).await;
         }
     }
 

@@ -2479,27 +2479,32 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
       }:${camCfg?.onvif?.user || ""}:${Boolean(
         camCfg?.onvif?.has_password
       )}:${profTok}:${proto}`;
-      if (
-        isCameraPtzEnabled(camCfg) &&
-        !ptzFetchedCamsRef.current.has(ptzCacheKey) &&
-        !ptzInFlightCamsRef.current.has(ptzCacheKey)
-      ) {
-        ptzInFlightCamsRef.current.add(ptzCacheKey);
-        fetch(`/api/${encodeURIComponent(camName)}/ptz/info`, {
-          credentials: "include",
-        })
-          .then((res) => (res.ok ? res.json() : null))
-          .then((data: CameraPtzInfoResponse | null) => {
-            ptzInFlightCamsRef.current.delete(ptzCacheKey);
-            if (isMountedRef.current && data) {
-              ptzFetchedCamsRef.current.add(ptzCacheKey);
-              setPtzInfoByCam((prev) => ({ ...prev, [camName]: data }));
-            }
+      const triggerPtzFetch = () => {
+        if (
+          !ptzFetchedCamsRef.current.has(ptzCacheKey) &&
+          !ptzInFlightCamsRef.current.has(ptzCacheKey)
+        ) {
+          ptzInFlightCamsRef.current.add(ptzCacheKey);
+          fetch(`/api/${encodeURIComponent(camName)}/ptz/info`, {
+            credentials: "include",
           })
-          .catch(() => {
-            ptzInFlightCamsRef.current.delete(ptzCacheKey);
-          });
-      }
+            .then((res) => (res.ok ? res.json() : null))
+            .then((ptzData: CameraPtzInfoResponse | null) => {
+              ptzInFlightCamsRef.current.delete(ptzCacheKey);
+              if (isMountedRef.current && ptzData) {
+                ptzFetchedCamsRef.current.add(ptzCacheKey);
+                setPtzInfoByCam((prev) => ({
+                  ...prev,
+                  [camName]: ptzData,
+                }));
+              }
+            })
+            .catch(() => {
+              ptzInFlightCamsRef.current.delete(ptzCacheKey);
+            });
+        }
+      };
+
       const hwCacheKey = `${camName}:${camCfg?.onvif?.host || ""}:${
         camCfg?.onvif?.port || 80
       }:${camCfg?.onvif?.user || ""}:${Boolean(
@@ -2521,36 +2526,24 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             if (isMountedRef.current && data) {
               hwFetchedCamsRef.current.add(hwCacheKey);
               setHardwareInfoByCam((prev) => ({ ...prev, [camName]: data }));
-              if (
-                data.online &&
-                data.capabilities?.ptz &&
-                !ptzFetchedCamsRef.current.has(ptzCacheKey) &&
-                !ptzInFlightCamsRef.current.has(ptzCacheKey)
-              ) {
-                ptzInFlightCamsRef.current.add(ptzCacheKey);
-                fetch(`/api/${encodeURIComponent(camName)}/ptz/info`, {
-                  credentials: "include",
-                })
-                  .then((res) => (res.ok ? res.json() : null))
-                  .then((ptzData: CameraPtzInfoResponse | null) => {
-                    ptzInFlightCamsRef.current.delete(ptzCacheKey);
-                    if (isMountedRef.current && ptzData) {
-                      ptzFetchedCamsRef.current.add(ptzCacheKey);
-                      setPtzInfoByCam((prev) => ({
-                        ...prev,
-                        [camName]: ptzData,
-                      }));
-                    }
-                  })
-                  .catch(() => {
-                    ptzInFlightCamsRef.current.delete(ptzCacheKey);
-                  });
+              if (data.online && data.capabilities?.ptz) {
+                triggerPtzFetch();
               }
+            } else if (isMountedRef.current && isCameraPtzEnabled(camCfg)) {
+              triggerPtzFetch();
             }
           })
           .catch(() => {
             hwInFlightCamsRef.current.delete(hwCacheKey);
+            if (isMountedRef.current && isCameraPtzEnabled(camCfg)) {
+              triggerPtzFetch();
+            }
           });
+      } else if (
+        isCameraPtzEnabled(camCfg, undefined, hardwareInfoByCam[camName]) &&
+        !hwInFlightCamsRef.current.has(hwCacheKey)
+      ) {
+        triggerPtzFetch();
       }
     }
   }, [config?.cameras]);

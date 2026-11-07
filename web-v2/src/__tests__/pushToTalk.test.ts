@@ -437,5 +437,17 @@ describe("WebRTC Push-to-Talk (AU-05) session helpers and deterministic mic rele
       has_cloud_password: false,
       clear_cloud_password: true,
     });
+
+    // Both active (slot 0) and standby (slot 1) <video> elements must render muted when muted=true
+    const dualSlotHtml = renderToStaticMarkup(
+      React.createElement(LiveMsePlayer, {
+        camera: "cozinha",
+        muted: true,
+      })
+    );
+    const videoMatches = dualSlotHtml.match(/<video[^>]+>/g) || [];
+    expect(videoMatches.length).toBe(2);
+    expect(videoMatches[0]).toContain("muted");
+    expect(videoMatches[1]).toContain("muted");
   });
 });
