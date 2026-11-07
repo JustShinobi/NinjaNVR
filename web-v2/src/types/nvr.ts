@@ -167,9 +167,103 @@ export interface OnvifCameraConfig {
   password?: string | null;
   has_password?: boolean;
   clear_password?: boolean;
+  cloud_password?: string | null;
+  has_cloud_password?: boolean;
+  clear_cloud_password?: boolean;
+  profile_token?: string | null;
+  video_source_token?: string | null;
+  protocol?: string | null;
   autotracking?: boolean;
   return_preset?: string | null;
   timeout_sec?: number;
+}
+
+export interface CameraSoftPreset {
+  name: string;
+  pan?: number;
+  tilt?: number;
+  zoom?: number;
+}
+
+export interface CameraHardwareConfig {
+  protocol?: string | null;
+  cloud_password?: string | null;
+  has_cloud_password?: boolean;
+  clear_cloud_password?: boolean;
+  profile_token?: string | null;
+  video_source_token?: string | null;
+  soft_presets?: Record<string, CameraSoftPreset>;
+}
+
+export interface CameraDeviceIdentity {
+  manufacturer?: string | null;
+  model?: string | null;
+  firmware?: string | null;
+  serial_number?: string | null;
+  hardware_id?: string | null;
+}
+
+export interface CameraHardwareCapabilities {
+  ptz: boolean;
+  ptz_zoom: boolean;
+  ptz_presets: boolean;
+  ptz_presets_manage: boolean;
+  push_to_talk: boolean;
+  push_to_talk_mode?: "webrtc" | "cgi_alaw" | null;
+  imaging: boolean;
+  hardware_autotracking: boolean;
+  day_night_mode: boolean;
+  ir_lighting: boolean;
+  status_led: boolean;
+  flip_mirror: boolean;
+  wdr: boolean;
+  siren_on_event: boolean;
+  audio_anomaly_detect: boolean;
+  audio_volume: boolean;
+  reboot: boolean;
+}
+
+export interface CameraHardwareState {
+  brightness?: number;
+  contrast?: number;
+  saturation?: number;
+  sharpness?: number;
+  hardware_autotracking?: boolean;
+  day_night_mode?: "auto" | "day" | "night" | string;
+  ir_mode?: "auto" | "manual" | "off" | string;
+  ir_brightness?: number;
+  status_led?: boolean;
+  flip?: boolean;
+  mirror?: boolean;
+  wdr?: boolean;
+  siren_on_motion?: boolean;
+  siren_on_audio?: boolean;
+  audio_detect_enabled?: boolean;
+  audio_sensitivity?: number;
+  speaker_volume?: number;
+  microphone_volume?: number;
+}
+
+export interface CameraSuggestedConfig {
+  onvif_host?: string | null;
+  onvif_port?: number;
+  onvif_user?: string | null;
+  profile_token?: string | null;
+  video_source_token?: string | null;
+  protocol?: string | null;
+  native_substream_url?: string | null;
+}
+
+export interface CameraHardwareInfoResponse {
+  camera: string;
+  online: boolean;
+  protocol_family: "dahua_cgi" | "tapo" | "onvif" | "rtsp_only" | string;
+  onvif_configured: boolean;
+  device_info: CameraDeviceIdentity;
+  capabilities: CameraHardwareCapabilities;
+  missing_requirements: string[];
+  suggested_config?: CameraSuggestedConfig | null;
+  state: CameraHardwareState;
 }
 
 export interface OnvifPresetItem {
@@ -183,6 +277,7 @@ export interface CameraPtzInfoResponse {
   camera?: string;
   host?: string | null;
   port?: number;
+  profile_token?: string | null;
   autotracking?: boolean;
   return_preset?: string | null;
   active_preset?: string | null;
@@ -297,6 +392,7 @@ export interface CameraConfig {
   ui?: CameraUiConfig;
   map?: CameraMapPlacement;
   onvif?: OnvifCameraConfig;
+  hardware?: CameraHardwareConfig;
   ffmpeg?: CameraFfmpegConfig;
   live?: CameraLiveConfig;
   detect: CameraDetectConfig;

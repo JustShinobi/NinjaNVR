@@ -1751,6 +1751,92 @@ impl OnvifCameraConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CameraSoftPreset {
+    pub name: String,
+    #[serde(default)]
+    pub pan: f32,
+    #[serde(default)]
+    pub tilt: f32,
+    #[serde(default)]
+    pub zoom: f32,
+}
+
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CameraHardwareConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_source_token: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub soft_presets: BTreeMap<String, CameraSoftPreset>,
+}
+
+impl std::fmt::Debug for CameraHardwareConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let masked_cloud = self
+            .cloud_password
+            .as_deref()
+            .map(|p| if p.is_empty() { "" } else { "***" });
+        f.debug_struct("CameraHardwareConfig")
+            .field("protocol", &self.protocol)
+            .field("cloud_password", &masked_cloud)
+            .field("profile_token", &self.profile_token)
+            .field("video_source_token", &self.video_source_token)
+            .field("soft_presets", &self.soft_presets)
+            .finish()
+    }
+}
+
+impl CameraHardwareConfig {
+    pub fn is_unconfigured(&self) -> bool {
+        self.protocol.as_deref().is_none_or(|p| p.trim().is_empty())
+            && self.cloud_password.as_deref().is_none_or(|p| p.is_empty())
+            && self
+                .profile_token
+                .as_deref()
+                .is_none_or(|t| t.trim().is_empty())
+            && self
+                .video_source_token
+                .as_deref()
+                .is_none_or(|t| t.trim().is_empty())
+            && self.soft_presets.is_empty()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct InferredCameraUpstream {
+    pub host: String,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub rtsp_path: Option<String>,
+    pub default_onvif_port: u16,
+    pub is_tapo_rtsp: bool,
+    pub is_dahua_rtsp: bool,
+}
+
+impl std::fmt::Debug for InferredCameraUpstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let masked_password = self
+            .password
+            .as_deref()
+            .map(|p| if p.is_empty() { "" } else { "***" });
+        f.debug_struct("InferredCameraUpstream")
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field("password", &masked_password)
+            .field("rtsp_path", &self.rtsp_path)
+            .field("default_onvif_port", &self.default_onvif_port)
+            .field("is_tapo_rtsp", &self.is_tapo_rtsp)
+            .field("is_dahua_rtsp", &self.is_dahua_rtsp)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraConfig {
     #[serde(default = "default_true")]
@@ -1769,6 +1855,8 @@ pub struct CameraConfig {
     pub map: CameraMapPlacement,
     #[serde(default, skip_serializing_if = "OnvifCameraConfig::is_unconfigured")]
     pub onvif: OnvifCameraConfig,
+    #[serde(default, skip_serializing_if = "CameraHardwareConfig::is_unconfigured")]
+    pub hardware: CameraHardwareConfig,
     #[serde(default)]
     pub ffmpeg: CameraFfmpegConfig,
     #[serde(default)]
@@ -1806,6 +1894,7 @@ impl Default for CameraConfig {
             ui: CameraUiConfig::default(),
             map: CameraMapPlacement::default(),
             onvif: OnvifCameraConfig::default(),
+            hardware: CameraHardwareConfig::default(),
             ffmpeg: CameraFfmpegConfig::default(),
             live: CameraLiveConfig::default(),
             detect: DetectConfig::default(),
@@ -2285,6 +2374,46 @@ impl NinjaConfig {
         if let Some(ref overlay) = validated_overlay {
             for (sk, sv) in &overlay.streams {
                 streams_map.entry(sk.clone()).or_insert_with(|| sv.clone());
+            }
+        }
+        for (cam_name, cam_cfg) in &self.cameras {
+            let Some(cloud_pw) = cam_cfg
+                .hardware
+                .cloud_password
+                .as_deref()
+                .filter(|p| !p.is_empty() && p.trim() != "***" && p.trim() != "*")
+            else {
+                continue;
+            };
+            let Some(upstream) = self.infer_camera_upstream(cam_name) else {
+                continue;
+            };
+            if !upstream.is_tapo_rtsp {
+                continue;
+            }
+            let encoded_pw = percent_encode_userinfo_component(cloud_pw);
+            let tapo_url = format!("tapo://{encoded_pw}@{}", upstream.host);
+            if let Some(stream_val) = streams_map.get_mut(cam_name) {
+                match stream_val {
+                    Value::String(s) => {
+                        if !s.trim().starts_with("tapo://") {
+                            let prev = s.clone();
+                            *stream_val =
+                                Value::Array(vec![Value::String(prev), Value::String(tapo_url)]);
+                        }
+                    }
+                    Value::Array(arr) => {
+                        let already_has_tapo = arr.iter().any(|item| {
+                            item.as_str().is_some_and(|s| {
+                                s.trim().to_ascii_lowercase().starts_with("tapo://")
+                            })
+                        });
+                        if !already_has_tapo {
+                            arr.push(Value::String(tapo_url));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -2783,9 +2912,30 @@ impl NinjaConfig {
                             Value::Null
                         },
                         "has_password": cam.onvif.password.as_ref().is_some_and(|p| !p.is_empty() && p != "***"),
+                        "cloud_password": if cam.hardware.cloud_password.as_ref().is_some_and(|p| !p.is_empty() && p != "***") {
+                            json!("***")
+                        } else {
+                            Value::Null
+                        },
+                        "has_cloud_password": cam.hardware.cloud_password.as_ref().is_some_and(|p| !p.is_empty() && p != "***"),
+                        "profile_token": cam.hardware.profile_token,
+                        "video_source_token": cam.hardware.video_source_token,
+                        "protocol": cam.hardware.protocol,
                         "autotracking": cam.onvif.autotracking,
                         "return_preset": cam.onvif.return_preset,
                         "timeout_sec": cam.onvif.timeout_sec
+                    },
+                    "hardware": {
+                        "protocol": cam.hardware.protocol,
+                        "cloud_password": if cam.hardware.cloud_password.as_ref().is_some_and(|p| !p.is_empty() && p != "***") {
+                            json!("***")
+                        } else {
+                            Value::Null
+                        },
+                        "has_cloud_password": cam.hardware.cloud_password.as_ref().is_some_and(|p| !p.is_empty() && p != "***"),
+                        "profile_token": cam.hardware.profile_token,
+                        "video_source_token": cam.hardware.video_source_token,
+                        "soft_presets": cam.hardware.soft_presets
                     },
                     "ui": {
                         "order": if cam.ui.order != 0 { cam.ui.order } else { order_idx as i32 },
@@ -3192,6 +3342,130 @@ impl NinjaConfig {
         None
     }
 
+    /// Infers the upstream camera host, RTSP credentials (`user`/`password`), RTSP path,
+    /// and protocol family hints (`is_tapo_rtsp`, `is_dahua_rtsp`, `default_onvif_port`)
+    /// from the camera's `onvif`, `ffmpeg.inputs`, or `go2rtc.streams` configuration.
+    pub fn infer_camera_upstream(&self, camera: &str) -> Option<InferredCameraUpstream> {
+        let cam = self.cameras.get(camera)?;
+        let mut candidate_urls: Vec<String> = Vec::new();
+        for inp in &cam.ffmpeg.inputs {
+            if !inp.path.is_empty() {
+                candidate_urls.push(inp.path.clone());
+            }
+        }
+        for key in [camera.to_string(), format!("{camera}_sub")] {
+            if let Some(val) = self.go2rtc.streams.get(&key) {
+                collect_urls_from_json_val(val, &mut candidate_urls);
+            }
+        }
+        if let Some(ref w) = cam.webui_url
+            && !w.trim().is_empty()
+        {
+            candidate_urls.push(w.clone());
+        }
+
+        let mut resolved_host: Option<String> = cam.onvif.host.as_deref().and_then(|h| {
+            let t = h.trim();
+            if t.contains("://") {
+                extract_non_loopback_host(t)
+            } else if !t.is_empty() {
+                extract_non_loopback_host(&format!("http://{t}"))
+            } else {
+                None
+            }
+        });
+        let mut resolved_user: Option<String> = cam
+            .onvif
+            .user
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut resolved_pass: Option<String> = cam
+            .onvif
+            .password
+            .as_deref()
+            .filter(|p| !p.is_empty() && p.trim() != "***" && p.trim() != "*")
+            .map(str::to_string);
+        let mut resolved_path: Option<String> = None;
+
+        let mut saw_tapo_url = false;
+        let mut saw_dahua_url = false;
+
+        for raw_url in &candidate_urls {
+            let raw_lc = raw_url.trim().to_ascii_lowercase();
+            if raw_lc.starts_with("tapo://") {
+                saw_tapo_url = true;
+            }
+            let Some(host) = extract_non_loopback_host(raw_url) else {
+                continue;
+            };
+            if resolved_host.is_none() {
+                resolved_host = Some(host);
+            }
+            if let Some((u_opt, p_opt, path_opt)) = parse_upstream_url_userinfo_and_path(raw_url) {
+                if resolved_user.is_none() {
+                    resolved_user = u_opt;
+                }
+                if resolved_pass.is_none() {
+                    resolved_pass = p_opt;
+                }
+                if let Some(ref p_str) = path_opt {
+                    let plc = p_str.to_ascii_lowercase();
+                    if plc.starts_with("/stream1") || plc.starts_with("/stream2") {
+                        saw_tapo_url = true;
+                    }
+                    if plc.contains("/cam/realmonitor") {
+                        saw_dahua_url = true;
+                    }
+                    if resolved_path.is_none() && p_str != "/" {
+                        resolved_path = Some(p_str.clone());
+                    }
+                }
+            }
+        }
+
+        let host = resolved_host?;
+        let path_lc = resolved_path.as_deref().unwrap_or("").to_ascii_lowercase();
+        let is_tapo_rtsp = saw_tapo_url
+            || path_lc.starts_with("/stream1")
+            || path_lc.starts_with("/stream2")
+            || cam.onvif.port == 2020
+            || cam
+                .hardware
+                .cloud_password
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+            || cam
+                .hardware
+                .protocol
+                .as_deref()
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("tapo"));
+        let is_dahua_rtsp = saw_dahua_url
+            || path_lc.contains("/cam/realmonitor")
+            || cam.hardware.protocol.as_deref().is_some_and(|p| {
+                p.trim().eq_ignore_ascii_case("dahua_cgi")
+                    || p.trim().eq_ignore_ascii_case("intelbras")
+            });
+        let default_onvif_port = if cam.onvif.port != default_onvif_port() {
+            cam.onvif.port
+        } else if is_tapo_rtsp {
+            2020
+        } else {
+            80
+        };
+
+        Some(InferredCameraUpstream {
+            host,
+            user: resolved_user,
+            password: resolved_pass,
+            rtsp_path: resolved_path,
+            default_onvif_port,
+            is_tapo_rtsp,
+            is_dahua_rtsp,
+        })
+    }
+
     /// Collects all raw URL strings currently stored in `cameras.*.ffmpeg.inputs`,
     /// `cameras.*.onvif.host`, `cameras.*.webui_url`, `go2rtc.streams`, `genai.base_url`,
     /// `peers.*.url`, `auth.oidc.issuer_url`, and `auth.proxy.logout_url`.
@@ -3287,6 +3561,18 @@ impl NinjaConfig {
                     .cameras
                     .get(cam_name)
                     .and_then(|c| c.onvif.password.clone());
+                restored_any = true;
+            }
+            if cam
+                .hardware
+                .cloud_password
+                .as_deref()
+                .is_some_and(|p| p.trim() == "***" || p.trim() == "*")
+            {
+                cam.hardware.cloud_password = prev
+                    .cameras
+                    .get(cam_name)
+                    .and_then(|c| c.hardware.cloud_password.clone());
                 restored_any = true;
             }
         }
@@ -3736,6 +4022,7 @@ impl NinjaConfig {
                             "zones",
                             "lines",
                             "state_rois",
+                            "soft_presets",
                             "filters",
                             "streams",
                             "mask",
@@ -3837,6 +4124,97 @@ impl NinjaConfig {
                 {
                     cam.onvif.return_preset = None;
                 }
+
+                // Support cloud_password, profile_token, video_source_token, and protocol under either `hardware` or `onvif`
+                let onvif_patch = cam_patch_val.get("onvif");
+                let hw_patch = cam_patch_val.get("hardware");
+                let clear_cloud_pass = hw_patch
+                    .and_then(|h| h.get("clear_cloud_password"))
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| {
+                        onvif_patch
+                            .and_then(|o| o.get("clear_cloud_password"))
+                            .and_then(|v| v.as_bool())
+                    })
+                    .unwrap_or(false);
+                let prev_cloud_pass =
+                    prev_cam_opt.and_then(|prev| prev.hardware.cloud_password.clone());
+                let hw_cloud_pass_patch = hw_patch
+                    .and_then(|h| h.get("cloud_password"))
+                    .and_then(|v| v.as_str())
+                    .filter(|p| !p.trim().is_empty() && p.trim() != "***" && p.trim() != "*")
+                    .map(str::to_string);
+                let onvif_cloud_pass_patch = onvif_patch
+                    .and_then(|o| o.get("cloud_password"))
+                    .and_then(|v| v.as_str())
+                    .filter(|p| !p.trim().is_empty() && p.trim() != "***" && p.trim() != "*")
+                    .map(str::to_string);
+                if clear_cloud_pass {
+                    cam.hardware.cloud_password = None;
+                } else if let Some(new_cp) = hw_cloud_pass_patch.or(onvif_cloud_pass_patch) {
+                    cam.hardware.cloud_password = Some(new_cp);
+                } else if cam
+                    .hardware
+                    .cloud_password
+                    .as_deref()
+                    .map(|p| p.trim().is_empty() || p.trim() == "***" || p.trim() == "*")
+                    .unwrap_or(true)
+                {
+                    cam.hardware.cloud_password = prev_cloud_pass;
+                }
+
+                let resolve_mirrored_string_field =
+                    |field_name: &str, prev_val: Option<&str>| -> Option<String> {
+                        let hw_f = hw_patch.and_then(|h| h.get(field_name));
+                        let onvif_f = onvif_patch.and_then(|o| o.get(field_name));
+                        let chosen = match (hw_f, onvif_f) {
+                            (Some(hv), Some(ov)) => {
+                                if prev_val.is_some_and(|pv| hv.as_str() == Some(pv))
+                                    && ov.as_str() != Some(prev_val.unwrap_or(""))
+                                {
+                                    Some(ov)
+                                } else {
+                                    Some(hv)
+                                }
+                            }
+                            (Some(hv), None) => Some(hv),
+                            (None, Some(ov)) => Some(ov),
+                            (None, None) => None,
+                        };
+                        match chosen {
+                            Some(Value::Null) => None,
+                            Some(Value::String(s)) => {
+                                let t = s.trim();
+                                if t.is_empty() {
+                                    None
+                                } else {
+                                    Some(t.to_string())
+                                }
+                            }
+                            _ => prev_val
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string),
+                        }
+                    };
+
+                cam.hardware.profile_token = resolve_mirrored_string_field(
+                    "profile_token",
+                    prev_cam_opt.and_then(|p| p.hardware.profile_token.as_deref()),
+                );
+                cam.hardware.video_source_token = resolve_mirrored_string_field(
+                    "video_source_token",
+                    prev_cam_opt.and_then(|p| p.hardware.video_source_token.as_deref()),
+                );
+                cam.hardware.protocol = resolve_mirrored_string_field(
+                    "protocol",
+                    prev_cam_opt.and_then(|p| p.hardware.protocol.as_deref()),
+                );
+                if hw_patch.and_then(|h| h.get("soft_presets")).is_none()
+                    && let Some(prev_cam) = prev_cam_opt
+                {
+                    cam.hardware.soft_presets = prev_cam.hardware.soft_presets.clone();
+                }
                 for zcfg in cam.zones.values_mut() {
                     if zcfg.preset.as_deref().is_some_and(|p| p.trim().is_empty()) {
                         zcfg.preset = None;
@@ -3911,6 +4289,13 @@ impl NinjaConfig {
         let clean_yaml = self.to_clean_yaml()?;
         // Verify the generated YAML can be parsed back cleanly
         let _ = Self::from_yaml_str(&clean_yaml, self.config_path.clone())?;
+        self.raw_yaml = clean_yaml;
+        Ok(())
+    }
+
+    pub fn refresh_raw_yaml(&mut self) -> Result<()> {
+        sanitize_config_floats(self);
+        let clean_yaml = self.to_clean_yaml()?;
         self.raw_yaml = clean_yaml;
         Ok(())
     }
@@ -4217,6 +4602,23 @@ fn sanitize_config_floats(cfg: &mut NinjaConfig) {
                     *pt = 0.0;
                 }
             }
+        }
+        for sp in cam.hardware.soft_presets.values_mut() {
+            sp.pan = if sp.pan.is_finite() {
+                sp.pan.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            sp.tilt = if sp.tilt.is_finite() {
+                sp.tilt.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            sp.zoom = if sp.zoom.is_finite() {
+                sp.zoom.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
         }
         for zone in cam.zones.values_mut() {
             if let Some(v) = zone.min_area
@@ -5761,6 +6163,7 @@ fn is_sensitive_yaml_key_name(key: &str) -> bool {
             .to_ascii_lowercase()
             .as_str(),
         "password"
+            | "cloud_password"
             | "pass"
             | "passwd"
             | "pwd"
@@ -5776,6 +6179,84 @@ fn is_sensitive_yaml_key_name(key: &str) -> bool {
             | "webhook_secret"
             | "jwt_secret"
     )
+}
+
+fn percent_encode_userinfo_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn percent_decode_userinfo_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((h << 4) | l) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_upstream_url_userinfo_and_path(
+    raw_url: &str,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let trimmed = raw_url.trim();
+    let (scheme, after_scheme) = trimmed.split_once("://")?;
+    let scheme_lc = scheme.trim().to_ascii_lowercase();
+    let slash_idx = after_scheme.find('/');
+    let authority = match slash_idx {
+        Some(idx) => &after_scheme[..idx],
+        None => after_scheme,
+    };
+    let path_opt = slash_idx.map(|idx| {
+        let raw_path = &after_scheme[idx..];
+        let hash_idx = raw_path.find('#').unwrap_or(raw_path.len());
+        raw_path[..hash_idx].to_string()
+    });
+    if scheme_lc == "tapo" {
+        return Some((None, None, path_opt));
+    }
+    let mut user_opt = None;
+    let mut pass_opt = None;
+    if let Some(at_idx) = authority.rfind('@') {
+        let userinfo = &authority[..at_idx];
+        if let Some((u, p)) = userinfo.split_once(':') {
+            let u_clean = percent_decode_userinfo_component(u.trim());
+            if !u_clean.is_empty() && u_clean != "*" {
+                user_opt = Some(u_clean);
+            }
+            if !p.is_empty() && p != "*" && p != "***" {
+                let p_clean = percent_decode_userinfo_component(p);
+                if !p_clean.is_empty() {
+                    pass_opt = Some(p_clean);
+                }
+            }
+        } else {
+            let u_clean = percent_decode_userinfo_component(userinfo.trim());
+            if !u_clean.is_empty() && u_clean != "*" {
+                user_opt = Some(u_clean);
+            }
+        }
+    }
+    Some((user_opt, pass_opt, path_opt))
 }
 
 fn strip_yaml_inline_comment(val: &str) -> &str {
@@ -10075,6 +10556,144 @@ cameras:
 
         // 4. Relative non-existent TLS path is rejected by is_safe_tls_path
         assert!(!is_safe_tls_path(Path::new("certs/ca.pem")));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn phase1_camera_hardware_config_upstream_inference_and_tapo_go2rtc_injection() {
+        let yaml = r#"
+go2rtc:
+  streams:
+    quarto:
+      - rtsp://tapo_cam_user:tapo_rtsp_pw@192.0.2.65:554/stream1#transport=tcp#timeout=10
+    quarto_sub:
+      - rtsp://tapo_cam_user:tapo_rtsp_pw@192.0.2.65:554/stream2#transport=tcp#timeout=10
+    sala:
+      - rtsp://admin:dahua_rtsp_pw@192.0.2.70:554/cam/realmonitor?channel=1&subtype=0&unicast=true&proto=Onvif
+cameras:
+  quarto:
+    enabled: true
+    hardware:
+      protocol: tapo
+      cloud_password: "tapo_cloud_secret!@#"
+      profile_token: profile_1
+      video_source_token: raw_vs1
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/quarto_sub
+          roles: [detect]
+  sala:
+    enabled: true
+    hardware:
+      soft_presets:
+        porta:
+          name: Porta Entrada
+          pan: 0.8
+          tilt: 0.4
+          zoom: 0.0
+    ffmpeg:
+      inputs:
+        - path: rtsp://127.0.0.1:8554/sala
+          roles: [detect, record]
+"#;
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr_p1_hw_cfg_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg_path = tmp_dir.join("config.yml");
+
+        let mut cfg = NinjaConfig::from_yaml_str(yaml, cfg_path).unwrap();
+
+        // 1. Upstream inference for Tapo (/stream1 -> port 2020, is_tapo_rtsp = true) and Dahua (/cam/realmonitor -> port 80, is_dahua_rtsp = true)
+        let quarto_up = cfg.infer_camera_upstream("quarto").unwrap();
+        assert_eq!(quarto_up.host, "192.0.2.65");
+        assert_eq!(quarto_up.user.as_deref(), Some("tapo_cam_user"));
+        assert_eq!(quarto_up.password.as_deref(), Some("tapo_rtsp_pw"));
+        assert_eq!(quarto_up.default_onvif_port, 2020);
+        assert!(quarto_up.is_tapo_rtsp);
+        assert!(!quarto_up.is_dahua_rtsp);
+        assert!(!format!("{quarto_up:?}").contains("tapo_rtsp_pw"));
+
+        let sala_up = cfg.infer_camera_upstream("sala").unwrap();
+        assert_eq!(sala_up.host, "192.0.2.70");
+        assert_eq!(sala_up.user.as_deref(), Some("admin"));
+        assert_eq!(sala_up.password.as_deref(), Some("dahua_rtsp_pw"));
+        assert_eq!(sala_up.default_onvif_port, 80);
+        assert!(!sala_up.is_tapo_rtsp);
+        assert!(sala_up.is_dahua_rtsp);
+
+        // 2. Scrubbing and API masking of cloud_password
+        let scrubbed_yaml = scrub_yaml_credentials(&cfg.raw_yaml);
+        assert!(!scrubbed_yaml.contains("tapo_cloud_secret!@#"));
+        assert!(!format!("{:?}", cfg.cameras["quarto"].hardware).contains("tapo_cloud_secret!@#"));
+
+        let mut api = cfg.to_api_value();
+        let api_str = serde_json::to_string(&api).unwrap();
+        assert!(!api_str.contains("tapo_cloud_secret!@#"));
+        assert_eq!(api["cameras"]["quarto"]["onvif"]["cloud_password"], "***");
+        assert_eq!(
+            api["cameras"]["quarto"]["onvif"]["has_cloud_password"],
+            true
+        );
+        assert_eq!(
+            api["cameras"]["quarto"]["hardware"]["cloud_password"],
+            "***"
+        );
+        assert_eq!(
+            api["cameras"]["quarto"]["hardware"]["has_cloud_password"],
+            true
+        );
+        assert_eq!(
+            api["cameras"]["quarto"]["onvif"]["profile_token"],
+            "profile_1"
+        );
+        assert_eq!(
+            api["cameras"]["sala"]["hardware"]["soft_presets"]["porta"]["name"],
+            "Porta Entrada"
+        );
+
+        // 3. Round-tripping masked "***" preserves cloud_password; rotating via onvif.cloud_password updates it; clear_cloud_password removes it
+        cfg.apply_structured_json(&api).unwrap();
+        assert_eq!(
+            cfg.cameras["quarto"].hardware.cloud_password.as_deref(),
+            Some("tapo_cloud_secret!@#")
+        );
+
+        // Rotate cloud_password and profile_token via onvif.* when a value already exists
+        api["cameras"]["quarto"]["onvif"]["cloud_password"] = json!("rotated_cloud_pw_99");
+        api["cameras"]["quarto"]["onvif"]["profile_token"] = json!("Profile000");
+        cfg.apply_structured_json(&api).unwrap();
+        assert_eq!(
+            cfg.cameras["quarto"].hardware.cloud_password.as_deref(),
+            Some("rotated_cloud_pw_99")
+        );
+        assert_eq!(
+            cfg.cameras["quarto"].hardware.profile_token.as_deref(),
+            Some("Profile000")
+        );
+
+        // Restore original secret for go2rtc test
+        api = cfg.to_api_value();
+        api["cameras"]["quarto"]["hardware"]["cloud_password"] = json!("tapo_cloud_secret!@#");
+        cfg.apply_structured_json(&api).unwrap();
+
+        // 4. write_go2rtc_config automatically appends tapo:// producer with percent-encoded cloud_password
+        let g2_out = tmp_dir.join("go2rtc.yaml");
+        cfg.write_go2rtc_config(&g2_out).unwrap();
+        let g2_yaml: Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&g2_out).unwrap()).unwrap();
+        let quarto_producers = g2_yaml["streams"]["quarto"].as_array().unwrap();
+        assert_eq!(quarto_producers.len(), 2);
+        assert_eq!(
+            quarto_producers[1].as_str(),
+            Some("tapo://tapo_cloud_secret%21%40%23@192.0.2.65")
+        );
+
+        // Clear cloud_password via onvif.clear_cloud_password
+        api["cameras"]["quarto"]["onvif"]["clear_cloud_password"] = json!(true);
+        cfg.apply_structured_json(&api).unwrap();
+        assert!(cfg.cameras["quarto"].hardware.cloud_password.is_none());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

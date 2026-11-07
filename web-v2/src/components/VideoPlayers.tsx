@@ -42,6 +42,7 @@ export interface PushToTalkPeerConnectionLike {
 }
 
 export interface PushToTalkDependencies {
+  mode?: "webrtc" | "cgi_alaw" | null;
   getUserMedia?: (constraints: { audio: boolean }) => Promise<PushToTalkStreamLike>;
   createPeerConnection?: () => PushToTalkPeerConnectionLike;
   fetchImpl?: (
@@ -158,10 +159,146 @@ export async function startPushToTalkSession(
 
   const fetchImpl =
     deps?.fetchImpl ??
-    ((url, init) => fetch(url, init));
+    ((url, init) => fetch(url, init as RequestInit));
 
   const stream = await getUserMedia({ audio: true });
   let pc: PushToTalkPeerConnectionLike | null = null;
+
+  if (deps?.mode === "cgi_alaw") {
+    const encodeBytesToBase64 = (bytes: Uint8Array): string => {
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) {
+        bin += String.fromCharCode(bytes[i]);
+      }
+      if (typeof btoa === "function") {
+        return btoa(bin);
+      }
+      return bin;
+    };
+
+    try {
+      const silenceProbeB64 = encodeBytesToBase64(new Uint8Array(320));
+      const resp = await fetchImpl(
+        `/api/${encodeURIComponent(camera)}/audio/talkback`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "audio/pcm;base64" },
+          credentials: "include",
+          body: silenceProbeB64,
+        }
+      );
+      if (!resp.ok) {
+        throw new Error(`HTTP audio talkback failed (${resp.status})`);
+      }
+
+      // Attach live WebAudio microphone capture when running in a browser context
+      let audioCleanup: (() => void) | null = null;
+      const AudioCtxCtor =
+        typeof window !== "undefined"
+          ? window.AudioContext ||
+            (window as unknown as { webkitAudioContext?: typeof AudioContext })
+              .webkitAudioContext
+          : undefined;
+      if (AudioCtxCtor) {
+        try {
+          const ctx = new AudioCtxCtor({ sampleRate: 8000 });
+          const src = ctx.createMediaStreamSource(
+            stream as unknown as MediaStream
+          );
+          const proc = ctx.createScriptProcessor(2048, 1, 1);
+          let stopped = false;
+          let inFlight = false;
+          const pendingChunks: Uint8Array[] = [];
+
+          const flushPendingAudio = async () => {
+            if (inFlight || stopped || pendingChunks.length === 0) return;
+            inFlight = true;
+            try {
+              while (!stopped && pendingChunks.length > 0) {
+                const batch = pendingChunks.splice(0, pendingChunks.length);
+                let totalLen = 0;
+                for (const c of batch) totalLen += c.length;
+                const merged = new Uint8Array(totalLen);
+                let offset = 0;
+                for (const c of batch) {
+                  merged.set(c, offset);
+                  offset += c.length;
+                }
+                const payloadB64 = encodeBytesToBase64(merged);
+                await fetchImpl(
+                  `/api/${encodeURIComponent(camera)}/audio/talkback`,
+                  {
+                    method: "POST",
+                    headers: { "Content-Type": "audio/pcm;base64" },
+                    credentials: "include",
+                    body: payloadB64,
+                  }
+                ).catch(() => {});
+              }
+            } finally {
+              inFlight = false;
+            }
+          };
+
+          proc.onaudioprocess = (ev) => {
+            if (stopped) return;
+            const ch = ev.inputBuffer.getChannelData(0);
+            if (!ch || ch.length === 0) return;
+            const inRate =
+              typeof ctx.sampleRate === "number" && ctx.sampleRate > 8000
+                ? ctx.sampleRate
+                : 8000;
+            const step = inRate / 8000;
+            const outSamples = Math.max(1, Math.floor(ch.length / step));
+            const bytes = new Uint8Array(outSamples * 2);
+            for (let i = 0; i < outSamples; i++) {
+              const srcIdx = Math.min(ch.length - 1, Math.floor(i * step));
+              const s = Math.max(-1, Math.min(1, ch[srcIdx]));
+              const v = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
+              bytes[i * 2] = v & 0xff;
+              bytes[i * 2 + 1] = (v >> 8) & 0xff;
+            }
+            if (pendingChunks.length >= 8) {
+              pendingChunks.shift();
+            }
+            pendingChunks.push(bytes);
+            void flushPendingAudio();
+          };
+          src.connect(proc);
+          proc.connect(ctx.destination);
+          audioCleanup = () => {
+            stopped = true;
+            pendingChunks.length = 0;
+            try {
+              proc.disconnect();
+              src.disconnect();
+              void ctx.close();
+            } catch {
+              // ignore
+            }
+          };
+        } catch {
+          // AudioContext optional in non-DOM/restricted contexts
+        }
+      }
+
+      const cgiPc: PushToTalkPeerConnectionLike = {
+        close() {
+          audioCleanup?.();
+        },
+      };
+      return {
+        camera,
+        stream,
+        pc: cgiPc,
+        answerSdp: "cgi_alaw",
+        stop: () => closePushToTalkSession(stream, cgiPc),
+      };
+    } catch (err) {
+      closePushToTalkSession(stream, null);
+      throw err;
+    }
+  }
 
   try {
     const activePc = createPeerConnection();
@@ -407,12 +544,16 @@ export function createPushToTalkController(
 export interface PushToTalkButtonProps {
   camera: string;
   height?: number;
+  supported?: boolean;
+  mode?: "webrtc" | "cgi_alaw" | null;
   onStateChange?: (state: PushToTalkState, error: string | null) => void;
 }
 
 export const PushToTalkButton: React.FC<PushToTalkButtonProps> = ({
   camera,
   height = 20,
+  supported = true,
+  mode = "webrtc",
   onStateChange,
 }) => {
   const [pttState, setPttState] = useState<PushToTalkState>("idle");
@@ -422,17 +563,34 @@ export const PushToTalkButton: React.FC<PushToTalkButtonProps> = ({
   onStateChangeRef.current = onStateChange;
 
   useEffect(() => {
-    const ctrl = createPushToTalkController(camera, undefined, (nextState, nextErr) => {
-      setPttState(nextState);
-      setPttError(nextErr);
-      onStateChangeRef.current?.(nextState, nextErr);
-    });
+    if (!supported) {
+      if (controllerRef.current) {
+        controllerRef.current.unmount();
+        controllerRef.current = null;
+      }
+      setPttState("idle");
+      setPttError(null);
+      return;
+    }
+    const ctrl = createPushToTalkController(
+      camera,
+      { mode: mode || "webrtc" },
+      (nextState, nextErr) => {
+        setPttState(nextState);
+        setPttError(nextErr);
+        onStateChangeRef.current?.(nextState, nextErr);
+      }
+    );
     controllerRef.current = ctrl;
     return () => {
       ctrl.unmount();
       controllerRef.current = null;
     };
-  }, [camera]);
+  }, [camera, supported, mode]);
+
+  if (!supported) {
+    return null;
+  }
 
   const isTalking = pttState === "talking";
   const isConnecting = pttState === "connecting";
@@ -807,6 +965,8 @@ interface LiveMsePlayerProps {
   draftColor?: string;
   /** Extra layer positioned exactly over the contained video picture (0..100% space). */
   stageOverlay?: React.ReactNode;
+  pushToTalkSupported?: boolean;
+  pushToTalkMode?: "webrtc" | "cgi_alaw" | null;
 }
 
 /**
@@ -1036,6 +1196,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   onClick,
   draftColor = "#f59e0b",
   stageOverlay,
+  pushToTalkSupported,
+  pushToTalkMode = "webrtc",
 }) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef0 = useRef<HTMLVideoElement | null>(null);
@@ -1732,6 +1894,29 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   };
 
   const posterSrc = resolveLivePosterUrl(realCamera, useMainStream, posterTick);
+  const effCfg = cameraConfig ?? configuredCameras?.[realCamera];
+  const effProto = (
+    effCfg?.hardware?.protocol ||
+    effCfg?.onvif?.protocol ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+  const resolvedPttSupported = Boolean(onPlotPoint)
+    ? false
+    : pushToTalkSupported !== undefined
+    ? pushToTalkSupported
+    : configuredCameras === undefined && cameraConfig === undefined
+    ? true
+    : Boolean(
+        effCfg?.onvif?.has_cloud_password ||
+          effCfg?.hardware?.has_cloud_password ||
+          effProto === "dahua_cgi" ||
+          effProto === "intelbras"
+      );
+  const resolvedPttMode =
+    pushToTalkMode ??
+    (effProto === "dahua_cgi" || effProto === "intelbras" ? "cgi_alaw" : "webrtc");
 
   return (
     <div
@@ -1780,8 +1965,10 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         extraHud={
           <>
             <PushToTalkButton
-              camera={camera}
+              camera={realCamera}
               height={20}
+              supported={resolvedPttSupported}
+              mode={resolvedPttMode}
               onStateChange={(nextState) => setPttState(nextState)}
             />
             <button

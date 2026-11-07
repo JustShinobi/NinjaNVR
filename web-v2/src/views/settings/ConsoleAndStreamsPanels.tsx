@@ -4,6 +4,7 @@ import { SupportedLocale, useI18n } from "../../i18n";
 import { useNvrStore } from "../../store/useNvrStore";
 import {
   CameraConfig,
+  CameraHardwareInfoResponse,
   FfprobeItem,
   NinjaConfigResponse,
 } from "../../types/nvr";
@@ -52,6 +53,37 @@ export function buildOnvifPasswordPatch(
     password: hasExistingPassword ? "***" : "",
     has_password: Boolean(hasExistingPassword),
     clear_password: false,
+  };
+}
+
+export function buildCloudPasswordPatch(
+  rawInput: string,
+  hasExistingPassword?: boolean,
+  clearRequested?: boolean
+): {
+  cloud_password: string;
+  has_cloud_password: boolean;
+  clear_cloud_password: boolean;
+} {
+  if (clearRequested) {
+    return {
+      cloud_password: "",
+      has_cloud_password: false,
+      clear_cloud_password: true,
+    };
+  }
+  const isMaskSentinel = rawInput === "***" || rawInput === "*";
+  if (rawInput.length > 0 && !isMaskSentinel) {
+    return {
+      cloud_password: rawInput,
+      has_cloud_password: Boolean(hasExistingPassword),
+      clear_cloud_password: false,
+    };
+  }
+  return {
+    cloud_password: hasExistingPassword ? "***" : "",
+    has_cloud_password: Boolean(hasExistingPassword),
+    clear_cloud_password: false,
   };
 }
 
@@ -655,6 +687,9 @@ export const ChannelsStreamsSection: React.FC<{
   const [newCamMainUrl, setNewCamMainUrl] = useState("");
   const [newCamSubUrl, setNewCamSubUrl] = useState("");
   const [probeBusy, setProbeBusy] = useState(false);
+  const [hwProbeBusy, setHwProbeBusy] = useState(false);
+  const [hwProbeResult, setHwProbeResult] =
+    useState<CameraHardwareInfoResponse | null>(null);
   const [probeResult, setProbeResult] = useState<{
     ok: boolean;
     latency_ms: number;
@@ -673,6 +708,48 @@ export const ChannelsStreamsSection: React.FC<{
   const inspectorCamRef = React.useRef(inspectorCam);
   inspectorCamRef.current = inspectorCam;
 
+  const handleRunHardwareDiscovery = async (silent = false) => {
+    const targetCam = inspectorCam;
+    if (!targetCam) return;
+    setHwProbeBusy(true);
+    try {
+      const res = await fetch(
+        `/api/${encodeURIComponent(targetCam)}/hardware?timeout_ms=4000`,
+        { credentials: "include" }
+      );
+      const data = (await res.json().catch(() => null)) as CameraHardwareInfoResponse | null;
+      if (inspectorCamRef.current !== targetCam) return;
+      if (res.ok && data) {
+        setHwProbeResult(data);
+        if (!silent) {
+          notify(
+            isPt
+              ? `Recursos detectados para '${targetCam}' (${data.device_info?.model || data.protocol_family})`
+              : `Detected capabilities for '${targetCam}' (${data.device_info?.model || data.protocol_family})`
+          );
+        }
+      } else if (!silent) {
+        notify(
+          isPt
+            ? "Falha ao detectar recursos de hardware da câmera"
+            : "Failed to detect camera hardware capabilities"
+        );
+      }
+    } catch {
+      if (!silent && inspectorCamRef.current === targetCam) {
+        notify(
+          isPt
+            ? "Erro de rede ao consultar hardware da câmera"
+            : "Network error probing camera hardware"
+        );
+      }
+    } finally {
+      if (inspectorCamRef.current === targetCam) {
+        setHwProbeBusy(false);
+      }
+    }
+  };
+
   React.useEffect(() => {
     inspectorCamRef.current = inspectorCam;
     probeSeqRef.current += 1;
@@ -682,6 +759,11 @@ export const ChannelsStreamsSection: React.FC<{
     }
     setProbeBusy(false);
     setProbeResult(null);
+    setHwProbeBusy(false);
+    setHwProbeResult(null);
+    if (typeof window !== "undefined" && inspectorCam) {
+      void handleRunHardwareDiscovery(true);
+    }
   }, [inspectorCam]);
 
   React.useEffect(() => {
@@ -742,6 +824,94 @@ export const ChannelsStreamsSection: React.FC<{
       }
     }
   };
+
+  const handleApplyHardwareControl = async (patch: Record<string, unknown>) => {
+    const targetCam = inspectorCam;
+    if (!targetCam) return;
+    setHwProbeBusy(true);
+    try {
+      const res = await fetch(`/api/${encodeURIComponent(targetCam)}/hardware`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(patch),
+      });
+      const data = await res.json().catch(() => null);
+      if (inspectorCamRef.current !== targetCam) return;
+      if (res.ok && data?.success) {
+        const stateOnlyPatch: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(patch)) {
+          if (
+            k !== "apply_suggested_onvif" &&
+            k !== "apply_suggested_substream" &&
+            k !== "cloud_password" &&
+            k !== "protocol" &&
+            k !== "profile_token" &&
+            k !== "video_source_token" &&
+            k !== "reboot"
+          ) {
+            stateOnlyPatch[k] = v;
+          }
+        }
+        const isConfigPersistencePatch =
+          patch.apply_suggested_onvif === true ||
+          patch.apply_suggested_substream === true ||
+          typeof patch.cloud_password === "string";
+        setHwProbeResult((prev) =>
+          prev
+            ? {
+                ...prev,
+                onvif_configured:
+                  patch.apply_suggested_onvif === true
+                    ? true
+                    : prev.onvif_configured,
+                missing_requirements: (prev.missing_requirements || []).filter(
+                  (r) =>
+                    !(
+                      patch.apply_suggested_onvif === true &&
+                      r === "onvif_not_configured"
+                    ) &&
+                    !(
+                      typeof patch.cloud_password === "string" &&
+                      patch.cloud_password.trim().length > 0 &&
+                      r === "tapo_cloud_password"
+                    )
+                ),
+                state: { ...prev.state, ...stateOnlyPatch },
+              }
+            : prev
+        );
+        if (isConfigPersistencePatch) {
+          try {
+            const cfgRes = await fetch("/api/config", { credentials: "include" });
+            if (cfgRes.ok) {
+              const freshCfg = (await cfgRes.json()) as NinjaConfigResponse;
+              useNvrStore.getState().setConfig(freshCfg);
+            }
+          } catch {
+            // ignore
+          }
+          void handleRunHardwareDiscovery(true);
+        }
+        notify(
+          isPt
+            ? `Controle de hardware aplicado em '${targetCam}'`
+            : `Applied hardware control on '${targetCam}'`
+        );
+      } else {
+        notify(data?.error || data?.message || "Hardware control request failed");
+      }
+    } catch {
+      if (inspectorCamRef.current === targetCam) {
+        notify("Failed to reach camera hardware endpoint");
+      }
+    } finally {
+      if (inspectorCamRef.current === targetCam) {
+        setHwProbeBusy(false);
+      }
+    }
+  };
+
   const [newStreamName, setNewStreamName] = useState("");
   const [newStreamUrl, setNewStreamUrl] = useState("");
   const [showAllGo2rtc, setShowAllGo2rtc] = useState(false);
@@ -1197,9 +1367,9 @@ export const ChannelsStreamsSection: React.FC<{
                 </div>
               </div>
 
-              {/* ONVIF PTZ & Resilient Auto-Tracking Configuration */}
+              {/* ONVIF PTZ, Hardware Capabilities & Two-Way Audio Configuration */}
               <div className="nvr-subcard">
-                <div className="nvr-subcard-header">
+                <div className="nvr-subcard-header" style={{ flexWrap: "wrap", gap: 6 }}>
                   <span
                     className="mono"
                     style={{
@@ -1209,10 +1379,26 @@ export const ChannelsStreamsSection: React.FC<{
                     }}
                   >
                     {isPt
-                      ? "ONVIF PTZ & AUTO-TRACKING RESILIENTE"
-                      : "ONVIF PTZ & RESILIENT AUTO-TRACKING"}
+                      ? "ONVIF PTZ, ÁUDIO 2 VIAS (PTT) & CONTROLE DE HARDWARE"
+                      : "ONVIF PTZ, 2-WAY AUDIO (PTT) & HARDWARE CONTROL"}
                   </span>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="nvr-btn mono sm"
+                      disabled={hwProbeBusy}
+                      aria-label={`Detect Hardware Capabilities ${inspectorCam}`}
+                      onClick={() => void handleRunHardwareDiscovery()}
+                    >
+                      <RefreshCw size={10} />
+                      {hwProbeBusy
+                        ? isPt
+                          ? "Detectando..."
+                          : "Detecting..."
+                        : isPt
+                        ? "Detectar Recursos"
+                        : "Detect Capabilities"}
+                    </button>
                     <span
                       className="mono"
                       style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}
@@ -1269,7 +1455,7 @@ export const ChannelsStreamsSection: React.FC<{
                     min={1}
                     max={65535}
                     className="nvr-input mono sm"
-                    placeholder="Port (80)"
+                    placeholder="Port (80 / 2020)"
                     aria-label="ONVIF Port"
                     value={activeCamCfg.onvif?.port ?? 80}
                     onChange={(e) => {
@@ -1416,6 +1602,921 @@ export const ChannelsStreamsSection: React.FC<{
                     }}
                   />
                 </div>
+
+                {/* Optional Cloud Password for TP-Link Tapo Two-Way Audio (Port 8800) & TPAP (Port 443) */}
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1.3fr 0.7fr",
+                    gap: 6,
+                    marginTop: 2,
+                  }}
+                >
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <input
+                      type="password"
+                      className="nvr-input mono sm"
+                      style={{ flex: 1, minWidth: 0 }}
+                      placeholder={
+                        activeCamCfg.onvif?.has_cloud_password ||
+                        activeCamCfg.hardware?.has_cloud_password
+                          ? "*** (Tapo Cloud Password saved — PTT enabled)"
+                          : isPt
+                          ? "Senha da Conta Cloud (Tapo 2-Way Audio / TPAP — opcional)"
+                          : "Cloud Account Password (Tapo 2-Way Audio / TPAP — optional)"
+                      }
+                      aria-label="Cloud Account Password"
+                      value={(() => {
+                        const rawCp =
+                          activeCamCfg.onvif?.cloud_password ||
+                          activeCamCfg.hardware?.cloud_password ||
+                          "";
+                        return rawCp === "***" || rawCp === "*" ? "" : rawCp;
+                      })()}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        updateDraft((next) => {
+                          const cam = next.cameras[inspectorCam];
+                          if (!cam) return;
+                          const patch = buildCloudPasswordPatch(
+                            val,
+                            Boolean(
+                              cam.onvif?.has_cloud_password ||
+                                cam.hardware?.has_cloud_password
+                            ),
+                            false
+                          );
+                          cam.onvif = {
+                            port: 80,
+                            timeout_sec: 5,
+                            ...(cam.onvif || {}),
+                            ...patch,
+                          };
+                          cam.hardware = {
+                            ...(cam.hardware || {}),
+                            ...patch,
+                          };
+                        });
+                      }}
+                    />
+                    {(() => {
+                      const rawTypedCp =
+                        activeCamCfg.onvif?.cloud_password ||
+                        activeCamCfg.hardware?.cloud_password ||
+                        "";
+                      const hasNewCp =
+                        rawTypedCp.trim().length > 0 &&
+                        rawTypedCp.trim() !== "***" &&
+                        rawTypedCp.trim() !== "*";
+                      return hasNewCp ? (
+                        <button
+                          type="button"
+                          className="nvr-btn primary mono sm"
+                          disabled={hwProbeBusy}
+                          aria-label={`Apply Cloud Password ${inspectorCam}`}
+                          title="Save Cloud Password & provision 2-way audio in go2rtc"
+                          onClick={() => {
+                            void handleApplyHardwareControl({
+                              cloud_password: rawTypedCp.trim(),
+                            });
+                          }}
+                        >
+                          {isPt ? "Ativar PTT" : "Enable PTT"}
+                        </button>
+                      ) : null;
+                    })()}
+                    {(activeCamCfg.onvif?.has_cloud_password ||
+                      activeCamCfg.hardware?.has_cloud_password ||
+                      (activeCamCfg.onvif?.cloud_password &&
+                        activeCamCfg.onvif.cloud_password !== "")) && (
+                      <button
+                        type="button"
+                        className="nvr-btn danger mono sm"
+                        title="Clear saved Cloud Account password"
+                        aria-label="Clear Cloud Password"
+                        onClick={() => {
+                          updateDraft((next) => {
+                            const cam = next.cameras[inspectorCam];
+                            if (!cam) return;
+                            const patch = buildCloudPasswordPatch("", false, true);
+                            cam.onvif = {
+                              port: 80,
+                              timeout_sec: 5,
+                              ...(cam.onvif || {}),
+                              ...patch,
+                            };
+                            cam.hardware = {
+                              ...(cam.hardware || {}),
+                              ...patch,
+                            };
+                          });
+                        }}
+                      >
+                        ×
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    className="nvr-input mono sm"
+                    placeholder={
+                      isPt
+                        ? "ProfileToken (Auto: Profile_1 / Profile000)"
+                        : "ProfileToken (Auto: Profile_1 / Profile000)"
+                    }
+                    aria-label="ONVIF Profile Token"
+                    value={
+                      activeCamCfg.onvif?.profile_token ||
+                      activeCamCfg.hardware?.profile_token ||
+                      ""
+                    }
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      updateDraft((next) => {
+                        const cam = next.cameras[inspectorCam];
+                        if (!cam) return;
+                        cam.onvif = {
+                          port: 80,
+                          timeout_sec: 5,
+                          ...(cam.onvif || {}),
+                          profile_token: val,
+                        };
+                        cam.hardware = {
+                          ...(cam.hardware || {}),
+                          profile_token: val,
+                        };
+                      });
+                    }}
+                  />
+                </div>
+
+                {/* Discovered Hardware Capabilities & Interactive Controls */}
+                {hwProbeResult && (
+                  <div
+                    className="nvr-subcard mono"
+                    style={{
+                      padding: 8,
+                      borderColor: hwProbeResult.online
+                        ? "var(--signal-live)"
+                        : "var(--signal-alert)",
+                      fontSize: "var(--text-xs)",
+                      gap: 6,
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        flexWrap: "wrap",
+                        gap: 6,
+                      }}
+                    >
+                      <span
+                        style={{
+                          fontWeight: 700,
+                          color: hwProbeResult.online
+                            ? "var(--signal-live-text)"
+                            : "var(--signal-alert-text)",
+                        }}
+                      >
+                        {hwProbeResult.online
+                          ? `${hwProbeResult.device_info?.manufacturer || "CAMERA"} ${
+                              hwProbeResult.device_info?.model || ""
+                            } // ${hwProbeResult.protocol_family.toUpperCase()}`
+                          : isPt
+                          ? "CÂMERA OFFLINE OU SEM RESPOSTA ONVIF/CGI"
+                          : "CAMERA OFFLINE OR UNREACHABLE ONVIF/CGI"}
+                      </span>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        {hwProbeResult.suggested_config?.onvif_host && (
+                          <button
+                            type="button"
+                            className={`nvr-btn ${
+                              hwProbeResult.onvif_configured ? "" : "primary"
+                            } mono sm`}
+                            aria-label={`Auto-Fill ONVIF Config ${inspectorCam}`}
+                            onClick={() => {
+                              const sug = hwProbeResult.suggested_config!;
+                              updateDraft((next) => {
+                                const cam = next.cameras[inspectorCam];
+                                if (!cam) return;
+                                cam.onvif = {
+                                  ...(cam.onvif || {}),
+                                  host: sug.onvif_host || cam.onvif?.host || "",
+                                  port: sug.onvif_port || cam.onvif?.port || 80,
+                                  user: sug.onvif_user || cam.onvif?.user || "",
+                                  profile_token:
+                                    sug.profile_token || cam.onvif?.profile_token || null,
+                                  video_source_token:
+                                    sug.video_source_token ||
+                                    cam.onvif?.video_source_token ||
+                                    null,
+                                  protocol: sug.protocol || cam.onvif?.protocol || null,
+                                  timeout_sec: cam.onvif?.timeout_sec ?? 5,
+                                };
+                                cam.hardware = {
+                                  ...(cam.hardware || {}),
+                                  profile_token:
+                                    sug.profile_token || cam.hardware?.profile_token || null,
+                                  video_source_token:
+                                    sug.video_source_token ||
+                                    cam.hardware?.video_source_token ||
+                                    null,
+                                  protocol: sug.protocol || cam.hardware?.protocol || null,
+                                };
+                              });
+                              void handleApplyHardwareControl({
+                                apply_suggested_onvif: true,
+                                protocol: sug.protocol || undefined,
+                                profile_token: sug.profile_token || undefined,
+                                video_source_token: sug.video_source_token || undefined,
+                              });
+                            }}
+                          >
+                            {hwProbeResult.onvif_configured
+                              ? isPt
+                                ? "Ressincronizar ONVIF"
+                                : "Re-Sync ONVIF"
+                              : isPt
+                              ? "Auto-Configurar ONVIF Agora"
+                              : "Auto-Configure ONVIF Now"}
+                          </button>
+                        )}
+                        {hwProbeResult.suggested_config?.native_substream_url && (
+                          <button
+                            type="button"
+                            className="nvr-btn mono sm"
+                            aria-label={`Use Native Substream ${inspectorCam}`}
+                            title={hwProbeResult.suggested_config.native_substream_url}
+                            onClick={() => {
+                              const subUrl =
+                                hwProbeResult.suggested_config?.native_substream_url;
+                              if (!subUrl) return;
+                              updateDraft((next) => {
+                                if (!next.go2rtc) next.go2rtc = { streams: {} };
+                                if (!next.go2rtc.streams) next.go2rtc.streams = {};
+                                next.go2rtc.streams[`${inspectorCam}_sub`] = [subUrl];
+                                const cam = next.cameras[inspectorCam];
+                                if (cam?.ffmpeg?.inputs) {
+                                  for (const inp of cam.ffmpeg.inputs) {
+                                    if (
+                                      inp.roles?.length === 1 &&
+                                      inp.roles[0] === "detect"
+                                    ) {
+                                      inp.path = `rtsp://127.0.0.1:8554/${inspectorCam}_sub`;
+                                    }
+                                  }
+                                }
+                              });
+                              void handleApplyHardwareControl({
+                                apply_suggested_substream: true,
+                              });
+                            }}
+                          >
+                            {isPt
+                              ? "Ativar Substream Nativo"
+                              : "Use Native Substream"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Capability Matrix Badges */}
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                      <span
+                        className={`nvr-badge mono ${
+                          hwProbeResult.capabilities.ptz ? "live" : ""
+                        }`}
+                      >
+                        PTZ: {hwProbeResult.capabilities.ptz ? "OK" : "OFF"}
+                      </span>
+                      <span
+                        className={`nvr-badge mono ${
+                          hwProbeResult.capabilities.ptz_presets ? "live" : ""
+                        }`}
+                      >
+                        PRESETS: {hwProbeResult.capabilities.ptz_presets ? "OK" : "OFF"}
+                      </span>
+                      <span
+                        className={`nvr-badge mono ${
+                          hwProbeResult.capabilities.push_to_talk
+                            ? "live"
+                            : hwProbeResult.missing_requirements?.includes(
+                                "tapo_cloud_password"
+                              )
+                            ? "motion"
+                            : ""
+                        }`}
+                      >
+                        PTT:{" "}
+                        {hwProbeResult.capabilities.push_to_talk
+                          ? `OK (${(
+                              hwProbeResult.capabilities.push_to_talk_mode || "webrtc"
+                            ).toUpperCase()})`
+                          : hwProbeResult.missing_requirements?.includes(
+                              "tapo_cloud_password"
+                            )
+                          ? isPt
+                            ? "OCULTO (REQUER SENHA CLOUD TAPO)"
+                            : "HIDDEN (NEEDS TAPO CLOUD PW)"
+                          : isPt
+                          ? "OCULTO (NÃO SUPORTADO)"
+                          : "HIDDEN (UNSUPPORTED)"}
+                      </span>
+                      <span
+                        className={`nvr-badge mono ${
+                          hwProbeResult.capabilities.imaging ? "live" : ""
+                        }`}
+                      >
+                        IMAGING: {hwProbeResult.capabilities.imaging ? "OK" : "OFF"}
+                      </span>
+                      {hwProbeResult.capabilities.hardware_autotracking && (
+                        <span className="nvr-badge mono live">CGI SMART-TRACK: OK</span>
+                      )}
+                    </div>
+
+                    {/* Interactive Hardware Controls inside Settings */}
+                    {hwProbeResult.online &&
+                      Boolean(
+                        hwProbeResult.capabilities.imaging ||
+                          hwProbeResult.capabilities.day_night_mode ||
+                          hwProbeResult.capabilities.ir_lighting ||
+                          hwProbeResult.capabilities.hardware_autotracking ||
+                          hwProbeResult.capabilities.status_led ||
+                          hwProbeResult.capabilities.flip_mirror ||
+                          hwProbeResult.capabilities.wdr ||
+                          hwProbeResult.capabilities.siren_on_event ||
+                          hwProbeResult.capabilities.audio_anomaly_detect ||
+                          hwProbeResult.capabilities.audio_volume ||
+                          hwProbeResult.capabilities.reboot
+                      ) && (
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns:
+                              "repeat(auto-fit, minmax(150px, 1fr))",
+                            gap: 6,
+                            paddingTop: 4,
+                            borderTop: "1px solid var(--border-hairline)",
+                          }}
+                        >
+                          {hwProbeResult.capabilities.imaging && (
+                            <>
+                              {(
+                                [
+                                  [
+                                    "brightness",
+                                    isPt ? "Brilho do Sensor" : "Sensor Brightness",
+                                    hwProbeResult.state.brightness ?? 50,
+                                  ],
+                                  [
+                                    "contrast",
+                                    isPt ? "Contraste" : "Contrast",
+                                    hwProbeResult.state.contrast ?? 50,
+                                  ],
+                                  [
+                                    "saturation",
+                                    isPt ? "Saturação" : "Saturation",
+                                    hwProbeResult.state.saturation ?? 50,
+                                  ],
+                                  [
+                                    "sharpness",
+                                    isPt ? "Nitidez" : "Sharpness",
+                                    hwProbeResult.state.sharpness ?? 50,
+                                  ],
+                                ] as const
+                              ).map(([fieldKey, labelText, curVal]) => (
+                                <label
+                                  key={fieldKey}
+                                  style={{
+                                    display: "flex",
+                                    flexDirection: "column",
+                                    gap: 2,
+                                  }}
+                                >
+                                  <span style={{ color: "var(--text-secondary)" }}>
+                                    {labelText} ({curVal}%):
+                                  </span>
+                                  <select
+                                    className="nvr-select mono sm"
+                                    aria-label={`${labelText} ${inspectorCam}`}
+                                    value={String(curVal)}
+                                    disabled={hwProbeBusy}
+                                    onChange={(e) =>
+                                      void handleApplyHardwareControl({
+                                        [fieldKey]: Number(e.target.value),
+                                      })
+                                    }
+                                  >
+                                    {Array.from(
+                                      new Set([20, 35, 50, 65, 80, 95, curVal])
+                                    )
+                                      .sort((a, b) => a - b)
+                                      .map((v) => (
+                                        <option key={v} value={v}>
+                                          {v}%
+                                        </option>
+                                      ))}
+                                  </select>
+                                </label>
+                              ))}
+                            </>
+                          )}
+                          {hwProbeResult.capabilities.day_night_mode && (
+                            <label
+                              style={{
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: 2,
+                              }}
+                            >
+                              <span style={{ color: "var(--text-secondary)" }}>
+                                {isPt
+                                  ? "Modo Visão Noturna IR:"
+                                  : "Day/Night IR Mode:"}
+                              </span>
+                              <select
+                                className="nvr-select mono sm"
+                                aria-label={`Day/Night IR Mode ${inspectorCam}`}
+                                value={
+                                  hwProbeResult.state.day_night_mode || "auto"
+                                }
+                                disabled={hwProbeBusy}
+                                onChange={(e) =>
+                                  void handleApplyHardwareControl({
+                                    day_night_mode: e.target.value,
+                                  })
+                                }
+                              >
+                                <option value="auto">
+                                  {isPt ? "Automático" : "Auto"}
+                                </option>
+                                <option value="day">
+                                  {isPt ? "Dia (Colorido)" : "Day (Color)"}
+                                </option>
+                                <option value="night">
+                                  {isPt
+                                    ? "Noite (Infravermelho P&B)"
+                                    : "Night (IR B&W)"}
+                                </option>
+                              </select>
+                            </label>
+                          )}
+                          {hwProbeResult.capabilities.ir_lighting && (
+                            <>
+                              <label
+                                style={{
+                                  display: "flex",
+                                  flexDirection: "column",
+                                  gap: 2,
+                                }}
+                              >
+                                <span style={{ color: "var(--text-secondary)" }}>
+                                  {isPt ? "Iluminação IR:" : "IR Lighting Mode:"}
+                                </span>
+                                <select
+                                  className="nvr-select mono sm"
+                                  aria-label={`IR Lighting Mode ${inspectorCam}`}
+                                  value={hwProbeResult.state.ir_mode || "auto"}
+                                  disabled={hwProbeBusy}
+                                  onChange={(e) =>
+                                    void handleApplyHardwareControl({
+                                      ir_mode: e.target.value,
+                                    })
+                                  }
+                                >
+                                  <option value="auto">
+                                    {isPt ? "Auto" : "Auto"}
+                                  </option>
+                                  <option value="manual">
+                                    {isPt ? "Manual" : "Manual"}
+                                  </option>
+                                  <option value="off">
+                                    {isPt ? "Desligado" : "Off"}
+                                  </option>
+                                </select>
+                              </label>
+                              <label
+                                style={{
+                                  display: "flex",
+                                  flexDirection: "column",
+                                  gap: 2,
+                                }}
+                              >
+                                <span style={{ color: "var(--text-secondary)" }}>
+                                  {isPt
+                                    ? `Potência IR (${
+                                        hwProbeResult.state.ir_brightness ?? 65
+                                      }%):`
+                                    : `IR Brightness (${
+                                        hwProbeResult.state.ir_brightness ?? 65
+                                      }%):`}
+                                </span>
+                                <select
+                                  className="nvr-select mono sm"
+                                  aria-label={`IR Brightness ${inspectorCam}`}
+                                  value={String(
+                                    hwProbeResult.state.ir_brightness ?? 65
+                                  )}
+                                  disabled={hwProbeBusy}
+                                  onChange={(e) =>
+                                    void handleApplyHardwareControl({
+                                      ir_brightness: Number(e.target.value),
+                                    })
+                                  }
+                                >
+                                  {Array.from(
+                                    new Set([
+                                      20,
+                                      40,
+                                      65,
+                                      80,
+                                      100,
+                                      hwProbeResult.state.ir_brightness ?? 65,
+                                    ])
+                                  )
+                                    .sort((a, b) => a - b)
+                                    .map((v) => (
+                                      <option key={v} value={v}>
+                                        {v}%
+                                      </option>
+                                    ))}
+                                </select>
+                              </label>
+                            </>
+                          )}
+                          {hwProbeResult.capabilities.audio_volume && (
+                            <>
+                              <label
+                                style={{
+                                  display: "flex",
+                                  flexDirection: "column",
+                                  gap: 2,
+                                }}
+                              >
+                                <span style={{ color: "var(--text-secondary)" }}>
+                                  {isPt
+                                    ? `Volume Alto-Falante (${
+                                        hwProbeResult.state.speaker_volume ?? 85
+                                      }%):`
+                                    : `Speaker Volume (${
+                                        hwProbeResult.state.speaker_volume ?? 85
+                                      }%):`}
+                                </span>
+                                <select
+                                  className="nvr-select mono sm"
+                                  aria-label={`Speaker Volume ${inspectorCam}`}
+                                  value={String(
+                                    hwProbeResult.state.speaker_volume ?? 85
+                                  )}
+                                  disabled={hwProbeBusy}
+                                  onChange={(e) =>
+                                    void handleApplyHardwareControl({
+                                      speaker_volume: Number(e.target.value),
+                                    })
+                                  }
+                                >
+                                  {Array.from(
+                                    new Set([
+                                      25,
+                                      50,
+                                      75,
+                                      85,
+                                      100,
+                                      hwProbeResult.state.speaker_volume ?? 85,
+                                    ])
+                                  )
+                                    .sort((a, b) => a - b)
+                                    .map((v) => (
+                                      <option key={v} value={v}>
+                                        {v}%
+                                      </option>
+                                    ))}
+                                </select>
+                              </label>
+                              <label
+                                style={{
+                                  display: "flex",
+                                  flexDirection: "column",
+                                  gap: 2,
+                                }}
+                              >
+                                <span style={{ color: "var(--text-secondary)" }}>
+                                  {isPt
+                                    ? `Volume Microfone (${
+                                        hwProbeResult.state.microphone_volume ?? 90
+                                      }%):`
+                                    : `Microphone Volume (${
+                                        hwProbeResult.state.microphone_volume ?? 90
+                                      }%):`}
+                                </span>
+                                <select
+                                  className="nvr-select mono sm"
+                                  aria-label={`Microphone Volume ${inspectorCam}`}
+                                  value={String(
+                                    hwProbeResult.state.microphone_volume ?? 90
+                                  )}
+                                  disabled={hwProbeBusy}
+                                  onChange={(e) =>
+                                    void handleApplyHardwareControl({
+                                      microphone_volume: Number(e.target.value),
+                                    })
+                                  }
+                                >
+                                  {Array.from(
+                                    new Set([
+                                      25,
+                                      50,
+                                      75,
+                                      90,
+                                      100,
+                                      hwProbeResult.state.microphone_volume ?? 90,
+                                    ])
+                                  )
+                                    .sort((a, b) => a - b)
+                                    .map((v) => (
+                                      <option key={v} value={v}>
+                                        {v}%
+                                      </option>
+                                    ))}
+                                </select>
+                              </label>
+                            </>
+                          )}
+                          {hwProbeResult.capabilities.audio_anomaly_detect && (
+                            <label
+                              style={{
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: 2,
+                              }}
+                            >
+                              <span style={{ color: "var(--text-secondary)" }}>
+                                {isPt
+                                  ? `Sensibilidade Áudio (${
+                                      hwProbeResult.state.audio_sensitivity ?? 70
+                                    }%):`
+                                  : `Audio Sensitivity (${
+                                      hwProbeResult.state.audio_sensitivity ?? 70
+                                    }%):`}
+                              </span>
+                              <select
+                                className="nvr-select mono sm"
+                                aria-label={`Audio Sensitivity ${inspectorCam}`}
+                                value={String(
+                                  hwProbeResult.state.audio_sensitivity ?? 70
+                                )}
+                                disabled={hwProbeBusy}
+                                onChange={(e) =>
+                                  void handleApplyHardwareControl({
+                                    audio_sensitivity: Number(e.target.value),
+                                  })
+                                }
+                              >
+                                {Array.from(
+                                  new Set([
+                                    30,
+                                    50,
+                                    70,
+                                    85,
+                                    100,
+                                    hwProbeResult.state.audio_sensitivity ?? 70,
+                                  ])
+                                )
+                                  .sort((a, b) => a - b)
+                                  .map((v) => (
+                                    <option key={v} value={v}>
+                                      {v}%
+                                    </option>
+                                  ))}
+                              </select>
+                            </label>
+                          )}
+                          {hwProbeResult.capabilities.hardware_autotracking && (
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                gap: 6,
+                              }}
+                            >
+                              <span>
+                                {isPt
+                                  ? "SmartTrack na Câmera:"
+                                  : "Camera SmartTrack:"}
+                              </span>
+                              <ToggleSwitch
+                                checked={Boolean(
+                                  hwProbeResult.state.hardware_autotracking
+                                )}
+                                label={`Toggle hardware SmartTrack on ${inspectorCam}`}
+                                onChange={(v) =>
+                                  void handleApplyHardwareControl({
+                                    hardware_autotracking: v,
+                                  })
+                                }
+                              />
+                            </div>
+                          )}
+                          {hwProbeResult.capabilities.status_led && (
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                gap: 6,
+                              }}
+                            >
+                              <span>
+                                {isPt ? "LED de Status:" : "Status LED:"}
+                              </span>
+                              <ToggleSwitch
+                                checked={Boolean(
+                                  hwProbeResult.state.status_led
+                                )}
+                                label={`Toggle status LED on ${inspectorCam}`}
+                                onChange={(v) =>
+                                  void handleApplyHardwareControl({
+                                    status_led: v,
+                                  })
+                                }
+                              />
+                            </div>
+                          )}
+                          {hwProbeResult.capabilities.flip_mirror && (
+                            <>
+                              <div
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  gap: 6,
+                                }}
+                              >
+                                <span>
+                                  {isPt ? "Espelhar Horizontal:" : "Mirror Image:"}
+                                </span>
+                                <ToggleSwitch
+                                  checked={Boolean(hwProbeResult.state.mirror)}
+                                  label={`Toggle mirror image on ${inspectorCam}`}
+                                  onChange={(v) =>
+                                    void handleApplyHardwareControl({
+                                      mirror: v,
+                                    })
+                                  }
+                                />
+                              </div>
+                              <div
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  gap: 6,
+                                }}
+                              >
+                                <span>
+                                  {isPt ? "Inverter 180° (Flip):" : "Flip 180°:"}
+                                </span>
+                                <ToggleSwitch
+                                  checked={Boolean(hwProbeResult.state.flip)}
+                                  label={`Toggle flip image on ${inspectorCam}`}
+                                  onChange={(v) =>
+                                    void handleApplyHardwareControl({
+                                      flip: v,
+                                    })
+                                  }
+                                />
+                              </div>
+                            </>
+                          )}
+                          {hwProbeResult.capabilities.wdr && (
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                gap: 6,
+                              }}
+                            >
+                              <span>{isPt ? "WDR (HDR):" : "WDR (HDR):"}</span>
+                              <ToggleSwitch
+                                checked={Boolean(hwProbeResult.state.wdr)}
+                                label={`Toggle WDR on ${inspectorCam}`}
+                                onChange={(v) =>
+                                  void handleApplyHardwareControl({
+                                    wdr: v,
+                                  })
+                                }
+                              />
+                            </div>
+                          )}
+                          {hwProbeResult.capabilities.siren_on_event && (
+                            <>
+                              <div
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  gap: 6,
+                                }}
+                              >
+                                <span>
+                                  {isPt
+                                    ? "Sirene em Movimento:"
+                                    : "Siren on Motion:"}
+                                </span>
+                                <ToggleSwitch
+                                  checked={Boolean(
+                                    hwProbeResult.state.siren_on_motion
+                                  )}
+                                  label={`Toggle motion siren on ${inspectorCam}`}
+                                  onChange={(v) =>
+                                    void handleApplyHardwareControl({
+                                      siren_on_motion: v,
+                                    })
+                                  }
+                                />
+                              </div>
+                              <div
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  gap: 6,
+                                }}
+                              >
+                                <span>
+                                  {isPt ? "Sirene em Ruído:" : "Siren on Audio:"}
+                                </span>
+                                <ToggleSwitch
+                                  checked={Boolean(
+                                    hwProbeResult.state.siren_on_audio
+                                  )}
+                                  label={`Toggle audio siren on ${inspectorCam}`}
+                                  onChange={(v) =>
+                                    void handleApplyHardwareControl({
+                                      siren_on_audio: v,
+                                    })
+                                  }
+                                />
+                              </div>
+                            </>
+                          )}
+                          {hwProbeResult.capabilities.audio_anomaly_detect && (
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                gap: 6,
+                              }}
+                            >
+                              <span>
+                                {isPt
+                                  ? "Detecção de Anomalia Sonora:"
+                                  : "Audio Anomaly Detect:"}
+                              </span>
+                              <ToggleSwitch
+                                checked={Boolean(
+                                  hwProbeResult.state.audio_detect_enabled
+                                )}
+                                label={`Toggle audio anomaly detect on ${inspectorCam}`}
+                                onChange={(v) =>
+                                  void handleApplyHardwareControl({
+                                    audio_detect_enabled: v,
+                                  })
+                                }
+                              />
+                            </div>
+                          )}
+                          {hwProbeResult.capabilities.reboot && (
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "flex-end",
+                              }}
+                            >
+                              <button
+                                type="button"
+                                className="nvr-btn danger mono sm"
+                                disabled={hwProbeBusy}
+                                aria-label={`Reboot Camera ${inspectorCam}`}
+                                onClick={() =>
+                                  void handleApplyHardwareControl({
+                                    reboot: true,
+                                  })
+                                }
+                              >
+                                {isPt ? "Reiniciar Câmera" : "Reboot Camera"}
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                  </div>
+                )}
               </div>
 
               {/* Visual Stream Probe Summary Cards */}

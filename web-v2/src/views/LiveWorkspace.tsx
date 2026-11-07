@@ -18,6 +18,7 @@ export {
 import {
   CameraConfig,
   CameraGroupConfig,
+  CameraHardwareInfoResponse,
   CameraLiveActivity,
   CameraMapPlacement,
   CameraPtzInfoResponse,
@@ -1092,10 +1093,111 @@ export function sanitizeTimeShiftSeek(
 
 export function isCameraPtzEnabled(
   camCfg?: CameraConfig,
-  ptzInfo?: CameraPtzInfoResponse | null
+  ptzInfo?: CameraPtzInfoResponse | null,
+  hwInfo?: CameraHardwareInfoResponse | null
 ): boolean {
+  if (
+    hwInfo?.online &&
+    hwInfo.capabilities &&
+    hwInfo.capabilities.ptz === false &&
+    ptzInfo?.online !== true
+  ) {
+    return false;
+  }
+  if (hwInfo?.online && hwInfo.capabilities?.ptz === true) {
+    return true;
+  }
   if (ptzInfo?.enabled) return true;
   return Boolean(camCfg?.onvif?.host && camCfg.onvif.host.trim().length > 0);
+}
+
+export function resolveCameraPushToTalkCapability(
+  camCfg?: CameraConfig,
+  hwInfo?: CameraHardwareInfoResponse | null,
+  go2rtcStreams?: Record<string, unknown> | null,
+  camName?: string
+): { supported: boolean; mode: "webrtc" | "cgi_alaw" | null } {
+  if (
+    camCfg?.onvif?.has_cloud_password ||
+    camCfg?.hardware?.has_cloud_password ||
+    Boolean(
+      camCfg?.onvif?.cloud_password &&
+        camCfg.onvif.cloud_password.trim() !== ""
+    ) ||
+    Boolean(
+      camCfg?.hardware?.cloud_password &&
+        camCfg.hardware.cloud_password.trim() !== ""
+    )
+  ) {
+    return { supported: true, mode: "webrtc" };
+  }
+  const hasTwoWayProducer = (rawUrl: string): boolean => {
+    const lc = rawUrl.trim().toLowerCase();
+    if (lc.includes("#backchannel=0")) return false;
+    return (
+      lc.startsWith("tapo://") ||
+      lc.startsWith("dvrip://") ||
+      lc.startsWith("isapi://") ||
+      lc.startsWith("roborock://") ||
+      lc.startsWith("ring://") ||
+      lc.startsWith("tuya://") ||
+      lc.startsWith("xiaomi://") ||
+      lc.startsWith("doorbird://") ||
+      lc.includes("#backchannel=1")
+    );
+  };
+  if (camName && go2rtcStreams && go2rtcStreams[camName] !== undefined) {
+    const entry = go2rtcStreams[camName];
+    if (typeof entry === "string" && hasTwoWayProducer(entry)) {
+      return { supported: true, mode: "webrtc" };
+    }
+    if (
+      Array.isArray(entry) &&
+      entry.some((item) => typeof item === "string" && hasTwoWayProducer(item))
+    ) {
+      return { supported: true, mode: "webrtc" };
+    }
+  }
+  if (hwInfo && hwInfo.capabilities) {
+    if (hwInfo.capabilities.push_to_talk) {
+      return {
+        supported: true,
+        mode: hwInfo.capabilities.push_to_talk_mode || "webrtc",
+      };
+    }
+    return { supported: false, mode: null };
+  }
+  const configuredProto = (
+    camCfg?.hardware?.protocol ||
+    camCfg?.onvif?.protocol ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+  if (configuredProto === "dahua_cgi" || configuredProto === "intelbras") {
+    return { supported: true, mode: "cgi_alaw" };
+  }
+  return { supported: false, mode: null };
+}
+
+export function isCameraHardwareControlsSupported(
+  hwInfo?: CameraHardwareInfoResponse | null
+): boolean {
+  if (!hwInfo?.online || !hwInfo.capabilities) return false;
+  const c = hwInfo.capabilities;
+  return Boolean(
+    c.imaging ||
+      c.hardware_autotracking ||
+      c.day_night_mode ||
+      c.ir_lighting ||
+      c.status_led ||
+      c.flip_mirror ||
+      c.wdr ||
+      c.siren_on_event ||
+      c.audio_anomaly_detect ||
+      c.audio_volume ||
+      c.reboot
+  );
 }
 
 export function resolveCameraPtzPresets(
@@ -1112,7 +1214,8 @@ export function resolveCameraPtzPresets(
     }
   };
   for (const p of ptzInfo?.presets || []) {
-    pushUnique(p.token || p.name);
+    pushUnique(p.name || p.token);
+    if (p.token) seen.add(p.token.trim());
   }
   for (const name of ptzInfo?.preset_names || []) {
     pushUnique(name);
@@ -1286,16 +1389,41 @@ export const TacticalPtzHudOverlay: React.FC<{
   camera: string;
   cameraConfig?: CameraConfig;
   ptzInfo?: CameraPtzInfoResponse | null;
+  hardwareInfo?: CameraHardwareInfoResponse | null;
   onPtzUpdate?: (camera: string, nextInfo: CameraPtzInfoResponse) => void;
-}> = ({ camera, cameraConfig, ptzInfo, onPtzUpdate }) => {
-  const ptzEnabled = isCameraPtzEnabled(cameraConfig, ptzInfo);
+  onHardwareUpdate?: (camera: string, nextHw: CameraHardwareInfoResponse) => void;
+}> = ({
+  camera,
+  cameraConfig,
+  ptzInfo,
+  hardwareInfo,
+  onPtzUpdate,
+  onHardwareUpdate,
+}) => {
+  const ptzEnabled = isCameraPtzEnabled(cameraConfig, ptzInfo, hardwareInfo);
+  const hwControlsSupported = isCameraHardwareControlsSupported(hardwareInfo);
+  const [showPresetInput, setShowPresetInput] = useState(false);
+  const [newPresetName, setNewPresetName] = useState("");
+  const [showHwDrawer, setShowHwDrawer] = useState(false);
+  const [hwBusy, setHwBusy] = useState(false);
   const onPtzUpdateRef = useRef(onPtzUpdate);
   onPtzUpdateRef.current = onPtzUpdate;
+  const onHardwareUpdateRef = useRef(onHardwareUpdate);
+  onHardwareUpdateRef.current = onHardwareUpdate;
   const ptzInfoRef = useRef(ptzInfo);
   ptzInfoRef.current = ptzInfo;
+  const hardwareInfoRef = useRef(hardwareInfo);
+  hardwareInfoRef.current = hardwareInfo;
   const activeCameraRef = useRef<string | null>((camera || "").trim());
   activeCameraRef.current = (camera || "").trim();
   const lifecycleRef = useRef<PtzMoveLifecycleController | null>(null);
+
+  useEffect(() => {
+    setShowPresetInput(false);
+    setNewPresetName("");
+    setShowHwDrawer(false);
+    setHwBusy(false);
+  }, [camera]);
 
   useEffect(() => {
     const cleanCam = (camera || "").trim();
@@ -1365,7 +1493,7 @@ export const TacticalPtzHudOverlay: React.FC<{
     };
   }, [camera, ptzEnabled]);
 
-  if (!ptzEnabled) {
+  if (!ptzEnabled && !hwControlsSupported) {
     return null;
   }
 
@@ -1374,6 +1502,27 @@ export const TacticalPtzHudOverlay: React.FC<{
     ptzInfo?.active_preset !== undefined
       ? ptzInfo.active_preset
       : cameraConfig?.onvif?.return_preset || null;
+  const canManagePresets =
+    hardwareInfo?.online && hardwareInfo?.capabilities?.ptz_presets_manage === false
+      ? false
+      : Boolean(ptzInfo?.features?.includes("presets_manage")) ||
+        Boolean(hardwareInfo?.capabilities?.ptz_presets_manage);
+  const cfgProto = (
+    cameraConfig?.hardware?.protocol ||
+    cameraConfig?.onvif?.protocol ||
+    ""
+  )
+    .trim()
+    .toLowerCase();
+  const isKnownPanTiltOnly =
+    cameraConfig?.onvif?.port === 2020 ||
+    cfgProto === "tapo" ||
+    cfgProto === "dahua_cgi" ||
+    cfgProto === "intelbras";
+  const zoomSupported =
+    hardwareInfo?.capabilities?.ptz_zoom !== undefined
+      ? Boolean(hardwareInfo.capabilities.ptz_zoom)
+      : !isKnownPanTiltOnly;
 
   const startContinuousMove = (dir: PtzMoveDirection) => {
     void lifecycleRef.current?.startMove(dir);
@@ -1455,6 +1604,118 @@ export const TacticalPtzHudOverlay: React.FC<{
     }
   };
 
+  const handleSaveCurrentPreset = async () => {
+    const cleanName = newPresetName.trim();
+    const targetCam = (camera || "").trim();
+    if (!cleanName || !targetCam) return;
+    try {
+      const res = await fetch(
+        `/api/${encodeURIComponent(targetCam)}/ptz/preset/save`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ name: cleanName }),
+        }
+      );
+      const data = await res.json().catch(() => null);
+      if (
+        res.ok &&
+        data?.success &&
+        activeCameraRef.current === targetCam &&
+        onPtzUpdateRef.current
+      ) {
+        const cur = ptzInfoRef.current || { enabled: true };
+        const nextPresets = [...(cur.presets || [])];
+        const tok = String(data.token || cleanName);
+        if (!nextPresets.some((p) => p.token === tok || p.name === cleanName)) {
+          nextPresets.push({ token: tok, name: cleanName });
+        }
+        onPtzUpdateRef.current(targetCam, {
+          ...cur,
+          presets: nextPresets,
+          preset_names: nextPresets.map((p) => p.name),
+          active_preset: cleanName,
+        });
+        setNewPresetName("");
+        setShowPresetInput(false);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleDeleteActivePreset = async () => {
+    const targetCam = (camera || "").trim();
+    if (!activePreset || !targetCam) return;
+    const matchItem = (ptzInfo?.presets || []).find(
+      (p) => p.name === activePreset || p.token === activePreset
+    );
+    const tokToDelete = matchItem?.token || activePreset;
+    try {
+      const res = await fetch(
+        `/api/${encodeURIComponent(targetCam)}/ptz/preset/${encodeURIComponent(tokToDelete)}`,
+        {
+          method: "DELETE",
+          credentials: "include",
+        }
+      );
+      if (
+        res.ok &&
+        activeCameraRef.current === targetCam &&
+        onPtzUpdateRef.current
+      ) {
+        const cur = ptzInfoRef.current || { enabled: true };
+        const nextPresets = (cur.presets || []).filter(
+          (p) => p.token !== tokToDelete && p.name !== activePreset
+        );
+        onPtzUpdateRef.current(targetCam, {
+          ...cur,
+          presets: nextPresets,
+          preset_names: nextPresets.map((p) => p.name),
+          active_preset: null,
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleApplyHardwareField = async (patch: Record<string, unknown>) => {
+    const targetCam = (camera || "").trim();
+    if (!targetCam || hwBusy) return;
+    setHwBusy(true);
+    try {
+      const res = await fetch(`/api/${encodeURIComponent(targetCam)}/hardware`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(patch),
+      });
+      const curHw = hardwareInfoRef.current;
+      if (
+        res.ok &&
+        activeCameraRef.current === targetCam &&
+        curHw &&
+        onHardwareUpdateRef.current
+      ) {
+        onHardwareUpdateRef.current(targetCam, {
+          ...curHw,
+          state: {
+            ...curHw.state,
+            ...patch,
+          },
+        });
+      }
+    } catch {
+      // ignore
+    } finally {
+      if (activeCameraRef.current === targetCam) {
+        setHwBusy(false);
+      }
+    }
+  };
+
   return (
     <div
       className="nvr-ptz-hud mono"
@@ -1463,6 +1724,7 @@ export const TacticalPtzHudOverlay: React.FC<{
       style={{
         display: "inline-flex",
         alignItems: "center",
+        flexWrap: "wrap",
         gap: 3,
         padding: "2px 5px",
         background: "rgba(7, 10, 15, 0.88)",
@@ -1471,62 +1733,347 @@ export const TacticalPtzHudOverlay: React.FC<{
         pointerEvents: "auto",
       }}
     >
-      <span
-        className="nvr-badge mono"
-        style={{
-          height: 20,
-          padding: "0 5px",
-          fontSize: "var(--text-xs)",
-          color: "var(--signal-accent-text)",
-        }}
-      >
-        PTZ{activePreset ? `:${activePreset}` : ""}
-      </span>
-      <button {...bindDirectionButtonProps("left", `PTZ Pan Left ${camera}`, "Pan Left")}>
-        ◀
-      </button>
-      <button {...bindDirectionButtonProps("up", `PTZ Tilt Up ${camera}`, "Tilt Up")}>
-        ▲
-      </button>
-      <button {...bindDirectionButtonProps("down", `PTZ Tilt Down ${camera}`, "Tilt Down")}>
-        ▼
-      </button>
-      <button {...bindDirectionButtonProps("right", `PTZ Pan Right ${camera}`, "Pan Right")}>
-        ▶
-      </button>
-      <button {...bindDirectionButtonProps("zoom_in", `PTZ Zoom In ${camera}`, "Zoom In")}>
-        Z+
-      </button>
-      <button {...bindDirectionButtonProps("zoom_out", `PTZ Zoom Out ${camera}`, "Zoom Out")}>
-        Z-
-      </button>
-      <button
-        type="button"
-        className="nvr-btn danger nvr-tile-action mono sm"
-        aria-label={`PTZ Stop ${camera}`}
-        title="Stop PTZ Movement"
-        onClick={() => stopContinuousMove(true)}
-      >
-        ■
-      </button>
-      {presets.length > 0 && (
-        <select
-          className="nvr-select mono sm"
-          aria-label={`PTZ Preset Selector ${camera}`}
-          value={activePreset || ""}
-          onChange={(e) => {
-            if (e.target.value) {
-              void sendPreset(e.target.value);
-            }
-          }}
-        >
-          <option value="">Preset...</option>
-          {presets.map((p) => (
-            <option key={p} value={p}>
-              {p}
-            </option>
-          ))}
-        </select>
+      {ptzEnabled && (
+        <>
+          <span
+            className="nvr-badge mono"
+            style={{
+              height: 20,
+              padding: "0 5px",
+              fontSize: "var(--text-xs)",
+              color: "var(--signal-accent-text)",
+            }}
+          >
+            PTZ{activePreset ? `:${activePreset}` : ""}
+          </span>
+          <button
+            {...bindDirectionButtonProps("left", `PTZ Pan Left ${camera}`, "Pan Left")}
+          >
+            ◀
+          </button>
+          <button
+            {...bindDirectionButtonProps("up", `PTZ Tilt Up ${camera}`, "Tilt Up")}
+          >
+            ▲
+          </button>
+          <button
+            {...bindDirectionButtonProps("down", `PTZ Tilt Down ${camera}`, "Tilt Down")}
+          >
+            ▼
+          </button>
+          <button
+            {...bindDirectionButtonProps("right", `PTZ Pan Right ${camera}`, "Pan Right")}
+          >
+            ▶
+          </button>
+          {zoomSupported && (
+            <>
+              <button
+                {...bindDirectionButtonProps("zoom_in", `PTZ Zoom In ${camera}`, "Zoom In")}
+              >
+                Z+
+              </button>
+              <button
+                {...bindDirectionButtonProps("zoom_out", `PTZ Zoom Out ${camera}`, "Zoom Out")}
+              >
+                Z-
+              </button>
+            </>
+          )}
+          <button
+            type="button"
+            className="nvr-btn danger nvr-tile-action mono sm"
+            aria-label={`PTZ Stop ${camera}`}
+            title="Stop PTZ Movement"
+            onClick={() => stopContinuousMove(true)}
+          >
+            ■
+          </button>
+          {presets.length > 0 && (
+            <select
+              className="nvr-select mono sm"
+              aria-label={`PTZ Preset Selector ${camera}`}
+              value={activePreset || ""}
+              onChange={(e) => {
+                if (e.target.value) {
+                  void sendPreset(e.target.value);
+                }
+              }}
+            >
+              <option value="">Preset...</option>
+              {presets.map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </select>
+          )}
+          {canManagePresets && (
+            <>
+              <button
+                type="button"
+                className="nvr-btn nvr-tile-action mono sm"
+                style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                aria-label={`Save PTZ Preset ${camera}`}
+                title="Save current camera position as preset"
+                onClick={() => setShowPresetInput((v) => !v)}
+              >
+                +P
+              </button>
+              {activePreset && (
+                <button
+                  type="button"
+                  className="nvr-btn danger nvr-tile-action mono sm"
+                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                  aria-label={`Delete PTZ Preset ${camera}`}
+                  title={`Delete preset '${activePreset}'`}
+                  onClick={() => void handleDeleteActivePreset()}
+                >
+                  ×
+                </button>
+              )}
+              {showPresetInput && (
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+                  <input
+                    type="text"
+                    className="nvr-input mono sm"
+                    style={{ width: 78, height: 20, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                    placeholder="Preset..."
+                    aria-label={`New Preset Name ${camera}`}
+                    value={newPresetName}
+                    onChange={(e) => setNewPresetName(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void handleSaveCurrentPreset();
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="nvr-btn primary mono sm"
+                    style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                    aria-label={`Confirm Save Preset ${camera}`}
+                    onClick={() => void handleSaveCurrentPreset()}
+                  >
+                    OK
+                  </button>
+                </span>
+              )}
+            </>
+          )}
+        </>
+      )}
+      {hwControlsSupported && hardwareInfo && (
+        <>
+          <button
+            type="button"
+            className={`nvr-btn nvr-tile-action mono sm ${showHwDrawer ? "active" : ""}`}
+            style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+            aria-label={`Hardware Controls ${camera}`}
+            aria-pressed={showHwDrawer}
+            title="Camera Hardware Controls (IR, SmartTrack, LED, Flip/Mirror, Image)"
+            onClick={() => setShowHwDrawer((v) => !v)}
+          >
+            HW
+          </button>
+          {showHwDrawer && (
+            <span
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 3,
+                paddingLeft: 3,
+                borderLeft: "1px solid var(--border-strong)",
+              }}
+            >
+              {hardwareInfo.capabilities.day_night_mode && (
+                <select
+                  className="nvr-select mono sm"
+                  style={{ height: 20, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                  aria-label={`Day Night IR Mode ${camera}`}
+                  disabled={hwBusy}
+                  value={hardwareInfo.state.day_night_mode || "auto"}
+                  onChange={(e) =>
+                    void handleApplyHardwareField({ day_night_mode: e.target.value })
+                  }
+                >
+                  <option value="auto">IR:AUTO</option>
+                  <option value="day">IR:DAY</option>
+                  <option value="night">IR:NIGHT</option>
+                </select>
+              )}
+              {hardwareInfo.capabilities.hardware_autotracking && (
+                <button
+                  type="button"
+                  disabled={hwBusy}
+                  aria-label={`Toggle SmartTrack ${camera}`}
+                  aria-pressed={Boolean(hardwareInfo.state.hardware_autotracking)}
+                  className={`nvr-btn nvr-tile-action mono sm ${
+                    hardwareInfo.state.hardware_autotracking ? "active" : ""
+                  }`}
+                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                  title="Toggle camera hardware SmartTrack"
+                  onClick={() =>
+                    void handleApplyHardwareField({
+                      hardware_autotracking: !hardwareInfo.state.hardware_autotracking,
+                    })
+                  }
+                >
+                  TRK
+                </button>
+              )}
+              {hardwareInfo.capabilities.status_led && (
+                <button
+                  type="button"
+                  disabled={hwBusy}
+                  aria-label={`Toggle Status LED ${camera}`}
+                  aria-pressed={Boolean(hardwareInfo.state.status_led)}
+                  className={`nvr-btn nvr-tile-action mono sm ${
+                    hardwareInfo.state.status_led ? "active" : ""
+                  }`}
+                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                  title="Toggle camera status indicator LED"
+                  onClick={() =>
+                    void handleApplyHardwareField({
+                      status_led: !hardwareInfo.state.status_led,
+                    })
+                  }
+                >
+                  LED
+                </button>
+              )}
+              {hardwareInfo.capabilities.flip_mirror && (
+                <>
+                  <button
+                    type="button"
+                    disabled={hwBusy}
+                    aria-label={`Mirror Image ${camera}`}
+                    aria-pressed={Boolean(hardwareInfo.state.mirror)}
+                    className={`nvr-btn nvr-tile-action mono sm ${
+                      hardwareInfo.state.mirror ? "active" : ""
+                    }`}
+                    style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                    title="Mirror image horizontally"
+                    onClick={() =>
+                      void handleApplyHardwareField({
+                        mirror: !hardwareInfo.state.mirror,
+                      })
+                    }
+                  >
+                    MIR
+                  </button>
+                  <button
+                    type="button"
+                    disabled={hwBusy}
+                    aria-label={`Flip Image ${camera}`}
+                    aria-pressed={Boolean(hardwareInfo.state.flip)}
+                    className={`nvr-btn nvr-tile-action mono sm ${
+                      hardwareInfo.state.flip ? "active" : ""
+                    }`}
+                    style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                    title="Flip image 180° vertically"
+                    onClick={() =>
+                      void handleApplyHardwareField({
+                        flip: !hardwareInfo.state.flip,
+                      })
+                    }
+                  >
+                    FLP
+                  </button>
+                </>
+              )}
+              {hardwareInfo.capabilities.wdr && (
+                <button
+                  type="button"
+                  disabled={hwBusy}
+                  aria-label={`Toggle WDR ${camera}`}
+                  aria-pressed={Boolean(hardwareInfo.state.wdr)}
+                  className={`nvr-btn nvr-tile-action mono sm ${
+                    hardwareInfo.state.wdr ? "active" : ""
+                  }`}
+                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                  title="Toggle Wide Dynamic Range (WDR)"
+                  onClick={() =>
+                    void handleApplyHardwareField({
+                      wdr: !hardwareInfo.state.wdr,
+                    })
+                  }
+                >
+                  WDR
+                </button>
+              )}
+              {hardwareInfo.capabilities.siren_on_event && (
+                <button
+                  type="button"
+                  disabled={hwBusy}
+                  aria-label={`Toggle Motion Siren ${camera}`}
+                  aria-pressed={Boolean(hardwareInfo.state.siren_on_motion)}
+                  className={`nvr-btn nvr-tile-action mono sm ${
+                    hardwareInfo.state.siren_on_motion ? "active" : ""
+                  }`}
+                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                  title="Toggle camera audible alarm on motion"
+                  onClick={() =>
+                    void handleApplyHardwareField({
+                      siren_on_motion: !hardwareInfo.state.siren_on_motion,
+                    })
+                  }
+                >
+                  SRN
+                </button>
+              )}
+              {hardwareInfo.capabilities.imaging && (
+                <select
+                  className="nvr-select mono sm"
+                  style={{ height: 20, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                  aria-label={`Brightness ${camera}`}
+                  disabled={hwBusy}
+                  value={String(hardwareInfo.state.brightness ?? 50)}
+                  onChange={(e) =>
+                    void handleApplyHardwareField({
+                      brightness: Number(e.target.value),
+                    })
+                  }
+                >
+                  {Array.from(
+                    new Set([25, 40, 50, 60, 75, 90, hardwareInfo.state.brightness ?? 50])
+                  )
+                    .sort((a, b) => a - b)
+                    .map((b) => (
+                      <option key={b} value={b}>
+                        BRI:{b}%
+                      </option>
+                    ))}
+                </select>
+              )}
+              {hardwareInfo.capabilities.audio_volume && (
+                <select
+                  className="nvr-select mono sm"
+                  style={{ height: 20, fontSize: "var(--text-xs)", padding: "0 4px" }}
+                  aria-label={`Speaker Volume ${camera}`}
+                  disabled={hwBusy}
+                  value={String(hardwareInfo.state.speaker_volume ?? 85)}
+                  onChange={(e) =>
+                    void handleApplyHardwareField({
+                      speaker_volume: Number(e.target.value),
+                    })
+                  }
+                >
+                  {Array.from(
+                    new Set([25, 50, 75, 85, 100, hardwareInfo.state.speaker_volume ?? 85])
+                  )
+                    .sort((a, b) => a - b)
+                    .map((v) => (
+                      <option key={v} value={v}>
+                        VOL:{v}%
+                      </option>
+                    ))}
+                </select>
+              )}
+            </span>
+          )}
+        </>
       )}
     </div>
   );
@@ -1724,10 +2271,15 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   const [mapPlacements, setMapPlacements] = useState<Record<string, CameraMapPlacement>>({});
   const [mapSaveStatus, setMapSaveStatus] = useState<string | null>(null);
   const [ptzInfoByCam, setPtzInfoByCam] = useState<Record<string, CameraPtzInfoResponse>>({});
+  const [hardwareInfoByCam, setHardwareInfoByCam] = useState<
+    Record<string, CameraHardwareInfoResponse>
+  >({});
   const [pttResetEpoch, setPttResetEpoch] = useState<number>(0);
   const activePttCamerasRef = useRef<Set<string>>(new Set());
   const ptzFetchedCamsRef = useRef<Set<string>>(new Set());
   const ptzInFlightCamsRef = useRef<Set<string>>(new Set());
+  const hwFetchedCamsRef = useRef<Set<string>>(new Set());
+  const hwInFlightCamsRef = useRef<Set<string>>(new Set());
   const isMountedRef = useRef<boolean>(true);
   const mapSaveTimerRef = useRef<number | null>(null);
   const mapSaveSeqRef = useRef<number>(0);
@@ -1912,40 +2464,111 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   }, [config?.ui?.floorplan, mapEditMode]);
 
   useEffect(() => {
-    let cancelled = false;
     const cams = config?.cameras || {};
     for (const [camName, camCfg] of Object.entries(cams)) {
+      const profTok =
+        camCfg?.onvif?.profile_token || camCfg?.hardware?.profile_token || "";
+      const vsTok =
+        camCfg?.onvif?.video_source_token ||
+        camCfg?.hardware?.video_source_token ||
+        "";
+      const proto =
+        camCfg?.onvif?.protocol || camCfg?.hardware?.protocol || "";
+      const ptzCacheKey = `${camName}:${camCfg?.onvif?.host || ""}:${
+        camCfg?.onvif?.port || 80
+      }:${camCfg?.onvif?.user || ""}:${Boolean(
+        camCfg?.onvif?.has_password
+      )}:${profTok}:${proto}`;
       if (
         isCameraPtzEnabled(camCfg) &&
-        !ptzFetchedCamsRef.current.has(camName) &&
-        !ptzInFlightCamsRef.current.has(camName)
+        !ptzFetchedCamsRef.current.has(ptzCacheKey) &&
+        !ptzInFlightCamsRef.current.has(ptzCacheKey)
       ) {
-        ptzInFlightCamsRef.current.add(camName);
+        ptzInFlightCamsRef.current.add(ptzCacheKey);
         fetch(`/api/${encodeURIComponent(camName)}/ptz/info`, {
           credentials: "include",
         })
           .then((res) => (res.ok ? res.json() : null))
           .then((data: CameraPtzInfoResponse | null) => {
-            ptzInFlightCamsRef.current.delete(camName);
-            if (!cancelled && isMountedRef.current && data) {
-              ptzFetchedCamsRef.current.add(camName);
+            ptzInFlightCamsRef.current.delete(ptzCacheKey);
+            if (isMountedRef.current && data) {
+              ptzFetchedCamsRef.current.add(ptzCacheKey);
               setPtzInfoByCam((prev) => ({ ...prev, [camName]: data }));
             }
           })
           .catch(() => {
-            ptzInFlightCamsRef.current.delete(camName);
+            ptzInFlightCamsRef.current.delete(ptzCacheKey);
+          });
+      }
+      const hwCacheKey = `${camName}:${camCfg?.onvif?.host || ""}:${
+        camCfg?.onvif?.port || 80
+      }:${camCfg?.onvif?.user || ""}:${Boolean(
+        camCfg?.onvif?.has_password
+      )}:${Boolean(
+        camCfg?.onvif?.has_cloud_password || camCfg?.hardware?.has_cloud_password
+      )}:${profTok}:${vsTok}:${proto}`;
+      if (
+        !hwFetchedCamsRef.current.has(hwCacheKey) &&
+        !hwInFlightCamsRef.current.has(hwCacheKey)
+      ) {
+        hwInFlightCamsRef.current.add(hwCacheKey);
+        fetch(`/api/${encodeURIComponent(camName)}/hardware?timeout_ms=3500`, {
+          credentials: "include",
+        })
+          .then((res) => (res.ok ? res.json() : null))
+          .then((data: CameraHardwareInfoResponse | null) => {
+            hwInFlightCamsRef.current.delete(hwCacheKey);
+            if (isMountedRef.current && data) {
+              hwFetchedCamsRef.current.add(hwCacheKey);
+              setHardwareInfoByCam((prev) => ({ ...prev, [camName]: data }));
+              if (
+                data.online &&
+                data.capabilities?.ptz &&
+                !ptzFetchedCamsRef.current.has(ptzCacheKey) &&
+                !ptzInFlightCamsRef.current.has(ptzCacheKey)
+              ) {
+                ptzInFlightCamsRef.current.add(ptzCacheKey);
+                fetch(`/api/${encodeURIComponent(camName)}/ptz/info`, {
+                  credentials: "include",
+                })
+                  .then((res) => (res.ok ? res.json() : null))
+                  .then((ptzData: CameraPtzInfoResponse | null) => {
+                    ptzInFlightCamsRef.current.delete(ptzCacheKey);
+                    if (isMountedRef.current && ptzData) {
+                      ptzFetchedCamsRef.current.add(ptzCacheKey);
+                      setPtzInfoByCam((prev) => ({
+                        ...prev,
+                        [camName]: ptzData,
+                      }));
+                    }
+                  })
+                  .catch(() => {
+                    ptzInFlightCamsRef.current.delete(ptzCacheKey);
+                  });
+              }
+            }
+          })
+          .catch(() => {
+            hwInFlightCamsRef.current.delete(hwCacheKey);
           });
       }
     }
-    return () => {
-      cancelled = true;
-    };
   }, [config?.cameras]);
 
   const handlePtzUpdate = (camName: string, nextInfo: CameraPtzInfoResponse) => {
     setPtzInfoByCam((prev) => ({
       ...prev,
       [camName]: { ...(prev[camName] || {}), ...nextInfo },
+    }));
+  };
+
+  const handleHardwareUpdate = (
+    camName: string,
+    nextHw: CameraHardwareInfoResponse
+  ) => {
+    setHardwareInfoByCam((prev) => ({
+      ...prev,
+      [camName]: nextHw,
     }));
   };
 
@@ -2923,6 +3546,22 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                     useMainStream={descriptor.useMainStream}
                     cameraConfig={camCfg}
                     showVectors={showVectors}
+                    pushToTalkSupported={
+                      resolveCameraPushToTalkCapability(
+                        camCfg,
+                        hardwareInfoByCam[realCam],
+                        config?.go2rtc?.streams,
+                        realCam
+                      ).supported
+                    }
+                    pushToTalkMode={
+                      resolveCameraPushToTalkCapability(
+                        camCfg,
+                        hardwareInfoByCam[realCam],
+                        config?.go2rtc?.streams,
+                        realCam
+                      ).mode
+                    }
                     onClick={
                       isHero ? undefined : () => handleTileActivate(false)
                     }
@@ -3199,6 +3838,22 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                         key={`ptt-${cam}-${realCam}-${pttResetEpoch}`}
                         camera={realCam}
                         height={22}
+                        supported={
+                          resolveCameraPushToTalkCapability(
+                            camCfg,
+                            hardwareInfoByCam[realCam],
+                            config?.go2rtc?.streams,
+                            realCam
+                          ).supported
+                        }
+                        mode={
+                          resolveCameraPushToTalkCapability(
+                            camCfg,
+                            hardwareInfoByCam[realCam],
+                            config?.go2rtc?.streams,
+                            realCam
+                          ).mode
+                        }
                         onStateChange={(state) => {
                           if (state === "connecting" || state === "talking") {
                             activePttCamerasRef.current.add(cam);
@@ -3230,7 +3885,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                       camera={realCam}
                       cameraConfig={camCfg}
                       ptzInfo={ptzInfoByCam[realCam]}
+                      hardwareInfo={hardwareInfoByCam[realCam]}
                       onPtzUpdate={handlePtzUpdate}
+                      onHardwareUpdate={handleHardwareUpdate}
                     />
                   </div>
                 )}
@@ -5379,12 +6036,30 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
             </div>
 
             <div className="nvr-cam-tile" style={{ height: 190, flexShrink: 0 }}>
-              <LiveMsePlayer
-                camera={selectedCamera}
-                useMainStream={false}
-                cameraConfig={config?.cameras?.[selectedCamera]}
-                showVectors={showVectors}
-              />
+              {(() => {
+                const mapRealCam = resolveRealCameraSource(
+                  selectedCamera,
+                  config?.cameras
+                );
+                const mapCamCfg =
+                  config?.cameras?.[selectedCamera] ?? config?.cameras?.[mapRealCam];
+                const mapPttCap = resolveCameraPushToTalkCapability(
+                  mapCamCfg,
+                  hardwareInfoByCam[mapRealCam],
+                  config?.go2rtc?.streams,
+                  mapRealCam
+                );
+                return (
+                  <LiveMsePlayer
+                    camera={selectedCamera}
+                    useMainStream={false}
+                    cameraConfig={mapCamCfg}
+                    showVectors={showVectors}
+                    pushToTalkSupported={mapPttCap.supported}
+                    pushToTalkMode={mapPttCap.mode}
+                  />
+                );
+              })()}
             </div>
 
             {mapPlacements[selectedCamera] && (

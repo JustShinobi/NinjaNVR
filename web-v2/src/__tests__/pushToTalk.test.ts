@@ -12,6 +12,13 @@ import {
   createPushToTalkController,
   startPushToTalkSession,
 } from "../components/VideoPlayers";
+import {
+  TacticalPtzHudOverlay,
+  isCameraHardwareControlsSupported,
+  resolveCameraPushToTalkCapability,
+} from "../views/LiveWorkspace";
+import { buildCloudPasswordPatch } from "../views/settings/ConsoleAndStreamsPanels";
+import type { CameraHardwareInfoResponse } from "../types/nvr";
 
 function createMockMediaStream(trackCount = 2): {
   stream: PushToTalkStreamLike;
@@ -280,5 +287,155 @@ describe("WebRTC Push-to-Talk (AU-05) session helpers and deterministic mic rele
       React.createElement(LiveMsePlayer, { camera: "front_door" })
     );
     expect(playerHtml).toContain('data-testid="ptt-btn-front_door"');
+  });
+
+  test("strictly hides PushToTalkButton when supported is false or camera lacks two-way audio configuration", () => {
+    const hiddenBtnHtml = renderToStaticMarkup(
+      React.createElement(PushToTalkButton, {
+        camera: "quarto",
+        supported: false,
+      })
+    );
+    expect(hiddenBtnHtml).toBe("");
+
+    const hiddenPlayerHtml = renderToStaticMarkup(
+      React.createElement(LiveMsePlayer, {
+        camera: "quarto",
+        pushToTalkSupported: false,
+      })
+    );
+    expect(hiddenPlayerHtml).not.toContain('data-testid="ptt-btn-quarto"');
+
+    // Unconfigured RTSP-only camera resolves to supported: false
+    expect(
+      resolveCameraPushToTalkCapability(
+        undefined,
+        null,
+        { quarto: ["rtsp://user:pw@192.0.2.65:554/stream1"] },
+        "quarto"
+      )
+    ).toEqual({ supported: false, mode: null });
+
+    // Tapo camera with cloud_password or tapo:// stream resolves to supported: true (webrtc)
+    expect(
+      resolveCameraPushToTalkCapability(
+        undefined,
+        null,
+        {
+          quarto: [
+            "rtsp://user:pw@192.0.2.65:554/stream1",
+            "tapo://secret@192.0.2.65",
+          ],
+        },
+        "quarto"
+      )
+    ).toEqual({ supported: true, mode: "webrtc" });
+
+    // Hardware probe reporting cgi_alaw (Intelbras/Dahua CGI) resolves to supported: true, mode: "cgi_alaw"
+    const mockHw: CameraHardwareInfoResponse = {
+      camera: "sala",
+      online: true,
+      protocol_family: "dahua_cgi",
+      onvif_configured: true,
+      device_info: { manufacturer: "IntelBras", model: "iME-360-C" },
+      capabilities: {
+        ptz: true,
+        ptz_zoom: false,
+        ptz_presets: true,
+        ptz_presets_manage: true,
+        push_to_talk: true,
+        push_to_talk_mode: "cgi_alaw",
+        imaging: true,
+        hardware_autotracking: true,
+        day_night_mode: true,
+        ir_lighting: true,
+        status_led: true,
+        flip_mirror: true,
+        wdr: true,
+        siren_on_event: true,
+        audio_anomaly_detect: true,
+        audio_volume: true,
+        reboot: true,
+      },
+      missing_requirements: [],
+      state: { day_night_mode: "day", hardware_autotracking: true },
+    };
+    expect(resolveCameraPushToTalkCapability(undefined, mockHw, null, "sala")).toEqual({
+      supported: true,
+      mode: "cgi_alaw",
+    });
+    expect(isCameraHardwareControlsSupported(mockHw)).toBe(true);
+
+    // TacticalPtzHudOverlay hides Z+/Z- when ptz_zoom is false and renders +P and HW buttons
+    const ptzHudHtml = renderToStaticMarkup(
+      React.createElement(TacticalPtzHudOverlay, {
+        camera: "sala",
+        ptzInfo: { enabled: true, online: true, features: ["pt", "presets_manage"] },
+        hardwareInfo: mockHw,
+      })
+    );
+    expect(ptzHudHtml).not.toContain("Z+");
+    expect(ptzHudHtml).not.toContain("Z-");
+    expect(ptzHudHtml).toContain("+P");
+    expect(ptzHudHtml).toContain("HW");
+  });
+
+  test("startPushToTalkSession in cgi_alaw mode posts to /api/<camera>/audio/talkback and buildCloudPasswordPatch masks secrets", async () => {
+    const { stream, tracks } = createMockMediaStream(1);
+    const calls: Array<{ url: string; contentType: string }> = [];
+    const session = await startPushToTalkSession("sala", {
+      mode: "cgi_alaw",
+      getUserMedia: async () => stream,
+      fetchImpl: async (url, init) => {
+        calls.push({ url, contentType: init.headers["Content-Type"] });
+        return {
+          ok: true,
+          status: 200,
+          text: async () => '{"success":true}',
+        };
+      },
+    });
+    expect(calls).toEqual([
+      { url: "/api/sala/audio/talkback", contentType: "audio/pcm;base64" },
+    ]);
+    session.stop();
+    expect(tracks[0].stopCalls).toBe(1);
+
+    // Configured protocol: "dahua_cgi" immediately enables cgi_alaw PTT even before /hardware probe completes
+    expect(
+      resolveCameraPushToTalkCapability(
+        {
+          enabled: true,
+          hardware: { protocol: "dahua_cgi" },
+          detect: { enabled: true, width: 1280, height: 720, fps: 5 },
+          motion: { enabled: true, threshold: 25, contour_area: 100, mask: "" },
+          zones: {},
+          record: { enabled: true },
+          snapshots: { enabled: true },
+        },
+        null,
+        null,
+        "sala"
+      )
+    ).toEqual({
+      supported: true,
+      mode: "cgi_alaw",
+    });
+
+    expect(buildCloudPasswordPatch("my_cloud_pw", false, false)).toEqual({
+      cloud_password: "my_cloud_pw",
+      has_cloud_password: false,
+      clear_cloud_password: false,
+    });
+    expect(buildCloudPasswordPatch("", true, false)).toEqual({
+      cloud_password: "***",
+      has_cloud_password: true,
+      clear_cloud_password: false,
+    });
+    expect(buildCloudPasswordPatch("", true, true)).toEqual({
+      cloud_password: "",
+      has_cloud_password: false,
+      clear_cloud_password: true,
+    });
   });
 });

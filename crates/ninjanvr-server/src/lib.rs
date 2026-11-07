@@ -972,6 +972,19 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         .route("/{camera}/ptz/stop", post(api_camera_ptz_stop))
         .route("/{camera}/ptz/preset", post(api_camera_ptz_preset))
         .route(
+            "/{camera}/ptz/preset/save",
+            post(api_camera_ptz_preset_save),
+        )
+        .route(
+            "/{camera}/ptz/preset/{token}",
+            delete(api_camera_ptz_preset_delete),
+        )
+        .route(
+            "/{camera}/hardware",
+            get(api_camera_hardware_get).post(api_camera_hardware_set),
+        )
+        .route("/{camera}/audio/talkback", post(api_camera_audio_talkback))
+        .route(
             "/{camera}/state",
             get(api_camera_state_get).post(api_camera_state_set),
         )
@@ -4446,6 +4459,7 @@ fn is_sensitive_yaml_secret_key_name(key: &str) -> bool {
             .to_ascii_lowercase()
             .as_str(),
         "password"
+            | "cloud_password"
             | "pass"
             | "passwd"
             | "pwd"
@@ -4587,6 +4601,12 @@ fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> String {
     for cam in cfg.cameras.values() {
         if let Some(ref p) = cam.onvif.password {
             let t = p.trim();
+            if !t.is_empty() && t != "***" && t != "*" {
+                known_secrets.push(t.to_string());
+            }
+        }
+        if let Some(ref cp) = cam.hardware.cloud_password {
+            let t = cp.trim();
             if !t.is_empty() && t != "***" && t != "*" {
                 known_secrets.push(t.to_string());
             }
@@ -20601,6 +20621,216 @@ pub fn build_onvif_get_status_soap(
     build_onvif_soap_envelope(&body, user, password)
 }
 
+pub fn build_onvif_absolute_move_soap(
+    profile_token: &str,
+    pan: f32,
+    tilt: f32,
+    zoom: f32,
+    speed: Option<f32>,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let p = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let t = if tilt.is_finite() {
+        tilt.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let z = if zoom.is_finite() {
+        zoom.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let speed_xml = if let Some(spd) = speed {
+        let s = if spd.is_finite() {
+            spd.clamp(0.05, 1.0)
+        } else {
+            0.5
+        };
+        format!(
+            "<tptz:Speed><tt:PanTilt x=\"{s:.4}\" y=\"{s:.4}\" space=\"http://www.onvif.org/ver10/tptz/PanTiltSpaces/GenericSpeedSpace\"/><tt:Zoom x=\"{s:.4}\"/></tptz:Speed>"
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<tptz:AbsoluteMove><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:Position><tt:PanTilt x=\"{p:.4}\" y=\"{t:.4}\" space=\"http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace\"/><tt:Zoom x=\"{z:.4}\"/></tptz:Position>{speed_xml}</tptz:AbsoluteMove>",
+        xml_escape_simple(profile_token)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn build_onvif_set_preset_soap(
+    profile_token: &str,
+    preset_name: &str,
+    preset_token: Option<&str>,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let tok_xml = if let Some(tok) = preset_token.map(str::trim).filter(|s| !s.is_empty()) {
+        format!(
+            "<tptz:PresetToken>{}</tptz:PresetToken>",
+            xml_escape_simple(tok)
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        "<tptz:SetPreset><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:PresetName>{}</tptz:PresetName>{tok_xml}</tptz:SetPreset>",
+        xml_escape_simple(profile_token),
+        xml_escape_simple(preset_name)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn build_onvif_remove_preset_soap(
+    profile_token: &str,
+    preset_token: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let body = format!(
+        "<tptz:RemovePreset><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:PresetToken>{}</tptz:PresetToken></tptz:RemovePreset>",
+        xml_escape_simple(profile_token),
+        xml_escape_simple(preset_token)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn parse_onvif_set_preset_token_xml(xml: &str) -> Option<String> {
+    extract_xml_element_text(xml, "PresetToken")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.contains('<'))
+        .map(str::to_string)
+}
+
+/// Pure-Rust RFC 3174 SHA-1 implementation for ONVIF WS-UsernameToken PasswordDigest.
+pub fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let mut h0: u32 = 0x6745_2301;
+    let mut h1: u32 = 0xEFCD_AB89;
+    let mut h2: u32 = 0x98BA_DCFE;
+    let mut h3: u32 = 0x1032_5476;
+    let mut h4: u32 = 0xC3D2_E1F0;
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity((data.len() + 72) & !63);
+    padded.extend_from_slice(data);
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0x00);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.as_chunks::<64>().0 {
+        let mut w = [0u32; 80];
+        for (i, wi) in w.iter_mut().enumerate().take(16) {
+            let off = i * 4;
+            *wi = u32::from_be_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDCu32),
+                _ => (b ^ c ^ d, 0xCA62_C1D6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    out[0..4].copy_from_slice(&h0.to_be_bytes());
+    out[4..8].copy_from_slice(&h1.to_be_bytes());
+    out[8..12].copy_from_slice(&h2.to_be_bytes());
+    out[12..16].copy_from_slice(&h3.to_be_bytes());
+    out[16..20].copy_from_slice(&h4.to_be_bytes());
+    out
+}
+
+pub fn build_onvif_wsse_digest_header(
+    user: &str,
+    password: &str,
+    nonce_raw: &[u8; 16],
+    created: &str,
+) -> String {
+    let mut sha_input = Vec::with_capacity(16 + created.len() + password.len());
+    sha_input.extend_from_slice(nonce_raw);
+    sha_input.extend_from_slice(created.as_bytes());
+    sha_input.extend_from_slice(password.as_bytes());
+    let digest_bytes = sha1_digest(&sha_input);
+    let digest_b64 = base64::engine::general_purpose::STANDARD.encode(digest_bytes);
+    let nonce_b64 = base64::engine::general_purpose::STANDARD.encode(nonce_raw);
+    format!(
+        "<s:Header><wsse:Security s:mustUnderstand=\"1\" xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\" xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\"><wsse:UsernameToken><wsse:Username>{}</wsse:Username><wsse:Password Type=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest\">{digest_b64}</wsse:Password><wsse:Nonce EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\">{nonce_b64}</wsse:Nonce><wsu:Created>{}</wsu:Created></wsse:UsernameToken></wsse:Security></s:Header>",
+        xml_escape_simple(user),
+        xml_escape_simple(created)
+    )
+}
+
+pub fn upgrade_soap_to_wsse_digest(
+    soap_xml: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let Some(u) = user.map(str::trim).filter(|s| !s.is_empty()) else {
+        return soap_xml.to_string();
+    };
+    let pw = password.unwrap_or("");
+    let mut nonce_raw = [0u8; 16];
+    rand::fill(&mut nonce_raw);
+    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let digest_hdr = build_onvif_wsse_digest_header(u, pw, &nonce_raw, &created);
+
+    if let Some(h_start) = soap_xml.find("<s:Header>")
+        && let Some(h_end_rel) = soap_xml[h_start..].find("</s:Header>")
+    {
+        let h_end = h_start + h_end_rel + "</s:Header>".len();
+        let mut out = String::with_capacity(soap_xml.len() + 256);
+        out.push_str(&soap_xml[..h_start]);
+        out.push_str(&digest_hdr);
+        out.push_str(&soap_xml[h_end..]);
+        return out;
+    }
+    if let Some(empty_idx) = soap_xml.find("<s:Header/>") {
+        let mut out = String::with_capacity(soap_xml.len() + 256);
+        out.push_str(&soap_xml[..empty_idx]);
+        out.push_str(&digest_hdr);
+        out.push_str(&soap_xml[empty_idx + "<s:Header/>".len()..]);
+        return out;
+    }
+    soap_xml.to_string()
+}
+
 fn extract_xml_attr<'a>(tag_fragment: &'a str, attr_name: &str) -> Option<&'a str> {
     if attr_name.is_empty() {
         return None;
@@ -20886,6 +21116,117 @@ pub fn parse_onvif_status_xml(xml: &str) -> OnvifPtzStatus {
     }
 }
 
+static ONVIF_DISCOVERED_PROFILES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(String, String), String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+static ONVIF_DISCOVERED_VIDEO_SOURCES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+static ONVIF_DISCOVERED_PROTOCOLS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+static HTTP_DIGEST_CHALLENGE_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn get_cached_onvif_profile(camera: &str, endpoint: &str) -> Option<String> {
+    ONVIF_DISCOVERED_PROFILES
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&(camera.to_string(), endpoint.to_string())).cloned())
+}
+
+fn cache_onvif_profile(camera: &str, endpoint: &str, profile: &str) {
+    if let Ok(mut g) = ONVIF_DISCOVERED_PROFILES.lock() {
+        if g.len() >= 128 && !g.contains_key(&(camera.to_string(), endpoint.to_string())) {
+            g.clear();
+        }
+        g.insert(
+            (camera.to_string(), endpoint.to_string()),
+            profile.to_string(),
+        );
+    }
+}
+
+fn get_cached_onvif_video_source(camera: &str) -> Option<String> {
+    ONVIF_DISCOVERED_VIDEO_SOURCES
+        .lock()
+        .ok()
+        .and_then(|g| g.get(camera).cloned())
+}
+
+fn cache_onvif_video_source(camera: &str, vs_token: &str) {
+    if let Ok(mut g) = ONVIF_DISCOVERED_VIDEO_SOURCES.lock() {
+        if g.len() >= 128 && !g.contains_key(camera) {
+            g.clear();
+        }
+        g.insert(camera.to_string(), vs_token.to_string());
+    }
+}
+
+fn get_cached_onvif_protocol(camera: &str) -> Option<String> {
+    ONVIF_DISCOVERED_PROTOCOLS
+        .lock()
+        .ok()
+        .and_then(|g| g.get(camera).cloned())
+}
+
+fn cache_onvif_protocol(camera: &str, protocol: &str) {
+    if let Ok(mut g) = ONVIF_DISCOVERED_PROTOCOLS.lock() {
+        if g.len() >= 128 && !g.contains_key(camera) {
+            g.clear();
+        }
+        g.insert(camera.to_string(), protocol.to_string());
+    }
+}
+
+fn resolve_effective_onvif_credentials(
+    cfg: &NinjaConfig,
+    camera: &str,
+    cam_cfg: &ninjanvr_config::CameraConfig,
+) -> (Option<String>, Option<String>) {
+    let explicit_user = cam_cfg
+        .onvif
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let explicit_pass = cam_cfg
+        .onvif
+        .password
+        .as_deref()
+        .filter(|p| !p.is_empty() && p.trim() != "***" && p.trim() != "*")
+        .map(str::to_string);
+    if explicit_user.is_some() && explicit_pass.is_some() {
+        return (explicit_user, explicit_pass);
+    }
+    if let Some(inferred) = cfg.infer_camera_upstream(camera) {
+        return (
+            explicit_user.or(inferred.user),
+            explicit_pass.or(inferred.password),
+        );
+    }
+    (explicit_user, explicit_pass)
+}
+
+fn is_onvif_profile_not_found_error(err_msg: &str) -> bool {
+    let lc = err_msg.to_ascii_lowercase();
+    lc.contains("noprofile")
+        || lc.contains("profile token")
+        || lc.contains("invalidargval")
+        || lc.contains("not exist")
+}
+
+fn is_onvif_action_not_supported_error(err_msg: &str) -> bool {
+    let lc = err_msg.to_ascii_lowercase();
+    lc.contains("actionnotsupported")
+        || lc.contains("notimplemented")
+        || lc.contains("not implemented")
+        || lc.contains("optional method")
+}
+
 async fn send_onvif_soap_request(
     client: &reqwest::Client,
     endpoint: &str,
@@ -20893,6 +21234,25 @@ async fn send_onvif_soap_request(
     soap_xml: String,
     user: Option<&str>,
     password: Option<&str>,
+    timeout: std::time::Duration,
+) -> std::result::Result<String, (StatusCode, String)> {
+    send_onvif_soap_request_with_ns(
+        client,
+        endpoint,
+        ("http://www.onvif.org/ver20/ptz/wsdl", action),
+        soap_xml,
+        (user, password),
+        timeout,
+    )
+    .await
+}
+
+async fn send_onvif_soap_request_with_ns(
+    client: &reqwest::Client,
+    endpoint: &str,
+    (wsdl_ns, action): (&str, &str),
+    soap_xml: String,
+    (user, password): (Option<&str>, Option<&str>),
     timeout: std::time::Duration,
 ) -> std::result::Result<String, (StatusCode, String)> {
     if !is_safe_onvif_endpoint_url(endpoint) {
@@ -20911,16 +21271,18 @@ async fn send_onvif_soap_request(
             "Invalid ONVIF SOAP action".to_string(),
         ));
     }
+    let digest_soap_xml = upgrade_soap_to_wsse_digest(&soap_xml, user, password);
     let mut req = client
         .post(endpoint)
         .timeout(timeout)
         .header(
             header::CONTENT_TYPE,
             format!(
-                "application/soap+xml; charset=utf-8; action=\"http://www.onvif.org/ver20/ptz/wsdl/{action}\""
+                "application/soap+xml; charset=utf-8; action=\"{}/{action}\"",
+                wsdl_ns.trim_end_matches('/')
             ),
         )
-        .body(soap_xml);
+        .body(digest_soap_xml);
     if let Some(u) = user.map(str::trim).filter(|s| !s.is_empty()) {
         req = req.basic_auth(u, password);
     }
@@ -21062,6 +21424,12 @@ impl PtzMoveBody {
             .as_deref()
             .is_some_and(|m| m.trim().eq_ignore_ascii_case("relative"))
     }
+
+    pub fn is_absolute(&self) -> bool {
+        self.mode
+            .as_deref()
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("absolute"))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -21099,6 +21467,126 @@ pub struct PtzPresetBody {
     pub timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PtzPresetSaveBody {
+    #[serde(default, alias = "preset", alias = "preset_name")]
+    pub name: String,
+    #[serde(default, alias = "preset_token")]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub profile_token: Option<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+fn default_camera_profile_token(
+    camera: &str,
+    endpoint: &str,
+    cam_cfg: &ninjanvr_config::CameraConfig,
+) -> String {
+    if let Some(cfg_tok) = cam_cfg
+        .hardware
+        .profile_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && let Some(clean) = sanitize_onvif_token(Some(cfg_tok), "Profile_1")
+    {
+        return clean;
+    }
+    if let Some(cached) = get_cached_onvif_profile(camera, endpoint) {
+        return cached;
+    }
+    "Profile_1".to_string()
+}
+
+fn resolve_effective_ptz_endpoint(
+    cfg: &NinjaConfig,
+    camera: &str,
+    cam_cfg: &ninjanvr_config::CameraConfig,
+) -> Option<String> {
+    if cam_cfg.onvif.is_configured() {
+        let inferred = cfg.infer_camera_upstream(camera);
+        let is_tapo_hint = inferred.as_ref().is_some_and(|i| i.is_tapo_rtsp)
+            || cam_cfg.onvif.port == 2020
+            || cam_cfg
+                .hardware
+                .protocol
+                .as_deref()
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("tapo"))
+            || get_cached_onvif_protocol(camera)
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case("tapo"));
+        let mut adjusted_onvif = cam_cfg.onvif.clone();
+        if adjusted_onvif.port == 80 && is_tapo_hint {
+            adjusted_onvif.port = 2020;
+        }
+        if let Some(ep) = resolve_onvif_ptz_endpoint(&adjusted_onvif) {
+            return Some(ep);
+        }
+    }
+    if !cam_cfg.hardware.is_unconfigured() || get_cached_onvif_protocol(camera).is_some() {
+        return resolve_camera_hardware_probe_targets(cfg, camera, cam_cfg)
+            .and_then(|t| t.ptz_ep_opt);
+    }
+    None
+}
+
+async fn fetch_ptz_status_with_profile_discovery(
+    client: &reqwest::Client,
+    camera: &str,
+    endpoint: &str,
+    initial_profile: &str,
+    allow_discovery: bool,
+    (user, pass): (Option<&str>, Option<&str>),
+    timeout: std::time::Duration,
+) -> std::result::Result<(String, OnvifPtzStatus), (StatusCode, String)> {
+    let mut profile_token = initial_profile.to_string();
+    let status_soap = build_onvif_get_status_soap(&profile_token, user, pass);
+    let mut status_res = send_onvif_soap_request(
+        client,
+        endpoint,
+        "GetStatus",
+        status_soap,
+        user,
+        pass,
+        timeout,
+    )
+    .await;
+
+    if allow_discovery
+        && let Err((_, ref st_err)) = status_res
+        && is_onvif_profile_not_found_error(st_err)
+    {
+        for candidate_prof in ["Profile000", "profile_1", "Profile_1"] {
+            if candidate_prof == profile_token {
+                continue;
+            }
+            let cand_status_soap = build_onvif_get_status_soap(candidate_prof, user, pass);
+            if let Ok(ok_xml) = send_onvif_soap_request(
+                client,
+                endpoint,
+                "GetStatus",
+                cand_status_soap,
+                user,
+                pass,
+                timeout,
+            )
+            .await
+            {
+                profile_token = candidate_prof.to_string();
+                cache_onvif_profile(camera, endpoint, &profile_token);
+                status_res = Ok(ok_xml);
+                break;
+            }
+        }
+    } else if status_res.is_ok() {
+        cache_onvif_profile(camera, endpoint, &profile_token);
+    }
+
+    status_res.map(|xml| (profile_token, parse_onvif_status_xml(&xml)))
+}
+
 async fn api_camera_ptz_info(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -21115,9 +21603,16 @@ async fn api_camera_ptz_info(
         )
             .into_response();
     }
-    let (cam_opt, active_preset) = {
+    let (cam_opt, active_preset, creds, ptz_endpoint_opt) = {
         let cfg = state.config.read().await;
         let cam = cfg.cameras.get(&camera).cloned();
+        let creds = cam
+            .as_ref()
+            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
+            .unwrap_or((None, None));
+        let ep_opt = cam
+            .as_ref()
+            .and_then(|c| resolve_effective_ptz_endpoint(&cfg, &camera, c));
         let active = state
             .ptz_active_presets
             .read()
@@ -21130,7 +21625,7 @@ async fn api_camera_ptz_info(
                     .and_then(|c| c.onvif.return_preset.clone())
                     .filter(|s| !s.trim().is_empty())
             });
-        (cam, active)
+        (cam, active, creds, ep_opt)
     };
 
     let Some(cam_cfg) = cam_opt else {
@@ -21146,12 +21641,21 @@ async fn api_camera_ptz_info(
     };
 
     let mut fallback_presets: Vec<OnvifPresetItem> = Vec::new();
+    for (soft_tok, soft_item) in &cam_cfg.hardware.soft_presets {
+        fallback_presets.push(OnvifPresetItem {
+            token: soft_tok.clone(),
+            name: soft_item.name.clone(),
+        });
+    }
     if let Some(ret_p) = cam_cfg
         .onvif
         .return_preset
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        && !fallback_presets
+            .iter()
+            .any(|p| p.token == ret_p || p.name == ret_p)
     {
         fallback_presets.push(OnvifPresetItem {
             token: ret_p.to_string(),
@@ -21175,7 +21679,7 @@ async fn api_camera_ptz_info(
         }
     }
 
-    let Some(endpoint) = resolve_onvif_ptz_endpoint(&cam_cfg.onvif) else {
+    let Some(endpoint) = ptz_endpoint_opt else {
         let preset_names: Vec<String> = fallback_presets.iter().map(|p| p.name.clone()).collect();
         return Json(json!({
             "enabled": false,
@@ -21193,20 +21697,22 @@ async fn api_camera_ptz_info(
         Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
         None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 30)),
     };
-    let Some(profile_token) = sanitize_onvif_token(q.profile_token.as_deref(), "Profile_1") else {
+    let default_prof = default_camera_profile_token(&camera, &endpoint, &cam_cfg);
+    let Some(mut profile_token) = sanitize_onvif_token(q.profile_token.as_deref(), &default_prof)
+    else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "message": "Invalid ONVIF profile token" })),
         )
             .into_response();
     };
-    let user = cam_cfg.onvif.user.as_deref();
-    let pass = cam_cfg.onvif.password.as_deref();
+    let user = creds.0.as_deref();
+    let pass = creds.1.as_deref();
 
     let presets_soap = build_onvif_get_presets_soap(&profile_token, user, pass);
     let status_soap = build_onvif_get_status_soap(&profile_token, user, pass);
 
-    let presets_res = send_onvif_soap_request(
+    let mut presets_res = send_onvif_soap_request(
         &state.http_client,
         &endpoint,
         "GetPresets",
@@ -21216,7 +21722,7 @@ async fn api_camera_ptz_info(
         timeout,
     )
     .await;
-    let status_res = send_onvif_soap_request(
+    let mut status_res = send_onvif_soap_request(
         &state.http_client,
         &endpoint,
         "GetStatus",
@@ -21226,6 +21732,49 @@ async fn api_camera_ptz_info(
         timeout,
     )
     .await;
+
+    // Auto-discover ProfileToken (e.g. "Profile000" on Intelbras/Dahua or "profile_1" on Tapo)
+    // when no explicit query profile_token was forced and GetStatus reported NoProfile.
+    if q.profile_token.is_none()
+        && let Err((_, ref st_err)) = status_res
+        && is_onvif_profile_not_found_error(st_err)
+    {
+        for candidate_prof in ["Profile000", "profile_1", "Profile_1"] {
+            if candidate_prof == profile_token {
+                continue;
+            }
+            let cand_status_soap = build_onvif_get_status_soap(candidate_prof, user, pass);
+            if let Ok(ok_xml) = send_onvif_soap_request(
+                &state.http_client,
+                &endpoint,
+                "GetStatus",
+                cand_status_soap,
+                user,
+                pass,
+                timeout,
+            )
+            .await
+            {
+                profile_token = candidate_prof.to_string();
+                cache_onvif_profile(&camera, &endpoint, &profile_token);
+                status_res = Ok(ok_xml);
+                let cand_presets_soap = build_onvif_get_presets_soap(&profile_token, user, pass);
+                presets_res = send_onvif_soap_request(
+                    &state.http_client,
+                    &endpoint,
+                    "GetPresets",
+                    cand_presets_soap,
+                    user,
+                    pass,
+                    timeout,
+                )
+                .await;
+                break;
+            }
+        }
+    } else if status_res.is_ok() || presets_res.is_ok() {
+        cache_onvif_profile(&camera, &endpoint, &profile_token);
+    }
 
     let mut merged_presets = match &presets_res {
         Ok(xml) => parse_onvif_presets_xml(xml),
@@ -21241,8 +21790,8 @@ async fn api_camera_ptz_info(
     }
     let preset_names: Vec<String> = merged_presets.iter().map(|p| p.name.clone()).collect();
 
-    let (status_obj, online, err_opt) = match (presets_res, status_res) {
-        (_, Ok(status_xml)) => (parse_onvif_status_xml(&status_xml), true, None),
+    let (status_obj, online, err_opt) = match (&presets_res, &status_res) {
+        (_, Ok(status_xml)) => (parse_onvif_status_xml(status_xml), true, None),
         (Ok(_), Err((_, err_msg))) => (
             OnvifPtzStatus {
                 pan: 0.0,
@@ -21252,7 +21801,7 @@ async fn api_camera_ptz_info(
                 error: Some(err_msg.clone()),
             },
             true,
-            Some(err_msg),
+            Some(err_msg.clone()),
         ),
         (Err((_, err_a)), Err((_, _))) => (
             OnvifPtzStatus {
@@ -21263,11 +21812,11 @@ async fn api_camera_ptz_info(
                 error: Some(err_a.clone()),
             },
             false,
-            Some(err_a),
+            Some(err_a.clone()),
         ),
     };
 
-    let mut features = vec!["pt", "zoom", "pt-r", "zoom-r", "presets"];
+    let mut features = vec!["pt", "zoom", "pt-r", "zoom-r", "presets", "presets_manage"];
     if cam_cfg.onvif.autotracking {
         features.push("autotracking");
     }
@@ -21278,6 +21827,7 @@ async fn api_camera_ptz_info(
         "camera": camera,
         "host": cam_cfg.onvif.host.as_deref().map(scrub_rtsp_credentials),
         "port": cam_cfg.onvif.port,
+        "profile_token": profile_token,
         "autotracking": cam_cfg.onvif.autotracking,
         "return_preset": cam_cfg.onvif.return_preset,
         "active_preset": active_preset,
@@ -21360,7 +21910,18 @@ async fn api_camera_ptz_move(
     {
         return err_resp;
     }
-    let cam_opt = { state.config.read().await.cameras.get(&camera).cloned() };
+    let (cam_opt, creds, ptz_endpoint_opt) = {
+        let cfg = state.config.read().await;
+        let cam = cfg.cameras.get(&camera).cloned();
+        let creds = cam
+            .as_ref()
+            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
+            .unwrap_or((None, None));
+        let ep_opt = cam
+            .as_ref()
+            .and_then(|c| resolve_effective_ptz_endpoint(&cfg, &camera, c));
+        (cam, creds, ep_opt)
+    };
     let Some(cam_cfg) = cam_opt else {
         return (
             StatusCode::NOT_FOUND,
@@ -21368,7 +21929,7 @@ async fn api_camera_ptz_move(
         )
             .into_response();
     };
-    let Some(endpoint) = resolve_onvif_ptz_endpoint(&cam_cfg.onvif) else {
+    let Some(endpoint) = ptz_endpoint_opt else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "success": false, "message": format!("ONVIF PTZ is not configured for camera '{camera}'") })),
@@ -21376,7 +21937,9 @@ async fn api_camera_ptz_move(
             .into_response();
     };
 
-    let Some(profile_token) = sanitize_onvif_token(body.profile_token.as_deref(), "Profile_1")
+    let default_prof = default_camera_profile_token(&camera, &endpoint, &cam_cfg);
+    let Some(mut profile_token) =
+        sanitize_onvif_token(body.profile_token.as_deref(), &default_prof)
     else {
         return (
             StatusCode::BAD_REQUEST,
@@ -21385,7 +21948,7 @@ async fn api_camera_ptz_move(
             .into_response();
     };
 
-    // Moving the camera via ContinuousMove or RelativeMove clears active_preset until GotoPreset completes
+    // Moving the camera via ContinuousMove, RelativeMove, or AbsoluteMove clears active_preset until GotoPreset completes
     state
         .ptz_active_presets
         .write()
@@ -21394,19 +21957,27 @@ async fn api_camera_ptz_move(
 
     let (pan, tilt, zoom) = body.resolve_vectors();
     let is_rel = body.is_relative();
-    let op_name = if is_rel {
+    let is_abs = body.is_absolute();
+    let op_name = if is_abs {
+        "AbsoluteMove"
+    } else if is_rel {
         "RelativeMove"
     } else {
         "ContinuousMove"
     };
-    let user = cam_cfg.onvif.user.as_deref();
-    let pass = cam_cfg.onvif.password.as_deref();
-    let soap_xml = if is_rel {
-        build_onvif_relative_move_soap(&profile_token, pan, tilt, zoom, body.speed, user, pass)
-    } else {
-        let move_timeout = body.timeout_sec.unwrap_or(cam_cfg.onvif.timeout_sec);
-        build_onvif_continuous_move_soap(&profile_token, pan, tilt, zoom, move_timeout, user, pass)
+    let user = creds.0.as_deref();
+    let pass = creds.1.as_deref();
+    let move_timeout = body.timeout_sec.unwrap_or(cam_cfg.onvif.timeout_sec);
+    let build_move_xml = |prof: &str| {
+        if is_abs {
+            build_onvif_absolute_move_soap(prof, pan, tilt, zoom, body.speed, user, pass)
+        } else if is_rel {
+            build_onvif_relative_move_soap(prof, pan, tilt, zoom, body.speed, user, pass)
+        } else {
+            build_onvif_continuous_move_soap(prof, pan, tilt, zoom, move_timeout, user, pass)
+        }
     };
+    let soap_xml = build_move_xml(&profile_token);
     let timeout = match body.timeout_ms {
         Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
         None => std::time::Duration::from_secs(
@@ -21416,7 +21987,7 @@ async fn api_camera_ptz_move(
         ),
     };
 
-    match send_onvif_soap_request(
+    let mut res = send_onvif_soap_request(
         &state.http_client,
         &endpoint,
         op_name,
@@ -21425,8 +21996,37 @@ async fn api_camera_ptz_move(
         pass,
         timeout,
     )
-    .await
+    .await;
+
+    if body.profile_token.is_none()
+        && let Err((_, ref err_msg)) = res
+        && is_onvif_profile_not_found_error(err_msg)
     {
+        for candidate_prof in ["Profile000", "profile_1", "Profile_1"] {
+            if candidate_prof == profile_token {
+                continue;
+            }
+            let retry_xml = build_move_xml(candidate_prof);
+            if let Ok(ok_xml) = send_onvif_soap_request(
+                &state.http_client,
+                &endpoint,
+                op_name,
+                retry_xml,
+                user,
+                pass,
+                timeout,
+            )
+            .await
+            {
+                profile_token = candidate_prof.to_string();
+                cache_onvif_profile(&camera, &endpoint, &profile_token);
+                res = Ok(ok_xml);
+                break;
+            }
+        }
+    }
+
+    match res {
         Ok(_) => Json(json!({
             "success": true,
             "camera": camera,
@@ -21470,7 +22070,18 @@ async fn api_camera_ptz_stop(
         serde_json::from_slice(&body_bytes).unwrap_or_default()
     };
 
-    let cam_opt = { state.config.read().await.cameras.get(&camera).cloned() };
+    let (cam_opt, creds, ptz_endpoint_opt) = {
+        let cfg = state.config.read().await;
+        let cam = cfg.cameras.get(&camera).cloned();
+        let creds = cam
+            .as_ref()
+            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
+            .unwrap_or((None, None));
+        let ep_opt = cam
+            .as_ref()
+            .and_then(|c| resolve_effective_ptz_endpoint(&cfg, &camera, c));
+        (cam, creds, ep_opt)
+    };
     let Some(cam_cfg) = cam_opt else {
         return (
             StatusCode::NOT_FOUND,
@@ -21478,7 +22089,7 @@ async fn api_camera_ptz_stop(
         )
             .into_response();
     };
-    let Some(endpoint) = resolve_onvif_ptz_endpoint(&cam_cfg.onvif) else {
+    let Some(endpoint) = ptz_endpoint_opt else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "success": false, "message": format!("ONVIF PTZ is not configured for camera '{camera}'") })),
@@ -21486,7 +22097,9 @@ async fn api_camera_ptz_stop(
             .into_response();
     };
 
-    let Some(profile_token) = sanitize_onvif_token(body.profile_token.as_deref(), "Profile_1")
+    let default_prof = default_camera_profile_token(&camera, &endpoint, &cam_cfg);
+    let Some(mut profile_token) =
+        sanitize_onvif_token(body.profile_token.as_deref(), &default_prof)
     else {
         return (
             StatusCode::BAD_REQUEST,
@@ -21494,8 +22107,8 @@ async fn api_camera_ptz_stop(
         )
             .into_response();
     };
-    let user = cam_cfg.onvif.user.as_deref();
-    let pass = cam_cfg.onvif.password.as_deref();
+    let user = creds.0.as_deref();
+    let pass = creds.1.as_deref();
     let soap_xml = build_onvif_stop_soap(&profile_token, body.pan_tilt, body.zoom, user, pass);
     let timeout = match body.timeout_ms {
         Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
@@ -21509,7 +22122,7 @@ async fn api_camera_ptz_stop(
         .cloned()
         .flatten();
 
-    match send_onvif_soap_request(
+    let mut res = send_onvif_soap_request(
         &state.http_client,
         &endpoint,
         "Stop",
@@ -21518,8 +22131,38 @@ async fn api_camera_ptz_stop(
         pass,
         timeout,
     )
-    .await
+    .await;
+
+    if body.profile_token.is_none()
+        && let Err((_, ref err_msg)) = res
+        && is_onvif_profile_not_found_error(err_msg)
     {
+        for candidate_prof in ["Profile000", "profile_1", "Profile_1"] {
+            if candidate_prof == profile_token {
+                continue;
+            }
+            let retry_xml =
+                build_onvif_stop_soap(candidate_prof, body.pan_tilt, body.zoom, user, pass);
+            if let Ok(ok_xml) = send_onvif_soap_request(
+                &state.http_client,
+                &endpoint,
+                "Stop",
+                retry_xml,
+                user,
+                pass,
+                timeout,
+            )
+            .await
+            {
+                profile_token = candidate_prof.to_string();
+                cache_onvif_profile(&camera, &endpoint, &profile_token);
+                res = Ok(ok_xml);
+                break;
+            }
+        }
+    }
+
+    match res {
         Ok(_) => Json(json!({
             "success": true,
             "camera": camera,
@@ -21567,7 +22210,37 @@ async fn api_camera_ptz_preset(
         )
             .into_response();
     }
-    let Some(profile_token) = sanitize_onvif_token(body.profile_token.as_deref(), "Profile_1")
+
+    let (cam_opt, creds, ptz_endpoint_opt) = {
+        let cfg = state.config.read().await;
+        let cam = cfg.cameras.get(&camera).cloned();
+        let creds = cam
+            .as_ref()
+            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
+            .unwrap_or((None, None));
+        let ep_opt = cam
+            .as_ref()
+            .and_then(|c| resolve_effective_ptz_endpoint(&cfg, &camera, c));
+        (cam, creds, ep_opt)
+    };
+    let Some(cam_cfg) = cam_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
+        )
+            .into_response();
+    };
+    let Some(endpoint) = ptz_endpoint_opt else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": format!("ONVIF PTZ is not configured for camera '{camera}'") })),
+        )
+            .into_response();
+    };
+
+    let default_prof = default_camera_profile_token(&camera, &endpoint, &cam_cfg);
+    let Some(mut profile_token) =
+        sanitize_onvif_token(body.profile_token.as_deref(), &default_prof)
     else {
         return (
             StatusCode::BAD_REQUEST,
@@ -21576,24 +22249,8 @@ async fn api_camera_ptz_preset(
             .into_response();
     };
 
-    let cam_opt = { state.config.read().await.cameras.get(&camera).cloned() };
-    let Some(cam_cfg) = cam_opt else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
-        )
-            .into_response();
-    };
-    let Some(endpoint) = resolve_onvif_ptz_endpoint(&cam_cfg.onvif) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "success": false, "message": format!("ONVIF PTZ is not configured for camera '{camera}'") })),
-        )
-            .into_response();
-    };
-
-    let user = cam_cfg.onvif.user.as_deref();
-    let pass = cam_cfg.onvif.password.as_deref();
+    let user = creds.0.as_deref();
+    let pass = creds.1.as_deref();
     let soap_xml =
         build_onvif_goto_preset_soap(&profile_token, preset_token, body.speed, user, pass);
     let timeout = match body.timeout_ms {
@@ -21601,7 +22258,7 @@ async fn api_camera_ptz_preset(
         None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 30)),
     };
 
-    match send_onvif_soap_request(
+    let mut goto_res = send_onvif_soap_request(
         &state.http_client,
         &endpoint,
         "GotoPreset",
@@ -21610,8 +22267,59 @@ async fn api_camera_ptz_preset(
         pass,
         timeout,
     )
-    .await
+    .await;
+
+    if body.profile_token.is_none()
+        && let Err((_, ref err_msg)) = goto_res
+        && is_onvif_profile_not_found_error(err_msg)
     {
+        for candidate_prof in ["Profile000", "profile_1", "Profile_1"] {
+            if candidate_prof == profile_token {
+                continue;
+            }
+            let retry_xml =
+                build_onvif_goto_preset_soap(candidate_prof, preset_token, body.speed, user, pass);
+            match send_onvif_soap_request(
+                &state.http_client,
+                &endpoint,
+                "GotoPreset",
+                retry_xml,
+                user,
+                pass,
+                timeout,
+            )
+            .await
+            {
+                Ok(ok_xml) => {
+                    profile_token = candidate_prof.to_string();
+                    cache_onvif_profile(&camera, &endpoint, &profile_token);
+                    goto_res = Ok(ok_xml);
+                    break;
+                }
+                Err((st, e)) if is_onvif_action_not_supported_error(&e) => {
+                    goto_res = Err((st, e));
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    let soft_opt = cam_cfg
+        .hardware
+        .soft_presets
+        .get(preset_token)
+        .cloned()
+        .or_else(|| {
+            cam_cfg
+                .hardware
+                .soft_presets
+                .values()
+                .find(|sp| sp.name.eq_ignore_ascii_case(preset_token))
+                .cloned()
+        });
+
+    match goto_res {
         Ok(_) => {
             state
                 .ptz_active_presets
@@ -21626,6 +22334,115 @@ async fn api_camera_ptz_preset(
                 "active_preset": preset_token
             }))
             .into_response()
+        }
+        Err((_, ref err_msg))
+            if is_onvif_action_not_supported_error(err_msg) || soft_opt.is_some() =>
+        {
+            // Soft-preset fallback for cameras (like Intelbras iME-360-C) where ONVIF GotoPreset is not implemented
+            if let Some(soft) = soft_opt {
+                let (resolved_prof, cur_status) = match fetch_ptz_status_with_profile_discovery(
+                    &state.http_client,
+                    &camera,
+                    &endpoint,
+                    &profile_token,
+                    body.profile_token.is_none(),
+                    (user, pass),
+                    timeout,
+                )
+                .await
+                {
+                    Ok(pair) => pair,
+                    Err((st, e)) => {
+                        state
+                            .ptz_active_presets
+                            .write()
+                            .await
+                            .insert(camera.clone(), None);
+                        return (
+                            st,
+                            Json(json!({
+                                "success": false,
+                                "camera": camera,
+                                "operation": "GotoPreset",
+                                "error": e,
+                                "active_preset": Value::Null
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+                let dx = (soft.pan - cur_status.pan).clamp(-1.0, 1.0);
+                let dy = (soft.tilt - cur_status.tilt).clamp(-1.0, 1.0);
+                let dz = (soft.zoom - cur_status.zoom).clamp(-1.0, 1.0);
+                let rel_soap = build_onvif_relative_move_soap(
+                    &resolved_prof,
+                    dx,
+                    dy,
+                    dz,
+                    body.speed,
+                    user,
+                    pass,
+                );
+                if let Err((st, e)) = send_onvif_soap_request(
+                    &state.http_client,
+                    &endpoint,
+                    "RelativeMove",
+                    rel_soap,
+                    user,
+                    pass,
+                    timeout,
+                )
+                .await
+                {
+                    state
+                        .ptz_active_presets
+                        .write()
+                        .await
+                        .insert(camera.clone(), None);
+                    return (
+                        st,
+                        Json(json!({
+                            "success": false,
+                            "camera": camera,
+                            "operation": "GotoPreset",
+                            "error": e,
+                            "active_preset": Value::Null
+                        })),
+                    )
+                        .into_response();
+                }
+                state
+                    .ptz_active_presets
+                    .write()
+                    .await
+                    .insert(camera.clone(), Some(preset_token.to_string()));
+                return Json(json!({
+                    "success": true,
+                    "camera": camera,
+                    "operation": "GotoPreset",
+                    "preset": preset_token,
+                    "active_preset": preset_token,
+                    "source": "soft_preset"
+                }))
+                .into_response();
+            }
+            let (status, err_msg) = goto_res.unwrap_err();
+            state
+                .ptz_active_presets
+                .write()
+                .await
+                .insert(camera.clone(), None);
+            (
+                status,
+                Json(json!({
+                    "success": false,
+                    "camera": camera,
+                    "operation": "GotoPreset",
+                    "error": err_msg,
+                    "active_preset": Value::Null
+                })),
+            )
+                .into_response()
         }
         Err((status, err_msg)) => {
             state
@@ -21645,6 +22462,2711 @@ async fn api_camera_ptz_preset(
             )
                 .into_response()
         }
+    }
+}
+
+async fn api_camera_ptz_preset_save(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+    AxumPath(camera): AxumPath<String>,
+    Json(body): Json<PtzPresetSaveBody>,
+) -> Response {
+    if let Some(err_resp) =
+        verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
+    {
+        return err_resp;
+    }
+    let preset_name = body.name.trim();
+    if preset_name.is_empty()
+        || preset_name.len() > 64
+        || preset_name.contains('/')
+        || preset_name.chars().any(|c| c.is_control())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Preset name is required (1-64 characters, no '/' or control characters)" })),
+        )
+            .into_response();
+    }
+    let validated_token = if let Some(raw_tok) = body
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if raw_tok.len() > 64 || raw_tok.contains('/') || raw_tok.chars().any(|c| c.is_control()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "success": false, "message": "Invalid preset token (1-64 characters, no '/' or control characters)" })),
+            )
+                .into_response();
+        }
+        Some(raw_tok.to_string())
+    } else {
+        None
+    };
+
+    let (cam_opt, creds, ptz_endpoint_opt) = {
+        let cfg = state.config.read().await;
+        let cam = cfg.cameras.get(&camera).cloned();
+        let creds = cam
+            .as_ref()
+            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
+            .unwrap_or((None, None));
+        let ep_opt = cam
+            .as_ref()
+            .and_then(|c| resolve_effective_ptz_endpoint(&cfg, &camera, c));
+        (cam, creds, ep_opt)
+    };
+    let Some(cam_cfg) = cam_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
+        )
+            .into_response();
+    };
+    let Some(endpoint) = ptz_endpoint_opt else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": format!("ONVIF PTZ is not configured for camera '{camera}'") })),
+        )
+            .into_response();
+    };
+
+    let default_prof = default_camera_profile_token(&camera, &endpoint, &cam_cfg);
+    let Some(mut profile_token) =
+        sanitize_onvif_token(body.profile_token.as_deref(), &default_prof)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid ONVIF profile token" })),
+        )
+            .into_response();
+    };
+
+    let user = creds.0.as_deref();
+    let pass = creds.1.as_deref();
+    let soap_xml = build_onvif_set_preset_soap(
+        &profile_token,
+        preset_name,
+        validated_token.as_deref(),
+        user,
+        pass,
+    );
+    let timeout = match body.timeout_ms {
+        Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
+        None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 30)),
+    };
+
+    let mut set_res = send_onvif_soap_request(
+        &state.http_client,
+        &endpoint,
+        "SetPreset",
+        soap_xml,
+        user,
+        pass,
+        timeout,
+    )
+    .await;
+
+    if body.profile_token.is_none()
+        && let Err((_, ref err_msg)) = set_res
+        && is_onvif_profile_not_found_error(err_msg)
+    {
+        for candidate_prof in ["Profile000", "profile_1", "Profile_1"] {
+            if candidate_prof == profile_token {
+                continue;
+            }
+            let retry_xml = build_onvif_set_preset_soap(
+                candidate_prof,
+                preset_name,
+                validated_token.as_deref(),
+                user,
+                pass,
+            );
+            match send_onvif_soap_request(
+                &state.http_client,
+                &endpoint,
+                "SetPreset",
+                retry_xml,
+                user,
+                pass,
+                timeout,
+            )
+            .await
+            {
+                Ok(ok_xml) => {
+                    profile_token = candidate_prof.to_string();
+                    cache_onvif_profile(&camera, &endpoint, &profile_token);
+                    set_res = Ok(ok_xml);
+                    break;
+                }
+                Err((st, e)) if is_onvif_action_not_supported_error(&e) => {
+                    set_res = Err((st, e));
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    match set_res {
+        Ok(resp_xml) => {
+            let resolved_token = parse_onvif_set_preset_token_xml(&resp_xml)
+                .or_else(|| validated_token.clone())
+                .unwrap_or_else(|| preset_name.to_string());
+            state
+                .ptz_active_presets
+                .write()
+                .await
+                .insert(camera.clone(), Some(preset_name.to_string()));
+            Json(json!({
+                "success": true,
+                "camera": camera,
+                "operation": "SetPreset",
+                "token": resolved_token,
+                "name": preset_name,
+                "active_preset": preset_name,
+                "source": "onvif"
+            }))
+            .into_response()
+        }
+        Err((_, ref err_msg)) if is_onvif_action_not_supported_error(err_msg) => {
+            // Soft-preset fallback: read current position from GetStatus (with ProfileToken discovery) and store in camera.hardware.soft_presets
+            let (_, cur_status) = match fetch_ptz_status_with_profile_discovery(
+                &state.http_client,
+                &camera,
+                &endpoint,
+                &profile_token,
+                body.profile_token.is_none(),
+                (user, pass),
+                timeout,
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err((st, e)) => {
+                    return (
+                        st,
+                        Json(json!({
+                            "success": false,
+                            "camera": camera,
+                            "operation": "SetPreset",
+                            "error": e
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            let soft_token = validated_token.unwrap_or_else(|| preset_name.to_string());
+            {
+                let mut cfg_guard = state.config.write().await;
+                if let Some(cam_mut) = cfg_guard.cameras.get_mut(&camera) {
+                    if cam_mut.hardware.soft_presets.len() >= MAX_ONVIF_PRESETS
+                        && !cam_mut.hardware.soft_presets.contains_key(&soft_token)
+                    {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "success": false,
+                                "camera": camera,
+                                "operation": "SetPreset",
+                                "message": format!("Maximum number of presets ({MAX_ONVIF_PRESETS}) reached")
+                            })),
+                        )
+                            .into_response();
+                    }
+                    cam_mut.hardware.soft_presets.insert(
+                        soft_token.clone(),
+                        ninjanvr_config::CameraSoftPreset {
+                            name: preset_name.to_string(),
+                            pan: cur_status.pan,
+                            tilt: cur_status.tilt,
+                            zoom: cur_status.zoom,
+                        },
+                    );
+                }
+                if let Err(err) = cfg_guard.refresh_raw_yaml() {
+                    warn!("Failed to refresh raw_yaml after saving soft preset: {err:#}");
+                }
+                let path_clone = cfg_guard.config_path.clone();
+                let yaml_clone = cfg_guard.raw_yaml.clone();
+                if let Ok(Err(err)) = tokio::task::spawn_blocking(move || {
+                    persist_config_yaml_atomically(&path_clone, &yaml_clone)
+                })
+                .await
+                {
+                    warn!("Failed to persist config.yml after saving soft preset: {err:#}");
+                }
+            }
+            state
+                .ptz_active_presets
+                .write()
+                .await
+                .insert(camera.clone(), Some(preset_name.to_string()));
+            Json(json!({
+                "success": true,
+                "camera": camera,
+                "operation": "SetPreset",
+                "token": soft_token,
+                "name": preset_name,
+                "active_preset": preset_name,
+                "source": "soft_preset"
+            }))
+            .into_response()
+        }
+        Err((status, err_msg)) => (
+            status,
+            Json(json!({
+                "success": false,
+                "camera": camera,
+                "operation": "SetPreset",
+                "error": err_msg
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_camera_ptz_preset_delete(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+    AxumPath((camera, token)): AxumPath<(String, String)>,
+    Query(q): Query<PtzInfoQueryParams>,
+) -> Response {
+    if let Some(err_resp) =
+        verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
+    {
+        return err_resp;
+    }
+    let clean_tok = token.trim();
+    if clean_tok.is_empty() || clean_tok.len() > 128 || clean_tok.chars().any(|c| c.is_control()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid preset token" })),
+        )
+            .into_response();
+    }
+
+    // Check if it is a soft preset first
+    let mut removed_soft_name: Option<String> = None;
+    {
+        let mut cfg_guard = state.config.write().await;
+        if let Some(cam_mut) = cfg_guard.cameras.get_mut(&camera) {
+            if let Some(removed) = cam_mut.hardware.soft_presets.remove(clean_tok) {
+                removed_soft_name = Some(removed.name);
+            } else if let Some(found_key) = cam_mut
+                .hardware
+                .soft_presets
+                .iter()
+                .find(|(_, v)| v.name.eq_ignore_ascii_case(clean_tok))
+                .map(|(k, _)| k.clone())
+                && let Some(removed) = cam_mut.hardware.soft_presets.remove(&found_key)
+            {
+                removed_soft_name = Some(removed.name);
+            }
+        }
+        if removed_soft_name.is_some() {
+            if let Err(err) = cfg_guard.refresh_raw_yaml() {
+                warn!("Failed to refresh raw_yaml after deleting soft preset: {err:#}");
+            }
+            let path_clone = cfg_guard.config_path.clone();
+            let yaml_clone = cfg_guard.raw_yaml.clone();
+            if let Ok(Err(err)) = tokio::task::spawn_blocking(move || {
+                persist_config_yaml_atomically(&path_clone, &yaml_clone)
+            })
+            .await
+            {
+                warn!("Failed to persist config.yml after deleting soft preset: {err:#}");
+            }
+        }
+    }
+    if let Some(soft_name) = removed_soft_name {
+        let mut active_guard = state.ptz_active_presets.write().await;
+        if active_guard
+            .get(&camera)
+            .and_then(|v| v.as_deref())
+            .is_some_and(|a| {
+                a.eq_ignore_ascii_case(clean_tok) || a.eq_ignore_ascii_case(&soft_name)
+            })
+        {
+            active_guard.insert(camera.clone(), None);
+        }
+        return Json(json!({
+            "success": true,
+            "camera": camera,
+            "operation": "RemovePreset",
+            "deleted_token": clean_tok,
+            "source": "soft_preset"
+        }))
+        .into_response();
+    }
+
+    let (cam_opt, creds, ptz_endpoint_opt) = {
+        let cfg = state.config.read().await;
+        let cam = cfg.cameras.get(&camera).cloned();
+        let creds = cam
+            .as_ref()
+            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
+            .unwrap_or((None, None));
+        let ep_opt = cam
+            .as_ref()
+            .and_then(|c| resolve_effective_ptz_endpoint(&cfg, &camera, c));
+        (cam, creds, ep_opt)
+    };
+    let Some(cam_cfg) = cam_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
+        )
+            .into_response();
+    };
+    let Some(endpoint) = ptz_endpoint_opt else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": format!("ONVIF PTZ is not configured for camera '{camera}'") })),
+        )
+            .into_response();
+    };
+
+    let default_prof = default_camera_profile_token(&camera, &endpoint, &cam_cfg);
+    let Some(mut profile_token) = sanitize_onvif_token(q.profile_token.as_deref(), &default_prof)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Invalid ONVIF profile token" })),
+        )
+            .into_response();
+    };
+
+    let user = creds.0.as_deref();
+    let pass = creds.1.as_deref();
+    let soap_xml = build_onvif_remove_preset_soap(&profile_token, clean_tok, user, pass);
+    let timeout = match q.timeout_ms {
+        Some(ms) => std::time::Duration::from_millis(ms.clamp(20, 30_000)),
+        None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 30)),
+    };
+
+    let mut del_res = send_onvif_soap_request(
+        &state.http_client,
+        &endpoint,
+        "RemovePreset",
+        soap_xml,
+        user,
+        pass,
+        timeout,
+    )
+    .await;
+
+    if q.profile_token.is_none()
+        && let Err((_, ref err_msg)) = del_res
+        && is_onvif_profile_not_found_error(err_msg)
+    {
+        for candidate_prof in ["Profile000", "profile_1", "Profile_1"] {
+            if candidate_prof == profile_token {
+                continue;
+            }
+            let retry_xml = build_onvif_remove_preset_soap(candidate_prof, clean_tok, user, pass);
+            if let Ok(ok_xml) = send_onvif_soap_request(
+                &state.http_client,
+                &endpoint,
+                "RemovePreset",
+                retry_xml,
+                user,
+                pass,
+                timeout,
+            )
+            .await
+            {
+                profile_token = candidate_prof.to_string();
+                cache_onvif_profile(&camera, &endpoint, &profile_token);
+                del_res = Ok(ok_xml);
+                break;
+            }
+        }
+    }
+
+    match del_res {
+        Ok(_) => {
+            let mut active_guard = state.ptz_active_presets.write().await;
+            if active_guard
+                .get(&camera)
+                .and_then(|v| v.as_deref())
+                .is_some_and(|a| a.eq_ignore_ascii_case(clean_tok))
+            {
+                active_guard.insert(camera.clone(), None);
+            }
+            Json(json!({
+                "success": true,
+                "camera": camera,
+                "operation": "RemovePreset",
+                "deleted_token": clean_tok,
+                "source": "onvif"
+            }))
+            .into_response()
+        }
+        Err((status, err_msg)) => (
+            status,
+            Json(json!({
+                "success": false,
+                "camera": camera,
+                "operation": "RemovePreset",
+                "error": err_msg
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Pure-Rust RFC 1321 MD5 implementation for HTTP Digest Authentication (RFC 2617 / 7616).
+pub fn md5_digest(data: &[u8]) -> [u8; 16] {
+    const S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
+        9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
+        15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    const K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
+        0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193,
+        0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d,
+        0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122,
+        0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa,
+        0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244,
+        0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb,
+        0xeb86d391,
+    ];
+
+    let mut a0: u32 = 0x6745_2301;
+    let mut b0: u32 = 0xefcd_ab89;
+    let mut c0: u32 = 0x98ba_dcfe;
+    let mut d0: u32 = 0x1032_5476;
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity((data.len() + 72) & !63);
+    padded.extend_from_slice(data);
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0x00);
+    }
+    padded.extend_from_slice(&bit_len.to_le_bytes());
+
+    for chunk in padded.as_chunks::<64>().0 {
+        let mut m = [0u32; 16];
+        for (i, mi) in m.iter_mut().enumerate() {
+            let off = i * 4;
+            *mi = u32::from_le_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
+        }
+        let mut a = a0;
+        let mut b = b0;
+        let mut c = c0;
+        let mut d = d0;
+        for i in 0..64 {
+            let (f, g) = match i {
+                0..=15 => ((b & c) | ((!b) & d), i),
+                16..=31 => ((d & b) | ((!d) & c), (5 * i + 1) % 16),
+                32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                _ => (c ^ (b | (!d)), (7 * i) % 16),
+            };
+            let temp = d;
+            d = c;
+            c = b;
+            let sum = a.wrapping_add(f).wrapping_add(K[i]).wrapping_add(m[g]);
+            b = b.wrapping_add(sum.rotate_left(S[i]));
+            a = temp;
+        }
+        a0 = a0.wrapping_add(a);
+        b0 = b0.wrapping_add(b);
+        c0 = c0.wrapping_add(c);
+        d0 = d0.wrapping_add(d);
+    }
+
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&a0.to_le_bytes());
+    out[4..8].copy_from_slice(&b0.to_le_bytes());
+    out[8..12].copy_from_slice(&c0.to_le_bytes());
+    out[12..16].copy_from_slice(&d0.to_le_bytes());
+    out
+}
+
+pub fn md5_hex(data: &[u8]) -> String {
+    md5_digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn extract_digest_challenge_param<'a>(header_val: &'a str, key: &str) -> Option<&'a str> {
+    let header_lc = header_val.to_ascii_lowercase();
+    let key_lc = key.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some(rel) = header_lc[cursor..].find(&key_lc) {
+        let idx = cursor + rel;
+        let boundary_ok = idx == 0 || {
+            let prev = header_val.as_bytes()[idx - 1];
+            prev.is_ascii_whitespace() || prev == b','
+        };
+        let after_key = idx + key.len();
+        if boundary_ok && after_key < header_val.len() {
+            let rest = header_val[after_key..].trim_start();
+            if let Some(after_eq) = rest.strip_prefix('=') {
+                let after_eq = after_eq.trim_start();
+                if let Some(quoted) = after_eq.strip_prefix('"') {
+                    if let Some(end_q) = quoted.find('"') {
+                        return Some(&quoted[..end_q]);
+                    }
+                } else {
+                    let end = after_eq
+                        .find(|c: char| c == ',' || c.is_ascii_whitespace())
+                        .unwrap_or(after_eq.len());
+                    return Some(&after_eq[..end]);
+                }
+            }
+        }
+        cursor = idx + 1;
+    }
+    None
+}
+
+fn escape_digest_quoted_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if ch == '\\' || ch == '"' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+pub fn build_http_digest_auth_header(
+    www_authenticate: &str,
+    method: &str,
+    uri_path_and_query: &str,
+    user: &str,
+    password: &str,
+    cnonce: &str,
+) -> Option<String> {
+    let trimmed = www_authenticate.trim();
+    if trimmed.len() < 7 || !trimmed[..7].eq_ignore_ascii_case("digest ") {
+        return None;
+    }
+    let after_digest = &trimmed[7..];
+    let realm = extract_digest_challenge_param(after_digest, "realm")?;
+    let nonce = extract_digest_challenge_param(after_digest, "nonce")?;
+    let qop_raw = extract_digest_challenge_param(after_digest, "qop");
+    let opaque_opt = extract_digest_challenge_param(after_digest, "opaque");
+
+    let use_qop_auth = qop_raw.is_some_and(|q| {
+        q.split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case("auth"))
+    });
+    let ha1 = md5_hex(format!("{user}:{realm}:{password}").as_bytes());
+    let ha2 = md5_hex(format!("{method}:{uri_path_and_query}").as_bytes());
+    let nc = "00000001";
+    let response_hex = if use_qop_auth {
+        md5_hex(format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}").as_bytes())
+    } else {
+        md5_hex(format!("{ha1}:{nonce}:{ha2}").as_bytes())
+    };
+
+    let safe_user = escape_digest_quoted_str(user);
+    let safe_realm = escape_digest_quoted_str(realm);
+    let safe_nonce = escape_digest_quoted_str(nonce);
+    let safe_uri = escape_digest_quoted_str(uri_path_and_query);
+    let safe_cnonce = escape_digest_quoted_str(cnonce);
+
+    let mut hdr = format!(
+        "Digest username=\"{safe_user}\", realm=\"{safe_realm}\", nonce=\"{safe_nonce}\", uri=\"{safe_uri}\", response=\"{response_hex}\""
+    );
+    if let Some(opaque) = opaque_opt {
+        let safe_opaque = escape_digest_quoted_str(opaque);
+        hdr.push_str(&format!(", opaque=\"{safe_opaque}\""));
+    }
+    if use_qop_auth {
+        hdr.push_str(&format!(", qop=auth, nc={nc}, cnonce=\"{safe_cnonce}\""));
+    }
+    Some(hdr)
+}
+
+fn extract_uri_path_and_query(full_url: &str) -> String {
+    if let Some((_, after_scheme)) = full_url.split_once("://")
+        && let Some(slash_idx) = after_scheme.find('/')
+    {
+        return after_scheme[slash_idx..].to_string();
+    }
+    "/".to_string()
+}
+
+fn format_camera_http_base(host: &str, default_port: u16) -> String {
+    let trimmed = host.trim().trim_end_matches('/');
+    let lc = trimmed.to_ascii_lowercase();
+    if lc.starts_with("http://") || lc.starts_with("https://") {
+        let after_scheme = trimmed.split_once("://").map(|(_, r)| r).unwrap_or("");
+        if let Some(slash_idx) = after_scheme.find('/') {
+            trimmed[..trimmed.len() - (after_scheme.len() - slash_idx)].to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else if trimmed.matches(':').count() > 1 && !trimmed.starts_with('[') {
+        format!("http://[{trimmed}]:{default_port}")
+    } else if trimmed.contains(':') && !trimmed.ends_with(']') {
+        format!("http://{trimmed}")
+    } else {
+        format!("http://{trimmed}:{default_port}")
+    }
+}
+
+fn extract_clean_camera_host(host: &str) -> String {
+    let trimmed = host.trim().trim_end_matches('/');
+    let authority = if let Some((_, after_scheme)) = trimmed.split_once("://") {
+        let before_slash = after_scheme.split('/').next().unwrap_or(after_scheme);
+        if let Some(at_idx) = before_slash.rfind('@') {
+            &before_slash[at_idx + 1..]
+        } else {
+            before_slash
+        }
+    } else {
+        trimmed.split('/').next().unwrap_or(trimmed)
+    };
+    if authority.starts_with('[')
+        && let Some(end_b) = authority.find(']')
+    {
+        return authority[..=end_b].to_string();
+    }
+    if authority.matches(':').count() > 1 {
+        return format!("[{authority}]");
+    }
+    authority.split(':').next().unwrap_or(authority).to_string()
+}
+
+async fn send_http_digest_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: &str,
+    (user, password): (Option<&str>, Option<&str>),
+    (content_type, body_bytes): (Option<&str>, Option<Vec<u8>>),
+    timeout: std::time::Duration,
+) -> std::result::Result<(StatusCode, String), (StatusCode, String)> {
+    // Allow query strings on CGI endpoints while enforcing SSRF host/port checks
+    let base_without_query = url.split('?').next().unwrap_or(url);
+    if !is_safe_onvif_endpoint_url(base_without_query) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Disallowed or invalid camera HTTP endpoint URL".to_string(),
+        ));
+    }
+
+    let is_audio_post = url.contains("/cgi-bin/audio.cgi") && url.contains("action=postAudio");
+    let authority_key = url
+        .split_once("://")
+        .map(|(sch, rest)| {
+            let auth = rest.split('/').next().unwrap_or(rest);
+            format!("{sch}://{auth}")
+        })
+        .unwrap_or_else(|| base_without_query.to_string());
+
+    let build_req = |auth_header: Option<String>, include_body: bool| {
+        let mut r = client.request(method.clone(), url).timeout(timeout);
+        if let Some(ct) = content_type {
+            r = r.header(header::CONTENT_TYPE, ct);
+        }
+        if let Some(ah) = auth_header {
+            r = r.header(header::AUTHORIZATION, ah);
+        }
+        if include_body && let Some(ref b) = body_bytes {
+            r = r.body(b.clone());
+        }
+        r
+    };
+
+    let cached_auth_hdr = if let Some(u) = user.map(str::trim).filter(|s| !s.is_empty()) {
+        let pw = password.unwrap_or("");
+        let cached_www = HTTP_DIGEST_CHALLENGE_CACHE
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&authority_key).cloned());
+        cached_www.and_then(|www_auth| {
+            let uri_pq = extract_uri_path_and_query(url);
+            let cnonce = format!("{:016x}", rand::random::<u64>());
+            build_http_digest_auth_header(&www_auth, method.as_str(), &uri_pq, u, pw, &cnonce)
+        })
+    } else {
+        None
+    };
+
+    // Step 1: initial request (uses cached Digest challenge if available)
+    let first_resp = match build_req(cached_auth_hdr, true).send().await {
+        Ok(r) => r,
+        Err(err) if err.is_timeout() => {
+            if is_audio_post && !err.is_connect() {
+                return Ok((StatusCode::OK, "OK".to_string()));
+            }
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "Camera HTTP request timed out".to_string(),
+            ));
+        }
+        Err(err) => {
+            if is_audio_post && !err.is_builder() && !err.is_connect() {
+                return Ok((StatusCode::OK, "OK".to_string()));
+            }
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                scrub_rtsp_credentials(&format!("Camera HTTP request failed: {err}")),
+            ));
+        }
+    };
+
+    let final_resp = if first_resp.status() == StatusCode::UNAUTHORIZED {
+        let Some(u) = user.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Camera requires authentication credentials".to_string(),
+            ));
+        };
+        let pw = password.unwrap_or("");
+        let www_auth = first_resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !www_auth.is_empty()
+            && let Ok(mut g) = HTTP_DIGEST_CHALLENGE_CACHE.lock()
+        {
+            if g.len() >= 128 && !g.contains_key(&authority_key) {
+                g.clear();
+            }
+            g.insert(authority_key, www_auth.to_string());
+        }
+        let uri_pq = extract_uri_path_and_query(url);
+        let cnonce = format!("{:016x}", rand::random::<u64>());
+        let auth_hdr = if let Some(digest_hdr) =
+            build_http_digest_auth_header(www_auth, method.as_str(), &uri_pq, u, pw, &cnonce)
+        {
+            digest_hdr
+        } else {
+            let b64 =
+                base64::engine::general_purpose::STANDARD.encode(format!("{u}:{pw}").as_bytes());
+            format!("Basic {b64}")
+        };
+        match build_req(Some(auth_hdr), true).send().await {
+            Ok(r) => r,
+            Err(err) if err.is_timeout() => {
+                if is_audio_post && !err.is_connect() {
+                    return Ok((StatusCode::OK, "OK".to_string()));
+                }
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Camera authenticated HTTP request timed out".to_string(),
+                ));
+            }
+            Err(err) => {
+                // Dahua audio.cgi?action=postAudio intentionally closes the socket without an HTTP status line
+                // after consuming the audio stream. Only treat post-connection EOF as OK.
+                if is_audio_post && !err.is_builder() && !err.is_connect() {
+                    return Ok((StatusCode::OK, "OK".to_string()));
+                }
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    scrub_rtsp_credentials(&format!(
+                        "Camera authenticated HTTP request failed: {err}"
+                    )),
+                ));
+            }
+        }
+    } else {
+        first_resp
+    };
+
+    let mut final_resp = final_resp;
+    let status = final_resp.status();
+    if status.is_redirection() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Camera redirect response HTTP {} is disallowed",
+                status.as_u16()
+            ),
+        ));
+    }
+    let mut buf = Vec::new();
+    loop {
+        match final_resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if buf.len().saturating_add(chunk.len()) > MAX_ONVIF_SOAP_RESPONSE_BYTES {
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        "Camera HTTP response exceeded maximum size".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(err) if err.is_timeout() => {
+                if is_audio_post && status.is_success() {
+                    return Ok((StatusCode::OK, "OK".to_string()));
+                }
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Camera HTTP response body timed out".to_string(),
+                ));
+            }
+            Err(err) => {
+                if is_audio_post && status.is_success() {
+                    return Ok((StatusCode::OK, "OK".to_string()));
+                }
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    scrub_rtsp_credentials(&format!("Camera HTTP response read failed: {err}")),
+                ));
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Ok((status, text))
+}
+
+pub fn parse_dahua_cgi_kv(text: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            map.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    map
+}
+
+pub fn build_onvif_get_device_info_soap(user: Option<&str>, password: Option<&str>) -> String {
+    build_onvif_soap_envelope(
+        "<tds:GetDeviceInformation xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\"/>",
+        user,
+        password,
+    )
+}
+
+pub fn build_onvif_get_profiles_soap(user: Option<&str>, password: Option<&str>) -> String {
+    build_onvif_soap_envelope(
+        "<trt:GetProfiles xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\"/>",
+        user,
+        password,
+    )
+}
+
+pub fn build_onvif_get_video_sources_soap(user: Option<&str>, password: Option<&str>) -> String {
+    build_onvif_soap_envelope(
+        "<trt:GetVideoSources xmlns:trt=\"http://www.onvif.org/ver10/media/wsdl\"/>",
+        user,
+        password,
+    )
+}
+
+pub fn parse_onvif_profiles_and_video_sources_xml(xml: &str) -> (Vec<String>, Vec<String>) {
+    let mut profiles = Vec::new();
+    let mut video_sources = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = xml[cursor..].find("Profiles") {
+        let start = cursor + rel;
+        let Some(gt_rel) = xml[start..].find('>') else {
+            break;
+        };
+        let tag_header = &xml[start..start + gt_rel];
+        if !tag_header.starts_with("Profiles")
+            || tag_header
+                .as_bytes()
+                .get("Profiles".len())
+                .is_some_and(|b| !b.is_ascii_whitespace() && *b != b'/')
+        {
+            cursor = start + "Profiles".len();
+            continue;
+        }
+        if let Some(tok) = extract_xml_attr(tag_header, "token")
+            && let Some(clean) = sanitize_onvif_token(Some(tok), "")
+            && !clean.is_empty()
+            && !profiles.contains(&clean)
+        {
+            profiles.push(clean);
+        }
+        cursor = start + gt_rel + 1;
+    }
+    if let Some(st) = extract_xml_element_text(xml, "SourceToken")
+        && let Some(clean) = sanitize_onvif_token(Some(st), "")
+        && !clean.is_empty()
+    {
+        video_sources.push(clean);
+    }
+    let mut vs_cursor = 0usize;
+    while let Some(rel) = xml[vs_cursor..].find("VideoSources") {
+        let start = vs_cursor + rel;
+        let Some(gt_rel) = xml[start..].find('>') else {
+            break;
+        };
+        let tag_header = &xml[start..start + gt_rel];
+        if let Some(tok) = extract_xml_attr(tag_header, "token")
+            && let Some(clean) = sanitize_onvif_token(Some(tok), "")
+            && !clean.is_empty()
+            && !video_sources.contains(&clean)
+        {
+            video_sources.push(clean);
+        }
+        vs_cursor = start + gt_rel + 1;
+    }
+    (profiles, video_sources)
+}
+
+pub fn build_onvif_get_imaging_settings_soap(
+    video_source_token: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let body = format!(
+        "<timg:GetImagingSettings xmlns:timg=\"http://www.onvif.org/ver20/imaging/wsdl\"><timg:VideoSourceToken>{}</timg:VideoSourceToken></timg:GetImagingSettings>",
+        xml_escape_simple(video_source_token)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn build_onvif_set_imaging_settings_soap(
+    video_source_token: &str,
+    brightness: Option<f32>,
+    contrast: Option<f32>,
+    saturation: Option<f32>,
+    sharpness: Option<f32>,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let mut inner = String::new();
+    if let Some(b) = brightness.filter(|v| v.is_finite()) {
+        inner.push_str(&format!(
+            "<tt:Brightness>{:.0}</tt:Brightness>",
+            b.clamp(0.0, 100.0)
+        ));
+    }
+    if let Some(s) = saturation.filter(|v| v.is_finite()) {
+        inner.push_str(&format!(
+            "<tt:ColorSaturation>{:.0}</tt:ColorSaturation>",
+            s.clamp(0.0, 100.0)
+        ));
+    }
+    if let Some(c) = contrast.filter(|v| v.is_finite()) {
+        inner.push_str(&format!(
+            "<tt:Contrast>{:.0}</tt:Contrast>",
+            c.clamp(0.0, 100.0)
+        ));
+    }
+    if let Some(sh) = sharpness.filter(|v| v.is_finite()) {
+        inner.push_str(&format!(
+            "<tt:Sharpness>{:.0}</tt:Sharpness>",
+            sh.clamp(0.0, 100.0)
+        ));
+    }
+    let body = format!(
+        "<timg:SetImagingSettings xmlns:timg=\"http://www.onvif.org/ver20/imaging/wsdl\"><timg:VideoSourceToken>{}</timg:VideoSourceToken><timg:ImagingSettings>{inner}</timg:ImagingSettings><timg:ForcePersistence>true</timg:ForcePersistence></timg:SetImagingSettings>",
+        xml_escape_simple(video_source_token)
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn build_onvif_system_reboot_soap(user: Option<&str>, password: Option<&str>) -> String {
+    build_onvif_soap_envelope(
+        "<tds:SystemReboot xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\"/>",
+        user,
+        password,
+    )
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CameraDeviceIdentity {
+    pub manufacturer: Option<String>,
+    pub model: Option<String>,
+    pub firmware: Option<String>,
+    pub serial_number: Option<String>,
+    pub hardware_id: Option<String>,
+}
+
+pub fn parse_onvif_device_info_xml(xml: &str) -> CameraDeviceIdentity {
+    CameraDeviceIdentity {
+        manufacturer: extract_xml_element_text(xml, "Manufacturer")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.contains('<'))
+            .map(str::to_string),
+        model: extract_xml_element_text(xml, "Model")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.contains('<'))
+            .map(str::to_string),
+        firmware: extract_xml_element_text(xml, "FirmwareVersion")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.contains('<'))
+            .map(str::to_string),
+        serial_number: extract_xml_element_text(xml, "SerialNumber")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.contains('<'))
+            .map(str::to_string),
+        hardware_id: extract_xml_element_text(xml, "HardwareId")
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.contains('<'))
+            .map(str::to_string),
+    }
+}
+
+pub fn parse_onvif_imaging_settings_xml(
+    xml: &str,
+) -> (Option<f32>, Option<f32>, Option<f32>, Option<f32>) {
+    let parse_tag = |tag: &str| -> Option<f32> {
+        extract_xml_element_text(xml, tag)
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 100.0))
+    };
+    (
+        parse_tag("Brightness"),
+        parse_tag("Contrast"),
+        parse_tag("ColorSaturation"),
+        parse_tag("Sharpness"),
+    )
+}
+
+/// ITU-T G.711 linear 16-bit PCM to 8-bit A-law encoder for Dahua/Intelbras HTTP audio talkback.
+pub fn linear_pcm16_to_alaw(sample: i16) -> u8 {
+    let mut pcm_val = (sample as i32) >> 3;
+    let mask: u8 = if pcm_val >= 0 {
+        0xD5
+    } else {
+        pcm_val = -pcm_val - 1;
+        0x55
+    };
+    let seg: usize = if pcm_val <= 0x1F {
+        0
+    } else if pcm_val <= 0x3F {
+        1
+    } else if pcm_val <= 0x7F {
+        2
+    } else if pcm_val <= 0xFF {
+        3
+    } else if pcm_val <= 0x1FF {
+        4
+    } else if pcm_val <= 0x3FF {
+        5
+    } else if pcm_val <= 0x7FF {
+        6
+    } else {
+        7
+    };
+    let aval: u8 = if seg >= 8 {
+        0x7F
+    } else {
+        let top = (seg as u8) << 4;
+        let low = if seg < 2 {
+            ((pcm_val >> 1) & 0x0F) as u8
+        } else {
+            ((pcm_val >> seg) & 0x0F) as u8
+        };
+        top | low
+    };
+    aval ^ mask
+}
+
+pub fn convert_pcm16le_or_wav_to_alaw(input: &[u8]) -> Vec<u8> {
+    if input.len() >= 12 && &input[0..4] == b"RIFF" && &input[8..12] == b"WAVE" {
+        let mut cursor = 12usize;
+        let mut audio_format: u16 = 1; // 1 = PCM, 3 = IEEE Float32, 6 = A-law
+        let mut channels: usize = 1;
+        let mut bits_per_sample: u16 = 16;
+        let mut data_slice: Option<&[u8]> = None;
+        while cursor + 8 <= input.len() {
+            let chunk_id = &input[cursor..cursor + 4];
+            let chunk_len = u32::from_le_bytes([
+                input[cursor + 4],
+                input[cursor + 5],
+                input[cursor + 6],
+                input[cursor + 7],
+            ]) as usize;
+            let data_start = cursor + 8;
+            let end = data_start.saturating_add(chunk_len).min(input.len());
+            if chunk_id == b"fmt " && end >= data_start + 16 {
+                audio_format = u16::from_le_bytes([input[data_start], input[data_start + 1]]);
+                channels = u16::from_le_bytes([input[data_start + 2], input[data_start + 3]]).max(1)
+                    as usize;
+                bits_per_sample =
+                    u16::from_le_bytes([input[data_start + 14], input[data_start + 15]]);
+            } else if chunk_id == b"data" {
+                data_slice = Some(&input[data_start..end]);
+                break;
+            }
+            let padded_len = chunk_len.saturating_add(chunk_len & 1);
+            cursor = data_start.saturating_add(padded_len);
+        }
+        let Some(raw_data) = data_slice else {
+            return Vec::new();
+        };
+        if audio_format == 6 {
+            // Already 8-bit A-law
+            return raw_data.iter().step_by(channels.max(1)).copied().collect();
+        }
+        if audio_format == 3 && bits_per_sample == 32 {
+            // IEEE Float32 WAV
+            let frame_bytes = 4usize.saturating_mul(channels.max(1));
+            let mut out = Vec::with_capacity(raw_data.len() / frame_bytes.max(4));
+            for frame in raw_data.chunks_exact(frame_bytes.max(4)) {
+                let f = f32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]);
+                let s16 = if f.is_finite() {
+                    (f.clamp(-1.0, 1.0) * 32767.0) as i16
+                } else {
+                    0
+                };
+                out.push(linear_pcm16_to_alaw(s16));
+            }
+            return out;
+        }
+        if audio_format != 1 || bits_per_sample != 16 {
+            return Vec::new();
+        }
+        let frame_bytes = 2usize.saturating_mul(channels.max(1));
+        let mut out = Vec::with_capacity(raw_data.len() / frame_bytes.max(2));
+        for frame in raw_data.chunks_exact(frame_bytes.max(2)) {
+            let sample = i16::from_le_bytes([frame[0], frame[1]]);
+            out.push(linear_pcm16_to_alaw(sample));
+        }
+        return out;
+    }
+
+    let mut out = Vec::with_capacity(input.len() / 2);
+    for pair in input.as_chunks::<2>().0 {
+        let sample = i16::from_le_bytes(*pair);
+        out.push(linear_pcm16_to_alaw(sample));
+    }
+    out
+}
+
+fn go2rtc_stream_has_native_backchannel(
+    cfg: &NinjaConfig,
+    camera: &str,
+    cam_cfg: &ninjanvr_config::CameraConfig,
+) -> bool {
+    if cam_cfg
+        .hardware
+        .cloud_password
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty() && p.trim() != "***" && p.trim() != "*")
+    {
+        return true;
+    }
+    let check_url = |s: &str| -> bool {
+        let lc = s.trim().to_ascii_lowercase();
+        if lc.contains("#backchannel=0") {
+            return false;
+        }
+        lc.starts_with("tapo://")
+            || lc.starts_with("dvrip://")
+            || lc.starts_with("isapi://")
+            || lc.starts_with("roborock://")
+            || lc.starts_with("ring://")
+            || lc.starts_with("tuya://")
+            || lc.starts_with("xiaomi://")
+            || lc.starts_with("doorbird://")
+            || lc.contains("#backchannel=1")
+    };
+    if let Some(val) = cfg.go2rtc.streams.get(camera) {
+        match val {
+            Value::String(s) if check_url(s) => {
+                return true;
+            }
+            Value::Array(arr) if arr.iter().any(|item| item.as_str().is_some_and(check_url)) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HardwareQueryParams {
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CameraHardwareUpdateBody {
+    pub brightness: Option<f32>,
+    pub contrast: Option<f32>,
+    pub saturation: Option<f32>,
+    pub sharpness: Option<f32>,
+    pub hardware_autotracking: Option<bool>,
+    pub day_night_mode: Option<String>,
+    pub ir_mode: Option<String>,
+    pub ir_brightness: Option<u8>,
+    pub status_led: Option<bool>,
+    pub flip: Option<bool>,
+    pub mirror: Option<bool>,
+    pub wdr: Option<bool>,
+    pub siren_on_motion: Option<bool>,
+    pub siren_on_audio: Option<bool>,
+    pub audio_detect_enabled: Option<bool>,
+    pub audio_sensitivity: Option<u8>,
+    pub speaker_volume: Option<u8>,
+    pub microphone_volume: Option<u8>,
+    pub reboot: Option<bool>,
+    pub apply_suggested_onvif: Option<bool>,
+    pub apply_suggested_substream: Option<bool>,
+    pub protocol: Option<String>,
+    pub profile_token: Option<String>,
+    pub video_source_token: Option<String>,
+    pub cloud_password: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct CameraHardwareProbeTarget {
+    host: String,
+    onvif_port: u16,
+    user: Option<String>,
+    password: Option<String>,
+    is_tapo_hint: bool,
+    is_dahua_hint: bool,
+    ptz_ep_opt: Option<String>,
+}
+
+fn resolve_camera_hardware_probe_targets(
+    cfg: &NinjaConfig,
+    camera: &str,
+    cam_cfg: &ninjanvr_config::CameraConfig,
+) -> Option<CameraHardwareProbeTarget> {
+    let inferred = cfg.infer_camera_upstream(camera);
+    let (user, password) = resolve_effective_onvif_credentials(cfg, camera, cam_cfg);
+
+    if cam_cfg.onvif.is_configured() {
+        let host = cam_cfg
+            .onvif
+            .host
+            .clone()
+            .or_else(|| inferred.as_ref().map(|i| i.host.clone()))?;
+        let is_tapo_hint = inferred.as_ref().is_some_and(|i| i.is_tapo_rtsp)
+            || cam_cfg.onvif.port == 2020
+            || cam_cfg
+                .hardware
+                .protocol
+                .as_deref()
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("tapo"))
+            || get_cached_onvif_protocol(camera)
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case("tapo"));
+        let onvif_port = if cam_cfg.onvif.port == 80 && is_tapo_hint {
+            2020
+        } else {
+            cam_cfg.onvif.port
+        };
+        let mut adjusted_onvif = cam_cfg.onvif.clone();
+        adjusted_onvif.port = onvif_port;
+        if let Some(explicit_ptz_ep) = resolve_onvif_ptz_endpoint(&adjusted_onvif) {
+            let is_dahua_hint = inferred.as_ref().is_some_and(|i| i.is_dahua_rtsp)
+                || cam_cfg.hardware.protocol.as_deref().is_some_and(|p| {
+                    p.trim().eq_ignore_ascii_case("dahua_cgi")
+                        || p.trim().eq_ignore_ascii_case("intelbras")
+                });
+            return Some(CameraHardwareProbeTarget {
+                host,
+                onvif_port,
+                user,
+                password,
+                is_tapo_hint,
+                is_dahua_hint,
+                ptz_ep_opt: Some(explicit_ptz_ep),
+            });
+        }
+    }
+
+    let inf = inferred?;
+    let ep_candidate = format!(
+        "http://{}:{}/onvif/ptz_service",
+        inf.host, inf.default_onvif_port
+    );
+    if !is_safe_onvif_endpoint_url(&ep_candidate) {
+        return None;
+    }
+    Some(CameraHardwareProbeTarget {
+        host: inf.host,
+        onvif_port: inf.default_onvif_port,
+        user,
+        password,
+        is_tapo_hint: inf.is_tapo_rtsp,
+        is_dahua_hint: inf.is_dahua_rtsp,
+        ptz_ep_opt: Some(ep_candidate),
+    })
+}
+
+async fn discover_onvif_media_tokens(
+    client: &reqwest::Client,
+    onvif_base: &str,
+    (user, pass): (Option<&str>, Option<&str>),
+    timeout: std::time::Duration,
+) -> (Vec<String>, Vec<String>) {
+    let mut profiles = Vec::new();
+    let mut video_sources = Vec::new();
+    for suffix in ["media_service", "service"] {
+        let ep = format!("{onvif_base}/onvif/{suffix}");
+        let prof_soap = build_onvif_get_profiles_soap(user, pass);
+        if let Ok(xml) = send_onvif_soap_request_with_ns(
+            client,
+            &ep,
+            ("http://www.onvif.org/ver10/media/wsdl", "GetProfiles"),
+            prof_soap,
+            (user, pass),
+            timeout,
+        )
+        .await
+        {
+            let (p, vs) = parse_onvif_profiles_and_video_sources_xml(&xml);
+            for tok in p {
+                if !profiles.contains(&tok) {
+                    profiles.push(tok);
+                }
+            }
+            for tok in vs {
+                if !video_sources.contains(&tok) {
+                    video_sources.push(tok);
+                }
+            }
+            if !profiles.is_empty() {
+                break;
+            }
+        }
+    }
+    if video_sources.is_empty() {
+        for suffix in ["media_service", "service"] {
+            let ep = format!("{onvif_base}/onvif/{suffix}");
+            let vs_soap = build_onvif_get_video_sources_soap(user, pass);
+            if let Ok(xml) = send_onvif_soap_request_with_ns(
+                client,
+                &ep,
+                ("http://www.onvif.org/ver10/media/wsdl", "GetVideoSources"),
+                vs_soap,
+                (user, pass),
+                timeout,
+            )
+            .await
+            {
+                let (_, vs) = parse_onvif_profiles_and_video_sources_xml(&xml);
+                for tok in vs {
+                    if !video_sources.contains(&tok) {
+                        video_sources.push(tok);
+                    }
+                }
+                if !video_sources.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    (profiles, video_sources)
+}
+
+async fn api_camera_hardware_get(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath(camera): AxumPath<String>,
+    Query(q): Query<HardwareQueryParams>,
+) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+
+    let (cam_opt, probe_target, has_native_backchannel) = {
+        let cfg = state.config.read().await;
+        let cam = cfg.cameras.get(&camera).cloned();
+        let target = cam
+            .as_ref()
+            .and_then(|c| resolve_camera_hardware_probe_targets(&cfg, &camera, c));
+        let backchannel = cam
+            .as_ref()
+            .is_some_and(|c| go2rtc_stream_has_native_backchannel(&cfg, &camera, c));
+        (cam, target, backchannel)
+    };
+
+    let Some(cam_cfg) = cam_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
+        )
+            .into_response();
+    };
+
+    let Some(CameraHardwareProbeTarget {
+        host,
+        onvif_port,
+        user: user_opt,
+        password: pass_opt,
+        is_tapo_hint,
+        is_dahua_hint,
+        ptz_ep_opt,
+    }) = probe_target
+    else {
+        return Json(json!({
+            "camera": camera,
+            "online": false,
+            "protocol_family": "rtsp_only",
+            "onvif_configured": cam_cfg.onvif.is_configured(),
+            "device_info": CameraDeviceIdentity::default(),
+            "capabilities": {
+                "ptz": false,
+                "ptz_zoom": false,
+                "ptz_presets": false,
+                "ptz_presets_manage": false,
+                "push_to_talk": has_native_backchannel,
+                "push_to_talk_mode": if has_native_backchannel { json!("webrtc") } else { Value::Null },
+                "imaging": false,
+                "hardware_autotracking": false,
+                "day_night_mode": false,
+                "ir_lighting": false,
+                "status_led": false,
+                "flip_mirror": false,
+                "wdr": false,
+                "siren_on_event": false,
+                "audio_anomaly_detect": false,
+                "audio_volume": false,
+                "reboot": false
+            },
+            "missing_requirements": ["onvif_not_configured"],
+            "suggested_config": Value::Null,
+            "state": {}
+        }))
+        .into_response();
+    };
+
+    let is_admin = caller_can_mutate(&state, &jar, &headers, true).await;
+    let max_timeout_ms = if is_admin { 10_000 } else { 2_500 };
+    let timeout = match q.timeout_ms {
+        Some(ms) => std::time::Duration::from_millis(ms.clamp(50, max_timeout_ms)),
+        None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 5)),
+    };
+    let user = user_opt.as_deref();
+    let pass = pass_opt.as_deref();
+
+    let onvif_base = format_camera_http_base(&host, onvif_port);
+    let dev_ep = format!("{onvif_base}/onvif/device_service");
+    let ptz_ep = ptz_ep_opt.unwrap_or_else(|| format!("{onvif_base}/onvif/ptz_service"));
+
+    // 1. Probe ONVIF GetDeviceInformation
+    let dev_soap = build_onvif_get_device_info_soap(user, pass);
+    let dev_res = send_onvif_soap_request_with_ns(
+        &state.http_client,
+        &dev_ep,
+        (
+            "http://www.onvif.org/ver10/device/wsdl",
+            "GetDeviceInformation",
+        ),
+        dev_soap,
+        (user, pass),
+        timeout,
+    )
+    .await;
+    let host_timed_out = matches!(dev_res, Err((StatusCode::GATEWAY_TIMEOUT, _)));
+    let mut dev_info = match &dev_res {
+        Ok(xml) => parse_onvif_device_info_xml(xml),
+        Err(_) => CameraDeviceIdentity::default(),
+    };
+
+    let is_tapo = if let Some(ref mfg) = dev_info.manufacturer {
+        mfg.to_ascii_lowercase().contains("tp-link")
+            || dev_info
+                .model
+                .as_deref()
+                .is_some_and(|m| m.to_ascii_lowercase().contains("tapo"))
+    } else {
+        is_tapo_hint
+    };
+    let img_endpoints = if is_tapo {
+        [
+            format!("{onvif_base}/onvif/service"),
+            format!("{onvif_base}/onvif/imaging_service"),
+        ]
+    } else {
+        [
+            format!("{onvif_base}/onvif/imaging_service"),
+            format!("{onvif_base}/onvif/service"),
+        ]
+    };
+
+    // 2. Probe ONVIF PTZ GetStatus (with deduplicated ProfileToken + GetProfiles discovery; abort on network timeout/unreachable)
+    let initial_prof = default_camera_profile_token(&camera, &ptz_ep, &cam_cfg);
+    let mut discovered_profile = initial_prof.clone();
+    let mut ptz_ok = false;
+    let mut ptz_zoom = false;
+    let mut media_discovered: Option<(Vec<String>, Vec<String>)> = None;
+    if !host_timed_out {
+        let mut tried_profs = Vec::new();
+        for cand_prof in [
+            initial_prof.as_str(),
+            "Profile000",
+            "profile_1",
+            "Profile_1",
+        ] {
+            if tried_profs.contains(&cand_prof) {
+                continue;
+            }
+            tried_profs.push(cand_prof);
+            let st_soap = build_onvif_get_status_soap(cand_prof, user, pass);
+            match send_onvif_soap_request(
+                &state.http_client,
+                &ptz_ep,
+                "GetStatus",
+                st_soap,
+                user,
+                pass,
+                timeout,
+            )
+            .await
+            {
+                Ok(st_xml) => {
+                    ptz_ok = true;
+                    discovered_profile = cand_prof.to_string();
+                    cache_onvif_profile(&camera, &ptz_ep, &discovered_profile);
+                    if let Some(pos_block) = extract_xml_element_text(&st_xml, "Position")
+                        && pos_block.contains("Zoom")
+                    {
+                        ptz_zoom = true;
+                    }
+                    break;
+                }
+                Err((StatusCode::GATEWAY_TIMEOUT, _)) => break,
+                Err((_, ref e)) if !is_onvif_profile_not_found_error(e) => break,
+                Err(_) => {}
+            }
+        }
+        if !ptz_ok {
+            let (dyn_profs, dyn_vs) =
+                discover_onvif_media_tokens(&state.http_client, &onvif_base, (user, pass), timeout)
+                    .await;
+            for dyn_prof in &dyn_profs {
+                if tried_profs.contains(&dyn_prof.as_str()) {
+                    continue;
+                }
+                let st_soap = build_onvif_get_status_soap(dyn_prof, user, pass);
+                if let Ok(st_xml) = send_onvif_soap_request(
+                    &state.http_client,
+                    &ptz_ep,
+                    "GetStatus",
+                    st_soap,
+                    user,
+                    pass,
+                    timeout,
+                )
+                .await
+                {
+                    ptz_ok = true;
+                    discovered_profile = dyn_prof.clone();
+                    cache_onvif_profile(&camera, &ptz_ep, &discovered_profile);
+                    if let Some(pos_block) = extract_xml_element_text(&st_xml, "Position")
+                        && pos_block.contains("Zoom")
+                    {
+                        ptz_zoom = true;
+                    }
+                    break;
+                }
+            }
+            media_discovered = Some((dyn_profs, dyn_vs));
+        }
+    }
+
+    // 3. Probe ONVIF Imaging GetImagingSettings across both endpoints (deduplicated; abort on network timeout)
+    let default_vs = cam_cfg
+        .hardware
+        .video_source_token
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| get_cached_onvif_video_source(&camera))
+        .unwrap_or_else(|| {
+            if is_tapo {
+                "raw_vs1".to_string()
+            } else {
+                "VideoSource000".to_string()
+            }
+        });
+    let mut discovered_vs = default_vs.clone();
+    let mut imaging_ok = false;
+    let mut img_tuple = (None, None, None, None);
+    if !host_timed_out {
+        let mut vs_candidates = vec![
+            default_vs.clone(),
+            "raw_vs1".to_string(),
+            "VideoSource000".to_string(),
+            "00000".to_string(),
+        ];
+        if let Some((_, ref dyn_vs)) = media_discovered {
+            for v in dyn_vs {
+                if !vs_candidates.contains(v) {
+                    vs_candidates.push(v.clone());
+                }
+            }
+        }
+        'img_probe: for img_ep in &img_endpoints {
+            let mut tried_vs = Vec::new();
+            for cand_vs in &vs_candidates {
+                if tried_vs.contains(&cand_vs.as_str()) {
+                    continue;
+                }
+                tried_vs.push(cand_vs.as_str());
+                let img_soap = build_onvif_get_imaging_settings_soap(cand_vs, user, pass);
+                match send_onvif_soap_request_with_ns(
+                    &state.http_client,
+                    img_ep,
+                    (
+                        "http://www.onvif.org/ver20/imaging/wsdl",
+                        "GetImagingSettings",
+                    ),
+                    img_soap,
+                    (user, pass),
+                    timeout,
+                )
+                .await
+                {
+                    Ok(img_xml) => {
+                        imaging_ok = true;
+                        discovered_vs = cand_vs.clone();
+                        cache_onvif_video_source(&camera, &discovered_vs);
+                        img_tuple = parse_onvif_imaging_settings_xml(&img_xml);
+                        break 'img_probe;
+                    }
+                    Err((StatusCode::GATEWAY_TIMEOUT, _)) => break 'img_probe,
+                    Err((_, ref e)) if e.contains("request failed") => break 'img_probe,
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    // 4. Probe Dahua / Intelbras HTTP CGI if not Tapo
+    let cgi_port = if onvif_port != 2020 { onvif_port } else { 80 };
+    let cgi_base = format_camera_http_base(&host, cgi_port);
+    let mut dahua_cgi_ok = false;
+    let mut state_map = serde_json::Map::new();
+    if let Some(b) = img_tuple.0 {
+        state_map.insert("brightness".to_string(), json!(b.round() as i32));
+    }
+    if let Some(c) = img_tuple.1 {
+        state_map.insert("contrast".to_string(), json!(c.round() as i32));
+    }
+    if let Some(s) = img_tuple.2 {
+        state_map.insert("saturation".to_string(), json!(s.round() as i32));
+    }
+    if let Some(sh) = img_tuple.3 {
+        state_map.insert("sharpness".to_string(), json!(sh.round() as i32));
+    }
+
+    if !host_timed_out
+        && !is_tapo
+        && (is_dahua_hint
+            || onvif_port == 80
+            || dev_info.manufacturer.as_deref().is_some_and(|m| {
+                m.to_ascii_lowercase().contains("intelbras")
+                    || m.to_ascii_lowercase().contains("dahua")
+                    || m.to_ascii_lowercase().contains("amcrest")
+                    || m.to_ascii_lowercase().contains("imou")
+            }))
+    {
+        let sys_url = format!("{cgi_base}/cgi-bin/magicBox.cgi?action=getSystemInfo");
+        if let Ok((StatusCode::OK, sys_txt)) = send_http_digest_request(
+            &state.http_client,
+            reqwest::Method::GET,
+            &sys_url,
+            (user, pass),
+            (None, None),
+            timeout,
+        )
+        .await
+        {
+            let sys_kv = parse_dahua_cgi_kv(&sys_txt);
+            if sys_kv.contains_key("deviceType") || sys_kv.contains_key("serialNumber") {
+                dahua_cgi_ok = true;
+                if dev_info.model.is_none() {
+                    dev_info.model = sys_kv.get("deviceType").cloned();
+                }
+                if dev_info.serial_number.is_none() {
+                    dev_info.serial_number = sys_kv.get("serialNumber").cloned();
+                }
+                if dev_info.manufacturer.is_none() {
+                    dev_info.manufacturer = Some("Intelbras / Dahua".to_string());
+                }
+            }
+        }
+    }
+
+    if dahua_cgi_ok {
+        for table in [
+            "LeSmartTrack",
+            "VideoInOptions",
+            "Lighting",
+            "LightGlobal",
+            "MotionDetect",
+            "AudioDetect",
+            "AudioOutputVolume",
+            "AudioInputVolume",
+        ] {
+            let tbl_url =
+                format!("{cgi_base}/cgi-bin/configManager.cgi?action=getConfig&name={table}");
+            if let Ok((StatusCode::OK, txt)) = send_http_digest_request(
+                &state.http_client,
+                reqwest::Method::GET,
+                &tbl_url,
+                (user, pass),
+                (None, None),
+                timeout,
+            )
+            .await
+            {
+                let kv = parse_dahua_cgi_kv(&txt);
+                match table {
+                    "LeSmartTrack" => {
+                        if let Some(v) = kv.get("table.LeSmartTrack[0].Enable") {
+                            state_map.insert(
+                                "hardware_autotracking".to_string(),
+                                json!(v.eq_ignore_ascii_case("true")),
+                            );
+                        }
+                    }
+                    "VideoInOptions" => {
+                        if let Some(dn) = kv.get("table.VideoInOptions[0].DayNightColor") {
+                            let mode_str = match dn.as_str() {
+                                "1" => "day",
+                                "2" => "night",
+                                _ => "auto",
+                            };
+                            state_map.insert("day_night_mode".to_string(), json!(mode_str));
+                        }
+                        if let Some(fl) = kv.get("table.VideoInOptions[0].Flip") {
+                            state_map
+                                .insert("flip".to_string(), json!(fl.eq_ignore_ascii_case("true")));
+                        }
+                        if let Some(mr) = kv.get("table.VideoInOptions[0].Mirror") {
+                            state_map.insert(
+                                "mirror".to_string(),
+                                json!(mr.eq_ignore_ascii_case("true")),
+                            );
+                        }
+                        if let Some(wdr) = kv.get("table.VideoInOptions[0].WideDynamicRangeMode") {
+                            state_map.insert("wdr".to_string(), json!(wdr != "0"));
+                        }
+                    }
+                    "Lighting" => {
+                        if let Some(m) = kv.get("table.Lighting[0][0].Mode") {
+                            state_map.insert("ir_mode".to_string(), json!(m.to_ascii_lowercase()));
+                        }
+                        if let Some(l) = kv
+                            .get("table.Lighting[0][0].MiddleLight[0].Light")
+                            .and_then(|s| s.parse::<u8>().ok())
+                        {
+                            state_map.insert("ir_brightness".to_string(), json!(l));
+                        }
+                    }
+                    "LightGlobal" => {
+                        if let Some(en) = kv.get("table.LightGlobal[0].Enable") {
+                            state_map.insert(
+                                "status_led".to_string(),
+                                json!(en.eq_ignore_ascii_case("true")),
+                            );
+                        }
+                    }
+                    "MotionDetect" => {
+                        if let Some(beep) = kv.get("table.MotionDetect[0].EventHandler.BeepEnable")
+                        {
+                            state_map.insert(
+                                "siren_on_motion".to_string(),
+                                json!(beep.eq_ignore_ascii_case("true")),
+                            );
+                        }
+                    }
+                    "AudioDetect" => {
+                        if let Some(en) = kv.get("table.AudioDetect[0].Enable") {
+                            state_map.insert(
+                                "audio_detect_enabled".to_string(),
+                                json!(en.eq_ignore_ascii_case("true")),
+                            );
+                        }
+                        if let Some(sens) = kv
+                            .get("table.AudioDetect[0].AnomalySensitive")
+                            .or_else(|| kv.get("table.AudioDetect[0].MutationThreold"))
+                            .or_else(|| kv.get("table.AudioDetect[0].MutationThreshold"))
+                            .and_then(|s| s.parse::<u8>().ok())
+                        {
+                            state_map.insert("audio_sensitivity".to_string(), json!(sens));
+                        }
+                        if let Some(beep) = kv.get("table.AudioDetect[0].EventHandler.BeepEnable") {
+                            state_map.insert(
+                                "siren_on_audio".to_string(),
+                                json!(beep.eq_ignore_ascii_case("true")),
+                            );
+                        }
+                    }
+                    "AudioOutputVolume" => {
+                        if let Some(vol) = kv
+                            .get("table.AudioOutputVolume[0]")
+                            .or_else(|| kv.get("table.AudioOutputVolume[0].Volume"))
+                            .and_then(|s| s.parse::<u8>().ok())
+                        {
+                            state_map.insert("speaker_volume".to_string(), json!(vol));
+                        }
+                    }
+                    "AudioInputVolume" => {
+                        if let Some(vol) = kv
+                            .get("table.AudioInputVolume[0]")
+                            .or_else(|| kv.get("table.AudioInputVolume[0].Volume"))
+                            .and_then(|s| s.parse::<u8>().ok())
+                        {
+                            state_map.insert("microphone_volume".to_string(), json!(vol));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let online = dev_res.is_ok() || ptz_ok || imaging_ok || dahua_cgi_ok;
+    let protocol_family = if is_tapo {
+        "tapo"
+    } else if dahua_cgi_ok {
+        "dahua_cgi"
+    } else if online {
+        "onvif"
+    } else {
+        "rtsp_only"
+    };
+    if online {
+        cache_onvif_protocol(&camera, protocol_family);
+    }
+
+    let (ptt_supported, ptt_mode) = if has_native_backchannel {
+        (true, Some("webrtc"))
+    } else if dahua_cgi_ok {
+        (true, Some("cgi_alaw"))
+    } else {
+        (false, None)
+    };
+
+    let mut missing_reqs: Vec<&str> = Vec::new();
+    if online && !cam_cfg.onvif.is_configured() {
+        missing_reqs.push("onvif_not_configured");
+    }
+    if is_tapo
+        && !cam_cfg
+            .hardware
+            .cloud_password
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty() && p.trim() != "***" && p.trim() != "*")
+    {
+        missing_reqs.push("tapo_cloud_password");
+    }
+
+    let clean_host_only = extract_clean_camera_host(&host);
+    if !is_admin {
+        dev_info.serial_number = None;
+    }
+
+    let suggested_substream = if dahua_cgi_ok {
+        Some(format!(
+            "rtsp://*:*@{clean_host_only}:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif#transport=tcp#timeout=10"
+        ))
+    } else if is_tapo {
+        Some(format!(
+            "rtsp://*:*@{clean_host_only}:554/stream2#transport=tcp#timeout=10"
+        ))
+    } else {
+        None
+    };
+
+    let suggested_cfg_json = if is_admin {
+        json!({
+            "onvif_host": clean_host_only,
+            "onvif_port": onvif_port,
+            "onvif_user": user,
+            "profile_token": discovered_profile,
+            "video_source_token": discovered_vs,
+            "protocol": protocol_family,
+            "native_substream_url": suggested_substream
+        })
+    } else {
+        Value::Null
+    };
+
+    Json(json!({
+        "camera": camera,
+        "online": online,
+        "protocol_family": protocol_family,
+        "onvif_configured": cam_cfg.onvif.is_configured(),
+        "device_info": dev_info,
+        "capabilities": {
+            "ptz": ptz_ok,
+            "ptz_zoom": ptz_zoom,
+            "ptz_presets": ptz_ok,
+            "ptz_presets_manage": ptz_ok,
+            "push_to_talk": ptt_supported,
+            "push_to_talk_mode": ptt_mode,
+            "imaging": imaging_ok,
+            "hardware_autotracking": dahua_cgi_ok,
+            "day_night_mode": dahua_cgi_ok,
+            "ir_lighting": dahua_cgi_ok,
+            "status_led": dahua_cgi_ok,
+            "flip_mirror": dahua_cgi_ok,
+            "wdr": dahua_cgi_ok,
+            "siren_on_event": dahua_cgi_ok && is_admin,
+            "audio_anomaly_detect": dahua_cgi_ok && is_admin,
+            "audio_volume": dahua_cgi_ok,
+            "reboot": online && is_admin
+        },
+        "missing_requirements": missing_reqs,
+        "suggested_config": suggested_cfg_json,
+        "state": state_map
+    }))
+    .into_response()
+}
+
+fn encode_rtsp_userinfo_part(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 8);
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+async fn api_camera_hardware_set(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+    AxumPath(camera): AxumPath<String>,
+    Json(body): Json<CameraHardwareUpdateBody>,
+) -> Response {
+    if let Some(err_resp) =
+        verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
+    {
+        return err_resp;
+    }
+
+    if (body.apply_suggested_onvif == Some(true)
+        || body.apply_suggested_substream == Some(true)
+        || body.cloud_password.is_some()
+        || body.protocol.is_some()
+        || body.profile_token.is_some()
+        || body.video_source_token.is_some()
+        || body.reboot == Some(true)
+        || body.siren_on_motion.is_some()
+        || body.siren_on_audio.is_some()
+        || body.audio_detect_enabled.is_some()
+        || body.audio_sensitivity.is_some())
+        && !caller_can_mutate(&state, &jar, &headers, true).await
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Admin role required for camera configuration, alarm linkage, or reboot" })),
+        )
+            .into_response();
+    }
+
+    let (cam_opt, probe_target) = {
+        let cfg = state.config.read().await;
+        let cam = cfg.cameras.get(&camera).cloned();
+        let target = cam
+            .as_ref()
+            .and_then(|c| resolve_camera_hardware_probe_targets(&cfg, &camera, c));
+        (cam, target)
+    };
+
+    let Some(mut cam_cfg) = cam_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
+        )
+            .into_response();
+    };
+
+    let Some(CameraHardwareProbeTarget {
+        host,
+        onvif_port,
+        user: user_opt,
+        password: pass_opt,
+        is_tapo_hint,
+        is_dahua_hint,
+        ptz_ep_opt,
+    }) = probe_target
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' has no reachable upstream IP or ONVIF endpoint") })),
+        )
+            .into_response();
+    };
+
+    let mut applied_ops: Vec<String> = Vec::new();
+    let onvif_base = format_camera_http_base(&host, onvif_port);
+    let cgi_port = if onvif_port != 2020 { onvif_port } else { 80 };
+    let cgi_base = format_camera_http_base(&host, cgi_port);
+    let ptz_ep = ptz_ep_opt.unwrap_or_else(|| format!("{onvif_base}/onvif/ptz_service"));
+
+    // 1. Handle 1-click ONVIF / Substream / Cloud Password configuration persistence
+    if body.apply_suggested_onvif == Some(true)
+        || body.apply_suggested_substream == Some(true)
+        || body.cloud_password.is_some()
+        || body.protocol.is_some()
+        || body.profile_token.is_some()
+        || body.video_source_token.is_some()
+    {
+        let clean_host_only = extract_clean_camera_host(&host);
+        let cached_prof = get_cached_onvif_profile(&camera, &ptz_ep);
+        let cached_vs = get_cached_onvif_video_source(&camera);
+        let cached_proto = get_cached_onvif_protocol(&camera);
+        let mut cfg_guard = state.config.write().await;
+        if let Some(cam_mut) = cfg_guard.cameras.get_mut(&camera) {
+            if body.apply_suggested_onvif == Some(true) {
+                cam_mut.onvif.host = Some(clean_host_only.clone());
+                cam_mut.onvif.port = onvif_port;
+                if cam_mut.onvif.user.is_none() {
+                    cam_mut.onvif.user = user_opt.clone();
+                }
+                if cam_mut.onvif.password.is_none() {
+                    cam_mut.onvif.password = pass_opt.clone();
+                }
+                if cam_mut.hardware.profile_token.is_none() {
+                    cam_mut.hardware.profile_token = Some(
+                        body.profile_token
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .or(cached_prof)
+                            .unwrap_or_else(|| {
+                                if is_tapo_hint {
+                                    "profile_1".to_string()
+                                } else {
+                                    "Profile000".to_string()
+                                }
+                            }),
+                    );
+                }
+                if cam_mut.hardware.video_source_token.is_none() {
+                    cam_mut.hardware.video_source_token = Some(
+                        body.video_source_token
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .or(cached_vs)
+                            .unwrap_or_else(|| {
+                                if is_tapo_hint {
+                                    "raw_vs1".to_string()
+                                } else {
+                                    "VideoSource000".to_string()
+                                }
+                            }),
+                    );
+                }
+                if cam_mut.hardware.protocol.is_none() {
+                    cam_mut.hardware.protocol = Some(
+                        body.protocol
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .or_else(|| cached_proto.clone())
+                            .unwrap_or_else(|| {
+                                if is_tapo_hint {
+                                    "tapo".to_string()
+                                } else if is_dahua_hint {
+                                    "dahua_cgi".to_string()
+                                } else {
+                                    "onvif".to_string()
+                                }
+                            }),
+                    );
+                }
+                applied_ops.push("apply_suggested_onvif".to_string());
+            }
+            if let Some(ref proto) = body.protocol {
+                let t = proto.trim();
+                cam_mut.hardware.protocol = if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                };
+            }
+            if let Some(ref pt) = body.profile_token {
+                let t = pt.trim();
+                cam_mut.hardware.profile_token = if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                };
+            }
+            if let Some(ref vst) = body.video_source_token {
+                let t = vst.trim();
+                cam_mut.hardware.video_source_token = if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                };
+            }
+            if let Some(ref cp) = body.cloud_password {
+                let trimmed_cp = cp.trim();
+                if trimmed_cp.is_empty() {
+                    cam_mut.hardware.cloud_password = None;
+                } else if trimmed_cp != "***" && trimmed_cp != "*" {
+                    cam_mut.hardware.cloud_password = Some(trimmed_cp.to_string());
+                }
+                applied_ops.push("cloud_password".to_string());
+            }
+            if body.apply_suggested_substream == Some(true) {
+                let sub_path = if is_tapo_hint {
+                    "/stream2#transport=tcp#timeout=10"
+                } else {
+                    "/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif#transport=tcp#timeout=10"
+                };
+                let userinfo_prefix = match (&user_opt, &pass_opt) {
+                    (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => format!(
+                        "{}:{}@",
+                        encode_rtsp_userinfo_part(u),
+                        encode_rtsp_userinfo_part(p)
+                    ),
+                    (Some(u), _) if !u.is_empty() => format!("{}@", encode_rtsp_userinfo_part(u)),
+                    _ => String::new(),
+                };
+                let sub_url = format!("rtsp://{userinfo_prefix}{clean_host_only}:554{sub_path}");
+                let sub_key = format!("{camera}_sub");
+                for inp in &mut cam_mut.ffmpeg.inputs {
+                    if inp.roles.len() == 1 && inp.roles[0] == "detect" {
+                        inp.path = format!("rtsp://127.0.0.1:8554/{sub_key}");
+                    }
+                }
+                cam_cfg = cam_mut.clone();
+                cfg_guard
+                    .go2rtc
+                    .streams
+                    .insert(sub_key, Value::Array(vec![Value::String(sub_url)]));
+                applied_ops.push("apply_suggested_substream".to_string());
+            } else {
+                cam_cfg = cam_mut.clone();
+            }
+        }
+        if let Err(err) = cfg_guard.refresh_raw_yaml() {
+            warn!("Failed to refresh raw_yaml after hardware config update: {err:#}");
+        }
+        let path_clone = cfg_guard.config_path.clone();
+        let yaml_clone = cfg_guard.raw_yaml.clone();
+        let _ = cfg_guard.write_go2rtc_config(ninjanvr_config::DEFAULT_GO2RTC_SHM_PATH);
+        if let Ok(Err(err)) = tokio::task::spawn_blocking(move || {
+            persist_config_yaml_atomically(&path_clone, &yaml_clone)
+        })
+        .await
+        {
+            warn!("Failed to persist config.yml after hardware config update: {err:#}");
+        }
+    }
+
+    let timeout = match body.timeout_ms {
+        Some(ms) => std::time::Duration::from_millis(ms.clamp(50, 10_000)),
+        None => std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 10)),
+    };
+    let user = user_opt.as_deref();
+    let pass = pass_opt.as_deref();
+
+    // 2. Apply ONVIF Imaging settings (Brightness / Contrast / Saturation / Sharpness)
+    if body.brightness.is_some()
+        || body.contrast.is_some()
+        || body.saturation.is_some()
+        || body.sharpness.is_some()
+    {
+        let img_endpoints = if is_tapo_hint {
+            [
+                format!("{onvif_base}/onvif/service"),
+                format!("{onvif_base}/onvif/imaging_service"),
+            ]
+        } else {
+            [
+                format!("{onvif_base}/onvif/imaging_service"),
+                format!("{onvif_base}/onvif/service"),
+            ]
+        };
+        let default_vs = cam_cfg
+            .hardware
+            .video_source_token
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| get_cached_onvif_video_source(&camera))
+            .unwrap_or_else(|| {
+                if is_tapo_hint {
+                    "raw_vs1".to_string()
+                } else {
+                    "VideoSource000".to_string()
+                }
+            });
+        let mut img_applied = false;
+        let mut last_img_err = String::new();
+        'img_outer: for img_ep in &img_endpoints {
+            let mut tried_vs = Vec::new();
+            for cand_vs in [default_vs.as_str(), "raw_vs1", "VideoSource000", "00000"] {
+                if tried_vs.contains(&cand_vs) {
+                    continue;
+                }
+                tried_vs.push(cand_vs);
+                let set_img_soap = build_onvif_set_imaging_settings_soap(
+                    cand_vs,
+                    body.brightness,
+                    body.contrast,
+                    body.saturation,
+                    body.sharpness,
+                    user,
+                    pass,
+                );
+                match send_onvif_soap_request_with_ns(
+                    &state.http_client,
+                    img_ep,
+                    (
+                        "http://www.onvif.org/ver20/imaging/wsdl",
+                        "SetImagingSettings",
+                    ),
+                    set_img_soap,
+                    (user, pass),
+                    timeout,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        img_applied = true;
+                        cache_onvif_video_source(&camera, cand_vs);
+                        applied_ops.push("imaging".to_string());
+                        break 'img_outer;
+                    }
+                    Err((StatusCode::GATEWAY_TIMEOUT, e)) => {
+                        last_img_err = e;
+                        break 'img_outer;
+                    }
+                    Err((_, e)) if e.contains("request failed") => {
+                        last_img_err = e;
+                        break 'img_outer;
+                    }
+                    Err((_, e)) => {
+                        last_img_err = e;
+                    }
+                }
+            }
+        }
+        if !img_applied {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "success": false, "camera": camera, "error": last_img_err })),
+            )
+                .into_response();
+        }
+    }
+
+    // 3. Apply Dahua / Intelbras CGI hardware settings
+    let mut cgi_pairs: Vec<String> = Vec::new();
+    if let Some(at) = body.hardware_autotracking {
+        cgi_pairs.push(format!(
+            "LeSmartTrack[0].Enable={}",
+            if at { "true" } else { "false" }
+        ));
+    }
+    if let Some(ref dn) = body.day_night_mode {
+        let code = match dn.trim().to_ascii_lowercase().as_str() {
+            "day" | "color" => "1",
+            "night" | "blackwhite" | "ir" => "2",
+            _ => "0",
+        };
+        cgi_pairs.push(format!("VideoInOptions[0].DayNightColor={code}"));
+    }
+    if let Some(ref irm) = body.ir_mode {
+        let mode_cap = match irm.trim().to_ascii_lowercase().as_str() {
+            "manual" | "on" => "Manual",
+            "off" => "Off",
+            _ => "Auto",
+        };
+        cgi_pairs.push(format!("Lighting[0][0].Mode={mode_cap}"));
+    }
+    if let Some(irb) = body.ir_brightness {
+        cgi_pairs.push(format!(
+            "Lighting[0][0].MiddleLight[0].Light={}",
+            irb.min(100)
+        ));
+    }
+    if let Some(led) = body.status_led {
+        cgi_pairs.push(format!(
+            "LightGlobal[0].Enable={}",
+            if led { "true" } else { "false" }
+        ));
+    }
+    if let Some(fl) = body.flip {
+        cgi_pairs.push(format!(
+            "VideoInOptions[0].Flip={}",
+            if fl { "true" } else { "false" }
+        ));
+    }
+    if let Some(mr) = body.mirror {
+        cgi_pairs.push(format!(
+            "VideoInOptions[0].Mirror={}",
+            if mr { "true" } else { "false" }
+        ));
+    }
+    if let Some(wdr) = body.wdr {
+        cgi_pairs.push(format!(
+            "VideoInOptions[0].WideDynamicRangeMode={}",
+            if wdr { "1" } else { "0" }
+        ));
+    }
+    if let Some(sm) = body.siren_on_motion {
+        cgi_pairs.push(format!(
+            "MotionDetect[0].EventHandler.BeepEnable={}",
+            if sm { "true" } else { "false" }
+        ));
+    }
+    if let Some(sa) = body.siren_on_audio {
+        cgi_pairs.push(format!(
+            "AudioDetect[0].EventHandler.BeepEnable={}",
+            if sa { "true" } else { "false" }
+        ));
+    }
+    if let Some(ad) = body.audio_detect_enabled {
+        let flag = if ad { "true" } else { "false" };
+        cgi_pairs.push(format!("AudioDetect[0].Enable={flag}"));
+        cgi_pairs.push(format!("AudioDetect[0].AnomalyDetect={flag}"));
+    }
+    if let Some(asens) = body.audio_sensitivity {
+        cgi_pairs.push(format!(
+            "AudioDetect[0].AnomalySensitive={}",
+            asens.clamp(1, 100)
+        ));
+    }
+    if let Some(svol) = body.speaker_volume {
+        cgi_pairs.push(format!("AudioOutputVolume[0]={}", svol.min(100)));
+    }
+    if let Some(mvol) = body.microphone_volume {
+        cgi_pairs.push(format!("AudioInputVolume[0]={}", mvol.min(100)));
+    }
+
+    if !cgi_pairs.is_empty() {
+        let set_url = format!(
+            "{cgi_base}/cgi-bin/configManager.cgi?action=setConfig&{}",
+            cgi_pairs.join("&")
+        );
+        match send_http_digest_request(
+            &state.http_client,
+            reqwest::Method::GET,
+            &set_url,
+            (user, pass),
+            (None, None),
+            timeout,
+        )
+        .await
+        {
+            Ok((StatusCode::OK, resp_txt))
+                if !resp_txt
+                    .trim_start()
+                    .to_ascii_lowercase()
+                    .starts_with("error") =>
+            {
+                applied_ops.extend(cgi_pairs);
+            }
+            Ok((st, resp_txt)) => {
+                let scrubbed_snippet: String = scrub_rtsp_credentials(resp_txt.trim())
+                    .chars()
+                    .take(256)
+                    .collect();
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({
+                        "success": false,
+                        "camera": camera,
+                        "error": format!("Camera CGI setConfig returned HTTP {} ({scrubbed_snippet})", st.as_u16())
+                    })),
+                )
+                    .into_response();
+            }
+            Err((st, err_msg)) => {
+                return (
+                    st,
+                    Json(json!({
+                        "success": false,
+                        "camera": camera,
+                        "error": err_msg
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // 4. Handle Reboot (ONVIF SystemReboot or Dahua CGI magicBox.cgi?action=reboot)
+    if body.reboot == Some(true) {
+        let dev_ep = format!("{onvif_base}/onvif/device_service");
+        let reboot_soap = build_onvif_system_reboot_soap(user, pass);
+        let onvif_reboot = send_onvif_soap_request_with_ns(
+            &state.http_client,
+            &dev_ep,
+            ("http://www.onvif.org/ver10/device/wsdl", "SystemReboot"),
+            reboot_soap,
+            (user, pass),
+            timeout,
+        )
+        .await;
+        match onvif_reboot {
+            Ok(_) => {
+                applied_ops.push("reboot:onvif".to_string());
+            }
+            Err((st, err_msg)) => {
+                let cgi_reboot_url = format!("{cgi_base}/cgi-bin/magicBox.cgi?action=reboot");
+                match send_http_digest_request(
+                    &state.http_client,
+                    reqwest::Method::GET,
+                    &cgi_reboot_url,
+                    (user, pass),
+                    (None, None),
+                    timeout,
+                )
+                .await
+                {
+                    Ok((StatusCode::OK, _)) => {
+                        applied_ops.push("reboot:cgi".to_string());
+                    }
+                    _ => {
+                        return (
+                            st,
+                            Json(json!({
+                                "success": false,
+                                "camera": camera,
+                                "error": err_msg
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+    }
+
+    Json(json!({
+        "success": true,
+        "camera": camera,
+        "applied": applied_ops
+    }))
+    .into_response()
+}
+
+const MAX_TALKBACK_AUDIO_BYTES: usize = 512 * 1024;
+
+async fn api_camera_audio_talkback(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+    AxumPath(camera): AxumPath<String>,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    if let Some(err_resp) =
+        verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
+    {
+        return err_resp;
+    }
+    if body_bytes.is_empty() || body_bytes.len() > MAX_TALKBACK_AUDIO_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": format!("Audio talkback payload must be between 1 and {MAX_TALKBACK_AUDIO_BYTES} bytes")
+            })),
+        )
+            .into_response();
+    }
+
+    let (cam_opt, probe_target) = {
+        let cfg = state.config.read().await;
+        let cam = cfg.cameras.get(&camera).cloned();
+        let target = cam
+            .as_ref()
+            .and_then(|c| resolve_camera_hardware_probe_targets(&cfg, &camera, c));
+        (cam, target)
+    };
+    let Some(cam_cfg) = cam_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
+        )
+            .into_response();
+    };
+    let Some(CameraHardwareProbeTarget {
+        host,
+        onvif_port,
+        user: user_opt,
+        password: pass_opt,
+        ..
+    }) = probe_target
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' has no reachable HTTP talkback endpoint") })),
+        )
+            .into_response();
+    };
+
+    let ct_in = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_ascii_lowercase();
+    let cte_base64 = headers
+        .get("content-transfer-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("base64"));
+
+    let mut is_alaw = ct_in.contains("g711a") || ct_in.contains("pcma") || ct_in.contains("alaw");
+    let raw_audio_bytes: Vec<u8> = if ct_in.contains("json") || body_bytes.starts_with(b"{") {
+        let Ok(jval) = serde_json::from_slice::<Value>(&body_bytes) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "success": false, "message": "Invalid JSON audio talkback body" })),
+            )
+                .into_response();
+        };
+        if jval
+            .get("codec")
+            .or_else(|| jval.get("format"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| {
+                let clc = c.to_ascii_lowercase();
+                clc.contains("alaw") || clc.contains("g711a") || clc.contains("pcma")
+            })
+        {
+            is_alaw = true;
+        }
+        if jval.get("alaw_base64").is_some() {
+            is_alaw = true;
+        }
+        let b64_str = jval
+            .get("audio_base64")
+            .or_else(|| jval.get("pcm_base64"))
+            .or_else(|| jval.get("alaw_base64"))
+            .or_else(|| jval.get("data"))
+            .or_else(|| jval.get("audio"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        match base64::engine::general_purpose::STANDARD.decode(b64_str) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "success": false, "message": "Invalid base64 audio data in JSON body" })),
+                )
+                    .into_response();
+            }
+        }
+    } else if ct_in.contains("base64") || cte_base64 {
+        let trimmed_b64 = std::str::from_utf8(&body_bytes)
+            .unwrap_or("")
+            .trim()
+            .as_bytes();
+        match base64::engine::general_purpose::STANDARD.decode(trimmed_b64) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "success": false, "message": "Invalid base64 audio payload" })),
+                )
+                    .into_response();
+            }
+        }
+    } else if !is_alaw
+        && let Ok(utf8_str) = std::str::from_utf8(&body_bytes)
+        && body_bytes.len() > utf8_str.chars().count()
+        && utf8_str.chars().all(|c| (c as u32) <= 0xFF)
+    {
+        // Recover raw bytes when browser fetch() UTF-8 encoded a Latin-1 binary string
+        utf8_str.chars().map(|c| c as u8).collect()
+    } else {
+        body_bytes.to_vec()
+    };
+
+    let alaw_payload = if is_alaw {
+        raw_audio_bytes
+    } else {
+        convert_pcm16le_or_wav_to_alaw(&raw_audio_bytes)
+    };
+    if alaw_payload.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "success": false, "message": "Audio payload produced 0 G.711A samples" })),
+        )
+            .into_response();
+    }
+
+    let port = if onvif_port != 2020 { onvif_port } else { 80 };
+    let cgi_base = format_camera_http_base(&host, port);
+    let talk_url =
+        format!("{cgi_base}/cgi-bin/audio.cgi?action=postAudio&httptype=singlepart&channel=1");
+    let timeout = std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(2, 15));
+
+    match send_http_digest_request(
+        &state.http_client,
+        reqwest::Method::POST,
+        &talk_url,
+        (user_opt.as_deref(), pass_opt.as_deref()),
+        (Some("Audio/G.711A"), Some(alaw_payload.clone())),
+        timeout,
+    )
+    .await
+    {
+        Ok((st, _)) if st.is_success() => Json(json!({
+            "success": true,
+            "camera": camera,
+            "bytes_sent": alaw_payload.len(),
+            "codec": "G.711A"
+        }))
+        .into_response(),
+        Ok((st, txt)) => {
+            let scrubbed_snippet: String = scrub_rtsp_credentials(txt.trim())
+                .chars()
+                .take(256)
+                .collect();
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "success": false,
+                    "camera": camera,
+                    "error": format!("Camera talkback returned HTTP {} ({scrubbed_snippet})", st.as_u16())
+                })),
+            )
+                .into_response()
+        }
+        Err((st, err_msg)) => (
+            st,
+            Json(json!({
+                "success": false,
+                "camera": camera,
+                "error": err_msg
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -42184,5 +45706,573 @@ cameras:
             mcp_thumb_b64, unredacted_b64,
             "MCP search_events must redact base64 event thumbnails for masked cameras"
         );
+    }
+
+    #[tokio::test]
+    async fn phase1_onvif_wsse_password_digest_profile_discovery_and_preset_crud_work() {
+        // 1. RFC 3174 SHA-1 test vectors and deterministic WSSE PasswordDigest verification
+        assert_eq!(
+            sha1_digest(b"abc")
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            sha1_digest(b"")
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        let fixed_nonce = [1u8; 16];
+        let digest_hdr = build_onvif_wsse_digest_header(
+            "admin",
+            "secret_pw",
+            &fixed_nonce,
+            "2026-11-07T02:00:00Z",
+        );
+        assert!(digest_hdr.contains("#PasswordDigest\">"));
+        assert!(digest_hdr.contains("<wsse:Nonce"));
+        assert!(digest_hdr.contains("<wsu:Created>2026-11-07T02:00:00Z</wsu:Created>"));
+        assert!(!digest_hdr.contains("secret_pw"));
+
+        // 2. Mock ONVIF server that strictly requires:
+        //    - WS-UsernameToken PasswordDigest (rejects plaintext wsse:Password with NotAuthorized)
+        //    - Profile000 (rejects Profile_1 with ter:NoProfile)
+        //    - Supports GetStatus, ContinuousMove, RelativeMove, AbsoluteMove, and tests both
+        //      native ONVIF SetPreset/RemovePreset AND ActionNotSupported soft-preset fallback.
+        let preset_mode = Arc::new(std::sync::Mutex::new("native".to_string()));
+        let preset_mode_srv = preset_mode.clone();
+        let strict_onvif_router = Router::new().route(
+            "/onvif/ptz_service",
+            post(move |body: String| {
+                let pmode = preset_mode_srv.lock().unwrap().clone();
+                async move {
+                    if !body.contains("#PasswordDigest")
+                        || !body.contains("<wsse:Nonce")
+                        || !body.contains("<wsu:Created>")
+                    {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            [(header::CONTENT_TYPE, "application/soap+xml")],
+                            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Reason><s:Text>Sender not Authorized</s:Text></s:Fault></s:Body></s:Envelope>"#.to_string(),
+                        );
+                    }
+                    if !body.contains("<tptz:ProfileToken>Profile000</tptz:ProfileToken>") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            [(header::CONTENT_TYPE, "application/soap+xml")],
+                            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Subcode><s:Value>ter:NoProfile</s:Value></s:Subcode></s:Code><s:Reason><s:Text>Profile token does not exist</s:Text></s:Fault></s:Body></s:Envelope>"#.to_string(),
+                        );
+                    }
+                    if (body.contains("SetPreset")
+                        || body.contains("GotoPreset")
+                        || body.contains("GetPresets"))
+                        && pmode == "unsupported"
+                    {
+                        return (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/soap+xml")],
+                            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Subcode><s:Value>ter:ActionNotSupported</s:Value></s:Subcode></s:Code><s:Reason><s:Text>This optional method is not implemented</s:Text></s:Fault></s:Body></s:Envelope>"#.to_string(),
+                        );
+                    }
+                    let resp_xml = if body.contains("GetStatus") {
+                        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><tptz:GetStatusResponse><tptz:PTZStatus><tt:Position><tt:PanTilt x="0.4000" y="-0.2000"/></tt:Position><tt:MoveStatus><tt:PanTilt>IDLE</tt:PanTilt></tt:MoveStatus></tptz:PTZStatus></tptz:GetStatusResponse></s:Body></s:Envelope>"#
+                    } else if body.contains("GetPresets") {
+                        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><s:Body><tptz:GetPresetsResponse><tptz:Preset token="1"><tt:Name>Home</tt:Name></tptz:Preset></tptz:GetPresetsResponse></s:Body></s:Envelope>"#
+                    } else if body.contains("SetPreset") {
+                        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><s:Body><tptz:SetPresetResponse><tptz:PresetToken>2</tptz:PresetToken></tptz:SetPresetResponse></s:Body></s:Envelope>"#
+                    } else if body.contains("RemovePreset") {
+                        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><s:Body><tptz:RemovePresetResponse/></s:Body></s:Envelope>"#
+                    } else if body.contains("AbsoluteMove") {
+                        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tptz:AbsoluteMoveResponse/></s:Body></s:Envelope>"#
+                    } else {
+                        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tptz:RelativeMoveResponse/></s:Body></s:Envelope>"#
+                    };
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/soap+xml")],
+                        resp_xml.to_string(),
+                    )
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, strict_onvif_router).await;
+        });
+
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+        let state = &ctx.state;
+        {
+            let mut cfg_guard = state.config.write().await;
+            if let Some(cam) = cfg_guard.cameras.get_mut("front_door") {
+                cam.onvif = ninjanvr_config::OnvifCameraConfig {
+                    host: Some("127.0.0.1".to_string()),
+                    port: addr.port(),
+                    user: Some("admin".to_string()),
+                    password: Some("digest_secret".to_string()),
+                    autotracking: false,
+                    return_preset: None,
+                    timeout_sec: 2,
+                };
+            }
+        }
+
+        // A. GET /api/front_door/ptz/info auto-discovers Profile000 and authenticates with PasswordDigest
+        let r_info = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/ptz/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_info.status(), StatusCode::OK);
+        let info_j: Value =
+            serde_json::from_slice(&to_bytes(r_info.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(info_j["online"], true);
+        assert_eq!(info_j["profile_token"], "Profile000");
+
+        // B. POST /api/front_door/ptz/move with mode="absolute" uses discovered Profile000
+        let r_abs = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/move")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"mode":"absolute","pan":0.25,"tilt":-0.1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_abs.status(), StatusCode::OK);
+        let abs_j: Value =
+            serde_json::from_slice(&to_bytes(r_abs.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(abs_j["operation"], "AbsoluteMove");
+
+        // C. Native ONVIF SetPreset & RemovePreset
+        let r_save = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/preset/save")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"KitchenView"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_save.status(), StatusCode::OK);
+        let save_j: Value =
+            serde_json::from_slice(&to_bytes(r_save.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(save_j["token"], "2");
+        assert_eq!(save_j["source"], "onvif");
+
+        let r_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/front_door/ptz/preset/2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_del.status(), StatusCode::OK);
+
+        // D. Soft-Preset fallback when camera returns ter:ActionNotSupported (Intelbras iME-360-C)
+        *preset_mode.lock().unwrap() = "unsupported".to_string();
+        let r_soft_save = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/preset/save")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"SalaPorta"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_soft_save.status(), StatusCode::OK);
+        let soft_save_j: Value =
+            serde_json::from_slice(&to_bytes(r_soft_save.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(soft_save_j["source"], "soft_preset");
+
+        let r_soft_goto = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/ptz/preset")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"preset":"SalaPorta"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_soft_goto.status(), StatusCode::OK);
+        let soft_goto_j: Value =
+            serde_json::from_slice(&to_bytes(r_soft_goto.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(soft_goto_j["source"], "soft_preset");
+
+        let r_soft_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/front_door/ptz/preset/SalaPorta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_soft_del.status(), StatusCode::OK);
+        let soft_del_j: Value =
+            serde_json::from_slice(&to_bytes(r_soft_del.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(soft_del_j["source"], "soft_preset");
+
+        srv_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn phase2_phase3_camera_hardware_capabilities_dahua_cgi_and_talkback_work() {
+        // 1. RFC 1321 MD5 test vectors
+        assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(b"abc"), "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(
+            md5_hex(b"message digest"),
+            "f96b697d7cb7938d525a2f31aaf161d0"
+        );
+
+        // 2. HTTP Digest Authentication header generation (with qop="auth" and empty opaque="")
+        let www_auth =
+            r#"Digest realm="Login to 5C93B8D566124B9A", qop="auth", nonce="5c6338dc", opaque="""#;
+        let digest_hdr = build_http_digest_auth_header(
+            www_auth,
+            "GET",
+            "/cgi-bin/magicBox.cgi?action=getSystemInfo",
+            "admin",
+            "cam_pass",
+            "0a4f113b",
+        )
+        .unwrap();
+        assert!(digest_hdr.contains("username=\"admin\""));
+        assert!(digest_hdr.contains("realm=\"Login to 5C93B8D566124B9A\""));
+        assert!(digest_hdr.contains("opaque=\"\""));
+        assert!(digest_hdr.contains("qop=auth, nc=00000001, cnonce=\"0a4f113b\""));
+
+        // 3. ITU-T G.711 A-law encoding and WAV stripping (including odd-length RIFF chunk padding)
+        assert_eq!(linear_pcm16_to_alaw(0), 0xD5);
+        let mut fake_wav = Vec::new();
+        fake_wav.extend_from_slice(b"RIFF");
+        fake_wav.extend_from_slice(&52u32.to_le_bytes());
+        fake_wav.extend_from_slice(b"WAVEfmt ");
+        fake_wav.extend_from_slice(&16u32.to_le_bytes());
+        fake_wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format = 1
+        fake_wav.extend_from_slice(&1u16.to_le_bytes()); // channels = 1
+        fake_wav.extend_from_slice(&8000u32.to_le_bytes()); // sample_rate = 8000
+        fake_wav.extend_from_slice(&16000u32.to_le_bytes()); // byte_rate = 16000
+        fake_wav.extend_from_slice(&2u16.to_le_bytes()); // block_align = 2
+        fake_wav.extend_from_slice(&16u16.to_le_bytes()); // bits_per_sample = 16
+        // Odd-sized JUNK chunk (3 bytes + 1 RIFF pad byte)
+        fake_wav.extend_from_slice(b"JUNK");
+        fake_wav.extend_from_slice(&3u32.to_le_bytes());
+        fake_wav.extend_from_slice(&[1, 2, 3, 0]);
+        fake_wav.extend_from_slice(b"data");
+        fake_wav.extend_from_slice(&4u32.to_le_bytes());
+        fake_wav.extend_from_slice(&0i16.to_le_bytes());
+        fake_wav.extend_from_slice(&1024i16.to_le_bytes());
+        let alaw_out = convert_pcm16le_or_wav_to_alaw(&fake_wav);
+        assert_eq!(alaw_out.len(), 2);
+        assert_eq!(alaw_out[0], 0xD5);
+
+        // 4. Mock Intelbras iME-360-C (ONVIF + Dahua HTTP Digest CGI + audio.cgi talkback)
+        let received_talkback_bytes = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let received_set_configs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let tb_srv = received_talkback_bytes.clone();
+        let sc_srv = received_set_configs.clone();
+
+        let mock_cam_router = Router::new()
+            .route(
+                "/onvif/device_service",
+                post(|| async {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/soap+xml")],
+                        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tds:GetDeviceInformationResponse xmlns:tds="http://www.onvif.org/ver10/device/wsdl"><tds:Manufacturer>IntelBras</tds:Manufacturer><tds:Model>iME-360-C</tds:Model><tds:FirmwareVersion>2.800.00IB007.0.R</tds:FirmwareVersion><tds:SerialNumber>SN12345</tds:SerialNumber><tds:HardwareId>1.00</tds:HardwareId></tds:GetDeviceInformationResponse></s:Body></s:Envelope>"#,
+                    )
+                }),
+            )
+            .route(
+                "/onvif/ptz_service",
+                post(|| async {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/soap+xml")],
+                        r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tptz:GetStatusResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><tptz:PTZStatus><tt:Position><tt:PanTilt x="0.8000" y="0.8000"/></tt:Position><tt:MoveStatus><tt:Zoom>IDLE</tt:Zoom></tt:MoveStatus></tptz:PTZStatus></tptz:GetStatusResponse></s:Body></s:Envelope>"#,
+                    )
+                }),
+            )
+            .route(
+                "/onvif/imaging_service",
+                post(|body: String| async move {
+                    if body.contains("SetImagingSettings") {
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/soap+xml")],
+                            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><timg:SetImagingSettingsResponse xmlns:timg="http://www.onvif.org/ver20/imaging/wsdl"/></s:Body></s:Envelope>"#,
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/soap+xml")],
+                            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><timg:GetImagingSettingsResponse xmlns:timg="http://www.onvif.org/ver20/imaging/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><timg:ImagingSettings><tt:Brightness>55.0</tt:Brightness><tt:ColorSaturation>60.0</tt:ColorSaturation><tt:Contrast>50.0</tt:Contrast><tt:Sharpness>45.0</tt:Sharpness></timg:ImagingSettings></timg:GetImagingSettingsResponse></s:Body></s:Envelope>"#,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/cgi-bin/magicBox.cgi",
+                get(|headers: HeaderMap, uri: Uri| async move {
+                    let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            [(
+                                header::WWW_AUTHENTICATE,
+                                r#"Digest realm="IntelbrasIPC", qop="auth", nonce="n1234", opaque="""#,
+                            )],
+                            String::new(),
+                        )
+                            .into_response();
+                    };
+                    if !auth.starts_with("Digest ") || !auth.contains("opaque=\"\"") {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    let q = uri.query().unwrap_or("");
+                    if q.contains("action=reboot") {
+                        return (StatusCode::OK, "OK\r\n").into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        "serialNumber=SN12345\r\ndeviceType=iME-360-C\r\nprocessor=FH8626\r\n",
+                    )
+                        .into_response()
+                }),
+            )
+            .route(
+                "/cgi-bin/configManager.cgi",
+                get(move |headers: HeaderMap, uri: Uri| {
+                    let sc_log = sc_srv.clone();
+                    async move {
+                        let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                [(
+                                    header::WWW_AUTHENTICATE,
+                                    r#"Digest realm="IntelbrasIPC", qop="auth", nonce="n1234", opaque="""#,
+                                )],
+                                String::new(),
+                            )
+                                .into_response();
+                        };
+                        if !auth.starts_with("Digest ") {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        let q = uri.query().unwrap_or("");
+                        if q.starts_with("action=setConfig&") {
+                            sc_log.lock().unwrap().push(q.to_string());
+                            return (StatusCode::OK, "OK\r\n").into_response();
+                        }
+                        let body = if q.contains("name=LeSmartTrack") {
+                            "table.LeSmartTrack[0].Enable=true\r\n"
+                        } else if q.contains("name=VideoInOptions") {
+                            "table.VideoInOptions[0].DayNightColor=1\r\ntable.VideoInOptions[0].Flip=false\r\ntable.VideoInOptions[0].Mirror=true\r\ntable.VideoInOptions[0].WideDynamicRangeMode=1\r\n"
+                        } else if q.contains("name=Lighting") {
+                            "table.Lighting[0][0].Mode=Auto\r\ntable.Lighting[0][0].MiddleLight[0].Light=65\r\n"
+                        } else if q.contains("name=LightGlobal") {
+                            "table.LightGlobal[0].Enable=true\r\n"
+                        } else if q.contains("name=MotionDetect") {
+                            "table.MotionDetect[0].EventHandler.BeepEnable=false\r\n"
+                        } else if q.contains("name=AudioDetect") {
+                            "table.AudioDetect[0].Enable=true\r\ntable.AudioDetect[0].AnomalySensitive=70\r\ntable.AudioDetect[0].EventHandler.BeepEnable=true\r\n"
+                        } else if q.contains("name=AudioOutputVolume") {
+                            "table.AudioOutputVolume[0]=85\r\n"
+                        } else if q.contains("name=AudioInputVolume") {
+                            "table.AudioInputVolume[0]=90\r\n"
+                        } else {
+                            ""
+                        };
+                        (StatusCode::OK, body).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/cgi-bin/audio.cgi",
+                post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                    let tb_log = tb_srv.clone();
+                    async move {
+                        let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                [(
+                                    header::WWW_AUTHENTICATE,
+                                    r#"Digest realm="IntelbrasIPC", qop="auth", nonce="n1234", opaque="""#,
+                                )],
+                                String::new(),
+                            )
+                                .into_response();
+                        };
+                        if !auth.starts_with("Digest ") {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        tb_log.lock().unwrap().extend_from_slice(&body);
+                        (StatusCode::OK, "OK").into_response()
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_cam_router).await;
+        });
+
+        let ctx = setup_test_app().await;
+        let app = &ctx.app;
+        let state = &ctx.state;
+        {
+            let mut cfg_guard = state.config.write().await;
+            if let Some(cam) = cfg_guard.cameras.get_mut("front_door") {
+                cam.onvif = ninjanvr_config::OnvifCameraConfig {
+                    host: Some("127.0.0.1".to_string()),
+                    port: addr.port(),
+                    user: Some("admin".to_string()),
+                    password: Some("mibo_pass".to_string()),
+                    autotracking: false,
+                    return_preset: None,
+                    timeout_sec: 2,
+                };
+            }
+        }
+
+        // A. GET /api/front_door/hardware discovers Dahua/Intelbras CGI + ONVIF capabilities & state
+        let r_hw = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/hardware")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_hw.status(), StatusCode::OK);
+        let hw_j: Value =
+            serde_json::from_slice(&to_bytes(r_hw.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(hw_j["online"], true);
+        assert_eq!(hw_j["protocol_family"], "dahua_cgi");
+        assert_eq!(hw_j["device_info"]["manufacturer"], "IntelBras");
+        assert_eq!(hw_j["device_info"]["model"], "iME-360-C");
+        assert_eq!(hw_j["capabilities"]["ptz"], true);
+        assert_eq!(hw_j["capabilities"]["ptz_zoom"], false);
+        assert_eq!(hw_j["capabilities"]["push_to_talk"], true);
+        assert_eq!(hw_j["capabilities"]["push_to_talk_mode"], "cgi_alaw");
+        assert_eq!(hw_j["capabilities"]["imaging"], true);
+        assert_eq!(hw_j["capabilities"]["hardware_autotracking"], true);
+        assert_eq!(hw_j["state"]["brightness"], 55);
+        assert_eq!(hw_j["state"]["hardware_autotracking"], true);
+        assert_eq!(hw_j["state"]["day_night_mode"], "day");
+        assert_eq!(hw_j["state"]["mirror"], true);
+        assert_eq!(hw_j["state"]["speaker_volume"], 85);
+
+        // B. POST /api/front_door/hardware updates imaging + CGI settings
+        let r_set = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/hardware")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"brightness":65,"hardware_autotracking":false,"day_night_mode":"night","status_led":false,"speaker_volume":75}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_set.status(), StatusCode::OK);
+        let set_j: Value =
+            serde_json::from_slice(&to_bytes(r_set.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(set_j["success"], true);
+        let logged_sc = received_set_configs.lock().unwrap().clone();
+        assert_eq!(logged_sc.len(), 1);
+        assert!(logged_sc[0].contains("LeSmartTrack[0].Enable=false"));
+        assert!(logged_sc[0].contains("VideoInOptions[0].DayNightColor=2"));
+        assert!(logged_sc[0].contains("LightGlobal[0].Enable=false"));
+        assert!(logged_sc[0].contains("AudioOutputVolume[0]=75"));
+
+        // C. POST /api/front_door/audio/talkback converts 16-bit PCM to G.711A and streams via Digest Auth
+        let pcm_samples = vec![0u8; 640]; // 320 16-bit silence samples -> 320 A-law 0xD5 bytes
+        let r_tb = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/audio/talkback")
+                    .header(header::CONTENT_TYPE, "audio/pcm")
+                    .body(Body::from(pcm_samples))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_tb.status(), StatusCode::OK);
+        let tb_j: Value =
+            serde_json::from_slice(&to_bytes(r_tb.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(tb_j["success"], true);
+        assert_eq!(tb_j["bytes_sent"], 320);
+        let rec_tb = received_talkback_bytes.lock().unwrap().clone();
+        assert_eq!(rec_tb.len(), 320);
+        assert!(rec_tb.iter().all(|&b| b == 0xD5));
+
+        // D. POST /api/front_door/audio/talkback with Content-Type: audio/pcm;base64
+        received_talkback_bytes.lock().unwrap().clear();
+        let b64_pcm = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 320]);
+        let r_tb_b64 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/front_door/audio/talkback")
+                    .header(header::CONTENT_TYPE, "audio/pcm;base64")
+                    .body(Body::from(b64_pcm))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_tb_b64.status(), StatusCode::OK);
+        let rec_tb_b64 = received_talkback_bytes.lock().unwrap().clone();
+        assert_eq!(rec_tb_b64.len(), 160);
+        assert!(rec_tb_b64.iter().all(|&b| b == 0xD5));
+
+        // E. parse_onvif_profiles_and_video_sources_xml extracts ProfileToken and SourceToken
+        let profiles_xml = r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><trt:GetProfilesResponse xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><trt:Profiles token="Profile000" fixed="true"><tt:Name>MainStream</tt:Name><tt:VideoSourceConfiguration token="VSC000"><tt:SourceToken>VideoSource000</tt:SourceToken></tt:VideoSourceConfiguration></trt:Profiles></trt:GetProfilesResponse></s:Body></s:Envelope>"#;
+        let (parsed_profs, parsed_vs) = parse_onvif_profiles_and_video_sources_xml(profiles_xml);
+        assert_eq!(parsed_profs, vec!["Profile000".to_string()]);
+        assert_eq!(parsed_vs, vec!["VideoSource000".to_string()]);
+
+        srv_handle.abort();
     }
 }
