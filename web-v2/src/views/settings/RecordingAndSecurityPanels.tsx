@@ -414,7 +414,7 @@ export const RecordingReviewSection: React.FC<{
             />
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)", gap: 8 }}>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 {isPt ? "Dias Contínuos (24/7)" : "Continuous Days"}
@@ -481,7 +481,7 @@ export const RecordingReviewSection: React.FC<{
             <span className="mono" style={{ fontSize: "var(--text-xs)", fontWeight: 700, color: "var(--signal-alert-text)" }}>
               {isPt ? "POLÍTICA DE RETENÇÃO DE ALERTAS" : "ALERT EVENT RETENTION POLICY"}
             </span>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1.2fr", gap: 8 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.2fr)", gap: 8 }}>
               <div>
                 <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   {isPt ? "Dias de Retenção" : "Retain Days"}
@@ -569,7 +569,7 @@ export const RecordingReviewSection: React.FC<{
                 ? "POLÍTICA DE RETENÇÃO DE DETECÇÕES"
                 : "DETECTION EVENT RETENTION POLICY"}
             </span>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1.2fr", gap: 8 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.2fr)", gap: 8 }}>
               <div>
                 <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   {isPt ? "Dias de Retenção" : "Retain Days"}
@@ -680,7 +680,7 @@ export const RecordingReviewSection: React.FC<{
               />
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 8 }}>
               <div>
                 <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   {isPt ? "Cota Máxima de Disco (GB)" : "Max Disk Quota (GB)"}
@@ -755,7 +755,7 @@ export const RecordingReviewSection: React.FC<{
                 ? "Re-compacta em background segmentos antigos estáticos (sem eventos dentro da janela Pré/Pós-Captura), preservando 100% da qualidade original nos eventos."
                 : "Compresses older idle segments in background while preserving untouched 1080p quality on all events and their pre/post-capture windows."}
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1.2fr", gap: 8 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.2fr)", gap: 8 }}>
               <div>
                 <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   {isPt ? "Compactar Após (h)" : "Compact After (h)"}
@@ -827,7 +827,7 @@ export const RecordingReviewSection: React.FC<{
                 </select>
               </div>
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1.1fr 1fr 1fr", gap: 8 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1fr)", gap: 8 }}>
               <div>
                 <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   {isPt ? "Aceleração de Hardware" : "Hardware Accel"}
@@ -929,7 +929,7 @@ export const RecordingReviewSection: React.FC<{
                 }
               />
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 8 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.6fr) minmax(0, 1fr)", gap: 8 }}>
               <div>
                 <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                   {isPt ? "Diretório Cold Archive (NAS/HDD)" : "Cold Archive Path (NAS/HDD)"}
@@ -1157,14 +1157,14 @@ export const RecordingReviewSection: React.FC<{
             className="nvr-subcard"
             style={{
               display: "grid",
-              gridTemplateColumns: "1fr 1fr 1fr",
-              gap: 8,
-              padding: "6px 8px",
+              gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)",
+              gap: 0,
+              padding: "8px 12px",
             }}
           >
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, paddingRight: 12 }}>
               <span className="mono" style={{ fontSize: "var(--text-xs)" }}>
-                Bounding Box
+                {isPt ? "Caixa do objeto" : "Bounding Box"}
               </span>
               <ToggleSwitch
                 checked={activeSnap.bounding_box ?? true}
@@ -1172,9 +1172,9 @@ export const RecordingReviewSection: React.FC<{
                 onChange={(v) => mutateSnap((s) => (s.bounding_box = v))}
               />
             </div>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "0 12px", borderLeft: "1px solid var(--border-hairline)" }}>
               <span className="mono" style={{ fontSize: "var(--text-xs)" }}>
-                Timestamp
+                {isPt ? "Data e hora" : "Timestamp"}
               </span>
               <ToggleSwitch
                 checked={activeSnap.timestamp ?? false}
@@ -1182,7 +1182,7 @@ export const RecordingReviewSection: React.FC<{
                 onChange={(v) => mutateSnap((s) => (s.timestamp = v))}
               />
             </div>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, paddingLeft: 12, borderLeft: "1px solid var(--border-hairline)" }}>
               <span className="mono" style={{ fontSize: "var(--text-xs)" }}>
                 {isPt ? "Recortar" : "Crop Box"}
               </span>
@@ -1390,7 +1390,7 @@ export const RecordingReviewSection: React.FC<{
               <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 {isPt ? "Presets Rápidos de Microfone:" : "Quick Mic Sensitivity Presets:"}
               </span>
-              <div style={{ display: "flex", gap: 4 }}>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", minWidth: 0 }}>
                 {(
                   [
                     [-70, isPt ? "Música / Ambiente (-70 dBFS)" : "Music / Ambient (-70 dBFS)"],
@@ -1732,7 +1732,7 @@ export const CommsAuthUsersSection: React.FC<{
           />
         </div>
         <div className="nvr-cfg-card-body">
-          <div style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.6fr) minmax(0, 1fr)", gap: 8 }}>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 Broker Host / IP
@@ -1758,7 +1758,7 @@ export const CommsAuthUsersSection: React.FC<{
             </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)", gap: 8 }}>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 Topic Prefix
@@ -1799,7 +1799,7 @@ export const CommsAuthUsersSection: React.FC<{
             </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 8 }}>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 {isPt ? "Usuário MQTT (Opcional)" : "MQTT Username (Optional)"}
@@ -1915,7 +1915,7 @@ export const CommsAuthUsersSection: React.FC<{
             />
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)", gap: 8 }}>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 Session Length (s)
@@ -1962,7 +1962,7 @@ export const CommsAuthUsersSection: React.FC<{
             </div>
           </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1.4fr", gap: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.4fr)", gap: 8 }}>
             <div>
               <div className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-secondary)" }}>
                 JWT Cookie Name
@@ -2251,7 +2251,7 @@ export const CommsAuthUsersSection: React.FC<{
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             <input
               className="nvr-input mono"
-              style={{ width: 200 }}
+              style={{ width: 240 }}
               placeholder="Token name (e.g. prometheus)"
               aria-label="API Token Name"
               value={newTokenName}

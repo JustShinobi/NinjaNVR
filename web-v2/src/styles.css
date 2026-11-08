@@ -1558,6 +1558,16 @@ input[type="range"] {
   background: var(--signal-live-text);
 }
 
+.nvr-switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.nvr-switch:focus-visible {
+  outline: 2px solid var(--signal-accent-text);
+  outline-offset: 2px;
+}
+
 .nvr-chip-group {
   display: flex;
   flex-wrap: wrap;
@@ -3605,7 +3615,7 @@ input[type="range"] {
   gap: 10px;
 }
 
-.nvr-switch {
+.nvr-sheet-switch {
   flex-shrink: 0;
   width: 52px;
   height: 32px;
@@ -3620,22 +3630,22 @@ input[type="range"] {
   transition: background 0.15s ease;
 }
 
-.nvr-switch.on {
+.nvr-sheet-switch.on {
   background: var(--signal-accent);
   justify-content: flex-end;
 }
 
-.nvr-switch:disabled {
+.nvr-sheet-switch:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
-.nvr-switch:focus-visible {
+.nvr-sheet-switch:focus-visible {
   outline: 2px solid var(--signal-accent-text);
   outline-offset: 2px;
 }
 
-.nvr-switch-knob {
+.nvr-sheet-switch-knob {
   width: 26px;
   height: 26px;
   border-radius: 50%;

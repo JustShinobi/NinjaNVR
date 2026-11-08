@@ -1465,7 +1465,7 @@ export const ChannelsStreamsSection: React.FC<{
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "1.5fr 0.7fr 0.8fr",
+                    gridTemplateColumns: "minmax(0, 1.5fr) minmax(0, 0.7fr) minmax(0, 0.8fr)",
                     gap: 6,
                   }}
                 >
@@ -1488,54 +1488,66 @@ export const ChannelsStreamsSection: React.FC<{
                       });
                     }}
                   />
-                  <input
-                    type="number"
-                    min={1}
-                    max={65535}
-                    className="nvr-input mono sm"
-                    placeholder="Port (80 / 2020)"
-                    aria-label="ONVIF Port"
-                    value={activeCamCfg.onvif?.port ?? 80}
-                    onChange={(e) => {
-                      const port = Math.max(1, Number(e.target.value) || 80);
-                      updateDraft((next) => {
-                        const cam = next.cameras[inspectorCam];
-                        if (!cam) return;
-                        cam.onvif = {
-                          timeout_sec: 5,
-                          ...(cam.onvif || {}),
-                          port,
-                        };
-                      });
-                    }}
-                  />
-                  <input
-                    type="number"
-                    min={1}
-                    max={30}
-                    className="nvr-input mono sm"
-                    placeholder="Timeout (s)"
-                    aria-label="ONVIF Timeout Seconds"
-                    value={activeCamCfg.onvif?.timeout_sec ?? 5}
-                    onChange={(e) => {
-                      const timeout_sec = Math.max(1, Number(e.target.value) || 5);
-                      updateDraft((next) => {
-                        const cam = next.cameras[inspectorCam];
-                        if (!cam) return;
-                        cam.onvif = {
-                          port: 80,
-                          ...(cam.onvif || {}),
-                          timeout_sec,
-                        };
-                      });
-                    }}
-                  />
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                    <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+                      {isPt ? "Porta" : "Port"}
+                    </span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={65535}
+                      className="nvr-input mono sm"
+                      style={{ flex: 1, minWidth: 0 }}
+                      placeholder="Port (80 / 2020)"
+                      aria-label="ONVIF Port"
+                      value={activeCamCfg.onvif?.port ?? 80}
+                      onChange={(e) => {
+                        const port = Math.max(1, Number(e.target.value) || 80);
+                        updateDraft((next) => {
+                          const cam = next.cameras[inspectorCam];
+                          if (!cam) return;
+                          cam.onvif = {
+                            timeout_sec: 5,
+                            ...(cam.onvif || {}),
+                            port,
+                          };
+                        });
+                      }}
+                    />
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                    <span className="mono" style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)", whiteSpace: "nowrap" }}>
+                      {isPt ? "Timeout (s)" : "Timeout (s)"}
+                    </span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={30}
+                      className="nvr-input mono sm"
+                      style={{ flex: 1, minWidth: 0 }}
+                      placeholder="Timeout (s)"
+                      aria-label="ONVIF Timeout Seconds"
+                      value={activeCamCfg.onvif?.timeout_sec ?? 5}
+                      onChange={(e) => {
+                        const timeout_sec = Math.max(1, Number(e.target.value) || 5);
+                        updateDraft((next) => {
+                          const cam = next.cameras[inspectorCam];
+                          if (!cam) return;
+                          cam.onvif = {
+                            port: 80,
+                            ...(cam.onvif || {}),
+                            timeout_sec,
+                          };
+                        });
+                      }}
+                    />
+                  </label>
                 </div>
 
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "1fr 1fr 1fr",
+                    gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)",
                     gap: 6,
                   }}
                 >
@@ -1645,7 +1657,7 @@ export const ChannelsStreamsSection: React.FC<{
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "1fr 0.6fr 0.6fr",
+                    gridTemplateColumns: "minmax(0, 1fr) minmax(0, 0.7fr) minmax(0, 1fr)",
                     gap: 6,
                     marginTop: 2,
                   }}
@@ -1658,12 +1670,17 @@ export const ChannelsStreamsSection: React.FC<{
                       placeholder={
                         activeCamCfg.onvif?.has_cloud_password ||
                         activeCamCfg.hardware?.has_cloud_password
-                          ? "*** (Tapo Cloud Password saved — PTT enabled)"
+                          ? "*** (cloud password saved)"
                           : isPt
-                          ? "Senha da Conta Cloud (Tapo 2-Way Audio / TPAP — opcional)"
-                          : "Cloud Account Password (Tapo 2-Way Audio / TPAP — optional)"
+                          ? "Senha cloud (opcional)"
+                          : "Cloud password (optional)"
                       }
                       aria-label="Cloud Account Password"
+                      title={
+                        isPt
+                          ? "Senha da conta cloud Tapo, usada no áudio de 2 vias (TPAP). Opcional."
+                          : "Tapo cloud account password, used for 2-way audio (TPAP). Optional."
+                      }
                       value={(() => {
                         const rawCp =
                           activeCamCfg.onvif?.cloud_password ||
@@ -1757,11 +1774,14 @@ export const ChannelsStreamsSection: React.FC<{
                   <input
                     className="nvr-input mono sm"
                     placeholder={
-                      isPt
-                        ? "ProfileToken (Auto: Profile_1 / Profile000)"
-                        : "ProfileToken (Auto: Profile_1 / Profile000)"
+                      isPt ? "ProfileToken (auto)" : "ProfileToken (auto)"
                     }
                     aria-label="ONVIF Profile Token"
+                    title={
+                      isPt
+                        ? "Vazio = automático (Profile_1 / Profile000)"
+                        : "Empty = automatic (Profile_1 / Profile000)"
+                    }
                     value={
                       activeCamCfg.onvif?.profile_token ||
                       activeCamCfg.hardware?.profile_token ||
@@ -2781,7 +2801,7 @@ export const ChannelsStreamsSection: React.FC<{
                   )}
                 </div>
               )}
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)", gap: 8 }}>
                 {(ffprobeInfo || []).map((probe, pIdx) => {
                   const streams = probe.stdout?.streams || [];
                   const vStream = streams.find((s) => s.width && s.height);
@@ -2880,7 +2900,7 @@ export const ChannelsStreamsSection: React.FC<{
               </span>
             </div>
             <div className="nvr-cfg-card-body">
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1.4fr", gap: 8 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.4fr)", gap: 8 }}>
                 <input
                   className="nvr-input mono"
                   placeholder={isPt ? "ID da câmera (ex: garagem)" : "Camera ID (e.g. garagem)"}

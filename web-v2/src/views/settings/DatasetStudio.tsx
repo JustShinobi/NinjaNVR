@@ -770,7 +770,7 @@ export const DatasetStudioSection: React.FC<{
     const status = datasetQueueStatus(s);
     const label =
       status === "ai"
-        ? "IA ✓"
+        ? t("IA ✓", "AI ✓")
         : status === "manual"
         ? "MANUAL ✓"
         : status === "pending"
@@ -782,7 +782,7 @@ export const DatasetStudioSection: React.FC<{
 
   const tabs: Array<{ id: DatasetQueueTab; label: string; count: number }> = [
     { id: "pending", label: t("PEND.", "PEND."), count: counts.pending },
-    { id: "ai", label: "IA ✓", count: counts.ai },
+    { id: "ai", label: t("IA ✓", "AI ✓"), count: counts.ai },
     { id: "manual", label: "MANUAL ✓", count: counts.manual },
     { id: "all", label: t("TODAS", "ALL"), count: counts.all },
   ];

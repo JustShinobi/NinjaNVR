@@ -40,7 +40,7 @@ function flagLabel(flag: CameraRuntimeFlag, isPt: boolean): string {
   }
 }
 
-const Switch: React.FC<{
+export const SheetSwitch: React.FC<{
   checked: boolean;
   label: string;
   disabled?: boolean;
@@ -54,10 +54,10 @@ const Switch: React.FC<{
     aria-label={label}
     data-testid={testId}
     disabled={disabled}
-    className={`nvr-switch ${checked ? "on" : ""}`}
+    className={`nvr-sheet-switch ${checked ? "on" : ""}`}
     onClick={() => onChange(!checked)}
   >
-    <span className="nvr-switch-knob" aria-hidden="true" />
+    <span className="nvr-sheet-switch-knob" aria-hidden="true" />
   </button>
 );
 
@@ -122,7 +122,7 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
           {FLAG_ORDER.map((flag) => (
             <div key={flag} className="nvr-sheet-row">
               <span>{flagLabel(flag, isPt)}</span>
-              <Switch
+              <SheetSwitch
                 checked={flags[flag]}
                 label={flagLabel(flag, isPt)}
                 disabled={!canEdit}
@@ -155,7 +155,7 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
           </div>
           <div className="nvr-sheet-row">
             <span>{isPt ? "Zonas e máscaras" : "Zones and masks overlay"}</span>
-            <Switch
+            <SheetSwitch
               checked={showVectors}
               label={isPt ? "Zonas e máscaras" : "Zones and masks overlay"}
               onChange={onSetShowVectors}
