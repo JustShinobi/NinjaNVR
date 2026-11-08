@@ -5,6 +5,7 @@ pub mod camera_protocols;
 pub mod mse_hub;
 pub mod pipeline;
 pub mod preview_frames;
+pub mod snapshot_capture;
 
 pub use camera_protocols::*;
 
@@ -1006,6 +1007,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
         )
         .route("/{camera}/latest.webp", get(api_camera_latest_frame))
         .route("/{camera}/latest.jpg", get(api_camera_latest_frame))
+        .route("/{camera}/snapshot.jpg", get(api_camera_snapshot_download))
         .route("/labels", get(api_labels))
         .route("/sub_labels", get(api_sub_labels))
         .route("/audio_labels", get(api_empty_array))
@@ -1887,6 +1889,7 @@ async fn auth_gate_middleware(
                             | "state"
                             | "latest.webp"
                             | "latest.jpg"
+                            | "snapshot.jpg"
                     ) && !(first == "recordings"
                         && after_first == "summary");
                     if is_camera_subroute {
@@ -23903,6 +23906,141 @@ async fn api_go2rtc_stream_prewarm(
     .into_response()
 }
 
+/// Unified operator snapshot: full-resolution main-stream frame (privacy-masked, fail-closed)
+/// with a fallback to the latest detect frame. Served as a dated `attachment` so a single
+/// "Snapshot" action behaves identically on desktop and mobile browsers.
+async fn api_camera_snapshot_download(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath(camera): AxumPath<String>,
+) -> Response {
+    use snapshot_capture::{
+        MAIN_STREAM_FRAME_TIMEOUT_MS, SnapshotSource, render_main_stream_snapshot,
+        snapshot_content_disposition, snapshot_download_filename,
+    };
+
+    if camera.is_empty() || !is_safe_id(&camera) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Invalid camera identifier" })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+    let Some((priv_mask, detect_w, detect_h)) = ({
+        let cfg = state.config.read().await;
+        cfg.cameras
+            .get(&camera)
+            .map(|c| (c.privacy_mask.clone(), c.detect.width, c.detect.height))
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "message": "Camera not found" })),
+        )
+            .into_response();
+    };
+
+    let filename = snapshot_download_filename(&camera, Local::now().naive_local());
+    let build = |bytes: Bytes, source: SnapshotSource, resolution: Option<(u32, u32)>| {
+        let mut resp = (
+            [
+                (header::CONTENT_TYPE, "image/jpeg".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    snapshot_content_disposition(&filename),
+                ),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            bytes,
+        )
+            .into_response();
+        let hdrs = resp.headers_mut();
+        if let Ok(v) = header::HeaderValue::from_str(source.as_header_value()) {
+            hdrs.insert(header::HeaderName::from_static("x-snapshot-source"), v);
+        }
+        if let Some((w, h)) = resolution
+            && let Ok(v) = header::HeaderValue::from_str(&format!("{w}x{h}"))
+        {
+            hdrs.insert(header::HeaderName::from_static("x-snapshot-resolution"), v);
+        }
+        resp
+    };
+
+    // 1. Full-resolution main stream via go2rtc (bounded size and time).
+    let url = format!(
+        "{}/api/frame.jpeg?src={}",
+        state.go2rtc_http_base,
+        urlencoding_simple(&camera)
+    );
+    if let Ok(resp) = state
+        .http_client
+        .get(&url)
+        .timeout(Duration::from_millis(MAIN_STREAM_FRAME_TIMEOUT_MS))
+        .send()
+        .await
+        && resp.status().is_success()
+        && let Some(bytes) = read_bounded_response_bytes(resp, MAX_SNAPSHOT_FRAME_BYTES).await
+    {
+        let mask_for_render = priv_mask.clone();
+        let rendered = tokio::task::spawn_blocking(move || {
+            render_main_stream_snapshot(&bytes, Some(&mask_for_render), detect_w, detect_h)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some((jpg, w, h)) = rendered {
+            return build(Bytes::from(jpg), SnapshotSource::MainStream, Some((w, h)));
+        }
+    }
+
+    // 2. Fallback: latest detect frame (already privacy-masked by `latest.jpg`).
+    let fallback = api_camera_latest_frame(
+        State(state),
+        jar,
+        headers,
+        AxumPath(camera),
+        Query(LatestFrameQuery {
+            height: None,
+            bbox: None,
+        }),
+        Uri::from_static("/latest.jpg"),
+    )
+    .await;
+    let has_real_frame = fallback.status().is_success()
+        && fallback
+            .headers()
+            .contains_key(header::HeaderName::from_static("x-last-frame-timestamp"));
+    if !has_real_frame {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "message": "No frame available for this camera yet" })),
+        )
+            .into_response();
+    }
+    let Ok(bytes) = axum::body::to_bytes(fallback.into_body(), MAX_SNAPSHOT_FRAME_BYTES).await
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "message": "No frame available for this camera yet" })),
+        )
+            .into_response();
+    };
+    let resolution = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok());
+    build(bytes, SnapshotSource::DetectFrame, resolution)
+}
+
 fn placeholder_jpeg_response() -> Response {
     let mut img = image::RgbImage::new(320, 180);
     for pixel in img.pixels_mut() {
@@ -30767,6 +30905,95 @@ cameras:
             .unwrap()
             .unwrap();
         assert_eq!(msg3, TungMsg::Binary(keyframe_bytes));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_download_falls_back_to_detect_frame_as_dated_attachment() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ninjanvr-snap-dl-{}", rand::random::<u32>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg_path = tmp_dir.join("config.yml");
+        let db_path = tmp_dir.join("ninjanvr.db");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "version: 0.18-0\ndatabase:\n  path: {}\ncameras:\n  front_door:\n    enabled: true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        let mut state = new_app_state(&cfg_path, tmp_dir.join("web"), tmp_dir.join("media"), false)
+            .await
+            .unwrap();
+        // Unroutable go2rtc so the main-stream grab fails fast and the detect fallback is used.
+        state.go2rtc_http_base = "http://127.0.0.1:9".to_string();
+        let app = build_router(state.clone());
+
+        // No frame yet: never hand the operator a placeholder image as a "snapshot".
+        let empty = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/snapshot.jpg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/garage/snapshot.jpg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let (width, height) = (1280u32, 720u32);
+        state.latest_yuv_frames.write().await.insert(
+            "front_door".to_string(),
+            ninjanvr_media::YuvFrame {
+                camera: Arc::from("front_door"),
+                timestamp: 1_793_700_000.0,
+                width,
+                height,
+                data: Arc::new(vec![128u8; ((width * height * 3) / 2) as usize]),
+            },
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/front_door/snapshot.jpg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let hdrs = resp.headers().clone();
+        assert_eq!(hdrs.get(header::CONTENT_TYPE).unwrap(), "image/jpeg");
+        let disposition = hdrs
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(disposition.starts_with("attachment; filename=\"front_door_"));
+        assert!(disposition.ends_with(".jpg\""));
+        assert_eq!(hdrs.get("x-snapshot-source").unwrap(), "detect");
+        assert_eq!(hdrs.get("x-snapshot-resolution").unwrap(), "1280x720");
+        assert_eq!(hdrs.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (1280, 720));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
