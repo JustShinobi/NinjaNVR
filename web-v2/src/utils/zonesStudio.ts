@@ -15,6 +15,7 @@ import type {
   StateRoiConfig,
   ZoneConfig,
 } from "../types/nvr";
+import { sanitizePolygonCoordString, sanitizeTripwireLine } from "./visionGeometry";
 
 export type Point = [number, number];
 
@@ -105,6 +106,26 @@ export function formatDurationShort(sec: number): string {
   return Number.isInteger(h) ? `${h} h` : `${h.toFixed(1)} h`;
 }
 
+/**
+ * Keys of the object form of a mask (`privacy_mask: { mode: pixelate, block_size: 8, a: "…" }`)
+ * that carry rendering options instead of a polygon. Mirrors the backend list in
+ * `ninjanvr-server::pipeline` and `ninjanvr-vision::PolygonMask`.
+ */
+export const MASK_META_KEYS = ["mode", "style", "pixelate", "block_size"] as const;
+
+function isMaskMetaKey(key: string): boolean {
+  return (MASK_META_KEYS as readonly string[]).includes(key);
+}
+
+/** Returns the option keys of an object-form mask, or null when it has none. */
+export function extractMaskMeta(mask: unknown): Record<string, unknown> | null {
+  if (!mask || typeof mask !== "object" || Array.isArray(mask)) return null;
+  const meta = Object.fromEntries(
+    Object.entries(mask as Record<string, unknown>).filter(([k]) => isMaskMetaKey(k))
+  );
+  return Object.keys(meta).length > 0 ? meta : null;
+}
+
 export function extractMaskList(mask: unknown): string[] {
   if (!mask) return [];
   if (typeof mask === "string") return mask.trim() ? [mask.trim()] : [];
@@ -121,8 +142,9 @@ export function extractMaskList(mask: unknown): string[] {
       .filter(Boolean);
   }
   if (typeof mask === "object") {
-    return Object.values(mask as Record<string, unknown>)
-      .map((val) => {
+    return Object.entries(mask as Record<string, unknown>)
+      .filter(([key]) => !isMaskMetaKey(key))
+      .map(([, val]) => {
         if (typeof val === "string") return val.trim();
         if (val && typeof val === "object" && "coordinates" in val) {
           const c = (val as { coordinates?: unknown }).coordinates;
@@ -295,14 +317,31 @@ export function readMasks(cam: CameraConfig | undefined, kind: MaskKind): string
   return extractMaskList(cam.privacy_mask);
 }
 
+function rawMaskValue(cam: CameraConfig, kind: MaskKind): unknown {
+  if (kind === "motion_mask") return cam.motion?.mask;
+  if (kind === "object_mask") return cam.objects?.mask;
+  return cam.privacy_mask;
+}
+
+/**
+ * Stores `list` as the camera's mask. A plain list is written unless the current value is the
+ * object form with options (`mode: pixelate`, `block_size`, …): those options are kept and the
+ * polygons are stored as `mask_1`, `mask_2`, … next to them, so editing a pixelated privacy mask
+ * does not silently turn it back into a solid one.
+ */
 export function writeMasks(cam: CameraConfig, kind: MaskKind, list: string[]): void {
+  const meta = extractMaskMeta(rawMaskValue(cam, kind));
+  const value: unknown = meta
+    ? { ...meta, ...Object.fromEntries(list.map((coords, i) => [`mask_${i + 1}`, coords])) }
+    : list;
   if (kind === "motion_mask") {
-    cam.motion.mask = list;
+    if (!cam.motion) cam.motion = { mask: value } as CameraMotionConfig;
+    else cam.motion.mask = value;
   } else if (kind === "object_mask") {
     if (!cam.objects) cam.objects = { track: ["person"], filters: {}, mask: [] };
-    cam.objects.mask = list;
+    cam.objects.mask = value;
   } else {
-    cam.privacy_mask = list;
+    cam.privacy_mask = value;
   }
 }
 
@@ -549,6 +588,8 @@ export type CommitError =
   | "need_name"
   | "name_taken"
   | "need_states"
+  | "bad_shape"
+  | "line_too_short"
   | "missing_camera";
 
 export type CommitResult = { ok: true; ref: VisionItemRef } | { ok: false; error: CommitError };
@@ -566,6 +607,23 @@ export function slugifyItemName(raw: string): string {
     .replace(/[̀-ͯ]/g, "")
     .replace(/[^a-z0-9_]+/g, "_")
     .replace(/^_+|_+$/g, "");
+}
+
+/**
+ * Rejects shapes the geometry sanitizer would drop when the draft is stored: polygons whose
+ * edges cross (points clicked out of order), collinear or tiny areas, and tripwires too short
+ * to be crossed. Checking here keeps the editor open with an explanation instead of reporting
+ * success while the shape silently disappears.
+ */
+export function validateDrawnShape(kind: VisionItemKind, points: Point[]): CommitError | null {
+  if (kind === "line") {
+    const [p1, p2] = points;
+    if (!p1 || !p2) return "need_points";
+    const ok = sanitizeTripwireLine({ points: [p1[0], p1[1], p2[0], p2[1]], direction: "any", objects: [] });
+    return ok ? null : "line_too_short";
+  }
+  if (kind === "state") return null;
+  return sanitizePolygonCoordString(formatCoordPoints(points)) ? null : "bad_shape";
 }
 
 function namedMapFor(cam: CameraConfig, kind: "zone" | "line" | "state"): Record<string, unknown> {
@@ -587,6 +645,8 @@ export function commitVisionEditor(
   const cam = draft.cameras?.[camera];
   if (!cam) return { ok: false, error: "missing_camera" };
   if (points.length < minPointsFor(editor.kind)) return { ok: false, error: "need_points" };
+  const shapeError = validateDrawnShape(editor.kind, points);
+  if (shapeError) return { ok: false, error: shapeError };
 
   if (isMaskKind(editor.kind)) {
     const list = readMasks(cam, editor.kind);

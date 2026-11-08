@@ -230,6 +230,13 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
         return tr("Já existe um item com esse nome nesta câmera", "This camera already has an item with that name");
       case "need_states":
         return tr("Defina pelo menos 2 estados", "Define at least 2 states");
+      case "bad_shape":
+        return tr(
+          "As bordas da área se cruzam ou ela é pequena demais. Clique nos pontos em ordem, contornando a área.",
+          "The area's edges cross or it is too small. Click the points in order around the area."
+        );
+      case "line_too_short":
+        return tr("A linha é curta demais. Marque pontos mais distantes.", "The line is too short. Mark points further apart.");
       default:
         return tr("Câmera não encontrada", "Camera not found");
     }
@@ -250,7 +257,11 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
     setSelected(res.ref);
     setDraftPoints([]);
     setMode({ name: "list" });
-    notify(tr("Adicionado. Revise e salve para valer nas câmeras.", "Added. Review and save to apply it."));
+    notify(
+      editing.originalKey === null
+        ? tr("Adicionado. Revise e salve para valer nas câmeras.", "Added. Review and save to apply it.")
+        : tr("Alteração aplicada. Revise e salve para valer nas câmeras.", "Change applied. Review and save to apply it.")
+    );
   };
 
   const removeSelected = () => {

@@ -791,6 +791,12 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
     dragOriginRef.current = null;
   }, []);
 
+  // Disabling the stage (e.g. while plotting zone points) also hides the zoom HUD and the wheel
+  // handler, so a zoom left over from before would be stuck on screen with no way to undo it.
+  useEffect(() => {
+    if (disabled) resetZoom();
+  }, [disabled, resetZoom]);
+
   useEffect(() => {
     const el = stageRef.current;
     if (!el || disabled) return;
@@ -1035,6 +1041,24 @@ interface LiveMsePlayerProps {
  * Safely extracts an array of polygon coordinate strings from `motion.mask`
  * (which may be a string, string[], or Record<string, { coordinates: string } | string>).
  */
+/**
+ * Maps a pointer position to normalized `[0..1]` frame coordinates using the on-screen box of
+ * the rendered picture. The box must be measured with `getBoundingClientRect()` on an element
+ * inside the zoom/pan transform, so it already reflects letterboxing, digital zoom and pan.
+ */
+export function mapClientPointToFrame(
+  clientX: number,
+  clientY: number,
+  frameRect: { left: number; top: number; width: number; height: number }
+): [number, number] {
+  const w = Math.max(1, Number.isFinite(frameRect.width) ? frameRect.width : 1);
+  const h = Math.max(1, Number.isFinite(frameRect.height) ? frameRect.height : 1);
+  const clamp = (v: number) => Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
+  return [clamp((clientX - frameRect.left) / w), clamp((clientY - frameRect.top) / h)];
+}
+
+const MASK_OPTION_KEYS = new Set(["mode", "style", "pixelate", "block_size"]);
+
 export function extractMaskPolygons(mask: unknown): string[] {
   if (!mask) return [];
   if (typeof mask === "string") return mask.trim() ? [mask.trim()] : [];
@@ -1051,8 +1075,9 @@ export function extractMaskPolygons(mask: unknown): string[] {
       .filter(Boolean);
   }
   if (typeof mask === "object") {
-    return Object.values(mask as Record<string, unknown>)
-      .map((val) => {
+    return Object.entries(mask as Record<string, unknown>)
+      .filter(([key]) => !MASK_OPTION_KEYS.has(key))
+      .map(([, val]) => {
         if (typeof val === "string") return val;
         if (val && typeof val === "object" && "coordinates" in val) {
           const c = (val as { coordinates?: unknown }).coordinates;
@@ -1265,6 +1290,8 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
   const videoRef0 = useRef<HTMLVideoElement | null>(null);
   const videoRef1 = useRef<HTMLVideoElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
+  /** Invisible box over the rendered picture, inside the zoom transform; used to map clicks. */
+  const frameAnchorRef = useRef<HTMLDivElement | null>(null);
   const slotMachineRef = useRef<DualSlotMachine>(new DualSlotMachine());
   const slotCleanupsRef = useRef<[(() => void) | null, (() => void) | null]>([
     null,
@@ -1398,6 +1425,12 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       detH;
     setOverlayBox(computeContainedBox(cw, ch, mw, mh));
   }, [detW, detH, getActiveVideoEl]);
+
+  // The picture's aspect ratio can change once the live stream (or the other MSE slot) takes
+  // over from the poster, so re-measure the letterbox whenever the shown media changes.
+  useEffect(() => {
+    updateOverlayGeometry();
+  }, [mseReady, activeSlot, updateOverlayGeometry]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -2005,17 +2038,23 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
       onClick={
         onPlotPoint
           ? (e) => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              const box = overlayBox || {
-                left: 0,
-                top: 0,
-                width: rect.width,
-                height: rect.height,
-              };
-              const relX = e.clientX - rect.left - box.left;
-              const relY = e.clientY - rect.top - box.top;
-              const nx = Math.max(0, Math.min(1, relX / Math.max(1, box.width)));
-              const ny = Math.max(0, Math.min(1, relY / Math.max(1, box.height)));
+              // Measure the picture where it is actually painted (after letterboxing and any
+              // zoom/pan transform) so the plotted point lands exactly under the cursor.
+              const anchor = frameAnchorRef.current;
+              let frameRect: { left: number; top: number; width: number; height: number };
+              if (anchor) {
+                frameRect = anchor.getBoundingClientRect();
+              } else {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const box = overlayBox || { left: 0, top: 0, width: rect.width, height: rect.height };
+                frameRect = {
+                  left: rect.left + box.left,
+                  top: rect.top + box.top,
+                  width: box.width,
+                  height: box.height,
+                };
+              }
+              const [nx, ny] = mapClientPointToFrame(e.clientX, e.clientY, frameRect);
               onPlotPoint(nx, ny);
             }
           : onClick
@@ -2114,6 +2153,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         )}
         <video
           ref={videoRef0}
+          onLoadedMetadata={updateOverlayGeometry}
           data-slot="0"
           autoPlay
           playsInline
@@ -2134,6 +2174,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         />
         <video
           ref={videoRef1}
+          onLoadedMetadata={updateOverlayGeometry}
           data-slot="1"
           autoPlay
           playsInline
@@ -2275,6 +2316,21 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
               </g>
             )}
           </svg>
+        )}
+        {onPlotPoint && overlayBox && (
+          <div
+            ref={frameAnchorRef}
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              left: `${overlayBox.left}px`,
+              top: `${overlayBox.top}px`,
+              width: `${overlayBox.width}px`,
+              height: `${overlayBox.height}px`,
+              pointerEvents: "none",
+              visibility: "hidden",
+            }}
+          />
         )}
         {stageOverlay && overlayBox && (
           <div
