@@ -115,6 +115,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   const [visionReviewOpen, setVisionReviewOpen] = useState(false);
   const [saveOutcome, setSaveOutcome] = useState<SaveOutcome | null>(null);
   const draftRevisionRef = useRef<number>(0);
+  const sanitizedDraftRef = useRef<NinjaConfigResponse | null>(null);
   const isMountedRef = useRef<boolean>(true);
   const showYamlKeys = useNvrStore((s) => s.showYamlKeys);
   const setShowYamlKeys = useNvrStore((s) => s.setShowYamlKeys);
@@ -190,7 +191,10 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     if (!draftConfig) return;
     const cloned: NinjaConfigResponse = JSON.parse(JSON.stringify(draftConfig));
     updater(cloned);
-    const { cleaned, rejectedCount } = sanitizeConfigGeometryDraft(cloned);
+    const { cleaned, rejectedCount } =
+      sanitizedDraftRef.current === cloned
+        ? { cleaned: cloned, rejectedCount: 0 }
+        : sanitizeConfigGeometryDraft(cloned);
     if (rejectedCount > 0) {
       notify(
         isPt
@@ -198,6 +202,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
           : "Rejected degenerate (collinear / zero-area) polygon or line to protect backend masks"
       );
     }
+    sanitizedDraftRef.current = cleaned;
     draftRevisionRef.current += 1;
     setDraftConfig(cleaned);
     const nextYaml = buildCleanYamlFromDraft(cleaned, baselineYaml || rawYaml);
@@ -207,6 +212,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
 
   const handleDiscardDraft = () => {
     draftRevisionRef.current += 1;
+    sanitizedDraftRef.current = null;
     if (config) {
       setDraftConfig(JSON.parse(JSON.stringify(config)));
     }
@@ -231,7 +237,10 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     setSaveOutcome(null);
     const saveRev = draftRevisionRef.current;
     const { cleaned: payloadConfig, rejectedCount } =
-      sanitizeConfigGeometryDraft(draftConfig);
+      sanitizedDraftRef.current === draftConfig
+        ? { cleaned: draftConfig, rejectedCount: 0 }
+        : sanitizeConfigGeometryDraft(draftConfig);
+    sanitizedDraftRef.current = payloadConfig;
     if (rejectedCount > 0) {
       notify(
         isPt

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { CameraConfig, NinjaConfigResponse } from "../types/nvr";
 import {
+  MASK_META_KEYS,
   applyMotionProfile,
   commitVisionEditor,
   copyVisionItemToCamera,
@@ -11,6 +12,9 @@ import {
   diffVisionConfig,
   editorStateFromItem,
   emptyEditorState,
+  extractMaskList,
+  extractMaskMeta,
+  formatCoordPoints,
   formatDurationShort,
   listCameraVisionItems,
   measureBox,
@@ -22,8 +26,13 @@ import {
   tripwireGuide,
   tripwireSide,
   visionItemGroup,
+  writeMasks,
   type Point,
 } from "../utils/zonesStudio";
+import {
+  coordStringToNormalizedPoints,
+  sanitizeMaskPolygonsValue,
+} from "../utils/visionGeometry";
 
 function cam(overrides: Partial<CameraConfig> = {}): CameraConfig {
   return {
@@ -346,5 +355,61 @@ describe("zones studio — save status feedback", () => {
     draft.cameras.sala.lines!.cantinho.siren = false;
     const changes = diffVisionConfig(base, draft, true);
     expect(changes[0]?.detail).toBe("Mudou: sirene da câmera.");
+  });
+
+  test("delegates mask union codecs and coordinate normalization to visionGeometry", () => {
+    expect(MASK_META_KEYS).toContain("pixelate");
+    expect(MASK_META_KEYS).toContain("color");
+    expect(MASK_META_KEYS).toContain("blur");
+
+    const maskUnion = {
+      mode: "pixelate",
+      style: "mosaic",
+      pixelate: true,
+      block_size: 10,
+      color: "#000000",
+      a: "0,0,640,0,640,360,0,360",
+      b: { coordinates: "0.5,0.5,0.9,0.5,0.9,0.9" },
+    };
+    const { sanitized, rejectedCount } = sanitizeMaskPolygonsValue(maskUnion, 1280, 720);
+    expect(rejectedCount).toBe(0);
+    expect(extractMaskMeta(sanitized)).toEqual({
+      mode: "pixelate",
+      style: "mosaic",
+      pixelate: true,
+      block_size: 10,
+      color: "#000000",
+    });
+    expect(extractMaskList(sanitized)).toEqual([
+      "0.000,0.000,0.500,0.000,0.500,0.500,0.000,0.500",
+      "0.500,0.500,0.900,0.500,0.900,0.900",
+    ]);
+
+    const c = cam({ privacy_mask: sanitized });
+    writeMasks(c, "privacy_mask", extractMaskList(sanitized));
+    expect(extractMaskMeta(c.privacy_mask)).toEqual({
+      mode: "pixelate",
+      style: "mosaic",
+      pixelate: true,
+      block_size: 10,
+      color: "#000000",
+    });
+    expect(readMasks(c, "privacy_mask")).toEqual([
+      "0.000,0.000,0.500,0.000,0.500,0.500,0.000,0.500",
+      "0.500,0.500,0.900,0.500,0.900,0.900",
+    ]);
+
+    // Pixel (> 1.5) vs normalized (0..1) coordinate parsing
+    expect(parseCoordPoints("320,180,960,540", 1280, 720)).toEqual([
+      [0.25, 0.25],
+      [0.75, 0.75],
+    ]);
+    expect(coordStringToNormalizedPoints("320,180,960,540", 1280, 720)).toEqual([
+      { x: 0.25, y: 0.25 },
+      { x: 0.75, y: 0.75 },
+    ]);
+    expect(formatCoordPoints(parseCoordPoints("320,180,960,540", 1280, 720), 2)).toBe(
+      "0.25,0.25,0.75,0.75"
+    );
   });
 });

@@ -4,7 +4,25 @@ import {
   CameraHardwareInfoResponse,
   CameraHardwareState,
   CameraPtzInfoResponse,
+  OnvifPresetItem,
 } from "../types/nvr";
+
+export const HARDWARE_CONFIG_ONLY_PATCH_KEYS = [
+  "apply_suggested_onvif",
+  "apply_suggested_substream",
+  "cloud_password",
+  "protocol",
+  "profile_token",
+  "video_source_token",
+  "reboot",
+] as const;
+
+export type HardwareConfigOnlyPatchKey =
+  (typeof HARDWARE_CONFIG_ONLY_PATCH_KEYS)[number];
+
+const HARDWARE_CONFIG_ONLY_PATCH_KEY_SET: ReadonlySet<string> = new Set<string>(
+  HARDWARE_CONFIG_ONLY_PATCH_KEYS
+);
 
 export interface CameraProtocolDescriptor {
   id: string;
@@ -321,3 +339,693 @@ export function isCameraHardwareControlsSupported(
       c.reboot
   );
 }
+
+export function resolveCameraPtzPresets(
+  camCfg?: CameraConfig,
+  ptzInfo?: CameraPtzInfoResponse | null
+): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const pushUnique = (val?: string | null) => {
+    const clean = val ? val.trim() : "";
+    if (clean && !seen.has(clean)) {
+      seen.add(clean);
+      out.push(clean);
+    }
+  };
+  for (const p of ptzInfo?.presets || []) {
+    pushUnique(p.name || p.token);
+    if (p.token) seen.add(p.token.trim());
+  }
+  for (const name of ptzInfo?.preset_names || []) {
+    pushUnique(name);
+  }
+  pushUnique(camCfg?.onvif?.return_preset);
+  for (const z of Object.values(camCfg?.zones || {})) {
+    pushUnique(z.preset);
+  }
+  return out;
+}
+
+export interface CameraCapabilitySnapshot {
+  ptzEnabled: boolean;
+  zoomSupported: boolean;
+  hardwareControlsSupported: boolean;
+  canManagePresets: boolean;
+  presets: string[];
+  activePreset: string | null;
+  pushToTalk: {
+    supported: boolean;
+    mode: "webrtc" | "cgi_alaw" | null;
+  };
+}
+
+export function resolveCameraCapabilitySnapshot(params: {
+  camera?: string;
+  cameraConfig?: CameraConfig;
+  ptzInfo?: CameraPtzInfoResponse | null;
+  hardwareInfo?: CameraHardwareInfoResponse | null;
+  go2rtcStreams?: Record<string, unknown> | null;
+}): CameraCapabilitySnapshot {
+  const { camera, cameraConfig, ptzInfo, hardwareInfo, go2rtcStreams } = params;
+  const ptzEnabled = isCameraPtzEnabled(cameraConfig, ptzInfo, hardwareInfo);
+  const zoomSupported = resolveCameraZoomSupported(cameraConfig, hardwareInfo);
+  const hardwareControlsSupported =
+    isCameraHardwareControlsSupported(hardwareInfo);
+  const canManagePresets =
+    hardwareInfo?.online &&
+    hardwareInfo?.capabilities?.ptz_presets_manage === false
+      ? false
+      : Boolean(ptzInfo?.features?.includes("presets_manage")) ||
+        Boolean(hardwareInfo?.capabilities?.ptz_presets_manage);
+  const presets = resolveCameraPtzPresets(cameraConfig, ptzInfo);
+  const activePreset =
+    ptzInfo?.active_preset !== undefined
+      ? ptzInfo.active_preset
+      : cameraConfig?.onvif?.return_preset || null;
+  const pushToTalk = resolveCameraPushToTalkCapability(
+    cameraConfig,
+    hardwareInfo,
+    go2rtcStreams,
+    camera
+  );
+  return {
+    ptzEnabled,
+    zoomSupported,
+    hardwareControlsSupported,
+    canManagePresets,
+    presets,
+    activePreset,
+    pushToTalk,
+  };
+}
+
+export function isConfigPersistenceHardwarePatch(
+  patch: Record<string, unknown>
+): boolean {
+  return (
+    patch.apply_suggested_onvif === true ||
+    patch.apply_suggested_substream === true ||
+    typeof patch.cloud_password === "string"
+  );
+}
+
+export function mergeOptimisticCameraHardwareInfo(
+  prev: CameraHardwareInfoResponse | null | undefined,
+  patch: Record<string, unknown>,
+  responseData?: Partial<CameraHardwareInfoResponse> | null
+): CameraHardwareInfoResponse | null {
+  const hasCompleteResponse =
+    responseData &&
+    typeof responseData.camera === "string" &&
+    responseData.capabilities !== undefined &&
+    responseData.state !== undefined;
+  const base =
+    prev ?? (hasCompleteResponse ? (responseData as CameraHardwareInfoResponse) : null);
+  if (!base) {
+    return null;
+  }
+
+  const stateOnlyPatch: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (
+      v !== undefined &&
+      k !== "__proto__" &&
+      k !== "constructor" &&
+      k !== "prototype" &&
+      !HARDWARE_CONFIG_ONLY_PATCH_KEY_SET.has(k)
+    ) {
+      stateOnlyPatch[k] = v;
+    }
+  }
+
+  const applySuggestedOnvif = patch?.apply_suggested_onvif === true;
+  const hasNonEmptyCloudPassword =
+    typeof patch?.cloud_password === "string" &&
+    patch.cloud_password.trim().length > 0;
+
+  const rawMissing = Array.isArray(responseData?.missing_requirements)
+    ? responseData.missing_requirements
+    : base.missing_requirements || [];
+  const nextMissing = rawMissing.filter(
+    (req) =>
+      !(applySuggestedOnvif && req === "onvif_not_configured") &&
+      !(hasNonEmptyCloudPassword && req === "tapo_cloud_password")
+  );
+
+  const responseState =
+    responseData?.state && typeof responseData.state === "object"
+      ? responseData.state
+      : {};
+
+  return {
+    ...base,
+    camera:
+      typeof responseData?.camera === "string" ? responseData.camera : base.camera,
+    online:
+      typeof responseData?.online === "boolean" ? responseData.online : base.online,
+    protocol_family:
+      typeof responseData?.protocol_family === "string"
+        ? responseData.protocol_family
+        : base.protocol_family,
+    onvif_configured:
+      typeof responseData?.onvif_configured === "boolean"
+        ? responseData.onvif_configured
+        : applySuggestedOnvif
+        ? true
+        : base.onvif_configured,
+    device_info: responseData?.device_info
+      ? { ...base.device_info, ...responseData.device_info }
+      : base.device_info,
+    capabilities: responseData?.capabilities
+      ? { ...base.capabilities, ...responseData.capabilities }
+      : base.capabilities,
+    missing_requirements: nextMissing,
+    ...(responseData?.suggested_config !== undefined
+      ? { suggested_config: responseData.suggested_config }
+      : {}),
+    state: {
+      ...(base.state || {}),
+      ...stateOnlyPatch,
+      ...responseState,
+    },
+  };
+}
+
+function deduplicatePresetItems(items: OnvifPresetItem[]): OnvifPresetItem[] {
+  const out: OnvifPresetItem[] = [];
+  const seenTokens = new Set<string>();
+  const seenNames = new Set<string>();
+  for (const item of items) {
+    const tok = (item?.token || "").trim();
+    const nm = (item?.name || tok).trim();
+    if (!tok && !nm) continue;
+    const effectiveToken = tok || nm;
+    const effectiveName = nm || tok;
+    if (seenTokens.has(effectiveToken) || seenNames.has(effectiveName)) {
+      continue;
+    }
+    seenTokens.add(effectiveToken);
+    seenNames.add(effectiveName);
+    out.push({ token: effectiveToken, name: effectiveName });
+  }
+  return out;
+}
+
+export function applySavedPresetToPtzInfo(
+  prev: CameraPtzInfoResponse | null | undefined,
+  token: string,
+  name?: string,
+  serverPresets?: string[],
+  serverPresetNames?: Record<string, string>
+): CameraPtzInfoResponse | null {
+  if (!prev) {
+    return null;
+  }
+  const cleanToken = (token || "").trim();
+  const cleanName = (name ?? token ?? "").trim() || cleanToken;
+  const effectiveToken = cleanToken || cleanName;
+  const effectiveName =
+    (effectiveToken && serverPresetNames?.[effectiveToken]?.trim()) ||
+    cleanName ||
+    effectiveToken;
+
+  if (!effectiveToken && !effectiveName) {
+    return { ...prev };
+  }
+
+  const existingByKey = new Map<string, OnvifPresetItem>();
+  for (const p of prev.presets || []) {
+    if (p.token) existingByKey.set(p.token.trim(), p);
+    if (p.name) existingByKey.set(p.name.trim(), p);
+  }
+
+  let rawItems: OnvifPresetItem[];
+  if (Array.isArray(serverPresets)) {
+    rawItems = serverPresets
+      .map((rawTok) => (rawTok || "").trim())
+      .filter(Boolean)
+      .map((tok) => {
+        const mappedName =
+          serverPresetNames?.[tok]?.trim() ||
+          (tok === effectiveToken ? effectiveName : undefined) ||
+          existingByKey.get(tok)?.name ||
+          tok;
+        return { token: tok, name: mappedName };
+      });
+    if (
+      !rawItems.some(
+        (p) => p.token === effectiveToken || p.name === effectiveName
+      )
+    ) {
+      rawItems.push({ token: effectiveToken, name: effectiveName });
+    }
+  } else {
+    rawItems = (prev.presets || []).map((p) => {
+      const tok = (p.token || "").trim();
+      const mapped = tok && serverPresetNames?.[tok]?.trim();
+      if (tok === effectiveToken || p.name.trim() === effectiveName) {
+        return {
+          token: effectiveToken || tok,
+          name: mapped || effectiveName || p.name,
+        };
+      }
+      return {
+        token: tok || p.name,
+        name: mapped || p.name,
+      };
+    });
+    if (
+      !rawItems.some(
+        (p) => p.token === effectiveToken || p.name === effectiveName
+      )
+    ) {
+      rawItems.push({ token: effectiveToken, name: effectiveName });
+    }
+  }
+
+  const nextPresets = deduplicatePresetItems(rawItems);
+  return {
+    ...prev,
+    presets: nextPresets,
+    preset_names: nextPresets.map((p) => p.name),
+    active_preset: effectiveName,
+  };
+}
+
+export const applyPresetSavedToPtzInfo = applySavedPresetToPtzInfo;
+
+export function applyDeletedPresetToPtzInfo(
+  prev: CameraPtzInfoResponse | null | undefined,
+  deletedToken: string,
+  serverPresets?: string[],
+  serverPresetNames?: Record<string, string>
+): CameraPtzInfoResponse | null {
+  if (!prev) {
+    return null;
+  }
+  const cleanDeleted = (deletedToken || "").trim();
+  if (!cleanDeleted) {
+    return { ...prev };
+  }
+
+  const existingPresets = prev.presets || [];
+  const matchedItem = existingPresets.find(
+    (p) => p.token.trim() === cleanDeleted || p.name.trim() === cleanDeleted
+  );
+  const matchedToken = matchedItem?.token?.trim() || cleanDeleted;
+  const matchedName =
+    matchedItem?.name?.trim() ||
+    serverPresetNames?.[cleanDeleted]?.trim() ||
+    cleanDeleted;
+
+  const existingByKey = new Map<string, OnvifPresetItem>();
+  for (const p of existingPresets) {
+    if (p.token) existingByKey.set(p.token.trim(), p);
+    if (p.name) existingByKey.set(p.name.trim(), p);
+  }
+
+  let nextPresets: OnvifPresetItem[];
+  if (Array.isArray(serverPresets)) {
+    const rawItems = serverPresets
+      .map((rawTok) => (rawTok || "").trim())
+      .filter(
+        (tok) =>
+          Boolean(tok) &&
+          tok !== cleanDeleted &&
+          tok !== matchedToken &&
+          tok !== matchedName
+      )
+      .map((tok) => ({
+        token: tok,
+        name:
+          serverPresetNames?.[tok]?.trim() ||
+          existingByKey.get(tok)?.name ||
+          tok,
+      }));
+    nextPresets = deduplicatePresetItems(rawItems);
+  } else {
+    nextPresets = deduplicatePresetItems(
+      existingPresets
+        .filter(
+          (p) =>
+            p.token.trim() !== cleanDeleted &&
+            p.name.trim() !== cleanDeleted &&
+            p.token.trim() !== matchedToken &&
+            p.name.trim() !== matchedName
+        )
+        .map((p) => {
+          const tok = p.token.trim();
+          const mapped = tok && serverPresetNames?.[tok]?.trim();
+          return {
+            token: tok,
+            name: mapped || p.name,
+          };
+        })
+    );
+  }
+
+  const nextPresetNames =
+    existingPresets.length === 0 &&
+    !Array.isArray(serverPresets) &&
+    Array.isArray(prev.preset_names)
+      ? prev.preset_names.filter(
+          (nm) =>
+            nm.trim() !== cleanDeleted &&
+            nm.trim() !== matchedToken &&
+            nm.trim() !== matchedName
+        )
+      : nextPresets.map((p) => p.name);
+
+  const curActive = prev.active_preset?.trim() || null;
+  const shouldClearActive =
+    !curActive ||
+    curActive === cleanDeleted ||
+    curActive === matchedToken ||
+    curActive === matchedName;
+
+  return {
+    ...prev,
+    presets: nextPresets,
+    preset_names: nextPresetNames,
+    active_preset: shouldClearActive ? null : prev.active_preset,
+  };
+}
+
+export const applyPresetDeletedToPtzInfo = applyDeletedPresetToPtzInfo;
+
+export interface ProbeCameraHardwareOptions {
+  cameraConfig?: CameraConfig;
+  force?: boolean;
+  timeoutMs?: number;
+  includePtz?: boolean;
+  fetchImpl?: typeof fetch;
+}
+
+export interface CameraHardwareProbeSnapshot {
+  hardware: CameraHardwareInfoResponse | null;
+  ptz: CameraPtzInfoResponse | null;
+  fromCache: boolean;
+  networkError?: boolean;
+}
+
+export type CameraHardwareCacheListener = (camera?: string) => void;
+
+export function buildCameraHardwareCacheKey(
+  camName: string,
+  camCfg?: CameraConfig
+): string {
+  const cleanCam = (camName || "").trim();
+  if (!camCfg) return cleanCam;
+  const profTok =
+    camCfg.onvif?.profile_token || camCfg.hardware?.profile_token || "";
+  const vsTok =
+    camCfg.onvif?.video_source_token ||
+    camCfg.hardware?.video_source_token ||
+    "";
+  const proto = camCfg.onvif?.protocol || camCfg.hardware?.protocol || "";
+  return `${cleanCam}:${camCfg.onvif?.host || ""}:${
+    camCfg.onvif?.port || 80
+  }:${camCfg.onvif?.user || ""}:${Boolean(
+    camCfg.onvif?.has_password
+  )}:${Boolean(
+    camCfg.onvif?.has_cloud_password || camCfg.hardware?.has_cloud_password
+  )}:${profTok}:${vsTok}:${proto}`;
+}
+
+export interface CameraHardwareCacheController {
+  getCachedCameraHardware: (cam: string) => CameraHardwareInfoResponse | null;
+  setCachedCameraHardware: (
+    cam: string,
+    info: CameraHardwareInfoResponse | null
+  ) => void;
+  getCachedCameraPtzInfo: (cam: string) => CameraPtzInfoResponse | null;
+  setCachedCameraPtzInfo: (
+    cam: string,
+    info: CameraPtzInfoResponse | null
+  ) => void;
+  invalidateCameraHardwareCache: (cam?: string) => void;
+  probeCameraHardwareAndPtz: (
+    cam: string,
+    options?: ProbeCameraHardwareOptions,
+    fetchImpl?: typeof fetch
+  ) => Promise<CameraHardwareProbeSnapshot>;
+  getSnapshot: () => {
+    hardwareByCam: Record<string, CameraHardwareInfoResponse>;
+    ptzByCam: Record<string, CameraPtzInfoResponse>;
+  };
+  subscribe: (listener: CameraHardwareCacheListener) => () => void;
+}
+
+export function createCameraHardwareCacheController(): CameraHardwareCacheController {
+  const hardwareByCam = new Map<string, CameraHardwareInfoResponse>();
+  const ptzByCam = new Map<string, CameraPtzInfoResponse>();
+  const configKeyByCam = new Map<string, string>();
+  const inFlightByCam = new Map<string, Promise<CameraHardwareProbeSnapshot>>();
+  const listeners = new Set<CameraHardwareCacheListener>();
+
+  const notify = (cam?: string) => {
+    for (const listener of listeners) {
+      try {
+        listener(cam);
+      } catch {
+        // ignore listener errors
+      }
+    }
+  };
+
+  const getCachedCameraHardware = (
+    cam: string
+  ): CameraHardwareInfoResponse | null => {
+    const clean = (cam || "").trim();
+    if (!clean) return null;
+    return hardwareByCam.get(clean) ?? null;
+  };
+
+  const setCachedCameraHardware = (
+    cam: string,
+    info: CameraHardwareInfoResponse | null
+  ): void => {
+    const clean = (cam || "").trim();
+    if (!clean) return;
+    if (info === null) {
+      hardwareByCam.delete(clean);
+    } else {
+      hardwareByCam.set(clean, info);
+    }
+    notify(clean);
+  };
+
+  const getCachedCameraPtzInfo = (cam: string): CameraPtzInfoResponse | null => {
+    const clean = (cam || "").trim();
+    if (!clean) return null;
+    return ptzByCam.get(clean) ?? null;
+  };
+
+  const setCachedCameraPtzInfo = (
+    cam: string,
+    info: CameraPtzInfoResponse | null
+  ): void => {
+    const clean = (cam || "").trim();
+    if (!clean) return;
+    if (info === null) {
+      ptzByCam.delete(clean);
+    } else {
+      ptzByCam.set(clean, info);
+    }
+    notify(clean);
+  };
+
+  const invalidateCameraHardwareCache = (cam?: string): void => {
+    const clean = (cam || "").trim();
+    if (clean) {
+      hardwareByCam.delete(clean);
+      ptzByCam.delete(clean);
+      configKeyByCam.delete(clean);
+      inFlightByCam.delete(clean);
+      notify(clean);
+    } else {
+      hardwareByCam.clear();
+      ptzByCam.clear();
+      configKeyByCam.clear();
+      inFlightByCam.clear();
+      notify(undefined);
+    }
+  };
+
+  const probeCameraHardwareAndPtz = async (
+    cam: string,
+    options: ProbeCameraHardwareOptions = {},
+    fetchImpl?: typeof fetch
+  ): Promise<CameraHardwareProbeSnapshot> => {
+    const cleanCam = (cam || "").trim();
+    if (!cleanCam) {
+      return { hardware: null, ptz: null, fromCache: false };
+    }
+
+    const resolvedOptions: ProbeCameraHardwareOptions =
+      typeof options === "function"
+        ? { fetchImpl: options as unknown as typeof fetch }
+        : options || {};
+    const fetchFn: typeof fetch =
+      fetchImpl ??
+      resolvedOptions.fetchImpl ??
+      ((input, init) => fetch(input, init));
+    const timeoutMs = resolvedOptions.timeoutMs ?? 3500;
+    const includePtz = resolvedOptions.includePtz ?? true;
+    const force = Boolean(resolvedOptions.force);
+    const camCfg = resolvedOptions.cameraConfig;
+
+    if (camCfg) {
+      const nextCfgKey = buildCameraHardwareCacheKey(cleanCam, camCfg);
+      const prevCfgKey = configKeyByCam.get(cleanCam);
+      if (prevCfgKey !== undefined && prevCfgKey !== nextCfgKey) {
+        hardwareByCam.delete(cleanCam);
+        ptzByCam.delete(cleanCam);
+        inFlightByCam.delete(cleanCam);
+      }
+      configKeyByCam.set(cleanCam, nextCfgKey);
+    }
+
+    if (!force && hardwareByCam.has(cleanCam)) {
+      const cachedHw = hardwareByCam.get(cleanCam) ?? null;
+      const needsPtz =
+        includePtz &&
+        ((cachedHw?.online && Boolean(cachedHw.capabilities?.ptz)) ||
+          isCameraPtzEnabled(camCfg, undefined, cachedHw));
+      if (!needsPtz || ptzByCam.has(cleanCam)) {
+        return {
+          hardware: cachedHw,
+          ptz: ptzByCam.get(cleanCam) ?? null,
+          fromCache: true,
+        };
+      }
+    }
+
+    if (!force) {
+      const existingInFlight = inFlightByCam.get(cleanCam);
+      if (existingInFlight) {
+        return existingInFlight;
+      }
+    }
+
+    const task = (async (): Promise<CameraHardwareProbeSnapshot> => {
+      let hwData: CameraHardwareInfoResponse | null = force
+        ? null
+        : hardwareByCam.get(cleanCam) ?? null;
+      let networkError = false;
+
+      if (force || !hwData) {
+        try {
+          const hwRes = await fetchFn(
+            `/api/${encodeURIComponent(cleanCam)}/hardware?timeout_ms=${timeoutMs}`,
+            { credentials: "include" }
+          );
+          if (hwRes.ok) {
+            const parsed = (await hwRes
+              .json()
+              .catch(() => null)) as CameraHardwareInfoResponse | null;
+            if (parsed) {
+              hwData = parsed;
+              hardwareByCam.set(cleanCam, parsed);
+            }
+          }
+        } catch {
+          networkError = true;
+        }
+      }
+
+      let ptzData: CameraPtzInfoResponse | null = force
+        ? null
+        : ptzByCam.get(cleanCam) ?? null;
+      const shouldProbePtz =
+        includePtz &&
+        ((hwData?.online && Boolean(hwData.capabilities?.ptz)) ||
+          isCameraPtzEnabled(camCfg, undefined, hwData));
+
+      if (shouldProbePtz && (force || !ptzData)) {
+        try {
+          const ptzRes = await fetchFn(
+            `/api/${encodeURIComponent(cleanCam)}/ptz/info`,
+            { credentials: "include" }
+          );
+          if (ptzRes.ok) {
+            const parsedPtz = (await ptzRes
+              .json()
+              .catch(() => null)) as CameraPtzInfoResponse | null;
+            if (parsedPtz) {
+              ptzData = parsedPtz;
+              ptzByCam.set(cleanCam, parsedPtz);
+            }
+          }
+        } catch {
+          // ignore PTZ fetch failure if hardware succeeded
+        }
+      }
+
+      notify(cleanCam);
+      return {
+        hardware: hwData ?? hardwareByCam.get(cleanCam) ?? null,
+        ptz: ptzData ?? ptzByCam.get(cleanCam) ?? null,
+        fromCache: false,
+        ...(networkError ? { networkError: true } : {}),
+      };
+    })();
+
+    inFlightByCam.set(cleanCam, task);
+    try {
+      return await task;
+    } finally {
+      if (inFlightByCam.get(cleanCam) === task) {
+        inFlightByCam.delete(cleanCam);
+      }
+    }
+  };
+
+  const getSnapshot = () => {
+    const hwObj: Record<string, CameraHardwareInfoResponse> = {};
+    for (const [k, v] of hardwareByCam.entries()) {
+      hwObj[k] = v;
+    }
+    const ptzObj: Record<string, CameraPtzInfoResponse> = {};
+    for (const [k, v] of ptzByCam.entries()) {
+      ptzObj[k] = v;
+    }
+    return { hardwareByCam: hwObj, ptzByCam: ptzObj };
+  };
+
+  const subscribe = (listener: CameraHardwareCacheListener) => {
+    listeners.add(listener);
+    return () => {
+      listeners.delete(listener);
+    };
+  };
+
+  return {
+    getCachedCameraHardware,
+    setCachedCameraHardware,
+    getCachedCameraPtzInfo,
+    setCachedCameraPtzInfo,
+    invalidateCameraHardwareCache,
+    probeCameraHardwareAndPtz,
+    getSnapshot,
+    subscribe,
+  };
+}
+
+export const cameraHardwareCache: CameraHardwareCacheController =
+  createCameraHardwareCacheController();
+
+export const getCachedCameraHardware =
+  cameraHardwareCache.getCachedCameraHardware;
+export const setCachedCameraHardware =
+  cameraHardwareCache.setCachedCameraHardware;
+export const getCachedCameraPtzInfo =
+  cameraHardwareCache.getCachedCameraPtzInfo;
+export const setCachedCameraPtzInfo =
+  cameraHardwareCache.setCachedCameraPtzInfo;
+export const invalidateCameraHardwareCache =
+  cameraHardwareCache.invalidateCameraHardwareCache;
+export const probeCameraHardwareAndPtz =
+  cameraHardwareCache.probeCameraHardwareAndPtz;
+export const subscribeCameraHardwareCache = cameraHardwareCache.subscribe;

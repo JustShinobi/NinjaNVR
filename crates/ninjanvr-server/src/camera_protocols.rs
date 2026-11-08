@@ -15,7 +15,7 @@ pub const MAX_TALKBACK_AUDIO_BYTES: usize = 512 * 1024;
 /// Declarative specification for a camera hardware/control protocol family.
 /// Adding support for a new camera vendor or protocol family only requires
 /// registering a `CameraProtocolSpec` entry in `CAMERA_PROTOCOL_REGISTRY`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CameraProtocolSpec {
     pub id: &'static str,
     pub display_name: &'static str,
@@ -377,6 +377,847 @@ impl CameraDriverRuntime {
         if let Ok(mut g) = self.tapo_streamd_ports.lock() {
             g.remove(camera);
         }
+    }
+
+    pub fn get_any_profile(&self, camera: &str) -> Option<String> {
+        self.discovered_profiles.lock().ok().and_then(|g| {
+            g.iter()
+                .find_map(|((cam, _), prof)| (cam == camera).then(|| prof.clone()))
+        })
+    }
+
+    pub fn resolve_probe_target(
+        &self,
+        camera: &str,
+        cam_cfg: &ninjanvr_config::CameraConfig,
+    ) -> CameraProbeTarget {
+        resolve_camera_probe_target(self, camera, cam_cfg)
+    }
+
+    pub fn resolve_probe_target_with_config(
+        &self,
+        cfg: &ninjanvr_config::NinjaConfig,
+        camera: &str,
+        cam_cfg: &ninjanvr_config::CameraConfig,
+    ) -> CameraProbeTarget {
+        resolve_camera_probe_target_with_config(self, cfg, camera, cam_cfg)
+    }
+
+    /// Executes an ONVIF SOAP request via `send_fn(profile_token)` and automatically falls back
+    /// through the camera protocol's `preferred_profile_tokens` (plus `["Profile000", "profile_1", "Profile_1"]`)
+    /// whenever the camera reports a profile-not-found fault (`ter:NoProfile`, `InvalidArgVal`, etc.).
+    /// Caches the working token via `self.set_profile(camera, endpoint, token)` and returns
+    /// `(status, body, resolved_profile_token)`.
+    pub async fn execute_onvif_with_profile_discovery<F, Fut>(
+        &self,
+        camera: &str,
+        endpoint: &str,
+        initial_profile: &str,
+        protocol_id: Option<&str>,
+        mut send_fn: F,
+    ) -> Result<(u16, String, String), String>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = Result<(u16, String), String>>,
+    {
+        let first_res = send_fn(initial_profile.to_string()).await;
+        match &first_res {
+            Ok((status, body)) if !is_onvif_profile_not_found_response(*status, body) => {
+                if (200..300).contains(status) && extract_onvif_soap_fault(body).is_none() {
+                    self.set_profile(camera, endpoint, initial_profile);
+                }
+                return Ok((*status, body.clone(), initial_profile.to_string()));
+            }
+            Err(err_msg) if !is_onvif_profile_not_found_error(err_msg) => {
+                return Err(err_msg.clone());
+            }
+            _ => {}
+        }
+
+        let effective_proto = protocol_id
+            .map(str::to_string)
+            .or_else(|| self.get_protocol(camera));
+        let spec_opt = effective_proto
+            .as_deref()
+            .and_then(find_protocol_spec_by_id_or_alias);
+
+        let mut candidates: Vec<&str> = Vec::with_capacity(6);
+        if let Some(spec) = spec_opt {
+            for &tok in spec.preferred_profile_tokens {
+                if tok != initial_profile && !candidates.contains(&tok) {
+                    candidates.push(tok);
+                }
+            }
+        }
+        for tok in ["Profile000", "profile_1", "Profile_1"] {
+            if tok != initial_profile && !candidates.contains(&tok) {
+                candidates.push(tok);
+            }
+        }
+
+        for candidate in candidates {
+            match send_fn(candidate.to_string()).await {
+                Ok((cand_status, cand_body)) => {
+                    if !is_onvif_profile_not_found_response(cand_status, &cand_body) {
+                        if (200..300).contains(&cand_status)
+                            && extract_onvif_soap_fault(&cand_body).is_none()
+                        {
+                            self.set_profile(camera, endpoint, candidate);
+                        }
+                        return Ok((cand_status, cand_body, candidate.to_string()));
+                    }
+                }
+                Err(cand_err) => {
+                    if !is_onvif_profile_not_found_error(&cand_err) {
+                        return Err(cand_err);
+                    }
+                }
+            }
+        }
+
+        match first_res {
+            Ok((status, body)) => Ok((status, body, initial_profile.to_string())),
+            Err(err_msg) => Err(err_msg),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compute_soft_preset_delta(
+        &self,
+        cur_pan: f64,
+        cur_tilt: f64,
+        cur_zoom: f64,
+        target_pan: f64,
+        target_tilt: f64,
+        target_zoom: f64,
+        min_step: f64,
+    ) -> Option<(f64, f64, f64)> {
+        compute_soft_preset_relative_delta(
+            cur_pan,
+            cur_tilt,
+            cur_zoom,
+            target_pan,
+            target_tilt,
+            target_zoom,
+            min_step,
+        )
+    }
+
+    /// Reboots a camera via ONVIF `SystemReboot` (`/onvif/device_service` or `/onvif/service`)
+    /// with automatic fallback to Dahua/Intelbras HTTP Digest CGI (`/cgi-bin/magicBox.cgi?action=reboot`).
+    pub async fn reboot_camera(
+        &self,
+        client: &reqwest::Client,
+        camera: &str,
+        cam_cfg: &ninjanvr_config::CameraConfig,
+    ) -> Result<String, String> {
+        let target = self.resolve_probe_target(camera, cam_cfg);
+        let Some(ref host) = target.host else {
+            return Err(format!(
+                "Camera '{camera}' has no reachable ONVIF or HTTP host"
+            ));
+        };
+        let timeout = Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 10));
+        let onvif_base = format_camera_http_base(host, target.onvif_port);
+        let user = target.user.as_deref();
+        let pass = target.password.as_deref();
+        let mut last_err = String::new();
+
+        for suffix in ["device_service", "service"] {
+            let dev_ep = format!("{onvif_base}/onvif/{suffix}");
+            let soap = build_onvif_system_reboot_soap(user, pass);
+            match send_onvif_soap_request_with_ns(
+                client,
+                &dev_ep,
+                ("http://www.onvif.org/ver10/device/wsdl", "SystemReboot"),
+                soap,
+                (user, pass),
+                timeout,
+            )
+            .await
+            {
+                Ok(_) => return Ok("reboot:onvif".to_string()),
+                Err((_, err_msg)) => {
+                    if last_err.is_empty() {
+                        last_err = err_msg;
+                    }
+                }
+            }
+        }
+
+        if !target.is_tapo_hint {
+            let cgi_base = format_camera_http_base(host, target.cgi_port);
+            let cgi_url = format!("{cgi_base}/cgi-bin/magicBox.cgi?action=reboot");
+            if let Ok((st, _)) = send_http_digest_request(
+                client,
+                self,
+                reqwest::Method::GET,
+                &cgi_url,
+                (user, pass),
+                (None, None),
+                timeout,
+            )
+            .await
+                && st.is_success()
+            {
+                return Ok("reboot:cgi".to_string());
+            }
+        }
+
+        Err(if last_err.is_empty() {
+            format!("Camera '{camera}' reboot failed")
+        } else {
+            last_err
+        })
+    }
+
+    /// Synthesizes a G.711 A-law siren payload for `duration_sec` and dispatches it to the camera
+    /// using the protocol-appropriate transport (`"tapo_streamd"` on TCP `:8800` or `"dahua_cgi"` `postAudio`).
+    pub async fn trigger_camera_siren(
+        &self,
+        client: &reqwest::Client,
+        camera: &str,
+        cam_cfg: &ninjanvr_config::CameraConfig,
+        duration_sec: f64,
+    ) -> Result<&'static str, String> {
+        let target = self.resolve_probe_target(camera, cam_cfg);
+        let Some(ref host) = target.host else {
+            return Err(format!(
+                "Camera '{camera}' has no reachable ONVIF or HTTP host"
+            ));
+        };
+        let dur_f32 = if duration_sec.is_finite() {
+            (duration_sec as f32).clamp(0.2, 15.0)
+        } else {
+            3.5
+        };
+        let siren_alaw = generate_siren_alaw_bytes(dur_f32);
+        let is_tapo_proto =
+            target.protocol == "tapo" || (target.is_tapo_hint && !target.is_dahua_hint);
+        let siren_timeout =
+            Duration::from_secs((dur_f32.ceil() as u64).saturating_add(6).clamp(5, 25));
+
+        send_camera_talkback_or_siren_alaw(
+            client,
+            self,
+            camera,
+            (host, target.onvif_port),
+            (target.user.as_deref(), target.password.as_deref()),
+            target.cloud_password.as_deref(),
+            is_tapo_proto,
+            siren_alaw,
+            true,
+            siren_timeout,
+        )
+        .await
+        .map(|_| {
+            if is_tapo_proto {
+                "tapo_streamd"
+            } else {
+                "dahua_cgi"
+            }
+        })
+        .map_err(|(_, err_msg)| err_msg)
+    }
+}
+
+pub type WireSoapFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = std::result::Result<String, (StatusCode, String)>>
+            + Send
+            + 'a,
+    >,
+>;
+
+pub type WireHttpFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = std::result::Result<(StatusCode, String), (StatusCode, String)>,
+            > + Send
+            + 'a,
+    >,
+>;
+
+/// Port trait abstracting low-level ONVIF SOAP and HTTP Digest wire exchanges for `CameraDriverRuntime`.
+pub trait CameraWireTransport: Send + Sync {
+    fn send_soap<'a>(
+        &'a self,
+        endpoint: &'a str,
+        wsdl_ns: &'a str,
+        action: &'a str,
+        soap_xml: String,
+        credentials: (Option<&'a str>, Option<&'a str>),
+        timeout: Duration,
+    ) -> WireSoapFuture<'a>;
+
+    fn send_digest_http<'a>(
+        &'a self,
+        runtime: &'a CameraDriverRuntime,
+        method: reqwest::Method,
+        url: &'a str,
+        credentials: (Option<&'a str>, Option<&'a str>),
+        body: (Option<&'a str>, Option<Vec<u8>>),
+        timeout: Duration,
+    ) -> WireHttpFuture<'a>;
+}
+
+/// Production `reqwest::Client` adapter implementing `CameraWireTransport`.
+#[derive(Debug, Clone)]
+pub struct ReqwestCameraWireTransport {
+    pub client: reqwest::Client,
+}
+
+impl ReqwestCameraWireTransport {
+    pub fn new(client: reqwest::Client) -> Self {
+        Self { client }
+    }
+}
+
+impl CameraWireTransport for ReqwestCameraWireTransport {
+    fn send_soap<'a>(
+        &'a self,
+        endpoint: &'a str,
+        wsdl_ns: &'a str,
+        action: &'a str,
+        soap_xml: String,
+        credentials: (Option<&'a str>, Option<&'a str>),
+        timeout: Duration,
+    ) -> WireSoapFuture<'a> {
+        Box::pin(send_onvif_soap_request_with_ns(
+            &self.client,
+            endpoint,
+            (wsdl_ns, action),
+            soap_xml,
+            credentials,
+            timeout,
+        ))
+    }
+
+    fn send_digest_http<'a>(
+        &'a self,
+        runtime: &'a CameraDriverRuntime,
+        method: reqwest::Method,
+        url: &'a str,
+        credentials: (Option<&'a str>, Option<&'a str>),
+        body: (Option<&'a str>, Option<Vec<u8>>),
+        timeout: Duration,
+    ) -> WireHttpFuture<'a> {
+        Box::pin(send_http_digest_request(
+            &self.client,
+            runtime,
+            method,
+            url,
+            credentials,
+            body,
+            timeout,
+        ))
+    }
+}
+
+/// Resolved hardware probe and control target for a camera, consolidating
+/// host, ONVIF/HTTP/Streamd ports, credentials, protocol specification,
+/// and preferred/discovered ONVIF tokens from `CAMERA_PROTOCOL_REGISTRY`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CameraProbeTarget {
+    pub host: Option<String>,
+    pub port: u16,
+    pub onvif_port: u16,
+    pub cgi_port: u16,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub cloud_password: Option<String>,
+    pub protocol: &'static str,
+    pub protocol_spec: &'static CameraProtocolSpec,
+    pub profile_token: String,
+    pub video_source_token: String,
+    pub streamd_port: u16,
+    pub is_tapo_hint: bool,
+    pub is_dahua_hint: bool,
+    pub ptz_endpoint: Option<String>,
+    pub onvif_base_url: Option<String>,
+    pub cgi_base_url: Option<String>,
+    pub onvif_configured: bool,
+}
+
+impl std::fmt::Debug for CameraProbeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let masked_pass = self
+            .password
+            .as_deref()
+            .map(|p| if p.is_empty() { "" } else { "***" });
+        let masked_cloud = self
+            .cloud_password
+            .as_deref()
+            .map(|p| if p.is_empty() { "" } else { "***" });
+        f.debug_struct("CameraProbeTarget")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("onvif_port", &self.onvif_port)
+            .field("cgi_port", &self.cgi_port)
+            .field("user", &self.user)
+            .field("password", &masked_pass)
+            .field("cloud_password", &masked_cloud)
+            .field("protocol", &self.protocol)
+            .field("profile_token", &self.profile_token)
+            .field("video_source_token", &self.video_source_token)
+            .field("streamd_port", &self.streamd_port)
+            .field("is_tapo_hint", &self.is_tapo_hint)
+            .field("is_dahua_hint", &self.is_dahua_hint)
+            .field("ptz_endpoint", &self.ptz_endpoint)
+            .field("onvif_configured", &self.onvif_configured)
+            .finish()
+    }
+}
+
+impl CameraProbeTarget {
+    pub fn host_str(&self) -> &str {
+        self.host.as_deref().unwrap_or("")
+    }
+
+    pub fn is_reachable_target(&self) -> bool {
+        self.host.is_some()
+    }
+}
+
+fn percent_decode_userinfo_str(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+struct ParsedCandidateUrl {
+    host: String,
+    user: Option<String>,
+    password: Option<String>,
+    path: Option<String>,
+    is_tapo_scheme: bool,
+}
+
+fn parse_rtsp_or_http_candidate_url(raw_url: &str) -> Option<ParsedCandidateUrl> {
+    let trimmed = raw_url.trim();
+    let (scheme, after_scheme) = trimmed.split_once("://")?;
+    let scheme_lc = scheme.trim().to_ascii_lowercase();
+    let is_tapo_scheme = scheme_lc == "tapo";
+
+    let slash_idx = after_scheme.find('/');
+    let authority = match slash_idx {
+        Some(idx) => &after_scheme[..idx],
+        None => after_scheme,
+    };
+    let path = slash_idx.map(|idx| {
+        let raw_path = &after_scheme[idx..];
+        let hash_idx = raw_path.find('#').unwrap_or(raw_path.len());
+        raw_path[..hash_idx].to_string()
+    });
+
+    let host_port_part = match authority.rfind('@') {
+        Some(at_idx) => &authority[at_idx + 1..],
+        None => authority,
+    };
+    let clean_host = extract_clean_camera_host(host_port_part);
+    let host_lc = clean_host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if host_lc.is_empty()
+        || host_lc == "localhost"
+        || host_lc == "127.0.0.1"
+        || host_lc.starts_with("127.")
+        || host_lc == "::1"
+    {
+        return None;
+    }
+    let probe_check_url = format!("{}/onvif/service", format_camera_http_base(&clean_host, 80));
+    if !is_safe_onvif_endpoint_url(&probe_check_url) {
+        return None;
+    }
+
+    let mut user = None;
+    let mut password = None;
+    if !is_tapo_scheme && let Some(at_idx) = authority.rfind('@') {
+        let userinfo = &authority[..at_idx];
+        if let Some((u, p)) = userinfo.split_once(':') {
+            let u_clean = percent_decode_userinfo_str(u.trim());
+            if !u_clean.is_empty() && u_clean != "*" && u_clean != "***" {
+                user = Some(u_clean);
+            }
+            let p_trimmed = p.trim();
+            if !p.is_empty() && p_trimmed != "*" && p_trimmed != "***" {
+                let p_clean = percent_decode_userinfo_str(p);
+                if !p_clean.is_empty() {
+                    password = Some(p_clean);
+                }
+            }
+        } else {
+            let u_clean = percent_decode_userinfo_str(userinfo.trim());
+            if !u_clean.is_empty() && u_clean != "*" && u_clean != "***" {
+                user = Some(u_clean);
+            }
+        }
+    }
+
+    Some(ParsedCandidateUrl {
+        host: clean_host,
+        user,
+        password,
+        path,
+        is_tapo_scheme,
+    })
+}
+
+/// Enriches a `CameraConfig` with upstream host, credentials, and protocol hints inferred
+/// from `NinjaConfig` (including `go2rtc.streams`) when those fields are not already set on `cam_cfg`.
+pub fn enrich_camera_config_from_upstream(
+    cfg: &ninjanvr_config::NinjaConfig,
+    camera: &str,
+    cam_cfg: &ninjanvr_config::CameraConfig,
+) -> ninjanvr_config::CameraConfig {
+    let mut enriched = cam_cfg.clone();
+    let Some(inferred) = cfg.infer_camera_upstream(camera) else {
+        return enriched;
+    };
+    if enriched
+        .onvif
+        .host
+        .as_deref()
+        .is_none_or(|h| h.trim().is_empty())
+    {
+        enriched.onvif.host = Some(inferred.host);
+        if enriched.onvif.port == 80 && inferred.default_onvif_port != 80 {
+            enriched.onvif.port = inferred.default_onvif_port;
+        }
+    }
+    if enriched
+        .onvif
+        .user
+        .as_deref()
+        .is_none_or(|u| u.trim().is_empty())
+    {
+        enriched.onvif.user = inferred.user;
+    }
+    if enriched
+        .onvif
+        .password
+        .as_deref()
+        .is_none_or(|p| p.is_empty() || p.trim() == "*" || p.trim() == "***")
+    {
+        enriched.onvif.password = inferred.password;
+    }
+    if enriched
+        .hardware
+        .protocol
+        .as_deref()
+        .is_none_or(|p| p.trim().is_empty())
+    {
+        if inferred.is_tapo_rtsp {
+            enriched.hardware.protocol = Some("tapo".to_string());
+        } else if inferred.is_dahua_rtsp {
+            enriched.hardware.protocol = Some("dahua_cgi".to_string());
+        } else if let Some(ref rtsp_path) = inferred.rtsp_path {
+            let path_lc = rtsp_path.to_ascii_lowercase();
+            if let Some(spec) = CAMERA_PROTOCOL_REGISTRY.iter().find(|spec| {
+                spec.rtsp_path_markers
+                    .iter()
+                    .any(|m| path_lc.contains(&m.to_ascii_lowercase()))
+            }) {
+                enriched.hardware.protocol = Some(spec.id.to_string());
+            }
+        }
+    }
+    enriched
+}
+
+pub fn resolve_camera_probe_target_with_config(
+    runtime: &CameraDriverRuntime,
+    cfg: &ninjanvr_config::NinjaConfig,
+    camera: &str,
+    cam_cfg: &ninjanvr_config::CameraConfig,
+) -> CameraProbeTarget {
+    let enriched = enrich_camera_config_from_upstream(cfg, camera, cam_cfg);
+    let mut target = resolve_camera_probe_target(runtime, camera, &enriched);
+    target.onvif_configured = cam_cfg.onvif.is_configured();
+    target
+}
+
+/// Consolidates camera host, port, credentials, cloud password, protocol specification,
+/// `profile_token`, `video_source_token`, and Tapo `streamd_port` resolution using
+/// `CAMERA_PROTOCOL_REGISTRY` and `CameraDriverRuntime`.
+pub fn resolve_camera_probe_target(
+    runtime: &CameraDriverRuntime,
+    camera: &str,
+    cam_cfg: &ninjanvr_config::CameraConfig,
+) -> CameraProbeTarget {
+    let mut inferred_host: Option<String> = None;
+    let mut inferred_user: Option<String> = None;
+    let mut inferred_pass: Option<String> = None;
+    let mut rtsp_matched_spec: Option<&'static CameraProtocolSpec> = None;
+    let mut saw_tapo_url = false;
+
+    let candidate_urls = cam_cfg
+        .ffmpeg
+        .inputs
+        .iter()
+        .map(|i| i.path.as_str())
+        .chain(cam_cfg.webui_url.as_deref());
+
+    for raw_url in candidate_urls {
+        if raw_url.trim().is_empty() {
+            continue;
+        }
+        if raw_url.trim().to_ascii_lowercase().starts_with("tapo://") {
+            saw_tapo_url = true;
+        }
+        let Some(parsed) = parse_rtsp_or_http_candidate_url(raw_url) else {
+            continue;
+        };
+        if parsed.is_tapo_scheme {
+            saw_tapo_url = true;
+        }
+        if inferred_host.is_none() {
+            inferred_host = Some(parsed.host);
+        }
+        if inferred_user.is_none() {
+            inferred_user = parsed.user;
+        }
+        if inferred_pass.is_none() {
+            inferred_pass = parsed.password;
+        }
+        if rtsp_matched_spec.is_none()
+            && let Some(ref path_str) = parsed.path
+        {
+            let path_lc = path_str.to_ascii_lowercase();
+            rtsp_matched_spec = CAMERA_PROTOCOL_REGISTRY.iter().find(|spec| {
+                spec.rtsp_path_markers
+                    .iter()
+                    .any(|marker| path_lc.contains(&marker.to_ascii_lowercase()))
+            });
+        }
+    }
+
+    let explicit_onvif_host_raw = cam_cfg
+        .onvif
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut host = explicit_onvif_host_raw
+        .map(extract_clean_camera_host)
+        .filter(|h| !h.is_empty())
+        .or(inferred_host);
+
+    let user = cam_cfg
+        .onvif
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "*" && *s != "***")
+        .map(str::to_string)
+        .or(inferred_user);
+
+    let password = cam_cfg
+        .onvif
+        .password
+        .as_deref()
+        .filter(|p| !p.is_empty() && p.trim() != "***" && p.trim() != "*")
+        .map(str::to_string)
+        .or(inferred_pass);
+
+    let cloud_password = cam_cfg
+        .hardware
+        .cloud_password
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && *p != "***" && *p != "*")
+        .map(str::to_string);
+
+    let explicit_spec = cam_cfg
+        .hardware
+        .protocol
+        .as_deref()
+        .and_then(find_protocol_spec_by_id_or_alias);
+    let cached_spec = runtime
+        .get_protocol(camera)
+        .as_deref()
+        .and_then(find_protocol_spec_by_id_or_alias);
+
+    let is_tapo_hint = saw_tapo_url
+        || explicit_spec.is_some_and(|s| s.id == "tapo")
+        || cached_spec.is_some_and(|s| s.id == "tapo")
+        || rtsp_matched_spec.is_some_and(|s| s.id == "tapo")
+        || cam_cfg.onvif.port == 2020
+        || (cloud_password.is_some() && explicit_spec.is_none() && rtsp_matched_spec.is_none());
+
+    let is_dahua_hint = explicit_spec.is_some_and(|s| s.supports_dahua_cgi)
+        || cached_spec.is_some_and(|s| s.supports_dahua_cgi)
+        || rtsp_matched_spec.is_some_and(|s| s.supports_dahua_cgi);
+
+    let protocol_spec: &'static CameraProtocolSpec = if let Some(exp) =
+        explicit_spec.filter(|s| s.id != "onvif" && s.id != "rtsp_only")
+    {
+        exp
+    } else if let Some(cached) = cached_spec.filter(|s| s.id != "onvif" && s.id != "rtsp_only") {
+        cached
+    } else if let Some(rtsp_spec) = rtsp_matched_spec {
+        rtsp_spec
+    } else if is_tapo_hint {
+        find_protocol_spec_by_id_or_alias("tapo").unwrap()
+    } else if is_dahua_hint {
+        find_protocol_spec_by_id_or_alias("dahua_cgi").unwrap()
+    } else if let Some(exp) = explicit_spec {
+        exp
+    } else if let Some(cached) = cached_spec {
+        cached
+    } else if host.is_some() {
+        find_protocol_spec_by_id_or_alias("onvif").unwrap()
+    } else {
+        find_protocol_spec_by_id_or_alias("rtsp_only").unwrap()
+    };
+
+    let onvif_port = if cam_cfg.onvif.port != 80 && cam_cfg.onvif.port != 0 {
+        cam_cfg.onvif.port
+    } else if cam_cfg.onvif.is_configured() {
+        if is_tapo_hint || protocol_spec.id == "tapo" || explicit_spec.is_some() {
+            protocol_spec.default_onvif_port
+        } else {
+            cam_cfg.onvif.port
+        }
+    } else {
+        protocol_spec.default_onvif_port
+    };
+
+    let cgi_port = if onvif_port != 2020 { onvif_port } else { 80 };
+
+    let mut ptz_endpoint = None;
+    let mut onvif_base_url = None;
+    let mut cgi_base_url = None;
+
+    if let Some(ref clean_h) = host {
+        let mut adjusted_onvif = cam_cfg.onvif.clone();
+        adjusted_onvif.host = Some(
+            explicit_onvif_host_raw
+                .unwrap_or(clean_h.as_str())
+                .to_string(),
+        );
+        adjusted_onvif.port = onvif_port;
+        if let Some(ep) = resolve_onvif_ptz_endpoint(&adjusted_onvif) {
+            ptz_endpoint = Some(ep);
+            onvif_base_url = Some(format_camera_http_base(clean_h, onvif_port));
+            cgi_base_url = Some(format_camera_http_base(clean_h, cgi_port));
+        } else {
+            host = None;
+        }
+    }
+
+    let default_prof = protocol_spec
+        .preferred_profile_tokens
+        .first()
+        .copied()
+        .unwrap_or("Profile000");
+    let profile_token = cam_cfg
+        .hardware
+        .profile_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|t| sanitize_onvif_token(Some(t), ""))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            ptz_endpoint
+                .as_deref()
+                .and_then(|ep| runtime.get_profile(camera, ep))
+        })
+        .or_else(|| runtime.get_any_profile(camera))
+        .unwrap_or_else(|| default_prof.to_string());
+
+    let default_vs = protocol_spec
+        .preferred_video_source_tokens
+        .first()
+        .copied()
+        .unwrap_or("VideoSource000");
+    let video_source_token = cam_cfg
+        .hardware
+        .video_source_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|t| sanitize_onvif_token(Some(t), ""))
+        .filter(|s| !s.is_empty())
+        .or_else(|| runtime.get_video_source(camera))
+        .unwrap_or_else(|| default_vs.to_string());
+
+    let streamd_port = runtime.get_tapo_streamd_port(camera);
+
+    CameraProbeTarget {
+        host,
+        port: onvif_port,
+        onvif_port,
+        cgi_port,
+        user,
+        password,
+        cloud_password,
+        protocol: protocol_spec.id,
+        protocol_spec,
+        profile_token,
+        video_source_token,
+        streamd_port,
+        is_tapo_hint: is_tapo_hint || protocol_spec.id == "tapo",
+        is_dahua_hint: is_dahua_hint || protocol_spec.supports_dahua_cgi,
+        ptz_endpoint,
+        onvif_base_url,
+        cgi_base_url,
+        onvif_configured: cam_cfg.onvif.is_configured(),
+    }
+}
+
+/// Computes the clamped `(dx, dy, dz)` relative PTZ translation delta toward a soft preset target,
+/// returning `None` when all three axes are already within `min_step` (deadband) or if any coordinate is non-finite.
+pub fn compute_soft_preset_relative_delta(
+    cur_pan: f64,
+    cur_tilt: f64,
+    cur_zoom: f64,
+    target_pan: f64,
+    target_tilt: f64,
+    target_zoom: f64,
+    min_step: f64,
+) -> Option<(f64, f64, f64)> {
+    if !cur_pan.is_finite()
+        || !cur_tilt.is_finite()
+        || !cur_zoom.is_finite()
+        || !target_pan.is_finite()
+        || !target_tilt.is_finite()
+        || !target_zoom.is_finite()
+    {
+        return None;
+    }
+    let threshold = if min_step.is_finite() && min_step > 0.0 {
+        min_step
+    } else {
+        0.0
+    };
+    let dx = (target_pan - cur_pan).clamp(-1.0, 1.0);
+    let dy = (target_tilt - cur_tilt).clamp(-1.0, 1.0);
+    let dz = (target_zoom - cur_zoom).clamp(-1.0, 1.0);
+    if dx.abs() <= threshold && dy.abs() <= threshold && dz.abs() <= threshold {
+        None
+    } else {
+        Some((dx, dy, dz))
     }
 }
 
@@ -1587,6 +2428,18 @@ pub fn is_onvif_profile_not_found_error(err_msg: &str) -> bool {
         || lc.contains("profile token")
         || lc.contains("invalidargval")
         || lc.contains("not exist")
+}
+
+pub fn is_onvif_profile_not_found_response(status: u16, body: &str) -> bool {
+    if is_onvif_profile_not_found_error(body) {
+        return true;
+    }
+    if let Some(fault) = extract_onvif_soap_fault(body)
+        && is_onvif_profile_not_found_error(&fault)
+    {
+        return true;
+    }
+    status >= 400 && is_onvif_profile_not_found_error(body)
 }
 
 pub fn is_onvif_action_not_supported_error(err_msg: &str) -> bool {
@@ -3501,5 +4354,206 @@ mod tests {
             received_ts_bytes.load(std::sync::atomic::Ordering::SeqCst) > 376,
             "mock Tapo Streamd server must receive PAT+PMT+PES audio/mp2t bytes"
         );
+    }
+
+    #[test]
+    fn resolve_probe_target_consolidates_tapo_and_dahua_defaults_and_rtsp_inference() {
+        let rt = CameraDriverRuntime::new();
+
+        // 1. Tapo camera inferred from RTSP /stream1 URL
+        let mut tapo_cfg = ninjanvr_config::CameraConfig::default();
+        tapo_cfg.hardware.cloud_password = Some("tapo_cloud_pw_123".to_string());
+        tapo_cfg
+            .ffmpeg
+            .inputs
+            .push(ninjanvr_config::CameraFfmpegInput {
+                path: "rtsp://tapo_admin:secret%401@192.0.2.44:554/stream1#transport=tcp"
+                    .to_string(),
+                roles: vec!["record".to_string()],
+                input_args: serde_json::Value::Null,
+            });
+
+        let tapo_target = rt.resolve_probe_target("escritorio", &tapo_cfg);
+        assert_eq!(tapo_target.host.as_deref(), Some("192.0.2.44"));
+        assert_eq!(tapo_target.port, 2020);
+        assert_eq!(tapo_target.onvif_port, 2020);
+        assert_eq!(tapo_target.user.as_deref(), Some("tapo_admin"));
+        assert_eq!(tapo_target.password.as_deref(), Some("secret@1"));
+        assert_eq!(
+            tapo_target.cloud_password.as_deref(),
+            Some("tapo_cloud_pw_123")
+        );
+        assert_eq!(tapo_target.protocol, "tapo");
+        assert_eq!(tapo_target.profile_token, "profile_1");
+        assert_eq!(tapo_target.video_source_token, "raw_vs1");
+        assert_eq!(tapo_target.streamd_port, 8800);
+        assert!(tapo_target.is_tapo_hint);
+        assert!(!tapo_target.is_dahua_hint);
+
+        // 2. Dahua / Intelbras camera inferred from RTSP /cam/realmonitor URL
+        let mut dahua_cfg = ninjanvr_config::CameraConfig::default();
+        dahua_cfg.ffmpeg.inputs.push(ninjanvr_config::CameraFfmpegInput {
+            path:
+                "rtsp://admin:intelbras_pw@192.0.2.77:554/cam/realmonitor?channel=1&subtype=0&unicast=true"
+                    .to_string(),
+            roles: vec!["record".to_string()],
+            input_args: serde_json::Value::Null,
+        });
+
+        let dahua_target = rt.resolve_probe_target("sala", &dahua_cfg);
+        assert_eq!(dahua_target.host.as_deref(), Some("192.0.2.77"));
+        assert_eq!(dahua_target.port, 80);
+        assert_eq!(dahua_target.onvif_port, 80);
+        assert_eq!(dahua_target.user.as_deref(), Some("admin"));
+        assert_eq!(dahua_target.password.as_deref(), Some("intelbras_pw"));
+        assert_eq!(dahua_target.protocol, "dahua_cgi");
+        assert_eq!(dahua_target.profile_token, "Profile000");
+        assert_eq!(dahua_target.video_source_token, "VideoSource000");
+        assert!(!dahua_target.is_tapo_hint);
+        assert!(dahua_target.is_dahua_hint);
+    }
+
+    #[tokio::test]
+    async fn execute_onvif_with_profile_discovery_retries_noprofile_and_caches_working_token() {
+        let rt = CameraDriverRuntime::new();
+        let camera = "sala";
+        let endpoint = "http://192.0.2.77:80/onvif/ptz_service";
+        let attempted = Arc::new(Mutex::new(Vec::<String>::new()));
+        let attempted_clone = attempted.clone();
+
+        let (status, body, resolved_prof) = rt
+            .execute_onvif_with_profile_discovery(
+                camera,
+                endpoint,
+                "Profile_1",
+                Some("dahua_cgi"),
+                move |prof| {
+                    let attempted_inner = attempted_clone.clone();
+                    async move {
+                        attempted_inner.lock().unwrap().push(prof.clone());
+                        if prof == "Profile_1" {
+                            Ok((
+                                400,
+                                "<s:Envelope><s:Body><s:Fault><s:Code><s:Subcode><s:Value>ter:NoProfile</s:Value></s:Subcode></s:Code><s:Reason><s:Text>The requested profile token Profile_1 does not exist</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>".to_string(),
+                            ))
+                        } else if prof == "Profile000" {
+                            Ok((
+                                200,
+                                "<s:Envelope><s:Body><tptz:GetStatusResponse/></s:Body></s:Envelope>"
+                                    .to_string(),
+                            ))
+                        } else {
+                            Err("unexpected profile token".to_string())
+                        }
+                    }
+                },
+            )
+            .await
+            .expect("profile discovery should succeed on Profile000");
+
+        assert_eq!(status, 200);
+        assert!(body.contains("GetStatusResponse"));
+        assert_eq!(resolved_prof, "Profile000");
+        assert_eq!(
+            *attempted.lock().unwrap(),
+            vec!["Profile_1".to_string(), "Profile000".to_string()]
+        );
+        assert_eq!(
+            rt.get_profile(camera, endpoint).as_deref(),
+            Some("Profile000"),
+            "working profile token must be cached in CameraDriverRuntime"
+        );
+    }
+
+    #[test]
+    fn compute_soft_preset_relative_delta_enforces_deadband_and_clamping() {
+        // Within deadband on all axes -> returns None
+        assert_eq!(
+            compute_soft_preset_relative_delta(0.25, -0.40, 0.10, 0.254, -0.395, 0.108, 0.01),
+            None
+        );
+        // Exact boundary equal to min_step -> returns None
+        assert_eq!(
+            compute_soft_preset_relative_delta(0.0, 0.0, 0.0, 0.01, -0.01, 0.01, 0.01),
+            None
+        );
+        // Exceeding min_step -> returns clamped delta tuple
+        let (dx, dy, dz) =
+            compute_soft_preset_relative_delta(0.10, -0.20, 0.0, 0.60, 0.30, 0.50, 0.01)
+                .expect("delta exceeding min_step must return Some");
+        assert!((dx - 0.50).abs() < 1e-9);
+        assert!((dy - 0.50).abs() < 1e-9);
+        assert!((dz - 0.50).abs() < 1e-9);
+
+        // Extreme delta clamps to [-1.0, 1.0]
+        let (cx, cy, cz) =
+            compute_soft_preset_relative_delta(-0.90, 0.85, 0.90, 0.95, -0.95, -0.50, 0.01)
+                .expect("large delta must clamp to [-1.0, 1.0]");
+        assert_eq!(cx, 1.0);
+        assert_eq!(cy, -1.0);
+        assert!((cz - (-1.0)).abs() < 0.5);
+
+        // Non-finite input returns None
+        assert_eq!(
+            compute_soft_preset_relative_delta(f64::NAN, 0.0, 0.0, 0.5, 0.5, 0.0, 0.01),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn reboot_camera_and_trigger_camera_siren_dispatch_protocol_seams() {
+        use axum::{Router, routing::get, routing::post};
+
+        let mock_app = Router::new()
+            .route(
+                "/onvif/device_service",
+                post(|| async { (StatusCode::BAD_REQUEST, "SOAP fault") }),
+            )
+            .route(
+                "/onvif/service",
+                post(|| async { (StatusCode::BAD_REQUEST, "SOAP fault") }),
+            )
+            .route(
+                "/cgi-bin/magicBox.cgi",
+                get(|| async { (StatusCode::OK, "OK\r\n") }),
+            )
+            .route(
+                "/cgi-bin/audio.cgi",
+                post(|| async { (StatusCode::OK, "OK\r\n") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        let rt = CameraDriverRuntime::new();
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+
+        let mut cam_cfg = ninjanvr_config::CameraConfig::default();
+        cam_cfg.onvif.host = Some("127.0.0.1".to_string());
+        cam_cfg.onvif.port = addr.port();
+        cam_cfg.onvif.user = Some("admin".to_string());
+        cam_cfg.onvif.password = Some("secret".to_string());
+        cam_cfg.hardware.protocol = Some("dahua_cgi".to_string());
+
+        let reboot_res = rt
+            .reboot_camera(&client, "sala", &cam_cfg)
+            .await
+            .expect("reboot_camera should fall back to Dahua CGI reboot");
+        assert_eq!(reboot_res, "reboot:cgi");
+
+        let siren_res = rt
+            .trigger_camera_siren(&client, "sala", &cam_cfg, 0.2)
+            .await
+            .expect("trigger_camera_siren should succeed over Dahua CGI postAudio");
+        assert_eq!(siren_res, "dahua_cgi");
+
+        srv.abort();
     }
 }

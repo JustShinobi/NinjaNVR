@@ -19,6 +19,12 @@ import { SettingsScopeDivider } from "../../components/SettingsScopeDivider";
 import {
   CAMERA_PROTOCOL_CATALOG,
   findCameraProtocolDescriptor,
+  getCachedCameraHardware,
+  invalidateCameraHardwareCache,
+  isConfigPersistenceHardwarePatch,
+  mergeOptimisticCameraHardwareInfo,
+  probeCameraHardwareAndPtz,
+  setCachedCameraHardware,
 } from "../../utils/cameraCapabilities";
 
 const RESERVED_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -749,35 +755,36 @@ export const ChannelsStreamsSection: React.FC<{
     if (!targetCam) return;
     setHwProbeBusy(true);
     try {
-      const res = await fetch(
-        `/api/${encodeURIComponent(targetCam)}/hardware?timeout_ms=4000`,
-        { credentials: "include" }
-      );
-      const data = (await res.json().catch(() => null)) as CameraHardwareInfoResponse | null;
+      const snap = await probeCameraHardwareAndPtz(targetCam, {
+        force: true,
+        timeoutMs: 4000,
+        includePtz: false,
+        cameraConfig: draftConfig.cameras?.[targetCam],
+      });
       if (inspectorCamRef.current !== targetCam) return;
-      if (res.ok && data) {
-        setHwProbeResult(data);
+      if (snap.hardware && !snap.networkError) {
+        setHwProbeResult(snap.hardware);
         if (!silent) {
           notify(
             isPt
-              ? `Recursos detectados para '${targetCam}' (${data.device_info?.model || data.protocol_family})`
-              : `Detected capabilities for '${targetCam}' (${data.device_info?.model || data.protocol_family})`
+              ? `Recursos detectados para '${targetCam}' (${snap.hardware.device_info?.model || snap.hardware.protocol_family})`
+              : `Detected capabilities for '${targetCam}' (${snap.hardware.device_info?.model || snap.hardware.protocol_family})`
           );
         }
       } else if (!silent) {
-        notify(
-          isPt
-            ? "Falha ao detectar recursos de hardware da câmera"
-            : "Failed to detect camera hardware capabilities"
-        );
-      }
-    } catch {
-      if (!silent && inspectorCamRef.current === targetCam) {
-        notify(
-          isPt
-            ? "Erro de rede ao consultar hardware da câmera"
-            : "Network error probing camera hardware"
-        );
+        if (snap.networkError) {
+          notify(
+            isPt
+              ? "Erro de rede ao consultar hardware da câmera"
+              : "Network error probing camera hardware"
+          );
+        } else {
+          notify(
+            isPt
+              ? "Falha ao detectar recursos de hardware da câmera"
+              : "Failed to detect camera hardware capabilities"
+          );
+        }
       }
     } finally {
       if (inspectorCamRef.current === targetCam) {
@@ -796,7 +803,7 @@ export const ChannelsStreamsSection: React.FC<{
     setProbeBusy(false);
     setProbeResult(null);
     setHwProbeBusy(false);
-    setHwProbeResult(null);
+    setHwProbeResult(inspectorCam ? getCachedCameraHardware(inspectorCam) : null);
     setCamLogsBusy(false);
     setCamLogsReport(null);
     if (typeof window !== "undefined" && inspectorCam) {
@@ -877,49 +884,17 @@ export const ChannelsStreamsSection: React.FC<{
       const data = await res.json().catch(() => null);
       if (inspectorCamRef.current !== targetCam) return;
       if (res.ok && data?.success) {
-        const stateOnlyPatch: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(patch)) {
-          if (
-            k !== "apply_suggested_onvif" &&
-            k !== "apply_suggested_substream" &&
-            k !== "cloud_password" &&
-            k !== "protocol" &&
-            k !== "profile_token" &&
-            k !== "video_source_token" &&
-            k !== "reboot"
-          ) {
-            stateOnlyPatch[k] = v;
+        const isConfigPersistencePatch = isConfigPersistenceHardwarePatch(patch);
+        setHwProbeResult((prev) => {
+          const base = prev ?? getCachedCameraHardware(targetCam);
+          const merged = mergeOptimisticCameraHardwareInfo(base, patch, data);
+          if (merged) {
+            setCachedCameraHardware(targetCam, merged);
           }
-        }
-        const isConfigPersistencePatch =
-          patch.apply_suggested_onvif === true ||
-          patch.apply_suggested_substream === true ||
-          typeof patch.cloud_password === "string";
-        setHwProbeResult((prev) =>
-          prev
-            ? {
-                ...prev,
-                onvif_configured:
-                  patch.apply_suggested_onvif === true
-                    ? true
-                    : prev.onvif_configured,
-                missing_requirements: (prev.missing_requirements || []).filter(
-                  (r) =>
-                    !(
-                      patch.apply_suggested_onvif === true &&
-                      r === "onvif_not_configured"
-                    ) &&
-                    !(
-                      typeof patch.cloud_password === "string" &&
-                      patch.cloud_password.trim().length > 0 &&
-                      r === "tapo_cloud_password"
-                    )
-                ),
-                state: { ...prev.state, ...stateOnlyPatch },
-              }
-            : prev
-        );
+          return merged;
+        });
         if (isConfigPersistencePatch) {
+          invalidateCameraHardwareCache(targetCam);
           try {
             const cfgRes = await fetch("/api/config", { credentials: "include" });
             if (cfgRes.ok) {

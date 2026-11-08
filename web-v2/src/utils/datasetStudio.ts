@@ -579,3 +579,84 @@ export function mergeDeployedModel(current: ModelConfig, patch: Partial<ModelCon
   });
   return next;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Optimistic state reconciliation & auto-annotate deduplication
+// ---------------------------------------------------------------------------------------------
+
+export type DatasetSample = DatasetSampleItem;
+
+/**
+ * Replaces an existing sample in-place by `id` or prepends a newly created sample,
+ * preserving list immutability and avoiding full-list re-fetches on single-item edits.
+ */
+export function upsertDatasetSampleInList(
+  samples: DatasetSample[],
+  updated: DatasetSample
+): DatasetSample[] {
+  const list = Array.isArray(samples) ? samples.filter(Boolean) : [];
+  if (!updated || typeof updated.id !== "string" || !updated.id.trim()) {
+    return [...list];
+  }
+  const idx = list.findIndex((s) => s.id === updated.id);
+  if (idx >= 0) {
+    return list.map((s, i) => (i === idx ? updated : s));
+  }
+  return [updated, ...list];
+}
+
+/**
+ * Removes the sample matching `sampleId` from `samples` immutably.
+ */
+export function removeDatasetSampleFromList(
+  samples: DatasetSample[],
+  sampleId: string
+): DatasetSample[] {
+  const list = Array.isArray(samples) ? samples.filter(Boolean) : [];
+  if (typeof sampleId !== "string" || !sampleId.trim()) {
+    return [...list];
+  }
+  return list.filter((s) => s.id !== sampleId);
+}
+
+/**
+ * Determines whether the client should fire a fallback `/auto-annotate` request after
+ * `/api/dataset/samples/from-event/{id}` completes.
+ *
+ * Returns `false` if `requestedAutoAnnotate` was false, if the server already attempted
+ * `auto_annotate` during `from-event` (`auto_annotate_attempted === true` or `auto_annotate_error`
+ * is present), or if the resulting sample is already `"ai_annotated"` or `"hard_negative"`.
+ */
+export function shouldRunFallbackAutoAnnotate(
+  fromEventResponse:
+    | {
+        sample_kind?: string;
+        sample?: { sample_kind?: string } | null;
+        auto_annotate_attempted?: boolean;
+        auto_annotate_error?: string | null;
+      }
+    | null
+    | undefined,
+  requestedAutoAnnotate: boolean
+): boolean {
+  if (!requestedAutoAnnotate || !fromEventResponse || typeof fromEventResponse !== "object") {
+    return false;
+  }
+  if (fromEventResponse.auto_annotate_attempted === true) {
+    return false;
+  }
+  if (
+    typeof fromEventResponse.auto_annotate_error === "string" &&
+    fromEventResponse.auto_annotate_error.trim().length > 0
+  ) {
+    return false;
+  }
+  const rawKind =
+    fromEventResponse.sample?.sample_kind ?? fromEventResponse.sample_kind ?? "";
+  const kind = String(rawKind).trim().toLowerCase();
+  if (kind === "ai_annotated" || kind === "hard_negative") {
+    return false;
+  }
+  return true;
+}
+

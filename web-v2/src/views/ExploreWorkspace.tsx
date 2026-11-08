@@ -22,6 +22,7 @@ import {
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import { useCompactViewport } from "../utils/useCompactViewport";
 import { countActiveExploreFilters } from "../utils/liveTileHud";
+import { shouldRunFallbackAutoAnnotate } from "../utils/datasetStudio";
 import {
   isSafeDatasetSampleId,
   normalizeFaceProfileName,
@@ -370,14 +371,18 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           .trim()
           .toLowerCase();
         let split = data.split || data.sample?.split || "train";
+        const initialAnns = Array.isArray(data.annotations)
+          ? data.annotations
+          : Array.isArray(data.sample?.annotations)
+          ? data.sample.annotations
+          : null;
         let aiBoxCount: number | null =
-          sampleKind === "ai_annotated" && Array.isArray(data.annotations)
-            ? data.annotations.length
+          sampleKind === "ai_annotated" && initialAnns
+            ? initialAnns.length
             : null;
         if (
           isSafeDatasetSampleId(rawSampleId) &&
-          sampleKind !== "hard_negative" &&
-          sampleKind !== "ai_annotated"
+          shouldRunFallbackAutoAnnotate(data, true)
         ) {
           try {
             const aiRes = await fetch(

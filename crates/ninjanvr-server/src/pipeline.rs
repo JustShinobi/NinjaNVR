@@ -735,59 +735,16 @@ pub fn apply_live_vision_config(
 
 /// Attempts an automatic ONVIF `SystemReboot` (or Dahua CGI `magicBox.cgi?action=reboot` fallback)
 /// when a camera's RTSP stream stalls repeatedly while its management port (`:2020` / `:80`) is still reachable.
-pub async fn try_watchdog_camera_reboot(cfg: &NinjaConfig, camera: &str) -> bool {
+pub async fn try_watchdog_camera_reboot(
+    cfg: &NinjaConfig,
+    camera: &str,
+    camera_driver_runtime: &crate::camera_protocols::CameraDriverRuntime,
+) -> bool {
     let Some(cam_cfg) = cfg.cameras.get(camera) else {
         return false;
     };
-    let inferred = cfg.infer_camera_upstream(camera);
-    let host_opt = cam_cfg
-        .onvif
-        .host
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| inferred.as_ref().map(|i| i.host.clone()));
-    let Some(host) = host_opt else {
-        return false;
-    };
-    let is_tapo_hint = inferred.as_ref().is_some_and(|i| i.is_tapo_rtsp)
-        || cam_cfg.onvif.port == 2020
-        || cam_cfg
-            .hardware
-            .protocol
-            .as_deref()
-            .and_then(crate::camera_protocols::find_protocol_spec_by_id_or_alias)
-            .is_some_and(|s| s.id == "tapo");
-    let onvif_port = if cam_cfg.onvif.is_configured() {
-        if cam_cfg.onvif.port == 80 && is_tapo_hint {
-            2020
-        } else {
-            cam_cfg.onvif.port
-        }
-    } else if is_tapo_hint {
-        2020
-    } else {
-        inferred
-            .as_ref()
-            .map(|i| i.default_onvif_port)
-            .unwrap_or(80)
-    };
-    let user = cam_cfg
-        .onvif
-        .user
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| inferred.as_ref().and_then(|i| i.user.clone()));
-    let pass = cam_cfg
-        .onvif
-        .password
-        .as_deref()
-        .filter(|p| !p.is_empty() && p.trim() != "***" && p.trim() != "*")
-        .map(str::to_string)
-        .or_else(|| inferred.as_ref().and_then(|i| i.password.clone()));
+    let effective_cam_cfg =
+        crate::camera_protocols::enrich_camera_config_from_upstream(cfg, camera, cam_cfg);
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let Ok(client) = reqwest::Client::builder()
@@ -798,50 +755,10 @@ pub async fn try_watchdog_camera_reboot(cfg: &NinjaConfig, camera: &str) -> bool
         return false;
     };
 
-    let onvif_base = crate::camera_protocols::format_camera_http_base(&host, onvif_port);
-    let timeout = Duration::from_secs(4);
-    for suffix in ["device_service", "service"] {
-        let dev_ep = format!("{onvif_base}/onvif/{suffix}");
-        let soap = crate::camera_protocols::build_onvif_system_reboot_soap(
-            user.as_deref(),
-            pass.as_deref(),
-        );
-        if crate::camera_protocols::send_onvif_soap_request_with_ns(
-            &client,
-            &dev_ep,
-            ("http://www.onvif.org/ver10/device/wsdl", "SystemReboot"),
-            soap,
-            (user.as_deref(), pass.as_deref()),
-            timeout,
-        )
+    camera_driver_runtime
+        .reboot_camera(&client, camera, &effective_cam_cfg)
         .await
         .is_ok()
-        {
-            return true;
-        }
-    }
-
-    if !is_tapo_hint {
-        let cgi_port = if onvif_port != 2020 { onvif_port } else { 80 };
-        let cgi_base = crate::camera_protocols::format_camera_http_base(&host, cgi_port);
-        let cgi_url = format!("{cgi_base}/cgi-bin/magicBox.cgi?action=reboot");
-        let rt = crate::camera_protocols::CameraDriverRuntime::new();
-        if let Ok((st, _)) = crate::camera_protocols::send_http_digest_request(
-            &client,
-            &rt,
-            reqwest::Method::GET,
-            &cgi_url,
-            (user.as_deref(), pass.as_deref()),
-            (None, None),
-            timeout,
-        )
-        .await
-            && st.is_success()
-        {
-            return true;
-        }
-    }
-    false
 }
 
 pub struct VisionPipeline {
@@ -1549,7 +1466,9 @@ impl VisionPipeline {
                 if consecutive_stall_cycles >= 3 && now_ts - last_watchdog_reboot_ts >= 1800.0 {
                     last_watchdog_reboot_ts = now_ts;
                     let cfg_snap = self.config.read().await.clone();
-                    if try_watchdog_camera_reboot(&cfg_snap, &camera).await {
+                    if try_watchdog_camera_reboot(&cfg_snap, &camera, &self.camera_driver_runtime)
+                        .await
+                    {
                         self.log_hub.push_ninjanvr(
                             "WARNING",
                             &format!("ninjanvr.camera.{camera}"),
@@ -1801,69 +1720,16 @@ impl VisionPipeline {
         {
             return;
         }
-        let (host_opt, onvif_port, user, pass, cloud_password, is_tapo_proto) = {
+        let effective_cam_cfg = {
             let cfg_guard = self.config.read().await;
-            let inferred = cfg_guard.infer_camera_upstream(camera);
-            let host = cam_cfg
-                .onvif
-                .host
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .or_else(|| inferred.as_ref().map(|i| i.host.clone()));
-            let is_tapo_hint = inferred.as_ref().is_some_and(|i| i.is_tapo_rtsp)
-                || cam_cfg.onvif.port == 2020
-                || cam_cfg
-                    .hardware
-                    .protocol
-                    .as_deref()
-                    .and_then(crate::camera_protocols::find_protocol_spec_by_id_or_alias)
-                    .is_some_and(|s| s.id == "tapo")
-                || self
-                    .camera_driver_runtime
-                    .get_protocol(camera)
-                    .is_some_and(|p| p == "tapo");
-            let port = if cam_cfg.onvif.is_configured() {
-                if cam_cfg.onvif.port == 80 && is_tapo_hint {
-                    2020
-                } else {
-                    cam_cfg.onvif.port
-                }
-            } else if is_tapo_hint {
-                2020
-            } else {
-                inferred
-                    .as_ref()
-                    .map(|i| i.default_onvif_port)
-                    .unwrap_or(80)
-            };
-            let u = cam_cfg
-                .onvif
-                .user
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .or_else(|| inferred.as_ref().and_then(|i| i.user.clone()));
-            let p = cam_cfg
-                .onvif
-                .password
-                .as_deref()
-                .filter(|pw| !pw.is_empty() && pw.trim() != "***" && pw.trim() != "*")
-                .map(str::to_string)
-                .or_else(|| inferred.as_ref().and_then(|i| i.password.clone()));
-            let cp = cam_cfg
-                .hardware
-                .cloud_password
-                .as_deref()
-                .filter(|pw| !pw.trim().is_empty() && pw.trim() != "***" && pw.trim() != "*")
-                .map(str::to_string);
-            (host, port, u, p, cp, is_tapo_hint)
+            crate::camera_protocols::enrich_camera_config_from_upstream(&cfg_guard, camera, cam_cfg)
         };
-        let Some(host) = host_opt else {
+        let target = self
+            .camera_driver_runtime
+            .resolve_probe_target(camera, &effective_cam_cfg);
+        if target.host.is_none() {
             return;
-        };
+        }
 
         self.log_hub.push_ninjanvr(
             "INFO",
@@ -1890,20 +1756,9 @@ impl VisionPipeline {
             let Some(client) = shared_snapshot_http_client() else {
                 return;
             };
-            let alaw = crate::camera_protocols::generate_siren_alaw_bytes(3.5);
-            if let Err((_, err_msg)) = crate::camera_protocols::send_camera_talkback_or_siren_alaw(
-                client,
-                &rt,
-                &cam_owned,
-                (&host, onvif_port),
-                (user.as_deref(), pass.as_deref()),
-                cloud_password.as_deref(),
-                is_tapo_proto,
-                alaw,
-                true,
-                Duration::from_secs(10),
-            )
-            .await
+            if let Err(err_msg) = rt
+                .trigger_camera_siren(client, &cam_owned, &effective_cam_cfg, 3.5)
+                .await
             {
                 log_hub.push_ninjanvr(
                     "WARN",
@@ -5394,7 +5249,8 @@ cameras:
         );
         let cfg =
             NinjaConfig::from_yaml_str(&yaml, PathBuf::from("/tmp/test_watchdog.yml")).unwrap();
-        assert!(try_watchdog_camera_reboot(&cfg, "quarto").await);
+        let rt = crate::camera_protocols::CameraDriverRuntime::new();
+        assert!(try_watchdog_camera_reboot(&cfg, "quarto", &rt).await);
         assert_eq!(reboot_hits.load(Ordering::SeqCst), 1);
         srv.abort();
     }

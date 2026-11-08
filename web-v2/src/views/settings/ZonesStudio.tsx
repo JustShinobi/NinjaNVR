@@ -250,9 +250,8 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
       notify(commitError(res.error));
       return;
     }
-    const points = draftPoints;
     updateDraft((next) => {
-      commitVisionEditor(next, inspectorCam, editing, points);
+      next.cameras[inspectorCam] = trial.cameras[inspectorCam];
     });
     setSelected(res.ref);
     setDraftPoints([]);
@@ -279,9 +278,8 @@ export const ZonesStudio: React.FC<ZonesStudioProps> = (props) => {
       notify(tr("Não foi possível copiar", "Could not copy"));
       return;
     }
-    const src = selected;
     updateDraft((next) => {
-      copyVisionItemToCamera(next, inspectorCam, src, copyTarget);
+      next.cameras[copyTarget] = trial.cameras[copyTarget];
     });
     notify(tr(`Copiado para ${copyTarget}`, `Copied to ${copyTarget}`));
     setCopyTarget("");

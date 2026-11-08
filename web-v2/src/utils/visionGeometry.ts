@@ -1,11 +1,241 @@
 /**
- * Pure geometry sanitizers for drawn zones, masks, tripwires and state ROIs.
+ * Unified VisionGeometry module: canonical polygon & mask-union codecs,
+ * pixel-to-normalized coordinate transforms, and geometry draft sanitizers
+ * for zones, masks, tripwires, and state ROIs.
  *
- * Shared by the settings workspace (which sanitizes every draft before it is stored or saved)
- * and the Zones studio editor (which validates a shape before adding it, so a shape the
- * sanitizer would drop is reported to the operator instead of vanishing silently).
+ * Shared across Live/VOD video stages, the settings workspace, and the Zones studio editor.
  */
 import type { CameraConfig, LineConfig, NinjaConfigResponse, StateRoiConfig } from "../types/nvr";
+
+/**
+ * Keys of the object form of a mask (`privacy_mask: { mode: pixelate, block_size: 8, a: "…" }`)
+ * that carry rendering or filter options instead of polygon coordinates.
+ */
+export const MASK_META_KEYS = [
+  "mode",
+  "style",
+  "pixelate",
+  "block_size",
+  "enabled",
+  "color",
+  "intensity",
+  "blur",
+] as const;
+
+export type MaskMetaKey = (typeof MASK_META_KEYS)[number];
+
+const MASK_META_KEY_SET: ReadonlySet<string> = new Set<string>(MASK_META_KEYS);
+
+function isMaskMetaKey(key: string): boolean {
+  return MASK_META_KEY_SET.has(key);
+}
+
+function isUnsafeObjectKey(key: string): boolean {
+  return key === "__proto__" || key === "constructor" || key === "prototype";
+}
+
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
+}
+
+/**
+ * Returns the option keys of an object-form mask, or `null` when it has none.
+ */
+export function extractMaskMeta(mask: unknown): Record<string, unknown> | null {
+  if (!mask || typeof mask !== "object" || Array.isArray(mask)) return null;
+  const meta: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(mask as Record<string, unknown>)) {
+    if (isUnsafeObjectKey(k)) continue;
+    if (isMaskMetaKey(k) && v !== undefined) {
+      meta[k] = v;
+    }
+  }
+  return Object.keys(meta).length > 0 ? meta : null;
+}
+
+/**
+ * Extracts polygon coordinate strings from any mask union representation:
+ * - `string`
+ * - `Array<string | { coordinates?: string }>`
+ * - `Record<string, unknown>` (skipping `MASK_META_KEYS` and boolean/numeric option fields)
+ */
+export function extractMaskList(mask: unknown): string[] {
+  if (!mask) return [];
+  if (typeof mask === "string") {
+    const trimmed = mask.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  if (Array.isArray(mask)) {
+    const out: string[] = [];
+    for (const item of mask) {
+      if (typeof item === "string") {
+        const trimmed = item.trim();
+        if (trimmed) out.push(trimmed);
+      } else if (
+        item &&
+        typeof item === "object" &&
+        !Array.isArray(item) &&
+        "coordinates" in (item as Record<string, unknown>)
+      ) {
+        const c = (item as { coordinates?: unknown }).coordinates;
+        if (typeof c === "string" && c.trim()) {
+          out.push(c.trim());
+        }
+      }
+    }
+    return out;
+  }
+  if (typeof mask === "object") {
+    const out: string[] = [];
+    for (const [key, val] of Object.entries(mask as Record<string, unknown>)) {
+      if (
+        isUnsafeObjectKey(key) ||
+        isMaskMetaKey(key) ||
+        typeof val === "boolean" ||
+        typeof val === "number"
+      ) {
+        continue;
+      }
+      if (typeof val === "string") {
+        const trimmed = val.trim();
+        if (trimmed) out.push(trimmed);
+      } else if (Array.isArray(val)) {
+        out.push(...extractMaskList(val));
+      } else if (
+        val &&
+        typeof val === "object" &&
+        "coordinates" in (val as Record<string, unknown>)
+      ) {
+        const c = (val as { coordinates?: unknown }).coordinates;
+        if (typeof c === "string" && c.trim()) {
+          out.push(c.trim());
+        }
+      }
+    }
+    return out;
+  }
+  return [];
+}
+
+export const extractMaskPolygons = extractMaskList;
+export const readMaskList = extractMaskList;
+
+/**
+ * Serializes a list of polygon coordinate strings back into a mask value,
+ * preserving any rendering metadata options (`mode`, `style`, `pixelate`, `block_size`, etc.)
+ * from `existingMask` when present.
+ */
+export function writeMaskList(list: string[], existingMask?: unknown): unknown {
+  const meta = extractMaskMeta(existingMask);
+  return meta
+    ? {
+        ...meta,
+        ...Object.fromEntries(list.map((coords, i) => [`mask_${i + 1}`, coords])),
+      }
+    : [...list];
+}
+
+/**
+ * Parses `"x1,y1,x2,y2,..."` (normalized `0..1` or detect-pixel `> 1.5`) into normalized `[x, y]` points.
+ */
+export function parseCoordPoints(
+  coords: string | undefined,
+  detectWidth: number = 1280,
+  detectHeight: number = 720
+): Array<[number, number]> {
+  if (typeof coords !== "string" || !coords.trim()) return [];
+  const safeW =
+    typeof detectWidth === "number" && Number.isFinite(detectWidth) && detectWidth > 1
+      ? detectWidth
+      : 1280;
+  const safeH =
+    typeof detectHeight === "number" && Number.isFinite(detectHeight) && detectHeight > 1
+      ? detectHeight
+      : 720;
+  const nums = coords.split(",").map((s) => {
+    const trimmed = s.trim();
+    return trimmed === "" ? Number.NaN : Number(trimmed);
+  });
+  const finiteNums = nums.filter((n) => Number.isFinite(n));
+  const hasPixelCoord = finiteNums.some((n) => n > 1.5);
+  const hasFractionalNormCoord = finiteNums.some(
+    (n) => n > 0 && n <= 1.5 && !Number.isInteger(n)
+  );
+  const out: Array<[number, number]> = [];
+  for (let i = 0; i + 1 < nums.length; i += 2) {
+    const x = nums[i];
+    const y = nums[i + 1];
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const isPixel =
+      x > 1.5 ||
+      y > 1.5 ||
+      (hasPixelCoord && !hasFractionalNormCoord && Number.isInteger(x) && Number.isInteger(y));
+    const nx = isPixel ? x / safeW : x;
+    const ny = isPixel ? y / safeH : y;
+    out.push([clamp01(nx), clamp01(ny)]);
+  }
+  return out;
+}
+
+/**
+ * Formats normalized `[x, y]` points into a comma-separated coordinate string.
+ */
+export function formatCoordPoints(
+  points: Array<[number, number]>,
+  precision: number = 3
+): string {
+  if (!Array.isArray(points) || points.length === 0) return "";
+  const digits =
+    typeof precision === "number" &&
+    Number.isInteger(precision) &&
+    precision >= 0 &&
+    precision <= 10
+      ? precision
+      : 3;
+  return points
+    .filter(
+      (pt): pt is [number, number] =>
+        Array.isArray(pt) &&
+        pt.length >= 2 &&
+        Number.isFinite(pt[0]) &&
+        Number.isFinite(pt[1])
+    )
+    .map(([x, y]) => `${clamp01(x).toFixed(digits)},${clamp01(y).toFixed(digits)}`)
+    .join(",");
+}
+
+/**
+ * Converts a polygon coordinate string into normalized `{ x, y }` vertices (`0..1`)
+ * for SVG/canvas stage rendering and interactive editing.
+ */
+export function coordStringToNormalizedPoints(
+  coordStr: string,
+  detectWidth: number = 1280,
+  detectHeight: number = 720
+): Array<{ x: number; y: number }> {
+  return parseCoordPoints(coordStr, detectWidth, detectHeight).map(([x, y]) => ({
+    x,
+    y,
+  }));
+}
+
+export function coordStringToPoints(
+  coordStr: string,
+  detectWidth: number = 1280,
+  detectHeight: number = 720
+): Array<[number, number]> {
+  return parseCoordPoints(coordStr, detectWidth, detectHeight);
+}
+
+export function parsePolygonPoints(
+  coordStr: string,
+  detectWidth: number = 1280,
+  detectHeight: number = 720
+): string {
+  return coordStringToNormalizedPoints(coordStr, detectWidth, detectHeight)
+    .map(({ x, y }) => `${Math.round(x * 1000)},${Math.round(y * 1000)}`)
+    .join(" ");
+}
 
 export function normalizeZonePoint(
   pt: [number, number],
@@ -220,7 +450,7 @@ export function sanitizePolygonCoordString(
   if (!isNonDegeneratePolygon(deduped)) {
     return null;
   }
-  return deduped.map(([x, y]) => `${x.toFixed(3)},${y.toFixed(3)}`).join(",");
+  return formatCoordPoints(deduped, 3);
 }
 
 export function sanitizeMaskPolygonsValue(
@@ -228,9 +458,6 @@ export function sanitizeMaskPolygonsValue(
   detectWidth: number = 1280,
   detectHeight: number = 720
 ): { sanitized: unknown; rejectedCount: number } {
-  const isUnsafeObjectKey = (k: string) =>
-    k === "__proto__" || k === "constructor" || k === "prototype";
-
   if (maskVal === null || maskVal === undefined) {
     return { sanitized: maskVal, rejectedCount: 0 };
   }
@@ -309,10 +536,9 @@ export function sanitizeMaskPolygonsValue(
     const objVal = maskVal as Record<string, unknown>;
     const nextObj: Record<string, unknown> = {};
     let rejectedCount = 0;
-    const metaKeys = new Set(["mode", "style", "pixelate", "block_size"]);
     for (const [k, v] of Object.entries(objVal)) {
       if (isUnsafeObjectKey(k)) continue;
-      if (metaKeys.has(k)) {
+      if (isMaskMetaKey(k) || typeof v === "boolean" || typeof v === "number") {
         nextObj[k] = v;
         continue;
       }

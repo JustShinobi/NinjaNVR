@@ -15,6 +15,12 @@ import {
   yoloNormalizedToXyxy,
 } from "../views/settings/VisionAndAiPanels";
 import { buildCleanYamlFromDraft } from "../utils/configYaml";
+import {
+  removeDatasetSampleFromList,
+  shouldRunFallbackAutoAnnotate,
+  upsertDatasetSampleInList,
+  type DatasetSample,
+} from "../utils/datasetStudio";
 import { countChangedSections } from "../utils/settingsUx";
 
 describe("Dataset Studio YOLO Normalization & Readiness Gauges", () => {
@@ -361,5 +367,121 @@ describe("Dataset Studio batch progress, sample ID validation, and YAML prototyp
     );
     expect(yamlOut).not.toContain("function toString");
     expect(countChangedSections({ a: 1 }, { a: 1 })).toBe(0);
+  });
+
+  test("upsertDatasetSampleInList and removeDatasetSampleFromList reconcile samples immutably", () => {
+    const sampleA: DatasetSample = {
+      id: "ds_a",
+      camera: "sala",
+      split: "train",
+      sample_kind: "true_positive",
+      image_path: "/media/dataset/ds_a.webp",
+      width: 1920,
+      height: 1080,
+      annotations: [],
+      verified: false,
+      night_mode: false,
+      created_at: 1000,
+    };
+    const sampleB: DatasetSample = {
+      ...sampleA,
+      id: "ds_b",
+      created_at: 1001,
+    };
+
+    const initial = [sampleA, sampleB];
+
+    // Updating an existing sample replaces it in-place without mutating original array
+    const updatedA: DatasetSample = {
+      ...sampleA,
+      verified: true,
+      verified_by: "manual",
+    };
+    const afterUpdate = upsertDatasetSampleInList(initial, updatedA);
+    expect(afterUpdate.length).toBe(2);
+    expect(afterUpdate[0].verified).toBe(true);
+    expect(afterUpdate[0].verified_by).toBe("manual");
+    expect(initial[0].verified).toBe(false);
+
+    // Upserting a new sample prepends it
+    const sampleC: DatasetSample = {
+      ...sampleA,
+      id: "ds_c",
+      created_at: 1002,
+    };
+    const afterInsert = upsertDatasetSampleInList(afterUpdate, sampleC);
+    expect(afterInsert.map((s) => s.id)).toEqual(["ds_c", "ds_a", "ds_b"]);
+
+    // Removing an existing sample filters it out cleanly
+    const afterRemove = removeDatasetSampleFromList(afterInsert, "ds_a");
+    expect(afterRemove.map((s) => s.id)).toEqual(["ds_c", "ds_b"]);
+
+    // Removing a blank or unknown id leaves the list intact
+    expect(removeDatasetSampleFromList(afterRemove, "").map((s) => s.id)).toEqual([
+      "ds_c",
+      "ds_b",
+    ]);
+  });
+
+  test("shouldRunFallbackAutoAnnotate suppresses duplicate Vision AI calls when server already ran or attempted auto-annotate", () => {
+    // Server already annotated sample during from-event
+    expect(
+      shouldRunFallbackAutoAnnotate(
+        { sample: { sample_kind: "ai_annotated" } },
+        true
+      )
+    ).toBe(false);
+    expect(
+      shouldRunFallbackAutoAnnotate({ sample_kind: "ai_annotated" }, true)
+    ).toBe(false);
+
+    // Server explicitly reported it already attempted auto_annotate (even if it fell back to true_positive)
+    expect(
+      shouldRunFallbackAutoAnnotate(
+        {
+          sample: { sample_kind: "true_positive" },
+          auto_annotate_attempted: true,
+          auto_annotate_error: "Vision AI timeout",
+        },
+        true
+      )
+    ).toBe(false);
+    expect(
+      shouldRunFallbackAutoAnnotate(
+        {
+          sample: { sample_kind: "true_positive" },
+          auto_annotate_error: "No model configured",
+        },
+        true
+      )
+    ).toBe(false);
+
+    // Hard negative samples never run teacher auto-annotation
+    expect(
+      shouldRunFallbackAutoAnnotate(
+        { sample: { sample_kind: "hard_negative" } },
+        true
+      )
+    ).toBe(false);
+
+    // Caller did not request auto_annotate
+    expect(
+      shouldRunFallbackAutoAnnotate(
+        { sample: { sample_kind: "true_positive" } },
+        false
+      )
+    ).toBe(false);
+
+    // Server returned an unannotated true_positive without having attempted auto_annotate
+    expect(
+      shouldRunFallbackAutoAnnotate(
+        {
+          sample: { sample_kind: "true_positive" },
+          auto_annotate_attempted: false,
+          auto_annotate_error: null,
+        },
+        true
+      )
+    ).toBe(true);
   });
 });

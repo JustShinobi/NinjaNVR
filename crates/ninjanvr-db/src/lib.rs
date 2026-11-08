@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -205,6 +205,55 @@ pub struct ExportRow {
     pub video_path: String,
     pub thumb_path: String,
     pub in_progress: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CameraScope {
+    #[default]
+    All,
+    Allowed(Vec<String>),
+}
+
+impl CameraScope {
+    pub fn from_option(allowed: Option<Vec<String>>) -> Self {
+        match allowed {
+            None => Self::All,
+            Some(cams) if cams.iter().any(|c| c.trim() == "*") => Self::All,
+            Some(cams) => Self::Allowed(cams),
+        }
+    }
+
+    pub fn allows(&self, camera: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Allowed(cams) => {
+                let target = camera.trim();
+                !target.is_empty() && cams.iter().any(|c| c.trim() == "*" || c.trim() == target)
+            }
+        }
+    }
+
+    pub fn is_restricted(&self) -> bool {
+        match self {
+            Self::All => false,
+            Self::Allowed(cams) => !cams.iter().any(|c| c.trim() == "*"),
+        }
+    }
+
+    pub fn allowed_cameras(&self) -> Option<Vec<String>> {
+        match self {
+            Self::All => None,
+            Self::Allowed(cams) if cams.iter().any(|c| c.trim() == "*") => None,
+            Self::Allowed(cams) => Some(
+                cams.iter()
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+                    .take(MAX_SQL_FILTER_ITEMS)
+                    .map(String::from)
+                    .collect(),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2049,12 +2098,54 @@ impl NinjaDatabase {
     }
 
     pub fn delete_reviews(&self, ids: &[String]) -> Result<usize> {
+        let (count, _) = self
+            .delete_reviews_scoped(ids, &CameraScope::All)?
+            .unwrap_or((0, Vec::new()));
+        Ok(count as usize)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn delete_reviews_scoped(
+        &self,
+        ids: &[String],
+        scope: &CameraScope,
+    ) -> Result<Result<(u64, Vec<Option<String>>), String>> {
         if ids.is_empty() {
-            return Ok(0);
+            return Ok(Ok((0, Vec::new())));
         }
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
-        let mut count = 0;
+        let mut existing_thumbs: HashMap<String, Option<String>> =
+            HashMap::with_capacity(ids.len());
+        {
+            let mut sel_stmt =
+                tx.prepare("SELECT camera, thumb_path FROM reviewsegment WHERE id = ?1")?;
+            for id in ids {
+                let row: Option<(String, Option<String>)> = sel_stmt
+                    .query_row(params![id], |r| {
+                        let cam: String = r.get(0)?;
+                        let thumb: Option<String> = r
+                            .get::<_, Option<String>>(1)
+                            .ok()
+                            .flatten()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        Ok((cam, thumb))
+                    })
+                    .optional()?;
+                if let Some((cam, thumb_opt)) = row {
+                    if !scope.allows(&cam) {
+                        return Ok(Err(cam));
+                    }
+                    existing_thumbs.insert(id.clone(), thumb_opt);
+                } else if scope.is_restricted() {
+                    return Ok(Err(id.clone()));
+                }
+            }
+        }
+
+        let mut deleted_count: u64 = 0;
+        let mut thumbs: Vec<Option<String>> = Vec::with_capacity(ids.len());
         {
             let mut del_status =
                 tx.prepare("DELETE FROM userreviewstatus WHERE review_segment_id = ?1")?;
@@ -2064,14 +2155,15 @@ impl NinjaDatabase {
             for id in ids {
                 del_status.execute(params![id])?;
                 let removed = del_seg.execute(params![id])?;
+                rev_share.execute(params![id])?;
                 if removed > 0 {
-                    rev_share.execute(params![id])?;
+                    deleted_count += removed as u64;
+                    thumbs.push(existing_thumbs.remove(id).flatten());
                 }
-                count += removed;
             }
         }
         tx.commit()?;
-        Ok(count)
+        Ok(Ok((deleted_count, thumbs)))
     }
 
     pub fn insert_review_segment(&self, item: &ReviewItemDto) -> Result<()> {
@@ -2380,40 +2472,158 @@ impl NinjaDatabase {
     }
 
     pub fn query_events_explore(&self, limit_per_label: usize) -> Result<Vec<Value>> {
-        let conn = self.lock_conn();
-        let mut stmt = conn.prepare(
-            "SELECT label, COUNT(*) as cnt FROM event GROUP BY label ORDER BY cnt DESC LIMIT 100",
-        )?;
-        let label_counts: Vec<(String, i64)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(stmt);
-        drop(conn);
+        self.query_events_explore_scoped(limit_per_label as i64, &CameraScope::All)
+    }
 
-        let per_label = limit_per_label.clamp(1, 100);
-        let mut out = Vec::new();
-        for (label, count) in label_counts {
-            let events = self.query_events(&EventFilter {
-                labels: Some(vec![label]),
-                limit: Some(per_label),
-                ..Default::default()
-            })?;
-            for mut ev in events {
-                if let Some(obj) = ev.as_object_mut() {
-                    obj.insert("event_count".to_string(), json!(count));
-                }
-                out.push(ev);
+    pub fn query_events_explore_scoped(
+        &self,
+        per_label_limit: i64,
+        scope: &CameraScope,
+    ) -> Result<Vec<Value>> {
+        let per_label = per_label_limit.clamp(1, 100);
+        let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
+        let where_clause = if let Some(cams) = scope.allowed_cameras() {
+            if cams.is_empty() {
+                return Ok(Vec::new());
             }
+            let mut placeholders = Vec::with_capacity(cams.len());
+            for cam in cams {
+                bind_vals.push(rusqlite::types::Value::Text(cam));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            format!("WHERE camera IN ({})", placeholders.join(","))
+        } else {
+            String::new()
+        };
+        bind_vals.push(rusqlite::types::Value::Integer(per_label));
+        let limit_param = bind_vals.len();
+
+        let sql = format!(
+            r#"
+            WITH scoped_events AS (
+                SELECT
+                    id, camera, label, zones, start_time, end_time,
+                    has_clip, has_snapshot, plus_id, retain_indefinitely,
+                    sub_label, top_score, false_positive, box, data, thumbnail, sub_label_score
+                FROM event
+                {where_clause}
+            ),
+            top_labels AS (
+                SELECT label, COUNT(*) AS label_cnt
+                FROM scoped_events
+                GROUP BY label
+                ORDER BY label_cnt DESC, label ASC
+                LIMIT 100
+            ),
+            ranked AS (
+                SELECT
+                    se.id, se.camera, se.label, se.zones, se.start_time, se.end_time,
+                    se.has_clip, se.has_snapshot, se.plus_id, se.retain_indefinitely,
+                    se.sub_label, se.top_score, se.false_positive, se.box, se.data,
+                    se.thumbnail, se.sub_label_score,
+                    tl.label_cnt,
+                    ROW_NUMBER() OVER (PARTITION BY se.label ORDER BY se.start_time DESC) AS rn
+                FROM scoped_events se
+                INNER JOIN top_labels tl ON tl.label = se.label
+            )
+            SELECT
+                id, camera, label, zones, start_time, end_time,
+                has_clip, has_snapshot, plus_id, retain_indefinitely,
+                sub_label, top_score, false_positive, box, data, thumbnail, sub_label_score,
+                label_cnt
+            FROM ranked
+            WHERE rn <= ?{limit_param}
+            ORDER BY label_cnt DESC, label ASC, start_time DESC
+            "#
+        );
+
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |row| {
+            let start_time = value_to_f64(&row.get_ref(4)?).unwrap_or(0.0);
+            let end_time = value_to_f64(&row.get_ref(5)?);
+            let zones_raw: Option<String> = row.get(3).ok();
+            let box_raw: Option<String> = row.get(13).ok();
+            let data_raw: Option<String> = row.get(14).ok();
+            let mut data_json = parse_json_or(data_raw, json!({}));
+            let sub_label_col: Option<String> = row.get::<_, Option<String>>(10).ok().flatten();
+            let sub_label_score_col: Option<f64> = row
+                .get::<_, Option<f64>>(16)
+                .ok()
+                .flatten()
+                .or_else(|| data_json.get("sub_label_score").and_then(|v| v.as_f64()))
+                .filter(|v| v.is_finite());
+            if let Some(sc) = sub_label_score_col
+                && let Some(obj) = data_json.as_object_mut()
+            {
+                obj.entry("sub_label_score".to_string())
+                    .or_insert_with(|| json!(sc));
+            }
+            let is_stationary = data_json["provenance"]["stationary"]
+                .as_bool()
+                .or_else(|| data_json["stationary"].as_bool())
+                .unwrap_or(false);
+            let event_count: i64 = row.get(17).unwrap_or(0);
+
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "camera": row.get::<_, String>(1)?,
+                "label": row.get::<_, String>(2)?,
+                "zones": parse_json_or(zones_raw, json!([])),
+                "start_time": start_time,
+                "end_time": end_time,
+                "has_clip": row.get::<_, i64>(6).unwrap_or(0) != 0,
+                "has_snapshot": row.get::<_, i64>(7).unwrap_or(0) != 0,
+                "plus_id": row.get::<_, Option<String>>(8).ok().flatten(),
+                "retain_indefinitely": row.get::<_, i64>(9).unwrap_or(0) != 0,
+                "sub_label": sub_label_col,
+                "sub_label_score": sub_label_score_col,
+                "top_score": row.get::<_, Option<f64>>(11).ok().flatten().filter(|v| v.is_finite()),
+                "false_positive": row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v != 0),
+                "box": parse_json_or(box_raw, Value::Null),
+                "stationary": is_stationary,
+                "data": data_json,
+                "thumbnail": row.get::<_, Option<String>>(15).ok().flatten(),
+                "event_count": event_count
+            }))
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
         }
         Ok(out)
     }
 
     pub fn query_events_summary(&self) -> Result<Vec<Value>> {
+        self.query_events_summary_rows(&CameraScope::All)
+    }
+
+    pub fn query_events_summary_scoped(&self, scope: &CameraScope) -> Result<Value> {
+        Ok(Value::Array(self.query_events_summary_rows(scope)?))
+    }
+
+    fn query_events_summary_rows(&self, scope: &CameraScope) -> Result<Vec<Value>> {
+        let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
+        let where_clause = if let Some(cams) = scope.allowed_cameras() {
+            if cams.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut placeholders = Vec::with_capacity(cams.len());
+            for cam in cams {
+                bind_vals.push(rusqlite::types::Value::Text(cam));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            format!("WHERE camera IN ({})", placeholders.join(","))
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "SELECT camera, label, sub_label, zones, start_time FROM event {where_clause} ORDER BY start_time DESC LIMIT 5000"
+        );
         let conn = self.lock_conn();
-        let mut stmt = conn.prepare(
-            "SELECT camera, label, sub_label, zones, start_time FROM event ORDER BY start_time DESC LIMIT 5000",
-        )?;
-        let rows = stmt.query_map([], |r| {
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), |r| {
             let cam: String = r.get(0)?;
             let label: String = r.get(1)?;
             let sub: Option<String> = r.get(2).ok().flatten();
@@ -2933,31 +3143,56 @@ impl NinjaDatabase {
     }
 
     pub fn list_false_positive_signatures(&self, camera: Option<&str>) -> Result<Vec<Value>> {
-        let conn = self.lock_conn();
-        let filter_cam = camera.filter(|c| !c.is_empty() && *c != "all");
-        let sql = if filter_cam.is_some() {
-            r#"
-            SELECT
-                id, camera, label, norm_x1, norm_y1, norm_x2, norm_y2,
-                dhash64, dominant_color, hit_count, source_event_id,
-                reason, created_at, last_seen_at
-            FROM false_positive_signature
-            WHERE camera = ?1
-            ORDER BY last_seen_at DESC, id DESC
-            LIMIT 5000
-            "#
+        self.list_false_positive_signatures_scoped(camera, &CameraScope::All)
+    }
+
+    pub fn list_false_positive_signatures_scoped(
+        &self,
+        camera: Option<&str>,
+        scope: &CameraScope,
+    ) -> Result<Vec<Value>> {
+        let filter_cam = camera
+            .map(str::trim)
+            .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("all") && *c != "*");
+        if let Some(cam) = filter_cam
+            && !scope.allows(cam)
+        {
+            return Ok(Vec::new());
+        }
+
+        let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
+        let where_clause = if let Some(cam) = filter_cam {
+            bind_vals.push(rusqlite::types::Value::Text(cam.to_string()));
+            String::from("WHERE camera = ?1")
+        } else if let Some(cams) = scope.allowed_cameras() {
+            if cams.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut placeholders = Vec::with_capacity(cams.len());
+            for cam in cams {
+                bind_vals.push(rusqlite::types::Value::Text(cam));
+                placeholders.push(format!("?{}", bind_vals.len()));
+            }
+            format!("WHERE camera IN ({})", placeholders.join(","))
         } else {
+            String::new()
+        };
+
+        let sql = format!(
             r#"
             SELECT
                 id, camera, label, norm_x1, norm_y1, norm_x2, norm_y2,
                 dhash64, dominant_color, hit_count, source_event_id,
                 reason, created_at, last_seen_at
             FROM false_positive_signature
+            {where_clause}
             ORDER BY last_seen_at DESC, id DESC
             LIMIT 5000
             "#
-        };
-        let mut stmt = conn.prepare(sql)?;
+        );
+
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(&sql)?;
         let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
             let nx1 = value_to_f64(&r.get_ref(3)?).unwrap_or(0.0);
             let ny1 = value_to_f64(&r.get_ref(4)?).unwrap_or(0.0);
@@ -2982,32 +3217,46 @@ impl NinjaDatabase {
                 "last_seen_at": value_to_f64(&r.get_ref(13)?).unwrap_or(0.0),
             }))
         };
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_vals.iter()), map_row)?;
         let mut out = Vec::new();
-        if let Some(cam) = filter_cam {
-            let rows = stmt.query_map(params![cam], map_row)?;
-            for r in rows {
-                out.push(r?);
-            }
-        } else {
-            let rows = stmt.query_map([], map_row)?;
-            for r in rows {
-                out.push(r?);
-            }
+        for r in rows {
+            out.push(r?);
         }
         Ok(out)
     }
 
     pub fn delete_false_positive_signature(&self, id: i64) -> Result<usize> {
+        match self.delete_false_positive_signature_scoped(id, &CameraScope::All)? {
+            Some(true) => Ok(1),
+            _ => Ok(0),
+        }
+    }
+
+    pub fn delete_false_positive_signature_scoped(
+        &self,
+        id: i64,
+        scope: &CameraScope,
+    ) -> Result<Option<bool>> {
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
-        let src_ev: Option<String> = tx
+        let row: Option<(String, Option<String>)> = tx
             .query_row(
-                "SELECT source_event_id FROM false_positive_signature WHERE id = ?1",
+                "SELECT camera, source_event_id FROM false_positive_signature WHERE id = ?1",
                 params![id],
-                |r| Ok(r.get::<_, Option<String>>(0).ok().flatten()),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1).ok().flatten(),
+                    ))
+                },
             )
-            .optional()?
-            .flatten();
+            .optional()?;
+        let Some((camera, src_ev)) = row else {
+            return Ok(Some(false));
+        };
+        if !scope.allows(&camera) {
+            return Ok(None);
+        }
         let deleted = tx.execute(
             "DELETE FROM false_positive_signature WHERE id = ?1",
             params![id],
@@ -3019,7 +3268,7 @@ impl NinjaDatabase {
             )?;
         }
         tx.commit()?;
-        Ok(deleted)
+        Ok(Some(deleted > 0))
     }
 
     pub fn set_event_sub_label(&self, id: &str, sub_label: Option<&str>) -> Result<usize> {
@@ -3609,26 +3858,79 @@ impl NinjaDatabase {
     }
 
     pub fn delete_events_bulk(&self, ids: &[String]) -> Result<usize> {
+        let deleted = self
+            .delete_events_bulk_scoped(ids, &CameraScope::All)?
+            .unwrap_or_default();
+        Ok(deleted.len())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn delete_events_bulk_scoped(
+        &self,
+        ids: &[String],
+        scope: &CameraScope,
+    ) -> Result<Result<Vec<(String, String, Option<String>)>, String>> {
         if ids.is_empty() {
-            return Ok(0);
+            return Ok(Ok(Vec::new()));
         }
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
-        let mut count = 0;
+        let mut existing: HashMap<String, (String, Option<String>)> =
+            HashMap::with_capacity(ids.len());
         {
-            let mut stmt = tx.prepare("DELETE FROM event WHERE id = ?1")?;
+            let mut sel_stmt =
+                tx.prepare("SELECT camera, thumbnail, data FROM event WHERE id = ?1")?;
+            for id in ids {
+                let row: Option<(String, Option<String>, Option<String>)> = sel_stmt
+                    .query_row(params![id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1).ok().flatten(),
+                            r.get::<_, Option<String>>(2).ok().flatten(),
+                        ))
+                    })
+                    .optional()?;
+                if let Some((cam, thumb_col, data_raw)) = row {
+                    if !scope.allows(&cam) {
+                        return Ok(Err(cam));
+                    }
+                    let data_json = parse_json_or(data_raw, json!({}));
+                    let thumb_path = data_json["thumb_path"]
+                        .as_str()
+                        .or_else(|| data_json["thumbnail_path"].as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .or_else(|| {
+                            thumb_col
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        });
+                    existing.insert(id.clone(), (cam, thumb_path));
+                } else if scope.is_restricted() {
+                    return Ok(Err(id.clone()));
+                }
+            }
+        }
+
+        let mut deleted_items: Vec<(String, String, Option<String>)> =
+            Vec::with_capacity(existing.len());
+        {
+            let mut del_stmt = tx.prepare("DELETE FROM event WHERE id = ?1")?;
             let mut rev_share =
                 tx.prepare("UPDATE share_link SET revoked = 1 WHERE target_id = ?1")?;
             for id in ids {
-                let removed = stmt.execute(params![id])?;
-                if removed > 0 {
-                    rev_share.execute(params![id])?;
+                let removed = del_stmt.execute(params![id])?;
+                rev_share.execute(params![id])?;
+                if removed > 0
+                    && let Some((cam, thumb_path)) = existing.remove(id)
+                {
+                    deleted_items.push((id.clone(), cam, thumb_path));
                 }
-                count += removed;
             }
         }
         tx.commit()?;
-        Ok(count)
+        Ok(Ok(deleted_items))
     }
 
     pub fn query_recordings(
@@ -5239,18 +5541,107 @@ impl NinjaDatabase {
         Ok(val)
     }
 
+    fn push_expired_review_artifact_paths(
+        media_dir: &Path,
+        id: &str,
+        files_to_remove: &mut Vec<String>,
+    ) {
+        let exports_dir = media_dir.join("exports");
+        let clips_dir = media_dir.join("clips");
+        files_to_remove.push(
+            exports_dir
+                .join(format!("share_redacted_{id}.mp4"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        files_to_remove.push(
+            exports_dir
+                .join(format!(".share_redacted_{id}.mask_hash"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        files_to_remove.push(
+            exports_dir
+                .join(format!("share_clip_{id}.mp4"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        files_to_remove.push(
+            clips_dir
+                .join(format!("share_redacted_{id}.webp"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        files_to_remove.push(
+            clips_dir
+                .join(format!("share_clip_{id}.webp"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+
+    fn push_expired_event_artifact_paths(
+        media_dir: &Path,
+        camera: &str,
+        safe_camera: bool,
+        id: &str,
+        files_to_remove: &mut Vec<String>,
+    ) {
+        let clips_dir = media_dir.join("clips");
+        files_to_remove.push(
+            clips_dir
+                .join(format!("{id}.jpg"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        if safe_camera {
+            files_to_remove.push(
+                clips_dir
+                    .join(format!("{camera}-{id}.webp"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            files_to_remove.push(
+                clips_dir
+                    .join(format!("{camera}-{id}-clean.webp"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        Self::push_expired_review_artifact_paths(media_dir, id, files_to_remove);
+    }
+
     pub fn cleanup_expired_events_and_reviews(
         &self,
         camera: &str,
         alerts_before_ts: f64,
         detections_before_ts: f64,
     ) -> Result<Vec<String>> {
+        let (_ev_deleted, _rev_deleted, files_to_remove) = self
+            .cleanup_camera_expired_events_and_reviews_in_dir(
+                Path::new("/media/ninjanvr"),
+                camera,
+                alerts_before_ts,
+                detections_before_ts,
+            )?;
+        Ok(files_to_remove)
+    }
+
+    pub fn cleanup_camera_expired_events_and_reviews_in_dir(
+        &self,
+        media_dir: &Path,
+        camera: &str,
+        alerts_before_ts: f64,
+        detections_before_ts: f64,
+    ) -> Result<(u64, u64, Vec<String>)> {
         if !alerts_before_ts.is_finite() || !detections_before_ts.is_finite() {
-            return Ok(Vec::new());
+            return Ok((0, 0, Vec::new()));
         }
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         let mut files_to_remove = Vec::new();
+        let mut deleted_events: u64 = 0;
+        let mut deleted_reviews: u64 = 0;
         let is_safe_id = |id: &str| -> bool {
             !id.is_empty()
                 && !id.contains("..")
@@ -5294,20 +5685,14 @@ impl NinjaDatabase {
                     "DELETE FROM userreviewstatus WHERE review_segment_id = ?1",
                     params![id],
                 )?;
-                tx.execute("DELETE FROM reviewsegment WHERE id = ?1", params![id])?;
+                let removed = tx.execute("DELETE FROM reviewsegment WHERE id = ?1", params![id])?;
+                deleted_reviews += removed as u64;
                 tx.execute(
                     "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
                     params![id],
                 )?;
                 if is_safe_id(&id) {
-                    files_to_remove
-                        .push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
-                    files_to_remove.push(format!(
-                        "/media/ninjanvr/exports/.share_redacted_{id}.mask_hash"
-                    ));
-                    files_to_remove.push(format!("/media/ninjanvr/exports/share_clip_{id}.mp4"));
-                    files_to_remove.push(format!("/media/ninjanvr/clips/share_redacted_{id}.webp"));
-                    files_to_remove.push(format!("/media/ninjanvr/clips/share_clip_{id}.webp"));
+                    Self::push_expired_review_artifact_paths(media_dir, &id, &mut files_to_remove);
                 }
             }
         }
@@ -5338,26 +5723,20 @@ impl NinjaDatabase {
             drop(stmt);
             for id in ids {
                 if is_safe_id(&id) {
-                    files_to_remove.push(format!("/media/ninjanvr/clips/{id}.jpg"));
-                    if safe_camera {
-                        files_to_remove.push(format!("/media/ninjanvr/clips/{camera}-{id}.webp"));
-                        files_to_remove
-                            .push(format!("/media/ninjanvr/clips/{camera}-{id}-clean.webp"));
-                    }
-                    files_to_remove
-                        .push(format!("/media/ninjanvr/exports/share_redacted_{id}.mp4"));
-                    files_to_remove.push(format!(
-                        "/media/ninjanvr/exports/.share_redacted_{id}.mask_hash"
-                    ));
-                    files_to_remove.push(format!("/media/ninjanvr/exports/share_clip_{id}.mp4"));
-                    files_to_remove.push(format!("/media/ninjanvr/clips/share_redacted_{id}.webp"));
-                    files_to_remove.push(format!("/media/ninjanvr/clips/share_clip_{id}.webp"));
+                    Self::push_expired_event_artifact_paths(
+                        media_dir,
+                        camera,
+                        safe_camera,
+                        &id,
+                        &mut files_to_remove,
+                    );
                 }
                 tx.execute(
                     "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
                     params![id],
                 )?;
-                tx.execute("DELETE FROM event WHERE id = ?1", params![id])?;
+                let removed = tx.execute("DELETE FROM event WHERE id = ?1", params![id])?;
+                deleted_events += removed as u64;
             }
         }
 
@@ -5388,7 +5767,179 @@ impl NinjaDatabase {
         }
 
         tx.commit()?;
-        Ok(files_to_remove)
+        Ok((deleted_events, deleted_reviews, files_to_remove))
+    }
+
+    pub fn cleanup_expired_events_and_reviews_in_dir(
+        &self,
+        media_dir: &Path,
+        default_event_days: f64,
+        per_camera_event_days: &HashMap<String, f64>,
+        review_days: f64,
+    ) -> Result<(u64, u64, Vec<String>)> {
+        if !default_event_days.is_finite()
+            || !review_days.is_finite()
+            || default_event_days < 0.0
+            || review_days < 0.0
+        {
+            return Ok((0, 0, Vec::new()));
+        }
+        let now = Utc::now().timestamp_millis() as f64 / 1000.0;
+        let review_cutoff = now - review_days * 86_400.0;
+
+        let cameras: Vec<String> = {
+            let conn = self.lock_conn();
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT DISTINCT camera FROM event
+                UNION
+                SELECT DISTINCT camera FROM reviewsegment
+                UNION
+                SELECT DISTINCT camera FROM timeline
+                UNION
+                SELECT DISTINCT camera FROM previews
+                "#,
+            )?;
+            let mut set: std::collections::BTreeSet<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            for cam in per_camera_event_days.keys() {
+                set.insert(cam.clone());
+            }
+            set.into_iter().collect()
+        };
+
+        let mut total_deleted_events: u64 = 0;
+        let mut total_deleted_reviews: u64 = 0;
+        let mut all_files: Vec<String> = Vec::new();
+        let is_safe_id = |id: &str| -> bool {
+            !id.is_empty()
+                && !id.contains("..")
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        };
+        let is_safe_path = |p: &str| -> bool { !p.is_empty() && !p.contains("..") };
+
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+
+        for camera in &cameras {
+            let ev_days = per_camera_event_days
+                .get(camera)
+                .copied()
+                .filter(|d| d.is_finite() && *d >= 0.0)
+                .unwrap_or(default_event_days);
+            let event_cutoff = now - ev_days * 86_400.0;
+            let min_cutoff = event_cutoff.min(review_cutoff);
+            let safe_camera = is_safe_id(camera);
+
+            // 1. Expired review segments for this camera
+            {
+                let mut stmt = tx.prepare(
+                    r#"
+                    SELECT id, thumb_path
+                    FROM reviewsegment
+                    WHERE camera = ?1
+                      AND COALESCE(end_time, start_time) < ?2
+                    LIMIT 500
+                    "#,
+                )?;
+                let rows = stmt.query_map(params![camera, review_cutoff], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                let mut ids = Vec::new();
+                for r in rows {
+                    let (id, thumb) = r?;
+                    ids.push(id);
+                    if is_safe_path(&thumb) {
+                        all_files.push(thumb);
+                    }
+                }
+                drop(stmt);
+                for id in ids {
+                    tx.execute(
+                        "DELETE FROM userreviewstatus WHERE review_segment_id = ?1",
+                        params![id],
+                    )?;
+                    let removed =
+                        tx.execute("DELETE FROM reviewsegment WHERE id = ?1", params![id])?;
+                    total_deleted_reviews += removed as u64;
+                    tx.execute(
+                        "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
+                        params![id],
+                    )?;
+                    if is_safe_id(&id) {
+                        Self::push_expired_review_artifact_paths(media_dir, &id, &mut all_files);
+                    }
+                }
+            }
+
+            // 2. Expired events for this camera (excluding retain_indefinitely = 1)
+            {
+                let mut stmt = tx.prepare(
+                    r#"
+                    SELECT id
+                    FROM event
+                    WHERE camera = ?1
+                      AND COALESCE(retain_indefinitely, 0) = 0
+                      AND COALESCE(end_time, start_time) < ?2
+                    LIMIT 500
+                    "#,
+                )?;
+                let ids: Vec<String> = stmt
+                    .query_map(params![camera, event_cutoff], |r| r.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for id in ids {
+                    if is_safe_id(&id) {
+                        Self::push_expired_event_artifact_paths(
+                            media_dir,
+                            camera,
+                            safe_camera,
+                            &id,
+                            &mut all_files,
+                        );
+                    }
+                    tx.execute(
+                        "UPDATE share_link SET revoked = 1 WHERE target_id = ?1",
+                        params![id],
+                    )?;
+                    let removed = tx.execute("DELETE FROM event WHERE id = ?1", params![id])?;
+                    total_deleted_events += removed as u64;
+                }
+            }
+
+            // 3. Expired timeline & previews for this camera
+            tx.execute(
+                "DELETE FROM timeline WHERE camera = ?1 AND timestamp < ?2",
+                params![camera, min_cutoff],
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT id, path FROM previews WHERE camera = ?1 AND end_time < ?2 LIMIT 200",
+                )?;
+                let rows = stmt.query_map(params![camera, min_cutoff], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                let mut pids = Vec::new();
+                for r in rows {
+                    let (pid, ppath) = r?;
+                    pids.push(pid);
+                    if is_safe_path(&ppath) {
+                        all_files.push(ppath);
+                    }
+                }
+                drop(stmt);
+                for pid in pids {
+                    tx.execute("DELETE FROM previews WHERE id = ?1", params![pid])?;
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok((total_deleted_events, total_deleted_reviews, all_files))
     }
 
     pub fn upsert_dataset_sample(&self, sample: &DatasetSampleDto) -> Result<DatasetSampleDto> {
@@ -11047,6 +11598,261 @@ mod tests {
         for s in ["äö", "a€b", "🔥", "  josé  ", "  EXT:josé  "] {
             assert!(db.revoke_share_links_by_creator(s).is_ok());
         }
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn camera_scope_queries_bulk_deletes_and_custom_media_dir_cleanup_work() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ninjanvr_camera_scope_test_{}_{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let db_path = tmp_dir.join("scope.db");
+        let custom_media_dir = tmp_dir.join("custom_media");
+        let db = NinjaDatabase::open(&db_path).unwrap();
+
+        // 1. CameraScope helper semantics
+        assert_eq!(CameraScope::from_option(None), CameraScope::All);
+        assert_eq!(
+            CameraScope::from_option(Some(vec!["*".to_string()])),
+            CameraScope::All
+        );
+        let front_only = CameraScope::from_option(Some(vec!["front_door".to_string()]));
+        assert!(front_only.is_restricted());
+        assert!(front_only.allows("front_door"));
+        assert!(!front_only.allows("backyard"));
+        assert!(!CameraScope::All.is_restricted());
+        assert!(CameraScope::All.allows("backyard"));
+        let empty_scope = CameraScope::Allowed(Vec::new());
+        assert!(empty_scope.is_restricted());
+        assert!(!empty_scope.allows("front_door"));
+
+        // 2. Seed events across "front_door" and "backyard"
+        for (id, cam, label, start_ts, thumb) in [
+            (
+                "ev_fd_1",
+                "front_door",
+                "person",
+                1000.0,
+                Some("/media/ninjanvr/clips/ev_fd_1.webp"),
+            ),
+            ("ev_fd_2", "front_door", "person", 1010.0, None),
+            (
+                "ev_by_1",
+                "backyard",
+                "car",
+                1020.0,
+                Some("/media/ninjanvr/clips/ev_by_1.webp"),
+            ),
+            ("ev_by_2", "backyard", "person", 1030.0, None),
+        ] {
+            db.upsert_event(&EventDto {
+                id: id.to_string(),
+                camera: cam.to_string(),
+                label: label.to_string(),
+                zones: json!(["driveway"]),
+                start_time: start_ts,
+                end_time: Some(start_ts + 5.0),
+                has_clip: true,
+                has_snapshot: true,
+                plus_id: None,
+                retain_indefinitely: false,
+                sub_label: None,
+                top_score: Some(0.92),
+                false_positive: Some(false),
+                box_coords: Some(json!([0.1, 0.2, 0.3, 0.4])),
+                data: json!({
+                    "max_severity": "alert",
+                    "thumb_path": thumb
+                }),
+                thumbnail: thumb.map(String::from),
+                area: None,
+                ratio: None,
+                score: Some(0.92),
+                stationary: false,
+            })
+            .unwrap();
+        }
+
+        // 3. query_events_explore_scoped & query_events_summary_scoped
+        let all_explore = db
+            .query_events_explore_scoped(1, &CameraScope::All)
+            .unwrap();
+        assert_eq!(all_explore.len(), 2);
+        let all_person = all_explore.iter().find(|e| e["label"] == "person").unwrap();
+        assert_eq!(all_person["event_count"], 3);
+
+        let scoped_explore = db.query_events_explore_scoped(5, &front_only).unwrap();
+        assert_eq!(scoped_explore.len(), 2);
+        assert!(scoped_explore.iter().all(|e| e["camera"] == "front_door"));
+        assert!(scoped_explore.iter().all(|e| e["event_count"] == 2));
+        assert!(
+            db.query_events_explore_scoped(5, &empty_scope)
+                .unwrap()
+                .is_empty()
+        );
+
+        let scoped_summary = db.query_events_summary_scoped(&front_only).unwrap();
+        let summary_arr = scoped_summary.as_array().unwrap();
+        assert_eq!(summary_arr.len(), 1);
+        assert_eq!(summary_arr[0]["camera"], "front_door");
+        assert_eq!(summary_arr[0]["count"], 2);
+
+        // 4. list_false_positive_signatures_scoped & delete_false_positive_signature_scoped
+        db.set_event_false_positive("ev_fd_1", true).unwrap();
+        db.set_event_false_positive("ev_by_1", true).unwrap();
+
+        let fd_sigs = db
+            .list_false_positive_signatures_scoped(None, &front_only)
+            .unwrap();
+        assert_eq!(fd_sigs.len(), 1);
+        assert_eq!(fd_sigs[0]["camera"], "front_door");
+        let fd_sig_id = fd_sigs[0]["id"].as_i64().unwrap();
+
+        let all_sigs = db
+            .list_false_positive_signatures_scoped(None, &CameraScope::All)
+            .unwrap();
+        assert_eq!(all_sigs.len(), 2);
+        let by_sig_id = all_sigs.iter().find(|s| s["camera"] == "backyard").unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        // Forbidden camera returns Ok(None) without deleting
+        assert_eq!(
+            db.delete_false_positive_signature_scoped(by_sig_id, &front_only)
+                .unwrap(),
+            None
+        );
+        // Non-existent signature returns Ok(Some(false))
+        assert_eq!(
+            db.delete_false_positive_signature_scoped(999_999, &front_only)
+                .unwrap(),
+            Some(false)
+        );
+        // Permitted signature returns Ok(Some(true)) and resets event.false_positive
+        assert_eq!(
+            db.delete_false_positive_signature_scoped(fd_sig_id, &front_only)
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            db.get_event("ev_fd_1").unwrap().unwrap()["false_positive"],
+            false
+        );
+
+        // 5. delete_reviews_scoped (atomicity on forbidden camera, thumb_path collection, share_link revocation)
+        for (id, cam, thumb) in [
+            ("rev_fd_1", "front_door", "/clips/rev_fd_1.webp"),
+            ("rev_by_1", "backyard", "/clips/rev_by_1.webp"),
+        ] {
+            db.insert_review_segment(&ReviewItemDto {
+                id: id.to_string(),
+                camera: cam.to_string(),
+                start_time: 1000.0,
+                end_time: Some(1010.0),
+                severity: "alert".to_string(),
+                thumb_path: thumb.to_string(),
+                data: json!({}),
+                has_been_reviewed: false,
+            })
+            .unwrap();
+            db.insert_share_link(
+                &format!("sl_{id}"),
+                "review",
+                id,
+                Some(cam),
+                "admin",
+                1000.0,
+                5000.0,
+            )
+            .unwrap();
+        }
+
+        // Mixed allowed + forbidden review batch must reject with Err("backyard") and leave rev_fd_1 intact
+        let forbidden_rev_res = db
+            .delete_reviews_scoped(
+                &["rev_fd_1".to_string(), "rev_by_1".to_string()],
+                &front_only,
+            )
+            .unwrap();
+        assert_eq!(forbidden_rev_res, Err("backyard".to_string()));
+        assert!(db.get_review_by_id("rev_fd_1").unwrap().is_some());
+        assert!(!db.is_share_link_revoked("sl_rev_fd_1").unwrap());
+
+        // Allowed review batch deletes, returns thumb_path, and revokes share_link
+        let ok_rev_res = db
+            .delete_reviews_scoped(&["rev_fd_1".to_string()], &front_only)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok_rev_res.0, 1);
+        assert_eq!(ok_rev_res.1, vec![Some("/clips/rev_fd_1.webp".to_string())]);
+        assert!(db.get_review_by_id("rev_fd_1").unwrap().is_none());
+        assert!(db.is_share_link_revoked("sl_rev_fd_1").unwrap());
+
+        // 6. delete_events_bulk_scoped (atomicity on forbidden camera, metadata collection, share_link revocation)
+        db.insert_share_link(
+            "sl_ev_fd_1",
+            "event",
+            "ev_fd_1",
+            Some("front_door"),
+            "admin",
+            1000.0,
+            5000.0,
+        )
+        .unwrap();
+        let forbidden_ev_res = db
+            .delete_events_bulk_scoped(&["ev_fd_1".to_string(), "ev_by_1".to_string()], &front_only)
+            .unwrap();
+        assert_eq!(forbidden_ev_res, Err("backyard".to_string()));
+        assert!(db.get_event("ev_fd_1").unwrap().is_some());
+        assert!(!db.is_share_link_revoked("sl_ev_fd_1").unwrap());
+
+        let ok_ev_res = db
+            .delete_events_bulk_scoped(&["ev_fd_1".to_string(), "ev_fd_2".to_string()], &front_only)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ok_ev_res,
+            vec![
+                (
+                    "ev_fd_1".to_string(),
+                    "front_door".to_string(),
+                    Some("/media/ninjanvr/clips/ev_fd_1.webp".to_string())
+                ),
+                ("ev_fd_2".to_string(), "front_door".to_string(), None),
+            ]
+        );
+        assert!(db.get_event("ev_fd_1").unwrap().is_none());
+        assert!(db.get_event("ev_fd_2").unwrap().is_none());
+        assert!(db.is_share_link_revoked("sl_ev_fd_1").unwrap());
+
+        // 7. cleanup_expired_events_and_reviews_in_dir roots derived paths at custom_media_dir
+        let mut per_cam_days = HashMap::new();
+        per_cam_days.insert("backyard".to_string(), 7.0);
+        let (ev_deleted, rev_deleted, files) = db
+            .cleanup_expired_events_and_reviews_in_dir(&custom_media_dir, 14.0, &per_cam_days, 7.0)
+            .unwrap();
+        assert_eq!(ev_deleted, 2); // ev_by_1 and ev_by_2
+        assert_eq!(rev_deleted, 1); // rev_by_1
+        let expected_clip = custom_media_dir
+            .join("clips")
+            .join("backyard-ev_by_1.webp")
+            .to_string_lossy()
+            .into_owned();
+        let expected_share = custom_media_dir
+            .join("exports")
+            .join("share_redacted_rev_by_1.mp4")
+            .to_string_lossy()
+            .into_owned();
+        assert!(files.contains(&expected_clip));
+        assert!(files.contains(&expected_share));
+        assert!(!files.iter().any(|p| p.starts_with("/media/ninjanvr/")
+            && (p.contains("ev_by_1") || p.contains("rev_by_1"))));
 
         drop(db);
         let _ = std::fs::remove_dir_all(&tmp_dir);

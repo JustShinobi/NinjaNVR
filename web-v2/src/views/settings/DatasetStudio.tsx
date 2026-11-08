@@ -30,9 +30,11 @@ import {
   filterDatasetQueue,
   minAnnotationScore,
   normalizeDragBox,
+  removeDatasetSampleFromList,
   resolveDatasetNextAction,
   stepDatasetQueue,
   stepStickyDatasetQueue,
+  upsertDatasetSampleInList,
   type DatasetQueueFilter,
   type DatasetQueueKind,
   type DatasetQueueTab,
@@ -162,6 +164,17 @@ export const DatasetStudioSection: React.FC<{
     };
   }, []);
 
+  const refreshDatasetSummary = useCallback(async () => {
+    try {
+      const sumRes = await fetch("/api/dataset/summary", { credentials: "include" });
+      if (!isMountedRef.current || !sumRes.ok) return;
+      const sumData = await sumRes.json().catch(() => null);
+      if (isMountedRef.current && sumData) setSummary(sumData);
+    } catch {
+      // Background summary refresh does not interrupt operator interaction
+    }
+  }, []);
+
   const loadDatasetState = useCallback(async () => {
     const seq = ++loadSeqRef.current;
     try {
@@ -250,7 +263,7 @@ export const DatasetStudioSection: React.FC<{
   };
 
   const replaceSample = (item: DatasetSampleItem) =>
-    setSamples((prev) => prev.map((s) => (s.id === item.id ? item : s)));
+    setSamples((prev) => upsertDatasetSampleInList(prev, item));
 
   /** Id to land on once `id` leaves the visible queue (it changed tab, or was deleted). */
   const neighbourAfter = (id: string): string | null => {
@@ -269,6 +282,16 @@ export const DatasetStudioSection: React.FC<{
     }
   ): Promise<boolean> => {
     if (!isSafeDatasetSampleId(sample?.id)) return false;
+    const optimistic: DatasetSampleItem = {
+      ...sample,
+      ...(patch.annotations !== undefined ? { annotations: patch.annotations } : {}),
+      ...(patch.verified !== undefined ? { verified: patch.verified } : {}),
+      ...(patch.verified_by !== undefined ? { verified_by: patch.verified_by } : {}),
+      ...(patch.sample_kind !== undefined
+        ? { sample_kind: patch.sample_kind as DatasetSampleItem["sample_kind"] }
+        : {}),
+    };
+    setSamples((prev) => upsertDatasetSampleInList(prev, optimistic));
     try {
       const res = await fetch(`/api/dataset/samples/${encodeURIComponent(sample.id)}`, {
         method: "PUT",
@@ -279,13 +302,17 @@ export const DatasetStudioSection: React.FC<{
       const data = await res.json().catch(() => null);
       if (!isMountedRef.current) return false;
       if (res.ok && data) {
-        replaceSample(data.sample || data);
-        void loadDatasetState();
+        setSamples((prev) => upsertDatasetSampleInList(prev, data.sample || data));
+        void refreshDatasetSummary();
         return true;
       }
+      setSamples((prev) => upsertDatasetSampleInList(prev, sample));
       notify(data?.message || t("Falha ao atualizar a amostra", "Failed to update the sample"));
     } catch {
-      if (isMountedRef.current) notify(t("Erro de rede ao atualizar a amostra", "Network error updating the sample"));
+      if (isMountedRef.current) {
+        setSamples((prev) => upsertDatasetSampleInList(prev, sample));
+        notify(t("Erro de rede ao atualizar a amostra", "Network error updating the sample"));
+      }
     }
     return false;
   };
@@ -302,14 +329,14 @@ export const DatasetStudioSection: React.FC<{
       if (!isMountedRef.current) return;
       if (res.ok && data) {
         const item: DatasetSampleItem = data.sample || data;
-        replaceSample(item);
+        setSamples((prev) => upsertDatasetSampleInList(prev, item));
         notify(
           t(
             `IA verificou ${sampleId} com ${(item.annotations || []).length} boxes`,
             `AI verified ${sampleId} with ${(item.annotations || []).length} boxes`
           )
         );
-        void loadDatasetState();
+        void refreshDatasetSummary();
       } else {
         notify(data?.message || t("A anotação por IA falhou", "AI annotation failed"));
       }
@@ -467,6 +494,8 @@ export const DatasetStudioSection: React.FC<{
     if (!isSafeDatasetSampleId(sample?.id)) return;
     if (!window.confirm(t("Descartar esta amostra do dataset?", "Discard this sample from the dataset?"))) return;
     const next = neighbourAfter(sample.id);
+    setSamples((prev) => removeDatasetSampleFromList(prev, sample.id));
+    setSelectedId(next);
     try {
       const res = await fetch(`/api/dataset/samples/${encodeURIComponent(sample.id)}`, {
         method: "DELETE",
@@ -474,15 +503,19 @@ export const DatasetStudioSection: React.FC<{
       });
       if (!isMountedRef.current) return;
       if (res.ok) {
-        setSamples((prev) => prev.filter((s) => s.id !== sample.id));
-        setSelectedId(next);
-        void loadDatasetState();
+        void refreshDatasetSummary();
       } else {
+        setSamples((prev) => upsertDatasetSampleInList(prev, sample));
+        setSelectedId(sample.id);
         const err = await res.json().catch(() => null);
         notify(err?.message || t("Falha ao descartar a amostra", "Failed to discard the sample"));
       }
     } catch {
-      if (isMountedRef.current) notify(t("Erro de rede ao descartar", "Network error while discarding"));
+      if (isMountedRef.current) {
+        setSamples((prev) => upsertDatasetSampleInList(prev, sample));
+        setSelectedId(sample.id);
+        notify(t("Erro de rede ao descartar", "Network error while discarding"));
+      }
     }
   };
 

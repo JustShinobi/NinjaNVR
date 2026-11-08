@@ -1057,112 +1057,15 @@ export function mapClientPointToFrame(
   return [clamp((clientX - frameRect.left) / w), clamp((clientY - frameRect.top) / h)];
 }
 
-const MASK_OPTION_KEYS = new Set(["mode", "style", "pixelate", "block_size"]);
+export type NormalizedPolygonVertex = [number, number];
 
-export function extractMaskPolygons(mask: unknown): string[] {
-  if (!mask) return [];
-  if (typeof mask === "string") return mask.trim() ? [mask.trim()] : [];
-  if (Array.isArray(mask)) {
-    return mask
-      .map((item) => {
-        if (typeof item === "string") return item;
-        if (item && typeof item === "object" && "coordinates" in item) {
-          const c = (item as { coordinates?: unknown }).coordinates;
-          return typeof c === "string" ? c : "";
-        }
-        return "";
-      })
-      .filter(Boolean);
-  }
-  if (typeof mask === "object") {
-    return Object.entries(mask as Record<string, unknown>)
-      .filter(([key]) => !MASK_OPTION_KEYS.has(key))
-      .map(([, val]) => {
-        if (typeof val === "string") return val;
-        if (val && typeof val === "object" && "coordinates" in val) {
-          const c = (val as { coordinates?: unknown }).coordinates;
-          return typeof c === "string" ? c : "";
-        }
-        return "";
-      })
-      .filter(Boolean);
-  }
-  return [];
-}
+import {
+  coordStringToPoints,
+  extractMaskPolygons,
+  parsePolygonPoints,
+} from "../utils/visionGeometry";
 
-/**
- * Parses a normalized or pixel polygon string ("x1,y1,x2,y2,...") into SVG points ("0..1000" coordinate space).
- */
-export function parsePolygonPoints(
-  coordStr: string,
-  detWidth: number,
-  detHeight: number
-): string {
-  if (typeof coordStr !== "string" || !coordStr.trim()) {
-    return "";
-  }
-  const safeW =
-    typeof detWidth === "number" && Number.isFinite(detWidth) && detWidth > 0
-      ? detWidth
-      : 1280;
-  const safeH =
-    typeof detHeight === "number" && Number.isFinite(detHeight) && detHeight > 0
-      ? detHeight
-      : 720;
-  const nums = coordStr.split(",").map((s) => parseFloat(s.trim()));
-  const pairs: string[] = [];
-  for (let i = 0; i + 1 < nums.length; i += 2) {
-    let x = nums[i];
-    let y = nums[i + 1];
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      continue;
-    }
-    if (x > 1.0 || y > 1.0) {
-      x = x / safeW;
-      y = y / safeH;
-    }
-    const sx = Math.round(Math.max(0, Math.min(1, x)) * 1000);
-    const sy = Math.round(Math.max(0, Math.min(1, y)) * 1000);
-    pairs.push(`${sx},${sy}`);
-  }
-  return pairs.join(" ");
-}
-
-/**
- * Converts a polygon coordinate string into normalized [x, y] vertex tuples (0..1) for interactive editing.
- */
-export function coordStringToPoints(
-  coordStr: string,
-  detWidth: number,
-  detHeight: number
-): Array<[number, number]> {
-  if (typeof coordStr !== "string" || !coordStr.trim()) {
-    return [];
-  }
-  const safeW =
-    typeof detWidth === "number" && Number.isFinite(detWidth) && detWidth > 0
-      ? detWidth
-      : 1280;
-  const safeH =
-    typeof detHeight === "number" && Number.isFinite(detHeight) && detHeight > 0
-      ? detHeight
-      : 720;
-  const nums = coordStr.split(",").map((s) => parseFloat(s.trim()));
-  const out: Array<[number, number]> = [];
-  for (let i = 0; i + 1 < nums.length; i += 2) {
-    let x = nums[i];
-    let y = nums[i + 1];
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      continue;
-    }
-    if (x > 1.0 || y > 1.0) {
-      x = x / safeW;
-      y = y / safeH;
-    }
-    out.push([Math.max(0, Math.min(1, x)), Math.max(0, Math.min(1, y))]);
-  }
-  return out;
-}
+export { coordStringToPoints, extractMaskPolygons, parsePolygonPoints };
 
 export interface ContainedBox {
   left: number;

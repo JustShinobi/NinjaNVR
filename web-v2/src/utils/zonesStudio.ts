@@ -15,7 +15,24 @@ import type {
   StateRoiConfig,
   ZoneConfig,
 } from "../types/nvr";
-import { sanitizePolygonCoordString, sanitizeTripwireLine } from "./visionGeometry";
+import {
+  MASK_META_KEYS,
+  extractMaskList,
+  extractMaskMeta,
+  formatCoordPoints,
+  parseCoordPoints,
+  sanitizePolygonCoordString,
+  sanitizeTripwireLine,
+  writeMaskList,
+} from "./visionGeometry";
+
+export {
+  MASK_META_KEYS,
+  extractMaskList,
+  extractMaskMeta,
+  formatCoordPoints,
+  parseCoordPoints,
+};
 
 export type Point = [number, number];
 
@@ -106,89 +123,15 @@ export function formatDurationShort(sec: number): string {
   return Number.isInteger(h) ? `${h} h` : `${h.toFixed(1)} h`;
 }
 
-/**
- * Keys of the object form of a mask (`privacy_mask: { mode: pixelate, block_size: 8, a: "…" }`)
- * that carry rendering options instead of a polygon. Mirrors the backend list in
- * `ninjanvr-server::pipeline` and `ninjanvr-vision::PolygonMask`.
- */
-export const MASK_META_KEYS = ["mode", "style", "pixelate", "block_size"] as const;
-
-function isMaskMetaKey(key: string): boolean {
-  return (MASK_META_KEYS as readonly string[]).includes(key);
-}
-
-/** Returns the option keys of an object-form mask, or null when it has none. */
-export function extractMaskMeta(mask: unknown): Record<string, unknown> | null {
-  if (!mask || typeof mask !== "object" || Array.isArray(mask)) return null;
-  const meta = Object.fromEntries(
-    Object.entries(mask as Record<string, unknown>).filter(([k]) => isMaskMetaKey(k))
-  );
-  return Object.keys(meta).length > 0 ? meta : null;
-}
-
-export function extractMaskList(mask: unknown): string[] {
-  if (!mask) return [];
-  if (typeof mask === "string") return mask.trim() ? [mask.trim()] : [];
-  if (Array.isArray(mask)) {
-    return mask
-      .map((item) => {
-        if (typeof item === "string") return item.trim();
-        if (item && typeof item === "object" && "coordinates" in item) {
-          const c = (item as { coordinates?: unknown }).coordinates;
-          return typeof c === "string" ? c.trim() : "";
-        }
-        return "";
-      })
-      .filter(Boolean);
-  }
-  if (typeof mask === "object") {
-    return Object.entries(mask as Record<string, unknown>)
-      .filter(([key]) => !isMaskMetaKey(key))
-      .map(([, val]) => {
-        if (typeof val === "string") return val.trim();
-        if (val && typeof val === "object" && "coordinates" in val) {
-          const c = (val as { coordinates?: unknown }).coordinates;
-          return typeof c === "string" ? c.trim() : "";
-        }
-        return "";
-      })
-      .filter(Boolean);
-  }
-  return [];
-}
-
-/** Parses "x1,y1,x2,y2,..." (normalized or detect-pixel) into normalized points. */
-export function parseCoordPoints(coords: string, detW: number, detH: number): Point[] {
-  if (typeof coords !== "string" || !coords.trim()) return [];
-  const w = Number.isFinite(detW) && detW > 0 ? detW : 1280;
-  const h = Number.isFinite(detH) && detH > 0 ? detH : 720;
-  const nums = coords.split(",").map((s) => parseFloat(s.trim()));
-  const pixel = nums.some((n) => Number.isFinite(n) && n > 1);
-  const out: Point[] = [];
-  for (let i = 0; i + 1 < nums.length; i += 2) {
-    const x = nums[i];
-    const y = nums[i + 1];
-    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-    const nx = pixel ? x / w : x;
-    const ny = pixel ? y / h : y;
-    out.push([clamp01(nx), clamp01(ny)]);
-  }
-  return out;
-}
-
-export function formatCoordPoints(points: Point[], digits = 3): string {
-  return points.map(([x, y]) => `${clamp01(x).toFixed(digits)},${clamp01(y).toFixed(digits)}`).join(",");
-}
-
 function clamp01(v: number): number {
   return Math.max(0, Math.min(1, Number.isFinite(v) ? v : 0));
 }
 
 export function linePoints(line: LineConfig, detW: number, detH: number): [Point, Point] {
   const pts = line.points || [0, 0, 0, 0];
-  const pixel = pts.some((n) => n > 1);
-  const w = detW > 0 ? detW : 1280;
-  const h = detH > 0 ? detH : 720;
+  const pixel = pts.some((n) => n > 1.5);
+  const w = detW > 1 ? detW : 1280;
+  const h = detH > 1 ? detH : 720;
   const p = (x: number, y: number): Point => [clamp01(pixel ? x / w : x), clamp01(pixel ? y / h : y)];
   return [p(pts[0], pts[1]), p(pts[2], pts[3])];
 }
@@ -334,10 +277,7 @@ function rawMaskValue(cam: CameraConfig, kind: MaskKind): unknown {
  * does not silently turn it back into a solid one.
  */
 export function writeMasks(cam: CameraConfig, kind: MaskKind, list: string[]): void {
-  const meta = extractMaskMeta(rawMaskValue(cam, kind));
-  const value: unknown = meta
-    ? { ...meta, ...Object.fromEntries(list.map((coords, i) => [`mask_${i + 1}`, coords])) }
-    : list;
+  const value: unknown = writeMaskList(list, rawMaskValue(cam, kind));
   if (kind === "motion_mask") {
     if (!cam.motion) cam.motion = { mask: value } as CameraMotionConfig;
     else cam.motion.mask = value;

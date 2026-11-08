@@ -56,15 +56,26 @@ import { resolveCanvasThemePalette } from "../utils/themeTokens";
 import { LiveMsePlayer, PushToTalkButton, VodHlsPlayer } from "../components/VideoPlayers";
 import {
   CAMERA_HUD_CONTROL_DESCRIPTORS,
+  applyDeletedPresetToPtzInfo,
+  applySavedPresetToPtzInfo,
+  cameraHardwareCache,
   isCameraHardwareControlsSupported,
   isCameraPtzEnabled,
+  mergeOptimisticCameraHardwareInfo,
+  probeCameraHardwareAndPtz,
+  resolveCameraCapabilitySnapshot,
+  resolveCameraPtzPresets,
   resolveCameraPushToTalkCapability,
   resolveCameraZoomSupported,
+  setCachedCameraHardware,
+  setCachedCameraPtzInfo,
+  subscribeCameraHardwareCache,
 } from "../utils/cameraCapabilities";
 
 export {
   isCameraHardwareControlsSupported,
   isCameraPtzEnabled,
+  resolveCameraPtzPresets,
   resolveCameraPushToTalkCapability,
   resolveCameraZoomSupported,
 };
@@ -1134,33 +1145,6 @@ export function sanitizeTimeShiftSeek(
   return Math.floor(ts);
 }
 
-export function resolveCameraPtzPresets(
-  camCfg?: CameraConfig,
-  ptzInfo?: CameraPtzInfoResponse | null
-): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  const pushUnique = (val?: string | null) => {
-    const clean = val ? val.trim() : "";
-    if (clean && !seen.has(clean)) {
-      seen.add(clean);
-      out.push(clean);
-    }
-  };
-  for (const p of ptzInfo?.presets || []) {
-    pushUnique(p.name || p.token);
-    if (p.token) seen.add(p.token.trim());
-  }
-  for (const name of ptzInfo?.preset_names || []) {
-    pushUnique(name);
-  }
-  pushUnique(camCfg?.onvif?.return_preset);
-  for (const z of Object.values(camCfg?.zones || {})) {
-    pushUnique(z.preset);
-  }
-  return out;
-}
-
 export type PtzMoveDirection =
   | "left"
   | "right"
@@ -1334,8 +1318,14 @@ export const TacticalPtzHudOverlay: React.FC<{
   onPtzUpdate,
   onHardwareUpdate,
 }) => {
-  const ptzEnabled = isCameraPtzEnabled(cameraConfig, ptzInfo, hardwareInfo);
-  const hwControlsSupported = isCameraHardwareControlsSupported(hardwareInfo);
+  const capabilitySnapshot = resolveCameraCapabilitySnapshot({
+    camera,
+    cameraConfig,
+    ptzInfo,
+    hardwareInfo,
+  });
+  const ptzEnabled = capabilitySnapshot.ptzEnabled;
+  const hwControlsSupported = capabilitySnapshot.hardwareControlsSupported;
   const [showPresetInput, setShowPresetInput] = useState(false);
   const [newPresetName, setNewPresetName] = useState("");
   const [showHwDrawer, setShowHwDrawer] = useState(false);
@@ -1431,17 +1421,8 @@ export const TacticalPtzHudOverlay: React.FC<{
     return null;
   }
 
-  const presets = resolveCameraPtzPresets(cameraConfig, ptzInfo);
-  const activePreset =
-    ptzInfo?.active_preset !== undefined
-      ? ptzInfo.active_preset
-      : cameraConfig?.onvif?.return_preset || null;
-  const canManagePresets =
-    hardwareInfo?.online && hardwareInfo?.capabilities?.ptz_presets_manage === false
-      ? false
-      : Boolean(ptzInfo?.features?.includes("presets_manage")) ||
-        Boolean(hardwareInfo?.capabilities?.ptz_presets_manage);
-  const zoomSupported = resolveCameraZoomSupported(cameraConfig, hardwareInfo);
+  const { presets, activePreset, canManagePresets, zoomSupported } =
+    capabilitySnapshot;
 
   const startContinuousMove = (dir: PtzMoveDirection) => {
     void lifecycleRef.current?.startMove(dir);
@@ -1544,18 +1525,21 @@ export const TacticalPtzHudOverlay: React.FC<{
         activeCameraRef.current === targetCam &&
         onPtzUpdateRef.current
       ) {
-        const cur = ptzInfoRef.current || { enabled: true };
-        const nextPresets = [...(cur.presets || [])];
-        const tok = String(data.token || cleanName);
-        if (!nextPresets.some((p) => p.token === tok || p.name === cleanName)) {
-          nextPresets.push({ token: tok, name: cleanName });
+        const nextPtz = applySavedPresetToPtzInfo(
+          ptzInfoRef.current || { enabled: true },
+          String(data.token || cleanName),
+          cleanName,
+          Array.isArray(data.presets) ? data.presets : undefined,
+          data.preset_names &&
+            typeof data.preset_names === "object" &&
+            !Array.isArray(data.preset_names)
+            ? data.preset_names
+            : undefined
+        );
+        if (nextPtz) {
+          setCachedCameraPtzInfo(targetCam, nextPtz);
+          onPtzUpdateRef.current(targetCam, nextPtz);
         }
-        onPtzUpdateRef.current(targetCam, {
-          ...cur,
-          presets: nextPresets,
-          preset_names: nextPresets.map((p) => p.name),
-          active_preset: cleanName,
-        });
         setNewPresetName("");
         setShowPresetInput(false);
       }
@@ -1579,21 +1563,26 @@ export const TacticalPtzHudOverlay: React.FC<{
           credentials: "include",
         }
       );
+      const data = await res.json().catch(() => null);
       if (
         res.ok &&
         activeCameraRef.current === targetCam &&
         onPtzUpdateRef.current
       ) {
-        const cur = ptzInfoRef.current || { enabled: true };
-        const nextPresets = (cur.presets || []).filter(
-          (p) => p.token !== tokToDelete && p.name !== activePreset
+        const nextPtz = applyDeletedPresetToPtzInfo(
+          ptzInfoRef.current || { enabled: true },
+          tokToDelete,
+          Array.isArray(data?.presets) ? data.presets : undefined,
+          data?.preset_names &&
+            typeof data.preset_names === "object" &&
+            !Array.isArray(data.preset_names)
+            ? data.preset_names
+            : undefined
         );
-        onPtzUpdateRef.current(targetCam, {
-          ...cur,
-          presets: nextPresets,
-          preset_names: nextPresets.map((p) => p.name),
-          active_preset: null,
-        });
+        if (nextPtz) {
+          setCachedCameraPtzInfo(targetCam, nextPtz);
+          onPtzUpdateRef.current(targetCam, nextPtz);
+        }
       }
     } catch {
       // ignore
@@ -1611,6 +1600,7 @@ export const TacticalPtzHudOverlay: React.FC<{
         credentials: "include",
         body: JSON.stringify(patch),
       });
+      const data = await res.json().catch(() => null);
       const curHw = hardwareInfoRef.current;
       if (
         res.ok &&
@@ -1618,13 +1608,11 @@ export const TacticalPtzHudOverlay: React.FC<{
         curHw &&
         onHardwareUpdateRef.current
       ) {
-        onHardwareUpdateRef.current(targetCam, {
-          ...curHw,
-          state: {
-            ...curHw.state,
-            ...patch,
-          },
-        });
+        const nextHw = mergeOptimisticCameraHardwareInfo(curHw, patch, data);
+        if (nextHw) {
+          setCachedCameraHardware(targetCam, nextHw);
+          onHardwareUpdateRef.current(targetCam, nextHw);
+        }
       }
     } catch {
       // ignore
@@ -2080,16 +2068,14 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   } | null>(null);
   const [mapPlacements, setMapPlacements] = useState<Record<string, CameraMapPlacement>>({});
   const [mapSaveStatus, setMapSaveStatus] = useState<string | null>(null);
-  const [ptzInfoByCam, setPtzInfoByCam] = useState<Record<string, CameraPtzInfoResponse>>({});
+  const [ptzInfoByCam, setPtzInfoByCam] = useState<Record<string, CameraPtzInfoResponse>>(
+    () => cameraHardwareCache.getSnapshot().ptzByCam
+  );
   const [hardwareInfoByCam, setHardwareInfoByCam] = useState<
     Record<string, CameraHardwareInfoResponse>
-  >({});
+  >(() => cameraHardwareCache.getSnapshot().hardwareByCam);
   const [pttResetEpoch, setPttResetEpoch] = useState<number>(0);
   const activePttCamerasRef = useRef<Set<string>>(new Set());
-  const ptzFetchedCamsRef = useRef<Set<string>>(new Set());
-  const ptzInFlightCamsRef = useRef<Set<string>>(new Set());
-  const hwFetchedCamsRef = useRef<Set<string>>(new Set());
-  const hwInFlightCamsRef = useRef<Set<string>>(new Set());
   const isMountedRef = useRef<boolean>(true);
   const mapSaveTimerRef = useRef<number | null>(null);
   const mapSaveSeqRef = useRef<number>(0);
@@ -2274,101 +2260,54 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
   }, [config?.ui?.floorplan, mapEditMode]);
 
   useEffect(() => {
+    return subscribeCameraHardwareCache(() => {
+      if (!isMountedRef.current) return;
+      const snap = cameraHardwareCache.getSnapshot();
+      setHardwareInfoByCam(snap.hardwareByCam);
+      setPtzInfoByCam(snap.ptzByCam);
+    });
+  }, []);
+
+  useEffect(() => {
     const cams = config?.cameras || {};
     for (const [camName, camCfg] of Object.entries(cams)) {
-      const profTok =
-        camCfg?.onvif?.profile_token || camCfg?.hardware?.profile_token || "";
-      const vsTok =
-        camCfg?.onvif?.video_source_token ||
-        camCfg?.hardware?.video_source_token ||
-        "";
-      const proto =
-        camCfg?.onvif?.protocol || camCfg?.hardware?.protocol || "";
-      const ptzCacheKey = `${camName}:${camCfg?.onvif?.host || ""}:${
-        camCfg?.onvif?.port || 80
-      }:${camCfg?.onvif?.user || ""}:${Boolean(
-        camCfg?.onvif?.has_password
-      )}:${profTok}:${proto}`;
-      const triggerPtzFetch = () => {
-        if (
-          !ptzFetchedCamsRef.current.has(ptzCacheKey) &&
-          !ptzInFlightCamsRef.current.has(ptzCacheKey)
-        ) {
-          ptzInFlightCamsRef.current.add(ptzCacheKey);
-          fetch(`/api/${encodeURIComponent(camName)}/ptz/info`, {
-            credentials: "include",
-          })
-            .then((res) => (res.ok ? res.json() : null))
-            .then((ptzData: CameraPtzInfoResponse | null) => {
-              ptzInFlightCamsRef.current.delete(ptzCacheKey);
-              if (isMountedRef.current && ptzData) {
-                ptzFetchedCamsRef.current.add(ptzCacheKey);
-                setPtzInfoByCam((prev) => ({
-                  ...prev,
-                  [camName]: ptzData,
-                }));
-              }
-            })
-            .catch(() => {
-              ptzInFlightCamsRef.current.delete(ptzCacheKey);
-            });
+      void probeCameraHardwareAndPtz(camName, {
+        cameraConfig: camCfg,
+        timeoutMs: 3500,
+      }).then((snap) => {
+        if (!isMountedRef.current) return;
+        if (snap.hardware) {
+          setHardwareInfoByCam((prev) => ({
+            ...prev,
+            [camName]: snap.hardware!,
+          }));
         }
-      };
-
-      const hwCacheKey = `${camName}:${camCfg?.onvif?.host || ""}:${
-        camCfg?.onvif?.port || 80
-      }:${camCfg?.onvif?.user || ""}:${Boolean(
-        camCfg?.onvif?.has_password
-      )}:${Boolean(
-        camCfg?.onvif?.has_cloud_password || camCfg?.hardware?.has_cloud_password
-      )}:${profTok}:${vsTok}:${proto}`;
-      if (
-        !hwFetchedCamsRef.current.has(hwCacheKey) &&
-        !hwInFlightCamsRef.current.has(hwCacheKey)
-      ) {
-        hwInFlightCamsRef.current.add(hwCacheKey);
-        fetch(`/api/${encodeURIComponent(camName)}/hardware?timeout_ms=3500`, {
-          credentials: "include",
-        })
-          .then((res) => (res.ok ? res.json() : null))
-          .then((data: CameraHardwareInfoResponse | null) => {
-            hwInFlightCamsRef.current.delete(hwCacheKey);
-            if (isMountedRef.current && data) {
-              hwFetchedCamsRef.current.add(hwCacheKey);
-              setHardwareInfoByCam((prev) => ({ ...prev, [camName]: data }));
-              if (data.online && data.capabilities?.ptz) {
-                triggerPtzFetch();
-              }
-            } else if (isMountedRef.current && isCameraPtzEnabled(camCfg)) {
-              triggerPtzFetch();
-            }
-          })
-          .catch(() => {
-            hwInFlightCamsRef.current.delete(hwCacheKey);
-            if (isMountedRef.current && isCameraPtzEnabled(camCfg)) {
-              triggerPtzFetch();
-            }
-          });
-      } else if (
-        isCameraPtzEnabled(camCfg, undefined, hardwareInfoByCam[camName]) &&
-        !hwInFlightCamsRef.current.has(hwCacheKey)
-      ) {
-        triggerPtzFetch();
-      }
+        if (snap.ptz) {
+          setPtzInfoByCam((prev) => ({
+            ...prev,
+            [camName]: snap.ptz!,
+          }));
+        }
+      });
     }
   }, [config?.cameras]);
 
   const handlePtzUpdate = (camName: string, nextInfo: CameraPtzInfoResponse) => {
-    setPtzInfoByCam((prev) => ({
-      ...prev,
-      [camName]: { ...(prev[camName] || {}), ...nextInfo },
-    }));
+    setPtzInfoByCam((prev) => {
+      const merged = { ...(prev[camName] || {}), ...nextInfo };
+      setCachedCameraPtzInfo(camName, merged);
+      return {
+        ...prev,
+        [camName]: merged,
+      };
+    });
   };
 
   const handleHardwareUpdate = (
     camName: string,
     nextHw: CameraHardwareInfoResponse
   ) => {
+    setCachedCameraHardware(camName, nextHw);
     setHardwareInfoByCam((prev) => ({
       ...prev,
       [camName]: nextHw,

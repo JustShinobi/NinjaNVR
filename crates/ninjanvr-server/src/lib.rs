@@ -2,12 +2,16 @@
 #![forbid(unsafe_code)]
 
 pub mod camera_protocols;
+pub mod config_coordinator;
+pub mod dataset_catalog;
+pub mod media_lifecycle;
 pub mod mse_hub;
 pub mod pipeline;
 pub mod preview_frames;
 pub mod snapshot_capture;
 
 pub use camera_protocols::*;
+pub use config_coordinator::{ConfigCoordinator, persist_config_yaml_atomically};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -31,10 +35,11 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 pub use mse_hub::{MseGopCache, MseStreamHub};
 use ninjanvr_comms::{CommsHub, SharedCommsHub};
 use ninjanvr_config::{
-    DEFAULT_GO2RTC_SHM_PATH, Go2RtcSupervisor, NINJANVR_VERSION, NinjaConfig, scrub_json_value,
-    scrub_rtsp_credentials,
+    Go2RtcSupervisor, NINJANVR_VERSION, NinjaConfig, scrub_json_value, scrub_rtsp_credentials,
 };
-use ninjanvr_db::{EventFilter, ExportRow, NinjaDatabase, ReviewFilter, verify_password};
+use ninjanvr_db::{
+    CameraScope, EventFilter, ExportRow, NinjaDatabase, ReviewFilter, verify_password,
+};
 use ninjanvr_infer::AiDetectorEngine;
 use ninjanvr_media::{
     RecordingEngine, SharedActivityLedger, build_mp4_export_with_privacy, new_activity_ledger,
@@ -315,6 +320,7 @@ pub type LazySnapshotCacheValue = (Instant, Bytes, u64);
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<NinjaConfig>>,
+    pub config_coordinator: ConfigCoordinator,
     pub db: NinjaDatabase,
     pub comms: SharedCommsHub,
     pub go2rtc_supervisor: Arc<Go2RtcSupervisor>,
@@ -4735,110 +4741,6 @@ async fn api_config_raw(State(state): State<AppState>) -> Json<Value> {
     )))
 }
 
-static CONFIG_COMMIT_LOCKS: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<()>>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-fn acquire_state_config_commit_lock(state: &AppState) -> Arc<tokio::sync::Mutex<()>> {
-    let key = Arc::as_ptr(&state.config) as usize;
-    let mut map = CONFIG_COMMIT_LOCKS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if map.len() > 256 {
-        map.retain(|_, v| Arc::strong_count(v) > 1);
-    }
-    map.entry(key)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
-}
-
-fn persist_config_yaml_atomically(path: &Path, raw_yaml: &str) -> Result<()> {
-    use std::io::Write;
-    if path.as_os_str().is_empty()
-        || path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        anyhow::bail!(
-            "Refusing to persist configuration to unsafe path {}",
-            path.display()
-        );
-    }
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            anyhow::bail!(
-                "Refusing to overwrite symlinked configuration file at {}",
-                path.display()
-            );
-        }
-        if meta.is_dir() {
-            anyhow::bail!(
-                "Refusing to overwrite directory at configuration path {}",
-                path.display()
-            );
-        }
-    }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    if let Ok(pmeta) = std::fs::symlink_metadata(parent)
-        && pmeta.file_type().is_symlink()
-    {
-        anyhow::bail!(
-            "Refusing to persist configuration inside symlinked directory {}",
-            parent.display()
-        );
-    }
-    std::fs::create_dir_all(parent)?;
-    let fname = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("config.yml");
-    let nonce: u64 = rand::random();
-    let tmp_path = parent.join(format!(".{fname}.{nonce:016x}.tmp"));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
-    }
-    let mut tmp_file = opts.open(&tmp_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(err) = tmp_file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-            drop(tmp_file);
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err.into());
-        }
-    }
-    if let Err(err) = tmp_file
-        .write_all(raw_yaml.as_bytes())
-        .and_then(|()| tmp_file.sync_all())
-    {
-        drop(tmp_file);
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err.into());
-    }
-    drop(tmp_file);
-    if let Ok(meta) = std::fs::symlink_metadata(path)
-        && (meta.file_type().is_symlink() || meta.is_dir())
-    {
-        let _ = std::fs::remove_file(&tmp_path);
-        anyhow::bail!(
-            "Refusing to rename configuration over symlink or directory at {}",
-            path.display()
-        );
-    }
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(err.into());
-    }
-    Ok(())
-}
-
 async fn api_config_save(
     State(state): State<AppState>,
     uri: Uri,
@@ -4866,8 +4768,7 @@ async fn api_config_save(
             .into_response();
     }
     let commit_res = tokio::spawn(async move {
-        let commit_lock = acquire_state_config_commit_lock(&state);
-        let _commit_guard = commit_lock.lock().await;
+        let _commit_guard = state.config_coordinator.lock_commit().await;
         let prev_cfg = state.config.read().await.clone();
         let path = prev_cfg.config_path.clone();
         let mut new_cfg = match NinjaConfig::from_yaml_str(&body, path.clone()) {
@@ -4884,12 +4785,9 @@ async fn api_config_save(
         let state_for_io = state.clone();
         let io_res = tokio::task::spawn_blocking(
             move || -> std::result::Result<(NinjaConfig, Vec<HeuristicAlertDto>), String> {
-                if let Err(err) = persist_config_yaml_atomically(&path, &new_cfg.raw_yaml) {
+                if let Err(err) = ConfigCoordinator::persist_and_sync_go2rtc(&new_cfg) {
                     error!("Failed to persist config.yml: {err:#}");
                     return Err(err.to_string());
-                }
-                if let Err(err) = new_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH) {
-                    warn!("Failed to write go2rtc config to {DEFAULT_GO2RTC_SHM_PATH}: {err:#}");
                 }
                 state_for_io.detector.reload(&new_cfg);
                 let rec_dir = state_for_io.media_dir.join("recordings");
@@ -4945,8 +4843,7 @@ async fn api_config_structured(
             .into_response();
     }
     let commit_res = tokio::spawn(async move {
-        let commit_lock = acquire_state_config_commit_lock(&state);
-        let _commit_guard = commit_lock.lock().await;
+        let _commit_guard = state.config_coordinator.lock_commit().await;
         let mut next_cfg = state.config.read().await.clone();
         if let Err(err) = next_cfg.apply_structured_json(&body) {
             return Err((StatusCode::BAD_REQUEST, format!("{err:#}")));
@@ -4957,14 +4854,9 @@ async fn api_config_structured(
         let state_for_io = state.clone();
         let io_res = tokio::task::spawn_blocking(
             move || -> std::result::Result<(NinjaConfig, Vec<HeuristicAlertDto>, Value, String), String> {
-                if let Err(err) =
-                    persist_config_yaml_atomically(&next_cfg.config_path, &next_cfg.raw_yaml)
-                {
+                if let Err(err) = ConfigCoordinator::persist_and_sync_go2rtc(&next_cfg) {
                     error!("Failed to persist structured config.yml: {err:#}");
                     return Err(err.to_string());
-                }
-                if let Err(err) = next_cfg.write_go2rtc_config(DEFAULT_GO2RTC_SHM_PATH) {
-                    warn!("Failed to write go2rtc config to {DEFAULT_GO2RTC_SHM_PATH}: {err:#}");
                 }
                 state_for_io.detector.reload(&next_cfg);
                 let rec_dir = state_for_io.media_dir.join("recordings");
@@ -8901,58 +8793,43 @@ async fn api_reviews_delete(
             .into_response();
     }
     let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let scope = CameraScope::from_option(allowed);
     let state_for_del = state.clone();
     let ids = body.ids;
     tokio::task::spawn_blocking(move || -> Response {
-        if let Some(ref allow_list) = allowed {
-            for id in &ids {
-                let permitted = state_for_del
-                    .db
-                    .get_review_by_id(id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|rev| allow_list.iter().any(|a| a == &rev.camera));
-                if !permitted {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "success": false,
-                            "message": "Camera is not permitted for this user"
-                        })),
-                    )
-                        .into_response();
+        match state_for_del.db.delete_reviews_scoped(&ids, &scope) {
+            Ok(Ok((_deleted, thumbs))) => {
+                for (idx, id) in ids.iter().enumerate() {
+                    let thumb = thumbs.get(idx).and_then(|t| t.as_deref());
+                    media_lifecycle::cleanup_review_media_artifacts(
+                        &state_for_del.media_dir,
+                        id,
+                        thumb,
+                    );
                 }
+                purge_revoked_share_credits(&state_for_del);
+                Json(json!({ "success": true })).into_response()
             }
-        }
-        if let Err(err) = state_for_del.db.delete_reviews(&ids) {
-            warn!("Failed to delete reviews in bulk: {err}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+            Ok(Err(_forbidden_cam)) => (
+                StatusCode::FORBIDDEN,
                 Json(json!({
                     "success": false,
-                    "message": "Failed to delete reviews"
+                    "message": "Camera is not permitted for this user"
                 })),
             )
-                .into_response();
-        }
-        for id in &ids {
-            if let Err(err) = state_for_del.db.revoke_share_links_for_target(None, id) {
-                warn!("Failed to revoke share links for review '{id}': {err}");
-                return (
+                .into_response(),
+            Err(err) => {
+                warn!("Failed to delete reviews in bulk: {err}");
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({
                         "success": false,
-                        "message": "Failed to revoke share links for review"
+                        "message": "Failed to delete reviews"
                     })),
                 )
-                    .into_response();
+                    .into_response()
             }
         }
-        for id in &ids {
-            cleanup_share_clip_artifacts(&state_for_del.media_dir, id);
-        }
-        purge_revoked_share_credits(&state_for_del);
-        Json(json!({ "success": true })).into_response()
     })
     .await
     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -9023,39 +8900,12 @@ async fn api_events_explore(
     Query(q): Query<EventQueryParams>,
 ) -> Json<Value> {
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
-    if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await
-        && !allowed.iter().any(|a| a == "*")
-    {
-        let scoped_events = state
-            .db
-            .query_events(&EventFilter {
-                cameras: scope_cameras_filter(None, Some(allowed)),
-                limit: Some(1000),
-                ..Default::default()
-            })
-            .unwrap_or_default();
-        let mut by_label: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-        for ev in scoped_events {
-            if let Some(lbl) = ev["label"].as_str() {
-                by_label.entry(lbl.to_string()).or_default().push(ev);
-            }
-        }
-        let mut label_groups: Vec<(String, Vec<Value>)> = by_label.into_iter().collect();
-        label_groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-        let mut out = Vec::new();
-        for (_label, group) in label_groups {
-            let count = group.len() as i64;
-            for mut ev in group.into_iter().take(limit) {
-                if let Some(obj) = ev.as_object_mut() {
-                    obj.insert("event_count".to_string(), json!(count));
-                }
-                out.push(ev);
-            }
-        }
-        redact_event_slice_thumbnails_if_masked(&state.config, &mut out).await;
-        return Json(Value::Array(out));
-    }
-    let mut events = state.db.query_events_explore(limit).unwrap_or_default();
+    let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let scope = CameraScope::from_option(allowed);
+    let mut events = state
+        .db
+        .query_events_explore_scoped(limit as i64, &scope)
+        .unwrap_or_default();
     redact_event_slice_thumbnails_if_masked(&state.config, &mut events).await;
     Json(Value::Array(events))
 }
@@ -9065,15 +8915,13 @@ async fn api_events_summary(
     jar: CookieJar,
     headers: HeaderMap,
 ) -> Json<Value> {
-    let mut summary = state.db.query_events_summary().unwrap_or_default();
-    if let Some(allowed) = effective_caller_allowed_cameras(&state, &jar, &headers).await {
-        summary.retain(|item| {
-            item["camera"]
-                .as_str()
-                .is_some_and(|cam| allowed.iter().any(|a| a == cam))
-        });
-    }
-    Json(Value::Array(summary))
+    let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let scope = CameraScope::from_option(allowed);
+    let summary = state
+        .db
+        .query_events_summary_scoped(&scope)
+        .unwrap_or_else(|_| Value::Array(Vec::new()));
+    Json(summary)
 }
 
 async fn api_event_by_id(
@@ -9223,62 +9071,51 @@ async fn api_events_bulk_delete(
             .into_response();
     }
     let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let scope = CameraScope::from_option(allowed);
     let state_for_del = state.clone();
     tokio::task::spawn_blocking(move || -> Response {
-        let mut ev_cams: Vec<(String, Option<String>)> = Vec::with_capacity(ids.len());
-        for id in &ids {
-            let cam = state_for_del
-                .db
-                .get_event(id)
-                .ok()
-                .flatten()
-                .and_then(|ev| ev["camera"].as_str().map(String::from));
-            ev_cams.push((id.clone(), cam));
-        }
-        if let Some(ref allow_list) = allowed {
-            for (_id, cam_opt) in &ev_cams {
-                let permitted = cam_opt
-                    .as_deref()
-                    .is_some_and(|c| allow_list.iter().any(|a| a == c));
-                if !permitted {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
-                    )
-                        .into_response();
+        match state_for_del.db.delete_events_bulk_scoped(&ids, &scope) {
+            Ok(Ok(deleted_items)) => {
+                for (id, cam, thumb_opt) in &deleted_items {
+                    media_lifecycle::cleanup_event_media_artifacts(
+                        &state_for_del.media_dir,
+                        id,
+                        Some(cam.as_str()),
+                        thumb_opt.as_deref(),
+                    );
                 }
+                for id in &ids {
+                    if !deleted_items.iter().any(|(d_id, _, _)| d_id == id) {
+                        media_lifecycle::cleanup_event_media_artifacts(
+                            &state_for_del.media_dir,
+                            id,
+                            None,
+                            None,
+                        );
+                    }
+                }
+                purge_revoked_share_credits(&state_for_del);
+                Json(json!({ "success": true })).into_response()
             }
-        }
-        if let Err(err) = state_for_del.db.delete_events_bulk(&ids) {
-            warn!("Failed to delete events in bulk: {err}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "success": false,
-                    "message": "Failed to delete events"
-                })),
+            Ok(Err(_forbidden_cam)) => (
+                StatusCode::FORBIDDEN,
+                Json(
+                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
+                ),
             )
-                .into_response();
-        }
-        for (id, _) in &ev_cams {
-            if let Err(err) = state_for_del.db.revoke_share_links_for_target(None, id) {
-                warn!("Failed to revoke share links for event '{id}': {err}");
-                return (
+                .into_response(),
+            Err(err) => {
+                warn!("Failed to delete events in bulk: {err}");
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({
                         "success": false,
-                        "message": "Failed to revoke share links for event"
+                        "message": "Failed to delete events"
                     })),
                 )
-                    .into_response();
+                    .into_response()
             }
         }
-        for (id, cam_opt) in &ev_cams {
-            cleanup_share_clip_artifacts(&state_for_del.media_dir, id);
-            cleanup_event_media_artifacts(&state_for_del.media_dir, cam_opt.as_deref(), id);
-        }
-        purge_revoked_share_credits(&state_for_del);
-        Json(json!({ "success": true })).into_response()
     })
     .await
     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -9491,20 +9328,11 @@ async fn api_event_false_positive(
         if let Ok(Some(existing)) = state.db.get_dataset_sample(&sample_id)
             && existing.sample_kind == "hard_negative"
         {
-            let p = PathBuf::from(&existing.image_path);
-            if let Some(safe_p) = ensure_dataset_sample_path(&state.media_dir, &p) {
-                let _ = tokio::fs::remove_file(&safe_p).await;
-            }
-            if is_safe_id(&existing.id) {
-                let mirror_p = state
-                    .media_dir
-                    .join("clips")
-                    .join("dataset")
-                    .join(format!("{}.webp", existing.id));
-                if let Some(safe_mp) = ensure_clips_artifact_path(&state.media_dir, &mirror_p) {
-                    let _ = tokio::fs::remove_file(&safe_mp).await;
-                }
-            }
+            dataset_catalog::delete_sample_artifacts(
+                &state.media_dir,
+                &existing.id,
+                Some(&existing.image_path),
+            );
             let _ = state.db.delete_dataset_sample(&sample_id);
         }
     }
@@ -9523,31 +9351,11 @@ async fn api_list_false_positive_signatures(
     Query(params): Query<FalsePositiveSignaturesQuery>,
 ) -> Json<Value> {
     let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
-    let normalized_cam = params
-        .camera
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("all") && *c != "*");
-    if let Some(ref allow_list) = allowed
-        && !allow_list.iter().any(|a| a == "*")
-        && let Some(req_cam) = normalized_cam
-        && !allow_list.iter().any(|a| a == req_cam)
-    {
-        return Json(json!([]));
-    }
-    let mut items = state
+    let scope = CameraScope::from_option(allowed);
+    let items = state
         .db
-        .list_false_positive_signatures(normalized_cam)
+        .list_false_positive_signatures_scoped(params.camera.as_deref(), &scope)
         .unwrap_or_default();
-    if let Some(allow_list) = allowed
-        && !allow_list.iter().any(|a| a == "*")
-    {
-        items.retain(|s| {
-            s["camera"]
-                .as_str()
-                .is_some_and(|cam| allow_list.iter().any(|a| a == cam))
-        });
-    }
     Json(json!(items))
 }
 
@@ -9575,40 +9383,36 @@ async fn api_delete_false_positive_signature(
         )
             .into_response();
     }
-    if let Some(allow_list) = effective_caller_allowed_cameras(&state, &jar, &headers).await
-        && !allow_list.iter().any(|a| a == "*")
-    {
-        let permitted = state
-            .db
-            .list_false_positive_signatures(None)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|s| s["id"].as_i64() == Some(id))
-            .and_then(|s| {
-                s["camera"]
-                    .as_str()
-                    .map(|cam| allow_list.iter().any(|a| a == cam))
-            })
-            .unwrap_or(false);
-        if !permitted {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(
-                    json!({ "success": false, "message": "Camera is not permitted for this user" }),
-                ),
-            )
-                .into_response();
-        }
-    }
-    let deleted = state.db.delete_false_positive_signature(id).unwrap_or(0);
-    if deleted == 0 {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "success": false, "message": "Signature not found" })),
+    let allowed = effective_caller_allowed_cameras(&state, &jar, &headers).await;
+    let scope = CameraScope::from_option(allowed);
+    match state.db.delete_false_positive_signature_scoped(id, &scope) {
+        Ok(Some(true)) => Json(json!({ "success": true, "deleted": 1 })).into_response(),
+        Ok(None) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
         )
-            .into_response();
+            .into_response(),
+        Ok(Some(false)) => {
+            if scope.is_restricted() {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "success": false, "message": "Camera is not permitted for this user" })),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "success": false, "message": "Signature not found" })),
+                )
+                    .into_response()
+            }
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": "Failed to delete signature" })),
+        )
+            .into_response(),
     }
-    Json(json!({ "success": true, "deleted": deleted })).into_response()
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -9724,16 +9528,6 @@ fn is_disallowed_ssrf_ipv6(v6: std::net::Ipv6Addr, block_private_v4: bool) -> bo
         || siit_v4.is_some_and(check_v4)
         || v6.to_ipv4().is_some_and(check_v4)
         || v6.to_ipv4_mapped().is_some_and(check_v4)
-}
-
-fn is_safe_genai_model_name(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    !trimmed.is_empty()
-        && trimmed.len() <= 128
-        && !trimmed.contains("..")
-        && !trimmed.chars().any(|c| {
-            c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '?' | '#' | '@')
-        })
 }
 
 async fn read_bounded_reqwest_json(
@@ -10406,94 +10200,15 @@ fn scrub_genai_secret_in_error(raw: String, api_key: &str) -> String {
 }
 
 fn extract_gemini_candidate_text(resp_val: &Value) -> Option<&str> {
-    if let Some(parts) = resp_val
-        .pointer("/candidates/0/content/parts")
-        .and_then(|v| v.as_array())
-    {
-        if let Some(text) = parts
-            .iter()
-            .rev()
-            .filter(|p| p.get("thought").and_then(|t| t.as_bool()) != Some(true))
-            .find_map(|p| {
-                p.get("text")
-                    .and_then(|t| t.as_str())
-                    .filter(|s| !s.trim().is_empty())
-            })
-        {
-            return Some(text);
-        }
-        if let Some(text) = parts.iter().rev().find_map(|p| {
-            p.get("text")
-                .and_then(|t| t.as_str())
-                .filter(|s| !s.trim().is_empty())
-        }) {
-            return Some(text);
-        }
-    }
-    resp_val
-        .pointer("/candidates/0/content/parts/0/text")
-        .and_then(|v| v.as_str())
+    dataset_catalog::extract_gemini_candidate_text(resp_val)
 }
 
 fn strip_markdown_json_fence(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    if let Some(after_open) = trimmed.strip_prefix("```") {
-        let after_lang = after_open
-            .strip_prefix("json")
-            .or_else(|| after_open.strip_prefix("JSON"))
-            .unwrap_or(after_open)
-            .trim_start();
-        if let Some(body) = after_lang.strip_suffix("```") {
-            return body.trim();
-        }
-    }
-    trimmed
+    dataset_catalog::strip_markdown_json_fence(raw)
 }
 
 fn parse_ai_judge_json_verdict(resp_val: &Value) -> Result<(bool, f64, String)> {
-    let candidate: Value = if resp_val.get("is_true_positive").is_some() {
-        resp_val.clone()
-    } else if let Some(text) = extract_gemini_candidate_text(resp_val) {
-        serde_json::from_str(strip_markdown_json_fence(text))
-            .context("invalid JSON in Gemini response text")?
-    } else if let Some(text) = resp_val
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-    {
-        serde_json::from_str(strip_markdown_json_fence(text))
-            .context("invalid JSON in OpenAI response content")?
-    } else if let Some(resp_field) = resp_val.get("response") {
-        if let Some(text) = resp_field.as_str() {
-            serde_json::from_str(strip_markdown_json_fence(text))
-                .context("invalid JSON in Ollama response string")?
-        } else {
-            resp_field.clone()
-        }
-    } else if let Some(text) = resp_val
-        .pointer("/message/content")
-        .and_then(|v| v.as_str())
-    {
-        serde_json::from_str(strip_markdown_json_fence(text))
-            .context("invalid JSON in Ollama chat content")?
-    } else {
-        anyhow::bail!("unrecognized AI Judge response payload: {resp_val}");
-    };
-
-    let is_true_positive = candidate
-        .get("is_true_positive")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let confidence = candidate
-        .get("confidence")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.9)
-        .clamp(0.0, 1.0);
-    let reason = candidate
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Verified by Vision AI Judge")
-        .to_string();
-    Ok((is_true_positive, confidence, reason))
+    dataset_catalog::parse_ai_judge_json_verdict(resp_val).map_err(|e| anyhow::anyhow!(e))
 }
 
 pub async fn verify_event_with_genai(state: &AppState, event_id: &str) -> Result<Value> {
@@ -10594,152 +10309,23 @@ pub async fn verify_event_with_genai_components(
     let img_b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
 
     let genai = config.read().await.genai.clone();
-    if genai.model.trim().is_empty() {
-        anyhow::bail!("No Vision AI model selected. Validate API and choose a model in Settings.");
-    }
-    if !is_safe_genai_model_name(&genai.model) {
-        anyhow::bail!("Disallowed or invalid GenAI model identifier");
-    }
-    if let Some(b) = genai
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        validate_genai_base_url(b)?;
-    }
-    let provider = genai.provider.trim().to_ascii_lowercase();
-    let api_key = resolve_safe_genai_api_key(&genai);
-    let timeout_ms = if genai.timeout_ms <= 5_000 {
-        30_000
-    } else {
-        genai.timeout_ms.clamp(5_000, 60_000)
-    };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-
     let prompt = format!(
         "You are a security camera false-positive verification judge for camera '{camera}'. \
          An edge object detector reported a '{label}' with confidence {score:.2}. \
          Inspect the image and respond ONLY with a JSON object: \
          {{\"is_true_positive\": boolean, \"confidence\": number, \"reason\": \"short explanation\"}}."
     );
-
-    let resp = match provider.as_str() {
-        "openai" => {
-            let base = genai
-                .base_url
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("https://api.openai.com/v1")
-                .trim_end_matches('/');
-            let url = if base.ends_with("/chat/completions") {
-                base.to_string()
-            } else if base.ends_with("/v1") {
-                format!("{base}/chat/completions")
-            } else {
-                format!("{base}/v1/chat/completions")
-            };
-            let mut req = client.post(&url).json(&json!({
-                "model": genai.model,
-                "response_format": { "type": "json_object" },
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        { "type": "text", "text": prompt },
-                        {
-                            "type": "image_url",
-                            "image_url": { "url": format!("data:{mime_type};base64,{img_b64}") }
-                        }
-                    ]
-                }]
-            }));
-            if !api_key.is_empty() {
-                req = req.bearer_auth(&api_key);
-            }
-            req.send()
-                .await
-                .context("OpenAI Vision API request failed")?
-        }
-        "ollama" => {
-            let base = genai
-                .base_url
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("http://127.0.0.1:11434")
-                .trim_end_matches('/');
-            let url = if base.ends_with("/api/generate") || base.ends_with("/api/chat") {
-                base.to_string()
-            } else {
-                format!("{base}/api/generate")
-            };
-            client
-                .post(&url)
-                .json(&json!({
-                    "model": genai.model,
-                    "prompt": prompt,
-                    "images": [img_b64],
-                    "stream": false,
-                    "format": "json"
-                }))
-                .send()
-                .await
-                .context("Ollama Vision API request failed")?
-        }
-        _ => {
-            let base = genai
-                .base_url
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("https://generativelanguage.googleapis.com")
-                .trim_end_matches('/');
-            let url = if api_key.is_empty() {
-                format!("{base}/v1beta/models/{}:generateContent", genai.model)
-            } else {
-                format!(
-                    "{base}/v1beta/models/{}:generateContent?key={api_key}",
-                    genai.model
-                )
-            };
-            let mut req = client.post(&url);
-            if !api_key.is_empty() {
-                req = req.header("x-goog-api-key", &api_key);
-            }
-            req.json(&json!({
-                "contents": [{
-                    "parts": [
-                        { "text": prompt },
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": img_b64
-                            }
-                        }
-                    ]
-                }],
-                "generationConfig": {
-                    "responseMimeType": "application/json"
-                }
-            }))
-            .send()
-            .await
-            .context("Gemini Vision API request failed")?
-        }
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        anyhow::bail!("AI Judge HTTP {status}");
-    }
-
-    let resp_json: Value = read_bounded_reqwest_json(
-        resp,
-        MAX_GENAI_RESPONSE_BYTES,
-        "failed to decode AI Judge JSON response",
+    let req =
+        dataset_catalog::build_vision_ai_request(&genai, &prompt, &img_b64, mime_type, 0.1, 512)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    let timeout = dataset_catalog::effective_vision_ai_timeout(&genai);
+    let resp_json = dataset_catalog::VisionAiTransport::send_json(
+        &dataset_catalog::ReqwestVisionAiTransport::new(),
+        &req,
+        timeout,
     )
-    .await?;
+    .await
+    .map_err(|e| anyhow::anyhow!(e))?;
     let (is_true_positive, confidence, reason) = parse_ai_judge_json_verdict(&resp_json)?;
     let verified_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -11503,27 +11089,11 @@ async fn api_dataset_sample_delete(
         }
     }
     if let Some(sample) = sample_opt {
-        let p = PathBuf::from(&sample.image_path);
-        if let Some(safe_p) = ensure_dataset_sample_path(&state.media_dir, &p) {
-            let _ = tokio::fs::remove_file(&safe_p).await;
-        }
-        if is_safe_id(&sample.id) {
-            let fallback_p = state
-                .media_dir
-                .join("dataset")
-                .join(format!("{}.webp", sample.id));
-            if let Some(safe_fb) = ensure_dataset_sample_path(&state.media_dir, &fallback_p) {
-                let _ = tokio::fs::remove_file(&safe_fb).await;
-            }
-            let mirror_p = state
-                .media_dir
-                .join("clips")
-                .join("dataset")
-                .join(format!("{}.webp", sample.id));
-            if let Some(safe_mp) = ensure_clips_artifact_path(&state.media_dir, &mirror_p) {
-                let _ = tokio::fs::remove_file(&safe_mp).await;
-            }
-        }
+        dataset_catalog::delete_sample_artifacts(
+            &state.media_dir,
+            &sample.id,
+            Some(&sample.image_path),
+        );
     }
     let deleted = state.db.delete_dataset_sample(&id).unwrap_or(0);
     if deleted == 0 {
@@ -11935,32 +11505,6 @@ pub async fn auto_annotate_dataset_sample(
     let img_b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
 
     let genai = state.config.read().await.genai.clone();
-    if genai.model.trim().is_empty() {
-        anyhow::bail!("No Vision AI model selected. Validate API and choose a model in Settings.");
-    }
-    if !is_safe_genai_model_name(&genai.model) {
-        anyhow::bail!("Disallowed or invalid GenAI model identifier");
-    }
-    if let Some(b) = genai
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        validate_genai_base_url(b)?;
-    }
-    let provider = genai.provider.trim().to_ascii_lowercase();
-    let api_key = resolve_safe_genai_api_key(&genai);
-    let timeout_ms = if genai.timeout_ms <= 5_000 {
-        30_000
-    } else {
-        genai.timeout_ms.clamp(5_000, 60_000)
-    };
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
-
     let classes_list = ninjanvr_db::NINJANVR_SECURITY_CLASSES.join(", ");
     let prompt = format!(
         "You are a Teacher Vision AI auto-annotator for security camera '{}'. \
@@ -11971,120 +11515,17 @@ pub async fn auto_annotate_dataset_sample(
          where coordinates are normalized in [0.0, 1.0].",
         sample.camera, classes_list
     );
-
-    let resp = match provider.as_str() {
-        "openai" => {
-            let base = genai
-                .base_url
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("https://api.openai.com/v1")
-                .trim_end_matches('/');
-            let url = if base.ends_with("/chat/completions") {
-                base.to_string()
-            } else if base.ends_with("/v1") {
-                format!("{base}/chat/completions")
-            } else {
-                format!("{base}/v1/chat/completions")
-            };
-            let mut req = client.post(&url).json(&json!({
-                "model": genai.model,
-                "response_format": { "type": "json_object" },
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        { "type": "text", "text": prompt },
-                        {
-                            "type": "image_url",
-                            "image_url": { "url": format!("data:{mime_type};base64,{img_b64}") }
-                        }
-                    ]
-                }]
-            }));
-            if !api_key.is_empty() {
-                req = req.bearer_auth(&api_key);
-            }
-            req.send()
-                .await
-                .context("OpenAI auto-annotate request failed")?
-        }
-        "ollama" => {
-            let base = genai
-                .base_url
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("http://127.0.0.1:11434")
-                .trim_end_matches('/');
-            let url = if base.ends_with("/api/generate") || base.ends_with("/api/chat") {
-                base.to_string()
-            } else {
-                format!("{base}/api/generate")
-            };
-            client
-                .post(&url)
-                .json(&json!({
-                    "model": genai.model,
-                    "prompt": prompt,
-                    "images": [img_b64],
-                    "stream": false,
-                    "format": "json"
-                }))
-                .send()
-                .await
-                .context("Ollama auto-annotate request failed")?
-        }
-        _ => {
-            let base = genai
-                .base_url
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or("https://generativelanguage.googleapis.com")
-                .trim_end_matches('/');
-            let url = if api_key.is_empty() {
-                format!("{base}/v1beta/models/{}:generateContent", genai.model)
-            } else {
-                format!(
-                    "{base}/v1beta/models/{}:generateContent?key={api_key}",
-                    genai.model
-                )
-            };
-            let mut req = client.post(&url);
-            if !api_key.is_empty() {
-                req = req.header("x-goog-api-key", &api_key);
-            }
-            req.json(&json!({
-                "contents": [{
-                    "parts": [
-                        { "text": prompt },
-                        {
-                            "inline_data": {
-                                "mime_type": mime_type,
-                                "data": img_b64
-                            }
-                        }
-                    ]
-                }],
-                "generationConfig": {
-                    "responseMimeType": "application/json"
-                }
-            }))
-            .send()
-            .await
-            .context("Gemini auto-annotate request failed")?
-        }
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        anyhow::bail!("Vision AI Auto-Annotate HTTP {status}");
-    }
-
-    let resp_json: Value = read_bounded_reqwest_json(
-        resp,
-        MAX_GENAI_RESPONSE_BYTES,
-        "failed to decode Vision AI auto-annotate JSON",
+    let req =
+        dataset_catalog::build_vision_ai_request(&genai, &prompt, &img_b64, mime_type, 0.1, 1024)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    let timeout = dataset_catalog::effective_vision_ai_timeout(&genai);
+    let resp_json = dataset_catalog::VisionAiTransport::send_json(
+        &dataset_catalog::ReqwestVisionAiTransport::new(),
+        &req,
+        timeout,
     )
-    .await?;
+    .await
+    .map_err(|e| anyhow::anyhow!(e))?;
     let annotations = parse_ai_auto_annotations(&resp_json, sample.width, sample.height)?;
     let updated = state
         .db
@@ -13186,8 +12627,7 @@ async fn api_detector_model_upload(
         }
     });
 
-    let commit_lock = acquire_state_config_commit_lock(&state);
-    let _commit_guard = commit_lock.lock().await;
+    let _commit_guard = state.config_coordinator.lock_commit().await;
     let prev_cfg = state.config.read().await.clone();
     let mut next_cfg = prev_cfg.clone();
     if let Err(err) = next_cfg.apply_structured_json(&model_patch) {
@@ -21335,9 +20775,17 @@ async fn api_camera_ptz_preset(
                             .into_response();
                     }
                 };
-                let dx = (soft.pan - cur_status.pan).clamp(-1.0, 1.0);
-                let dy = (soft.tilt - cur_status.tilt).clamp(-1.0, 1.0);
-                let dz = (soft.zoom - cur_status.zoom).clamp(-1.0, 1.0);
+                let (dx, dy, dz) = compute_soft_preset_relative_delta(
+                    f64::from(cur_status.pan),
+                    f64::from(cur_status.tilt),
+                    f64::from(cur_status.zoom),
+                    f64::from(soft.pan),
+                    f64::from(soft.tilt),
+                    f64::from(soft.zoom),
+                    0.0,
+                )
+                .map(|(x, y, z)| (x as f32, y as f32, z as f32))
+                .unwrap_or((0.0, 0.0, 0.0));
                 let rel_soap = build_onvif_relative_move_soap(
                     &resolved_prof,
                     dx,
@@ -21628,45 +21076,48 @@ async fn api_camera_ptz_preset_save(
                 }
             };
             let soft_token = validated_token.unwrap_or_else(|| preset_name.to_string());
-            {
-                let mut cfg_guard = state.config.write().await;
-                if let Some(cam_mut) = cfg_guard.cameras.get_mut(&camera) {
-                    if cam_mut.hardware.soft_presets.len() >= MAX_ONVIF_PRESETS
-                        && !cam_mut.hardware.soft_presets.contains_key(&soft_token)
-                    {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({
-                                "success": false,
-                                "camera": camera,
-                                "operation": "SetPreset",
-                                "message": format!("Maximum number of presets ({MAX_ONVIF_PRESETS}) reached")
-                            })),
-                        )
-                            .into_response();
+            let soft_token_for_mutate = soft_token.clone();
+            let preset_name_for_mutate = preset_name.to_string();
+            let cam_for_mutate = camera.clone();
+            let save_soft_res = state
+                .config_coordinator
+                .mutate_camera_and_persist(&camera, None, false, move |cfg_guard| {
+                    if let Some(cam_mut) = cfg_guard.cameras.get_mut(&cam_for_mutate) {
+                        if cam_mut.hardware.soft_presets.len() >= MAX_ONVIF_PRESETS
+                            && !cam_mut
+                                .hardware
+                                .soft_presets
+                                .contains_key(&soft_token_for_mutate)
+                        {
+                            anyhow::bail!("MAX_ONVIF_PRESETS_REACHED");
+                        }
+                        cam_mut.hardware.soft_presets.insert(
+                            soft_token_for_mutate,
+                            ninjanvr_config::CameraSoftPreset {
+                                name: preset_name_for_mutate,
+                                pan: cur_status.pan,
+                                tilt: cur_status.tilt,
+                                zoom: cur_status.zoom,
+                            },
+                        );
                     }
-                    cam_mut.hardware.soft_presets.insert(
-                        soft_token.clone(),
-                        ninjanvr_config::CameraSoftPreset {
-                            name: preset_name.to_string(),
-                            pan: cur_status.pan,
-                            tilt: cur_status.tilt,
-                            zoom: cur_status.zoom,
-                        },
-                    );
-                }
-                if let Err(err) = cfg_guard.refresh_raw_yaml() {
-                    warn!("Failed to refresh raw_yaml after saving soft preset: {err:#}");
-                }
-                let path_clone = cfg_guard.config_path.clone();
-                let yaml_clone = cfg_guard.raw_yaml.clone();
-                if let Ok(Err(err)) = tokio::task::spawn_blocking(move || {
-                    persist_config_yaml_atomically(&path_clone, &yaml_clone)
+                    Ok(())
                 })
-                .await
-                {
-                    warn!("Failed to persist config.yml after saving soft preset: {err:#}");
+                .await;
+            if let Err(err) = save_soft_res {
+                if err.to_string().contains("MAX_ONVIF_PRESETS_REACHED") {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "success": false,
+                            "camera": camera,
+                            "operation": "SetPreset",
+                            "message": format!("Maximum number of presets ({MAX_ONVIF_PRESETS}) reached")
+                        })),
+                    )
+                        .into_response();
                 }
+                warn!("Failed to persist config.yml after saving soft preset: {err:#}");
             }
             state
                 .ptz_active_presets
@@ -21720,38 +21171,33 @@ async fn api_camera_ptz_preset_delete(
     }
 
     // Check if it is a soft preset first
-    let mut removed_soft_name: Option<String> = None;
-    {
-        let mut cfg_guard = state.config.write().await;
-        if let Some(cam_mut) = cfg_guard.cameras.get_mut(&camera) {
-            if let Some(removed) = cam_mut.hardware.soft_presets.remove(clean_tok) {
-                removed_soft_name = Some(removed.name);
-            } else if let Some(found_key) = cam_mut
-                .hardware
-                .soft_presets
-                .iter()
-                .find(|(_, v)| v.name.eq_ignore_ascii_case(clean_tok))
-                .map(|(k, _)| k.clone())
-                && let Some(removed) = cam_mut.hardware.soft_presets.remove(&found_key)
-            {
-                removed_soft_name = Some(removed.name);
+    let clean_tok_owned = clean_tok.to_string();
+    let cam_for_soft = camera.clone();
+    let removed_soft_name: Option<String> = state
+        .config_coordinator
+        .mutate_camera_and_persist(&camera, None, false, move |cfg_guard| {
+            let mut removed_name = None;
+            if let Some(cam_mut) = cfg_guard.cameras.get_mut(&cam_for_soft) {
+                if let Some(removed) = cam_mut.hardware.soft_presets.remove(&clean_tok_owned) {
+                    removed_name = Some(removed.name);
+                } else if let Some(found_key) = cam_mut
+                    .hardware
+                    .soft_presets
+                    .iter()
+                    .find(|(_, v)| v.name.eq_ignore_ascii_case(&clean_tok_owned))
+                    .map(|(k, _)| k.clone())
+                    && let Some(removed) = cam_mut.hardware.soft_presets.remove(&found_key)
+                {
+                    removed_name = Some(removed.name);
+                }
             }
-        }
-        if removed_soft_name.is_some() {
-            if let Err(err) = cfg_guard.refresh_raw_yaml() {
-                warn!("Failed to refresh raw_yaml after deleting soft preset: {err:#}");
-            }
-            let path_clone = cfg_guard.config_path.clone();
-            let yaml_clone = cfg_guard.raw_yaml.clone();
-            if let Ok(Err(err)) = tokio::task::spawn_blocking(move || {
-                persist_config_yaml_atomically(&path_clone, &yaml_clone)
-            })
-            .await
-            {
-                warn!("Failed to persist config.yml after deleting soft preset: {err:#}");
-            }
-        }
-    }
+            Ok(removed_name)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            warn!("Failed to persist config.yml after deleting soft preset: {err:#}");
+            None
+        });
     if let Some(soft_name) = removed_soft_name {
         let mut active_guard = state.ptz_active_presets.write().await;
         if active_guard
@@ -21956,70 +21402,20 @@ fn resolve_camera_hardware_probe_targets(
     camera: &str,
     cam_cfg: &ninjanvr_config::CameraConfig,
 ) -> Option<CameraHardwareProbeTarget> {
-    let inferred = cfg.infer_camera_upstream(camera);
-    let (user, password) = resolve_effective_onvif_credentials(cfg, camera, cam_cfg);
-
-    if cam_cfg.onvif.is_configured() {
-        let host = cam_cfg
-            .onvif
-            .host
-            .clone()
-            .or_else(|| inferred.as_ref().map(|i| i.host.clone()))?;
-        let is_tapo_hint = inferred.as_ref().is_some_and(|i| i.is_tapo_rtsp)
-            || cam_cfg.onvif.port == 2020
-            || cam_cfg
-                .hardware
-                .protocol
-                .as_deref()
-                .and_then(find_protocol_spec_by_id_or_alias)
-                .is_some_and(|s| s.id == "tapo")
-            || runtime
-                .get_protocol(camera)
-                .as_deref()
-                .is_some_and(|p| p.eq_ignore_ascii_case("tapo"));
-        let onvif_port = if cam_cfg.onvif.port == 80 && is_tapo_hint {
-            2020
-        } else {
-            cam_cfg.onvif.port
-        };
-        let mut adjusted_onvif = cam_cfg.onvif.clone();
-        adjusted_onvif.port = onvif_port;
-        if let Some(explicit_ptz_ep) = resolve_onvif_ptz_endpoint(&adjusted_onvif) {
-            let is_dahua_hint = inferred.as_ref().is_some_and(|i| i.is_dahua_rtsp)
-                || cam_cfg
-                    .hardware
-                    .protocol
-                    .as_deref()
-                    .and_then(find_protocol_spec_by_id_or_alias)
-                    .is_some_and(|s| s.supports_dahua_cgi);
-            return Some(CameraHardwareProbeTarget {
-                host,
-                onvif_port,
-                user,
-                password,
-                is_tapo_hint,
-                is_dahua_hint,
-                ptz_ep_opt: Some(explicit_ptz_ep),
-            });
-        }
-    }
-
-    let inf = inferred?;
-    let ep_candidate = format!(
-        "http://{}:{}/onvif/ptz_service",
-        inf.host, inf.default_onvif_port
-    );
-    if !is_safe_onvif_endpoint_url(&ep_candidate) {
-        return None;
-    }
+    let target = runtime.resolve_probe_target_with_config(cfg, camera, cam_cfg);
+    let host = target.host?;
+    let ptz_ep_opt = target
+        .ptz_endpoint
+        .filter(|ep| is_safe_onvif_endpoint_url(ep));
+    ptz_ep_opt.as_ref()?;
     Some(CameraHardwareProbeTarget {
-        host: inf.host,
-        onvif_port: inf.default_onvif_port,
-        user,
-        password,
-        is_tapo_hint: inf.is_tapo_rtsp,
-        is_dahua_hint: inf.is_dahua_rtsp,
-        ptz_ep_opt: Some(ep_candidate),
+        host,
+        onvif_port: target.onvif_port,
+        user: target.user,
+        password: target.password,
+        is_tapo_hint: target.is_tapo_hint,
+        is_dahua_hint: target.is_dahua_hint,
+        ptz_ep_opt,
     })
 }
 
@@ -22675,149 +22071,173 @@ async fn api_camera_hardware_set(
         let cached_prof = state.camera_driver_runtime.get_profile(&camera, &ptz_ep);
         let cached_vs = state.camera_driver_runtime.get_video_source(&camera);
         let cached_proto = state.camera_driver_runtime.get_protocol(&camera);
-        let mut cfg_guard = state.config.write().await;
-        if let Some(cam_mut) = cfg_guard.cameras.get_mut(&camera) {
-            if body.apply_suggested_onvif == Some(true) {
-                cam_mut.onvif.host = Some(clean_host_only.clone());
-                cam_mut.onvif.port = onvif_port;
-                if cam_mut.onvif.user.is_none() {
-                    cam_mut.onvif.user = user_opt.clone();
-                }
-                if cam_mut.onvif.password.is_none() {
-                    cam_mut.onvif.password = pass_opt.clone();
-                }
-                if cam_mut.hardware.profile_token.is_none() {
-                    cam_mut.hardware.profile_token = Some(
-                        body.profile_token
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .or(cached_prof)
-                            .unwrap_or_else(|| {
-                                if is_tapo_hint {
-                                    "profile_1".to_string()
-                                } else {
-                                    "Profile000".to_string()
+        let cam_name_for_hw = camera.clone();
+        let user_for_hw = user_opt.clone();
+        let pass_for_hw = pass_opt.clone();
+        let body_apply_onvif = body.apply_suggested_onvif;
+        let body_apply_sub = body.apply_suggested_substream;
+        let body_proto = body.protocol.clone();
+        let body_prof = body.profile_token.clone();
+        let body_vs = body.video_source_token.clone();
+        let body_cp = body.cloud_password.clone();
+
+        match state
+            .config_coordinator
+            .mutate_camera_and_persist(
+                &camera,
+                Some(&state.camera_driver_runtime),
+                true,
+                move |cfg_guard| {
+                    let mut ops = Vec::new();
+                    let mut updated_cam = None;
+                    if let Some(cam_mut) = cfg_guard.cameras.get_mut(&cam_name_for_hw) {
+                        if body_apply_onvif == Some(true) {
+                            cam_mut.onvif.host = Some(clean_host_only.clone());
+                            cam_mut.onvif.port = onvif_port;
+                            if cam_mut.onvif.user.is_none() {
+                                cam_mut.onvif.user = user_for_hw.clone();
+                            }
+                            if cam_mut.onvif.password.is_none() {
+                                cam_mut.onvif.password = pass_for_hw.clone();
+                            }
+                            if cam_mut.hardware.profile_token.is_none() {
+                                cam_mut.hardware.profile_token = Some(
+                                    body_prof
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .or(cached_prof)
+                                        .unwrap_or_else(|| {
+                                            if is_tapo_hint {
+                                                "profile_1".to_string()
+                                            } else {
+                                                "Profile000".to_string()
+                                            }
+                                        }),
+                                );
+                            }
+                            if cam_mut.hardware.video_source_token.is_none() {
+                                cam_mut.hardware.video_source_token = Some(
+                                    body_vs
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .or(cached_vs)
+                                        .unwrap_or_else(|| {
+                                            if is_tapo_hint {
+                                                "raw_vs1".to_string()
+                                            } else {
+                                                "VideoSource000".to_string()
+                                            }
+                                        }),
+                                );
+                            }
+                            if cam_mut.hardware.protocol.is_none() {
+                                cam_mut.hardware.protocol = Some(
+                                    body_proto
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .or_else(|| cached_proto.clone())
+                                        .unwrap_or_else(|| {
+                                            if is_tapo_hint {
+                                                "tapo".to_string()
+                                            } else if is_dahua_hint {
+                                                "dahua_cgi".to_string()
+                                            } else {
+                                                "onvif".to_string()
+                                            }
+                                        }),
+                                );
+                            }
+                            ops.push("apply_suggested_onvif".to_string());
+                        }
+                        if let Some(ref proto) = body_proto {
+                            let t = proto.trim();
+                            cam_mut.hardware.protocol = if t.is_empty() {
+                                None
+                            } else {
+                                Some(t.to_string())
+                            };
+                        }
+                        if let Some(ref pt) = body_prof {
+                            let t = pt.trim();
+                            cam_mut.hardware.profile_token = if t.is_empty() {
+                                None
+                            } else {
+                                Some(t.to_string())
+                            };
+                        }
+                        if let Some(ref vst) = body_vs {
+                            let t = vst.trim();
+                            cam_mut.hardware.video_source_token = if t.is_empty() {
+                                None
+                            } else {
+                                Some(t.to_string())
+                            };
+                        }
+                        if let Some(ref cp) = body_cp {
+                            let trimmed_cp = cp.trim();
+                            if trimmed_cp.is_empty() {
+                                cam_mut.hardware.cloud_password = None;
+                            } else if trimmed_cp != "***" && trimmed_cp != "*" {
+                                cam_mut.hardware.cloud_password = Some(trimmed_cp.to_string());
+                            }
+                            ops.push("cloud_password".to_string());
+                        }
+                        if body_apply_sub == Some(true) {
+                            let sub_path = if is_tapo_hint {
+                                "/stream2#transport=tcp#timeout=10"
+                            } else {
+                                "/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif#transport=tcp#timeout=10"
+                            };
+                            let userinfo_prefix = match (&user_for_hw, &pass_for_hw) {
+                                (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => format!(
+                                    "{}:{}@",
+                                    encode_rtsp_userinfo_part(u),
+                                    encode_rtsp_userinfo_part(p)
+                                ),
+                                (Some(u), _) if !u.is_empty() => {
+                                    format!("{}@", encode_rtsp_userinfo_part(u))
                                 }
-                            }),
-                    );
-                }
-                if cam_mut.hardware.video_source_token.is_none() {
-                    cam_mut.hardware.video_source_token = Some(
-                        body.video_source_token
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .or(cached_vs)
-                            .unwrap_or_else(|| {
-                                if is_tapo_hint {
-                                    "raw_vs1".to_string()
-                                } else {
-                                    "VideoSource000".to_string()
+                                _ => String::new(),
+                            };
+                            let sub_url =
+                                format!("rtsp://{userinfo_prefix}{clean_host_only}:554{sub_path}");
+                            let sub_key = format!("{cam_name_for_hw}_sub");
+                            for inp in &mut cam_mut.ffmpeg.inputs {
+                                if inp.roles.len() == 1 && inp.roles[0] == "detect" {
+                                    inp.path = format!("rtsp://127.0.0.1:8554/{sub_key}");
                                 }
-                            }),
-                    );
-                }
-                if cam_mut.hardware.protocol.is_none() {
-                    cam_mut.hardware.protocol = Some(
-                        body.protocol
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .or_else(|| cached_proto.clone())
-                            .unwrap_or_else(|| {
-                                if is_tapo_hint {
-                                    "tapo".to_string()
-                                } else if is_dahua_hint {
-                                    "dahua_cgi".to_string()
-                                } else {
-                                    "onvif".to_string()
-                                }
-                            }),
-                    );
-                }
-                applied_ops.push("apply_suggested_onvif".to_string());
-            }
-            if let Some(ref proto) = body.protocol {
-                let t = proto.trim();
-                cam_mut.hardware.protocol = if t.is_empty() {
-                    None
-                } else {
-                    Some(t.to_string())
-                };
-            }
-            if let Some(ref pt) = body.profile_token {
-                let t = pt.trim();
-                cam_mut.hardware.profile_token = if t.is_empty() {
-                    None
-                } else {
-                    Some(t.to_string())
-                };
-            }
-            if let Some(ref vst) = body.video_source_token {
-                let t = vst.trim();
-                cam_mut.hardware.video_source_token = if t.is_empty() {
-                    None
-                } else {
-                    Some(t.to_string())
-                };
-            }
-            if let Some(ref cp) = body.cloud_password {
-                let trimmed_cp = cp.trim();
-                if trimmed_cp.is_empty() {
-                    cam_mut.hardware.cloud_password = None;
-                } else if trimmed_cp != "***" && trimmed_cp != "*" {
-                    cam_mut.hardware.cloud_password = Some(trimmed_cp.to_string());
-                }
-                applied_ops.push("cloud_password".to_string());
-            }
-            if body.apply_suggested_substream == Some(true) {
-                let sub_path = if is_tapo_hint {
-                    "/stream2#transport=tcp#timeout=10"
-                } else {
-                    "/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif#transport=tcp#timeout=10"
-                };
-                let userinfo_prefix = match (&user_opt, &pass_opt) {
-                    (Some(u), Some(p)) if !u.is_empty() && !p.is_empty() => format!(
-                        "{}:{}@",
-                        encode_rtsp_userinfo_part(u),
-                        encode_rtsp_userinfo_part(p)
-                    ),
-                    (Some(u), _) if !u.is_empty() => format!("{}@", encode_rtsp_userinfo_part(u)),
-                    _ => String::new(),
-                };
-                let sub_url = format!("rtsp://{userinfo_prefix}{clean_host_only}:554{sub_path}");
-                let sub_key = format!("{camera}_sub");
-                for inp in &mut cam_mut.ffmpeg.inputs {
-                    if inp.roles.len() == 1 && inp.roles[0] == "detect" {
-                        inp.path = format!("rtsp://127.0.0.1:8554/{sub_key}");
+                            }
+                            updated_cam = Some(cam_mut.clone());
+                            cfg_guard
+                                .go2rtc
+                                .streams
+                                .insert(sub_key, Value::Array(vec![Value::String(sub_url)]));
+                            ops.push("apply_suggested_substream".to_string());
+                        } else {
+                            updated_cam = Some(cam_mut.clone());
+                        }
                     }
-                }
-                cam_cfg = cam_mut.clone();
-                cfg_guard
-                    .go2rtc
-                    .streams
-                    .insert(sub_key, Value::Array(vec![Value::String(sub_url)]));
-                applied_ops.push("apply_suggested_substream".to_string());
-            } else {
-                cam_cfg = cam_mut.clone();
-            }
-        }
-        if let Err(err) = cfg_guard.refresh_raw_yaml() {
-            warn!("Failed to refresh raw_yaml after hardware config update: {err:#}");
-        }
-        let path_clone = cfg_guard.config_path.clone();
-        let yaml_clone = cfg_guard.raw_yaml.clone();
-        let _ = cfg_guard.write_go2rtc_config(ninjanvr_config::DEFAULT_GO2RTC_SHM_PATH);
-        if let Ok(Err(err)) = tokio::task::spawn_blocking(move || {
-            persist_config_yaml_atomically(&path_clone, &yaml_clone)
-        })
-        .await
+                    Ok((updated_cam, ops))
+                },
+            )
+            .await
         {
-            warn!("Failed to persist config.yml after hardware config update: {err:#}");
+            Ok((Some(updated), ops)) => {
+                cam_cfg = updated;
+                applied_ops.extend(ops);
+            }
+            Ok((None, ops)) => {
+                applied_ops.extend(ops);
+            }
+            Err(err) => {
+                warn!("Failed to persist config.yml after hardware config update: {err:#}");
+            }
         }
     }
 
@@ -25663,8 +25083,10 @@ pub async fn new_app_state(
         web_dir
     };
 
+    let config_coordinator = ConfigCoordinator::new(shared_cfg.clone());
     let state = AppState {
         config: shared_cfg,
+        config_coordinator,
         db,
         comms,
         go2rtc_supervisor,
