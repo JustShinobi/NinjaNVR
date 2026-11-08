@@ -32,6 +32,8 @@ pub struct CameraProtocolSpec {
     pub native_substream_template: Option<&'static str>,
     pub default_talkback_mode: Option<&'static str>,
     pub supports_dahua_cgi: bool,
+    pub supports_onvif_system_log: bool,
+    pub supports_onvif_pull_events: bool,
     pub pan_tilt_only_default: bool,
 }
 
@@ -53,6 +55,8 @@ pub const CAMERA_PROTOCOL_REGISTRY: &[CameraProtocolSpec] = &[
         native_substream_template: Some("rtsp://*:*@{host}:554/stream2#transport=tcp#timeout=10"),
         default_talkback_mode: None,
         supports_dahua_cgi: false,
+        supports_onvif_system_log: false,
+        supports_onvif_pull_events: true,
         pan_tilt_only_default: true,
     },
     CameraProtocolSpec {
@@ -73,6 +77,8 @@ pub const CAMERA_PROTOCOL_REGISTRY: &[CameraProtocolSpec] = &[
         ),
         default_talkback_mode: Some("cgi_alaw"),
         supports_dahua_cgi: true,
+        supports_onvif_system_log: false,
+        supports_onvif_pull_events: false,
         pan_tilt_only_default: true,
     },
     CameraProtocolSpec {
@@ -93,6 +99,8 @@ pub const CAMERA_PROTOCOL_REGISTRY: &[CameraProtocolSpec] = &[
         ),
         default_talkback_mode: None,
         supports_dahua_cgi: false,
+        supports_onvif_system_log: true,
+        supports_onvif_pull_events: true,
         pan_tilt_only_default: false,
     },
     CameraProtocolSpec {
@@ -113,6 +121,8 @@ pub const CAMERA_PROTOCOL_REGISTRY: &[CameraProtocolSpec] = &[
         ),
         default_talkback_mode: None,
         supports_dahua_cgi: false,
+        supports_onvif_system_log: true,
+        supports_onvif_pull_events: true,
         pan_tilt_only_default: false,
     },
     CameraProtocolSpec {
@@ -131,6 +141,8 @@ pub const CAMERA_PROTOCOL_REGISTRY: &[CameraProtocolSpec] = &[
         native_substream_template: None,
         default_talkback_mode: None,
         supports_dahua_cgi: false,
+        supports_onvif_system_log: true,
+        supports_onvif_pull_events: true,
         pan_tilt_only_default: false,
     },
     CameraProtocolSpec {
@@ -149,6 +161,8 @@ pub const CAMERA_PROTOCOL_REGISTRY: &[CameraProtocolSpec] = &[
         native_substream_template: None,
         default_talkback_mode: None,
         supports_dahua_cgi: false,
+        supports_onvif_system_log: true,
+        supports_onvif_pull_events: true,
         pan_tilt_only_default: false,
     },
     CameraProtocolSpec {
@@ -167,6 +181,8 @@ pub const CAMERA_PROTOCOL_REGISTRY: &[CameraProtocolSpec] = &[
         native_substream_template: None,
         default_talkback_mode: None,
         supports_dahua_cgi: false,
+        supports_onvif_system_log: false,
+        supports_onvif_pull_events: false,
         pan_tilt_only_default: false,
     },
 ];
@@ -336,6 +352,8 @@ pub const DAHUA_CGI_PROBE_TABLES: &[&str] = &[
     "AudioDetect",
     "AudioOutputVolume",
     "AudioInputVolume",
+    "Syslog",
+    "AutoMaintain",
 ];
 
 /// Parses a Dahua/Intelbras `configManager.cgi?action=getConfig&name=<table>` key-value map
@@ -440,6 +458,49 @@ pub fn apply_dahua_cgi_table_to_state(
                 state_map.insert("microphone_volume".to_string(), json!(vol));
             }
         }
+        "Syslog" => {
+            if let Some(en) = kv.get("table.Syslog.Enable") {
+                state_map.insert(
+                    "syslog_enabled".to_string(),
+                    json!(en.eq_ignore_ascii_case("true")),
+                );
+            }
+            if let Some(srv) = kv.get("table.Syslog.Server") {
+                state_map.insert("syslog_server".to_string(), json!(srv));
+            }
+            if let Some(port) = kv
+                .get("table.Syslog.Port")
+                .and_then(|s| s.parse::<u16>().ok())
+            {
+                state_map.insert("syslog_port".to_string(), json!(port));
+            }
+        }
+        "AutoMaintain" => {
+            if let Some(en) = kv.get("table.AutoMaintain.AutoRebootEnable") {
+                state_map.insert(
+                    "auto_reboot_enabled".to_string(),
+                    json!(en.eq_ignore_ascii_case("true")),
+                );
+            }
+            if let Some(day) = kv
+                .get("table.AutoMaintain.AutoRebootDay")
+                .and_then(|s| s.parse::<i8>().ok())
+            {
+                state_map.insert("auto_reboot_day".to_string(), json!(day));
+            }
+            if let Some(hr) = kv
+                .get("table.AutoMaintain.AutoRebootHour")
+                .and_then(|s| s.parse::<u8>().ok())
+            {
+                state_map.insert("auto_reboot_hour".to_string(), json!(hr));
+            }
+            if let Some(min) = kv
+                .get("table.AutoMaintain.AutoRebootMinute")
+                .and_then(|s| s.parse::<u8>().ok())
+            {
+                state_map.insert("auto_reboot_minute".to_string(), json!(min));
+            }
+        }
         _ => {}
     }
 }
@@ -464,6 +525,13 @@ pub struct CameraHardwareUpdateBody {
     pub audio_sensitivity: Option<u8>,
     pub speaker_volume: Option<u8>,
     pub microphone_volume: Option<u8>,
+    pub syslog_enabled: Option<bool>,
+    pub syslog_server: Option<String>,
+    pub syslog_port: Option<u16>,
+    pub auto_reboot_enabled: Option<bool>,
+    pub auto_reboot_day: Option<i8>,
+    pub auto_reboot_hour: Option<u8>,
+    pub auto_reboot_minute: Option<u8>,
     pub reboot: Option<bool>,
     pub apply_suggested_onvif: Option<bool>,
     pub apply_suggested_substream: Option<bool>,
@@ -555,6 +623,44 @@ pub fn build_dahua_cgi_set_config_pairs(body: &CameraHardwareUpdateBody) -> Vec<
     }
     if let Some(mvol) = body.microphone_volume {
         cgi_pairs.push(format!("AudioInputVolume[0]={}", mvol.min(100)));
+    }
+    if let Some(sys_en) = body.syslog_enabled {
+        cgi_pairs.push(format!(
+            "Syslog.Enable={}",
+            if sys_en { "true" } else { "false" }
+        ));
+    }
+    if let Some(ref sys_srv) = body.syslog_server {
+        let clean: String = sys_srv
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
+            .take(128)
+            .collect();
+        if !clean.is_empty() {
+            cgi_pairs.push(format!("Syslog.Server={clean}"));
+        }
+    }
+    if let Some(sys_port) = body.syslog_port {
+        cgi_pairs.push(format!("Syslog.Port={}", sys_port.max(1)));
+    }
+    if let Some(ar_en) = body.auto_reboot_enabled {
+        cgi_pairs.push(format!(
+            "AutoMaintain.AutoRebootEnable={}",
+            if ar_en { "true" } else { "false" }
+        ));
+    }
+    if let Some(ar_day) = body.auto_reboot_day {
+        cgi_pairs.push(format!(
+            "AutoMaintain.AutoRebootDay={}",
+            ar_day.clamp(-1, 7)
+        ));
+    }
+    if let Some(ar_hr) = body.auto_reboot_hour {
+        cgi_pairs.push(format!("AutoMaintain.AutoRebootHour={}", ar_hr.min(23)));
+    }
+    if let Some(ar_min) = body.auto_reboot_minute {
+        cgi_pairs.push(format!("AutoMaintain.AutoRebootMinute={}", ar_min.min(59)));
     }
     cgi_pairs
 }
@@ -2292,6 +2398,321 @@ pub fn convert_pcm16le_or_wav_to_alaw(input: &[u8]) -> Vec<u8> {
     out
 }
 
+pub fn build_onvif_get_system_log_soap(
+    log_type: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    let safe_type = if log_type.eq_ignore_ascii_case("access") {
+        "Access"
+    } else {
+        "System"
+    };
+    let body = format!(
+        "<tds:GetSystemLog xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\"><tds:LogType>{safe_type}</tds:LogType></tds:GetSystemLog>"
+    );
+    build_onvif_soap_envelope(&body, user, password)
+}
+
+pub fn parse_onvif_system_log_xml(xml: &str) -> Vec<String> {
+    let Some(raw) = extract_xml_element_text(xml, "String") else {
+        return Vec::new();
+    };
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(200)
+        .map(|l| scrub_rtsp_credentials(l).chars().take(512).collect())
+        .collect()
+}
+
+pub fn build_onvif_create_pull_point_soap(user: Option<&str>, password: Option<&str>) -> String {
+    build_onvif_soap_envelope(
+        "<tev:CreatePullPointSubscription xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\"><tev:InitialTerminationTime>PT30S</tev:InitialTerminationTime></tev:CreatePullPointSubscription>",
+        user,
+        password,
+    )
+}
+
+pub fn build_onvif_pull_messages_soap(user: Option<&str>, password: Option<&str>) -> String {
+    build_onvif_soap_envelope(
+        "<tev:PullMessages xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\"><tev:Timeout>PT1S</tev:Timeout><tev:MessageLimit>16</tev:MessageLimit></tev:PullMessages>",
+        user,
+        password,
+    )
+}
+
+pub fn build_onvif_unsubscribe_soap(user: Option<&str>, password: Option<&str>) -> String {
+    build_onvif_soap_envelope(
+        "<wsnt:Unsubscribe xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\"/>",
+        user,
+        password,
+    )
+}
+
+pub fn parse_onvif_pull_messages_xml(xml: &str) -> (Option<String>, Vec<String>) {
+    let cur_time = extract_xml_element_text(xml, "CurrentTime")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.contains('<'))
+        .map(str::to_string);
+    let mut events = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = xml[cursor..].find("NotificationMessage") {
+        let start = cursor + rel;
+        let Some((close_rel, close_end_rel)) =
+            find_closing_xml_tag_offset(&xml[start..], "NotificationMessage")
+        else {
+            break;
+        };
+        let block = &xml[start..start + close_rel];
+        let topic = extract_xml_element_text(block, "Topic")
+            .map(str::trim)
+            .unwrap_or("Event");
+        let mut kv_parts = Vec::new();
+        let mut sc = 0usize;
+        while let Some(s_rel) = block[sc..].find("SimpleItem") {
+            let s_idx = sc + s_rel;
+            let Some(gt) = block[s_idx..].find('>') else {
+                break;
+            };
+            let tag = &block[s_idx..s_idx + gt];
+            if let (Some(n), Some(v)) = (
+                extract_xml_attr(tag, "Name"),
+                extract_xml_attr(tag, "Value"),
+            ) {
+                kv_parts.push(format!("{n}={v}"));
+            }
+            sc = s_idx + gt + 1;
+        }
+        let summary = if kv_parts.is_empty() {
+            format!("ONVIF Event: {topic}")
+        } else {
+            format!("ONVIF Event: {topic} ({})", kv_parts.join(", "))
+        };
+        events.push(summary);
+        if events.len() >= 32 {
+            break;
+        }
+        cursor = (start + close_end_rel).min(xml.len());
+    }
+    (cur_time, events)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CameraDiagnosticReport {
+    pub camera: String,
+    pub online: bool,
+    pub protocol_family: String,
+    pub sources_queried: Vec<String>,
+    pub lines: Vec<String>,
+}
+
+/// Queries supported camera log and event diagnostic channels (`ONVIF GetDeviceInformation`,
+/// `ONVIF GetSystemLog`, `ONVIF PullPointSubscription`, and `Dahua CGI` diagnostics/syslog status)
+/// according to the camera's `CameraProtocolSpec`.
+pub async fn collect_camera_diagnostic_logs(
+    client: &reqwest::Client,
+    runtime: &CameraDriverRuntime,
+    camera: &str,
+    (host, onvif_port): (&str, u16),
+    (user, pass): (Option<&str>, Option<&str>),
+    spec: &CameraProtocolSpec,
+    timeout: Duration,
+) -> CameraDiagnosticReport {
+    let mut lines: Vec<String> = Vec::new();
+    let mut sources: Vec<String> = Vec::new();
+    let mut online = false;
+
+    let onvif_base = format_camera_http_base(host, onvif_port);
+    let dev_ep = format!("{onvif_base}/onvif/device_service");
+
+    // 1. ONVIF Device Identity
+    let dev_soap = build_onvif_get_device_info_soap(user, pass);
+    if let Ok(xml) = send_onvif_soap_request_with_ns(
+        client,
+        &dev_ep,
+        (
+            "http://www.onvif.org/ver10/device/wsdl",
+            "GetDeviceInformation",
+        ),
+        dev_soap,
+        (user, pass),
+        timeout,
+    )
+    .await
+    {
+        online = true;
+        sources.push("onvif:GetDeviceInformation".to_string());
+        let info = parse_onvif_device_info_xml(&xml);
+        lines.push(format!(
+            "[onvif/device] Manufacturer={} Model={} Firmware={} HardwareId={}",
+            info.manufacturer.as_deref().unwrap_or("unknown"),
+            info.model.as_deref().unwrap_or("unknown"),
+            info.firmware.as_deref().unwrap_or("unknown"),
+            info.hardware_id.as_deref().unwrap_or("unknown"),
+        ));
+    }
+
+    // 2. ONVIF GetSystemLog (for protocols that support it: Hikvision ISAPI, Axis, Reolink, Standard ONVIF)
+    if spec.supports_onvif_system_log {
+        let log_soap = build_onvif_get_system_log_soap("System", user, pass);
+        if let Ok(xml) = send_onvif_soap_request_with_ns(
+            client,
+            &dev_ep,
+            ("http://www.onvif.org/ver10/device/wsdl", "GetSystemLog"),
+            log_soap,
+            (user, pass),
+            timeout,
+        )
+        .await
+        {
+            online = true;
+            sources.push("onvif:GetSystemLog".to_string());
+            for l in parse_onvif_system_log_xml(&xml) {
+                lines.push(format!("[onvif/syslog] {l}"));
+            }
+        }
+    }
+
+    // 3. ONVIF PullPoint Event Subscription (Tapo C200 :2020/onvif/service and ONVIF Profile S/T)
+    if spec.supports_onvif_pull_events {
+        let ev_ep = if spec.id == "tapo" {
+            format!("{onvif_base}/onvif/service")
+        } else {
+            format!("{onvif_base}/onvif/event_service")
+        };
+        let sub_soap = build_onvif_create_pull_point_soap(user, pass);
+        if let Ok(sub_xml) = send_onvif_soap_request_with_ns(
+            client,
+            &ev_ep,
+            (
+                "http://www.onvif.org/ver10/events/wsdl/EventPortType",
+                "CreatePullPointSubscriptionRequest",
+            ),
+            sub_soap,
+            (user, pass),
+            timeout,
+        )
+        .await
+        {
+            online = true;
+            sources.push("onvif:PullPointEvents".to_string());
+            if let Some(sub_addr) = extract_xml_element_text(&sub_xml, "Address")
+                .map(str::trim)
+                .filter(|u| is_safe_onvif_endpoint_url(u))
+            {
+                let pull_soap = build_onvif_pull_messages_soap(user, pass);
+                if let Ok(pull_xml) = send_onvif_soap_request_with_ns(
+                    client,
+                    sub_addr,
+                    (
+                        "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription",
+                        "PullMessagesRequest",
+                    ),
+                    pull_soap,
+                    (user, pass),
+                    timeout,
+                )
+                .await
+                {
+                    let (cam_clock, ev_list) = parse_onvif_pull_messages_xml(&pull_xml);
+                    if let Some(clk) = cam_clock {
+                        lines.push(format!(
+                            "[onvif/pullpoint] Subscription active (camera clock={clk}, pending_events={})",
+                            ev_list.len()
+                        ));
+                    }
+                    for ev in ev_list {
+                        lines.push(format!("[onvif/event] {ev}"));
+                    }
+                }
+                // Always Unsubscribe immediately so no subscription slot is leaked on the camera
+                let unsub_soap = build_onvif_unsubscribe_soap(user, pass);
+                let _ = send_onvif_soap_request_with_ns(
+                    client,
+                    sub_addr,
+                    (
+                        "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager",
+                        "UnsubscribeRequest",
+                    ),
+                    unsub_soap,
+                    (user, pass),
+                    Duration::from_secs(2),
+                )
+                .await;
+            }
+        }
+    }
+
+    // 4. Dahua / Intelbras HTTP Digest CGI diagnostics & event/syslog state
+    if spec.supports_dahua_cgi {
+        let cgi_port = if onvif_port != 2020 { onvif_port } else { 80 };
+        let cgi_base = format_camera_http_base(host, cgi_port);
+        for (label, path) in [
+            ("cgi/system", "/cgi-bin/magicBox.cgi?action=getSystemInfo"),
+            (
+                "cgi/version",
+                "/cgi-bin/magicBox.cgi?action=getSoftwareVersion",
+            ),
+            ("cgi/clock", "/cgi-bin/global.cgi?action=getCurrentTime"),
+            (
+                "cgi/syslog",
+                "/cgi-bin/configManager.cgi?action=getConfig&name=Syslog",
+            ),
+            (
+                "cgi/automaintain",
+                "/cgi-bin/configManager.cgi?action=getConfig&name=AutoMaintain",
+            ),
+            (
+                "cgi/events",
+                "/cgi-bin/eventManager.cgi?action=getEventIndexes&code=VideoMotion",
+            ),
+        ] {
+            let url = format!("{cgi_base}{path}");
+            if let Ok((StatusCode::OK, txt)) = send_http_digest_request(
+                client,
+                runtime,
+                reqwest::Method::GET,
+                &url,
+                (user, pass),
+                (None, None),
+                timeout,
+            )
+            .await
+            {
+                online = true;
+                if !sources.contains(&"dahua_cgi".to_string()) {
+                    sources.push("dahua_cgi".to_string());
+                }
+                let compact: Vec<String> = txt
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("Error"))
+                    .map(scrub_rtsp_credentials)
+                    .collect();
+                if !compact.is_empty() {
+                    lines.push(format!("[{label}] {}", compact.join(" | ")));
+                }
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(format!(
+            "[diagnostic] Camera '{camera}' ({}) did not return any log or event lines (online={online})",
+            spec.id
+        ));
+    }
+
+    CameraDiagnosticReport {
+        camera: camera.to_string(),
+        online,
+        protocol_family: spec.id.to_string(),
+        sources_queried: sources,
+        lines,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2334,5 +2755,45 @@ mod tests {
         );
         assert!(rt.get_video_source("sala").is_none());
         assert!(rt.get_protocol("sala").is_none());
+
+        // Test ONVIF GetSystemLog & PullPoint XML parsers and Dahua CGI Syslog/AutoMaintain encoders
+        let syslog_xml = r#"<s:Envelope><s:Body><tds:GetSystemLogResponse><tds:SystemLog><tt:String>2026-11-08 00:01:02 [rtsp] client connected rtsp://admin:secret@192.0.2.10:554/stream1
+2026-11-08 00:02:00 [ptz] move completed</tt:String></tds:SystemLog></tds:GetSystemLogResponse></s:Body></s:Envelope>"#;
+        let parsed_logs = parse_onvif_system_log_xml(syslog_xml);
+        assert_eq!(parsed_logs.len(), 2);
+        assert!(parsed_logs[0].contains("rtsp://*:*@192.0.2.10:554/stream1"));
+
+        let pull_xml = r#"<SOAP-ENV:Envelope><SOAP-ENV:Body><tev:PullMessagesResponse><tev:CurrentTime>2026-11-08T03:12:10Z</tev:CurrentTime><wsnt:NotificationMessage><wsnt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</wsnt:Topic><wsnt:Message><tt:Message><tt:Data><tt:SimpleItem Name="IsMotion" Value="true"/></tt:Data></tt:Message></wsnt:Message></wsnt:NotificationMessage></tev:PullMessagesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>"#;
+        let (clk, evs) = parse_onvif_pull_messages_xml(pull_xml);
+        assert_eq!(clk.as_deref(), Some("2026-11-08T03:12:10Z"));
+        assert_eq!(
+            evs,
+            vec!["ONVIF Event: tns1:RuleEngine/CellMotionDetector/Motion (IsMotion=true)"]
+        );
+
+        let mut st_map = Map::new();
+        let syslog_kv = parse_dahua_cgi_kv(
+            "table.Syslog.Enable=true\r\ntable.Syslog.Server=192.0.2.1\r\ntable.Syslog.Port=514\r\n",
+        );
+        apply_dahua_cgi_table_to_state("Syslog", &syslog_kv, &mut st_map);
+        assert_eq!(st_map["syslog_enabled"], json!(true));
+        assert_eq!(st_map["syslog_server"], json!("192.0.2.1"));
+        assert_eq!(st_map["syslog_port"], json!(514));
+
+        let pairs = build_dahua_cgi_set_config_pairs(&CameraHardwareUpdateBody {
+            syslog_enabled: Some(true),
+            syslog_server: Some("192.0.2.99".to_string()),
+            syslog_port: Some(5514),
+            auto_reboot_enabled: Some(true),
+            auto_reboot_day: Some(2),
+            auto_reboot_hour: Some(4),
+            auto_reboot_minute: Some(30),
+            ..Default::default()
+        });
+        assert!(pairs.contains(&"Syslog.Enable=true".to_string()));
+        assert!(pairs.contains(&"Syslog.Server=192.0.2.99".to_string()));
+        assert!(pairs.contains(&"Syslog.Port=5514".to_string()));
+        assert!(pairs.contains(&"AutoMaintain.AutoRebootEnable=true".to_string()));
+        assert!(pairs.contains(&"AutoMaintain.AutoRebootHour=4".to_string()));
     }
 }

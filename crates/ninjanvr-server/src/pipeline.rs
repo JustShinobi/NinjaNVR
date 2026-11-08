@@ -1006,6 +1006,11 @@ impl VisionPipeline {
                                 &format!("ninjanvr.camera.{camera}"),
                                 "Camera stream reconnected (ONLINE)",
                             );
+                            self.log_hub.push_camera(
+                                &camera,
+                                "INFO",
+                                "Camera stream reconnected (ONLINE)",
+                            );
                         }
                     }
 
@@ -1526,6 +1531,11 @@ impl VisionPipeline {
                     &format!("ninjanvr.camera.{camera}"),
                     "Camera stream disconnected (OFFLINE)",
                 );
+                self.log_hub.push_camera(
+                    &camera,
+                    "WARNING",
+                    "Camera stream disconnected (OFFLINE)",
+                );
             }
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
@@ -1542,6 +1552,11 @@ impl VisionPipeline {
                         self.log_hub.push_ninjanvr(
                             "WARNING",
                             &format!("ninjanvr.camera.{camera}"),
+                            "RTSP stream stalled for 3 consecutive cycles; triggered automatic ONVIF/CGI SystemReboot recovery",
+                        );
+                        self.log_hub.push_camera(
+                            &camera,
+                            "WARNING",
                             "RTSP stream stalled for 3 consecutive cycles; triggered automatic ONVIF/CGI SystemReboot recovery",
                         );
                         warn!(

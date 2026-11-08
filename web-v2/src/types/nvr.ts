@@ -220,6 +220,9 @@ export interface CameraHardwareCapabilities {
   siren_on_event: boolean;
   audio_anomaly_detect: boolean;
   audio_volume: boolean;
+  camera_logs?: boolean;
+  remote_syslog?: boolean;
+  scheduled_reboot?: boolean;
   reboot: boolean;
 }
 
@@ -242,6 +245,21 @@ export interface CameraHardwareState {
   audio_sensitivity?: number;
   speaker_volume?: number;
   microphone_volume?: number;
+  syslog_enabled?: boolean;
+  syslog_server?: string;
+  syslog_port?: number;
+  auto_reboot_enabled?: boolean;
+  auto_reboot_day?: number;
+  auto_reboot_hour?: number;
+  auto_reboot_minute?: number;
+}
+
+export interface CameraDiagnosticReport {
+  camera: string;
+  online: boolean;
+  protocol_family: string;
+  sources_queried: string[];
+  lines: string[];
 }
 
 export interface CameraSuggestedConfig {

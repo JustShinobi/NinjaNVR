@@ -443,8 +443,8 @@ export function buildClientFallbackHeuristics(
 
 interface SystemWorkspaceProps {
   cameraNames: string[];
-  logService: "ninjanvr" | "go2rtc" | "nginx";
-  setLogService: (svc: "ninjanvr" | "go2rtc" | "nginx") => void;
+  logService: "ninjanvr" | "go2rtc" | "nginx" | "cameras";
+  setLogService: (svc: "ninjanvr" | "go2rtc" | "nginx" | "cameras") => void;
   logLines: string[];
   logSearch: string;
   setLogSearch: (q: string) => void;
@@ -1102,7 +1102,7 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 {isPt ? "ALERTAS" : "ALERTS"} ({heuristicAlerts.length})
               </span>
             </button>
-            {(["ninjanvr", "go2rtc", "nginx"] as const).map((svc) => (
+            {(["ninjanvr", "go2rtc", "nginx", "cameras"] as const).map((svc) => (
               <button
                 key={svc}
                 type="button"
@@ -1113,6 +1113,13 @@ export const SystemWorkspace: React.FC<SystemWorkspaceProps> = ({
                 onClick={() => {
                   setRightMode("logs");
                   setLogService(svc);
+                  if (svc === "cameras") {
+                    for (const cam of cameraNames) {
+                      void fetch(`/api/${encodeURIComponent(cam)}/logs?timeout_ms=2500`, {
+                        credentials: "include",
+                      }).catch(() => {});
+                    }
+                  }
                 }}
               >
                 {svc.toUpperCase()}

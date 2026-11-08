@@ -4,6 +4,7 @@ import { SupportedLocale, useI18n } from "../../i18n";
 import { useNvrStore } from "../../store/useNvrStore";
 import {
   CameraConfig,
+  CameraDiagnosticReport,
   CameraHardwareInfoResponse,
   FfprobeItem,
   NinjaConfigResponse,
@@ -711,6 +712,37 @@ export const ChannelsStreamsSection: React.FC<{
   const probeAbortRef = React.useRef<AbortController | null>(null);
   const inspectorCamRef = React.useRef(inspectorCam);
   inspectorCamRef.current = inspectorCam;
+  const [camLogsBusy, setCamLogsBusy] = useState(false);
+  const [camLogsReport, setCamLogsReport] =
+    useState<CameraDiagnosticReport | null>(null);
+
+  const handleFetchCameraLogs = async () => {
+    const targetCam = inspectorCam;
+    if (!targetCam || camLogsBusy) return;
+    setCamLogsBusy(true);
+    try {
+      const res = await fetch(
+        `/api/${encodeURIComponent(targetCam)}/logs?timeout_ms=4000`,
+        { credentials: "include" }
+      );
+      const data = (await res.json().catch(() => null)) as CameraDiagnosticReport | null;
+      if (inspectorCamRef.current !== targetCam) return;
+      if (res.ok && data) {
+        setCamLogsReport(data);
+        notify(
+          isPt
+            ? `Coletadas ${data.lines.length} linha(s) de diagnóstico de '${targetCam}'`
+            : `Collected ${data.lines.length} diagnostic line(s) from '${targetCam}'`
+        );
+      }
+    } catch {
+      // ignore
+    } finally {
+      if (inspectorCamRef.current === targetCam) {
+        setCamLogsBusy(false);
+      }
+    }
+  };
 
   const handleRunHardwareDiscovery = async (silent = false) => {
     const targetCam = inspectorCam;
@@ -765,6 +797,8 @@ export const ChannelsStreamsSection: React.FC<{
     setProbeResult(null);
     setHwProbeBusy(false);
     setHwProbeResult(null);
+    setCamLogsBusy(false);
+    setCamLogsReport(null);
     if (typeof window !== "undefined" && inspectorCam) {
       void handleRunHardwareDiscovery(true);
     }
@@ -2531,31 +2565,137 @@ export const ChannelsStreamsSection: React.FC<{
                               />
                             </div>
                           )}
-                          {hwProbeResult.capabilities.reboot && (
+                          {hwProbeResult.capabilities.scheduled_reboot && (
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                gap: 6,
+                              }}
+                            >
+                              <span>
+                                {isPt
+                                  ? `Auto-Reboot (${String(
+                                      hwProbeResult.state.auto_reboot_hour ?? 4
+                                    ).padStart(2, "0")}:${String(
+                                      hwProbeResult.state.auto_reboot_minute ?? 0
+                                    ).padStart(2, "0")}):`
+                                  : `Scheduled Reboot (${String(
+                                      hwProbeResult.state.auto_reboot_hour ?? 4
+                                    ).padStart(2, "0")}:${String(
+                                      hwProbeResult.state.auto_reboot_minute ?? 0
+                                    ).padStart(2, "0")}):`}
+                              </span>
+                              <ToggleSwitch
+                                checked={Boolean(
+                                  hwProbeResult.state.auto_reboot_enabled
+                                )}
+                                label={`Toggle scheduled auto-reboot on ${inspectorCam}`}
+                                onChange={(v) =>
+                                  void handleApplyHardwareControl({
+                                    auto_reboot_enabled: v,
+                                  })
+                                }
+                              />
+                            </div>
+                          )}
+                          {hwProbeResult.capabilities.remote_syslog && (
+                            <div
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                gap: 6,
+                              }}
+                            >
+                              <span>
+                                {isPt
+                                  ? `Syslog Remoto (${
+                                      hwProbeResult.state.syslog_server || "UDP:514"
+                                    }):`
+                                  : `Remote Syslog (${
+                                      hwProbeResult.state.syslog_server || "UDP:514"
+                                    }):`}
+                              </span>
+                              <ToggleSwitch
+                                checked={Boolean(
+                                  hwProbeResult.state.syslog_enabled
+                                )}
+                                label={`Toggle remote syslog on ${inspectorCam}`}
+                                onChange={(v) =>
+                                  void handleApplyHardwareControl({
+                                    syslog_enabled: v,
+                                  })
+                                }
+                              />
+                            </div>
+                          )}
+                          {(hwProbeResult.capabilities.camera_logs ||
+                            hwProbeResult.capabilities.reboot) && (
                             <div
                               style={{
                                 display: "flex",
                                 alignItems: "center",
                                 justifyContent: "flex-end",
+                                gap: 6,
                               }}
                             >
-                              <button
-                                type="button"
-                                className="nvr-btn danger mono sm"
-                                disabled={hwProbeBusy}
-                                aria-label={`Reboot Camera ${inspectorCam}`}
-                                onClick={() =>
-                                  void handleApplyHardwareControl({
-                                    reboot: true,
-                                  })
-                                }
-                              >
-                                {isPt ? "Reiniciar Câmera" : "Reboot Camera"}
-                              </button>
+                              {hwProbeResult.capabilities.camera_logs && (
+                                <button
+                                  type="button"
+                                  className="nvr-btn mono sm"
+                                  disabled={camLogsBusy}
+                                  aria-label={`Fetch Camera Logs ${inspectorCam}`}
+                                  onClick={() => void handleFetchCameraLogs()}
+                                >
+                                  {camLogsBusy
+                                    ? isPt
+                                      ? "Coletando..."
+                                      : "Fetching..."
+                                    : isPt
+                                    ? "Logs da Câmera"
+                                    : "Camera Logs"}
+                                </button>
+                              )}
+                              {hwProbeResult.capabilities.reboot && (
+                                <button
+                                  type="button"
+                                  className="nvr-btn danger mono sm"
+                                  disabled={hwProbeBusy}
+                                  aria-label={`Reboot Camera ${inspectorCam}`}
+                                  onClick={() =>
+                                    void handleApplyHardwareControl({
+                                      reboot: true,
+                                    })
+                                  }
+                                >
+                                  {isPt ? "Reiniciar Câmera" : "Reboot Camera"}
+                                </button>
+                              )}
                             </div>
                           )}
                         </div>
                       )}
+                    {camLogsReport && (
+                      <div
+                        className="mono"
+                        style={{
+                          marginTop: 6,
+                          padding: 6,
+                          background: "var(--bg-input)",
+                          border: "1px solid var(--border-input)",
+                          borderRadius: 3,
+                          maxHeight: 140,
+                          overflowY: "auto",
+                          fontSize: "var(--text-xs)",
+                          whiteSpace: "pre-wrap",
+                          color: "var(--text-secondary)",
+                        }}
+                      >
+                        {camLogsReport.lines.join("\n")}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

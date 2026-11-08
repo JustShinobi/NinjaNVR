@@ -281,7 +281,7 @@ export const App: React.FC = () => {
   const [ffprobeInfo, setFfprobeInfo] = useState<FfprobeItem[] | null>(null);
 
   // System & Logs state
-  const [logService, setLogService] = useState<"ninjanvr" | "go2rtc" | "nginx">("ninjanvr");
+  const [logService, setLogService] = useState<"ninjanvr" | "go2rtc" | "nginx" | "cameras">("ninjanvr");
   const [logLines, setLogLines] = useState<string[]>([]);
   const [logSearch, setLogSearch] = useState("");
   const [logPaused, setLogPaused] = useState(false);

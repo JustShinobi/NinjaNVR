@@ -107,10 +107,21 @@ impl LogBufferHub {
         map.insert("ninjanvr".to_string(), VecDeque::new());
         map.insert("go2rtc".to_string(), VecDeque::new());
         map.insert("nginx".to_string(), VecDeque::new());
+        map.insert("cameras".to_string(), VecDeque::new());
         Self {
             buffers: Arc::new(std::sync::Mutex::new(map)),
             stream_tx,
         }
+    }
+
+    pub fn push_camera(&self, camera: &str, severity: &str, message: &str) {
+        let now = Local::now();
+        let outer_ts = now.format("%Y-%m-%d %H:%M:%S%.9f");
+        let inner_ts = now.format("%Y-%m-%d %H:%M:%S");
+        let sev_pad = format!("{:<7}", severity.to_ascii_uppercase());
+        let sec_pad = format!("{:<30}", format!("camera.{camera}"));
+        let line = format!("{outer_ts}  [{inner_ts}] {sec_pad} {sev_pad} : {message}");
+        self.push_raw("cameras", line);
     }
 
     pub fn push_ninjanvr(&self, severity: &str, section: &str, message: &str) {
@@ -987,6 +998,7 @@ pub fn build_router_with_auth(state: AppState, enforce_auth: bool) -> Router {
             "/{camera}/hardware",
             get(api_camera_hardware_get).post(api_camera_hardware_set),
         )
+        .route("/{camera}/logs", get(api_camera_logs_get))
         .route("/{camera}/audio/talkback", post(api_camera_audio_talkback))
         .route(
             "/{camera}/state",
@@ -1869,6 +1881,9 @@ async fn auth_gate_middleware(
                             | "ptz/move"
                             | "ptz/stop"
                             | "ptz/preset"
+                            | "hardware"
+                            | "logs"
+                            | "audio/talkback"
                             | "state"
                             | "latest.webp"
                             | "latest.jpg"
@@ -22537,6 +22552,9 @@ async fn api_camera_hardware_get(
             "siren_on_event": dahua_cgi_ok && is_admin,
             "audio_anomaly_detect": dahua_cgi_ok && is_admin,
             "audio_volume": dahua_cgi_ok,
+            "camera_logs": online && (resolved_spec.supports_onvif_system_log || resolved_spec.supports_onvif_pull_events || dahua_cgi_ok),
+            "remote_syslog": dahua_cgi_ok && is_admin,
+            "scheduled_reboot": dahua_cgi_ok && is_admin,
             "reboot": online && is_admin
         },
         "missing_requirements": missing_reqs,
@@ -22582,7 +22600,14 @@ async fn api_camera_hardware_set(
         || body.siren_on_motion.is_some()
         || body.siren_on_audio.is_some()
         || body.audio_detect_enabled.is_some()
-        || body.audio_sensitivity.is_some())
+        || body.audio_sensitivity.is_some()
+        || body.syslog_enabled.is_some()
+        || body.syslog_server.is_some()
+        || body.syslog_port.is_some()
+        || body.auto_reboot_enabled.is_some()
+        || body.auto_reboot_day.is_some()
+        || body.auto_reboot_hour.is_some()
+        || body.auto_reboot_minute.is_some())
         && !caller_can_mutate(&state, &jar, &headers, true).await
     {
         return (
@@ -23001,6 +23026,97 @@ async fn api_camera_hardware_set(
         "applied": applied_ops
     }))
     .into_response()
+}
+
+async fn api_camera_logs_get(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    AxumPath(camera): AxumPath<String>,
+    Query(q): Query<HardwareQueryParams>,
+) -> Response {
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == &camera || a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "Camera is not permitted for this user" })),
+        )
+            .into_response();
+    }
+
+    let (cam_opt, probe_target) = {
+        let cfg = state.config.read().await;
+        let cam = cfg.cameras.get(&camera).cloned();
+        let target = cam.as_ref().and_then(|c| {
+            resolve_camera_hardware_probe_targets(&state.camera_driver_runtime, &cfg, &camera, c)
+        });
+        (cam, target)
+    };
+
+    let Some(cam_cfg) = cam_opt else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "success": false, "message": format!("Camera '{camera}' not found") })),
+        )
+            .into_response();
+    };
+
+    let Some(CameraHardwareProbeTarget {
+        host,
+        onvif_port,
+        user: user_opt,
+        password: pass_opt,
+        is_tapo_hint,
+        is_dahua_hint,
+        ..
+    }) = probe_target
+    else {
+        return Json(json!({
+            "camera": camera,
+            "online": false,
+            "protocol_family": "rtsp_only",
+            "sources_queried": [],
+            "lines": [format!("[diagnostic] Camera '{camera}' has no reachable ONVIF/CGI host configured")]
+        }))
+        .into_response();
+    };
+
+    let cached_proto = state.camera_driver_runtime.get_protocol(&camera);
+    let spec = infer_protocol_spec_from_device_or_hints(
+        cam_cfg
+            .hardware
+            .protocol
+            .as_deref()
+            .or(cached_proto.as_deref()),
+        None,
+        None,
+        is_tapo_hint,
+        is_dahua_hint,
+        is_dahua_hint,
+        true,
+    );
+    let timeout = match q.timeout_ms {
+        Some(ms) => Duration::from_millis(ms.clamp(50, 8_000)),
+        None => Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(1, 5)),
+    };
+
+    let report = collect_camera_diagnostic_logs(
+        &state.http_client,
+        &state.camera_driver_runtime,
+        &camera,
+        (&host, onvif_port),
+        (user_opt.as_deref(), pass_opt.as_deref()),
+        spec,
+        timeout,
+    )
+    .await;
+
+    for line in &report.lines {
+        state.log_hub.push_camera(&camera, "INFO", line);
+    }
+
+    Json(report).into_response()
 }
 
 async fn api_camera_audio_talkback(
