@@ -53,6 +53,10 @@ export const pt: TranslationDict = {
     snapshotHint: "Salvar foto em resolução máxima (stream principal, máscaras de privacidade aplicadas)",
     cameraDetails: "Detalhes da câmera",
     gridColumns: "Colunas",
+    detailsShort: "Detalhes",
+    modeShortGrid: "Grade",
+    modeShortCamera: "Câmera",
+    modeShortSpotlight: "Destaque",
     zonesOverlay: "Vetores",
     hdStream: "1080p Principal",
     subStream: "720p Sub",
@@ -91,6 +95,7 @@ export const pt: TranslationDict = {
     syncLocked: "4 CANAIS SINCRONIZADOS",
   },
   review: {
+    filtersShort: "Filtros",
     title: "BANCADA DE REVISÃO E TRIAGEM",
     alerts: "Alertas",
     detections: "Detecções",

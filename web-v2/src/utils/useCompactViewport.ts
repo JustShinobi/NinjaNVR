@@ -1,14 +1,18 @@
 import { useEffect, useState } from "react";
-import { MOBILE_BREAKPOINT_PX, isCompactViewport } from "./liveTileHud";
+import { COMPACT_MEDIA_QUERY, isCompactViewport } from "./liveTileHud";
 
-/** Tracks whether the console is running on a phone-width viewport (< 768px). */
+/** Tracks whether the console runs on a phone: < 768px wide, or a touch screen <= 500px tall (landscape). */
 export function useCompactViewport(): boolean {
-  const read = () =>
-    typeof window !== "undefined" ? isCompactViewport(window.innerWidth) : false;
+  const read = () => {
+    if (typeof window === "undefined") return false;
+    const coarse =
+      typeof window.matchMedia === "function" && window.matchMedia("(pointer: coarse)").matches;
+    return isCompactViewport(window.innerWidth, window.innerHeight, coarse);
+  };
   const [compact, setCompact] = useState<boolean>(read);
   useEffect(() => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const mql = window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT_PX - 1}px)`);
+    const mql = window.matchMedia(COMPACT_MEDIA_QUERY);
     const sync = () => setCompact(mql.matches);
     sync();
     mql.addEventListener?.("change", sync);

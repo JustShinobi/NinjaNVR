@@ -146,8 +146,21 @@ export function resolveCameraRuntimeFlags(config?: {
 /** Viewports narrower than this use the mobile shell (bottom tab bar, 1-column live). */
 export const MOBILE_BREAKPOINT_PX = 768;
 
-export function isCompactViewport(width: number): boolean {
-  return Number.isFinite(width) && width > 0 && width < MOBILE_BREAKPOINT_PX;
+/** Phones in landscape are wider than the breakpoint but short and touch-driven. */
+export const COMPACT_LANDSCAPE_MAX_HEIGHT_PX = 500;
+
+export const COMPACT_MEDIA_QUERY = `(max-width: ${MOBILE_BREAKPOINT_PX - 1}px), (pointer: coarse) and (max-height: ${COMPACT_LANDSCAPE_MAX_HEIGHT_PX}px)`;
+
+export function isCompactViewport(width: number, height?: number, coarsePointer = false): boolean {
+  if (!Number.isFinite(width) || width <= 0) return false;
+  if (width < MOBILE_BREAKPOINT_PX) return true;
+  return (
+    coarsePointer &&
+    typeof height === "number" &&
+    Number.isFinite(height) &&
+    height > 0 &&
+    height <= COMPACT_LANDSCAPE_MAX_HEIGHT_PX
+  );
 }
 
 export type { WorkspaceTab };
@@ -189,7 +202,8 @@ export function resolveCompactStageContainerStyle(
     return {
       gridTemplateColumns: columns === 2 ? "repeat(2, minmax(0, 1fr))" : "minmax(0, 1fr)",
       gridTemplateRows: "none",
-      gridAutoRows: "auto",
+      // max-content: 16:9 tiles keep their height instead of being squeezed to the viewport
+      gridAutoRows: "max-content",
       alignContent: "start",
       gap: 8,
       overflowY: "auto",
@@ -198,9 +212,10 @@ export function resolveCompactStageContainerStyle(
   return {
     gridTemplateColumns: "minmax(0, 1fr)",
     gridTemplateRows: "none",
-    gridAutoRows: "auto",
+    gridAutoRows: "max-content",
     alignContent: "start",
-    overflowY: "auto",
+    flex: "0 0 auto",
+    overflowY: "visible",
   };
 }
 
@@ -214,4 +229,52 @@ export function filterCompactStageDescriptors<T extends { role: string }>(
 
 export function sanitizeCompactGridColumns(raw: unknown): CompactGridColumns {
   return raw === 2 || raw === "2" ? 2 : 1;
+}
+
+/** Number of Review filters that differ from their defaults (drives the mobile "Filters (N)" button). */
+export function countActiveReviewFilters(filters: {
+  camera?: string;
+  severity?: string;
+  object?: string;
+  status?: string;
+  date?: string;
+  excludeObject?: string;
+  zone?: string;
+  plate?: string;
+}): number {
+  let n = 0;
+  if (filters.camera && filters.camera !== "all") n += 1;
+  if (filters.severity && filters.severity !== "all") n += 1;
+  if (filters.object && filters.object !== "all") n += 1;
+  if (filters.status && filters.status !== "unreviewed") n += 1;
+  if (filters.date && filters.date.trim()) n += 1;
+  if (filters.excludeObject && filters.excludeObject !== "none") n += 1;
+  if (filters.zone && filters.zone !== "all") n += 1;
+  if (filters.plate && filters.plate.trim()) n += 1;
+  return n;
+}
+
+/** Number of Object Explore filters that differ from their defaults (search text excluded: it stays visible). */
+export function countActiveExploreFilters(filters: {
+  camera?: string;
+  label?: string;
+  excludeLabel?: string;
+  zone?: string;
+  minScore?: number;
+  stationary?: string;
+  retainedOnly?: boolean;
+  plate?: string;
+  date?: string;
+}): number {
+  let n = 0;
+  if (filters.camera && filters.camera !== "all") n += 1;
+  if (filters.label && filters.label !== "all") n += 1;
+  if (filters.excludeLabel && filters.excludeLabel !== "none") n += 1;
+  if (filters.zone && filters.zone !== "all") n += 1;
+  if (typeof filters.minScore === "number" && filters.minScore > 0) n += 1;
+  if (filters.stationary && filters.stationary !== "all") n += 1;
+  if (filters.retainedOnly) n += 1;
+  if (filters.plate && filters.plate.trim()) n += 1;
+  if (filters.date && filters.date.trim()) n += 1;
+  return n;
 }

@@ -2,6 +2,8 @@ import React from "react";
 import { Check, Trash2 } from "lucide-react";
 import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
+import { useCompactViewport } from "../utils/useCompactViewport";
+import { countActiveReviewFilters } from "../utils/liveTileHud";
 import {
   EnrolledFaceProfileItem,
   ExportItem,
@@ -307,6 +309,21 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const reviewMutationSeqRef = React.useRef(0);
   const activeReviewIdRef = React.useRef<string | null>(activeReview?.id ?? null);
   activeReviewIdRef.current = activeReview?.id ?? null;
+
+  const isCompact = useCompactViewport();
+  const [filtersOpen, setFiltersOpen] = React.useState(false);
+  const detailStageRef = React.useRef<HTMLDivElement | null>(null);
+  const activeReviewIdForScroll = activeReview?.id ?? null;
+  // Phones: list-first master/detail — selecting an item brings its player into view.
+  const lastScrolledReviewIdRef = React.useRef<string | null | undefined>(undefined);
+  React.useEffect(() => {
+    const prev = lastScrolledReviewIdRef.current;
+    lastScrolledReviewIdRef.current = activeReviewIdForScroll;
+    // Skip the auto-selected first item on load; only follow an operator's change.
+    if (prev === undefined || prev === null) return;
+    if (!isCompact || !activeReviewIdForScroll || prev === activeReviewIdForScroll) return;
+    detailStageRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [isCompact, activeReviewIdForScroll]);
 
   React.useEffect(() => {
     setReviewNoteDraft(activeReview?.data?.notes || "");
@@ -777,7 +794,40 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
 
   return (
     <>
-      <div className="nvr-subbar">
+      {isCompact && (
+        <div className="nvr-filter-toggle-row">
+          <button
+            type="button"
+            className={`nvr-btn ${filtersOpen ? "active" : ""}`}
+            aria-expanded={filtersOpen}
+            aria-controls="review-filters"
+            data-testid="review-filters-toggle"
+            onClick={() => setFiltersOpen((v) => !v)}
+          >
+            {t.review.filtersShort}
+            {(() => {
+              const n = countActiveReviewFilters({
+                camera: reviewCameraFilter,
+                severity: reviewSeverityFilter,
+                object: reviewObjectFilter,
+                status: reviewStatusFilter,
+                date: reviewDateFilter,
+                excludeObject: excludeObjectFilter,
+                zone: zoneFilter,
+                plate: plateFilter,
+              });
+              return n > 0 ? <span className="nvr-filter-count mono">{n}</span> : null;
+            })()}
+          </button>
+          <span className="mono nvr-filter-toggle-meta">
+            {visibleFilteredReviews.length} items
+          </span>
+        </div>
+      )}
+      <div
+        id="review-filters"
+        className={`nvr-subbar nvr-review-filters ${filtersOpen ? "is-open" : ""}`}
+      >
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <select
             className="nvr-select"
@@ -976,7 +1026,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         </div>
       </div>
 
-      <div className="nvr-workbench">
+      <div className="nvr-workbench is-list-first">
         <div className="nvr-panel">
           <div className="nvr-panel-header" style={{ gap: 6, flexWrap: "wrap" }}>
             <span>REVIEW QUEUE</span>
@@ -1330,7 +1380,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
           </div>
         </div>
 
-        <div className="nvr-focus-stage">
+        <div className="nvr-focus-stage" ref={detailStageRef}>
           {activeReview ? (
             <>
               <div className="nvr-subbar">

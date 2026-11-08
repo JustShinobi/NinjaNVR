@@ -1,4 +1,5 @@
-import React, { useEffect, useRef } from "react";
+import React from "react";
+import { useSheetDismiss } from "../utils/useSheetDismiss";
 import { X } from "lucide-react";
 import type { CameraRuntimeFlag, CameraTelemetryRow } from "../utils/liveTileHud";
 
@@ -73,10 +74,7 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
   isPt = false,
   canEdit = true,
 }) => {
-  const closeRef = useRef<HTMLButtonElement | null>(null);
-  useEffect(() => {
-    closeRef.current?.focus();
-  }, []);
+  const sheetRef = useSheetDismiss<HTMLElement>(true, onClose);
 
   const titleId = `nvr-details-title-${camera}`;
   return (
@@ -87,13 +85,8 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
         aria-modal="true"
         aria-labelledby={titleId}
         data-testid={`camera-details-${camera}`}
+        ref={sheetRef}
         onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            e.stopPropagation();
-            onClose();
-          }
-        }}
       >
         <div className="nvr-sheet-handle" aria-hidden="true" />
         <header className="nvr-sheet-head">
@@ -106,7 +99,6 @@ export const CameraDetailsSheet: React.FC<CameraDetailsSheetProps> = ({
             </p>
           </div>
           <button
-            ref={closeRef}
             type="button"
             className="nvr-icon-btn"
             aria-label={isPt ? "Fechar detalhes" : "Close details"}

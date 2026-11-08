@@ -6,6 +6,7 @@ import { RecordingSegment, ReviewItem } from "../types/nvr";
 import { formatDateTime, formatTs } from "../utils/format";
 import { VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
+import { useCompactViewport } from "../utils/useCompactViewport";
 
 export const MAX_SYNC_QUAD_SLOTS = 4;
 export const SYNC_SEEK_DEBOUNCE_MS = 120;
@@ -223,6 +224,7 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
   handleQuickExport,
 }) => {
   const { t } = useI18n();
+  const isCompact = useCompactViewport();
   const selectedCamera = useNvrStore((s) => s.selectedCamera);
   const setSelectedCamera = useNvrStore((s) => s.setSelectedCamera);
   const hudPosition = useNvrStore((s) => s.hudPosition);
@@ -288,7 +290,7 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
     <>
       <div className="nvr-subbar">
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <span className="nvr-badge rewind">{t.sync.syncLocked}</span>
+          {!isCompact && <span className="nvr-badge rewind">{t.sync.syncLocked}</span>}
           <span className="mono" style={{ fontWeight: 700, color: "var(--text-primary)" }}>
             {formatDateTime(safeMasterTs)}
           </span>
@@ -305,6 +307,9 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
             {t.sync.jumpFwd30}
           </button>
           <span className="nvr-divider" aria-hidden="true" />
+          {(() => {
+            const slotControls = (
+              <>
           {activeQuadCameras.map((slotCam, slotIdx) => (
             <select
               key={`slot-${slotIdx}`}
@@ -344,6 +349,19 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
             <Sparkles size={11} />
             Auto-Pick 4 Active @ Timestamp
           </button>
+              </>
+            );
+            return isCompact ? (
+              <details className="nvr-sync-slots" data-testid="sync-slot-disclosure">
+                <summary className="nvr-btn">
+                  {activeQuadCameras.map((c) => c.toUpperCase()).join(" · ")}
+                </summary>
+                <div className="nvr-sync-slots-body">{slotControls}</div>
+              </details>
+            ) : (
+              slotControls
+            );
+          })()}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           {[1, 2, 4].map((spd) => (
@@ -448,7 +466,8 @@ export const SyncWorkspace: React.FC<SyncWorkspaceProps> = ({
                 />
                 <div className={`nvr-cam-hud pos-${hudPosition}`}>
                   <span className="nvr-badge rewind">
-                    S{slotIdx + 1} · {cam.toUpperCase()} // SYNC @ {formatTs(safeMasterTs)}
+                    S{slotIdx + 1} · {cam.toUpperCase()}
+                    <span className="nvr-sync-badge-ts"> // SYNC @ {formatTs(safeMasterTs)}</span>
                   </span>
                   <button
                     className="nvr-btn nvr-tile-action"

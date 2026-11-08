@@ -20,6 +20,8 @@ import {
   validateLicensePlateFormat,
 } from "../utils/configYaml";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
+import { useCompactViewport } from "../utils/useCompactViewport";
+import { countActiveExploreFilters } from "../utils/liveTileHud";
 import {
   isSafeDatasetSampleId,
   normalizeFaceProfileName,
@@ -1063,6 +1065,19 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     }
   };
   const [excludeLabel, setExcludeLabel] = React.useState("none");
+  const isCompact = useCompactViewport();
+  const [filtersOpen, setFiltersOpen] = React.useState(false);
+  const detailStageRef = React.useRef<HTMLDivElement | null>(null);
+  const selectedEventIdForScroll = selectedEvent?.id ?? null;
+  const lastScrolledEventIdRef = React.useRef<string | null | undefined>(undefined);
+  // Phones: list-first master/detail — an operator's selection brings the detail into view.
+  React.useEffect(() => {
+    const prev = lastScrolledEventIdRef.current;
+    lastScrolledEventIdRef.current = selectedEventIdForScroll;
+    if (prev === undefined) return;
+    if (!isCompact || !selectedEventIdForScroll || prev === selectedEventIdForScroll) return;
+    detailStageRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [isCompact, selectedEventIdForScroll]);
   const [zoneFilter, setZoneFilter] = React.useState("all");
   const [minScoreFilter, setMinScoreFilter] = React.useState(0);
   const [stationaryFilter, setStationaryFilter] = React.useState<"all" | "moving" | "stationary">(
@@ -1140,12 +1155,52 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     setPresetName("");
   };
 
+  const activeExploreFilterCount = countActiveExploreFilters({
+    camera: exploreCamera,
+    label: exploreLabel,
+    excludeLabel,
+    zone: zoneFilter,
+    minScore: minScoreFilter,
+    stationary: stationaryFilter,
+    retainedOnly: exploreRetainedOnly,
+    plate: plateFilter,
+    date: reviewDateFilter,
+  });
+
   return (
     <>
-      <div className="nvr-subbar">
+      {isCompact && (
+        <div className="nvr-filter-toggle-row">
+          <input
+            className="nvr-input nvr-filter-search"
+            type="search"
+            aria-label="Filter tracked objects"
+            placeholder={t.explore.searchPlaceholder}
+            value={exploreQuery}
+            onChange={(e) => setExploreQuery(e.target.value)}
+          />
+          <button
+            type="button"
+            className={`nvr-btn ${filtersOpen ? "active" : ""}`}
+            aria-expanded={filtersOpen}
+            aria-controls="explore-filters"
+            data-testid="explore-filters-toggle"
+            onClick={() => setFiltersOpen((v) => !v)}
+          >
+            {t.review.filtersShort}
+            {activeExploreFilterCount > 0 && (
+              <span className="nvr-filter-count mono">{activeExploreFilterCount}</span>
+            )}
+          </button>
+        </div>
+      )}
+      <div
+        id="explore-filters"
+        className={`nvr-subbar nvr-review-filters ${filtersOpen ? "is-open" : ""}`}
+      >
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <input
-            className="nvr-input"
+            className="nvr-input nvr-desktop-search"
             style={{ width: 240 }}
             aria-label="Filter tracked objects"
             placeholder={t.explore.searchPlaceholder}
@@ -1311,7 +1366,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         </span>
       </div>
 
-      <div className="nvr-workbench">
+      <div className="nvr-workbench is-list-first">
         <div className="nvr-panel">
           <div className="nvr-panel-header" style={{ gap: 6, flexWrap: "wrap" }}>
             <span>TRACKED OBJECTS</span>
@@ -1593,7 +1648,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           </div>
         </div>
 
-        <div className="nvr-focus-stage">
+        <div className="nvr-focus-stage" ref={detailStageRef}>
           {selectedEvent ? (
             <>
               <div className="nvr-subbar">

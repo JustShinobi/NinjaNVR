@@ -125,6 +125,14 @@ describe("mobile shell", () => {
     expect(isCompactViewport(Number.NaN)).toBe(false);
   });
 
+  test("touch phones in landscape stay compact, short desktop windows do not", () => {
+    // iPhone 17 Pro Max landscape: 956x440 CSS px, coarse pointer
+    expect(isCompactViewport(956, 440, true)).toBe(true);
+    expect(isCompactViewport(956, 440, false)).toBe(false);
+    // Tablet landscape is tall enough for the desktop console
+    expect(isCompactViewport(1180, 820, true)).toBe(false);
+  });
+
   test("admin-only tabs never leak to viewers", () => {
     expect(resolveMobileNavTabs("viewer")).toEqual({
       primary: ["live", "sync", "review", "exports"],
@@ -153,6 +161,10 @@ describe("compact live stage", () => {
       "repeat(2, minmax(0, 1fr))"
     );
     expect(resolveCompactStageContainerStyle("2x2", 1).overflowY).toBe("auto");
+    // Regression: "auto" rows squeezed 16:9 tiles to the viewport and overlapped them.
+    expect(resolveCompactStageContainerStyle("2x2", 1).gridAutoRows).toBe("max-content");
+    expect(resolveCompactStageContainerStyle("focus", 1).gridAutoRows).toBe("max-content");
+    expect(resolveCompactStageContainerStyle("focus", 1).flex).toBe("0 0 auto");
     expect(resolveCompactStageContainerStyle("focus", 2).gridTemplateColumns).toBe(
       "minmax(0, 1fr)"
     );
@@ -171,5 +183,84 @@ describe("compact live stage", () => {
     expect(sanitizeCompactGridColumns(2)).toBe(2);
     expect(sanitizeCompactGridColumns("3")).toBe(1);
     expect(sanitizeCompactGridColumns(null)).toBe(1);
+  });
+});
+
+import { countActiveReviewFilters } from "../utils/liveTileHud";
+
+describe("countActiveReviewFilters", () => {
+  test("defaults count as zero", () => {
+    expect(
+      countActiveReviewFilters({
+        camera: "all",
+        severity: "all",
+        object: "all",
+        status: "unreviewed",
+        date: "",
+        excludeObject: "none",
+        zone: "all",
+        plate: "  ",
+      })
+    ).toBe(0);
+  });
+  test("each non-default filter counts once", () => {
+    expect(
+      countActiveReviewFilters({
+        camera: "sala",
+        severity: "alert",
+        status: "all",
+        date: "2026-11-08",
+        plate: "ABC1D23",
+      })
+    ).toBe(5);
+  });
+});
+
+import { computePinchScale } from "../components/VideoPlayers";
+
+describe("computePinchScale", () => {
+  test("spreading fingers scales proportionally from the start scale", () => {
+    expect(computePinchScale(100, 200, 1)).toBe(2);
+    expect(computePinchScale(100, 150, 2)).toBe(3);
+  });
+  test("clamps to the 1x–5x range", () => {
+    expect(computePinchScale(100, 50, 1)).toBe(1);
+    expect(computePinchScale(100, 1000, 2)).toBe(5);
+  });
+  test("degenerate distances keep the current scale", () => {
+    expect(computePinchScale(0, 100, 2)).toBe(2);
+    expect(computePinchScale(100, Number.NaN, 3)).toBe(3);
+    expect(computePinchScale(100, 120, Number.NaN)).toBe(1.2);
+  });
+});
+
+import { countActiveExploreFilters } from "../utils/liveTileHud";
+
+describe("countActiveExploreFilters", () => {
+  test("defaults count as zero", () => {
+    expect(
+      countActiveExploreFilters({
+        camera: "all",
+        label: "all",
+        excludeLabel: "none",
+        zone: "all",
+        minScore: 0,
+        stationary: "all",
+        retainedOnly: false,
+        plate: "",
+        date: "",
+      })
+    ).toBe(0);
+  });
+  test("counts every non-default filter once", () => {
+    expect(
+      countActiveExploreFilters({
+        camera: "sala",
+        minScore: 60,
+        stationary: "moving",
+        retainedOnly: true,
+        plate: "ABC",
+      })
+    ).toBe(5);
   });
 });

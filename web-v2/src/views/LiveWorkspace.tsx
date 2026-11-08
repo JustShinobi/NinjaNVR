@@ -5,12 +5,14 @@ import {
   ChevronLeft,
   ChevronRight,
   Eye,
+  Grid2x2,
   Maximize2,
   MoreHorizontal,
   Move,
   Play,
   RefreshCw,
   RotateCcw,
+  Rows2,
   Scissors,
 } from "lucide-react";
 import { useI18n } from "../i18n";
@@ -2804,7 +2806,9 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   "Interactive Tactical Map / Floorplan with FOV cones and real-time motion/object pulses",
                 ],
               ] as Array<[LiveLayoutMode, string, string | undefined]>
-            ).map(([mode, label, hint]) => (
+            )
+              .filter(([mode]) => !isCompact || mode === "2x2" || mode === "focus" || mode === "spotlight")
+              .map(([mode, label, hint]) => (
               <button
                 key={mode}
                 type="button"
@@ -2816,7 +2820,13 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   if (mode !== "focus" && mode !== "single") setTimeShiftTs(null);
                 }}
               >
-                {label}
+                {isCompact
+                  ? mode === "2x2"
+                    ? t.live.modeShortGrid
+                    : mode === "focus"
+                    ? t.live.modeShortCamera
+                    : t.live.modeShortSpotlight
+                  : label}
               </button>
             ))}
           </div>
@@ -2833,7 +2843,11 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
                   aria-label={`${t.live.gridColumns}: ${cols}`}
                   onClick={() => updateCompactColumns(cols)}
                 >
-                  {cols === 1 ? "▤" : "▦"}
+                  {cols === 1 ? (
+                    <Rows2 size={18} aria-hidden="true" />
+                  ) : (
+                    <Grid2x2 size={18} aria-hidden="true" />
+                  )}
                 </button>
               ))}
             </div>
@@ -3047,7 +3061,7 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
               )}
             </>
           )}
-          {(liveLayout === "focus" || liveLayout === "single") && (
+          {!isCompact && (liveLayout === "focus" || liveLayout === "single") && (
             <>
               <span className="nvr-divider" aria-hidden="true" />
               <TacticalCameraPicker
@@ -3109,7 +3123,53 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
 
       {/* Recent events strip: each card loops its still frames as a flipbook (<img> swaps,
           no video decoder). The full MP4 preview still mounts ONLY on pointer hover. */}
-      {shouldRenderLiveAlertRibbon(
+      {isCompact &&
+        liveLayout === "2x2" &&
+        showAlertRibbon &&
+        recentEvents.length > 0 &&
+        (() => {
+          const latest = recentEvents[0];
+          const label = ((latest.data?.objects || [])[0] || latest.severity).toString();
+          return (
+            <div className="nvr-event-summary" data-testid="compact-event-summary">
+              <button
+                type="button"
+                className="nvr-event-summary-main"
+                aria-label={`${t.live.eventTimeShift}: ${latest.camera} ${label}`}
+                onClick={() => {
+                  setSelectedCamera(latest.camera);
+                  setLiveLayout("focus");
+                  setTimeShiftTs(sanitizeTimeShiftSeek(latest.start_time));
+                }}
+              >
+                <img
+                  src={resolveSafeAlertThumbSrc(latest.thumb_path, latest.camera)}
+                  alt=""
+                  className={`nvr-event-summary-thumb severity-${latest.severity}`}
+                />
+                <span className="nvr-event-summary-text">
+                  <span className="mono nvr-event-summary-count">
+                    {unreviewedAlerts.length} {t.live.unreviewedShort}
+                  </span>
+                  <span className="nvr-event-summary-detail">
+                    <span className="nvr-event-summary-label">{label}</span> · {latest.camera} ·{" "}
+                    {formatRelativeAgo(stripNowSec, latest.start_time, locale === "pt")}
+                  </span>
+                </span>
+              </button>
+              <button
+                type="button"
+                className="nvr-btn primary nvr-event-summary-cta"
+                onClick={() => setActiveTab("review")}
+              >
+                {t.live.openReview}
+              </button>
+            </div>
+          );
+        })()}
+
+      {!isCompact &&
+        shouldRenderLiveAlertRibbon(
         liveLayout,
         showAlertRibbon,
         unreviewedAlerts.length
@@ -3685,6 +3745,99 @@ export const LiveWorkspace: React.FC<LiveWorkspaceProps> = ({
           })}
         </div>
       )}
+
+      {isCompact &&
+        liveLayout !== "2x2" &&
+        liveLayout !== "map" &&
+        (() => {
+          const cam = liveLayout === "spotlight" ? spotlightHeroCam : selectedCamera;
+          if (!cam) return null;
+          const realCam = resolveRealCameraSource(cam, config?.cameras || cameraNames);
+          const camCfg = effectiveCamerasConfig?.[cam] ?? config?.cameras?.[realCam];
+          const ptt = resolveCameraPushToTalkCapability(
+            camCfg,
+            hardwareInfoByCam[realCam],
+            config?.go2rtc?.streams,
+            realCam
+          );
+          const ptzCapable =
+            isCameraPtzEnabled(camCfg, ptzInfoByCam[realCam], hardwareInfoByCam[realCam]) ||
+            isCameraHardwareControlsSupported(hardwareInfoByCam[realCam]);
+          return (
+            <div className="nvr-cam-actionbar" role="toolbar" aria-label={`${cam} actions`}>
+              {timeShiftTs !== null ? (
+                <button
+                  type="button"
+                  className="nvr-cam-action is-live"
+                  onClick={() => setTimeShiftTs(null)}
+                >
+                  <Play size={20} aria-hidden="true" />
+                  <span>{t.live.returnToLive}</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="nvr-cam-action"
+                  onClick={() => setTimeShiftTs(Math.floor(Date.now() / 1000) - 30)}
+                >
+                  <RotateCcw size={20} aria-hidden="true" />
+                  <span>{t.live.rewind30s}</span>
+                </button>
+              )}
+              <a
+                href={buildCameraSnapshotUrl(realCam)}
+                download
+                className="nvr-cam-action"
+                data-testid={`action-snapshot-${cam}`}
+              >
+                <Camera size={20} aria-hidden="true" />
+                <span>{t.live.snapshot}</span>
+              </a>
+              <button
+                type="button"
+                className="nvr-cam-action"
+                onClick={() => {
+                  const nowSec = Math.floor(Date.now() / 1000);
+                  requestClip(cam, nowSec - 30, nowSec);
+                }}
+              >
+                <Scissors size={20} aria-hidden="true" />
+                <span>{t.live.clipLast30s}</span>
+              </button>
+              {ptt.supported && timeShiftTs === null && (
+                <div className="nvr-cam-action is-ptt">
+                  <PushToTalkButton
+                    key={`ptt-bar-${cam}-${realCam}-${pttResetEpoch}`}
+                    camera={realCam}
+                    height={44}
+                    supported={ptt.supported}
+                    mode={ptt.mode}
+                  />
+                </div>
+              )}
+              {ptzCapable && (
+                <button
+                  type="button"
+                  className={`nvr-cam-action ${ptzOpenCam === cam ? "active" : ""}`}
+                  aria-pressed={ptzOpenCam === cam}
+                  onClick={() => setPtzOpenCam((c) => (c === cam ? null : cam))}
+                >
+                  <Move size={20} aria-hidden="true" />
+                  <span>PTZ</span>
+                </button>
+              )}
+              <button
+                type="button"
+                className="nvr-cam-action"
+                data-testid={`action-details-${cam}`}
+                onClick={() => setDetailsCam(cam)}
+              >
+                <MoreHorizontal size={20} aria-hidden="true" />
+                <span>{t.live.detailsShort}</span>
+              </button>
+            </div>
+          );
+        })()}
 
       {liveLayout === "map" && (
         <div

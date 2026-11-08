@@ -51,6 +51,10 @@ export const en = {
     snapshotHint: "Save a full-resolution snapshot (main stream, privacy masks applied)",
     cameraDetails: "Camera details",
     gridColumns: "Columns",
+    detailsShort: "Details",
+    modeShortGrid: "Grid",
+    modeShortCamera: "Camera",
+    modeShortSpotlight: "Spotlight",
     zonesOverlay: "Vectors",
     hdStream: "1080p Main",
     subStream: "720p Sub",
@@ -89,6 +93,7 @@ export const en = {
     syncLocked: "4 CHANNELS LOCKED",
   },
   review: {
+    filtersShort: "Filters",
     title: "REVIEW & TRIAGE WORKBENCH",
     alerts: "Alerts",
     detections: "Detections",
@@ -237,6 +242,10 @@ export interface TranslationDict {
     snapshotHint: string;
     cameraDetails: string;
     gridColumns: string;
+    detailsShort: string;
+    modeShortGrid: string;
+    modeShortCamera: string;
+    modeShortSpotlight: string;
     zonesOverlay: string;
     hdStream: string;
     subStream: string;
@@ -275,6 +284,7 @@ export interface TranslationDict {
     syncLocked: string;
   };
   review: {
+    filtersShort: string;
     title: string;
     alerts: string;
     detections: string;

@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { formatBadgeCount, resolveMobileNavTabs } from "./utils/liveTileHud";
 import { useCompactViewport } from "./utils/useCompactViewport";
+import { useSheetDismiss } from "./utils/useSheetDismiss";
 import { useI18n } from "./i18n";
 import {
   EventItem,
@@ -211,6 +212,13 @@ export const App: React.FC = () => {
   const activeTab = useNvrStore((s) => s.activeTab);
   const isCompact = useCompactViewport();
   const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
+  const [profileSheetOpen, setProfileSheetOpen] = useState(false);
+  const profileSheetRef = useSheetDismiss<HTMLElement>(isCompact && profileSheetOpen, () =>
+    setProfileSheetOpen(false)
+  );
+  const moreSheetRef = useSheetDismiss<HTMLElement>(isCompact && mobileMoreOpen, () =>
+    setMobileMoreOpen(false)
+  );
   const setActiveTab = useNvrStore((s) => s.setActiveTab);
   const securityProfile = useNvrStore((s) => s.securityProfile);
   const setSecurityProfile = useNvrStore((s) => s.setSecurityProfile);
@@ -1343,6 +1351,21 @@ export const App: React.FC = () => {
     );
   }
 
+  const applySecurityProfile = async (prof: "armed" | "home" | "disarmed") => {
+    setSecurityProfile(prof);
+    try {
+      await fetch("/api/profile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ profile: prof }),
+      });
+      notify(`Operational security profile switched to ${prof.toUpperCase()}`);
+    } catch {
+      // ignore
+    }
+  };
+
   const handleLogout = async () => {
           manualLogoutRef.current = true;
           coreFetchSeqRef.current += 1;
@@ -1499,8 +1522,19 @@ export const App: React.FC = () => {
                 ))}
             </select>
           )}
+          <button
+            type="button"
+            data-testid="profile-pill"
+            className={`nvr-profile-pill mono is-${securityProfile}`}
+            aria-haspopup="dialog"
+            aria-label={`Security profile: ${securityProfile}`}
+            disabled={userRole === "viewer"}
+            onClick={() => setProfileSheetOpen(true)}
+          >
+            <span className="nvr-profile-pill-dot" aria-hidden="true" />
+            {securityProfile.toUpperCase()}
+          </button>
           <div
-            className="mono"
             style={{
               display: "inline-flex",
               alignItems: "center",
@@ -1511,6 +1545,7 @@ export const App: React.FC = () => {
               padding: 2,
             }}
             aria-label="Operational Security Profile"
+            className="mono nvr-profile-seg"
           >
             {(["armed", "home", "disarmed"] as const).map((prof) => {
               const isAct = securityProfile === prof;
@@ -1531,20 +1566,7 @@ export const App: React.FC = () => {
                         ? "var(--signal-motion-text)"
                         : undefined,
                   }}
-                  onClick={async () => {
-                    setSecurityProfile(prof);
-                    try {
-                      await fetch("/api/profile", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        credentials: "include",
-                        body: JSON.stringify({ profile: prof }),
-                      });
-                      notify(`Operational security profile switched to ${prof.toUpperCase()}`);
-                    } catch {
-                      // ignore
-                    }
-                  }}
+                  onClick={() => void applySecurityProfile(prof)}
                 >
                   {prof.toUpperCase()}
                 </button>
@@ -1832,6 +1854,11 @@ export const App: React.FC = () => {
                 key={tab}
                 type="button"
                 data-testid={`tabbar-${tab}`}
+                aria-label={
+                  badge
+                    ? `${t.navMobile[tab as keyof typeof t.navMobile]} (${badge})`
+                    : t.navMobile[tab as keyof typeof t.navMobile]
+                }
                 className={`nvr-tabbar-btn ${activeTab === tab ? "active" : ""}`}
                 aria-current={activeTab === tab ? "page" : undefined}
                 onClick={() => {
@@ -1848,6 +1875,7 @@ export const App: React.FC = () => {
           <button
             type="button"
             data-testid="tabbar-more"
+            aria-label={t.navMobile.more}
             className={`nvr-tabbar-btn ${
               mobileMoreOpen || mobileNav.overflow.includes(activeTab as WorkspaceTab) ? "active" : ""
             }`}
@@ -1860,6 +1888,39 @@ export const App: React.FC = () => {
         </nav>
       )}
 
+      {isCompact && profileSheetOpen && (
+        <div className="nvr-sheet-backdrop" onClick={() => setProfileSheetOpen(false)}>
+          <section
+            className="nvr-sheet nvr-more-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Security profile"
+            ref={profileSheetRef}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="nvr-sheet-handle" aria-hidden="true" />
+            {(["armed", "home", "disarmed"] as const).map((prof) => (
+              <button
+                key={prof}
+                type="button"
+                data-testid={`profile-option-${prof}`}
+                className={`nvr-sheet-link nvr-profile-option is-${prof} ${
+                  securityProfile === prof ? "active" : ""
+                }`}
+                aria-pressed={securityProfile === prof}
+                onClick={() => {
+                  setProfileSheetOpen(false);
+                  void applySecurityProfile(prof);
+                }}
+              >
+                <span className="nvr-profile-pill-dot" aria-hidden="true" />
+                <span className="mono">{prof.toUpperCase()}</span>
+              </button>
+            ))}
+          </section>
+        </div>
+      )}
+
       {isCompact && mobileMoreOpen && (
         <div className="nvr-sheet-backdrop" onClick={() => setMobileMoreOpen(false)}>
           <section
@@ -1867,10 +1928,8 @@ export const App: React.FC = () => {
             role="dialog"
             aria-modal="true"
             aria-label={t.navMobile.more}
+            ref={moreSheetRef}
             onClick={(e) => e.stopPropagation()}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") setMobileMoreOpen(false);
-            }}
           >
             <div className="nvr-sheet-handle" aria-hidden="true" />
             {mobileNav.overflow.map((tab) => (

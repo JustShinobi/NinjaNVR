@@ -698,6 +698,28 @@ interface ZoomableVideoStageProps {
   children: React.ReactNode;
 }
 
+/**
+ * Pinch-to-zoom scale from two-finger distances, clamped to the stage's 1x–5x range.
+ * Returns the start scale unchanged for degenerate distances.
+ */
+export function computePinchScale(
+  startDistance: number,
+  currentDistance: number,
+  startScale: number
+): number {
+  const base = Number.isFinite(startScale) && startScale > 0 ? startScale : 1;
+  if (
+    !Number.isFinite(startDistance) ||
+    !Number.isFinite(currentDistance) ||
+    startDistance <= 0 ||
+    currentDistance <= 0
+  ) {
+    return Math.max(1, Math.min(5, base));
+  }
+  const next = base * (currentDistance / startDistance);
+  return Math.round(Math.max(1, Math.min(5, next)) * 100) / 100;
+}
+
 export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
   disabled = false,
   forceHudVisible = false,
@@ -783,6 +805,42 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
     return () => el.removeEventListener("wheel", onWheel);
   }, [disabled, scale, applyZoom]);
 
+  // Two-finger pinch zoom on touch screens (phones/tablets), anchored at the pinch midpoint.
+  const scaleRef = useRef(scale);
+  scaleRef.current = scale;
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el || disabled) return;
+    let pinch: { dist: number; scale: number } | null = null;
+    const distanceOf = (t: TouchList) =>
+      Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const onStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        pinch = { dist: distanceOf(e.touches), scale: scaleRef.current };
+      }
+    };
+    const onMove = (e: TouchEvent) => {
+      if (!pinch || e.touches.length !== 2) return;
+      e.preventDefault();
+      const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      applyZoom(computePinchScale(pinch.dist, distanceOf(e.touches), pinch.scale), midX, midY);
+    };
+    const onEnd = (e: TouchEvent) => {
+      if (e.touches.length < 2) pinch = null;
+    };
+    el.addEventListener("touchstart", onStart, { passive: true });
+    el.addEventListener("touchmove", onMove, { passive: false });
+    el.addEventListener("touchend", onEnd);
+    el.addEventListener("touchcancel", onEnd);
+    return () => {
+      el.removeEventListener("touchstart", onStart);
+      el.removeEventListener("touchmove", onMove);
+      el.removeEventListener("touchend", onEnd);
+      el.removeEventListener("touchcancel", onEnd);
+    };
+  }, [disabled, applyZoom]);
+
   return (
     <div
       ref={stageRef}
@@ -793,6 +851,8 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
         overflow: "hidden",
         cursor:
           !disabled && scale > 1.0 ? (isDragging ? "grabbing" : "grab") : "inherit",
+        // Let the page scroll vertically, but keep pinch for the video; zoomed in, drag pans.
+        touchAction: disabled ? undefined : scale > 1.0 ? "none" : "pan-x pan-y",
       }}
       onDoubleClick={(e) => {
         if (disabled) return;
@@ -878,7 +938,9 @@ export const ZoomableVideoStage: React.FC<ZoomableVideoStageProps> = ({
       {!disabled && (
         <div
           data-zoom-hud="true"
-          className="mono"
+          data-zoomed={scale > 1.0 ? "true" : "false"}
+          data-has-extra={extraHud ? "true" : "false"}
+          className="mono nvr-zoom-hud"
           onClick={(e) => e.stopPropagation()}
           style={{
             position: "absolute",

@@ -1763,6 +1763,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
           {titlePrefix && (
             <span
+              className="nvr-tl-desktop"
               style={{
                 fontSize: "var(--text-xs)",
                 fontWeight: 700,
@@ -1859,7 +1860,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
           {/* 24h Activity Matrix Toggle: neutral when closed, accent when open */}
           <button
-            className={`nvr-btn ${showArchiveDeck ? "active" : ""} sm`}
+            className={`nvr-btn nvr-tl-desktop ${showArchiveDeck ? "active" : ""} sm`}
             onClick={() => setShowArchiveDeck((v) => !v)}
           >
             <Grid size={12} />
@@ -1927,7 +1928,7 @@ export const TimelineScrubber: React.FC<TimelineScrubberProps> = ({
 
         {/* Right: Zoom (5m / 15m / 1h / 6h / 24h), Pan, and Segment Clipper Toggle */}
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-          <span className="nvr-timeline-legend mono" aria-label={isPt ? "Legenda" : "Legend"}>
+          <span className="nvr-timeline-legend nvr-tl-desktop mono" aria-label={isPt ? "Legenda" : "Legend"}>
             <span><i className="is-alert" aria-hidden="true" />{isPt ? "Alertas" : "Alerts"}</span>
             <span><i className="is-detection" aria-hidden="true" />{isPt ? "Detecções" : "Detections"}</span>
           </span>
