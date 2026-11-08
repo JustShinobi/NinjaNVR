@@ -1894,30 +1894,6 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
     ? `rotate(${rotateDeg}deg)${isCorridorRot ? " scale(0.5625)" : ""}`
     : undefined;
 
-  const handleCaptureLiveStill = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    const vid = getActiveVideoEl();
-    const img = imgRef.current;
-    const canvas = document.createElement("canvas");
-    if (vid && vid.videoWidth > 0 && vid.videoHeight > 0 && mseReady) {
-      canvas.width = vid.videoWidth;
-      canvas.height = vid.videoHeight;
-      const ctx = canvas.getContext("2d");
-      ctx?.drawImage(vid, 0, 0, canvas.width, canvas.height);
-    } else if (img && img.naturalWidth > 0 && img.naturalHeight > 0) {
-      canvas.width = img.naturalWidth;
-      canvas.height = img.naturalHeight;
-      const ctx = canvas.getContext("2d");
-      ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
-    } else {
-      return;
-    }
-    const link = document.createElement("a");
-    link.download = `${camera}_${Math.floor(Date.now() / 1000)}.png`;
-    link.href = canvas.toDataURL("image/png");
-    link.click();
-  };
-
   const posterSrc = resolveLivePosterUrl(realCamera, useMainStream, posterTick);
   const effCfg = cameraConfig ?? configuredCameras?.[realCamera];
   const effProto = (
@@ -1988,7 +1964,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
         disabled={Boolean(onPlotPoint)}
         forceHudVisible={pttState !== "idle"}
         extraHud={
-          <>
+          resolvedPttSupported ? (
             <PushToTalkButton
               camera={realCamera}
               height={20}
@@ -1996,17 +1972,7 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
               mode={resolvedPttMode}
               onStateChange={(nextState) => setPttState(nextState)}
             />
-            <button
-              type="button"
-              className="nvr-btn mono"
-              style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
-              title="Save high-resolution PNG photo of current frame"
-              onClick={handleCaptureLiveStill}
-            >
-              <Camera size={11} />
-              Photo
-            </button>
-          </>
+          ) : undefined
         }
       >
         {(pttState === "talking" || pttState === "connecting") && (
@@ -2062,8 +2028,10 @@ export const LiveMsePlayer: React.FC<LiveMsePlayerProps> = ({
             className="mono"
             style={{
               position: "absolute",
-              left: 10,
-              bottom: 10,
+              left: "50%",
+              top: "50%",
+              transform: "translate(-50%, -50%)",
+              whiteSpace: "nowrap",
               zIndex: 10,
               background: "rgba(9, 13, 20, 0.88)",
               border: "1px solid var(--signal-alert)",
@@ -2538,13 +2506,13 @@ export const VodHlsPlayer: React.FC<VodHlsPlayerProps> = ({
         style={{ height: 20, padding: "0 6px", fontSize: "var(--text-xs)" }}
         title={
           isPt
-            ? "Salvar foto PNG na resolução original deste quadro"
-            : "Save native-resolution PNG photo of this frame"
+            ? "Salvar foto deste quadro gravado (resolução original)"
+            : "Save a snapshot of this recorded frame (native resolution)"
         }
         onClick={handleCaptureVodStill}
       >
         <Camera size={11} />
-        {isPt ? "Salvar Foto" : "Save Photo"}
+        {isPt ? "Foto do quadro" : "Frame snapshot"}
       </button>
     </>
   );

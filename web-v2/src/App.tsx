@@ -1,5 +1,17 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { LogOut, Monitor, Moon, Sun } from "lucide-react";
+import {
+  Clock,
+  Download,
+  LayoutGrid,
+  ListChecks,
+  LogOut,
+  Monitor,
+  Moon,
+  MoreHorizontal,
+  Sun,
+} from "lucide-react";
+import { formatBadgeCount, resolveMobileNavTabs } from "./utils/liveTileHud";
+import { useCompactViewport } from "./utils/useCompactViewport";
 import { useI18n } from "./i18n";
 import {
   EventItem,
@@ -197,6 +209,8 @@ export function playTacticalAlertChime(): void {
 export const App: React.FC = () => {
   const { t } = useI18n();
   const activeTab = useNvrStore((s) => s.activeTab);
+  const isCompact = useCompactViewport();
+  const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
   const setActiveTab = useNvrStore((s) => s.setActiveTab);
   const securityProfile = useNvrStore((s) => s.securityProfile);
   const setSecurityProfile = useNvrStore((s) => s.setSecurityProfile);
@@ -1329,8 +1343,57 @@ export const App: React.FC = () => {
     );
   }
 
+  const handleLogout = async () => {
+          manualLogoutRef.current = true;
+          coreFetchSeqRef.current += 1;
+          try {
+            await fetch("/api/logout", {
+              method: "POST",
+              credentials: "include",
+            });
+          } catch {
+            // ignore
+          }
+          coreFetchSeqRef.current += 1;
+          setConfig(null);
+          setStats(null);
+          setStatsHistory([]);
+          setCameraActivity({});
+          setFocusSegments([]);
+          setGlobalDaysSummary([]);
+          setFfprobeInfo(null);
+          setDraftPoints([]);
+          setRawYaml("");
+          setEvents([]);
+          setReviews([]);
+          setExportsList([]);
+          setLogLines([]);
+          setActiveReview(null);
+          setSelectedEvent(null);
+          setActiveExportPreview(null);
+          setUserRole("viewer");
+          setWsOnline(false);
+          if (activeTab === "zones" || activeTab === "system") {
+            switchTab("live");
+          }
+          setAuthNeeded(true);
+  };
+
+  const mobileNav = resolveMobileNavTabs(userRole);
+  const navLabel = (tab: WorkspaceTab): string => t.nav[tab];
+  const mobileTabIcon = (tab: WorkspaceTab) =>
+    tab === "live" ? (
+      <LayoutGrid size={22} aria-hidden="true" />
+    ) : tab === "sync" ? (
+      <Clock size={22} aria-hidden="true" />
+    ) : tab === "review" ? (
+      <ListChecks size={22} aria-hidden="true" />
+    ) : (
+      <Download size={22} aria-hidden="true" />
+    );
+
   return (
-    <div className="nvr-shell">
+    <div className={`nvr-shell ${isCompact ? "is-compact" : ""}`}>
       <header className="nvr-header">
         <div className="nvr-brand">
           <img
@@ -1525,7 +1588,7 @@ export const App: React.FC = () => {
           <button
             type="button"
             data-testid="topbar-theme-toggle"
-            className="nvr-btn mono"
+            className="nvr-btn mono nvr-header-aux"
             style={{
               height: 26,
               padding: "0 8px",
@@ -1581,42 +1644,9 @@ export const App: React.FC = () => {
               gap: 4,
             }}
             title={`Signed in as ${username} (${userRole}) — Click to log out`}
+            data-testid="topbar-logout"
             aria-label="Log out of NinjaNVR Console"
-            onClick={async () => {
-              manualLogoutRef.current = true;
-              coreFetchSeqRef.current += 1;
-              try {
-                await fetch("/api/logout", {
-                  method: "POST",
-                  credentials: "include",
-                });
-              } catch {
-                // ignore
-              }
-              coreFetchSeqRef.current += 1;
-              setConfig(null);
-              setStats(null);
-              setStatsHistory([]);
-              setCameraActivity({});
-              setFocusSegments([]);
-              setGlobalDaysSummary([]);
-              setFfprobeInfo(null);
-              setDraftPoints([]);
-              setRawYaml("");
-              setEvents([]);
-              setReviews([]);
-              setExportsList([]);
-              setLogLines([]);
-              setActiveReview(null);
-              setSelectedEvent(null);
-              setActiveExportPreview(null);
-              setUserRole("viewer");
-              setWsOnline(false);
-              if (activeTab === "zones" || activeTab === "system") {
-                switchTab("live");
-              }
-              setAuthNeeded(true);
-            }}
+            onClick={handleLogout}
           >
             <LogOut size={12} />
             <span>Logout</span>
@@ -1792,6 +1822,99 @@ export const App: React.FC = () => {
           />
         )}
       </main>
+
+      {isCompact && (
+        <nav className="nvr-tabbar" aria-label="Primary Workspace Navigation (mobile)">
+          {mobileNav.primary.map((tab) => {
+            const badge = tab === "review" ? formatBadgeCount(unreviewedAlerts.length) : "";
+            return (
+              <button
+                key={tab}
+                type="button"
+                data-testid={`tabbar-${tab}`}
+                className={`nvr-tabbar-btn ${activeTab === tab ? "active" : ""}`}
+                aria-current={activeTab === tab ? "page" : undefined}
+                onClick={() => {
+                  setMobileMoreOpen(false);
+                  switchTab(tab);
+                }}
+              >
+                {mobileTabIcon(tab)}
+                <span className="nvr-tabbar-label">{t.navMobile[tab as keyof typeof t.navMobile]}</span>
+                {badge && <span className="nvr-tabbar-badge mono">{badge}</span>}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            data-testid="tabbar-more"
+            className={`nvr-tabbar-btn ${
+              mobileMoreOpen || mobileNav.overflow.includes(activeTab as WorkspaceTab) ? "active" : ""
+            }`}
+            aria-expanded={mobileMoreOpen}
+            onClick={() => setMobileMoreOpen((v) => !v)}
+          >
+            <MoreHorizontal size={22} aria-hidden="true" />
+            <span className="nvr-tabbar-label">{t.navMobile.more}</span>
+          </button>
+        </nav>
+      )}
+
+      {isCompact && mobileMoreOpen && (
+        <div className="nvr-sheet-backdrop" onClick={() => setMobileMoreOpen(false)}>
+          <section
+            className="nvr-sheet nvr-more-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t.navMobile.more}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setMobileMoreOpen(false);
+            }}
+          >
+            <div className="nvr-sheet-handle" aria-hidden="true" />
+            {mobileNav.overflow.map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                data-testid={`more-${tab}`}
+                className={`nvr-sheet-link ${activeTab === tab ? "active" : ""}`}
+                onClick={() => {
+                  setMobileMoreOpen(false);
+                  switchTab(tab);
+                }}
+              >
+                {navLabel(tab)}
+              </button>
+            ))}
+            <div className="nvr-sheet-row">
+              <span className="mono">{headerTelemetry.channelBadge} · CPU {sysCpu} · {totalFps}</span>
+            </div>
+            <button
+              type="button"
+              className="nvr-sheet-link"
+              onClick={() => setThemeMode(cycleThemeMode(themeMode))}
+            >
+              {t.theme.label}:{" "}
+              {themeMode === "dark"
+                ? t.theme.dark
+                : themeMode === "light"
+                ? t.theme.light
+                : t.theme.system}
+            </button>
+            <button
+              type="button"
+              className="nvr-sheet-link danger"
+              onClick={() => {
+                setMobileMoreOpen(false);
+                void handleLogout();
+              }}
+            >
+              <LogOut size={16} aria-hidden="true" /> Logout ({username})
+            </button>
+          </section>
+        </div>
+      )}
     </div>
   );
 };

@@ -3344,3 +3344,469 @@ input[type="range"] {
 .nvr-ds-outcome.is-bad strong {
   color: var(--signal-alert-text);
 }
+
+/* ==========================================================================
+   Live tile HUD by exception (identity · exception chip · on-demand actions)
+   ========================================================================== */
+.nvr-cam-hud.nvr-tile-bar {
+  gap: 6px;
+  flex-wrap: nowrap;
+  max-width: 100%;
+}
+
+.nvr-cam-hud.nvr-tile-bar.pos-bottom-right,
+.nvr-cam-hud.nvr-tile-bar.pos-top-right {
+  flex-direction: row-reverse;
+}
+
+.nvr-tile-identity {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nvr-tile-actions {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.nvr-cam-tile:hover .nvr-tile-actions,
+.nvr-cam-tile:focus-within .nvr-tile-actions {
+  display: inline-flex;
+}
+
+.nvr-tile-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 4px;
+  border: 1px solid var(--border-hairline);
+  background: var(--badge-surface);
+  color: var(--text-primary);
+  cursor: pointer;
+  text-decoration: none;
+  flex-shrink: 0;
+}
+
+.nvr-tile-icon:hover,
+.nvr-tile-icon:focus-visible {
+  border-color: var(--signal-accent-border);
+  color: var(--signal-accent-text);
+}
+
+.nvr-tile-icon.active {
+  background: var(--signal-accent);
+  border-color: var(--signal-accent);
+  color: #04111c;
+}
+
+.nvr-tile-exception {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 6;
+  pointer-events: none;
+}
+
+.nvr-tile-exception.at-bottom {
+  top: auto;
+  bottom: 6px;
+}
+
+.nvr-tile-exception .nvr-badge {
+  padding: 3px 8px;
+  font-weight: 700;
+}
+
+.nvr-tile-exception .nvr-badge.alert {
+  background: linear-gradient(var(--signal-alert-tint), var(--signal-alert-tint)), var(--badge-surface);
+}
+
+.nvr-tile-exception .nvr-badge.motion {
+  background: linear-gradient(var(--signal-motion-tint), var(--signal-motion-tint)), var(--badge-surface);
+}
+
+.nvr-tile-ptz {
+  position: absolute;
+  left: 50%;
+  bottom: 44px;
+  transform: translateX(-50%);
+  z-index: 7;
+  max-width: calc(100% - 16px);
+}
+
+.nvr-tile-ptz .nvr-tile-action {
+  display: inline-flex;
+}
+
+/* ==========================================================================
+   Sheets (Camera Details, mobile "More") — bottom sheet on phones,
+   right-hand drawer on wider screens
+   ========================================================================== */
+.nvr-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  background: rgba(5, 7, 10, 0.62);
+  display: flex;
+  justify-content: flex-end;
+  align-items: stretch;
+}
+
+.nvr-sheet {
+  width: min(380px, 100%);
+  height: 100%;
+  box-sizing: border-box;
+  overflow-y: auto;
+  background: var(--bg-panel);
+  border-left: 1px solid var(--border-card);
+  color: var(--text-primary);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  box-shadow: var(--shadow-card);
+}
+
+.nvr-sheet-handle {
+  display: none;
+}
+
+.nvr-sheet-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.nvr-sheet-title {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: 700;
+}
+
+.nvr-sheet-sub {
+  margin: 2px 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.nvr-icon-btn {
+  width: 44px;
+  height: 44px;
+  margin: -8px -10px 0 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.nvr-icon-btn:hover,
+.nvr-icon-btn:focus-visible {
+  background: var(--bg-hover);
+}
+
+.nvr-sheet-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.nvr-sheet-stat {
+  background: var(--bg-subcard);
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.nvr-sheet-k {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.nvr-sheet-v {
+  font-size: var(--text-md);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.nvr-sheet-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.nvr-sheet-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 48px;
+  border-bottom: 1px solid var(--border-divider);
+  font-size: var(--text-md);
+}
+
+.nvr-sheet-row:last-child {
+  border-bottom: 0;
+}
+
+.nvr-sheet-seg {
+  display: flex;
+}
+
+.nvr-sheet-seg .nvr-btn {
+  flex: 1 1 0;
+  height: 40px;
+  justify-content: center;
+}
+
+.nvr-sheet-link {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 0 12px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 8px;
+  background: var(--bg-subcard);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-md);
+  text-align: left;
+  cursor: pointer;
+}
+
+.nvr-sheet-link.active {
+  border-color: var(--signal-accent);
+  color: var(--signal-accent-text);
+}
+
+.nvr-sheet-link.danger {
+  color: var(--signal-alert-text);
+}
+
+.nvr-more-sheet {
+  gap: 10px;
+}
+
+.nvr-switch {
+  flex-shrink: 0;
+  width: 52px;
+  height: 32px;
+  padding: 3px;
+  border: 0;
+  border-radius: 16px;
+  background: var(--border-strong);
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.nvr-switch.on {
+  background: var(--signal-accent);
+  justify-content: flex-end;
+}
+
+.nvr-switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.nvr-switch:focus-visible {
+  outline: 2px solid var(--signal-accent-text);
+  outline-offset: 2px;
+}
+
+.nvr-switch-knob {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: #f1f5f9;
+  display: block;
+}
+
+/* Mobile bottom tab bar (rendered only on compact viewports) */
+.nvr-tabbar {
+  display: flex;
+  flex-shrink: 0;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border-hairline);
+  padding: 4px 4px calc(4px + env(safe-area-inset-bottom, 0px));
+}
+
+.nvr-tabbar-btn {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 56px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.nvr-tabbar-btn.active {
+  color: var(--signal-accent-text);
+}
+
+.nvr-tabbar-badge {
+  position: absolute;
+  top: 4px;
+  left: calc(50% + 6px);
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border-radius: 9px;
+  background: var(--signal-alert);
+  color: #fff;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Touch devices: 44px targets on every tile action, actions always reachable */
+@media (pointer: coarse) {
+  .nvr-tile-icon {
+    width: 44px;
+    height: 44px;
+  }
+}
+
+@media (max-width: 1024px) {
+  .nvr-cam-tile .nvr-tile-actions {
+    display: inline-flex;
+  }
+}
+
+/* ==========================================================================
+   Phone layout (< 768px)
+   ========================================================================== */
+@media (max-width: 767px) {
+  .nvr-shell {
+    height: 100dvh;
+  }
+
+  .nvr-header {
+    height: 52px;
+    min-height: 52px;
+    padding: 0 8px 0 12px;
+  }
+
+  .nvr-header .nvr-nav,
+  .nvr-header .nvr-brand-version,
+  .nvr-header .nvr-telemetry-pill,
+  .nvr-header .nvr-header-aux,
+  .nvr-header [data-testid="topbar-logout"],
+  .nvr-persistent-stage .nvr-timeline-reticle {
+    display: none !important;
+  }
+
+  .nvr-compact-cols {
+    order: -1;
+  }
+
+  .nvr-main {
+    overflow-y: auto;
+  }
+
+  .nvr-desktop-only {
+    display: none !important;
+  }
+
+  .nvr-subbar {
+    height: 48px;
+    min-height: 48px;
+    padding: 0 8px;
+  }
+
+  .nvr-subbar .nvr-btn {
+    min-height: 36px;
+  }
+
+  /* Event strip collapses to one summary row + the latest event */
+  .nvr-alert-ribbon {
+    min-height: 0;
+    padding: 8px;
+  }
+
+  .nvr-alert-ribbon > .nvr-event-card ~ .nvr-event-card {
+    display: none;
+  }
+
+  .nvr-persistent-stage {
+    background: var(--bg-canvas);
+    padding: 8px;
+  }
+
+  .nvr-persistent-stage .nvr-cam-tile {
+    aspect-ratio: 16 / 9;
+    height: auto;
+    min-height: 0;
+    border-radius: 8px;
+  }
+
+  /* Matrix list: identity + exception only; one tap opens the camera screen */
+  .nvr-persistent-stage.is-layout-grid .nvr-cam-tile .nvr-tile-actions {
+    display: none;
+  }
+
+  .nvr-tile-icon {
+    width: 44px;
+    height: 44px;
+  }
+
+  .nvr-sheet-backdrop {
+    align-items: flex-end;
+  }
+
+  .nvr-sheet {
+    width: 100%;
+    height: auto;
+    max-height: 88dvh;
+    border-left: 0;
+    border-top: 1px solid var(--border-card);
+    border-radius: 16px 16px 0 0;
+    padding: 8px 16px calc(16px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .nvr-sheet-handle {
+    display: block;
+    align-self: center;
+    width: 40px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border-strong);
+  }
+
+  .nvr-timeline-bar {
+    height: auto;
+  }
+}

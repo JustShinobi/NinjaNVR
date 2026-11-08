@@ -13,6 +13,13 @@ export const en = {
     zones: "Settings & Studio",
     system: "System & Logs",
   },
+  navMobile: {
+    live: "Live",
+    sync: "Playback",
+    review: "Review",
+    exports: "Exports",
+    more: "More",
+  },
   auth: {
     title: "OPERATOR AUTHENTICATION",
     subtitle: "Enter credentials to access NinjaNVR Security Console",
@@ -41,6 +48,9 @@ export const en = {
     rewind2m: "-2m",
     export60s: "Clip 60s",
     snapshot: "Snapshot",
+    snapshotHint: "Save a full-resolution snapshot (main stream, privacy masks applied)",
+    cameraDetails: "Camera details",
+    gridColumns: "Columns",
     zonesOverlay: "Vectors",
     hdStream: "1080p Main",
     subStream: "720p Sub",
@@ -189,6 +199,13 @@ export interface TranslationDict {
     zones: string;
     system: string;
   };
+  navMobile: {
+    live: string;
+    sync: string;
+    review: string;
+    exports: string;
+    more: string;
+  };
   auth: {
     title: string;
     subtitle: string;
@@ -217,6 +234,9 @@ export interface TranslationDict {
     rewind2m: string;
     export60s: string;
     snapshot: string;
+    snapshotHint: string;
+    cameraDetails: string;
+    gridColumns: string;
     zonesOverlay: string;
     hdStream: string;
     subStream: string;

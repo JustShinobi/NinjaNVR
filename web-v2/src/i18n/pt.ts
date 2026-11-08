@@ -15,6 +15,13 @@ export const pt: TranslationDict = {
     zones: "Configurações",
     system: "Sistema & Logs",
   },
+  navMobile: {
+    live: "Ao vivo",
+    sync: "Playback",
+    review: "Revisão",
+    exports: "Exportar",
+    more: "Mais",
+  },
   auth: {
     title: "AUTENTICAÇÃO DO OPERADOR",
     subtitle: "Insira suas credenciais para acessar o Console NinjaNVR",
@@ -43,6 +50,9 @@ export const pt: TranslationDict = {
     rewind2m: "-2m",
     export60s: "Clipe 60s",
     snapshot: "Foto",
+    snapshotHint: "Salvar foto em resolução máxima (stream principal, máscaras de privacidade aplicadas)",
+    cameraDetails: "Detalhes da câmera",
+    gridColumns: "Colunas",
     zonesOverlay: "Vetores",
     hdStream: "1080p Principal",
     subStream: "720p Sub",
