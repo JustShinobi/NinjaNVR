@@ -1424,6 +1424,7 @@ mod tests {
                 points: [100.0, 200.0, 500.0, 200.0],
                 direction: LineDirection::AToB,
                 objects: vec!["person".to_string()],
+                ..Default::default()
             },
         );
 
@@ -1510,6 +1511,7 @@ mod tests {
                 max_area: None,
                 min_score: Some(0.80),
                 preset: None,
+                ..Default::default()
             },
         );
 
@@ -1565,6 +1567,7 @@ mod tests {
             max_area: None,
             min_score: None,
             preset: None,
+            ..Default::default()
         };
         cam_cfg
             .zones
@@ -1638,6 +1641,7 @@ mod tests {
                 max_area: None,
                 min_score: None,
                 preset: None,
+                ..Default::default()
             },
         );
         cam_cfg.zones.insert(
@@ -1651,6 +1655,7 @@ mod tests {
                 max_area: None,
                 min_score: None,
                 preset: None,
+                ..Default::default()
             },
         );
 
@@ -1858,6 +1863,7 @@ mod tests {
                 points: [0.1, 0.5, 0.9, 0.5], // normalized line at y = 180 on 640x360 frame
                 direction: LineDirection::Any,
                 objects: vec!["person".to_string()],
+                ..Default::default()
             },
         );
         let mut tracker = ByteTracker::new("front_door", 640, 360, &cam_cfg);
@@ -2096,6 +2102,7 @@ mod tests {
                 max_area: None,
                 min_score: None,
                 preset: Some("driveway".to_string()),
+                ..Default::default()
             },
         );
         cam_cfg.zones.insert(
@@ -2109,6 +2116,7 @@ mod tests {
                 max_area: None,
                 min_score: None,
                 preset: Some("entry_gate".to_string()),
+                ..Default::default()
             },
         );
         cam_cfg.zones.insert(
@@ -2122,6 +2130,7 @@ mod tests {
                 max_area: None,
                 min_score: None,
                 preset: None,
+                ..Default::default()
             },
         );
 
@@ -2548,6 +2557,7 @@ mod tests {
                 max_area: None,
                 min_score: None,
                 preset: None,
+                ..Default::default()
             },
         );
 
@@ -2644,6 +2654,7 @@ mod tests {
                 max_area: Some(0.0), // 0.0 must be treated as unset, not 1px max
                 min_score: None,
                 preset: None,
+                ..Default::default()
             },
         );
 

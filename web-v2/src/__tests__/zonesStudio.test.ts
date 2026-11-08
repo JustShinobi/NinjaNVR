@@ -319,4 +319,32 @@ describe("zones studio — save status feedback", () => {
     expect(resolveSaveStatus({ isSaving: false, isDirty: true, outcome: { ok: false } })).toBe("error");
     expect(resolveSaveStatus({ isSaving: true, isDirty: true, outcome: { ok: false } })).toBe("busy");
   });
+
+  test("zone and line siren flag round-trips through editor, summary, and review diff", () => {
+    const draft = config({ sala: cam() });
+    const lineEd = emptyEditorState("line");
+    lineEd.name = "Cantinho";
+    lineEd.direction = "a_to_b";
+    lineEd.objects = ["person"];
+    lineEd.siren = true;
+
+    const res = commitVisionEditor(draft, "sala", lineEd, [
+      [0.2, 0.2],
+      [0.8, 0.2],
+    ]);
+    expect(res).toEqual({ ok: true, ref: { kind: "line", key: "cantinho" } });
+    expect(draft.cameras.sala.lines?.cantinho?.siren).toBe(true);
+
+    const loaded = editorStateFromItem(draft.cameras.sala, { kind: "line", key: "cantinho" });
+    expect(loaded?.state.siren).toBe(true);
+
+    const items = listCameraVisionItems(draft.cameras.sala, true);
+    const lineItem = items.find((i) => i.ref.kind === "line" && i.ref.key === "cantinho");
+    expect(lineItem?.summary).toContain("🔔 sirene");
+
+    const base = clone(draft);
+    draft.cameras.sala.lines!.cantinho.siren = false;
+    const changes = diffVisionConfig(base, draft, true);
+    expect(changes[0]?.detail).toBe("Mudou: sirene da câmera.");
+  });
 });

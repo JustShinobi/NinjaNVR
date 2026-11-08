@@ -2651,7 +2651,8 @@ export const ChannelsStreamsSection: React.FC<{
                               />
                             </div>
                           )}
-                          {(hwProbeResult.capabilities.camera_logs ||
+                          {(hwProbeResult.capabilities.manual_siren ||
+                            hwProbeResult.capabilities.camera_logs ||
                             hwProbeResult.capabilities.reboot) && (
                             <div
                               style={{
@@ -2661,6 +2662,21 @@ export const ChannelsStreamsSection: React.FC<{
                                 gap: 6,
                               }}
                             >
+                              {hwProbeResult.capabilities.manual_siren && (
+                                <button
+                                  type="button"
+                                  className="nvr-btn mono sm"
+                                  disabled={hwProbeBusy}
+                                  aria-label={`Trigger Siren ${inspectorCam}`}
+                                  onClick={() =>
+                                    void handleApplyHardwareControl({
+                                      trigger_siren: true,
+                                    })
+                                  }
+                                >
+                                  {isPt ? "Testar Sirene (3.5s)" : "Trigger Siren (3.5s)"}
+                                </button>
+                              )}
                               {hwProbeResult.capabilities.camera_logs && (
                                 <button
                                   type="button"

@@ -315,6 +315,7 @@ export function isCameraHardwareControlsSupported(
   const c = hwInfo.capabilities;
   return Boolean(
     CAMERA_HUD_CONTROL_DESCRIPTORS.some((desc) => Boolean(c[desc.capability])) ||
+      c.manual_siren ||
       c.ir_lighting ||
       c.audio_anomaly_detect ||
       c.reboot

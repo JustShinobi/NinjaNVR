@@ -257,6 +257,8 @@ pub struct CameraDriverRuntime {
     discovered_video_sources: Arc<Mutex<HashMap<String, String>>>,
     discovered_protocols: Arc<Mutex<HashMap<String, String>>>,
     digest_challenges: Arc<Mutex<HashMap<String, String>>>,
+    siren_cooldown_until: Arc<Mutex<HashMap<String, f64>>>,
+    tapo_streamd_ports: Arc<Mutex<HashMap<String, u16>>>,
 }
 
 impl CameraDriverRuntime {
@@ -329,6 +331,36 @@ impl CameraDriverRuntime {
         }
     }
 
+    pub fn try_claim_siren_trigger(&self, camera: &str, now_sec: f64, cooldown_sec: f64) -> bool {
+        let Ok(mut g) = self.siren_cooldown_until.lock() else {
+            return false;
+        };
+        if let Some(&until) = g.get(camera)
+            && now_sec < until
+        {
+            return false;
+        }
+        if g.len() >= 128 && !g.contains_key(camera) {
+            g.clear();
+        }
+        g.insert(camera.to_string(), now_sec + cooldown_sec.max(1.0));
+        true
+    }
+
+    pub fn get_tapo_streamd_port(&self, camera: &str) -> u16 {
+        self.tapo_streamd_ports
+            .lock()
+            .ok()
+            .and_then(|g| g.get(camera).copied())
+            .unwrap_or(8800)
+    }
+
+    pub fn set_tapo_streamd_port(&self, camera: &str, port: u16) {
+        if let Ok(mut g) = self.tapo_streamd_ports.lock() {
+            g.insert(camera.to_string(), port);
+        }
+    }
+
     pub fn invalidate_camera(&self, camera: &str) {
         if let Ok(mut g) = self.discovered_profiles.lock() {
             g.retain(|(cam, _), _| cam != camera);
@@ -337,6 +369,12 @@ impl CameraDriverRuntime {
             g.remove(camera);
         }
         if let Ok(mut g) = self.discovered_protocols.lock() {
+            g.remove(camera);
+        }
+        if let Ok(mut g) = self.siren_cooldown_until.lock() {
+            g.remove(camera);
+        }
+        if let Ok(mut g) = self.tapo_streamd_ports.lock() {
             g.remove(camera);
         }
     }
@@ -539,6 +577,8 @@ pub struct CameraHardwareUpdateBody {
     pub profile_token: Option<String>,
     pub video_source_token: Option<String>,
     pub cloud_password: Option<String>,
+    pub trigger_siren: Option<bool>,
+    pub siren_duration_sec: Option<f32>,
     pub timeout_ms: Option<u64>,
 }
 
@@ -2398,6 +2438,570 @@ pub fn convert_pcm16le_or_wav_to_alaw(input: &[u8]) -> Vec<u8> {
     out
 }
 
+pub const TAPO_STREAMD_BOUNDARY: &[u8] = b"----client-stream-boundary--";
+pub const TAPO_AUDIO_RATE: usize = 8000;
+pub const TAPO_AUDIO_CHUNK_BYTES: usize = 160; // 20 ms at 8 kHz G.711 A-law
+pub const TAPO_ALAW_SILENCE: u8 = 0xD5;
+const TAPO_STREAM_TYPE_PCMA: u8 = 0x90;
+const TAPO_PCR_PID: u16 = 0x1FFF;
+const TAPO_PES_PID: u16 = 0x0100;
+const TAPO_PMT_PID: u16 = 0x1000;
+
+/// Synthesizes a sweeping two-tone tactical siren (`750 Hz – 1450 Hz` at `8000 Hz` mono)
+/// encoded as ITU-T G.711 A-law (`PCMA`) bytes for immediate playback on camera speakers.
+pub fn generate_siren_alaw_bytes(duration_sec: f32) -> Vec<u8> {
+    let clamped_sec = if duration_sec.is_finite() {
+        duration_sec.clamp(0.2, 15.0)
+    } else {
+        3.5
+    };
+    let total_samples = ((TAPO_AUDIO_RATE as f32) * clamped_sec).round() as usize;
+    let mut out = Vec::with_capacity(total_samples);
+    let mut phase: f64 = 0.0;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    for i in 0..total_samples {
+        let t = (i as f64) / (TAPO_AUDIO_RATE as f64);
+        let sweep = 0.5 * (1.0 + (two_pi * 2.2 * t).sin());
+        let freq = 750.0 + 700.0 * sweep;
+        phase += two_pi * freq / (TAPO_AUDIO_RATE as f64);
+        let sample = (26_000.0 * phase.sin()).round() as i16;
+        out.push(linear_pcm16_to_alaw(sample));
+    }
+    out
+}
+
+/// Computes ISO/IEC 13818-1 MPEG-2 CRC-32 (`poly = 0x04C11DB7`, `init = 0xFFFFFFFF`) for PAT/PMT tables.
+pub fn crc32_mpeg2(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= (b as u32) << 24;
+        for _ in 0..8 {
+            if (crc & 0x8000_0000) != 0 {
+                crc = (crc << 1) ^ 0x04C1_1DB7;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+fn build_mpegts_packet(pid: u16, payload: &[u8], continuity_counter: u8, start: bool) -> [u8; 188] {
+    let mut pkt = [0xFFu8; 188];
+    let payload_len = payload.len().min(184);
+    pkt[0] = 0x47;
+    pkt[1] = (if start { 0x40 } else { 0x00 }) | (((pid >> 8) as u8) & 0x1F);
+    pkt[2] = (pid & 0xFF) as u8;
+    if payload_len == 184 {
+        pkt[3] = 0x10 | (continuity_counter & 0x0F);
+        pkt[4..188].copy_from_slice(&payload[..184]);
+    } else {
+        let fill = 184 - payload_len - 1;
+        pkt[3] = 0x30 | (continuity_counter & 0x0F);
+        pkt[4] = fill as u8;
+        if fill > 0 {
+            pkt[5] = 0x00;
+            // pkt[6..4 + 1 + fill] already filled with 0xFF stuffing bytes
+        }
+        let payload_offset = 4 + 1 + fill;
+        pkt[payload_offset..188].copy_from_slice(&payload[..payload_len]);
+    }
+    pkt
+}
+
+fn build_mpegts_psi_section(table_id: u8, body: &[u8]) -> Vec<u8> {
+    let section_len = 5 + body.len() + 4;
+    let mut sec = Vec::with_capacity(3 + section_len);
+    sec.push(table_id);
+    sec.push(0xB0 | (((section_len >> 8) as u8) & 0x0F));
+    sec.push((section_len & 0xFF) as u8);
+    sec.extend_from_slice(&[0x00, 0x01, 0xC1, 0x00, 0x00]);
+    sec.extend_from_slice(body);
+    let crc = crc32_mpeg2(&sec);
+    sec.extend_from_slice(&crc.to_be_bytes());
+    sec
+}
+
+/// Builds the 2-packet (376-byte) MPEG-TS PAT + PMT header declaring an 8 kHz G.711 A-law (`0x90`)
+/// audio stream on PID `0x0100` for Tapo `Streamd` (`:8800`) two-way audio / siren playback.
+pub fn build_tapo_mpegts_audio_header_packets() -> Vec<u8> {
+    let mut pat_body = Vec::with_capacity(4);
+    pat_body.extend_from_slice(&1u16.to_be_bytes());
+    pat_body.extend_from_slice(&(0xE000u16 | TAPO_PMT_PID).to_be_bytes());
+    let pat_sec = build_mpegts_psi_section(0x00, &pat_body);
+    let mut pat_payload = Vec::with_capacity(1 + pat_sec.len());
+    pat_payload.push(0x00);
+    pat_payload.extend_from_slice(&pat_sec);
+
+    let mut pmt_body = Vec::with_capacity(9);
+    pmt_body.extend_from_slice(&(0xE000u16 | TAPO_PCR_PID).to_be_bytes());
+    pmt_body.extend_from_slice(&0xF000u16.to_be_bytes());
+    pmt_body.push(TAPO_STREAM_TYPE_PCMA);
+    pmt_body.extend_from_slice(&(0xE000u16 | TAPO_PES_PID).to_be_bytes());
+    pmt_body.extend_from_slice(&0xF000u16.to_be_bytes());
+    let pmt_sec = build_mpegts_psi_section(0x02, &pmt_body);
+    let mut pmt_payload = Vec::with_capacity(1 + pmt_sec.len());
+    pmt_payload.push(0x00);
+    pmt_payload.extend_from_slice(&pmt_sec);
+
+    let mut out = Vec::with_capacity(376);
+    out.extend_from_slice(&build_mpegts_packet(0x0000, &pat_payload, 0, true));
+    out.extend_from_slice(&build_mpegts_packet(TAPO_PMT_PID, &pmt_payload, 0, true));
+    out
+}
+
+fn encode_mpegts_pts_33bit(pts: u64) -> [u8; 5] {
+    let v = pts & 0x1_FFFF_FFFF;
+    [
+        0x21 | ((((v >> 30) & 0x07) as u8) << 1),
+        ((v >> 22) & 0xFF) as u8,
+        ((((v >> 15) & 0x7F) as u8) << 1) | 0x01,
+        ((v >> 7) & 0xFF) as u8,
+        (((v & 0x7F) as u8) << 1) | 0x01,
+    ]
+}
+
+/// Wraps a raw G.711 A-law frame into a PES packet (`00 00 01 C0`) and slices it into 188-byte MPEG-TS packets.
+pub fn wrap_alaw_chunk_in_mpegts_pes(
+    alaw_chunk: &[u8],
+    pts_90khz: u64,
+    continuity_counter: &mut u8,
+) -> Vec<u8> {
+    let pes_payload_len = (3 + 5 + alaw_chunk.len()).min(u16::MAX as usize) as u16;
+    let mut pes = Vec::with_capacity(6 + 3 + 5 + alaw_chunk.len());
+    pes.extend_from_slice(&[0x00, 0x00, 0x01, 0xC0]);
+    pes.extend_from_slice(&pes_payload_len.to_be_bytes());
+    pes.extend_from_slice(&[0x80, 0x80, 0x05]);
+    pes.extend_from_slice(&encode_mpegts_pts_33bit(pts_90khz));
+    pes.extend_from_slice(alaw_chunk);
+
+    let mut out = Vec::with_capacity(pes.len().div_ceil(184) * 188);
+    let mut first = true;
+    for slice in pes.chunks(184) {
+        let pkt = build_mpegts_packet(TAPO_PES_PID, slice, *continuity_counter, first);
+        out.extend_from_slice(&pkt);
+        first = false;
+        *continuity_counter = (*continuity_counter + 1) & 0x0F;
+    }
+    out
+}
+
+pub fn sha256_hex_upper(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(data);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{b:02X}"));
+    }
+    out
+}
+
+async fn read_http_headers_bounded(
+    stream: &mut tokio::net::TcpStream,
+    timeout: Duration,
+) -> std::result::Result<(String, Vec<u8>), (StatusCode, String)> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        if buf.len() > 16 * 1024 {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Tapo Streamd HTTP header exceeded 16 KiB".to_string(),
+            ));
+        }
+        let n = match tokio::time::timeout(timeout, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Tapo Streamd socket read error: {e}"),
+                ));
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Tapo Streamd header read timed out".to_string(),
+                ));
+            }
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let hdr_str = String::from_utf8_lossy(&buf[..pos]).into_owned();
+            let rest = buf[pos + 4..].to_vec();
+            return Ok((hdr_str, rest));
+        }
+    }
+    Err((
+        StatusCode::BAD_GATEWAY,
+        "Tapo Streamd closed connection before completing HTTP headers".to_string(),
+    ))
+}
+
+/// Streams 8 kHz G.711 A-law (`PCMA`) audio or siren payload to a TP-Link Tapo camera's
+/// `Streamd` service on TCP port `8800` (`POST /stream`, Digest auth with `SHA256(cloud_password)`
+/// uppercase for `encrypt_type="3"` or `MD5(cloud_password)` uppercase, `talk` session negotiation,
+/// and MPEG-TS `audio/mp2t` multipart framing).
+pub async fn send_tapo_streamd_alaw_audio(
+    host: &str,
+    port: u16,
+    cloud_password: &str,
+    alaw_bytes: &[u8],
+    pace_realtime: bool,
+    timeout: Duration,
+) -> std::result::Result<usize, (StatusCode, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let clean_host = extract_clean_camera_host(host);
+    if clean_host.is_empty()
+        || clean_host
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid camera host for Tapo Streamd".to_string(),
+        ));
+    }
+    let trimmed_cp = cloud_password.trim();
+    if trimmed_cp.is_empty() || trimmed_cp == "***" || trimmed_cp == "*" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Camera requires tapo_cloud_password to stream audio or siren on port 8800".to_string(),
+        ));
+    }
+    if alaw_bytes.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Audio payload is empty".to_string(),
+        ));
+    }
+
+    let addr = if clean_host.contains(':') && !clean_host.starts_with('[') {
+        format!("[{clean_host}]:{port}")
+    } else {
+        format!("{clean_host}:{port}")
+    };
+
+    // Step 1: Unauthenticated POST /stream to obtain WWW-Authenticate Digest challenge
+    let mut sock1 = match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to connect to Tapo Streamd at {addr}: {e}"),
+            ));
+        }
+        Err(_) => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("Timed out connecting to Tapo Streamd at {addr}"),
+            ));
+        }
+    };
+    let _ = sock1.set_nodelay(true);
+    let post1 = format!(
+        "POST /stream HTTP/1.1\r\nHost: {addr}\r\nContent-Type: multipart/mixed; boundary=--client-stream-boundary--\r\nContent-Length: 0\r\n\r\n"
+    );
+    if let Err(e) = tokio::time::timeout(timeout, sock1.write_all(post1.as_bytes())).await {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to write initial Tapo Streamd challenge request: {e}"),
+        ));
+    }
+    let (challenge_hdrs, _) = read_http_headers_bounded(&mut sock1, timeout).await?;
+    drop(sock1);
+
+    let www_auth = challenge_hdrs
+        .lines()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("www-authenticate") {
+                Some(v.trim())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Tapo Streamd did not return a WWW-Authenticate Digest challenge".to_string(),
+            )
+        })?;
+
+    let after_digest = if www_auth.len() >= 7 && www_auth[..7].eq_ignore_ascii_case("digest ") {
+        &www_auth[7..]
+    } else {
+        www_auth
+    };
+    let encrypt_type = extract_digest_challenge_param(after_digest, "encrypt_type").unwrap_or("3");
+    let hashed_pwd = if encrypt_type == "3" {
+        sha256_hex_upper(trimmed_cp.as_bytes())
+    } else {
+        md5_hex(trimmed_cp.as_bytes()).to_ascii_uppercase()
+    };
+    let cnonce = format!(
+        "{:016x}{:016x}",
+        rand::random::<u64>(),
+        rand::random::<u64>()
+    );
+    let auth_hdr =
+        build_http_digest_auth_header(www_auth, "POST", "/stream", "admin", &hashed_pwd, &cnonce)
+            .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                "Failed to construct Digest Authorization header for Tapo Streamd".to_string(),
+            )
+        })?;
+
+    // Step 2: Open authenticated POST /stream connection
+    let mut sock2 = match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to reconnect to Tapo Streamd at {addr}: {e}"),
+            ));
+        }
+        Err(_) => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("Timed out reconnecting to Tapo Streamd at {addr}"),
+            ));
+        }
+    };
+    let _ = sock2.set_nodelay(true);
+    let post2 = format!(
+        "POST /stream HTTP/1.1\r\nHost: {addr}\r\nContent-Type: multipart/mixed; boundary=--client-stream-boundary--\r\nAuthorization: {auth_hdr}, algorithm=MD5\r\nContent-Length: 0\r\n\r\n"
+    );
+    if tokio::time::timeout(timeout, sock2.write_all(post2.as_bytes()))
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Failed to send authenticated Tapo Streamd request".to_string(),
+        ));
+    }
+    let (auth_resp_hdrs, mut body_buf) = read_http_headers_bounded(&mut sock2, timeout).await?;
+    let status_line = auth_resp_hdrs.lines().next().unwrap_or("");
+    if !status_line.contains(" 200") {
+        let code = if status_line.contains(" 401") {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return Err((
+            code,
+            format!("Tapo Streamd authentication rejected ({status_line}); verify cloud_password"),
+        ));
+    }
+
+    // Step 3: Request two-way audio talk session ({"talk":{"mode":"aec"},"method":"get"})
+    let talk_req_json =
+        r#"{"type":"request","seq":3,"params":{"talk":{"mode":"aec"},"method":"get"}}"#;
+    let talk_part = format!(
+        "----client-stream-boundary--\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}\r\n",
+        talk_req_json.len(),
+        talk_req_json
+    );
+    if tokio::time::timeout(timeout, sock2.write_all(talk_part.as_bytes()))
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Failed to write Tapo talk session request".to_string(),
+        ));
+    }
+
+    let mut session_id: Option<String> = None;
+    let mut read_tmp = [0u8; 1024];
+    while session_id.is_none() {
+        if let Some(brace_idx) = body_buf.iter().position(|&b| b == b'{') {
+            let json_slice = &body_buf[brace_idx..];
+            let mut de = serde_json::Deserializer::from_slice(json_slice).into_iter::<Value>();
+            if let Some(Ok(val)) = de.next() {
+                let err_code = val["params"]["error_code"].as_i64().unwrap_or(0);
+                if err_code != 0 {
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        format!("Tapo camera refused talk session (error_code={err_code})"),
+                    ));
+                }
+                if let Some(sid) = val["params"]["session_id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| val["params"]["session_id"].as_i64().map(|n| n.to_string()))
+                {
+                    session_id = Some(sid);
+                    break;
+                }
+            }
+        }
+        if body_buf.len() > 64 * 1024 {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Tapo talk session response exceeded 64 KiB without session_id".to_string(),
+            ));
+        }
+        match tokio::time::timeout(timeout, sock2.read(&mut read_tmp)).await {
+            Ok(Ok(0)) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "Tapo camera closed connection before starting talk session".to_string(),
+                ));
+            }
+            Ok(Ok(n)) => body_buf.extend_from_slice(&read_tmp[..n]),
+            Ok(Err(e)) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Tapo talk session read error: {e}"),
+                ));
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Timed out waiting for Tapo talk session_id".to_string(),
+                ));
+            }
+        }
+    }
+    let sid = session_id.unwrap_or_else(|| "1".to_string());
+
+    // Step 4: Stream MPEG-TS PAT+PMT header and 20ms G.711 A-law PES chunks
+    let ts_header = build_tapo_mpegts_audio_header_packets();
+    let mut init_part = Vec::with_capacity(128 + ts_header.len());
+    init_part.extend_from_slice(TAPO_STREAMD_BOUNDARY);
+    init_part.extend_from_slice(
+        format!(
+            "\r\nContent-Type: audio/mp2t\r\nX-If-Encrypt: 0\r\nX-Session-Id: {sid}\r\nContent-Length: {}\r\n\r\n",
+            ts_header.len()
+        )
+        .as_bytes(),
+    );
+    init_part.extend_from_slice(&ts_header);
+    if tokio::time::timeout(timeout, sock2.write_all(&init_part))
+        .await
+        .is_err()
+    {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Failed to write MPEG-TS PAT/PMT header to Tapo Streamd".to_string(),
+        ));
+    }
+
+    let mut continuity_counter: u8 = 0;
+    let mut pts_90khz: u64 = 0;
+    let start_instant = tokio::time::Instant::now();
+    for (chunk_idx, raw_chunk) in alaw_bytes.chunks(TAPO_AUDIO_CHUNK_BYTES).enumerate() {
+        let mut padded = [TAPO_ALAW_SILENCE; TAPO_AUDIO_CHUNK_BYTES];
+        padded[..raw_chunk.len()].copy_from_slice(raw_chunk);
+        let ts_pes = wrap_alaw_chunk_in_mpegts_pes(&padded, pts_90khz, &mut continuity_counter);
+        pts_90khz = pts_90khz
+            .saturating_add(((TAPO_AUDIO_CHUNK_BYTES as u64) * 90_000) / (TAPO_AUDIO_RATE as u64));
+        let mut part = Vec::with_capacity(128 + ts_pes.len());
+        part.extend_from_slice(TAPO_STREAMD_BOUNDARY);
+        part.extend_from_slice(
+            format!(
+                "\r\nContent-Type: audio/mp2t\r\nX-If-Encrypt: 0\r\nX-Session-Id: {sid}\r\nContent-Length: {}\r\n\r\n",
+                ts_pes.len()
+            )
+            .as_bytes(),
+        );
+        part.extend_from_slice(&ts_pes);
+        if tokio::time::timeout(timeout, sock2.write_all(&part))
+            .await
+            .is_err()
+        {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "Tapo camera closed speaker stream during audio transmission".to_string(),
+            ));
+        }
+        if pace_realtime {
+            let target_elapsed = Duration::from_millis(((chunk_idx + 1) as u64) * 20);
+            let now_elapsed = start_instant.elapsed();
+            if target_elapsed > now_elapsed {
+                tokio::time::sleep(target_elapsed - now_elapsed).await;
+            }
+        }
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), sock2.flush()).await;
+    if pace_realtime {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(alaw_bytes.len())
+}
+
+/// Unified protocol-driven audio talkback and siren dispatcher.
+/// Routes 8 kHz G.711 A-law (`PCMA`) payloads to either:
+/// - **TP-Link Tapo (`tapo`)**: TCP port `8800` `Streamd` (`POST /stream` + MPEG-TS `audio/mp2t`) using `cloud_password`
+/// - **Intelbras / Dahua (`dahua_cgi`)**: HTTP Digest `POST /cgi-bin/audio.cgi?action=postAudio&httptype=singlepart&channel=1`
+#[allow(clippy::too_many_arguments)]
+pub async fn send_camera_talkback_or_siren_alaw(
+    client: &reqwest::Client,
+    runtime: &CameraDriverRuntime,
+    camera: &str,
+    (host, onvif_port): (&str, u16),
+    (user, pass): (Option<&str>, Option<&str>),
+    cloud_password: Option<&str>,
+    is_tapo_protocol: bool,
+    alaw_payload: Vec<u8>,
+    pace_realtime: bool,
+    timeout: Duration,
+) -> std::result::Result<usize, (StatusCode, String)> {
+    if is_tapo_protocol {
+        let cp = cloud_password.unwrap_or("");
+        let streamd_port = runtime.get_tapo_streamd_port(camera);
+        return send_tapo_streamd_alaw_audio(
+            host,
+            streamd_port,
+            cp,
+            &alaw_payload,
+            pace_realtime,
+            timeout,
+        )
+        .await;
+    }
+
+    let port = if onvif_port != 2020 { onvif_port } else { 80 };
+    let cgi_base = format_camera_http_base(host, port);
+    let talk_url =
+        format!("{cgi_base}/cgi-bin/audio.cgi?action=postAudio&httptype=singlepart&channel=1");
+    let total_len = alaw_payload.len();
+    match send_http_digest_request(
+        client,
+        runtime,
+        reqwest::Method::POST,
+        &talk_url,
+        (user, pass),
+        (Some("Audio/G.711A"), Some(alaw_payload)),
+        timeout,
+    )
+    .await
+    {
+        Ok((st, _)) if st.is_success() => Ok(total_len),
+        Ok((st, txt)) => {
+            let scrubbed_snippet: String = scrub_rtsp_credentials(txt.trim())
+                .chars()
+                .take(256)
+                .collect();
+            Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "Camera talkback returned HTTP {} ({scrubbed_snippet})",
+                    st.as_u16()
+                ),
+            ))
+        }
+        Err((st, err_msg)) => Err((st, err_msg)),
+    }
+}
+
 pub fn build_onvif_get_system_log_soap(
     log_type: &str,
     user: Option<&str>,
@@ -2795,5 +3399,107 @@ mod tests {
         assert!(pairs.contains(&"Syslog.Port=5514".to_string()));
         assert!(pairs.contains(&"AutoMaintain.AutoRebootEnable=true".to_string()));
         assert!(pairs.contains(&"AutoMaintain.AutoRebootHour=4".to_string()));
+    }
+
+    #[tokio::test]
+    async fn tapo_streamd_8800_siren_and_mpegts_audio_talkback_handshake_works() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let siren_bytes = generate_siren_alaw_bytes(0.4);
+        assert_eq!(siren_bytes.len(), 3200);
+        let ts_hdr = build_tapo_mpegts_audio_header_packets();
+        assert_eq!(ts_hdr.len(), 376);
+        assert_eq!(ts_hdr[0], 0x47);
+        assert_eq!(ts_hdr[188], 0x47);
+
+        let mut cc = 0u8;
+        let ts_pes = wrap_alaw_chunk_in_mpegts_pes(&siren_bytes[..160], 0, &mut cc);
+        assert_eq!(ts_pes.len() % 188, 0);
+        assert_eq!(ts_pes[0], 0x47);
+
+        let rt = CameraDriverRuntime::new();
+        assert!(rt.try_claim_siren_trigger("escritorio", 100.0, 15.0));
+        assert!(
+            !rt.try_claim_siren_trigger("escritorio", 105.0, 15.0),
+            "cooldown must suppress duplicate siren trigger within 15s"
+        );
+        assert!(rt.try_claim_siren_trigger("escritorio", 116.0, 15.0));
+
+        // Spawn mock Tapo Streamd server (:8800 equivalent) verifying Digest auth + talk session + audio/mp2t
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received_ts_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rec_clone = received_ts_bytes.clone();
+
+        let srv = tokio::spawn(async move {
+            // Connection 1: unauthenticated -> return 401 Digest challenge with encrypt_type="3"
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let mut b1 = [0u8; 1024];
+            let _ = s1.read(&mut b1).await.unwrap();
+            let resp_401 = "HTTP/1.0 401 Unauthorized\r\nServer: Streamd\r\nWWW-Authenticate: Digest realm=\"TP-Link IP-Camera\",algorithm=\"MD5\",encrypt_type=\"3\",qop=\"auth\",nonce=\"deadbeef12345678\",opaque=\"6494321465\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+            s1.write_all(resp_401.as_bytes()).await.unwrap();
+            drop(s1);
+
+            // Connection 2: authenticated -> verify Digest Authorization -> 200 OK -> talk session -> audio/mp2t
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let mut b2 = vec![0u8; 4096];
+            let n2 = s2.read(&mut b2).await.unwrap();
+            let req2_str = String::from_utf8_lossy(&b2[..n2]);
+            assert!(req2_str.contains("Authorization: Digest username=\"admin\""));
+            let resp_200 = "HTTP/1.0 200 OK\r\nServer: Streamd\r\nContent-Type: multipart/mixed;boundary=--device-stream-boundary--\r\nKey-Exchange: cipher=\"AES_128_CBC\" username=\"admin\" padding=\"PKCS7_16\" algorithm=\"MD5\" encrypt_type=\"3\" nonce=\"11223344\"\r\nConnection: keep-alive\r\n\r\n";
+            s2.write_all(resp_200.as_bytes()).await.unwrap();
+
+            // Read talk request part if not already in b2
+            let mut stream_buf = b2[..n2].to_vec();
+            while !String::from_utf8_lossy(&stream_buf).contains("\"talk\"") {
+                let mut tmp = [0u8; 1024];
+                let m = s2.read(&mut tmp).await.unwrap();
+                if m == 0 {
+                    break;
+                }
+                stream_buf.extend_from_slice(&tmp[..m]);
+            }
+            let talk_reply_json =
+                r#"{"type":"response", "seq":3, "params":{"error_code":0, "session_id":"42"}}"#;
+            let talk_reply_part = format!(
+                "----device-stream-boundary--\r\nContent-Type: application/json\r\nX-If-Encrypt: 0\r\nContent-Length: {}\r\n\r\n{}\r\n",
+                talk_reply_json.len(),
+                talk_reply_json
+            );
+            s2.write_all(talk_reply_part.as_bytes()).await.unwrap();
+
+            // Read incoming audio/mp2t parts
+            let mut total_read = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match s2.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(k) => total_read.extend_from_slice(&tmp[..k]),
+                }
+            }
+            let body_str = String::from_utf8_lossy(&total_read);
+            if body_str.contains("Content-Type: audio/mp2t")
+                && body_str.contains("X-Session-Id: 42")
+            {
+                rec_clone.store(total_read.len(), std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let sent = send_tapo_streamd_alaw_audio(
+            "127.0.0.1",
+            port,
+            "tp_cloud_secret_pw",
+            &siren_bytes[..320],
+            false,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Tapo Streamd audio transmission should succeed");
+        assert_eq!(sent, 320);
+        let _ = tokio::time::timeout(Duration::from_secs(2), srv).await;
+        assert!(
+            received_ts_bytes.load(std::sync::atomic::Ordering::SeqCst) > 376,
+            "mock Tapo Streamd server must receive PAT+PMT+PES audio/mp2t bytes"
+        );
     }
 }

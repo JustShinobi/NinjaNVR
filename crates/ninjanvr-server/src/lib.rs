@@ -22157,6 +22157,7 @@ async fn api_camera_hardware_get(
                 "flip_mirror": false,
                 "wdr": false,
                 "siren_on_event": false,
+                "manual_siren": false,
                 "audio_anomaly_detect": false,
                 "audio_volume": false,
                 "reboot": false
@@ -22497,17 +22498,17 @@ async fn api_camera_hardware_get(
         (false, None)
     };
 
+    let has_tapo_cloud_pw = cam_cfg
+        .hardware
+        .cloud_password
+        .as_deref()
+        .is_some_and(|p| !p.trim().is_empty() && p.trim() != "***" && p.trim() != "*");
+
     let mut missing_reqs: Vec<&str> = Vec::new();
     if online && !cam_cfg.onvif.is_configured() {
         missing_reqs.push("onvif_not_configured");
     }
-    if is_tapo
-        && !cam_cfg
-            .hardware
-            .cloud_password
-            .as_deref()
-            .is_some_and(|p| !p.trim().is_empty() && p.trim() != "***" && p.trim() != "*")
-    {
+    if is_tapo && !has_tapo_cloud_pw {
         missing_reqs.push("tapo_cloud_password");
     }
 
@@ -22553,6 +22554,7 @@ async fn api_camera_hardware_get(
             "flip_mirror": dahua_cgi_ok,
             "wdr": dahua_cgi_ok,
             "siren_on_event": dahua_cgi_ok && is_admin,
+            "manual_siren": (dahua_cgi_ok || (is_tapo && has_tapo_cloud_pw)) && is_admin,
             "audio_anomaly_detect": dahua_cgi_ok && is_admin,
             "audio_volume": dahua_cgi_ok,
             "camera_logs": online && (resolved_spec.supports_onvif_system_log || resolved_spec.supports_onvif_pull_events || dahua_cgi_ok),
@@ -22600,6 +22602,7 @@ async fn api_camera_hardware_set(
         || body.profile_token.is_some()
         || body.video_source_token.is_some()
         || body.reboot == Some(true)
+        || body.trigger_siren == Some(true)
         || body.siren_on_motion.is_some()
         || body.siren_on_audio.is_some()
         || body.audio_detect_enabled.is_some()
@@ -22974,7 +22977,60 @@ async fn api_camera_hardware_set(
         }
     }
 
-    // 4. Handle Reboot (ONVIF SystemReboot or Dahua CGI magicBox.cgi?action=reboot)
+    // 4. Handle Manual Siren / Audible Alarm Trigger (Tapo Streamd :8800 audio/mp2t or Dahua CGI postAudio)
+    if body.trigger_siren == Some(true) {
+        let dur_sec = body.siren_duration_sec.unwrap_or(3.5).clamp(0.5, 15.0);
+        let siren_alaw = generate_siren_alaw_bytes(dur_sec);
+        let effective_proto = cam_cfg
+            .hardware
+            .protocol
+            .as_deref()
+            .and_then(find_protocol_spec_by_id_or_alias)
+            .map(|s| s.id.to_string())
+            .or_else(|| state.camera_driver_runtime.get_protocol(&camera));
+        let is_tapo_proto = match effective_proto.as_deref() {
+            Some(p) => p == "tapo",
+            None => is_tapo_hint && !is_dahua_hint,
+        };
+        let siren_timeout =
+            std::time::Duration::from_secs((dur_sec.ceil() as u64).saturating_add(6).clamp(5, 25));
+        match send_camera_talkback_or_siren_alaw(
+            &state.http_client,
+            &state.camera_driver_runtime,
+            &camera,
+            (&host, onvif_port),
+            (user, pass),
+            cam_cfg.hardware.cloud_password.as_deref(),
+            is_tapo_proto,
+            siren_alaw,
+            true,
+            siren_timeout,
+        )
+        .await
+        {
+            Ok(_) => {
+                state.log_hub.push_ninjanvr(
+                    "INFO",
+                    &format!("ninjanvr.hardware.{camera}"),
+                    &format!("Triggered camera siren on {camera} ({dur_sec:.1}s)"),
+                );
+                applied_ops.push("trigger_siren".to_string());
+            }
+            Err((st, err_msg)) => {
+                return (
+                    st,
+                    Json(json!({
+                        "success": false,
+                        "camera": camera,
+                        "error": err_msg
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // 5. Handle Reboot (ONVIF SystemReboot or Dahua CGI magicBox.cgi?action=reboot)
     if body.reboot == Some(true) {
         let dev_ep = format!("{onvif_base}/onvif/device_service");
         let reboot_soap = build_onvif_system_reboot_soap(user, pass);
@@ -23166,6 +23222,8 @@ async fn api_camera_audio_talkback(
         onvif_port,
         user: user_opt,
         password: pass_opt,
+        is_tapo_hint,
+        is_dahua_hint,
         ..
     }) = probe_target
     else {
@@ -23267,45 +23325,40 @@ async fn api_camera_audio_talkback(
             .into_response();
     }
 
-    let port = if onvif_port != 2020 { onvif_port } else { 80 };
-    let cgi_base = format_camera_http_base(&host, port);
-    let talk_url =
-        format!("{cgi_base}/cgi-bin/audio.cgi?action=postAudio&httptype=singlepart&channel=1");
+    let effective_proto = cam_cfg
+        .hardware
+        .protocol
+        .as_deref()
+        .and_then(find_protocol_spec_by_id_or_alias)
+        .map(|s| s.id.to_string())
+        .or_else(|| state.camera_driver_runtime.get_protocol(&camera));
+    let is_tapo_proto = match effective_proto.as_deref() {
+        Some(p) => p == "tapo",
+        None => is_tapo_hint && !is_dahua_hint,
+    };
     let timeout = std::time::Duration::from_secs(cam_cfg.onvif.timeout_sec.clamp(2, 15));
 
-    match send_http_digest_request(
+    match send_camera_talkback_or_siren_alaw(
         &state.http_client,
         &state.camera_driver_runtime,
-        reqwest::Method::POST,
-        &talk_url,
+        &camera,
+        (&host, onvif_port),
         (user_opt.as_deref(), pass_opt.as_deref()),
-        (Some("Audio/G.711A"), Some(alaw_payload.clone())),
+        cam_cfg.hardware.cloud_password.as_deref(),
+        is_tapo_proto,
+        alaw_payload,
+        true,
         timeout,
     )
     .await
     {
-        Ok((st, _)) if st.is_success() => Json(json!({
+        Ok(bytes_sent) => Json(json!({
             "success": true,
             "camera": camera,
-            "bytes_sent": alaw_payload.len(),
+            "bytes_sent": bytes_sent,
             "codec": "G.711A"
         }))
         .into_response(),
-        Ok((st, txt)) => {
-            let scrubbed_snippet: String = scrub_rtsp_credentials(txt.trim())
-                .chars()
-                .take(256)
-                .collect();
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({
-                    "success": false,
-                    "camera": camera,
-                    "error": format!("Camera talkback returned HTTP {} ({scrubbed_snippet})", st.as_u16())
-                })),
-            )
-                .into_response()
-        }
         Err((st, err_msg)) => (
             st,
             Json(json!({
@@ -25560,6 +25613,7 @@ pub async fn new_app_state(
         }
     }
     let ptz_active_presets = Arc::new(RwLock::new(initial_ptz_presets));
+    let camera_driver_runtime = CameraDriverRuntime::new();
 
     if spawn_go2rtc {
         go2rtc_supervisor.clone().spawn_supervisor_task();
@@ -25586,6 +25640,7 @@ pub async fn new_app_state(
             media_dir: media_dir.clone(),
             log_hub: log_hub.clone(),
             ptz_active_presets: ptz_active_presets.clone(),
+            camera_driver_runtime: camera_driver_runtime.clone(),
         });
         vision_pipeline.start().await;
     }
@@ -25634,7 +25689,7 @@ pub async fn new_app_state(
         storage_degraded,
         storage_error,
         ptz_active_presets,
-        camera_driver_runtime: CameraDriverRuntime::new(),
+        camera_driver_runtime,
         share_clip_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         share_page_video_credits: Arc::new(std::sync::Mutex::new(HashMap::new())),
         share_creator_auto_revoked: Arc::new(std::sync::Mutex::new(HashMap::new())),

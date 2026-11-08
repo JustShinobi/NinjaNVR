@@ -1284,6 +1284,33 @@ const EditorPanel: React.FC<{
               </>
             )}
 
+            {(k === "zone" || k === "line") && (
+              <div className="nvr-zs-field">
+                <label className="nvr-zs-radio" style={{ alignItems: "flex-start" }}>
+                  <input
+                    type="checkbox"
+                    checked={Boolean(editor.siren)}
+                    onChange={(e) => onPatch({ siren: e.target.checked })}
+                  />
+                  <span>
+                    <strong>
+                      {tr(
+                        "Disparar sirene sonora da câmera ao alertar",
+                        "Sound camera audible siren on alert"
+                      )}
+                    </strong>
+                    <br />
+                    <span className="nvr-zs-muted">
+                      {tr(
+                        "Toca a sirene no alto-falante da câmera (Tapo :8800 / Intelbras CGI) quando um objeto permitido entrar na zona ou cruzar a linha.",
+                        "Plays the siren on the camera speaker (Tapo :8800 / Intelbras CGI) when a permitted object enters the zone or crosses the line."
+                      )}
+                    </span>
+                  </span>
+                </label>
+              </div>
+            )}
+
             {k === "state" && <StateFields pt={pt} editor={editor} onPatch={onPatch} />}
           </section>
         )}

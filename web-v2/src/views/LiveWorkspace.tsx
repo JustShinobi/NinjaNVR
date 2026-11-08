@@ -1864,6 +1864,23 @@ export const TacticalPtzHudOverlay: React.FC<{
                   </button>
                 );
               })}
+              {hardwareInfo.capabilities.manual_siren && (
+                <button
+                  type="button"
+                  disabled={hwBusy}
+                  aria-label={`Trigger Siren ${camera}`}
+                  className="nvr-btn danger nvr-tile-action mono sm"
+                  style={{ height: 20, padding: "0 5px", fontSize: "var(--text-xs)" }}
+                  title="Trigger 3.5s audible siren on camera speaker"
+                  onClick={() =>
+                    void handleApplyHardwareField({
+                      trigger_siren: true,
+                    })
+                  }
+                >
+                  ALM
+                </button>
+              )}
             </span>
           )}
         </>

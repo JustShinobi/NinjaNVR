@@ -274,12 +274,15 @@ export function tripwireGuide(start: Point, end: Point, offset = 0.07): Tripwire
 function zoneSummary(z: ZoneConfig, pt: boolean): string {
   const who = formatObjectList(z.objects, pt);
   const loiter = Number(z.loitering_time || 0);
+  const sirenTag = z.siren ? (pt ? " · 🔔 sirene" : " · 🔔 siren") : "";
   if (loiter > 0) {
     return pt
-      ? `Zona · ${who} · alerta se ficar ${formatDurationShort(loiter)}`
-      : `Zone · ${who} · alert after ${formatDurationShort(loiter)} inside`;
+      ? `Zona · ${who} · alerta se ficar ${formatDurationShort(loiter)}${sirenTag}`
+      : `Zone · ${who} · alert after ${formatDurationShort(loiter)} inside${sirenTag}`;
   }
-  return pt ? `Zona · ${who} · alerta ao entrar` : `Zone · ${who} · alert on entry`;
+  return pt
+    ? `Zona · ${who} · alerta ao entrar${sirenTag}`
+    : `Zone · ${who} · alert on entry${sirenTag}`;
 }
 
 export function directionPhrase(direction: LineConfig["direction"], pt: boolean): string {
@@ -289,7 +292,8 @@ export function directionPhrase(direction: LineConfig["direction"], pt: boolean)
 }
 
 function lineSummary(l: LineConfig, pt: boolean): string {
-  return `${pt ? "Linha" : "Line"} · ${formatObjectList(l.objects, pt)} ${directionPhrase(l.direction, pt)}`;
+  const sirenTag = l.siren ? (pt ? " · 🔔 sirene" : " · 🔔 siren") : "";
+  return `${pt ? "Linha" : "Line"} · ${formatObjectList(l.objects, pt)} ${directionPhrase(l.direction, pt)}${sirenTag}`;
 }
 
 function stateSummary(r: StateRoiConfig, pt: boolean): string {
@@ -490,6 +494,7 @@ export interface VisionEditorState {
   dwellSec: number;
   inertia: number;
   preset: string;
+  siren: boolean;
   direction: "any" | "a_to_b" | "b_to_a";
   roiClasses: string[];
   roiAlertState: string;
@@ -508,6 +513,7 @@ export function emptyEditorState(kind: VisionItemKind): VisionEditorState {
     dwellSec: 30,
     inertia: 3,
     preset: "",
+    siren: false,
     direction: "any",
     roiClasses: ["closed", "open"],
     roiAlertState: "open",
@@ -539,6 +545,7 @@ export function editorStateFromItem(
         dwellSec: loiter > 0 ? loiter : 30,
         inertia: z.inertia ?? 3,
         preset: z.preset || "",
+        siren: Boolean(z.siren),
       },
       points: parseCoordPoints(String(z.coordinates || ""), detW, detH),
     };
@@ -553,6 +560,7 @@ export function editorStateFromItem(
         name: ref.key,
         objects: [...(l.objects || [])],
         direction: l.direction || "any",
+        siren: Boolean(l.siren),
       },
       points: linePoints(l, detW, detH),
     };
@@ -685,6 +693,8 @@ export function commitVisionEditor(
     };
     if (preset) next.preset = preset;
     else delete next.preset;
+    if (editor.siren) next.siren = true;
+    else delete next.siren;
     cam.zones[slug] = next;
     return { ok: true, ref: { kind: "zone", key: slug } };
   }
@@ -694,11 +704,13 @@ export function commitVisionEditor(
     if (editor.originalKey && editor.originalKey !== slug) delete cam.lines[editor.originalKey];
     const [p1, p2] = points;
     const r = (v: number) => Number(clamp01(v).toFixed(4));
-    cam.lines[slug] = {
+    const nextLine: LineConfig = {
       points: [r(p1[0]), r(p1[1]), r(p2[0]), r(p2[1])],
       direction: editor.direction,
       objects: [...editor.objects],
     };
+    if (editor.siren) nextLine.siren = true;
+    cam.lines[slug] = nextLine;
     return { ok: true, ref: { kind: "line", key: slug } };
   }
 
@@ -851,6 +863,7 @@ const FIELD_LABELS_PT: Record<string, string> = {
   inertia: "confirmação de entrada",
   loitering_time: "tempo para alertar",
   preset: "preset PTZ",
+  siren: "sirene da câmera",
   direction: "sentido",
   classes: "estados",
   anomaly_state: "estado de alerta",

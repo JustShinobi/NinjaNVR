@@ -857,6 +857,7 @@ pub struct VisionPipeline {
     pub media_dir: PathBuf,
     pub log_hub: crate::LogBufferHub,
     pub ptz_active_presets: Arc<RwLock<HashMap<String, Option<String>>>>,
+    pub camera_driver_runtime: crate::camera_protocols::CameraDriverRuntime,
 }
 
 impl VisionPipeline {
@@ -1786,6 +1787,133 @@ impl VisionPipeline {
         };
     }
 
+    pub async fn spawn_camera_siren_for_trigger(
+        &self,
+        camera: &str,
+        cam_cfg: &CameraConfig,
+        trigger_source: &str,
+        object_label: &str,
+        now: f64,
+    ) {
+        if !self
+            .camera_driver_runtime
+            .try_claim_siren_trigger(camera, now, 15.0)
+        {
+            return;
+        }
+        let (host_opt, onvif_port, user, pass, cloud_password, is_tapo_proto) = {
+            let cfg_guard = self.config.read().await;
+            let inferred = cfg_guard.infer_camera_upstream(camera);
+            let host = cam_cfg
+                .onvif
+                .host
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| inferred.as_ref().map(|i| i.host.clone()));
+            let is_tapo_hint = inferred.as_ref().is_some_and(|i| i.is_tapo_rtsp)
+                || cam_cfg.onvif.port == 2020
+                || cam_cfg
+                    .hardware
+                    .protocol
+                    .as_deref()
+                    .and_then(crate::camera_protocols::find_protocol_spec_by_id_or_alias)
+                    .is_some_and(|s| s.id == "tapo")
+                || self
+                    .camera_driver_runtime
+                    .get_protocol(camera)
+                    .is_some_and(|p| p == "tapo");
+            let port = if cam_cfg.onvif.is_configured() {
+                if cam_cfg.onvif.port == 80 && is_tapo_hint {
+                    2020
+                } else {
+                    cam_cfg.onvif.port
+                }
+            } else if is_tapo_hint {
+                2020
+            } else {
+                inferred
+                    .as_ref()
+                    .map(|i| i.default_onvif_port)
+                    .unwrap_or(80)
+            };
+            let u = cam_cfg
+                .onvif
+                .user
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| inferred.as_ref().and_then(|i| i.user.clone()));
+            let p = cam_cfg
+                .onvif
+                .password
+                .as_deref()
+                .filter(|pw| !pw.is_empty() && pw.trim() != "***" && pw.trim() != "*")
+                .map(str::to_string)
+                .or_else(|| inferred.as_ref().and_then(|i| i.password.clone()));
+            let cp = cam_cfg
+                .hardware
+                .cloud_password
+                .as_deref()
+                .filter(|pw| !pw.trim().is_empty() && pw.trim() != "***" && pw.trim() != "*")
+                .map(str::to_string);
+            (host, port, u, p, cp, is_tapo_hint)
+        };
+        let Some(host) = host_opt else {
+            return;
+        };
+
+        self.log_hub.push_ninjanvr(
+            "INFO",
+            &format!("ninjanvr.siren.{camera}"),
+            &format!(
+                "Triggered audible camera alarm on {camera} (trigger={trigger_source}, label={object_label})"
+            ),
+        );
+        self.comms.publish_json(
+            "siren",
+            &json!({
+                "camera": camera,
+                "trigger": trigger_source,
+                "label": object_label,
+                "timestamp": now
+            }),
+        );
+
+        let rt = self.camera_driver_runtime.clone();
+        let cam_owned = camera.to_string();
+        let trig_owned = trigger_source.to_string();
+        let log_hub = self.log_hub.clone();
+        tokio::spawn(async move {
+            let Some(client) = shared_snapshot_http_client() else {
+                return;
+            };
+            let alaw = crate::camera_protocols::generate_siren_alaw_bytes(3.5);
+            if let Err((_, err_msg)) = crate::camera_protocols::send_camera_talkback_or_siren_alaw(
+                client,
+                &rt,
+                &cam_owned,
+                (&host, onvif_port),
+                (user.as_deref(), pass.as_deref()),
+                cloud_password.as_deref(),
+                is_tapo_proto,
+                alaw,
+                true,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                log_hub.push_ninjanvr(
+                    "WARN",
+                    &format!("ninjanvr.siren.{cam_owned}"),
+                    &format!("Camera siren failed on {cam_owned} ({trig_owned}): {err_msg}"),
+                );
+            }
+        });
+    }
+
     pub async fn process_lifecycle_events(
         &self,
         ctx: &FrameLifecycleCtx<'_>,
@@ -2569,6 +2697,41 @@ impl VisionPipeline {
                 continue;
             }
 
+            if cam_rt_flags.alerts
+                && !camera_suppressed_in_profile
+                && !newly_entered_zones.is_empty()
+            {
+                for entered_name in &newly_entered_zones {
+                    if let Some(line_cfg) = cam_cfg.lines.get(entered_name)
+                        && line_cfg.siren
+                        && (line_cfg.objects.is_empty()
+                            || line_cfg.objects.iter().any(|o| o == &trk.label))
+                    {
+                        self.spawn_camera_siren_for_trigger(
+                            camera,
+                            cam_cfg,
+                            &format!("line:{entered_name}"),
+                            &trk.label,
+                            now,
+                        )
+                        .await;
+                    } else if let Some(zone_cfg) = cam_cfg.zones.get(entered_name)
+                        && zone_cfg.siren
+                        && (zone_cfg.objects.is_empty()
+                            || zone_cfg.objects.iter().any(|o| o == &trk.label))
+                    {
+                        self.spawn_camera_siren_for_trigger(
+                            camera,
+                            cam_cfg,
+                            &format!("zone:{entered_name}"),
+                            &trk.label,
+                            now,
+                        )
+                        .await;
+                    }
+                }
+            }
+
             // Update or open ReviewSegment if enabled
             let mut trk_for_rev_sev = trk.clone();
             if trk_for_rev_sev.inferred_sub_label.is_none() {
@@ -3314,6 +3477,7 @@ mod tests {
             media_dir,
             log_hub: crate::LogBufferHub::new(),
             ptz_active_presets: Arc::new(RwLock::new(HashMap::new())),
+            camera_driver_runtime: crate::camera_protocols::CameraDriverRuntime::new(),
         };
         (pipeline, tmp_dir)
     }
@@ -5233,5 +5397,78 @@ cameras:
         assert!(try_watchdog_camera_reboot(&cfg, "quarto").await);
         assert_eq!(reboot_hits.load(Ordering::SeqCst), 1);
         srv.abort();
+    }
+
+    #[tokio::test]
+    async fn zone_entry_and_line_crossing_with_siren_enabled_triggers_audible_camera_alarm() {
+        let (pipeline, tmp_dir) = build_isolated_pipeline("zone-line-siren");
+        let camera = "escritorio";
+
+        let mut cam_cfg = CameraConfig::default();
+        cam_cfg.onvif.host = Some("127.0.0.1".to_string());
+        cam_cfg.onvif.port = 2020;
+        cam_cfg.hardware.protocol = Some("tapo".to_string());
+        cam_cfg.hardware.cloud_password = Some("test_cloud_pw".to_string());
+        cam_cfg.review.alerts.enabled = true;
+        cam_cfg.review.alerts.labels = vec!["person".to_string()];
+        cam_cfg.lines.insert(
+            "cantinho".to_string(),
+            ninjanvr_config::LineConfig {
+                points: [0.2, 0.2, 0.8, 0.2],
+                direction: ninjanvr_config::LineDirection::AToB,
+                objects: vec!["person".to_string()],
+                siren: true,
+            },
+        );
+
+        let mut ws_rx = pipeline.comms.subscribe_ws();
+        let w = 320u32;
+        let h = 180u32;
+        let y_len = (w * h) as usize;
+        let uv_len = y_len / 4;
+        let yuv_frame = YuvFrame {
+            camera: Arc::from(camera),
+            timestamp: 9500.0,
+            width: w,
+            height: h,
+            data: Arc::new(vec![128u8; y_len + uv_len * 2]),
+        };
+
+        let mut active_review: Option<ActiveReviewState> = None;
+        let mut track_snapshots: HashMap<String, TrackPersistSnapshot> = HashMap::new();
+        let mut trk = sample_track();
+        trk.id = "1730509500.000000-sirenline".to_string();
+        trk.label = "person".to_string();
+        trk.crossed_lines = vec!["cantinho".to_string()];
+        trk.entered_zones = vec!["cantinho".to_string()];
+
+        let ctx = FrameLifecycleCtx {
+            camera,
+            cam_cfg: &cam_cfg,
+            frame: &yuv_frame,
+            now: 9500.0,
+        };
+        pipeline
+            .process_lifecycle_events(
+                &ctx,
+                std::slice::from_ref(&trk),
+                &[],
+                &mut active_review,
+                &mut track_snapshots,
+            )
+            .await;
+
+        let ws_msgs = drain_ws_messages(&mut ws_rx);
+        assert!(
+            ws_msgs.iter().any(|m| {
+                m["topic"] == "siren"
+                    && serde_json::from_str::<Value>(m["payload"].as_str().unwrap_or("{}"))
+                        .map(|p| p["camera"] == "escritorio" && p["trigger"] == "line:cantinho")
+                        .unwrap_or(false)
+            }),
+            "crossing a line with siren=true must publish a 'siren' event"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

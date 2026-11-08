@@ -158,6 +158,7 @@ export interface ZoneConfig {
   max_area?: number;
   min_score?: number;
   preset?: string | null;
+  siren?: boolean;
 }
 
 export interface OnvifCameraConfig {
@@ -218,6 +219,7 @@ export interface CameraHardwareCapabilities {
   flip_mirror: boolean;
   wdr: boolean;
   siren_on_event: boolean;
+  manual_siren?: boolean;
   audio_anomaly_detect: boolean;
   audio_volume: boolean;
   camera_logs?: boolean;
@@ -316,6 +318,7 @@ export interface LineConfig {
   points: [number, number, number, number];
   direction?: "any" | "a_to_b" | "b_to_a";
   objects?: string[];
+  siren?: boolean;
 }
 
 export interface StateRoiConfig {

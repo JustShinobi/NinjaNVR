@@ -1976,6 +1976,8 @@ pub struct LineConfig {
     pub direction: LineDirection,
     #[serde(default)]
     pub objects: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub siren: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1995,6 +1997,12 @@ pub struct ZoneConfig {
     pub min_score: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub siren: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn default_zone_inertia() -> u32 {
@@ -10694,6 +10702,35 @@ cameras:
         api["cameras"]["quarto"]["onvif"]["clear_cloud_password"] = json!(true);
         cfg.apply_structured_json(&api).unwrap();
         assert!(cfg.cameras["quarto"].hardware.cloud_password.is_none());
+
+        // 5. Zone and Line siren flag round-trips cleanly through YAML and to_api_value()
+        api["cameras"]["quarto"]["zones"] = json!({
+            "restrita": {
+                "coordinates": "0.1,0.1,0.9,0.1,0.9,0.9",
+                "objects": ["person"],
+                "siren": true
+            }
+        });
+        api["cameras"]["quarto"]["lines"] = json!({
+            "cantinho": {
+                "points": [0.2, 0.2, 0.8, 0.2],
+                "direction": "a_to_b",
+                "objects": ["person"],
+                "siren": true
+            }
+        });
+        cfg.apply_structured_json(&api).unwrap();
+        assert!(cfg.cameras["quarto"].zones["restrita"].siren);
+        assert!(cfg.cameras["quarto"].lines["cantinho"].siren);
+        let roundtrip_api = cfg.to_api_value();
+        assert_eq!(
+            roundtrip_api["cameras"]["quarto"]["zones"]["restrita"]["siren"],
+            json!(true)
+        );
+        assert_eq!(
+            roundtrip_api["cameras"]["quarto"]["lines"]["cantinho"]["siren"],
+            json!(true)
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
