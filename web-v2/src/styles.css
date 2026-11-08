@@ -1763,8 +1763,60 @@ input[type="range"] {
   }
 }
 
-@media (max-width: 1380px) {
+/*
+ * Desktop header: collapse progressively instead of scrolling sideways. Full layout needs
+ * ~1800px (brand + 7 tabs + profile + telemetry + theme/logout); each step frees room for the
+ * next width class, down to the 768px phone layout which has its own header.
+ */
+.nvr-nav-short {
+  display: none;
+}
+
+@media (max-width: 1860px) {
+  .nvr-nav .nvr-kbd,
+  .nvr-header-btn .nvr-header-label {
+    display: none;
+  }
+}
+
+@media (max-width: 1500px) {
+  .nvr-header .nvr-brand-version,
   .nvr-telemetry-ext {
+    display: none;
+  }
+  .nvr-nav-btn {
+    padding: 0 5px;
+  }
+}
+
+@media (max-width: 1400px) {
+  .nvr-telemetry-perf {
+    display: none;
+  }
+}
+
+@media (max-width: 1180px) {
+  .nvr-nav-btn {
+    position: relative;
+  }
+  /* Keep the full name for assistive tech; show the short one on screen. */
+  .nvr-nav-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .nvr-nav-short {
+    display: inline;
+  }
+}
+
+/* Desktop only: the phone header (< 768px) keeps its brand title. */
+@media (min-width: 768px) and (max-width: 900px) {
+  .nvr-header .nvr-brand-title {
     display: none;
   }
 }

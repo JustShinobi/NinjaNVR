@@ -13,6 +13,15 @@ export const en = {
     zones: "Settings & Studio",
     system: "System & Logs",
   },
+  navShort: {
+    live: "Live",
+    sync: "Playback",
+    review: "Review",
+    explore: "Explore",
+    exports: "Exports",
+    zones: "Settings",
+    system: "System",
+  },
   navMobile: {
     live: "Live",
     sync: "Playback",
@@ -196,6 +205,16 @@ export interface TranslationDict {
     engine: string;
   };
   nav: {
+    live: string;
+    sync: string;
+    review: string;
+    explore: string;
+    exports: string;
+    zones: string;
+    system: string;
+  };
+  /** Short tab names the desktop header switches to when the window is too narrow. */
+  navShort: {
     live: string;
     sync: string;
     review: string;

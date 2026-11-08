@@ -15,6 +15,15 @@ export const pt: TranslationDict = {
     zones: "Configurações",
     system: "Sistema & Logs",
   },
+  navShort: {
+    live: "Ao vivo",
+    sync: "Playback",
+    review: "Revisão",
+    explore: "Explorar",
+    exports: "Exportar",
+    zones: "Config.",
+    system: "Sistema",
+  },
   navMobile: {
     live: "Ao vivo",
     sync: "Playback",

@@ -1435,21 +1435,30 @@ export const App: React.FC = () => {
             className={`nvr-nav-btn ${activeTab === "live" ? "active" : ""}`}
             onClick={() => switchTab("live")}
           >
-            {t.nav.live}
+            <span className="nvr-nav-label">{t.nav.live}</span>
+            <span className="nvr-nav-short" aria-hidden="true">
+              {t.navShort.live}
+            </span>
             <span className="nvr-kbd">1</span>
           </button>
           <button
             className={`nvr-nav-btn ${activeTab === "sync" ? "active" : ""}`}
             onClick={() => switchTab("sync")}
           >
-            {t.nav.sync}
+            <span className="nvr-nav-label">{t.nav.sync}</span>
+            <span className="nvr-nav-short" aria-hidden="true">
+              {t.navShort.sync}
+            </span>
             <span className="nvr-kbd">2</span>
           </button>
           <button
             className={`nvr-nav-btn ${activeTab === "review" ? "active" : ""}`}
             onClick={() => switchTab("review")}
           >
-            {t.nav.review}
+            <span className="nvr-nav-label">{t.nav.review}</span>
+            <span className="nvr-nav-short" aria-hidden="true">
+              {t.navShort.review}
+            </span>
             {unreviewedAlerts.length > 0 && (
               <span
                 className="mono"
@@ -1471,14 +1480,20 @@ export const App: React.FC = () => {
             className={`nvr-nav-btn ${activeTab === "explore" ? "active" : ""}`}
             onClick={() => switchTab("explore")}
           >
-            {t.nav.explore}
+            <span className="nvr-nav-label">{t.nav.explore}</span>
+            <span className="nvr-nav-short" aria-hidden="true">
+              {t.navShort.explore}
+            </span>
             <span className="nvr-kbd">4</span>
           </button>
           <button
             className={`nvr-nav-btn ${activeTab === "exports" ? "active" : ""}`}
             onClick={() => switchTab("exports")}
           >
-            {t.nav.exports}
+            <span className="nvr-nav-label">{t.nav.exports}</span>
+            <span className="nvr-nav-short" aria-hidden="true">
+              {t.navShort.exports}
+            </span>
             <span className="nvr-kbd">5</span>
           </button>
           {userRole === "admin" && (
@@ -1487,14 +1502,20 @@ export const App: React.FC = () => {
                 className={`nvr-nav-btn ${activeTab === "zones" ? "active" : ""}`}
                 onClick={() => switchTab("zones")}
               >
-                {t.nav.zones}
+                <span className="nvr-nav-label">{t.nav.zones}</span>
+                <span className="nvr-nav-short" aria-hidden="true">
+                  {t.navShort.zones}
+                </span>
                 <span className="nvr-kbd">6</span>
               </button>
               <button
                 className={`nvr-nav-btn ${activeTab === "system" ? "active" : ""}`}
                 onClick={() => switchTab("system")}
               >
-                {t.nav.system}
+                <span className="nvr-nav-label">{t.nav.system}</span>
+                <span className="nvr-nav-short" aria-hidden="true">
+                  {t.navShort.system}
+                </span>
                 <span className="nvr-kbd">7</span>
               </button>
             </>
@@ -1602,15 +1623,15 @@ export const App: React.FC = () => {
             <span>CPU {sysCpu}</span>
             <span className="nvr-divider nvr-telemetry-ext" aria-hidden="true" />
             <span className="nvr-telemetry-ext">MEM {sysMem}</span>
-            <span className="nvr-divider" aria-hidden="true" />
-            <span>OV {inferMs}</span>
-            <span className="nvr-divider" aria-hidden="true" />
-            <span>{totalFps}</span>
+            <span className="nvr-divider nvr-telemetry-perf" aria-hidden="true" />
+            <span className="nvr-telemetry-perf">OV {inferMs}</span>
+            <span className="nvr-divider nvr-telemetry-perf" aria-hidden="true" />
+            <span className="nvr-telemetry-perf">{totalFps}</span>
           </button>
           <button
             type="button"
             data-testid="topbar-theme-toggle"
-            className="nvr-btn mono nvr-header-aux"
+            className="nvr-btn mono nvr-header-aux nvr-header-btn"
             style={{
               height: 26,
               padding: "0 8px",
@@ -1646,7 +1667,7 @@ export const App: React.FC = () => {
             ) : (
               <Monitor size={12} />
             )}
-            <span>
+            <span className="nvr-header-label">
               {themeMode === "dark"
                 ? "DARK"
                 : themeMode === "light"
@@ -1656,7 +1677,7 @@ export const App: React.FC = () => {
           </button>
           <button
             type="button"
-            className="nvr-btn mono"
+            className="nvr-btn mono nvr-header-btn"
             style={{
               height: 26,
               padding: "0 8px",
@@ -1671,7 +1692,7 @@ export const App: React.FC = () => {
             onClick={handleLogout}
           >
             <LogOut size={12} />
-            <span>Logout</span>
+            <span className="nvr-header-label">Logout</span>
           </button>
         </div>
       </header>
