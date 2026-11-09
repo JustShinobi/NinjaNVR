@@ -4,278 +4,70 @@ import { useI18n } from "../i18n";
 import { useNvrStore } from "../store/useNvrStore";
 import {
   AiVerificationResult,
-  DetectedAttribute,
   EnrolledFaceProfileItem,
   EventItem,
   ExportItem,
   RecordingDaySummary,
-  ReviewItem,
 } from "../types/nvr";
 import { WorkspaceTab, findMatchingExport, formatDateTime } from "../utils/format";
-import {
-  DEFAULT_LPR_FORMAT_REGEX,
-  formatLicensePlateBadge,
-  normalizeLicensePlate,
-  resolveKnownPlateLabel,
-  validateLicensePlateFormat,
-} from "../utils/configYaml";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
 import { useCompactViewport } from "../utils/useCompactViewport";
 import { countActiveExploreFilters } from "../utils/liveTileHud";
 import { shouldRunFallbackAutoAnnotate } from "../utils/datasetStudio";
+import { isSafeDatasetSampleId } from "./settings/VisionAndAiPanels";
 import {
-  isSafeDatasetSampleId,
+  BatchFaceProgress,
+  DEFAULT_LPR_FORMAT_REGEX,
+  SavedExploreFilterPreset,
+  applyEventSubLabelUpdate,
+  applyReviewSubLabelUpdate,
+  clearFaceProfileFromEvents,
+  clearFaceProfileFromReviews,
+  createForensicTriageController,
+  formatAiVerificationBadge,
+  formatDetectedAttributePill,
+  formatEventLabelWithSubLabel,
+  formatLicensePlateBadge,
+  formatSubLabelBadge,
+  matchesLicensePlateFilter,
   normalizeFaceProfileName,
+  normalizeForensicLicensePlate,
+  normalizeLicensePlate,
   parseFacesApiResponse,
-} from "./settings/VisionAndAiPanels";
+  parseSavedExplorePresets,
+  resolveFiniteEventScore,
+  resolveKnownPlateLabel,
+  shouldApplyEventMutationResult,
+  validateLicensePlateFormat,
+} from "../utils/forensicTriage";
 
-export function formatAiVerificationBadge(verdict: AiVerificationResult): string {
-  const rawConf =
-    typeof verdict.confidence === "number" && Number.isFinite(verdict.confidence)
-      ? verdict.confidence
-      : 0;
-  const pct = Math.max(0, Math.min(100, Math.round(rawConf * 100)));
-  const status = verdict.is_true_positive ? "TRUE POSITIVE" : "FALSE POSITIVE";
-  return `AI JUDGE: ${status} (${pct}%)`;
-}
-
+export type {
+  BatchFaceProgress,
+  SavedExploreFilterPreset,
+} from "../utils/forensicTriage";
 export {
   DEFAULT_LPR_FORMAT_REGEX,
+  applyEventSubLabelUpdate,
+  applyReviewSubLabelUpdate,
+  clearFaceProfileFromEvents,
+  clearFaceProfileFromReviews,
+  createForensicTriageController,
+  formatAiVerificationBadge,
+  formatDetectedAttributePill,
+  formatEventLabelWithSubLabel,
   formatLicensePlateBadge,
+  formatSubLabelBadge,
+  matchesLicensePlateFilter,
+  normalizeFaceProfileName,
+  normalizeForensicLicensePlate,
   normalizeLicensePlate,
+  parseFacesApiResponse,
+  parseSavedExplorePresets,
+  resolveFiniteEventScore,
   resolveKnownPlateLabel,
+  shouldApplyEventMutationResult,
   validateLicensePlateFormat,
 };
-
-export interface SavedExploreFilterPreset {
-  name: string;
-  camera: string;
-  label: string;
-  excludeLabel: string;
-  zone: string;
-  minScore: number;
-  stationary: "all" | "moving" | "stationary";
-  retainedOnly: boolean;
-}
-
-export function resolveFiniteEventScore(
-  ev: Pick<EventItem, "top_score" | "score" | "data">,
-  fallback: number = 0.85
-): number {
-  const candidates = [ev.top_score, ev.data?.top_score, ev.score];
-  for (const val of candidates) {
-    if (typeof val === "number" && Number.isFinite(val)) {
-      return Math.max(0, Math.min(1, val));
-    }
-  }
-  return typeof fallback === "number" && Number.isFinite(fallback)
-    ? Math.max(0, Math.min(1, fallback))
-    : 0.85;
-}
-
-export function shouldApplyEventMutationResult(
-  selectedEventId: string | null | undefined,
-  requestEventId: string,
-  responseOk: boolean
-): boolean {
-  return Boolean(
-    responseOk &&
-      requestEventId &&
-      selectedEventId &&
-      selectedEventId === requestEventId
-  );
-}
-
-export function parseSavedExplorePresets(
-  raw: string | null | undefined
-): SavedExploreFilterPreset[] {
-  if (!raw || typeof raw !== "string") return [];
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    const out: SavedExploreFilterPreset[] = [];
-    for (const item of parsed) {
-      if (!item || typeof item !== "object") continue;
-      const rec = item as Record<string, unknown>;
-      if (typeof rec.name !== "string" || !rec.name.trim()) continue;
-      const stationary =
-        rec.stationary === "all" ||
-        rec.stationary === "moving" ||
-        rec.stationary === "stationary"
-          ? rec.stationary
-          : "all";
-      const minScore =
-        typeof rec.minScore === "number" &&
-        Number.isFinite(rec.minScore) &&
-        rec.minScore >= 0 &&
-        rec.minScore <= 100
-          ? rec.minScore
-          : 0;
-      out.push({
-        name: rec.name.trim(),
-        camera: typeof rec.camera === "string" && rec.camera ? rec.camera : "all",
-        label: typeof rec.label === "string" && rec.label ? rec.label : "all",
-        excludeLabel:
-          typeof rec.excludeLabel === "string" && rec.excludeLabel
-            ? rec.excludeLabel
-            : "none",
-        zone: typeof rec.zone === "string" && rec.zone ? rec.zone : "all",
-        minScore,
-        stationary,
-        retainedOnly: Boolean(rec.retainedOnly),
-      });
-    }
-    return out;
-  } catch {
-    return [];
-  }
-}
-
-export function matchesLicensePlateFilter(
-  ev: Pick<EventItem, "sub_label" | "data">,
-  plateQuery: string
-): boolean {
-  const normQuery = normalizeLicensePlate(plateQuery);
-  if (!normQuery) return true;
-  const evPlate = normalizeLicensePlate(ev.data?.recognized_license_plate || "");
-  const evSub = normalizeLicensePlate(ev.sub_label || "");
-  return (
-    (evPlate.length > 0 && evPlate.includes(normQuery)) ||
-    (evSub.length > 0 && evSub.includes(normQuery))
-  );
-}
-
-export function formatEventLabelWithSubLabel(
-  label: string,
-  subLabel?: string | null,
-  detectedAttributes?: DetectedAttribute[]
-): string {
-  const primary = (label || "object").toUpperCase();
-  const effectiveSub =
-    subLabel && subLabel.trim().length > 0
-      ? subLabel.trim().toUpperCase()
-      : detectedAttributes && detectedAttributes.length > 0
-      ? detectedAttributes[0].label.toUpperCase()
-      : null;
-  return effectiveSub ? `${primary} · ${effectiveSub}` : primary;
-}
-
-export function formatDetectedAttributePill(attr: DetectedAttribute): string {
-  const safeScore =
-    typeof attr.score === "number" && Number.isFinite(attr.score) ? attr.score : 0;
-  const pct = Math.max(0, Math.min(100, Math.round(safeScore * 100)));
-  const safeArea =
-    typeof attr.area_px === "number" && Number.isFinite(attr.area_px)
-      ? Math.max(0, Math.round(attr.area_px))
-      : 0;
-  return `${(attr.label || "attribute").toUpperCase()} ${pct}% · ${safeArea}px²`;
-}
-
-export function formatSubLabelBadge(
-  subLabel?: string | null,
-  subLabelScore?: number | null
-): { text: string; isUnknown: boolean; isKnown: boolean } | null {
-  const clean = subLabel?.trim();
-  if (!clean) return null;
-  const isUnknown = clean.toLowerCase() === "unknown";
-  const scorePct =
-    typeof subLabelScore === "number" &&
-    Number.isFinite(subLabelScore) &&
-    subLabelScore > 0
-      ? ` ${Math.round(subLabelScore * 100)}%`
-      : "";
-  return {
-    text: isUnknown
-      ? `UNKNOWN VISITOR${scorePct}`
-      : `ID: ${clean.toUpperCase()}${scorePct}`,
-    isUnknown,
-    isKnown: !isUnknown,
-  };
-}
-
-export function applyEventSubLabelUpdate(
-  events: EventItem[],
-  eventId: string,
-  subLabel: string | null,
-  score?: number | null
-): EventItem[] {
-  const clean = subLabel && subLabel.trim().length > 0 ? subLabel.trim() : null;
-  return events.map((ev) => {
-    if (ev.id !== eventId) return ev;
-    return {
-      ...ev,
-      sub_label: clean,
-      sub_label_score: clean ? score ?? ev.sub_label_score ?? null : null,
-      data: {
-        ...(ev.data || {}),
-        sub_label: clean,
-        sub_label_score: clean ? score ?? ev.data?.sub_label_score ?? null : null,
-      },
-    };
-  });
-}
-
-export function applyReviewSubLabelUpdate(
-  reviews: ReviewItem[],
-  reviewId: string,
-  subLabel: string | null
-): ReviewItem[] {
-  const clean = subLabel && subLabel.trim().length > 0 ? subLabel.trim() : null;
-  return reviews.map((rev) => {
-    if (rev.id !== reviewId) return rev;
-    return {
-      ...rev,
-      data: {
-        ...(rev.data || {}),
-        sub_labels: clean ? [clean] : [],
-        ...(clean ? {} : { sub_label_score: null }),
-      },
-    };
-  });
-}
-
-export function clearFaceProfileFromEvents(
-  events: EventItem[],
-  profileName: string
-): EventItem[] {
-  const target = profileName.trim().toLowerCase();
-  if (!target) return events;
-  return events.map((ev) => {
-    const evSub = (ev.sub_label || ev.data?.sub_label || "").trim().toLowerCase();
-    if (evSub !== target) return ev;
-    return {
-      ...ev,
-      sub_label: null,
-      sub_label_score: null,
-      data: {
-        ...(ev.data || {}),
-        sub_label: null,
-        sub_label_score: null,
-      },
-    };
-  });
-}
-
-export function clearFaceProfileFromReviews(
-  reviews: ReviewItem[],
-  profileName: string
-): ReviewItem[] {
-  const target = profileName.trim().toLowerCase();
-  if (!target) return reviews;
-  return reviews.map((rev) => {
-    const subs = rev.data?.sub_labels || [];
-    if (!subs.some((s) => s.trim().toLowerCase() === target)) return rev;
-    const remaining = subs.filter((s) => s.trim().toLowerCase() !== target);
-    return {
-      ...rev,
-      data: {
-        ...(rev.data || {}),
-        sub_labels: remaining,
-        ...(remaining.length === 0 ? { sub_label_score: null } : {}),
-      },
-    };
-  });
-}
 
 interface ExploreWorkspaceProps {
   cameraNames: string[];
@@ -337,7 +129,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const [datasetAddBusy, setDatasetAddBusy] = React.useState(false);
   const [addedDatasetIds, setAddedDatasetIds] = React.useState<Record<string, boolean>>({});
   const isMountedRef = React.useRef(true);
-  const eventMutationSeqRef = React.useRef(0);
+  const datasetAddSeqRef = React.useRef(0);
+  const fpToggleSeqRef = React.useRef(0);
+  const aiVerifySeqRef = React.useRef(0);
   const selectedEventIdRef = React.useRef<string | null>(selectedEvent?.id ?? null);
   selectedEventIdRef.current = selectedEvent?.id ?? null;
   const debugReplayAbortRef = React.useRef<AbortController | null>(null);
@@ -347,7 +141,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     if (!selectedEvent || datasetAddBusy) return;
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
-    const seq = ++eventMutationSeqRef.current;
+    const seq = ++datasetAddSeqRef.current;
     setDatasetAddBusy(true);
     try {
       const res = await fetch(
@@ -425,7 +219,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         notify("Network error while adding event snapshot to training dataset");
       }
     } finally {
-      if (isMountedRef.current && seq === eventMutationSeqRef.current) {
+      if (isMountedRef.current && seq === datasetAddSeqRef.current) {
         setDatasetAddBusy(false);
       }
     }
@@ -436,7 +230,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
     const nextFp = !targetEvent.false_positive;
-    const seq = ++eventMutationSeqRef.current;
+    const seq = ++fpToggleSeqRef.current;
     try {
       const res = await fetch(
         `/api/events/${encodeURIComponent(targetId)}/false_positive`,
@@ -450,7 +244,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       if (!isMountedRef.current) return;
       if (res.ok) {
         if (
-          seq === eventMutationSeqRef.current &&
+          seq === fpToggleSeqRef.current &&
           shouldApplyEventMutationResult(
             selectedEventIdRef.current,
             targetId,
@@ -482,7 +276,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     if (!selectedEvent || aiVerifyBusy) return;
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
-    const seq = ++eventMutationSeqRef.current;
+    const seq = ++aiVerifySeqRef.current;
     setAiVerifyBusy(true);
     try {
       const res = await fetch(
@@ -505,7 +299,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
           verified_at: data.verified_at,
         };
         if (
-          seq === eventMutationSeqRef.current &&
+          seq === aiVerifySeqRef.current &&
           shouldApplyEventMutationResult(
             selectedEventIdRef.current,
             targetId,
@@ -535,7 +329,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         notify("Vision AI Judge request failed");
       }
     } finally {
-      if (isMountedRef.current && seq === eventMutationSeqRef.current) {
+      if (isMountedRef.current && seq === aiVerifySeqRef.current) {
         setAiVerifyBusy(false);
       }
     }
@@ -546,17 +340,18 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const [localEventSubLabels, setLocalEventSubLabels] = React.useState<
     Record<string, string | null>
   >({});
-  const [batchFaceProgress, setBatchFaceProgress] = React.useState<{
-    active: boolean;
-    completed: number;
-    total: number;
-    name: string;
-  } | null>(null);
+  const [batchFaceProgress, setBatchFaceProgress] =
+    React.useState<BatchFaceProgress | null>(null);
   const [eventPlateDraft, setEventPlateDraft] = React.useState("");
   const [plateFilter, setPlateFilter] = React.useState("");
   const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
   const subLabelsRefreshTick = useNvrStore((s) => s.subLabelsRefreshTick);
   const bumpSubLabelsRefresh = useNvrStore((s) => s.bumpSubLabelsRefresh);
+  const triageController = React.useMemo(() => {
+    const ctrl = createForensicTriageController();
+    ctrl.setActiveTarget("event", selectedEvent?.id ?? null);
+    return ctrl;
+  }, []);
 
   React.useEffect(() => {
     setEventNoteDraft(selectedEvent?.data?.notes || "");
@@ -575,7 +370,10 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
 
   React.useEffect(() => {
     selectedEventIdRef.current = selectedEvent?.id ?? null;
-    eventMutationSeqRef.current += 1;
+    datasetAddSeqRef.current += 1;
+    fpToggleSeqRef.current += 1;
+    aiVerifySeqRef.current += 1;
+    triageController.setActiveTarget("event", selectedEvent?.id ?? null);
     setAiVerifyBusy(false);
     setDatasetAddBusy(false);
     if (debugReplayAbortRef.current) {
@@ -585,42 +383,42 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     debugReplaySeqRef.current += 1;
     setDebugBusy(false);
     setDebugTrace(null);
-  }, [selectedEvent?.id]);
+  }, [selectedEvent?.id, triageController]);
 
   React.useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
-      eventMutationSeqRef.current += 1;
+      datasetAddSeqRef.current += 1;
+      fpToggleSeqRef.current += 1;
+      aiVerifySeqRef.current += 1;
+      triageController.invalidatePendingMutations();
       debugReplaySeqRef.current += 1;
       if (debugReplayAbortRef.current) {
         debugReplayAbortRef.current.abort();
         debugReplayAbortRef.current = null;
       }
     };
-  }, []);
+  }, [triageController]);
 
   React.useEffect(() => {
     let cancelled = false;
     const controller = new AbortController();
-    fetch("/api/faces", { credentials: "include", signal: controller.signal })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => {
-        if (cancelled || !d) return;
-        const parsed = parseFacesApiResponse(d);
-        const deletedLower = lastDeletedFaceProfile?.name?.trim().toLowerCase();
-        setEnrolledFaces(
-          deletedLower
-            ? parsed.filter((p) => p.name.trim().toLowerCase() !== deletedLower)
-            : parsed
-        );
+    triageController
+      .fetchEnrolledFaces({
+        excludeDeletedProfile: lastDeletedFaceProfile,
+        signal: controller.signal,
       })
-      .catch(() => {});
+      .then((faces) => {
+        if (!cancelled) {
+          setEnrolledFaces(faces);
+        }
+      });
     return () => {
       cancelled = true;
       controller.abort();
     };
-  }, [subLabelsRefreshTick, lastDeletedFaceProfile]);
+  }, [triageController, subLabelsRefreshTick, lastDeletedFaceProfile]);
 
   React.useEffect(() => {
     if (!lastDeletedFaceProfile?.name) return;
@@ -659,15 +457,15 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     }
     if (selectedBatchEventIds.length > 0 && clean === null) {
       const targetIds = [...selectedBatchEventIds];
-      for (const eid of targetIds) {
-        await fetch(`/api/events/${encodeURIComponent(eid)}/sub_label`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({ sub_label: null }),
-        }).catch(() => null);
-        setLocalEventSubLabels((prev) => ({ ...prev, [eid]: null }));
-      }
+      await triageController.batchAssignFaceSubLabel({
+        items: targetIds,
+        rawName: null,
+        isCancelled: () => !isMountedRef.current,
+        onItemSuccess: (eid) => {
+          setLocalEventSubLabels((prev) => ({ ...prev, [eid]: null }));
+        },
+      });
+      if (!isMountedRef.current) return;
       if (selectedEvent && targetIds.includes(selectedEvent.id)) {
         const [updated] = applyEventSubLabelUpdate(
           [selectedEvent],
@@ -684,79 +482,45 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     if (!selectedEvent) return;
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
-    const seq = ++eventMutationSeqRef.current;
+    triageController.setActiveTarget("event", targetId);
     try {
-      let res: Response;
-      if (clean) {
-        res = await fetch(`/api/faces/${encodeURIComponent(clean)}/enroll`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({
-            event_id: targetId,
-            assign_sub_label: true,
-            backfill_events: true,
-          }),
-        });
-        if (!res.ok) {
-          res = await fetch(
-            `/api/events/${encodeURIComponent(targetId)}/sub_label`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              credentials: "include",
-              body: JSON.stringify({
-                sub_label: clean,
-                sub_label_score: 1.0,
-                enroll_face: true,
-              }),
-            }
-          );
-        }
-      } else {
-        res = await fetch(
-          `/api/events/${encodeURIComponent(targetId)}/sub_label`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            credentials: "include",
-            body: JSON.stringify({ sub_label: null }),
-          }
-        );
-      }
+      const result = await triageController.assignFaceSubLabel({
+        primaryEventId: targetId,
+        rawName: clean,
+        targetKind: "event",
+        targetId,
+        getActiveTargetId: () => selectedEventIdRef.current,
+        isCancelled: () => !isMountedRef.current,
+      });
       if (!isMountedRef.current) return;
-      if (res.ok) {
-        const data = await res.json().catch(() => null);
-        setLocalEventSubLabels((prev) => ({ ...prev, [targetId]: clean }));
-        if (
-          seq === eventMutationSeqRef.current &&
-          shouldApplyEventMutationResult(
-            selectedEventIdRef.current,
-            targetId,
-            true
-          )
-        ) {
+      if (result.ok) {
+        setLocalEventSubLabels((prev) => ({
+          ...prev,
+          [targetId]: result.cleanName,
+        }));
+        if (result.shouldApply) {
           const [updated] = applyEventSubLabelUpdate(
             [targetEvent],
             targetId,
-            clean,
-            clean ? 1.0 : null
+            result.cleanName,
+            result.cleanName ? 1.0 : null
           );
           setSelectedEvent(updated);
         }
         bumpSubLabelsRefresh();
-        const backfilled = Number(data?.backfilled_events || 0);
-        const sampleCount = Number(data?.sample_count || 0);
         notify(
-          clean
-            ? `Assigned & enrolled '${clean}' into Face Gallery${
-                sampleCount > 0 ? ` (${sampleCount} samples)` : ""
-              }${backfilled > 0 ? ` · +${backfilled} similar events matched` : ""}`
+          result.cleanName
+            ? `Assigned & enrolled '${result.cleanName}' into Face Gallery${
+                result.sampleCount > 0 ? ` (${result.sampleCount} samples)` : ""
+              }${
+                result.backfilledEvents > 0
+                  ? ` · +${result.backfilledEvents} similar events matched`
+                  : ""
+              }`
             : "Cleared event sub-label"
         );
       } else {
-        const data = await res.json().catch(() => null);
-        notify(data?.message || "Failed to update event face sub-label");
+        notify(result.message || "Failed to update event face sub-label");
       }
     } catch {
       if (isMountedRef.current) {
@@ -787,74 +551,39 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
       return;
     }
     setFaceNameDraft(cleanName);
-    setBatchFaceProgress({
-      active: true,
-      completed: 0,
-      total: targetIds.length,
-      name: cleanName,
-    });
-    let okCount = 0;
-    let totalBackfilled = 0;
     try {
-      for (let i = 0; i < targetIds.length; i += 1) {
-        if (!isMountedRef.current) break;
-        const eid = targetIds[i];
-        const isLast = i === targetIds.length - 1;
-        const res = await fetch(
-          `/api/faces/${encodeURIComponent(cleanName)}/enroll`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            credentials: "include",
-            body: JSON.stringify({
-              event_id: eid,
-              assign_sub_label: true,
-              backfill_events: isLast,
-            }),
-          }
-        );
-        if (res.ok) {
-          okCount += 1;
-          const data = await res.json().catch(() => null);
-          totalBackfilled += Number(data?.backfilled_events || 0);
-          if (isMountedRef.current) {
-            setLocalEventSubLabels((prev) => ({ ...prev, [eid]: cleanName }));
-          }
+      const batchResult = await triageController.batchAssignFaceSubLabel({
+        items: targetIds,
+        rawName: cleanName,
+        isCancelled: () => !isMountedRef.current,
+        onProgress: (progress) => setBatchFaceProgress(progress),
+        onItemSuccess: (eid, assignedName) => {
+          setLocalEventSubLabels((prev) => ({ ...prev, [eid]: assignedName }));
           if (selectedEvent && selectedEvent.id === eid) {
             const [updated] = applyEventSubLabelUpdate(
               [selectedEvent],
               eid,
-              cleanName,
-              1.0
+              assignedName,
+              assignedName ? 1.0 : null
             );
             setSelectedEvent(updated);
           }
-        }
-        if (isMountedRef.current) {
-          setBatchFaceProgress({
-            active: true,
-            completed: i + 1,
-            total: targetIds.length,
-            name: cleanName,
-          });
-        }
-      }
+        },
+      });
       if (isMountedRef.current) {
         bumpSubLabelsRefresh();
         setSelectedBatchEventIds([]);
         notify(
-          `Batch assigned & enrolled '${cleanName}' on ${okCount}/${targetIds.length} events${
-            totalBackfilled > 0 ? ` (+${totalBackfilled} auto-matched)` : ""
+          `Batch assigned & enrolled '${cleanName}' on ${batchResult.succeededIds.length}/${targetIds.length} events${
+            batchResult.totalBackfilled > 0
+              ? ` (+${batchResult.totalBackfilled} auto-matched)`
+              : ""
           }`
         );
       }
     } catch {
       if (isMountedRef.current) {
         notify("Network error during batch face assignment");
-      }
-    } finally {
-      if (isMountedRef.current) {
-        setBatchFaceProgress(null);
       }
     }
   };
@@ -863,40 +592,24 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     if (!selectedEvent) return;
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
-    const normalized = normalizeLicensePlate(eventPlateDraft);
-    const seq = ++eventMutationSeqRef.current;
+    triageController.setActiveTarget("event", targetId);
     try {
-      const res = await fetch(
-        `/api/events/${encodeURIComponent(targetId)}/license_plate`,
-        {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({
-            recognized_license_plate: normalized || null,
-          }),
-        }
-      );
+      const result = await triageController.saveLicensePlate({
+        eventId: targetId,
+        rawPlate: eventPlateDraft,
+        targetKind: "event",
+        targetId,
+        getActiveTargetId: () => selectedEventIdRef.current,
+        isCancelled: () => !isMountedRef.current,
+      });
       if (!isMountedRef.current) return;
-      if (res.ok) {
-        const payload = await res.json().catch(() => ({}));
-        if (!isMountedRef.current) return;
-        const nextPlate =
-          payload.recognized_license_plate !== undefined
-            ? payload.recognized_license_plate
-            : normalized || null;
+      if (result.ok) {
+        const nextPlate = result.normalizedPlate;
         const nextSubLabel =
-          payload.sub_label !== undefined
-            ? payload.sub_label
+          result.subLabel !== undefined
+            ? result.subLabel
             : targetEvent.sub_label;
-        if (
-          seq === eventMutationSeqRef.current &&
-          shouldApplyEventMutationResult(
-            selectedEventIdRef.current,
-            targetId,
-            true
-          )
-        ) {
+        if (result.shouldApply) {
           setSelectedEvent({
             ...targetEvent,
             sub_label: nextSubLabel,
@@ -913,8 +626,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
             : "Cleared recognized license plate"
         );
       } else {
-        const data = await res.json().catch(() => null);
-        notify(data?.message || "Failed to save recognized license plate");
+        notify(result.message || "Failed to save recognized license plate");
       }
     } catch {
       if (isMountedRef.current) {
@@ -928,33 +640,26 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
     const targetEvent = selectedEvent;
     const targetId = targetEvent.id;
     const noteToSave = eventNoteDraft;
-    const seq = ++eventMutationSeqRef.current;
+    triageController.setActiveTarget("event", targetId);
     try {
-      const res = await fetch(`/api/events/${encodeURIComponent(targetId)}/notes`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ notes: noteToSave }),
+      const result = await triageController.saveForensicNote({
+        targetKind: "event",
+        targetId,
+        notes: noteToSave,
+        getActiveTargetId: () => selectedEventIdRef.current,
+        isCancelled: () => !isMountedRef.current,
       });
       if (!isMountedRef.current) return;
-      if (res.ok) {
-        if (
-          seq === eventMutationSeqRef.current &&
-          shouldApplyEventMutationResult(
-            selectedEventIdRef.current,
-            targetId,
-            true
-          )
-        ) {
+      if (result.ok) {
+        if (result.shouldApply) {
           setSelectedEvent({
             ...targetEvent,
-            data: { ...(targetEvent.data || {}), notes: noteToSave },
+            data: { ...(targetEvent.data || {}), notes: result.notes },
           });
         }
         notify("Saved forensic note on event");
       } else {
-        const data = await res.json().catch(() => null);
-        notify(data?.message || "Failed to save forensic note");
+        notify(result.message || "Failed to save forensic note");
       }
     } catch {
       if (isMountedRef.current) {
@@ -1091,14 +796,7 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   const [presetName, setPresetName] = React.useState("");
   const [savedPresets, setSavedPresets] = React.useState<
     SavedExploreFilterPreset[]
-  >(() => {
-    try {
-      const raw = window.localStorage?.getItem("ninjanvr_explore_saved_filters");
-      return parseSavedExplorePresets(raw);
-    } catch {
-      return [];
-    }
-  });
+  >(() => triageController.loadFilterPresets("explore"));
 
   const availableZones = React.useMemo(() => {
     const set = new Set<string>();
@@ -1139,13 +837,11 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
   ]);
 
   const handleSaveExplorePreset = () => {
-    const name =
-      presetName.trim() ||
-      `${exploreCamera === "all" ? "ALL" : exploreCamera.toUpperCase()} · ${exploreLabel.toUpperCase()}`;
-    const next = [
-      ...savedPresets.filter((p) => p.name !== name),
+    const next = triageController.saveFilterPreset(
+      "explore",
+      savedPresets,
+      presetName,
       {
-        name,
         camera: exploreCamera,
         label: exploreLabel,
         excludeLabel,
@@ -1153,10 +849,9 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
         minScore: minScoreFilter,
         stationary: stationaryFilter,
         retainedOnly: exploreRetainedOnly,
-      },
-    ];
+      }
+    );
     setSavedPresets(next);
-    window.localStorage?.setItem("ninjanvr_explore_saved_filters", JSON.stringify(next));
     setPresetName("");
   };
 
@@ -1350,11 +1045,12 @@ export const ExploreWorkspace: React.FC<ExploreWorkspaceProps> = ({
                 style={{ height: 24, padding: "0 4px", fontSize: "var(--text-xs)" }}
                 title={`Delete preset ${p.name}`}
                 onClick={() => {
-                  const next = savedPresets.filter((x) => x.name !== p.name);
-                  setSavedPresets(next);
-                  window.localStorage?.setItem(
-                    "ninjanvr_explore_saved_filters",
-                    JSON.stringify(next)
+                  setSavedPresets(
+                    triageController.deleteFilterPreset(
+                      "explore",
+                      savedPresets,
+                      p.name
+                    )
                   );
                 }}
               >

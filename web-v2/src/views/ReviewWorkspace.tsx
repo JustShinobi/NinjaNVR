@@ -16,204 +16,54 @@ import { buildSharePublicUrl } from "../utils/shareLinks";
 import { VodHlsPlayer } from "../components/VideoPlayers";
 import { TimelineScrubber } from "../components/TimelineScrubber";
 import { RecordingCalendarPopover } from "../components/RecordingCalendarPopover";
+import { validateExportTimeWindow } from "./ExportsWorkspace";
 import {
+  BatchFaceProgress,
+  SavedReviewFilterPreset,
   applyReviewSubLabelUpdate,
   clearFaceProfileFromReviews,
+  computeReviewPlaybackWindow,
+  createForensicTriageController,
   formatDetectedAttributePill,
   formatEventLabelWithSubLabel,
   formatLicensePlateBadge,
   formatSubLabelBadge,
-  normalizeLicensePlate,
-} from "./ExploreWorkspace";
-import {
-  MAX_EXPORT_WINDOW_SEC,
-  validateExportTimeWindow,
-} from "./ExportsWorkspace";
-import {
+  getVisibleReviewPageIds,
+  matchesLicensePlateFilter,
   normalizeFaceProfileName,
+  normalizeForensicLicensePlate,
+  normalizeLicensePlate,
   parseFacesApiResponse,
-} from "./settings/VisionAndAiPanels";
+  parseSavedReviewPresets,
+  resolveNextBriefingStep,
+  resolveReviewThumbUrl,
+  shouldApplyReviewMutationResult,
+} from "../utils/forensicTriage";
 
-export interface SavedReviewFilterPreset {
-  name: string;
-  camera: string;
-  severity: string;
-  object: string;
-  excludeObject: string;
-  zone: string;
-  status: "unreviewed" | "reviewed" | "all";
-}
-
-export function resolveReviewThumbUrl(
-  item: Pick<ReviewItem, "camera" | "thumb_path">
-): string {
-  const rawCam = (item.camera || "unknown").trim();
-  const cleanCam =
-    !rawCam || rawCam === "." || rawCam === ".." || rawCam.includes("..")
-      ? "unknown"
-      : rawCam;
-  const safeCamera = encodeURIComponent(cleanCam);
-  const fallback = `/api/${safeCamera}/latest.webp`;
-  const raw = (item.thumb_path || "").trim();
-  if (!raw || /[\u0000-\u001f\u007f\\?#]/.test(raw)) {
-    return fallback;
-  }
-  const stripped = raw.replace(/^\/media\/[^/]+/, "");
-  let decoded = stripped;
-  try {
-    decoded = decodeURIComponent(stripped);
-  } catch {
-    return fallback;
-  }
-  const segments = decoded.split("/");
-  const isAllowedMediaPath = /^\/(?:clips|previews|exports)\//.test(decoded);
-  const isAllowedApiThumbPath =
-    /^\/api\/(?:events\/[^/]+\/(?:thumbnail\.webp|snapshot\.jpg)|preview\/[^/]+\/thumbnail\.jpg|[^/]+\/latest\.(?:webp|jpg))$/i.test(
-      decoded
-    ) && !/^\/api\/(?:auth|logout|users|tokens|config|restart)\b/i.test(decoded);
-  if (
-    !stripped.startsWith("/") ||
-    stripped.startsWith("//") ||
-    stripped.includes("..") ||
-    decoded.startsWith("//") ||
-    decoded.includes("..") ||
-    decoded.includes("%") ||
-    segments.some((seg) => seg === "." || seg === "..") ||
-    /[\u0000-\u001f\u007f\\?#]/.test(decoded) ||
-    (!isAllowedMediaPath && !isAllowedApiThumbPath)
-  ) {
-    return fallback;
-  }
-  return stripped;
-}
-
-export function resolveNextBriefingStep(
-  queueIds: ReadonlyArray<string>,
-  currentIdx: number,
-  availableReviews: ReadonlyArray<ReviewItem>,
-  activeReviewId?: string | null
-): { nextIdx: number; nextReview: ReviewItem } | null {
-  if (!Array.isArray(queueIds) || queueIds.length === 0) return null;
-  const activeIdx =
-    typeof activeReviewId === "string" && activeReviewId.length > 0
-      ? queueIds.indexOf(activeReviewId)
-      : -1;
-  const baseIdx =
-    activeIdx >= 0
-      ? activeIdx
-      : typeof currentIdx === "number" && Number.isFinite(currentIdx)
-      ? Math.floor(currentIdx)
-      : -1;
-  const startIdx = Math.max(0, baseIdx + 1);
-  for (let idx = startIdx; idx < queueIds.length; idx++) {
-    const candidateId = queueIds[idx];
-    if (!candidateId) continue;
-    const found = availableReviews.find((r) => r.id === candidateId);
-    if (found) {
-      return { nextIdx: idx, nextReview: found };
-    }
-  }
-  return null;
-}
-
-export function shouldApplyReviewMutationResult(
-  activeReviewId: string | null | undefined,
-  requestReviewId: string,
-  responseOk: boolean
-): boolean {
-  return Boolean(
-    responseOk &&
-      requestReviewId &&
-      activeReviewId &&
-      activeReviewId === requestReviewId
-  );
-}
-
-export function getVisibleReviewPageIds(
-  visibleReviews: ReadonlyArray<Pick<ReviewItem, "id">>,
-  pageSize: number = 40
-): string[] {
-  const limit = Number.isFinite(pageSize) && pageSize > 0 ? Math.floor(pageSize) : 40;
-  return visibleReviews
-    .slice(0, limit)
-    .map((r) => r.id)
-    .filter((id): id is string => typeof id === "string" && id.length > 0);
-}
-
-export function computeReviewPlaybackWindow(
-  startTime: number,
-  endTime: number | null | undefined,
-  preRollSec: number = 4,
-  postRollSec: number = 6,
-  fallbackDurationSec: number = 20
-): { startSec: number; endSec: number } {
-  const safeStart =
-    typeof startTime === "number" && Number.isFinite(startTime) && startTime > 0
-      ? startTime
-      : Math.floor(Date.now() / 1000) - fallbackDurationSec;
-  const safePre =
-    typeof preRollSec === "number" && Number.isFinite(preRollSec) && preRollSec >= 0
-      ? preRollSec
-      : 0;
-  const safePost =
-    typeof postRollSec === "number" && Number.isFinite(postRollSec) && postRollSec >= 0
-      ? postRollSec
-      : 0;
-  const safeFallbackDur =
-    typeof fallbackDurationSec === "number" &&
-    Number.isFinite(fallbackDurationSec) &&
-    fallbackDurationSec > 0
-      ? fallbackDurationSec
-      : 20;
-  const baseEnd =
-    typeof endTime === "number" && Number.isFinite(endTime) && endTime > safeStart
-      ? endTime
-      : safeStart + safeFallbackDur;
-  const startSec = Math.max(0, safeStart - safePre);
-  const endSec = Math.min(
-    startSec + MAX_EXPORT_WINDOW_SEC,
-    Math.max(startSec + 1, baseEnd + safePost)
-  );
-  return { startSec, endSec };
-}
-
-export function parseSavedReviewPresets(
-  raw: string | null | undefined
-): SavedReviewFilterPreset[] {
-  if (!raw || typeof raw !== "string") return [];
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    const out: SavedReviewFilterPreset[] = [];
-    for (const item of parsed) {
-      if (!item || typeof item !== "object") continue;
-      const rec = item as Record<string, unknown>;
-      if (typeof rec.name !== "string" || !rec.name.trim()) continue;
-      const status =
-        rec.status === "unreviewed" ||
-        rec.status === "reviewed" ||
-        rec.status === "all"
-          ? rec.status
-          : "unreviewed";
-      out.push({
-        name: rec.name.trim(),
-        camera: typeof rec.camera === "string" && rec.camera ? rec.camera : "all",
-        severity:
-          typeof rec.severity === "string" && rec.severity ? rec.severity : "all",
-        object: typeof rec.object === "string" && rec.object ? rec.object : "all",
-        excludeObject:
-          typeof rec.excludeObject === "string" && rec.excludeObject
-            ? rec.excludeObject
-            : "none",
-        zone: typeof rec.zone === "string" && rec.zone ? rec.zone : "all",
-        status,
-      });
-    }
-    return out;
-  } catch {
-    return [];
-  }
-}
+export type {
+  BatchFaceProgress,
+  SavedReviewFilterPreset,
+} from "../utils/forensicTriage";
+export {
+  applyReviewSubLabelUpdate,
+  clearFaceProfileFromReviews,
+  computeReviewPlaybackWindow,
+  createForensicTriageController,
+  formatDetectedAttributePill,
+  formatEventLabelWithSubLabel,
+  formatLicensePlateBadge,
+  formatSubLabelBadge,
+  getVisibleReviewPageIds,
+  matchesLicensePlateFilter,
+  normalizeFaceProfileName,
+  normalizeForensicLicensePlate,
+  normalizeLicensePlate,
+  parseFacesApiResponse,
+  parseSavedReviewPresets,
+  resolveNextBriefingStep,
+  resolveReviewThumbUrl,
+  shouldApplyReviewMutationResult,
+};
 
 interface ReviewWorkspaceProps {
   cameraNames: string[];
@@ -288,12 +138,8 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [localReviewSubLabels, setLocalReviewSubLabels] = React.useState<
     Record<string, string | null>
   >({});
-  const [batchReviewFaceProgress, setBatchReviewFaceProgress] = React.useState<{
-    active: boolean;
-    completed: number;
-    total: number;
-    name: string;
-  } | null>(null);
+  const [batchReviewFaceProgress, setBatchReviewFaceProgress] =
+    React.useState<BatchFaceProgress | null>(null);
   const [reviewPlateDraft, setReviewPlateDraft] = React.useState("");
   const lastDeletedFaceProfile = useNvrStore((s) => s.lastDeletedFaceProfile);
   const subLabelsRefreshTick = useNvrStore((s) => s.subLabelsRefreshTick);
@@ -306,9 +152,20 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [shareCreating, setShareCreating] = React.useState(false);
   const shareCopiedTimerRef = React.useRef<number | null>(null);
   const isMountedRef = React.useRef(true);
-  const reviewMutationSeqRef = React.useRef(0);
   const activeReviewIdRef = React.useRef<string | null>(activeReview?.id ?? null);
   activeReviewIdRef.current = activeReview?.id ?? null;
+  const wasInReviewsRef = React.useRef<boolean>(
+    Boolean(
+      activeReview &&
+        (reviews.some((r) => r.id === activeReview.id) ||
+          filteredReviews.some((r) => r.id === activeReview.id))
+    )
+  );
+  const triageController = React.useMemo(() => {
+    const ctrl = createForensicTriageController();
+    ctrl.setActiveTarget("review", activeReview?.id ?? null);
+    return ctrl;
+  }, []);
 
   const isCompact = useCompactViewport();
   const [filtersOpen, setFiltersOpen] = React.useState(false);
@@ -338,8 +195,14 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   ]);
 
   React.useEffect(() => {
-    activeReviewIdRef.current = activeReview?.id ?? null;
-    reviewMutationSeqRef.current += 1;
+    const nextId = activeReview?.id ?? null;
+    activeReviewIdRef.current = nextId;
+    triageController.setActiveTarget("review", nextId);
+    wasInReviewsRef.current = Boolean(
+      nextId &&
+        (reviews.some((r) => r.id === nextId) ||
+          filteredReviews.some((r) => r.id === nextId))
+    );
     if (shareCopiedTimerRef.current !== null) {
       window.clearTimeout(shareCopiedTimerRef.current);
       shareCopiedTimerRef.current = null;
@@ -348,12 +211,29 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     setShareFallbackUrl(null);
     setShareCopied(false);
     setShareCreating(false);
-  }, [activeReview?.id]);
+  }, [activeReview?.id, triageController]);
 
   React.useEffect(() => {
-    if (!activeReview || !reviews.some((r) => r.id === activeReview.id)) {
+    if (!activeReview) {
+      wasInReviewsRef.current = false;
       activeReviewIdRef.current = null;
-      reviewMutationSeqRef.current += 1;
+      triageController.setActiveTarget("review", null);
+      setBriefingActive(false);
+      return;
+    }
+    const isPresent =
+      reviews.some((r) => r.id === activeReview.id) ||
+      filteredReviews.some((r) => r.id === activeReview.id);
+    if (isPresent) {
+      wasInReviewsRef.current = true;
+      activeReviewIdRef.current = activeReview.id;
+      triageController.setActiveTarget("review", activeReview.id);
+      return;
+    }
+    if (wasInReviewsRef.current) {
+      wasInReviewsRef.current = false;
+      activeReviewIdRef.current = null;
+      triageController.setActiveTarget("review", null);
       if (shareCopiedTimerRef.current !== null) {
         window.clearTimeout(shareCopiedTimerRef.current);
         shareCopiedTimerRef.current = null;
@@ -364,18 +244,19 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
       setShareCreating(false);
       setBriefingActive(false);
     }
-  }, [reviews, activeReview]);
+  }, [reviews, filteredReviews, activeReview, triageController]);
 
   React.useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
+      triageController.invalidatePendingMutations();
       if (shareCopiedTimerRef.current !== null) {
         window.clearTimeout(shareCopiedTimerRef.current);
         shareCopiedTimerRef.current = null;
       }
     };
-  }, []);
+  }, [triageController]);
 
   React.useEffect(() => {
     if (!lastDeletedFaceProfile?.name || !activeReview) return;
@@ -397,24 +278,21 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   React.useEffect(() => {
     let cancelled = false;
     const controller = new AbortController();
-    fetch("/api/faces", { credentials: "include", signal: controller.signal })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => {
-        if (cancelled || !d) return;
-        const parsed = parseFacesApiResponse(d);
-        const deletedLower = lastDeletedFaceProfile?.name?.trim().toLowerCase();
-        setEnrolledFaces(
-          deletedLower
-            ? parsed.filter((p) => p.name.trim().toLowerCase() !== deletedLower)
-            : parsed
-        );
+    triageController
+      .fetchEnrolledFaces({
+        excludeDeletedProfile: lastDeletedFaceProfile,
+        signal: controller.signal,
       })
-      .catch(() => {});
+      .then((faces) => {
+        if (!cancelled) {
+          setEnrolledFaces(faces);
+        }
+      });
     return () => {
       cancelled = true;
       controller.abort();
     };
-  }, [subLabelsRefreshTick, lastDeletedFaceProfile]);
+  }, [triageController, subLabelsRefreshTick, lastDeletedFaceProfile]);
 
   const handleAssignReviewFace = async (overrideName?: string | null) => {
     const raw = overrideName !== undefined ? overrideName : reviewFaceDraft;
@@ -429,22 +307,26 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     }
     if (selectedBatchReviewIds.length > 0 && clean === null) {
       const targetRevIds = [...selectedBatchReviewIds];
-      for (const rid of targetRevIds) {
+      const batchItems = targetRevIds.map((rid) => {
         const revObj = reviews.find((r) => r.id === rid);
         const allDets = (revObj?.data?.detections || [])
           .map((d) => d.trim())
           .filter((d) => d.length > 0);
-        const detIds = allDets.length > 0 ? allDets : [rid];
-        for (const did of detIds) {
-          await fetch(`/api/events/${encodeURIComponent(did)}/sub_label`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            credentials: "include",
-            body: JSON.stringify({ sub_label: null }),
-          }).catch(() => null);
-        }
-        setLocalReviewSubLabels((prev) => ({ ...prev, [rid]: null }));
-      }
+        return {
+          id: rid,
+          primaryEventId: allDets[0] || rid,
+          detectionEventIds: allDets.length > 0 ? allDets : [rid],
+        };
+      });
+      await triageController.batchAssignFaceSubLabel({
+        items: batchItems,
+        rawName: null,
+        isCancelled: () => !isMountedRef.current,
+        onItemSuccess: (rid) => {
+          setLocalReviewSubLabels((prev) => ({ ...prev, [rid]: null }));
+        },
+      });
+      if (!isMountedRef.current) return;
       if (activeReview && targetRevIds.includes(activeReview.id)) {
         const [updated] = applyReviewSubLabelUpdate(
           [activeReview],
@@ -460,68 +342,33 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     if (!activeReview) return;
     const targetReview = activeReview;
     const targetId = targetReview.id;
-    const detId = (targetReview.data?.detections?.[0] || targetId).trim();
+    const allDets = (targetReview.data?.detections || [])
+      .map((d) => d.trim())
+      .filter((d) => d.length > 0);
+    const detId = (allDets[0] || targetId).trim();
     if (!detId) return;
-    const seq = ++reviewMutationSeqRef.current;
+    triageController.setActiveTarget("review", targetId);
     try {
-      let anyOk = false;
-      if (clean) {
-        const res = await fetch(`/api/faces/${encodeURIComponent(clean)}/enroll`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({
-            event_id: detId,
-            assign_sub_label: true,
-            backfill_events: true,
-          }),
-        });
-        if (res.ok) {
-          anyOk = true;
-        } else {
-          const fbRes = await fetch(`/api/events/${encodeURIComponent(detId)}/sub_label`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            credentials: "include",
-            body: JSON.stringify({
-              sub_label: clean,
-              sub_label_score: 1.0,
-              enroll_face: true,
-            }),
-          });
-          if (fbRes.ok) anyOk = true;
-        }
-      } else {
-        const allDets = (targetReview.data?.detections || [])
-          .map((d) => d.trim())
-          .filter((d) => d.length > 0);
-        const targetDetIds = allDets.length > 1 ? allDets : [detId];
-        for (const did of targetDetIds) {
-          const res = await fetch(`/api/events/${encodeURIComponent(did)}/sub_label`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            credentials: "include",
-            body: JSON.stringify({ sub_label: null }),
-          });
-          if (res.ok) anyOk = true;
-        }
+      const result = await triageController.assignFaceSubLabel({
+        primaryEventId: detId,
+        detectionEventIds: allDets.length > 1 ? allDets : [detId],
+        rawName: clean,
+        targetKind: "review",
+        targetId,
+        getActiveTargetId: () => activeReviewIdRef.current,
+        isCancelled: () => !isMountedRef.current,
+      });
+      if (result.ok && isMountedRef.current) {
+        setLocalReviewSubLabels((prev) => ({
+          ...prev,
+          [targetId]: result.cleanName,
+        }));
       }
-      if (anyOk && isMountedRef.current) {
-        setLocalReviewSubLabels((prev) => ({ ...prev, [targetId]: clean }));
-      }
-      if (
-        isMountedRef.current &&
-        seq === reviewMutationSeqRef.current &&
-        shouldApplyReviewMutationResult(
-          activeReviewIdRef.current,
-          targetId,
-          anyOk
-        )
-      ) {
+      if (result.shouldApply) {
         const [updated] = applyReviewSubLabelUpdate(
           [targetReview],
           targetId,
-          clean
+          result.cleanName
         );
         setActiveReview(updated);
         bumpSubLabelsRefresh();
@@ -547,66 +394,38 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
         : [];
     if (targetRevIds.length === 0) return;
     setReviewFaceDraft(cleanName);
-    setBatchReviewFaceProgress({
-      active: true,
-      completed: 0,
-      total: targetRevIds.length,
-      name: cleanName,
-    });
     try {
-      for (let i = 0; i < targetRevIds.length; i += 1) {
-        if (!isMountedRef.current) break;
-        const rid = targetRevIds[i];
+      const batchItems = targetRevIds.map((rid) => {
         const revObj = reviews.find((r) => r.id === rid);
         const detId = (revObj?.data?.detections?.[0] || rid).trim();
-        const isLast = i === targetRevIds.length - 1;
-        if (detId) {
-          const res = await fetch(
-            `/api/faces/${encodeURIComponent(cleanName)}/enroll`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              credentials: "include",
-              body: JSON.stringify({
-                event_id: detId,
-                assign_sub_label: true,
-                backfill_events: isLast,
-              }),
-            }
-          );
-          if (res.ok) {
-            if (isMountedRef.current) {
-              setLocalReviewSubLabels((prev) => ({ ...prev, [rid]: cleanName }));
-            }
-            if (activeReview && activeReview.id === rid) {
-              const [updated] = applyReviewSubLabelUpdate(
-                [activeReview],
-                rid,
-                cleanName
-              );
-              setActiveReview(updated);
-            }
+        return { id: rid, primaryEventId: detId };
+      });
+      await triageController.batchAssignFaceSubLabel({
+        items: batchItems,
+        rawName: cleanName,
+        isCancelled: () => !isMountedRef.current,
+        onProgress: (progress) => setBatchReviewFaceProgress(progress),
+        onItemSuccess: (rid, assignedName) => {
+          setLocalReviewSubLabels((prev) => ({
+            ...prev,
+            [rid]: assignedName,
+          }));
+          if (activeReview && activeReview.id === rid) {
+            const [updated] = applyReviewSubLabelUpdate(
+              [activeReview],
+              rid,
+              assignedName
+            );
+            setActiveReview(updated);
           }
-        }
-        if (isMountedRef.current) {
-          setBatchReviewFaceProgress({
-            active: true,
-            completed: i + 1,
-            total: targetRevIds.length,
-            name: cleanName,
-          });
-        }
-      }
+        },
+      });
       if (isMountedRef.current) {
         bumpSubLabelsRefresh();
         setSelectedBatchReviewIds([]);
       }
     } catch {
       // ignore transient error
-    } finally {
-      if (isMountedRef.current) {
-        setBatchReviewFaceProgress(null);
-      }
     }
   };
 
@@ -614,29 +433,20 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     if (!activeReview) return;
     const targetReview = activeReview;
     const targetId = targetReview.id;
-    const norm = normalizeLicensePlate(reviewPlateDraft);
     const primaryEventId = (targetReview.data?.detections?.[0] || targetId).trim();
     if (!primaryEventId) return;
-    const seq = ++reviewMutationSeqRef.current;
+    triageController.setActiveTarget("review", targetId);
     try {
-      const res = await fetch(
-        `/api/events/${encodeURIComponent(primaryEventId)}/license_plate`,
-        {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({ recognized_license_plate: norm || null }),
-        }
-      );
-      if (
-        isMountedRef.current &&
-        seq === reviewMutationSeqRef.current &&
-        shouldApplyReviewMutationResult(
-          activeReviewIdRef.current,
-          targetId,
-          res.ok
-        )
-      ) {
+      const result = await triageController.saveLicensePlate({
+        eventId: primaryEventId,
+        rawPlate: reviewPlateDraft,
+        targetKind: "review",
+        targetId,
+        getActiveTargetId: () => activeReviewIdRef.current,
+        isCancelled: () => !isMountedRef.current,
+      });
+      if (result.shouldApply) {
+        const norm = result.normalizedPlate || "";
         setActiveReview({
           ...targetReview,
           data: {
@@ -656,26 +466,19 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
     const targetReview = activeReview;
     const targetId = targetReview.id;
     const noteToSave = reviewNoteDraft;
-    const seq = ++reviewMutationSeqRef.current;
+    triageController.setActiveTarget("review", targetId);
     try {
-      const res = await fetch(`/api/review/${encodeURIComponent(targetId)}/notes`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
-        body: JSON.stringify({ notes: noteToSave }),
+      const result = await triageController.saveForensicNote({
+        targetKind: "review",
+        targetId,
+        notes: noteToSave,
+        getActiveTargetId: () => activeReviewIdRef.current,
+        isCancelled: () => !isMountedRef.current,
       });
-      if (
-        isMountedRef.current &&
-        seq === reviewMutationSeqRef.current &&
-        shouldApplyReviewMutationResult(
-          activeReviewIdRef.current,
-          targetId,
-          res.ok
-        )
-      ) {
+      if (result.shouldApply) {
         setActiveReview({
           ...targetReview,
-          data: { ...targetReview.data, notes: noteToSave },
+          data: { ...targetReview.data, notes: result.notes },
         });
       }
     } catch {
@@ -689,14 +492,7 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
   const [briefingIdx, setBriefingIdx] = React.useState(0);
   const [savedPresets, setSavedPresets] = React.useState<
     SavedReviewFilterPreset[]
-  >(() => {
-    try {
-      const raw = window.localStorage?.getItem("ninjanvr_saved_filters");
-      return parseSavedReviewPresets(raw);
-    } catch {
-      return [];
-    }
-  });
+  >(() => triageController.loadFilterPresets("review"));
 
   const availableZones = React.useMemo(() => {
     const set = new Set<string>();
@@ -719,37 +515,28 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
       if (zoneFilter !== "all" && !(r.data?.zones || []).includes(zoneFilter)) {
         return false;
       }
-      const normPlateQuery = normalizeLicensePlate(plateFilter);
-      if (normPlateQuery) {
-        const plates = (r.data?.recognized_license_plates || []).map(normalizeLicensePlate);
-        const subs = (r.data?.sub_labels || []).map(normalizeLicensePlate);
-        const matched =
-          plates.some((p) => p.includes(normPlateQuery)) ||
-          subs.some((s) => s.includes(normPlateQuery));
-        if (!matched) return false;
+      if (!matchesLicensePlateFilter(r, plateFilter)) {
+        return false;
       }
       return true;
     });
   }, [filteredReviews, excludeObjectFilter, zoneFilter, plateFilter]);
 
   const handleSavePreset = () => {
-    const label =
-      presetName.trim() ||
-      `${reviewCameraFilter === "all" ? "ALL" : reviewCameraFilter.toUpperCase()} · ${reviewSeverityFilter.toUpperCase()}`;
-    const next = [
-      ...savedPresets.filter((p) => p.name !== label),
+    const next = triageController.saveFilterPreset(
+      "review",
+      savedPresets,
+      presetName,
       {
-        name: label,
         camera: reviewCameraFilter,
         severity: reviewSeverityFilter,
         object: reviewObjectFilter,
         excludeObject: excludeObjectFilter,
         zone: zoneFilter,
         status: reviewStatusFilter,
-      },
-    ];
+      }
+    );
     setSavedPresets(next);
-    window.localStorage?.setItem("ninjanvr_saved_filters", JSON.stringify(next));
     setPresetName("");
   };
 
@@ -964,9 +751,13 @@ export const ReviewWorkspace: React.FC<ReviewWorkspaceProps> = ({
                 style={{ height: 24, padding: "0 4px", fontSize: "var(--text-xs)" }}
                 title={`Delete preset ${p.name}`}
                 onClick={() => {
-                  const next = savedPresets.filter((x) => x.name !== p.name);
-                  setSavedPresets(next);
-                  window.localStorage?.setItem("ninjanvr_saved_filters", JSON.stringify(next));
+                  setSavedPresets(
+                    triageController.deleteFilterPreset(
+                      "review",
+                      savedPresets,
+                      p.name
+                    )
+                  );
                 }}
               >
                 ×

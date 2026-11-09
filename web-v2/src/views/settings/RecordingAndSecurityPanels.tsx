@@ -17,70 +17,12 @@ import {
   sanitizeConfigEntrySlug,
   ToggleSwitch,
 } from "./ConsoleAndStreamsPanels";
+import {
+  createScopedConfigLens,
+  resolveEffectiveRecordConfig,
+} from "../../utils/scopedConfigDraft";
 
-export function resolveEffectiveRecordConfig(
-  base: RecordConfig,
-  override?: {
-    enabled?: boolean;
-    expire_interval?: number;
-    continuous?: { days: number };
-    motion?: { days: number };
-    alerts?: {
-      pre_capture?: number;
-      post_capture?: number;
-      retain?: { days?: number; mode?: string };
-    };
-    detections?: {
-      pre_capture?: number;
-      post_capture?: number;
-      retain?: { days?: number; mode?: string };
-    };
-    preview?: { quality: string };
-    continuous_substream?: boolean;
-    max_size_gb?: number | null;
-    min_free_gb?: number | null;
-    cold_compaction?: RecordConfig["cold_compaction"];
-    storage_tiers?: RecordConfig["storage_tiers"];
-    alert_backup?: RecordConfig["alert_backup"];
-  } | null
-): RecordConfig {
-  const src = override || {};
-  return {
-    ...base,
-    ...src,
-    continuous: {
-      days: src.continuous?.days ?? base.continuous?.days ?? 14,
-    },
-    motion: {
-      days: src.motion?.days ?? base.motion?.days ?? 0,
-    },
-    alerts: {
-      pre_capture: src.alerts?.pre_capture ?? base.alerts?.pre_capture ?? 5,
-      post_capture: src.alerts?.post_capture ?? base.alerts?.post_capture ?? 5,
-      retain: {
-        days: src.alerts?.retain?.days ?? base.alerts?.retain?.days ?? 14,
-        mode: src.alerts?.retain?.mode || base.alerts?.retain?.mode || "motion",
-      },
-    },
-    detections: {
-      pre_capture:
-        src.detections?.pre_capture ?? base.detections?.pre_capture ?? 5,
-      post_capture:
-        src.detections?.post_capture ?? base.detections?.post_capture ?? 5,
-      retain: {
-        days:
-          src.detections?.retain?.days ?? base.detections?.retain?.days ?? 14,
-        mode:
-          src.detections?.retain?.mode ||
-          base.detections?.retain?.mode ||
-          "motion",
-      },
-    },
-    preview: {
-      quality: src.preview?.quality || base.preview?.quality || "medium",
-    },
-  };
-}
+export { resolveEffectiveRecordConfig };
 
 export function normalizeAllowedCamerasScope(raw: string): string {
   const trimmed = (raw || "").trim();
@@ -221,144 +163,35 @@ export const RecordingReviewSection: React.FC<{
   const { locale } = useI18n();
   const isPt = locale === "pt";
 
-  const defaultRec: RecordConfig = {
-    enabled: true,
-    expire_interval: 60,
-    continuous: { days: 14 },
-    motion: { days: 0 },
-    alerts: {
-      pre_capture: 5,
-      post_capture: 5,
-      retain: { days: 14, mode: "motion" },
-    },
-    detections: {
-      pre_capture: 5,
-      post_capture: 5,
-      retain: { days: 14, mode: "motion" },
-    },
-    preview: { quality: "medium" },
-  };
-
-  const defaultSnap: SnapshotsConfig = {
-    enabled: true,
-    timestamp: false,
-    bounding_box: true,
-    crop: false,
-    quality: 70,
-  };
-
-  const defaultRev: ReviewConfig = {
-    alerts: {
-      enabled: true,
-      labels: ["person", "car"],
-      required_zones: [],
-      cutoff_time: 40,
-    },
-    detections: {
-      enabled: true,
-      required_zones: [],
-      cutoff_time: 30,
-    },
-  };
-
-  const activeRec: RecordConfig =
-    scope === "global"
-      ? resolveEffectiveRecordConfig(defaultRec, draftConfig.record)
-      : resolveEffectiveRecordConfig(
-          defaultRec,
-          draftConfig.cameras?.[inspectorCam]?.record
-        );
-
-  const activeSnap: SnapshotsConfig =
-    scope === "global"
-      ? { ...defaultSnap, ...(draftConfig.snapshots || {}) }
-      : {
-          ...defaultSnap,
-          ...(draftConfig.cameras?.[inspectorCam]?.snapshots || {}),
-        };
-
-  const activeRev: ReviewConfig =
-    scope === "global"
-      ? {
-          alerts: { ...defaultRev.alerts, ...(draftConfig.review?.alerts || {}) },
-          detections: {
-            ...defaultRev.detections,
-            ...(draftConfig.review?.detections || {}),
-          },
-        }
-      : {
-          alerts: {
-            ...defaultRev.alerts,
-            ...(draftConfig.cameras?.[inspectorCam]?.review?.alerts || {}),
-          },
-          detections: {
-            ...defaultRev.detections,
-            ...(draftConfig.cameras?.[inspectorCam]?.review?.detections || {}),
-          },
-        };
+  const configLens = createScopedConfigLens(draftConfig, scope, inspectorCam);
+  const activeRec: RecordConfig = configLens.readRecord();
+  const activeSnap: SnapshotsConfig = configLens.readSnapshots();
+  const activeRev: ReviewConfig = configLens.readReview();
+  const activeAudio: AudioConfig = configLens.readAudio();
 
   const camZoneNames = Object.keys(draftConfig.cameras?.[inspectorCam]?.zones || {});
 
   const mutateRec = (fn: (r: RecordConfig) => void) => {
     updateDraft((next) => {
-      const cloned: RecordConfig = JSON.parse(JSON.stringify(activeRec));
-      fn(cloned);
-      if (scope === "global") {
-        next.record = cloned;
-      } else if (next.cameras[inspectorCam]) {
-        next.cameras[inspectorCam].record = cloned;
-      }
+      configLens.mutateRecord(next, fn);
     });
   };
 
   const mutateSnap = (fn: (s: SnapshotsConfig) => void) => {
     updateDraft((next) => {
-      const cloned: SnapshotsConfig = JSON.parse(JSON.stringify(activeSnap));
-      fn(cloned);
-      if (scope === "global") {
-        next.snapshots = cloned;
-      } else if (next.cameras[inspectorCam]) {
-        next.cameras[inspectorCam].snapshots = cloned;
-      }
+      configLens.mutateSnapshots(next, fn);
     });
   };
 
   const mutateRev = (fn: (rv: ReviewConfig) => void) => {
     updateDraft((next) => {
-      const cloned: ReviewConfig = JSON.parse(JSON.stringify(activeRev));
-      fn(cloned);
-      if (scope === "global") {
-        next.review = cloned;
-      } else if (next.cameras[inspectorCam]) {
-        next.cameras[inspectorCam].review = cloned;
-      }
+      configLens.mutateReview(next, fn);
     });
   };
 
-  const defaultAudio: AudioConfig = {
-    enabled: false,
-    min_volume_dbfs: -60,
-    labels: ["audio", "speech", "bark", "alarm"],
-  };
-
-  const activeAudio: AudioConfig =
-    scope === "global"
-      ? { ...defaultAudio, ...(draftConfig.audio || {}) }
-      : {
-          ...defaultAudio,
-          ...(draftConfig.audio || {}),
-          ...(draftConfig.cameras?.[inspectorCam]?.audio || {}),
-        };
-
   const mutateAudio = (fn: (au: AudioConfig) => void) => {
     updateDraft((next) => {
-      const cloned: AudioConfig = JSON.parse(JSON.stringify(activeAudio));
-      fn(cloned);
-      if (scope === "global") {
-        next.audio = cloned;
-      } else if (next.cameras[inspectorCam]) {
-        next.cameras[inspectorCam].audio = cloned;
-      }
+      configLens.mutateAudio(next, fn);
     });
   };
 
@@ -383,9 +216,7 @@ export const RecordingReviewSection: React.FC<{
             className="nvr-btn sm"
             onClick={() => {
               updateDraft((next) => {
-                Object.values(next.cameras).forEach((cam) => {
-                  cam.record = JSON.parse(JSON.stringify(activeRec));
-                });
+                configLens.applySectionToAllCameras(next, "record");
               });
               notify("Applied recording & retention policy to all cameras");
             }}

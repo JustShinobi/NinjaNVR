@@ -43,7 +43,26 @@ import {
   validateLicensePlateFormat,
 } from "../../utils/configYaml";
 import { formatDateTime } from "../../utils/format";
+import {
+  createForensicTriageController,
+  normalizeFaceProfileName,
+  parseFacesApiResponse,
+} from "../../utils/forensicTriage";
+import {
+  createScopedConfigLens,
+  DEFAULT_ATTRIBUTE_LABELS,
+  toggleAttributeLabelList,
+  toggleSubLabelRuleList,
+} from "../../utils/scopedConfigDraft";
 import { ToggleSwitch } from "./ConsoleAndStreamsPanels";
+
+export {
+  DEFAULT_ATTRIBUTE_LABELS,
+  normalizeFaceProfileName,
+  parseFacesApiResponse,
+  toggleAttributeLabelList,
+  toggleSubLabelRuleList,
+};
 
 export const NINJANVR_SECURITY_CLASSES = [
   "person",
@@ -758,30 +777,6 @@ export const STANDARD_LABELS = [
   "license_plate",
 ];
 
-export const DEFAULT_ATTRIBUTE_LABELS = [
-  "face",
-  "license_plate",
-  "correios",
-  "mercado_livre",
-  "amazon",
-  "fedex",
-  "dhl",
-  "ups",
-  "usps",
-];
-
-export function toggleAttributeLabelList(
-  current: string[] | undefined,
-  label: string
-): string[] {
-  const base = current ?? DEFAULT_ATTRIBUTE_LABELS;
-  const clean = label.trim().toLowerCase();
-  if (!clean) return [...base];
-  return base.includes(clean)
-    ? base.filter((x) => x !== clean)
-    : [...base, clean];
-}
-
 export function upsertKnownPlateEntry(
   current: Record<string, string> | undefined,
   plate: string,
@@ -807,81 +802,6 @@ export function removeKnownPlateEntry(
     }
   }
   return next;
-}
-
-export function normalizeFaceProfileName(raw: string): string {
-  const trimmed = raw.trim();
-  if (!trimmed || trimmed.includes("..") || /[\\/]/.test(trimmed)) {
-    return "";
-  }
-  const cleaned = trimmed.replace(/[^a-zA-Z0-9_\- ]/g, "").trim();
-  if (
-    !cleaned ||
-    !/[a-zA-Z0-9]/.test(cleaned) ||
-    cleaned.toLowerCase() === "unknown" ||
-    VISION_RESERVED_KEYS.has(cleaned.toLowerCase())
-  ) {
-    return "";
-  }
-  return cleaned;
-}
-
-export function toggleSubLabelRuleList(
-  current: string[] | undefined,
-  subLabel: string
-): string[] {
-  const base = current ? [...current] : [];
-  const clean = subLabel.trim();
-  if (!clean) return base;
-  const existingIdx = base.findIndex(
-    (item) => item.toLowerCase() === clean.toLowerCase()
-  );
-  if (existingIdx >= 0) {
-    return base.filter((_, idx) => idx !== existingIdx);
-  }
-  return [...base, clean];
-}
-
-export function parseFacesApiResponse(payload: unknown): EnrolledFaceProfileItem[] {
-  if (!payload || typeof payload !== "object") return [];
-  const obj = payload as Record<string, unknown>;
-  if (Array.isArray(obj.profiles)) {
-    return obj.profiles
-      .filter(
-        (item): item is Record<string, unknown> =>
-          item !== null && typeof item === "object" && typeof (item as Record<string, unknown>).name === "string"
-      )
-      .map((item) => ({
-        name: String(item.name),
-        sample_count:
-          typeof item.sample_count === "number"
-            ? item.sample_count
-            : Array.isArray(item.sample_files)
-            ? item.sample_files.length
-            : 1,
-        sample_files: Array.isArray(item.sample_files)
-          ? item.sample_files.map(String)
-          : [],
-        updated_at:
-          typeof item.updated_at === "number" ? item.updated_at : undefined,
-      }));
-  }
-  const facesMap =
-    obj.faces && typeof obj.faces === "object" && !Array.isArray(obj.faces)
-      ? (obj.faces as Record<string, unknown>)
-      : obj;
-  const out: EnrolledFaceProfileItem[] = [];
-  for (const [key, val] of Object.entries(facesMap)) {
-    if (key === "profiles" || key === "faces") continue;
-    if (Array.isArray(val)) {
-      out.push({
-        name: key,
-        sample_count: val.length,
-        sample_files: val.map(String),
-      });
-    }
-  }
-  return out;
 }
 
 export type AiSettingsSubSectionId =
@@ -1378,11 +1298,9 @@ export const AiDetectionObjectsSection: React.FC<{
     unknown_alert: false,
   };
 
-  const activeExcludeSubLabels: string[] =
-    (scope === "global"
-      ? draftConfig.review?.alerts?.exclude_sub_labels
-      : draftConfig.cameras?.[inspectorCam]?.review?.alerts?.exclude_sub_labels ??
-        draftConfig.review?.alerts?.exclude_sub_labels) || [];
+  const configLens = createScopedConfigLens(draftConfig, scope, inspectorCam);
+  const triageControllerRef = React.useRef(createForensicTriageController());
+  const activeExcludeSubLabels: string[] = configLens.readExcludedSubLabels();
 
   const updateFaceRecognition = (patch: Partial<FaceRecognitionConfig>) => {
     updateDraft((next) => {
@@ -1398,58 +1316,17 @@ export const AiDetectionObjectsSection: React.FC<{
   };
 
   const handleToggleExcludeSubLabel = (name: string) => {
-    const nextList = toggleSubLabelRuleList(activeExcludeSubLabels, name);
     updateDraft((next) => {
-      if (scope === "global") {
-        if (!next.review) {
-          next.review = {
-            alerts: {
-              enabled: true,
-              labels: ["person", "car"],
-              required_zones: [],
-              cutoff_time: 40,
-            },
-            detections: {
-              enabled: true,
-              required_zones: [],
-              cutoff_time: 30,
-            },
-          };
-        }
-        next.review.alerts.exclude_sub_labels = nextList;
-      } else if (next.cameras[inspectorCam]) {
-        if (!next.cameras[inspectorCam].review) {
-          next.cameras[inspectorCam].review = {
-            alerts: {
-              enabled: true,
-              labels: ["person", "car"],
-              required_zones: [],
-              cutoff_time: 40,
-            },
-            detections: {
-              enabled: true,
-              required_zones: [],
-              cutoff_time: 30,
-            },
-          };
-        }
-        next.cameras[inspectorCam].review!.alerts.exclude_sub_labels = nextList;
-      }
+      configLens.toggleExcludedSubLabel(next, name);
     });
   };
 
-  const refreshEnrolledFaces = async () => {
-    try {
-      const res = await fetch("/api/faces", { credentials: "include" });
-      if (!aiSectionMountedRef.current) return;
-      if (res.ok) {
-        const data = await res.json();
-        if (aiSectionMountedRef.current) {
-          setEnrolledProfiles(parseFacesApiResponse(data));
-        }
-      }
-    } catch {
-      // ignore offline/unit environment
+  const refreshEnrolledFaces = async (excludeDeletedProfile?: string) => {
+    const profiles = await triageControllerRef.current.fetchEnrolledFaces(
+      excludeDeletedProfile ? { excludeDeletedProfile } : undefined
+    );
+    if (aiSectionMountedRef.current) {
+      setEnrolledProfiles(profiles);
     }
   };
 
@@ -1513,7 +1390,7 @@ export const AiDetectionObjectsSection: React.FC<{
           prev.filter((p) => p.name.trim().toLowerCase() !== name.trim().toLowerCase())
         );
         useNvrStore.getState().recordDeletedFaceProfile(name);
-        await refreshEnrolledFaces();
+        await refreshEnrolledFaces(name);
         if (!aiSectionMountedRef.current) return;
         const clearedCount = Number(data?.cleared_events || 0);
         notify(
@@ -1639,68 +1516,14 @@ export const AiDetectionObjectsSection: React.FC<{
     model_type: "ssd",
   };
 
-  const activeDetect: CameraDetectConfig =
-    scope === "global"
-      ? draftConfig.detect || {
-          enabled: true,
-          width: 1280,
-          height: 720,
-          fps: 5,
-          min_initialized: 2,
-          max_disappeared: 25,
-          stationary: { interval: 50, threshold: 50, classifier: true },
-        }
-      : draftConfig.cameras?.[inspectorCam]?.detect || {
-          enabled: true,
-          width: 1280,
-          height: 720,
-          fps: 5,
-          min_initialized: 2,
-          max_disappeared: 25,
-          stationary: { interval: 50, threshold: 50, classifier: true },
-        };
-
-  const trackedLabels: string[] =
-    scope === "global"
-      ? draftConfig.objects?.track || ["person"]
-      : draftConfig.cameras?.[inspectorCam]?.objects?.track ||
-        draftConfig.objects?.track || ["person"];
-
-  const attributeLabels: string[] =
-    scope === "global"
-      ? draftConfig.objects?.attribute_labels ?? DEFAULT_ATTRIBUTE_LABELS
-      : draftConfig.cameras?.[inspectorCam]?.objects?.attribute_labels ??
-        draftConfig.objects?.attribute_labels ??
-        DEFAULT_ATTRIBUTE_LABELS;
-
-  const activeSnapshotSelection =
-    (scope === "global"
-      ? draftConfig.snapshots?.selection
-      : draftConfig.cameras?.[inspectorCam]?.snapshots?.selection ??
-        draftConfig.snapshots?.selection) || "best_in_zone";
+  const activeDetect: CameraDetectConfig = configLens.readDetect();
+  const trackedLabels: string[] = configLens.readTrackedLabels();
+  const attributeLabels: string[] = configLens.readAttributeLabels();
+  const activeSnapshotSelection = configLens.readSnapshotSelection();
 
   const toggleAttributeLabel = (lbl: string) => {
     updateDraft((next) => {
-      if (scope === "global") {
-        if (!next.objects) next.objects = { track: ["person"], filters: {} };
-        next.objects.attribute_labels = toggleAttributeLabelList(
-          next.objects.attribute_labels ?? attributeLabels,
-          lbl
-        );
-      } else if (next.cameras[inspectorCam]) {
-        if (!next.cameras[inspectorCam].objects) {
-          next.cameras[inspectorCam].objects = {
-            track: [...trackedLabels],
-            filters: {},
-          };
-        }
-        next.cameras[inspectorCam].objects!.attribute_labels =
-          toggleAttributeLabelList(
-            next.cameras[inspectorCam].objects!.attribute_labels ??
-              attributeLabels,
-            lbl
-          );
-      }
+      configLens.toggleAttributeLabel(next, lbl);
     });
   };
 
@@ -1708,15 +1531,7 @@ export const AiDetectionObjectsSection: React.FC<{
     selection: "best_overall" | "best_in_zone" | "first_trigger" | "best_attribute"
   ) => {
     updateDraft((next) => {
-      if (scope === "global") {
-        if (!next.snapshots) next.snapshots = { enabled: true };
-        next.snapshots.selection = selection;
-      } else if (next.cameras[inspectorCam]) {
-        if (!next.cameras[inspectorCam].snapshots) {
-          next.cameras[inspectorCam].snapshots = { enabled: true };
-        }
-        next.cameras[inspectorCam].snapshots.selection = selection;
-      }
+      configLens.mutateSnapshotSelection(next, selection);
     });
   };
 
@@ -1728,27 +1543,11 @@ export const AiDetectionObjectsSection: React.FC<{
   }, [trackedLabels, selectedFilterLabel]);
 
   const activeFilter: ObjectFilterConfig =
-    (scope === "global"
-      ? draftConfig.objects?.filters?.[selectedFilterLabel]
-      : draftConfig.cameras?.[inspectorCam]?.objects?.filters?.[selectedFilterLabel]) || {
-      min_area: 0,
-      max_area: 24000000,
-      min_ratio: 0,
-      max_ratio: 24000000,
-      threshold: 0.7,
-      min_score: 0.5,
-    };
+    configLens.readObjectFilter(selectedFilterLabel);
 
   const updateDetect = (patch: Partial<CameraDetectConfig>) => {
     updateDraft((next) => {
-      if (scope === "global") {
-        next.detect = { ...activeDetect, ...patch };
-      } else if (next.cameras[inspectorCam]) {
-        next.cameras[inspectorCam].detect = {
-          ...next.cameras[inspectorCam].detect,
-          ...patch,
-        };
-      }
+      configLens.mutateDetect(next, patch);
     });
   };
 
@@ -1804,52 +1603,13 @@ export const AiDetectionObjectsSection: React.FC<{
       setSelectedFilterLabel(lbl);
     }
     updateDraft((next) => {
-      if (scope === "global") {
-        if (!next.objects) next.objects = { track: ["person"], filters: {} };
-        const curr = next.objects.track || [];
-        next.objects.track = curr.includes(lbl)
-          ? curr.filter((x) => x !== lbl)
-          : [...curr, lbl];
-      } else if (next.cameras[inspectorCam]) {
-        if (!next.cameras[inspectorCam].objects) {
-          next.cameras[inspectorCam].objects = {
-            track: [...trackedLabels],
-            filters: {},
-          };
-        }
-        const curr = next.cameras[inspectorCam].objects!.track || [];
-        next.cameras[inspectorCam].objects!.track = curr.includes(lbl)
-          ? curr.filter((x) => x !== lbl)
-          : [...curr, lbl];
-      }
+      configLens.toggleTrackedLabel(next, lbl);
     });
   };
 
   const updateObjectFilter = (patch: Partial<ObjectFilterConfig>) => {
     updateDraft((next) => {
-      const merged: ObjectFilterConfig = { ...activeFilter, ...patch };
-      if (patch.min_score !== undefined && merged.min_score > merged.threshold) {
-        merged.threshold = merged.min_score;
-      }
-      if (patch.threshold !== undefined && merged.threshold < merged.min_score) {
-        merged.min_score = merged.threshold;
-      }
-      if (scope === "global") {
-        if (!next.objects) next.objects = { track: ["person"], filters: {} };
-        if (!next.objects.filters) next.objects.filters = {};
-        next.objects.filters[selectedFilterLabel] = merged;
-      } else if (next.cameras[inspectorCam]) {
-        if (!next.cameras[inspectorCam].objects) {
-          next.cameras[inspectorCam].objects = {
-            track: [...trackedLabels],
-            filters: {},
-          };
-        }
-        if (!next.cameras[inspectorCam].objects!.filters) {
-          next.cameras[inspectorCam].objects!.filters = {};
-        }
-        next.cameras[inspectorCam].objects!.filters![selectedFilterLabel] = merged;
-      }
+      configLens.updateObjectFilter(next, selectedFilterLabel, patch);
     });
   };
 
@@ -2335,9 +2095,7 @@ export const AiDetectionObjectsSection: React.FC<{
               className="nvr-btn sm"
               onClick={() => {
                 updateDraft((next) => {
-                  Object.values(next.cameras).forEach((cam) => {
-                    cam.detect = { ...activeDetect };
-                  });
+                  configLens.applySectionToAllCameras(next, "detect");
                 });
                 notify("Applied detection & tracking settings to all cameras");
               }}
@@ -2416,8 +2174,8 @@ export const AiDetectionObjectsSection: React.FC<{
                         type: "openvino",
                         device: "CPU",
                       };
+                      configLens.mutateDetect(next, { detector: newKey });
                     });
-                    updateDetect({ detector: newKey });
                     notify(`Added detector instance '${newKey}'`);
                   }}
                 >
@@ -2903,12 +2661,7 @@ export const AiDetectionObjectsSection: React.FC<{
                   {isPt ? "CALIBRAR CLASSE:" : "TUNE CLASS:"}
                 </span>
                 {trackedLabels.map((lbl) => {
-                  const clsFilter =
-                    (scope === "global"
-                      ? draftConfig.objects?.filters?.[lbl]
-                      : draftConfig.cameras?.[inspectorCam]?.objects?.filters?.[lbl]) || {
-                      threshold: 0.7,
-                    };
+                  const clsFilter = configLens.readObjectFilter(lbl);
                   const pct = Math.round((clsFilter.threshold ?? 0.7) * 100);
                   return (
                     <button

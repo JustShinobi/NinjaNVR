@@ -1,29 +1,23 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use ninjanvr_comms::SharedCommsHub;
 use ninjanvr_config::{CameraConfig, NinjaConfig, scrub_yaml_credentials};
-use ninjanvr_db::{EventDto, NinjaDatabase, ReviewItemDto};
+use ninjanvr_db::{NinjaDatabase, ReviewItemDto};
 use ninjanvr_infer::AiDetectorEngine;
-use ninjanvr_media::{
-    SharedActivityLedger, YuvFrame, backup_alert_clip, privacy_mask_is_configured,
-    resolve_ffmpeg_bin,
-};
-use ninjanvr_track::{
-    ByteTracker, TrackedAttribute, TrackedObject, TriggerProvenance, compute_attribute_quality,
-    should_replace_snapshot,
-};
+use ninjanvr_media::{SharedActivityLedger, YuvFrame, backup_alert_clip, resolve_ffmpeg_bin};
+use ninjanvr_track::{ByteTracker, TrackedObject, should_replace_snapshot};
 pub use ninjanvr_vision::classify_dominant_color_tag;
 use ninjanvr_vision::{
     BoundingBox, CameraRoiStateMonitor, RgbImage, RoiStateTransition, SimdMotionDetector,
     annotate_rgb_image_with_boxes, apply_privacy_masks_from_value, check_frame_tamper,
-    compute_crop_dhash64, compute_inference_regions, crop_yuv420p_to_tensor_nhwc,
-    encode_image_jpeg, encode_image_jpeg_with_quality, encode_image_webp, is_monochrome_ir,
-    yuv420p_to_rgb_image, yuv420p_to_rgb_image_scaled,
+    compute_inference_regions, crop_yuv420p_to_tensor_nhwc, encode_image_jpeg,
+    encode_image_jpeg_with_quality, encode_image_webp, yuv420p_to_rgb_image,
+    yuv420p_to_rgb_image_scaled,
 };
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -31,47 +25,27 @@ use tokio::process::Command;
 use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
+pub use crate::track_lifecycle::*;
+
 pub const MIN_DETECT_WIDTH: u32 = 160;
 pub const MAX_DETECT_WIDTH: u32 = 3840;
 pub const MIN_DETECT_HEIGHT: u32 = 120;
 pub const MAX_DETECT_HEIGHT: u32 = 2160;
 pub const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(15);
-pub const MAX_TRACK_SNAPSHOTS: usize = 512;
-pub const MAX_REVIEW_DETECTIONS: usize = 256;
-pub const MAX_REVIEW_DURATION_SECS: f64 = 300.0;
 pub const MAX_HIGH_RES_SNAPSHOT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_HIGH_RES_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_CONCURRENT_HIGH_RES_SNAPSHOT_TASKS: usize = 4;
 pub const MAX_CONCURRENT_GENAI_VERIFY_TASKS: usize = 4;
 pub const MAX_CONCURRENT_ALERT_BACKUP_TASKS: usize = 2;
 pub const GENAI_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PRIVACY_MASK_DEPTH: usize = 16;
 
-fn shared_snapshot_http_client() -> Option<&'static reqwest::Client> {
-    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(Duration::from_millis(1500))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .ok()
-        })
-        .as_ref()
-}
-
-fn high_res_snapshot_semaphore() -> &'static Arc<Semaphore> {
-    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SEM.get_or_init(|| Arc::new(Semaphore::new(4)))
-}
-
-pub fn genai_verify_semaphore() -> &'static Arc<Semaphore> {
-    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SEM.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_GENAI_VERIFY_TASKS)))
-}
-
-pub fn alert_backup_semaphore() -> &'static Arc<Semaphore> {
-    static SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SEM.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_ALERT_BACKUP_TASKS)))
+pub fn build_snapshot_http_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(1500))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()
 }
 
 /// Validates that a camera stream URL uses `rtsp://` or `rtsps://`, has a valid non-empty host
@@ -565,11 +539,6 @@ pub fn normalize_yuv_frame_for_processing(frame: &YuvFrame) -> Option<YuvFrame> 
     })
 }
 
-/// Detects whether a YUV420p frame is in monochrome IR night mode based on U/V chroma plane variance.
-pub fn is_frame_night_ir(yuv_data: &[u8], width: u32, height: u32) -> bool {
-    is_monochrome_ir(yuv_data, width, height)
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct CameraRuntimeMetrics {
     pub camera_fps: f64,
@@ -600,70 +569,6 @@ pub struct FrameLifecycleCtx<'a> {
     pub cam_cfg: &'a CameraConfig,
     pub frame: &'a YuvFrame,
     pub now: f64,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct TrackPersistSnapshot {
-    pub best_score: f32,
-    pub best_attribute_score: f32,
-    pub sub_label: Option<String>,
-    pub sub_label_score: Option<f32>,
-    pub detected_attributes: Vec<TrackedAttribute>,
-    pub zones: Vec<String>,
-    pub stationary: bool,
-    pub dhash64: Option<u64>,
-    pub suppressed_fp: bool,
-    pub matched_fp_sig_id: Option<i64>,
-    pub ai_verify_triggered: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct ActiveReviewState {
-    pub id: String,
-    pub start_time: f64,
-    pub last_activity_time: f64,
-    pub last_backup_time: f64,
-    pub severity: String,
-    pub thumb_path: String,
-    pub thumb_time: f64,
-    pub best_score: f32,
-    pub detections: Vec<String>,
-    pub objects: Vec<String>,
-    pub sub_labels: Vec<String>,
-    pub sub_label_score: Option<f32>,
-    pub detected_attributes: Vec<TrackedAttribute>,
-    pub zones: Vec<String>,
-    pub provenance: Option<TriggerProvenance>,
-    pub is_new: bool,
-    pub dirty: bool,
-    pub prev_dto: Option<ReviewItemDto>,
-}
-
-impl ActiveReviewState {
-    pub fn to_dto(&self, camera: &str, end_time: Option<f64>) -> ReviewItemDto {
-        ReviewItemDto {
-            id: self.id.clone(),
-            camera: camera.to_string(),
-            start_time: self.start_time,
-            end_time,
-            severity: self.severity.clone(),
-            thumb_path: self.thumb_path.clone(),
-            data: json!({
-                "detections": self.detections,
-                "objects": self.objects,
-                "verified_objects": [],
-                "sub_labels": self.sub_labels,
-                "sub_label_score": self.sub_label_score,
-                "detected_attributes": self.detected_attributes,
-                "zones": self.zones,
-                "audio": [],
-                "thumb_time": self.thumb_time,
-                "provenance": self.provenance,
-                "metadata": null
-            }),
-            has_been_reviewed: false,
-        }
-    }
 }
 
 /// How often each camera vision loop re-reads the shared config to pick up edits saved
@@ -775,6 +680,10 @@ pub struct VisionPipeline {
     pub log_hub: crate::LogBufferHub,
     pub ptz_active_presets: Arc<RwLock<HashMap<String, Option<String>>>>,
     pub camera_driver_runtime: crate::camera_protocols::CameraDriverRuntime,
+    pub snapshot_http_client: Option<reqwest::Client>,
+    pub high_res_snapshot_semaphore: Arc<Semaphore>,
+    pub genai_verify_semaphore: Arc<Semaphore>,
+    pub alert_backup_semaphore: Arc<Semaphore>,
 }
 
 impl VisionPipeline {
@@ -1686,24 +1595,71 @@ impl VisionPipeline {
         }
     }
 
-    async fn recompute_active_review_severity(&self, rev: &mut ActiveReviewState) {
-        let det_ids = rev.detections.clone();
-        let db_clone = self.db.clone();
-        let has_remaining_alert = tokio::task::spawn_blocking(move || {
-            det_ids.iter().any(|det_id| {
-                db_clone.get_event(det_id).ok().flatten().is_some_and(|ev| {
-                    ev["false_positive"].as_bool() != Some(true)
-                        && ev["data"]["max_severity"].as_str() == Some("alert")
+    async fn prune_false_positive_track_from_review(
+        &self,
+        active_review: &mut Option<ActiveReviewState>,
+        track_id: &str,
+        camera: &str,
+        now: f64,
+    ) {
+        let remaining_det_ids: Vec<String> = match active_review.as_ref() {
+            Some(rev) if rev.detections.iter().any(|d| d == track_id) => rev
+                .detections
+                .iter()
+                .filter(|d| *d != track_id)
+                .cloned()
+                .collect(),
+            _ => return,
+        };
+        let has_remaining_alert = if remaining_det_ids.is_empty() {
+            false
+        } else {
+            let db_clone = self.db.clone();
+            tokio::task::spawn_blocking(move || {
+                remaining_det_ids.iter().any(|det_id| {
+                    db_clone.get_event(det_id).ok().flatten().is_some_and(|ev| {
+                        ev["false_positive"].as_bool() != Some(true)
+                            && ev["data"]["max_severity"].as_str() == Some("alert")
+                    })
                 })
             })
-        })
-        .await
-        .unwrap_or(false);
-        rev.severity = if has_remaining_alert {
-            "alert".to_string()
-        } else {
-            "detection".to_string()
+            .await
+            .unwrap_or(false)
         };
+        if let ReviewFalsePositiveTransition::DeleteEmptyReview {
+            review_id,
+            persisted_in_db: true,
+            before_dto,
+            closed_dto,
+        } = prune_false_positive_from_active_review(active_review, track_id, camera, now, |_| {
+            has_remaining_alert
+        }) {
+            let db_for_del = self.db.clone();
+            let rev_id_for_del = review_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                db_for_del.delete_reviews(std::slice::from_ref(&rev_id_for_del))
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    warn!("Failed to delete false-positive review {review_id}: {err:#}");
+                }
+                Err(join_err) => {
+                    warn!(
+                        "Blocking task failed deleting false-positive review {review_id}: {join_err:#}"
+                    );
+                }
+            }
+            self.comms.publish_json(
+                "reviews",
+                &json!({
+                    "type": "end",
+                    "before": before_dto,
+                    "after": closed_dto
+                }),
+            );
+        }
     }
 
     pub async fn spawn_camera_siren_for_trigger(
@@ -1748,16 +1704,16 @@ impl VisionPipeline {
             }),
         );
 
+        let Some(client) = self.snapshot_http_client.clone() else {
+            return;
+        };
         let rt = self.camera_driver_runtime.clone();
         let cam_owned = camera.to_string();
         let trig_owned = trigger_source.to_string();
         let log_hub = self.log_hub.clone();
         tokio::spawn(async move {
-            let Some(client) = shared_snapshot_http_client() else {
-                return;
-            };
             if let Err(err_msg) = rt
-                .trigger_camera_siren(client, &cam_owned, &effective_cam_cfg, 3.5)
+                .trigger_camera_siren(&client, &cam_owned, &effective_cam_cfg, 3.5)
                 .await
             {
                 log_hub.push_ninjanvr(
@@ -1790,22 +1746,7 @@ impl VisionPipeline {
         let normalized_priv_mask =
             normalize_privacy_mask_for_resolution(&cam_cfg.privacy_mask, frame.width, frame.height);
 
-        if track_snapshots.len() >= MAX_TRACK_SNAPSHOTS {
-            track_snapshots.retain(|k, _| {
-                active_tracks.iter().any(|t| &t.id == k) || ended_tracks.iter().any(|t| &t.id == k)
-            });
-            while track_snapshots.len() >= MAX_TRACK_SNAPSHOTS {
-                let Some(evict_id) = track_snapshots
-                    .keys()
-                    .find(|k| !active_tracks.iter().any(|t| &t.id == *k))
-                    .or_else(|| track_snapshots.keys().next())
-                    .cloned()
-                else {
-                    break;
-                };
-                track_snapshots.remove(&evict_id);
-            }
-        }
+        bound_track_snapshots_capacity(track_snapshots, active_tracks, ended_tracks);
 
         let active_profile = self.comms.get_active_profile();
         let cam_rt_flags = self.comms.get_camera_flags(camera);
@@ -1843,45 +1784,6 @@ impl VisionPipeline {
 
         for trk in active_tracks {
             let prev = track_snapshots.get(&trk.id).cloned();
-            let is_new = prev.is_none();
-            let prev_zones: Vec<String> =
-                prev.as_ref().map(|p| p.zones.clone()).unwrap_or_default();
-            let newly_entered_zones: Vec<String> = trk
-                .entered_zones
-                .iter()
-                .filter(|z| !prev_zones.contains(z))
-                .cloned()
-                .collect();
-            let prev_best_score = prev.as_ref().map(|p| p.best_score).unwrap_or(0.0);
-            let prev_best_attr_quality =
-                prev.as_ref().map(|p| p.best_attribute_score).unwrap_or(0.0);
-            let attr_q_from_boxes = trk
-                .attributes
-                .iter()
-                .filter(|a| {
-                    a.label.eq_ignore_ascii_case("face")
-                        || a.label.eq_ignore_ascii_case("license_plate")
-                })
-                .map(|a| compute_attribute_quality(a.score, a.area_px, frame.width, frame.height))
-                .fold(0.0f32, f32::max);
-            let new_attr_quality = if attr_q_from_boxes > 0.0 {
-                attr_q_from_boxes.max(trk.best_attribute_score)
-            } else if trk.best_attribute_score > prev_best_attr_quality {
-                trk.best_attribute_score
-            } else {
-                0.0
-            };
-            let is_better_score = prev
-                .as_ref()
-                .map(|p| trk.score > p.best_score + 0.05)
-                .unwrap_or(true);
-            let is_better_attr = (prev_best_attr_quality <= 0.0 && new_attr_quality > 0.0)
-                || new_attr_quality > prev_best_attr_quality + 0.02;
-            let state_changed = prev
-                .as_ref()
-                .map(|p| p.zones != trk.entered_zones || p.stationary != trk.stationary)
-                .unwrap_or(false);
-
             let lpr_consensus = if lpr_cfg.enabled {
                 if let Some(ref cand) = trk.inferred_sub_label
                     && ninjanvr_infer::validate_license_plate(cand, lpr_cfg.format_regex.as_deref())
@@ -1903,81 +1805,56 @@ impl VisionPipeline {
             } else {
                 None
             };
-            let recognized_license_plate = lpr_consensus.as_ref().map(|c| c.plate.clone());
-            let mut effective_sub_label = lpr_consensus
-                .as_ref()
-                .and_then(|c| c.sub_label.clone())
-                .or_else(|| trk.inferred_sub_label.clone())
-                .or_else(|| prev.as_ref().and_then(|p| p.sub_label.clone()));
-            let mut effective_sub_label_score: Option<f32> =
-                prev.as_ref().and_then(|p| p.sub_label_score);
-            let mut merged_attrs: Vec<TrackedAttribute> = prev
-                .as_ref()
-                .map(|p| p.detected_attributes.clone())
-                .unwrap_or_default();
-            for attr in &trk.attributes {
-                if let Some(existing) = merged_attrs.iter_mut().find(|a| a.label == attr.label) {
-                    if attr.score >= existing.score || attr.area_px >= existing.area_px {
-                        *existing = attr.clone();
-                    }
-                } else {
-                    merged_attrs.push(attr.clone());
-                }
-            }
-            if face_cfg.enabled
-                && trk.label == "person"
-                && (effective_sub_label.is_none()
-                    || effective_sub_label.as_deref() == Some("unknown"))
-            {
-                let face_attr_bbox = merged_attrs
-                    .iter()
-                    .find(|a| a.label.eq_ignore_ascii_case("face"))
-                    .map(|a| a.bbox);
-                if let Some(face_crop_box) = ninjanvr_infer::resolve_face_crop_bbox(
-                    trk.bbox,
-                    face_attr_bbox,
-                    frame.width,
-                    frame.height,
-                    face_cfg.min_face_area,
-                ) {
-                    let full_redacted = cached_redacted_full_rgb.get_or_insert_with(|| {
-                        let mut img = yuv420p_to_rgb_image(frame, None, &[]);
-                        apply_privacy_masks_from_value(&mut img, &normalized_priv_mask);
-                        img
-                    });
-                    let face_rgb = crop_and_scale_rgb_square(full_redacted, face_crop_box, 112);
-                    let det_clone = self.detector.clone();
-                    let faces_dir_clone = faces_dir.clone();
-                    let sim_thresh = face_cfg.similarity_threshold;
-                    let unk_alert = face_cfg.unknown_alert;
-                    if let Ok(Some(m)) = tokio::task::spawn_blocking(move || {
-                        det_clone.match_face_crop(
-                            &faces_dir_clone,
-                            face_rgb.as_raw(),
-                            sim_thresh,
-                            unk_alert,
-                        )
-                    })
-                    .await
-                    {
-                        effective_sub_label = Some(m.sub_label);
-                        effective_sub_label_score = Some(m.score);
-                    }
-                }
-            }
-            let attrs_changed = prev
-                .as_ref()
-                .map(|p| {
-                    p.sub_label != effective_sub_label
-                        || p.sub_label_score != effective_sub_label_score
-                        || p.detected_attributes != merged_attrs
-                })
-                .unwrap_or(!merged_attrs.is_empty() || effective_sub_label.is_some());
 
-            let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
-            let crop_dhash64 =
-                compute_crop_dhash64(&frame.data, frame.width, frame.height, trk.bbox);
+            let face_match = if let Some(face_crop_box) = resolve_face_recognition_candidate_bbox(
+                trk,
+                prev.as_ref(),
+                lpr_consensus.as_ref(),
+                &face_cfg,
+                frame.width,
+                frame.height,
+            ) {
+                let full_redacted = cached_redacted_full_rgb.get_or_insert_with(|| {
+                    let mut img = yuv420p_to_rgb_image(frame, None, &[]);
+                    apply_privacy_masks_from_value(&mut img, &normalized_priv_mask);
+                    img
+                });
+                let face_rgb = crop_and_scale_rgb_square(full_redacted, face_crop_box, 112);
+                let det_clone = self.detector.clone();
+                let faces_dir_clone = faces_dir.clone();
+                let sim_thresh = face_cfg.similarity_threshold;
+                let unk_alert = face_cfg.unknown_alert;
+                tokio::task::spawn_blocking(move || {
+                    det_clone.match_face_crop(
+                        &faces_dir_clone,
+                        face_rgb.as_raw(),
+                        sim_thresh,
+                        unk_alert,
+                    )
+                })
+                .await
+                .ok()
+                .flatten()
+                .map(|m| (m.sub_label, m.score))
+            } else {
+                None
+            };
+
             let prev_suppressed = prev.as_ref().is_some_and(|p| p.suppressed_fp);
+            let enriched = enrich_tracked_object(TrackEnrichmentInput {
+                trk,
+                prev: prev.as_ref(),
+                lpr_consensus: lpr_consensus.as_ref(),
+                face_match,
+                frame,
+                cam_cfg,
+                active_profile: &active_profile,
+                camera_suppressed_in_profile,
+                alerts_enabled: cam_rt_flags.alerts,
+                suppressed_fp: prev_suppressed,
+                is_ended: false,
+            });
+
             let mut suppressed_fp = prev_suppressed;
             let mut matched_fp_sig_id: Option<i64> =
                 prev.as_ref().and_then(|p| p.matched_fp_sig_id);
@@ -1986,7 +1863,9 @@ impl VisionPipeline {
                 let cam_for_fp = camera.to_string();
                 let lbl_for_fp = trk.label.clone();
                 let trk_id_for_fp = trk.id.clone();
-                if is_new {
+                let norm_box = enriched.norm_box;
+                let crop_dhash64 = enriched.crop_dhash64;
+                if enriched.is_new {
                     if let Ok(Ok(Some(sig_val))) = tokio::task::spawn_blocking(move || {
                         db_for_fp.match_false_positive_signature(
                             &cam_for_fp,
@@ -2018,60 +1897,20 @@ impl VisionPipeline {
                     }
                 }
             }
-            let fp_just_activated = suppressed_fp && !prev_suppressed && !is_new;
-            if suppressed_fp
-                && let Some(rev) = active_review.as_mut()
-                && let Some(pos) = rev.detections.iter().position(|d| d == &trk.id)
-            {
-                rev.detections.remove(pos);
-                rev.dirty = true;
-                if rev.detections.is_empty() {
-                    if !rev.is_new {
-                        let closed_dto = rev.to_dto(camera, Some(now));
-                        let before_dto = rev.prev_dto.clone().unwrap_or_else(|| closed_dto.clone());
-                        let db_for_del = self.db.clone();
-                        let rev_id_for_del = rev.id.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            db_for_del.delete_reviews(std::slice::from_ref(&rev_id_for_del))
-                        })
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(err)) => {
-                                warn!("Failed to delete false-positive review {}: {err:#}", rev.id);
-                            }
-                            Err(join_err) => {
-                                warn!(
-                                    "Blocking task failed deleting false-positive review {}: {join_err:#}",
-                                    rev.id
-                                );
-                            }
-                        }
-                        self.comms.publish_json(
-                            "reviews",
-                            &json!({
-                                "type": "end",
-                                "before": before_dto,
-                                "after": closed_dto
-                            }),
-                        );
-                    }
-                    *active_review = None;
-                } else {
-                    self.recompute_active_review_severity(rev).await;
-                }
+            let fp_just_activated = suppressed_fp && !prev_suppressed && !enriched.is_new;
+            if suppressed_fp {
+                self.prune_false_positive_track_from_review(active_review, &trk.id, camera, now)
+                    .await;
             }
             let mut ai_verify_triggered = prev.as_ref().is_some_and(|p| p.ai_verify_triggered);
 
-            if is_new
-                || is_better_score
-                || is_better_attr
-                || state_changed
-                || attrs_changed
+            if enriched.is_new
+                || enriched.is_better_score
+                || enriched.is_better_attr
+                || enriched.state_changed
+                || enriched.attrs_changed
                 || fp_just_activated
             {
-                let best_score = prev_best_score.max(trk.score);
-                let best_attr_score = prev_best_attr_quality.max(new_attr_quality);
                 let should_trigger_ai = !suppressed_fp
                     && !ai_verify_triggered
                     && genai_cfg.enabled
@@ -2079,7 +1918,7 @@ impl VisionPipeline {
                     && trk.score >= genai_cfg.ambiguous_score_min
                     && trk.score <= genai_cfg.ambiguous_score_max;
                 let genai_permit_opt = if should_trigger_ai {
-                    genai_verify_semaphore().clone().try_acquire_owned().ok()
+                    self.genai_verify_semaphore.clone().try_acquire_owned().ok()
                 } else {
                     None
                 };
@@ -2089,14 +1928,14 @@ impl VisionPipeline {
                 track_snapshots.insert(
                     trk.id.clone(),
                     TrackPersistSnapshot {
-                        best_score,
-                        best_attribute_score: best_attr_score,
-                        sub_label: effective_sub_label.clone(),
-                        sub_label_score: effective_sub_label_score,
-                        detected_attributes: merged_attrs.clone(),
+                        best_score: enriched.best_score,
+                        best_attribute_score: enriched.best_attr_score,
+                        sub_label: enriched.effective_sub_label.clone(),
+                        sub_label_score: enriched.effective_sub_label_score,
+                        detected_attributes: enriched.merged_attributes.clone(),
                         zones: trk.entered_zones.clone(),
                         stationary: trk.stationary,
-                        dhash64: Some(crop_dhash64),
+                        dhash64: Some(enriched.crop_dhash64),
                         suppressed_fp,
                         matched_fp_sig_id,
                         ai_verify_triggered,
@@ -2106,11 +1945,11 @@ impl VisionPipeline {
                 let mut thumb_b64 = None;
                 let replace_snap = should_replace_snapshot(
                     cam_cfg.snapshots.selection,
-                    is_new,
-                    prev_best_score,
+                    enriched.is_new,
+                    enriched.prev_best_score,
                     trk.score,
-                    prev_best_attr_quality,
-                    new_attr_quality,
+                    enriched.prev_best_attr_quality,
+                    enriched.new_attr_quality,
                     &trk.zones,
                     &trk.entered_zones,
                 );
@@ -2218,214 +2057,141 @@ impl VisionPipeline {
                         thumb_b64 = encoded_b64;
                     }
 
-                    if snapshots_active {
-                        // Async high-resolution main-stream snapshot upgrade via normalized bbox projection
-                        if cam_cfg.snapshots.high_res
-                            && cam_cfg.snapshots.from_main_stream
-                            && let Ok(permit) =
-                                high_res_snapshot_semaphore().clone().try_acquire_owned()
-                        {
-                            let safe_src = sanitize_filename_component(camera);
-                            let det_bbox = trk.bbox;
-                            let det_w = frame.width;
-                            let det_h = frame.height;
-                            let draw_bbox = cam_cfg.snapshots.bounding_box;
-                            let priv_mask = normalized_priv_mask.clone();
-                            let media_root_clone = self.media_dir.clone();
-                            let clips_dir_clone = clips_dir.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let Some(client) = shared_snapshot_http_client() else {
-                                    return;
-                                };
-                                let url =
-                                    format!("http://127.0.0.1:1984/api/frame.jpeg?src={safe_src}");
-                                if let Ok(mut resp) = client.get(&url).send().await
-                                    && resp.status().is_success()
-                                    && resp
-                                        .content_length()
-                                        .is_none_or(|len| len <= MAX_HIGH_RES_SNAPSHOT_BYTES as u64)
-                                {
-                                    let mut bytes = Vec::new();
-                                    let mut within_cap = true;
-                                    while let Ok(Some(chunk)) = resp.chunk().await {
-                                        if bytes.len().saturating_add(chunk.len())
-                                            > MAX_HIGH_RES_SNAPSHOT_BYTES
-                                        {
-                                            within_cap = false;
-                                            break;
-                                        }
-                                        bytes.extend_from_slice(&chunk);
+                    if snapshots_active
+                        && cam_cfg.snapshots.high_res
+                        && cam_cfg.snapshots.from_main_stream
+                        && let Some(client) = self.snapshot_http_client.clone()
+                        && let Ok(permit) =
+                            self.high_res_snapshot_semaphore.clone().try_acquire_owned()
+                    {
+                        let safe_src = sanitize_filename_component(camera);
+                        let det_bbox = trk.bbox;
+                        let det_w = frame.width;
+                        let det_h = frame.height;
+                        let draw_bbox = cam_cfg.snapshots.bounding_box;
+                        let priv_mask = normalized_priv_mask.clone();
+                        let media_root_clone = self.media_dir.clone();
+                        let clips_dir_clone = clips_dir.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let url =
+                                format!("http://127.0.0.1:1984/api/frame.jpeg?src={safe_src}");
+                            if let Ok(mut resp) = client.get(&url).send().await
+                                && resp.status().is_success()
+                                && resp
+                                    .content_length()
+                                    .is_none_or(|len| len <= MAX_HIGH_RES_SNAPSHOT_BYTES as u64)
+                            {
+                                let mut bytes = Vec::new();
+                                let mut within_cap = true;
+                                while let Ok(Some(chunk)) = resp.chunk().await {
+                                    if bytes.len().saturating_add(chunk.len())
+                                        > MAX_HIGH_RES_SNAPSHOT_BYTES
+                                    {
+                                        within_cap = false;
+                                        break;
                                     }
-                                    if within_cap && !bytes.is_empty() {
-                                        let _ = tokio::task::spawn_blocking(move || {
-                                            if let Some(mut hr_rgb) =
-                                                decode_bounded_high_res_snapshot(
-                                                    &bytes, det_w, det_h,
-                                                )
-                                            {
+                                    bytes.extend_from_slice(&chunk);
+                                }
+                                if within_cap && !bytes.is_empty() {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        if let Some(mut hr_rgb) =
+                                            decode_bounded_high_res_snapshot(&bytes, det_w, det_h)
+                                        {
+                                            apply_privacy_masks_from_value(&mut hr_rgb, &priv_mask);
+                                            if let Ok(hr_clean_webp) = encode_image_webp(&hr_rgb) {
+                                                let _ = write_contained_media_file(
+                                                    &media_root_clone,
+                                                    &clips_dir_clone,
+                                                    &clean_webp_name,
+                                                    &hr_clean_webp,
+                                                );
+                                            }
+                                            if let Ok(hr_clean_jpg) = encode_image_jpeg(&hr_rgb) {
+                                                let _ = write_contained_media_file(
+                                                    &media_root_clone,
+                                                    &clips_dir_clone,
+                                                    &clean_jpg_name,
+                                                    &hr_clean_jpg,
+                                                );
+                                            }
+                                            if draw_bbox {
+                                                let projected = det_bbox.project_to_resolution(
+                                                    det_w,
+                                                    det_h,
+                                                    hr_rgb.width(),
+                                                    hr_rgb.height(),
+                                                );
+                                                annotate_rgb_image_with_boxes(
+                                                    &mut hr_rgb,
+                                                    &[(projected, [31, 119, 180])],
+                                                );
                                                 apply_privacy_masks_from_value(
                                                     &mut hr_rgb,
                                                     &priv_mask,
                                                 );
-                                                if let Ok(hr_clean_webp) =
-                                                    encode_image_webp(&hr_rgb)
-                                                {
-                                                    let _ = write_contained_media_file(
-                                                        &media_root_clone,
-                                                        &clips_dir_clone,
-                                                        &clean_webp_name,
-                                                        &hr_clean_webp,
-                                                    );
-                                                }
-                                                if let Ok(hr_clean_jpg) = encode_image_jpeg(&hr_rgb)
-                                                {
-                                                    let _ = write_contained_media_file(
-                                                        &media_root_clone,
-                                                        &clips_dir_clone,
-                                                        &clean_jpg_name,
-                                                        &hr_clean_jpg,
-                                                    );
-                                                }
-                                                if draw_bbox {
-                                                    let projected = det_bbox.project_to_resolution(
-                                                        det_w,
-                                                        det_h,
-                                                        hr_rgb.width(),
-                                                        hr_rgb.height(),
-                                                    );
-                                                    annotate_rgb_image_with_boxes(
-                                                        &mut hr_rgb,
-                                                        &[(projected, [31, 119, 180])],
-                                                    );
-                                                    apply_privacy_masks_from_value(
-                                                        &mut hr_rgb,
-                                                        &priv_mask,
-                                                    );
-                                                }
-                                                if let Ok(hr_jpg) = encode_image_jpeg(&hr_rgb) {
-                                                    let _ = write_contained_media_file(
-                                                        &media_root_clone,
-                                                        &clips_dir_clone,
-                                                        &jpg_name,
-                                                        &hr_jpg,
-                                                    );
-                                                }
-                                                if let Ok(hr_webp) = encode_image_webp(&hr_rgb) {
-                                                    let _ = write_contained_media_file(
-                                                        &media_root_clone,
-                                                        &clips_dir_clone,
-                                                        &webp_name,
-                                                        &hr_webp,
-                                                    );
-                                                }
                                             }
-                                        })
-                                        .await;
-                                    }
+                                            if let Ok(hr_jpg) = encode_image_jpeg(&hr_rgb) {
+                                                let _ = write_contained_media_file(
+                                                    &media_root_clone,
+                                                    &clips_dir_clone,
+                                                    &jpg_name,
+                                                    &hr_jpg,
+                                                );
+                                            }
+                                            if let Ok(hr_webp) = encode_image_webp(&hr_rgb) {
+                                                let _ = write_contained_media_file(
+                                                    &media_root_clone,
+                                                    &clips_dir_clone,
+                                                    &webp_name,
+                                                    &hr_webp,
+                                                );
+                                            }
+                                        }
+                                    })
+                                    .await;
                                 }
-                            });
-                        }
+                            }
+                        });
                     }
                 }
 
-                let norm_reg = trk.region.to_normalized(frame.width, frame.height);
-                let mut trk_for_sev = trk.clone();
-                if trk_for_sev.inferred_sub_label.is_none() {
-                    trk_for_sev.inferred_sub_label = effective_sub_label.clone();
-                }
-                let severity = if suppressed_fp || !cam_rt_flags.alerts {
-                    "detection"
-                } else {
-                    compute_track_severity_for_profile(
-                        cam_cfg,
-                        &trk_for_sev,
-                        &active_profile,
-                        camera_suppressed_in_profile,
-                    )
-                };
-                let area = trk.bbox.area();
-                let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
-
-                let color_attr =
-                    classify_dominant_color_tag(&frame.data, frame.width, frame.height, trk.bbox);
-                let mut attr_tags = vec![color_attr.to_string()];
-                for a in &merged_attrs {
-                    if !attr_tags.contains(&a.label) {
-                        attr_tags.push(a.label.clone());
-                    }
-                }
-                if let Some(ref plate_str) = recognized_license_plate
-                    && !attr_tags.contains(plate_str)
-                {
-                    attr_tags.push(plate_str.clone());
-                }
-                let face_box = merged_attrs
-                    .iter()
-                    .find(|a| a.label.eq_ignore_ascii_case("face"))
-                    .map(|a| a.norm_bbox);
-                let license_plate_box = merged_attrs
-                    .iter()
-                    .find(|a| a.label.eq_ignore_ascii_case("license_plate"))
-                    .map(|a| a.norm_bbox)
-                    .or_else(|| {
-                        if trk.label.eq_ignore_ascii_case("license_plate") {
-                            Some(norm_box)
-                        } else {
-                            None
-                        }
-                    });
-
-                let ev_dto = EventDto {
-                    id: trk.id.clone(),
-                    camera: camera.to_string(),
-                    label: trk.label.clone(),
-                    zones: json!(trk.entered_zones),
-                    start_time: trk.start_time,
-                    end_time: None,
-                    has_clip: record_active,
-                    has_snapshot: snapshots_active,
-                    plus_id: None,
-                    retain_indefinitely: false,
-                    sub_label: effective_sub_label.clone(),
-                    top_score: Some(best_score as f64),
-                    false_positive: Some(suppressed_fp),
-                    box_coords: Some(json!(norm_box)),
-                    data: json!({
-                        "box": norm_box,
-                        "region": norm_reg,
-                        "dhash64": crop_dhash64,
-                        "suppressed_by_fp_signature": matched_fp_sig_id,
-                        "score": trk.score,
-                        "top_score": best_score,
-                        "sub_label": effective_sub_label,
-                        "sub_label_score": effective_sub_label_score,
-                        "attributes": attr_tags,
-                        "detected_attributes": merged_attrs,
-                        "face_box": face_box,
-                        "license_plate_box": license_plate_box,
-                        "recognized_license_plate": recognized_license_plate,
-                        "night_mode": is_frame_night_ir(&frame.data, frame.width, frame.height),
-                        "type": "object",
-                        "max_severity": severity,
-                        "provenance": trk.provenance
-                    }),
+                let severity = enriched.resolve_severity(
+                    trk,
+                    cam_cfg,
+                    &active_profile,
+                    camera_suppressed_in_profile,
+                    cam_rt_flags.alerts,
+                    suppressed_fp,
+                );
+                let ev_dto = build_track_event_dto(BuildTrackEventDtoParams {
+                    camera,
+                    trk,
+                    enriched: &enriched,
+                    record_active,
+                    snapshots_active,
+                    suppressed_fp,
+                    matched_fp_sig_id,
+                    severity,
                     thumbnail: thumb_b64,
-                    area: Some(area),
-                    ratio: Some(ratio),
-                    score: Some(trk.score),
-                    stationary: trk.stationary,
-                };
+                    end_time: None,
+                    night_mode: Some(is_frame_night_ir(&frame.data, frame.width, frame.height)),
+                });
+
                 let db_for_ev = self.db.clone();
                 let ev_dto_for_db = ev_dto.clone();
-                let sub_label_for_db = effective_sub_label.clone();
-                let sub_score_for_db = effective_sub_label_score.map(|v| v as f64);
+                let sub_label_for_db = enriched.effective_sub_label.clone();
+                let sub_score_for_db = enriched.effective_sub_label_score.map(|v| v as f64);
                 let trk_id_for_db = trk.id.clone();
                 let cam_for_db = camera.to_string();
                 let trk_label_for_db = trk.label.clone();
                 let trk_score_for_db = trk.score;
                 let entered_zones_for_db = trk.entered_zones.clone();
-                let newly_entered_for_db = newly_entered_zones.clone();
+                let newly_entered_for_db = enriched.newly_entered_zones.clone();
+                let norm_box = enriched.norm_box;
+                let norm_reg = enriched.norm_reg;
+                let best_score = enriched.best_score;
+                let is_new = enriched.is_new;
 
                 let event_persisted = match tokio::task::spawn_blocking(move || {
                     if let Err(err) = db_for_ev.upsert_event(&ev_dto_for_db) {
@@ -2541,7 +2307,7 @@ impl VisionPipeline {
                             &format!("ninjanvr.detect.{camera}"),
                             &format!(
                                 "Tracked object {}: {} (score={:.2}, area={})",
-                                trk.id, trk.label, trk.score, area
+                                trk.id, trk.label, trk.score, enriched.area
                             ),
                         );
                     }
@@ -2554,9 +2320,9 @@ impl VisionPipeline {
 
             if cam_rt_flags.alerts
                 && !camera_suppressed_in_profile
-                && !newly_entered_zones.is_empty()
+                && !enriched.newly_entered_zones.is_empty()
             {
-                for entered_name in &newly_entered_zones {
+                for entered_name in &enriched.newly_entered_zones {
                     if let Some(line_cfg) = cam_cfg.lines.get(entered_name)
                         && line_cfg.siren
                         && (line_cfg.objects.is_empty()
@@ -2588,39 +2354,26 @@ impl VisionPipeline {
             }
 
             // Update or open ReviewSegment if enabled
-            let mut trk_for_rev_sev = trk.clone();
-            if trk_for_rev_sev.inferred_sub_label.is_none() {
-                trk_for_rev_sev.inferred_sub_label = effective_sub_label.clone();
-            }
-            let track_sev = if !cam_rt_flags.alerts {
-                "detection"
-            } else {
-                compute_track_severity_for_profile(
-                    cam_cfg,
-                    &trk_for_rev_sev,
-                    &active_profile,
-                    camera_suppressed_in_profile,
-                )
-            };
-            let is_alert = track_sev == "alert";
-            let detection_zone_ok = cam_cfg.review.detections.required_zones.is_empty()
-                || trk
-                    .entered_zones
-                    .iter()
-                    .any(|z| cam_cfg.review.detections.required_zones.contains(z));
-            if !is_alert && (!cam_cfg.review.detections.enabled || !detection_zone_ok) {
-                continue;
-            }
-            // Do not open a brand-new review segment for an already-tracked stationary object
-            // whose previous review segment already expired, unless it just entered a new zone.
-            if active_review.is_none()
-                && trk.stationary
-                && !is_new
-                && newly_entered_zones.is_empty()
-            {
+            let track_sev = enriched.resolve_severity(
+                trk,
+                cam_cfg,
+                &active_profile,
+                camera_suppressed_in_profile,
+                cam_rt_flags.alerts,
+                false,
+            );
+            if !should_include_track_in_review(
+                cam_cfg,
+                trk,
+                track_sev,
+                active_review.is_some(),
+                enriched.is_new,
+                &enriched.newly_entered_zones,
+            ) {
                 continue;
             }
 
+            let is_alert = track_sev == "alert";
             let rev = active_review.get_or_insert_with(|| {
                 let rev_id = format!("{now:.6}-{}", random_suffix());
                 let thumb_rel =
@@ -2637,7 +2390,7 @@ impl VisionPipeline {
                     detections: Vec::new(),
                     objects: Vec::new(),
                     sub_labels: Vec::new(),
-                    sub_label_score: effective_sub_label_score,
+                    sub_label_score: enriched.effective_sub_label_score,
                     detected_attributes: Vec::new(),
                     zones: Vec::new(),
                     provenance: Some(trk.provenance.clone()),
@@ -2647,60 +2400,7 @@ impl VisionPipeline {
                 }
             });
 
-            let already_in_rev = rev.detections.contains(&trk.id);
-            if !trk.stationary || !already_in_rev {
-                rev.last_activity_time = now;
-            }
-            let promoted_to_alert = is_alert && rev.severity != "alert";
-            if promoted_to_alert {
-                rev.severity = "alert".to_string();
-                rev.dirty = true;
-            }
-            if !already_in_rev && rev.detections.len() < MAX_REVIEW_DETECTIONS {
-                rev.detections.push(trk.id.clone());
-                rev.dirty = true;
-            }
-            if !rev.objects.contains(&trk.label) && rev.objects.len() < MAX_REVIEW_DETECTIONS {
-                rev.objects.push(trk.label.clone());
-                rev.dirty = true;
-            }
-            if let Some(ref sl) = effective_sub_label
-                && !rev.sub_labels.contains(sl)
-                && rev.sub_labels.len() < MAX_REVIEW_DETECTIONS
-            {
-                rev.sub_labels.push(sl.clone());
-                rev.dirty = true;
-            }
-            if let Some(sc) = effective_sub_label_score
-                && rev
-                    .sub_label_score
-                    .map(|prev_sc| sc > prev_sc)
-                    .unwrap_or(true)
-            {
-                rev.sub_label_score = Some(sc);
-                rev.dirty = true;
-            }
-            for attr in &merged_attrs {
-                if !rev
-                    .detected_attributes
-                    .iter()
-                    .any(|a| a.label == attr.label)
-                    && rev.detected_attributes.len() < MAX_REVIEW_DETECTIONS
-                {
-                    rev.detected_attributes.push(attr.clone());
-                    rev.dirty = true;
-                }
-            }
-            for z in &trk.entered_zones {
-                if !rev.zones.contains(z) && rev.zones.len() < MAX_REVIEW_DETECTIONS {
-                    rev.zones.push(z.clone());
-                    rev.dirty = true;
-                }
-            }
-            if rev.is_new || trk.score > rev.best_score + 0.05 || promoted_to_alert {
-                rev.best_score = trk.score.max(rev.best_score);
-                rev.thumb_time = now;
-                rev.provenance = Some(trk.provenance.clone());
+            if rev.absorb_track(trk, &enriched, is_alert, now) {
                 let frame_for_rev = frame.clone();
                 let bbox_for_rev = trk.bbox;
                 let draw_bbox_rev = cam_cfg.snapshots.bounding_box;
@@ -2753,176 +2453,53 @@ impl VisionPipeline {
                     }
                 }
             }
-            if suppressed_fp
-                && let Some(rev) = active_review.as_mut()
-                && let Some(pos) = rev.detections.iter().position(|d| d == &trk.id)
-            {
-                rev.detections.remove(pos);
-                rev.dirty = true;
-                if rev.detections.is_empty() {
-                    if !rev.is_new {
-                        let closed_dto = rev.to_dto(camera, Some(now));
-                        let before_dto = rev.prev_dto.clone().unwrap_or_else(|| closed_dto.clone());
-                        let db_for_del = self.db.clone();
-                        let rev_id_for_del = rev.id.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            db_for_del.delete_reviews(std::slice::from_ref(&rev_id_for_del))
-                        })
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(err)) => {
-                                warn!("Failed to delete false-positive review {}: {err:#}", rev.id);
-                            }
-                            Err(join_err) => {
-                                warn!(
-                                    "Blocking task failed deleting false-positive review {}: {join_err:#}",
-                                    rev.id
-                                );
-                            }
-                        }
-                        self.comms.publish_json(
-                            "reviews",
-                            &json!({
-                                "type": "end",
-                                "before": before_dto,
-                                "after": closed_dto
-                            }),
-                        );
-                    }
-                    *active_review = None;
-                } else {
-                    self.recompute_active_review_severity(rev).await;
-                }
+            if suppressed_fp {
+                self.prune_false_positive_track_from_review(active_review, &trk.id, camera, now)
+                    .await;
             }
-            let crop_dhash64 = removed_snap
-                .as_ref()
-                .and_then(|s| s.dhash64)
-                .unwrap_or_else(|| {
-                    compute_crop_dhash64(&frame.data, frame.width, frame.height, trk.bbox)
-                });
-            let best_score = removed_snap
-                .as_ref()
-                .map(|s| s.best_score.max(trk.top_score))
-                .unwrap_or(trk.top_score);
             let lpr_consensus = if lpr_cfg.enabled {
                 self.detector.finalize_lpr_track(&trk.id, &lpr_cfg)
             } else {
                 None
             };
-            let recognized_license_plate = lpr_consensus.as_ref().map(|c| c.plate.clone());
-            let effective_sub_label = lpr_consensus
-                .as_ref()
-                .and_then(|c| c.sub_label.clone())
-                .or_else(|| trk.inferred_sub_label.clone())
-                .or_else(|| removed_snap.as_ref().and_then(|s| s.sub_label.clone()));
-            let effective_sub_label_score = removed_snap.as_ref().and_then(|s| s.sub_label_score);
-            let mut merged_attrs = removed_snap
-                .map(|s| s.detected_attributes)
-                .unwrap_or_default();
-            for attr in &trk.attributes {
-                if let Some(existing) = merged_attrs.iter_mut().find(|a| a.label == attr.label) {
-                    if attr.score >= existing.score || attr.area_px >= existing.area_px {
-                        *existing = attr.clone();
-                    }
-                } else {
-                    merged_attrs.push(attr.clone());
-                }
-            }
-            let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
-            let norm_reg = trk.region.to_normalized(frame.width, frame.height);
-            let mut trk_for_sev = trk.clone();
-            if trk_for_sev.inferred_sub_label.is_none() {
-                trk_for_sev.inferred_sub_label = effective_sub_label.clone();
-            }
-            let severity = if suppressed_fp || !cam_rt_flags.alerts {
-                "detection"
-            } else {
-                compute_track_severity_for_profile(
-                    cam_cfg,
-                    &trk_for_sev,
-                    &active_profile,
-                    camera_suppressed_in_profile,
-                )
-            };
-            let area = trk.bbox.area();
-            let ratio = (trk.bbox.width() as f32) / (trk.bbox.height().max(1) as f32);
-            let color_attr =
-                classify_dominant_color_tag(&frame.data, frame.width, frame.height, trk.bbox);
-            let mut attr_tags = vec![color_attr.to_string()];
-            for a in &merged_attrs {
-                if !attr_tags.contains(&a.label) {
-                    attr_tags.push(a.label.clone());
-                }
-            }
-            if let Some(ref plate_str) = recognized_license_plate
-                && !attr_tags.contains(plate_str)
-            {
-                attr_tags.push(plate_str.clone());
-            }
-            let face_box = merged_attrs
-                .iter()
-                .find(|a| a.label.eq_ignore_ascii_case("face"))
-                .map(|a| a.norm_bbox);
-            let license_plate_box = merged_attrs
-                .iter()
-                .find(|a| a.label.eq_ignore_ascii_case("license_plate"))
-                .map(|a| a.norm_bbox)
-                .or_else(|| {
-                    if trk.label.eq_ignore_ascii_case("license_plate") {
-                        Some(norm_box)
-                    } else {
-                        None
-                    }
-                });
-
-            let ev_dto = EventDto {
-                id: trk.id.clone(),
-                camera: camera.to_string(),
-                label: trk.label.clone(),
-                zones: json!(trk.entered_zones),
-                start_time: trk.start_time,
-                end_time: Some(trk.last_seen_time),
-                has_clip: record_active,
-                has_snapshot: snapshots_active,
-                plus_id: None,
-                retain_indefinitely: false,
-                sub_label: effective_sub_label.clone(),
-                top_score: Some(best_score as f64),
-                false_positive: Some(suppressed_fp),
-                box_coords: Some(json!(norm_box)),
-                data: json!({
-                    "box": norm_box,
-                    "region": norm_reg,
-                    "dhash64": crop_dhash64,
-                    "suppressed_by_fp_signature": matched_fp_sig_id,
-                    "score": trk.score,
-                    "top_score": best_score,
-                    "sub_label": effective_sub_label,
-                    "sub_label_score": effective_sub_label_score,
-                    "attributes": attr_tags,
-                    "detected_attributes": merged_attrs,
-                    "face_box": face_box,
-                    "license_plate_box": license_plate_box,
-                    "recognized_license_plate": recognized_license_plate,
-                    "type": "object",
-                    "max_severity": severity,
-                    "provenance": trk.provenance
-                }),
+            let enriched = enrich_tracked_object(TrackEnrichmentInput {
+                trk,
+                prev: removed_snap.as_ref(),
+                lpr_consensus: lpr_consensus.as_ref(),
+                face_match: None,
+                frame,
+                cam_cfg,
+                active_profile: &active_profile,
+                camera_suppressed_in_profile,
+                alerts_enabled: cam_rt_flags.alerts,
+                suppressed_fp,
+                is_ended: true,
+            });
+            let ev_dto = build_track_event_dto(BuildTrackEventDtoParams {
+                camera,
+                trk,
+                enriched: &enriched,
+                record_active,
+                snapshots_active,
+                suppressed_fp,
+                matched_fp_sig_id,
+                severity: enriched.severity,
                 thumbnail: None,
-                area: Some(area),
-                ratio: Some(ratio),
-                score: Some(trk.score),
-                stationary: trk.stationary,
-            };
+                end_time: Some(trk.last_seen_time),
+                night_mode: None,
+            });
+
             let db_for_end = self.db.clone();
             let ev_dto_for_end = ev_dto.clone();
-            let sub_label_for_end = effective_sub_label.clone();
-            let sub_score_for_end = effective_sub_label_score.map(|v| v as f64);
+            let sub_label_for_end = enriched.effective_sub_label.clone();
+            let sub_score_for_end = enriched.effective_sub_label_score.map(|v| v as f64);
             let trk_id_for_end = trk.id.clone();
             let cam_for_end = camera.to_string();
             let trk_label_for_end = trk.label.clone();
             let trk_score_for_end = trk.score;
+            let norm_box = enriched.norm_box;
+            let norm_reg = enriched.norm_reg;
+            let best_score = enriched.best_score;
 
             let ended_event_persisted = match tokio::task::spawn_blocking(move || {
                 if let Err(err) = db_for_end.upsert_event(&ev_dto_for_end) {
@@ -2991,23 +2568,10 @@ impl VisionPipeline {
 
         // Flush or close active review segment with {type, before, after} schema
         if let Some(rev) = active_review {
-            let cutoff_secs = if rev.severity == "alert" {
-                cam_cfg.review.alerts.cutoff_time.max(15) as f64
-            } else {
-                cam_cfg.review.detections.cutoff_time.max(15) as f64
-            };
-            let has_non_stationary_active = active_tracks.iter().any(|t| !t.stationary);
-            let is_expired = (!has_non_stationary_active
-                && (now - rev.last_activity_time) >= cutoff_secs)
-                || (now - rev.start_time) >= MAX_REVIEW_DURATION_SECS;
+            let decision = evaluate_review_cutoff_and_checkpoint(rev, cam_cfg, active_tracks, now);
 
-            if rev.dirty || is_expired {
-                let end_time = if is_expired {
-                    Some(rev.last_activity_time)
-                } else {
-                    None
-                };
-                let dto = rev.to_dto(camera, end_time);
+            if decision.should_flush {
+                let dto = rev.to_dto(camera, decision.end_time);
                 let db_for_rev = self.db.clone();
                 let dto_for_rev = dto.clone();
                 let rev_id_for_log = rev.id.clone();
@@ -3037,18 +2601,10 @@ impl VisionPipeline {
 
                 if review_persisted {
                     let before_dto = rev.prev_dto.clone().unwrap_or_else(|| dto.clone());
-                    let msg_type = if is_expired {
-                        "end"
-                    } else if rev.is_new {
-                        "new"
-                    } else {
-                        "update"
-                    };
-
                     self.comms.publish_json(
                         "reviews",
                         &json!({
-                            "type": msg_type,
+                            "type": decision.ws_msg_type,
                             "before": before_dto,
                             "after": dto
                         }),
@@ -3059,15 +2615,13 @@ impl VisionPipeline {
                     rev.prev_dto = Some(dto);
                 }
 
-                let reached_60s_checkpoint = (now - rev.last_backup_time) >= 60.0;
-                if is_expired || reached_60s_checkpoint {
+                if decision.should_advance_backup_time {
                     rev.last_backup_time = now;
                     let bak_cfg = &cam_cfg.record.alert_backup;
-                    if bak_cfg.enabled
-                        && !privacy_mask_is_configured(Some(&cam_cfg.privacy_mask))
-                        && bak_cfg.severities.iter().any(|s| s == &rev.severity)
+                    if decision.should_spawn_alert_backup
                         && let Some(ref target_dir) = bak_cfg.target_dir
-                        && let Ok(bak_permit) = alert_backup_semaphore().clone().try_acquire_owned()
+                        && let Ok(bak_permit) =
+                            self.alert_backup_semaphore.clone().try_acquire_owned()
                     {
                         let db_clone = self.db.clone();
                         let media_clone = self.media_dir.clone();
@@ -3102,95 +2656,12 @@ impl VisionPipeline {
                         });
                     }
                 }
-                if is_expired {
+                if decision.is_expired {
                     *active_review = None;
                 }
             }
         }
     }
-}
-
-pub fn lookup_profile_override<'a>(
-    cfg: &'a NinjaConfig,
-    active_profile: &str,
-) -> Option<&'a ninjanvr_config::ProfileOverrideConfig> {
-    cfg.profiles.get(active_profile).or_else(|| {
-        cfg.profiles
-            .iter()
-            .find(|(k, _)| k.trim().eq_ignore_ascii_case(active_profile.trim()))
-            .map(|(_, v)| v)
-    })
-}
-
-pub fn is_camera_alert_suppressed_in_profile(
-    cfg: &NinjaConfig,
-    active_profile: &str,
-    camera: &str,
-) -> bool {
-    let prof_cfg = lookup_profile_override(cfg, active_profile);
-    prof_cfg
-        .map(|p| {
-            p.disabled_alerts_cameras
-                .iter()
-                .any(|c| c == camera || c == "*")
-        })
-        .unwrap_or(false)
-}
-
-pub fn compute_track_severity_for_profile(
-    cam_cfg: &CameraConfig,
-    trk: &TrackedObject,
-    active_profile: &str,
-    camera_suppressed_in_profile: bool,
-) -> &'static str {
-    if active_profile == "disarmed"
-        || camera_suppressed_in_profile
-        || (active_profile == "home" && cam_cfg.indoor)
-    {
-        return "detection";
-    }
-    compute_track_severity(cam_cfg, trk)
-}
-
-pub fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'static str {
-    if !cam_cfg.review.alerts.enabled
-        || !cam_cfg.review.alerts.labels.contains(&trk.label)
-        || (!cam_cfg.review.alerts.required_zones.is_empty()
-            && !trk
-                .entered_zones
-                .iter()
-                .any(|z| cam_cfg.review.alerts.required_zones.contains(z)))
-    {
-        return "detection";
-    }
-
-    if !cam_cfg.review.alerts.exclude_sub_labels.is_empty()
-        && let Some(ref sub) = trk.inferred_sub_label
-        && cam_cfg
-            .review
-            .alerts
-            .exclude_sub_labels
-            .iter()
-            .any(|ex| ex.eq_ignore_ascii_case(sub))
-    {
-        return "detection";
-    }
-
-    if !cam_cfg.review.alerts.sub_labels.is_empty() {
-        let matched_allowed = trk.inferred_sub_label.as_ref().is_some_and(|sub| {
-            cam_cfg
-                .review
-                .alerts
-                .sub_labels
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(sub))
-        });
-        if !matched_allowed {
-            return "detection";
-        }
-    }
-
-    "alert"
 }
 
 #[cfg(test)]
@@ -3247,7 +2718,7 @@ mod tests {
     use ninjanvr_config::{ProfileOverrideConfig, SnapshotSelectionPolicy};
     use ninjanvr_db::ReviewFilter;
     use ninjanvr_media::new_activity_ledger;
-    use ninjanvr_track::TriggerProvenance;
+    use ninjanvr_track::{TrackedAttribute, TriggerProvenance, compute_attribute_quality};
     use ninjanvr_vision::BoundingBox;
 
     fn sample_track() -> TrackedObject {
@@ -3333,6 +2804,12 @@ mod tests {
             log_hub: crate::LogBufferHub::new(),
             ptz_active_presets: Arc::new(RwLock::new(HashMap::new())),
             camera_driver_runtime: crate::camera_protocols::CameraDriverRuntime::new(),
+            snapshot_http_client: build_snapshot_http_client(),
+            high_res_snapshot_semaphore: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_HIGH_RES_SNAPSHOT_TASKS,
+            )),
+            genai_verify_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_GENAI_VERIFY_TASKS)),
+            alert_backup_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_ALERT_BACKUP_TASKS)),
         };
         (pipeline, tmp_dir)
     }

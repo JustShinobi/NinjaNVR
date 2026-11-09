@@ -15,6 +15,10 @@ import {
 import { useI18n } from "../i18n";
 import { FfprobeItem, NinjaConfigResponse } from "../types/nvr";
 import { buildCleanYamlFromDraft } from "../utils/configYaml";
+import {
+  applyStructuredDraftMutation,
+  synthesizeDraftYamlIfNeeded,
+} from "../utils/scopedConfigDraft";
 import { TacticalCameraPicker } from "../components/TacticalCameraPicker";
 import { useNvrStore } from "../store/useNvrStore";
 import { countChangedSections, formatUnsavedLabel } from "../utils/settingsUx";
@@ -108,14 +112,20 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     zonesSubTab === "yaml" ? "yaml" : "vision"
   );
   const [scope, setScope] = useState<"global" | string>("camera");
-  const [draftConfig, setDraftConfig] = useState<NinjaConfigResponse | null>(null);
-  const [baselineYaml, setBaselineYaml] = useState<string>("");
+  const [draftConfig, setDraftConfig] = useState<NinjaConfigResponse | null>(() =>
+    config ? JSON.parse(JSON.stringify(config)) : null
+  );
+  const [baselineYaml, setBaselineYaml] = useState<string>(() => rawYaml || "");
   const [isDirty, setIsDirty] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [visionReviewOpen, setVisionReviewOpen] = useState(false);
   const [saveOutcome, setSaveOutcome] = useState<SaveOutcome | null>(null);
   const draftRevisionRef = useRef<number>(0);
   const sanitizedDraftRef = useRef<NinjaConfigResponse | null>(null);
+  const latestDraftRef = useRef<NinjaConfigResponse | null>(draftConfig);
+  latestDraftRef.current = sanitizedDraftRef.current ?? draftConfig;
+  const yamlStaleRef = useRef<boolean>(false);
+  const prevZonesSubTabRef = useRef<"visual" | "yaml">(zonesSubTab);
   const isMountedRef = useRef<boolean>(true);
   const showYamlKeys = useNvrStore((s) => s.showYamlKeys);
   const setShowYamlKeys = useNvrStore((s) => s.setShowYamlKeys);
@@ -128,17 +138,46 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   }, []);
 
   useEffect(() => {
-    if (zonesSubTab === "yaml" && activeCategory !== "yaml") {
-      setActiveCategory("yaml");
-    } else if (zonesSubTab === "visual" && activeCategory === "yaml") {
-      setActiveCategory("vision");
+    const subTabChanged = prevZonesSubTabRef.current !== zonesSubTab;
+    prevZonesSubTabRef.current = zonesSubTab;
+    if (subTabChanged) {
+      if (zonesSubTab === "yaml" && activeCategory !== "yaml") {
+        const currentDraft = latestDraftRef.current;
+        if (yamlStaleRef.current && currentDraft) {
+          const synced = synthesizeDraftYamlIfNeeded(
+            currentDraft,
+            baselineYaml,
+            rawYaml,
+            yamlStaleRef.current
+          );
+          yamlStaleRef.current = synced.yamlStale;
+          setRawYaml(synced.rawYaml);
+        }
+        setActiveCategory("yaml");
+      } else if (zonesSubTab === "visual" && activeCategory === "yaml") {
+        setActiveCategory("vision");
+      }
+      return;
     }
-  }, [zonesSubTab, activeCategory]);
+    if (activeCategory === "yaml" && yamlStaleRef.current && latestDraftRef.current) {
+      const synced = synthesizeDraftYamlIfNeeded(
+        latestDraftRef.current,
+        baselineYaml,
+        rawYaml,
+        yamlStaleRef.current
+      );
+      yamlStaleRef.current = synced.yamlStale;
+      setRawYaml(synced.rawYaml);
+    }
+  }, [zonesSubTab, activeCategory, draftConfig, baselineYaml, rawYaml, setRawYaml]);
 
   // Sync incoming config into draftConfig when no local unsaved changes exist
   useEffect(() => {
     if (config && !isDirty && !isSaving) {
-      setDraftConfig(JSON.parse(JSON.stringify(config)));
+      const cloned = JSON.parse(JSON.stringify(config)) as NinjaConfigResponse;
+      sanitizedDraftRef.current = null;
+      latestDraftRef.current = cloned;
+      setDraftConfig(cloned);
     }
   }, [config, isDirty, isSaving]);
 
@@ -188,33 +227,40 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   );
 
   const updateDraft = (updater: (next: NinjaConfigResponse) => void) => {
-    if (!draftConfig) return;
-    const cloned: NinjaConfigResponse = JSON.parse(JSON.stringify(draftConfig));
-    updater(cloned);
-    const { cleaned, rejectedCount } =
-      sanitizedDraftRef.current === cloned
-        ? { cleaned: cloned, rejectedCount: 0 }
-        : sanitizeConfigGeometryDraft(cloned);
-    if (rejectedCount > 0) {
+    const baseDraft = latestDraftRef.current;
+    if (!baseDraft) return;
+    const syncYamlImmediately =
+      activeCategory === "yaml" || zonesSubTab === "yaml";
+    const mutation = applyStructuredDraftMutation(baseDraft, updater, {
+      syncYamlImmediately,
+      baselineYaml: baselineYaml || rawYaml,
+    });
+    if (mutation.rejectedGeometryCount > 0) {
       notify(
         isPt
           ? "Polígono ou linha degenerada (colinear / área zero) ignorada para proteger máscaras de privacidade"
           : "Rejected degenerate (collinear / zero-area) polygon or line to protect backend masks"
       );
     }
-    sanitizedDraftRef.current = cleaned;
+    sanitizedDraftRef.current = mutation.draft;
+    latestDraftRef.current = mutation.draft;
     draftRevisionRef.current += 1;
-    setDraftConfig(cleaned);
-    const nextYaml = buildCleanYamlFromDraft(cleaned, baselineYaml || rawYaml);
-    setRawYaml(nextYaml);
+    setDraftConfig(mutation.draft);
+    yamlStaleRef.current = mutation.yamlStale;
+    if (mutation.rawYaml !== null) {
+      setRawYaml(mutation.rawYaml);
+    }
     setIsDirty(true);
   };
 
   const handleDiscardDraft = () => {
     draftRevisionRef.current += 1;
     sanitizedDraftRef.current = null;
+    yamlStaleRef.current = false;
     if (config) {
-      setDraftConfig(JSON.parse(JSON.stringify(config)));
+      const cloned = JSON.parse(JSON.stringify(config)) as NinjaConfigResponse;
+      latestDraftRef.current = cloned;
+      setDraftConfig(cloned);
     }
     if (baselineYaml) {
       setRawYaml(baselineYaml);
@@ -229,7 +275,8 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   };
 
   const handleSaveStructured = async (restartAfter = false) => {
-    if (!draftConfig || isSaving) return;
+    const activeDraft = latestDraftRef.current;
+    if (!activeDraft || isSaving) return;
     const report = (ok: boolean, message: string) => {
       notify(message);
       setSaveOutcome({ ok, message, at: Date.now() });
@@ -237,10 +284,11 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
     setSaveOutcome(null);
     const saveRev = draftRevisionRef.current;
     const { cleaned: payloadConfig, rejectedCount } =
-      sanitizedDraftRef.current === draftConfig
-        ? { cleaned: draftConfig, rejectedCount: 0 }
-        : sanitizeConfigGeometryDraft(draftConfig);
+      sanitizedDraftRef.current === activeDraft
+        ? { cleaned: activeDraft, rejectedCount: 0 }
+        : sanitizeConfigGeometryDraft(activeDraft);
     sanitizedDraftRef.current = payloadConfig;
+    latestDraftRef.current = payloadConfig;
     if (rejectedCount > 0) {
       notify(
         isPt
@@ -278,6 +326,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
           setConfig(JSON.parse(JSON.stringify(payloadConfig)));
           setBaselineYaml(generatedYaml);
           if (draftRevisionRef.current === saveRev) {
+            yamlStaleRef.current = false;
             setRawYaml(generatedYaml);
             setIsDirty(false);
           }
@@ -308,7 +357,12 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
           data.config || payloadConfig;
         setConfig(JSON.parse(JSON.stringify(nextSavedConfig)));
         if (draftRevisionRef.current === saveRev) {
-          setDraftConfig(JSON.parse(JSON.stringify(nextSavedConfig)));
+          const clonedSaved = JSON.parse(
+            JSON.stringify(nextSavedConfig)
+          ) as NinjaConfigResponse;
+          sanitizedDraftRef.current = clonedSaved;
+          latestDraftRef.current = clonedSaved;
+          setDraftConfig(clonedSaved);
         }
         const nextSavedYaml =
           typeof data.raw_yaml === "string" && data.raw_yaml.trim()
@@ -319,6 +373,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               );
         setBaselineYaml(nextSavedYaml);
         if (draftRevisionRef.current === saveRev) {
+          yamlStaleRef.current = false;
           setRawYaml(nextSavedYaml);
           setIsDirty(false);
         }
@@ -367,7 +422,18 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   const handleSaveRawYaml = async (saveOption: "saveonly" | "restart") => {
     if (isSaving) return;
     const saveRev = draftRevisionRef.current;
-    const savedYamlSnapshot = rawYaml;
+    let savedYamlSnapshot = rawYaml;
+    if (yamlStaleRef.current && latestDraftRef.current) {
+      const synced = synthesizeDraftYamlIfNeeded(
+        latestDraftRef.current,
+        baselineYaml,
+        rawYaml,
+        yamlStaleRef.current
+      );
+      yamlStaleRef.current = synced.yamlStale;
+      savedYamlSnapshot = synced.rawYaml;
+      setRawYaml(synced.rawYaml);
+    }
     setIsSaving(true);
     try {
       await handleSaveConfig(saveOption);
@@ -389,9 +455,22 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
   };
 
   const selectCategory = (cat: SettingsCategory) => {
+    const currentDraft = latestDraftRef.current;
+    if (cat === "yaml" && yamlStaleRef.current && currentDraft) {
+      const synced = synthesizeDraftYamlIfNeeded(
+        currentDraft,
+        baselineYaml,
+        rawYaml,
+        yamlStaleRef.current
+      );
+      yamlStaleRef.current = synced.yamlStale;
+      setRawYaml(synced.rawYaml);
+    }
+    const nextSubTab = cat === "yaml" ? "yaml" : "visual";
+    prevZonesSubTabRef.current = nextSubTab;
     setActiveCategory(cat);
     setVisionReviewOpen(false);
-    setZonesSubTab(cat === "yaml" ? "yaml" : "visual");
+    setZonesSubTab(nextSubTab);
     setDraftPoints([]);
   };
 
@@ -762,6 +841,7 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
               value={rawYaml}
               onChange={(e) => {
                 draftRevisionRef.current += 1;
+                yamlStaleRef.current = false;
                 setRawYaml(e.target.value);
                 setIsDirty(true);
               }}
@@ -824,7 +904,13 @@ export const ZonesWorkspace: React.FC<ZonesWorkspaceProps> = ({
                   const patch = (cfg: NinjaConfigResponse | null): NinjaConfigResponse | null =>
                     cfg && cfg.model ? { ...cfg, model: mergeDeployedModel(cfg.model, model) } : cfg;
                   if (config) setConfig(patch(config));
-                  setDraftConfig((prev) => patch(prev));
+                  setDraftConfig((prev) => {
+                    const next = patch(prev);
+                    sanitizedDraftRef.current = next;
+                    latestDraftRef.current = next;
+                    return next;
+                  });
+                  yamlStaleRef.current = true;
                 }}
               />
             )}
