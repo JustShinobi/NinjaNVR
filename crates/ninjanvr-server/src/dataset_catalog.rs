@@ -3744,7 +3744,17 @@ pub async fn api_dataset_export_zip(
         let cfg = state.config.read().await;
         cfg.cameras
             .iter()
-            .map(|(k, v)| (k.clone(), v.privacy_mask.clone()))
+            .filter(|(_, v)| has_active_privacy_mask(Some(&v.privacy_mask)))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    crate::normalize_privacy_mask_value_for_resolution(
+                        &v.privacy_mask,
+                        v.detect.width.max(1),
+                        v.detect.height.max(1),
+                    ),
+                )
+            })
             .collect()
     };
     let state_for_zip = state.clone();

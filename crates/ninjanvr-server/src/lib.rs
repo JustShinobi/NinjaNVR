@@ -5167,7 +5167,17 @@ pub(crate) async fn camera_privacy_mask_value(
     camera: &str,
 ) -> Option<Value> {
     let cfg = config.read().await;
-    cfg.cameras.get(camera).map(|c| c.privacy_mask.clone())
+    cfg.cameras.get(camera).map(|c| {
+        if has_active_privacy_mask(Some(&c.privacy_mask)) {
+            normalize_privacy_mask_value_for_resolution(
+                &c.privacy_mask,
+                c.detect.width.max(1),
+                c.detect.height.max(1),
+            )
+        } else {
+            c.privacy_mask.clone()
+        }
+    })
 }
 
 fn redact_event_json_thumbnail_with_masks(active_masks: &HashMap<String, Value>, ev: &mut Value) {
@@ -5209,7 +5219,16 @@ async fn redact_event_slice_thumbnails_if_masked(
         cfg.cameras
             .iter()
             .filter(|(_, c)| has_active_privacy_mask(Some(&c.privacy_mask)))
-            .map(|(k, c)| (k.clone(), c.privacy_mask.clone()))
+            .map(|(k, c)| {
+                (
+                    k.clone(),
+                    normalize_privacy_mask_value_for_resolution(
+                        &c.privacy_mask,
+                        c.detect.width.max(1),
+                        c.detect.height.max(1),
+                    ),
+                )
+            })
             .collect()
     };
     if active_masks.is_empty() {
@@ -5530,6 +5549,8 @@ async fn api_review_frame(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let priv_mask = camera_privacy_mask_value(&state.config, &item.camera).await;
+    let (bytes, _) = redact_image_bytes_with_privacy_mask_async(bytes, priv_mask, true).await;
     (
         [
             (header::CONTENT_TYPE, "image/jpeg"),
@@ -14099,6 +14120,15 @@ async fn vod_master_m3u8(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let privacy_mask_active = {
+        let cfg = state.config.read().await;
+        cfg.cameras
+            .get(&camera)
+            .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)))
+    };
+    if privacy_mask_active {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     (
         [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
         ninjanvr_vod::build_master_playlist(),
@@ -14159,6 +14189,15 @@ async fn vod_index_m3u8(
         && !allowed.iter().any(|a| a == &camera || a == "*")
     {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    let privacy_mask_active = {
+        let cfg = state.config.read().await;
+        cfg.cameras
+            .get(&camera)
+            .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)))
+    };
+    if privacy_mask_active {
+        return StatusCode::NOT_FOUND.into_response();
     }
     let media_dir = state.media_dir.clone();
     let state_for_vod = state.clone();
@@ -14238,6 +14277,15 @@ async fn vod_init_mp4(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let privacy_mask_active = {
+        let cfg = state.config.read().await;
+        cfg.cameras
+            .get(&camera)
+            .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)))
+    };
+    if privacy_mask_active {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if let Some(seg) = q.seg
         && (seg == 0 || seg > MAX_VOD_SEGMENTS)
     {
@@ -14289,6 +14337,15 @@ async fn vod_segment_m4s(
         && !allowed.iter().any(|a| a == &camera || a == "*")
     {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    let privacy_mask_active = {
+        let cfg = state.config.read().await;
+        cfg.cameras
+            .get(&camera)
+            .is_some_and(|c| has_active_privacy_mask(Some(&c.privacy_mask)))
+    };
+    if privacy_mask_active {
+        return StatusCode::NOT_FOUND.into_response();
     }
     if !segment.ends_with(".m4s") || !is_safe_id(&segment) {
         return StatusCode::NOT_FOUND.into_response();

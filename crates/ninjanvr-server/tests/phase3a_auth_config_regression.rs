@@ -10,7 +10,8 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use ninjanvr_db::ExportRow;
 use ninjanvr_server::{
     JwtClaims, LogBufferHub, build_router, build_router_with_auth, ip_matches_cidr, new_app_state,
-    resolve_static_media_camera, sanitize_logged_path,
+    resolve_static_media_camera, resolve_static_media_camera_async,
+    resolve_static_media_camera_with_keys, sanitize_logged_path,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -2128,6 +2129,239 @@ version: 0.18-0
                 "Non-admin caller on direct_app must receive 403 FORBIDDEN on {method} {admin_uri}"
             );
         }
+    }
+
+    // 10. Supplied credentials on direct_app (enforce_auth = false) enforce auth_gate_middleware
+    //     for ServeDir static media camera scoping, metrics token confinement, and invalid tokens.
+    let rec_by_dir = state.media_dir.join("recordings/2026-11-09/00/backyard");
+    let rec_fd_dir = state.media_dir.join("recordings/2026-11-09/00/front_door");
+    let clips_dir = state.media_dir.join("clips");
+    let exports_dir = state.media_dir.join("exports");
+    std::fs::create_dir_all(&rec_by_dir).unwrap();
+    std::fs::create_dir_all(&rec_fd_dir).unwrap();
+    std::fs::create_dir_all(&clips_dir).unwrap();
+    std::fs::create_dir_all(&exports_dir).unwrap();
+    std::fs::write(rec_by_dir.join("00.00.mp4"), b"RAW_BY_MP4").unwrap();
+    std::fs::write(rec_fd_dir.join("00.00.mp4"), b"RAW_FD_MP4").unwrap();
+
+    let scoped_fd_viewer = format!(
+        "Bearer {}",
+        mint_test_jwt(&state.jwt_secret, "fd_viewer", "viewer", Some("front_door"))
+    );
+    let (_, raw_metrics_tok) = state
+        .db
+        .create_api_token("prom_tok", "metrics", None)
+        .unwrap();
+    let metrics_bearer = format!("Bearer {raw_metrics_tok}");
+
+    // Invalid token on direct_app ServeDir route -> 401 UNAUTHORIZED
+    let r_bad_tok_static = direct_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/recordings/2026-11-09/00/front_door/00.00.mp4")
+                .header(header::AUTHORIZATION, "Bearer invalid.jwt.token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_bad_tok_static.status(), StatusCode::UNAUTHORIZED);
+
+    // Scoped viewer ("front_door") on direct_app ServeDir route for "backyard" -> 403 FORBIDDEN
+    let r_scoped_static_forbid = direct_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/recordings/2026-11-09/00/backyard/00.00.mp4")
+                .header(header::AUTHORIZATION, &scoped_fd_viewer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_scoped_static_forbid.status(), StatusCode::FORBIDDEN);
+
+    // Metrics token on direct_app is blocked (403) on static media routes (/recordings/*, /clips/*, /exports/*)
+    for static_media_uri in [
+        "/recordings/2026-11-09/00/front_door/00.00.mp4",
+        "/clips/front_door-ev_masked_1.jpg",
+        "/exports/front_door_100_200.mp4",
+    ] {
+        let r_m_forbid = direct_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(static_media_uri)
+                    .header(header::AUTHORIZATION, &metrics_bearer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_m_forbid.status(),
+            StatusCode::FORBIDDEN,
+            "metrics token on direct_app must be blocked from {static_media_uri}"
+        );
+    }
+
+    // 11. resolve_static_media_camera_async and resolve_static_media_camera_with_keys resolve
+    //     hyphenated camera names and preview_frames deterministically without non-blocking try_read fallback.
+    assert_eq!(
+        resolve_static_media_camera_async(&state, "/clips/front_door-unseeded_ev-clean.webp")
+            .await
+            .as_deref(),
+        Some("front_door")
+    );
+    assert_eq!(
+        resolve_static_media_camera_async(
+            &state,
+            "/clips/preview_frames/front_door/1700000000.jpg"
+        )
+        .await
+        .as_deref(),
+        Some("front_door")
+    );
+    assert_eq!(
+        resolve_static_media_camera_with_keys(
+            &state,
+            "/clips/review/thumb-front-door-east-1700-1.webp",
+            &["front-door-east".to_string(), "front_door".to_string()]
+        )
+        .as_deref(),
+        Some("front-door-east")
+    );
+
+    // 12. Camera privacy_mask blocks raw /recordings/*, /exports/share_clip_*, /clips/*.mp4, and /vod/*
+    //     (including unresolvable orphan artifacts), while dynamically redacting /clips/*.jpg and /clips/*.webp
+    //     even when HTTP Range headers are sent.
+    let mut bright_img = image::RgbImage::new(64, 64);
+    for p in bright_img.pixels_mut() {
+        *p = image::Rgb([250, 250, 250]);
+    }
+    let bright_jpeg = ninjanvr_vision::encode_image_jpeg(&bright_img).unwrap();
+    std::fs::write(clips_dir.join("front_door-ev_masked_1.jpg"), &bright_jpeg).unwrap();
+    std::fs::write(clips_dir.join("orphan_unseeded_id.jpg"), &bright_jpeg).unwrap();
+    std::fs::write(clips_dir.join("orphan_unseeded_id.mp4"), b"RAW_ORPHAN_MP4").unwrap();
+    std::fs::write(
+        clips_dir.join("front_door-ev_masked_1.mp4"),
+        b"RAW_CLIP_MP4",
+    )
+    .unwrap();
+    state
+        .db
+        .upsert_event(&ninjanvr_db::EventDto {
+            id: "ev_masked_1".to_string(),
+            camera: "front_door".to_string(),
+            label: "person".to_string(),
+            zones: json!([]),
+            start_time: 1000.0,
+            end_time: Some(1008.0),
+            has_clip: true,
+            has_snapshot: true,
+            plus_id: None,
+            retain_indefinitely: false,
+            sub_label: None,
+            top_score: Some(0.9),
+            false_positive: Some(false),
+            box_coords: None,
+            data: json!({}),
+            thumbnail: None,
+            area: None,
+            ratio: None,
+            score: Some(0.9),
+            stationary: false,
+        })
+        .unwrap();
+    std::fs::write(
+        exports_dir.join("share_clip_ev_masked_1.mp4"),
+        b"UNMASKED_SHARE_CLIP_MP4",
+    )
+    .unwrap();
+    std::fs::write(
+        exports_dir.join("share_clip_orphan_unseeded.mp4"),
+        b"UNMASKED_ORPHAN_SHARE_CLIP_MP4",
+    )
+    .unwrap();
+
+    {
+        let mut cfg = state.config.write().await;
+        cfg.cameras.get_mut("front_door").unwrap().privacy_mask =
+            json!(["0.0,0.0,1.0,0.0,1.0,1.0,0.0,1.0"]);
+    }
+
+    for blocked_masked_uri in [
+        "/recordings/2026-11-09/00/front_door/00.00.mp4",
+        "/exports/share_clip_ev_masked_1.mp4",
+        "/clips/front_door-ev_masked_1.mp4",
+        "/vod/front_door/start/1000/end/1020/master.m3u8",
+        "/vod/front_door/start/1000/end/1020/index.m3u8",
+        "/vod/front_door/start/1000/end/1020/init-v1-a1.mp4",
+        "/vod/front_door/start/1000/end/1020/seg-1-v1-a1.m4s",
+        "/vod/clip/front_door/start/1000/end/1020/master.m3u8",
+    ] {
+        let r_blocked = direct_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(blocked_masked_uri)
+                    .header(header::AUTHORIZATION, &scoped_fd_viewer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_blocked.status(),
+            StatusCode::NOT_FOUND,
+            "Active privacy_mask must block raw unredacted video on {blocked_masked_uri}"
+        );
+    }
+
+    // Orphan unattributable static artifacts also fail closed (404) when any camera has an active privacy_mask
+    for orphan_uri in [
+        "/clips/orphan_unseeded_id.mp4",
+        "/clips/orphan_unseeded_id.jpg",
+        "/exports/share_clip_orphan_unseeded.mp4",
+    ] {
+        let r_orphan = direct_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(orphan_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_orphan.status(),
+            StatusCode::NOT_FOUND,
+            "Unattributable static artifact {orphan_uri} must fail closed (404) when active_masks is non-empty"
+        );
+    }
+
+    // Both standard GET and HTTP Range GET on /clips/*.jpg return 200 OK with dynamically redacted pixels
+    for use_range in [false, true] {
+        let mut req_builder = Request::builder()
+            .uri("/clips/front_door-ev_masked_1.jpg")
+            .header(header::AUTHORIZATION, &scoped_fd_viewer);
+        if use_range {
+            req_builder = req_builder.header(header::RANGE, "bytes=0-");
+        }
+        let r_clip_img = direct_app
+            .clone()
+            .oneshot(req_builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r_clip_img.status(), StatusCode::OK);
+        let clip_img_bytes = to_bytes(r_clip_img.into_body(), 65536).await.unwrap();
+        let decoded_clip = image::load_from_memory(&clip_img_bytes).unwrap().to_rgb8();
+        assert!(
+            decoded_clip.get_pixel(32, 32).0[0] < 30,
+            "/clips/*.jpg (range={use_range}) must dynamically apply privacy_mask redaction when camera privacy_mask is active"
+        );
     }
 
     upstream_task.abort();

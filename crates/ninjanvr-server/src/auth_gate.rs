@@ -954,6 +954,27 @@ pub fn is_hidden_static_media_path(path: &str) -> bool {
 }
 
 pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<String> {
+    let camera_keys: Vec<String> = state
+        .config
+        .try_read()
+        .map(|cfg| cfg.cameras.keys().cloned().collect())
+        .unwrap_or_default();
+    resolve_static_media_camera_with_keys(state, path, &camera_keys)
+}
+
+pub async fn resolve_static_media_camera_async(state: &AppState, path: &str) -> Option<String> {
+    let camera_keys: Vec<String> = {
+        let cfg = state.config.read().await;
+        cfg.cameras.keys().cloned().collect()
+    };
+    resolve_static_media_camera_with_keys(state, path, &camera_keys)
+}
+
+pub fn resolve_static_media_camera_with_keys(
+    state: &AppState,
+    path: &str,
+    camera_keys: &[String],
+) -> Option<String> {
     if is_hidden_static_media_path(path) {
         return None;
     }
@@ -1019,8 +1040,34 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
     }
     if let Some(rest) = path.strip_prefix("/clips/") {
         let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.first() == Some(&"previews") && parts.len() >= 2 {
+        if (parts.first() == Some(&"previews") || parts.first() == Some(&"preview_frames"))
+            && parts.len() >= 2
+        {
             return Some(parts[1].to_string());
+        }
+        if parts.first() == Some(&"dataset") && parts.len() == 2 {
+            let sample_id = parts[1]
+                .rsplit_once('.')
+                .map(|(s, _)| s)
+                .unwrap_or(parts[1]);
+            if let Ok(Some(sample)) = state.db.get_dataset_sample(sample_id)
+                && !sample.camera.trim().is_empty()
+            {
+                return Some(sample.camera);
+            }
+            return None;
+        }
+        if parts.first() == Some(&"faces") && parts.len() == 3 {
+            let sample_id = parts[2]
+                .rsplit_once('.')
+                .map(|(s, _)| s)
+                .unwrap_or(parts[2]);
+            if let Ok(Some(ev)) = state.db.get_event(sample_id)
+                && let Some(cam) = ev["camera"].as_str().filter(|s| !s.trim().is_empty())
+            {
+                return Some(cam.to_string());
+            }
+            return None;
         }
         if parts.first() == Some(&"review") && parts.len() >= 2 {
             if let Some(raw_after_thumb) = parts[1].strip_prefix("thumb-") {
@@ -1039,19 +1086,17 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
                         return Some(rev.camera);
                     }
                 }
-                if let Ok(cfg) = state.config.try_read() {
-                    let mut matched_cam: Option<&str> = None;
-                    for cam in cfg.cameras.keys() {
-                        let prefix = format!("{cam}-");
-                        if after_thumb.starts_with(&prefix)
-                            && matched_cam.is_none_or(|prev| cam.len() > prev.len())
-                        {
-                            matched_cam = Some(cam.as_str());
-                        }
+                let mut matched_cam: Option<&str> = None;
+                for cam in camera_keys {
+                    let prefix = format!("{cam}-");
+                    if after_thumb.starts_with(&prefix)
+                        && matched_cam.is_none_or(|prev| cam.len() > prev.len())
+                    {
+                        matched_cam = Some(cam.as_str());
                     }
-                    if let Some(cam) = matched_cam {
-                        return Some(cam.to_string());
-                    }
+                }
+                if let Some(cam) = matched_cam {
+                    return Some(cam.to_string());
                 }
                 if let Some(cam) = after_thumb
                     .rsplitn(3, '-')
@@ -1112,19 +1157,17 @@ pub fn resolve_static_media_camera(state: &AppState, path: &str) -> Option<Strin
                     }
                 }
             }
-            if let Ok(cfg) = state.config.try_read() {
-                let mut matched_cam: Option<&str> = None;
-                for cam in cfg.cameras.keys() {
-                    let prefix = format!("{cam}-");
-                    if clean_stem.starts_with(&prefix)
-                        && matched_cam.is_none_or(|prev| cam.len() > prev.len())
-                    {
-                        matched_cam = Some(cam.as_str());
-                    }
+            let mut matched_cam: Option<&str> = None;
+            for cam in camera_keys {
+                let prefix = format!("{cam}-");
+                if clean_stem.starts_with(&prefix)
+                    && matched_cam.is_none_or(|prev| cam.len() > prev.len())
+                {
+                    matched_cam = Some(cam.as_str());
                 }
-                if let Some(cam) = matched_cam {
-                    return Some(cam.to_string());
-                }
+            }
+            if let Some(cam) = matched_cam {
+                return Some(cam.to_string());
             }
         }
     }
@@ -1142,7 +1185,7 @@ pub fn path_matches_segment_prefix(path: &str, prefix: &str) -> bool {
 pub async fn auth_gate_middleware(
     State((state, enforce_auth)): State<(AppState, bool)>,
     jar: CookieJar,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let method = req.method().as_str().to_string();
@@ -1171,228 +1214,362 @@ pub async fn auth_gate_middleware(
         )
             .into_response();
     }
-    if (enforce_auth || is_external_public_peer_ip(req.headers())) && is_protected_path(&path) {
-        let auth_cfg = state.config.read().await.auth.clone();
-        if auth_cfg.enabled {
-            let Some((user, role)) =
-                extract_authenticated_user_with_cfg(&state, &jar, req.headers(), &auth_cfg)
-            else {
-                state.log_hub.push_nginx(&method, &path, 401);
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({ "message": "Unauthorized" })),
+    let (auth_cfg, camera_keys, active_masks) = {
+        let cfg = state.config.read().await;
+        let keys: Vec<String> = cfg.cameras.keys().cloned().collect();
+        let masks: std::collections::BTreeMap<String, Value> = cfg
+            .cameras
+            .iter()
+            .filter(|(_, c)| crate::has_active_privacy_mask(Some(&c.privacy_mask)))
+            .map(|(k, c)| {
+                (
+                    k.clone(),
+                    crate::normalize_privacy_mask_value_for_resolution(
+                        &c.privacy_mask,
+                        c.detect.width.max(1),
+                        c.detect.height.max(1),
+                    ),
                 )
-                    .into_response();
-            };
+            })
+            .collect();
+        (cfg.auth.clone(), keys, masks)
+    };
+    let is_static_media_route = path == "/exports"
+        || path.starts_with("/exports/")
+        || path == "/recordings"
+        || path.starts_with("/recordings/")
+        || path == "/clips"
+        || path.starts_with("/clips/");
+    let has_supplied_credentials = req.headers().contains_key(header::AUTHORIZATION)
+        || jar.get(&auth_cfg.cookie_name).is_some()
+        || (auth_cfg.proxy.enabled && extract_trusted_proxy_peer_ip(req.headers()).is_some());
+    if auth_cfg.enabled
+        && (enforce_auth
+            || is_external_public_peer_ip(req.headers())
+            || (is_static_media_route && has_supplied_credentials))
+        && is_protected_path(&path)
+    {
+        let Some((user, role)) =
+            extract_authenticated_user_with_cfg(&state, &jar, req.headers(), &auth_cfg)
+        else {
+            state.log_hub.push_nginx(&method, &path, 401);
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "message": "Unauthorized" })),
+            )
+                .into_response();
+        };
 
-            if method != "GET"
-                && method != "HEAD"
-                && method != "OPTIONS"
-                && !verify_cookie_csrf_origin(req.headers(), req.uri())
-            {
+        if method != "GET"
+            && method != "HEAD"
+            && method != "OPTIONS"
+            && !verify_cookie_csrf_origin(req.headers(), req.uri())
+        {
+            state.log_hub.push_nginx(&method, &path, 403);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "success": false,
+                    "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+                })),
+            )
+                .into_response();
+        }
+
+        let role_lc = role.to_ascii_lowercase();
+        if role_lc == "metrics" {
+            let is_metrics_route = (method == "GET" || method == "HEAD")
+                && (path == "/api/stats" || path == "/api/stats/history" || path == "/api/metrics");
+            if !is_metrics_route {
                 state.log_hub.push_nginx(&method, &path, 403);
                 return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "success": false,
-                        "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-                    })),
-                )
-                    .into_response();
-            }
-
-            let role_lc = role.to_ascii_lowercase();
-            if role_lc == "metrics" {
-                let is_metrics_route = (method == "GET" || method == "HEAD")
-                    && (path == "/api/stats"
-                        || path == "/api/stats/history"
-                        || path == "/api/metrics");
-                if !is_metrics_route {
-                    state.log_hub.push_nginx(&method, &path, 403);
-                    return (
                         StatusCode::FORBIDDEN,
                         Json(json!({ "message": "Token scope 'metrics' only permits GET /api/stats and /api/metrics" })),
                     )
                         .into_response();
-                }
             }
+        }
 
-            let is_admin_only = path_matches_segment_prefix(&path, "/api/config/save")
-                || path_matches_segment_prefix(&path, "/api/config/structured")
-                || path_matches_segment_prefix(&path, "/api/config/set")
-                || path_matches_segment_prefix(&path, "/api/config/raw")
-                || path_matches_segment_prefix(&path, "/api/restart")
-                || path_matches_segment_prefix(&path, "/api/tokens")
-                || path_matches_segment_prefix(&path, "/api/users")
-                || path_matches_segment_prefix(&path, "/api/camera-proxy")
-                || path_matches_segment_prefix(&path, "/api/recordings/sync")
-                || path_matches_segment_prefix(&path, "/api/logs")
-                || path_matches_segment_prefix(&path, "/api/genai/models")
-                || path_matches_segment_prefix(&path, "/api/genai/validate")
-                || path_matches_segment_prefix(&path, "/api/detectors/models/upload")
-                || path_matches_segment_prefix(&path, "/api/streams/probe")
-                || path_matches_segment_prefix(&path, "/api/federation")
-                || path_matches_segment_prefix(&path, "/api/debug")
-                || path_matches_segment_prefix(&path, "/api/notifications/test")
-                || path == "/api/exports/delete"
-                || path == "/api/reviews/delete"
-                || path == "/api/events/delete"
-                || (method != "GET"
-                    && method != "HEAD"
-                    && (path_matches_segment_prefix(&path, "/api/faces")
-                        || path_matches_segment_prefix(&path, "/api/dataset")
-                        || path_matches_segment_prefix(&path, "/api/false_positives")))
-                || (method == "DELETE"
-                    && !path.ends_with("/retain")
-                    && !path.ends_with("/viewed")
-                    && (path.ends_with("/recordings")
-                        || path_matches_segment_prefix(&path, "/api/events")
-                        || path_matches_segment_prefix(&path, "/api/review")
-                        || path_matches_segment_prefix(&path, "/api/export")));
-            if is_admin_only && role_lc != "admin" {
-                state.log_hub.push_nginx(&method, &path, 403);
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "message": "Admin role required" })),
-                )
-                    .into_response();
-            }
-
-            if role_lc == "read_only"
-                && !path_matches_segment_prefix(&path, "/api/mcp")
-                && ((method != "GET" && method != "HEAD")
-                    || !(path.starts_with("/api/") || path == "/api"))
-            {
-                state.log_hub.push_nginx(&method, &path, 403);
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "message": "Token scope 'read_only' only permits GET /api/*" })),
-                )
-                    .into_response();
-            }
-
-            if role_lc == "viewer"
-                && method != "GET"
+        let is_admin_only = path_matches_segment_prefix(&path, "/api/config/save")
+            || path_matches_segment_prefix(&path, "/api/config/structured")
+            || path_matches_segment_prefix(&path, "/api/config/set")
+            || path_matches_segment_prefix(&path, "/api/config/raw")
+            || path_matches_segment_prefix(&path, "/api/restart")
+            || path_matches_segment_prefix(&path, "/api/tokens")
+            || path_matches_segment_prefix(&path, "/api/users")
+            || path_matches_segment_prefix(&path, "/api/camera-proxy")
+            || path_matches_segment_prefix(&path, "/api/recordings/sync")
+            || path_matches_segment_prefix(&path, "/api/logs")
+            || path_matches_segment_prefix(&path, "/api/genai/models")
+            || path_matches_segment_prefix(&path, "/api/genai/validate")
+            || path_matches_segment_prefix(&path, "/api/detectors/models/upload")
+            || path_matches_segment_prefix(&path, "/api/streams/probe")
+            || path_matches_segment_prefix(&path, "/api/federation")
+            || path_matches_segment_prefix(&path, "/api/debug")
+            || path_matches_segment_prefix(&path, "/api/notifications/test")
+            || path == "/api/exports/delete"
+            || path == "/api/reviews/delete"
+            || path == "/api/events/delete"
+            || (method != "GET"
                 && method != "HEAD"
-                && !path_matches_segment_prefix(&path, "/api/logout")
-                && !path_matches_segment_prefix(&path, "/api/mcp")
+                && (path_matches_segment_prefix(&path, "/api/faces")
+                    || path_matches_segment_prefix(&path, "/api/dataset")
+                    || path_matches_segment_prefix(&path, "/api/false_positives")))
+            || (method == "DELETE"
+                && !path.ends_with("/retain")
+                && !path.ends_with("/viewed")
+                && (path.ends_with("/recordings")
+                    || path_matches_segment_prefix(&path, "/api/events")
+                    || path_matches_segment_prefix(&path, "/api/review")
+                    || path_matches_segment_prefix(&path, "/api/export")));
+        if is_admin_only && role_lc != "admin" {
+            state.log_hub.push_nginx(&method, &path, 403);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "message": "Admin role required" })),
+            )
+                .into_response();
+        }
+
+        if role_lc == "read_only"
+            && !path_matches_segment_prefix(&path, "/api/mcp")
+            && ((method != "GET" && method != "HEAD")
+                || !(path.starts_with("/api/") || path == "/api"))
+        {
+            state.log_hub.push_nginx(&method, &path, 403);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "message": "Token scope 'read_only' only permits GET /api/*" })),
+            )
+                .into_response();
+        }
+
+        if role_lc == "viewer"
+            && method != "GET"
+            && method != "HEAD"
+            && !path_matches_segment_prefix(&path, "/api/logout")
+            && !path_matches_segment_prefix(&path, "/api/mcp")
+        {
+            state.log_hub.push_nginx(&method, &path, 403);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "message": "Viewer role is read-only" })),
+            )
+                .into_response();
+        }
+
+        // Enforce go2rtc stream syntax and camera scoping unconditionally for all callers
+        let allowed_set_opt = if role_lc != "admin" {
+            resolve_user_allowed_cameras(&state, &jar, req.headers(), &auth_cfg, &user, &role)
+        } else {
+            None
+        };
+        if (path.starts_with("/live/") || path == "/live" || path == "/api/go2rtc/webrtc")
+            && let Err(msg) =
+                validate_go2rtc_query_streams(req.uri().query(), allowed_set_opt.as_deref())
+        {
+            let status = if msg == "Stream camera is not permitted for this user"
+                || (msg == "Missing stream src query parameter" && allowed_set_opt.is_some())
             {
-                state.log_hub.push_nginx(&method, &path, 403);
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            state.log_hub.push_nginx(&method, &path, status.as_u16());
+            return (status, Json(json!({ "message": msg }))).into_response();
+        }
+        if let Some(after_streams) = path.strip_prefix("/api/go2rtc/streams/") {
+            let raw_seg = after_streams
+                .strip_suffix("/prewarm")
+                .unwrap_or(after_streams)
+                .trim_matches('/');
+            let Some(decoded_seg) = percent_decode_segment(raw_seg) else {
+                state.log_hub.push_nginx(&method, &path, 400);
                 return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "message": "Viewer role is read-only" })),
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "message": "Invalid stream identifier" })),
+                )
+                    .into_response();
+            };
+            if !is_safe_go2rtc_stream_name(&decoded_seg) {
+                state.log_hub.push_nginx(&method, &path, 400);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "message": "Invalid stream identifier" })),
                 )
                     .into_response();
             }
-
-            // Enforce go2rtc stream syntax and camera scoping unconditionally for all callers
-            let allowed_set_opt = if role_lc != "admin" {
-                resolve_user_allowed_cameras(&state, &jar, req.headers(), &auth_cfg, &user, &role)
-            } else {
-                None
-            };
-            if (path.starts_with("/live/") || path == "/live" || path == "/api/go2rtc/webrtc")
-                && let Err(msg) =
-                    validate_go2rtc_query_streams(req.uri().query(), allowed_set_opt.as_deref())
+            let base_cam = decoded_seg
+                .strip_suffix("_sub")
+                .unwrap_or(&decoded_seg)
+                .trim();
+            if let Some(ref allowed_set) = allowed_set_opt
+                && (base_cam.is_empty() || !allowed_set.iter().any(|a| a == base_cam || a == "*"))
             {
-                let status = if msg == "Stream camera is not permitted for this user"
-                    || (msg == "Missing stream src query parameter" && allowed_set_opt.is_some())
-                {
-                    StatusCode::FORBIDDEN
-                } else {
-                    StatusCode::BAD_REQUEST
-                };
-                state.log_hub.push_nginx(&method, &path, status.as_u16());
-                return (status, Json(json!({ "message": msg }))).into_response();
-            }
-            if let Some(after_streams) = path.strip_prefix("/api/go2rtc/streams/") {
-                let raw_seg = after_streams
-                    .strip_suffix("/prewarm")
-                    .unwrap_or(after_streams)
-                    .trim_matches('/');
-                let Some(decoded_seg) = percent_decode_segment(raw_seg) else {
-                    state.log_hub.push_nginx(&method, &path, 400);
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "message": "Invalid stream identifier" })),
-                    )
-                        .into_response();
-                };
-                if !is_safe_go2rtc_stream_name(&decoded_seg) {
-                    state.log_hub.push_nginx(&method, &path, 400);
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "message": "Invalid stream identifier" })),
-                    )
-                        .into_response();
-                }
-                let base_cam = decoded_seg
-                    .strip_suffix("_sub")
-                    .unwrap_or(&decoded_seg)
-                    .trim();
-                if let Some(ref allowed_set) = allowed_set_opt
-                    && (base_cam.is_empty()
-                        || !allowed_set.iter().any(|a| a == base_cam || a == "*"))
-                {
-                    state.log_hub.push_nginx(&method, &path, 403);
-                    return (
+                state.log_hub.push_nginx(&method, &path, 403);
+                return (
                         StatusCode::FORBIDDEN,
                         Json(json!({ "message": format!("Camera '{base_cam}' is not permitted for this user") })),
                     )
                         .into_response();
-                }
             }
+        }
 
-            // Enforce per-camera scoping when user is restricted to specific cameras
-            if let Some(allowed_set) = allowed_set_opt {
-                let is_static_media = path.starts_with("/exports/")
-                    || path == "/exports"
-                    || path.starts_with("/recordings/")
-                    || path == "/recordings"
-                    || path.starts_with("/clips/")
-                    || path == "/clips";
-                let static_media_cam = if is_static_media {
-                    resolve_static_media_camera(&state, &path)
-                } else {
-                    None
-                };
-                if is_static_media
-                    && static_media_cam.is_none()
-                    && !allowed_set.iter().any(|a| a == "*")
-                {
-                    state.log_hub.push_nginx(&method, &path, 403);
-                    return (
+        // Enforce per-camera scoping when user is restricted to specific cameras
+        if let Some(allowed_set) = allowed_set_opt {
+            let is_static_media = path.starts_with("/exports/")
+                || path == "/exports"
+                || path.starts_with("/recordings/")
+                || path == "/recordings"
+                || path.starts_with("/clips/")
+                || path == "/clips";
+            let static_media_cam = if is_static_media {
+                resolve_static_media_camera_with_keys(&state, &path, &camera_keys)
+            } else {
+                None
+            };
+            if is_static_media
+                && static_media_cam.is_none()
+                && !allowed_set.iter().any(|a| a == "*")
+            {
+                state.log_hub.push_nginx(&method, &path, 403);
+                return (
                         StatusCode::FORBIDDEN,
                         Json(json!({ "message": "Static media resource is not permitted for this user" })),
                     )
                         .into_response();
-                }
-                let query_cam = if path.starts_with("/api/go2rtc") {
-                    req.uri().query().and_then(|q| {
-                        q.split('&').find_map(|kv| {
-                            let (k, v) = kv.split_once('=')?;
-                            let dk = percent_decode_segment(k)?;
-                            let dv = percent_decode_segment(v)?;
-                            if dk == "src" || dk == "dst" {
-                                Some(dv.strip_suffix("_sub").unwrap_or(&dv).to_string())
-                            } else {
-                                None
-                            }
-                        })
+            }
+            let query_cam = if path.starts_with("/api/go2rtc") {
+                req.uri().query().and_then(|q| {
+                    q.split('&').find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        let dk = percent_decode_segment(k)?;
+                        let dv = percent_decode_segment(v)?;
+                        if dk == "src" || dk == "dst" {
+                            Some(dv.strip_suffix("_sub").unwrap_or(&dv).to_string())
+                        } else {
+                            None
+                        }
                     })
-                } else {
+                })
+            } else {
+                None
+            };
+            let target_cam = if let Some(ref sc) = static_media_cam {
+                Some(sc.as_str())
+            } else if let Some(ref qc) = query_cam {
+                Some(qc.as_str())
+            } else if path == "/vod" || path.starts_with("/vod/") {
+                let rest = path.strip_prefix("/vod/").unwrap_or("");
+                let vod_rest = rest
+                    .strip_prefix("clip/")
+                    .unwrap_or_else(|| if rest == "clip" { "" } else { rest });
+                let vod_cam = vod_rest.split('/').find(|s| !s.is_empty()).unwrap_or("");
+                if vod_cam.is_empty() && !allowed_set.iter().any(|a| a == "*") {
+                    state.log_hub.push_nginx(&method, &path, 403);
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "message": "VOD camera is not permitted for this user" })),
+                    )
+                        .into_response();
+                }
+                Some(vod_cam)
+            } else if let Some(rest) = path.strip_prefix("/api/") {
+                let first = rest.split('/').next().unwrap_or("");
+                let after_first = rest
+                    .strip_prefix(first)
+                    .unwrap_or("")
+                    .trim_start_matches('/');
+                let is_camera_subroute = matches!(
+                    after_first,
+                    "recordings"
+                        | "recordings/summary"
+                        | "ptz/info"
+                        | "ptz/move"
+                        | "ptz/stop"
+                        | "ptz/preset"
+                        | "hardware"
+                        | "logs"
+                        | "audio/talkback"
+                        | "state"
+                        | "latest.webp"
+                        | "latest.jpg"
+                        | "snapshot.jpg"
+                ) && !(first == "recordings" && after_first == "summary");
+                if is_camera_subroute {
+                    Some(first)
+                } else if first == "preview" {
+                    if after_first.contains("/start/") {
+                        let p_cam = after_first.split('/').next().unwrap_or("");
+                        if p_cam.is_empty() || p_cam == "all" {
+                            None
+                        } else {
+                            Some(p_cam)
+                        }
+                    } else {
+                        None
+                    }
+                } else if matches!(
+                    first,
+                    "version"
+                        | "ui"
+                        | "auth"
+                        | "login"
+                        | "logout"
+                        | "profile"
+                        | "profiles"
+                        | "users"
+                        | "config"
+                        | "detectors"
+                        | "dataset"
+                        | "ffmpeg"
+                        | "ffprobe"
+                        | "streams"
+                        | "keyframe_analysis"
+                        | "restart"
+                        | "logs"
+                        | "stats"
+                        | "review"
+                        | "review_ids"
+                        | "reviews"
+                        | "events"
+                        | "event_ids"
+                        | "false_positives"
+                        | "timeline"
+                        | "recordings"
+                        | "exports"
+                        | "jobs"
+                        | "cases"
+                        | "share"
+                        | "tokens"
+                        | "metrics"
+                        | "ai"
+                        | "mcp"
+                        | "debug"
+                        | "notifications"
+                        | "federation"
+                        | "camera-proxy"
+                        | "go2rtc"
+                        | "ws"
+                        | "labels"
+                        | "sub_labels"
+                        | "audio_labels"
+                        | "recognized_license_plates"
+                        | "classification"
+                        | "genai"
+                        | "plus"
+                        | "faces"
+                ) {
                     None
-                };
-                let target_cam = if let Some(ref sc) = static_media_cam {
-                    Some(sc.as_str())
-                } else if let Some(ref qc) = query_cam {
-                    Some(qc.as_str())
-                } else if path == "/vod" || path.starts_with("/vod/") {
-                    let rest = path.strip_prefix("/vod/").unwrap_or("");
-                    let vod_rest = rest
-                        .strip_prefix("clip/")
-                        .unwrap_or_else(|| if rest == "clip" { "" } else { rest });
-                    let vod_cam = vod_rest.split('/').find(|s| !s.is_empty()).unwrap_or("");
+                } else if first == "vod" {
+                    let after_clip = after_first.strip_prefix("clip/").unwrap_or_else(|| {
+                        if after_first == "clip" {
+                            ""
+                        } else {
+                            after_first
+                        }
+                    });
+                    let vod_cam = after_clip.split('/').find(|s| !s.is_empty()).unwrap_or("");
                     if vod_cam.is_empty() && !allowed_set.iter().any(|a| a == "*") {
                         state.log_hub.push_nginx(&method, &path, 403);
                         return (
@@ -1402,140 +1579,95 @@ pub async fn auth_gate_middleware(
                             .into_response();
                     }
                     Some(vod_cam)
-                } else if let Some(rest) = path.strip_prefix("/api/") {
-                    let first = rest.split('/').next().unwrap_or("");
-                    let after_first = rest
-                        .strip_prefix(first)
-                        .unwrap_or("")
-                        .trim_start_matches('/');
-                    let is_camera_subroute = matches!(
-                        after_first,
-                        "recordings"
-                            | "recordings/summary"
-                            | "ptz/info"
-                            | "ptz/move"
-                            | "ptz/stop"
-                            | "ptz/preset"
-                            | "hardware"
-                            | "logs"
-                            | "audio/talkback"
-                            | "state"
-                            | "latest.webp"
-                            | "latest.jpg"
-                            | "snapshot.jpg"
-                    ) && !(first == "recordings"
-                        && after_first == "summary");
-                    if is_camera_subroute {
-                        Some(first)
-                    } else if first == "preview" {
-                        if after_first.contains("/start/") {
-                            let p_cam = after_first.split('/').next().unwrap_or("");
-                            if p_cam.is_empty() || p_cam == "all" {
-                                None
-                            } else {
-                                Some(p_cam)
-                            }
-                        } else {
-                            None
-                        }
-                    } else if matches!(
-                        first,
-                        "version"
-                            | "ui"
-                            | "auth"
-                            | "login"
-                            | "logout"
-                            | "profile"
-                            | "profiles"
-                            | "users"
-                            | "config"
-                            | "detectors"
-                            | "dataset"
-                            | "ffmpeg"
-                            | "ffprobe"
-                            | "streams"
-                            | "keyframe_analysis"
-                            | "restart"
-                            | "logs"
-                            | "stats"
-                            | "review"
-                            | "review_ids"
-                            | "reviews"
-                            | "events"
-                            | "event_ids"
-                            | "false_positives"
-                            | "timeline"
-                            | "recordings"
-                            | "exports"
-                            | "jobs"
-                            | "cases"
-                            | "share"
-                            | "tokens"
-                            | "metrics"
-                            | "ai"
-                            | "mcp"
-                            | "debug"
-                            | "notifications"
-                            | "federation"
-                            | "camera-proxy"
-                            | "go2rtc"
-                            | "ws"
-                            | "labels"
-                            | "sub_labels"
-                            | "audio_labels"
-                            | "recognized_license_plates"
-                            | "classification"
-                            | "genai"
-                            | "plus"
-                            | "faces"
-                    ) {
-                        None
-                    } else if first == "vod" {
-                        let after_clip = after_first.strip_prefix("clip/").unwrap_or_else(|| {
-                            if after_first == "clip" {
-                                ""
-                            } else {
-                                after_first
-                            }
-                        });
-                        let vod_cam = after_clip.split('/').find(|s| !s.is_empty()).unwrap_or("");
-                        if vod_cam.is_empty() && !allowed_set.iter().any(|a| a == "*") {
-                            state.log_hub.push_nginx(&method, &path, 403);
-                            return (
-                                StatusCode::FORBIDDEN,
-                                Json(json!({ "message": "VOD camera is not permitted for this user" })),
-                            )
-                                .into_response();
-                        }
-                        Some(vod_cam)
-                    } else if first == "export" {
-                        let after_clip = after_first.strip_prefix("clip/").unwrap_or(after_first);
-                        if after_clip.contains("/start/") {
-                            after_clip.split('/').next()
-                        } else {
-                            None
-                        }
+                } else if first == "export" {
+                    let after_clip = after_first.strip_prefix("clip/").unwrap_or(after_first);
+                    if after_clip.contains("/start/") {
+                        after_clip.split('/').next()
                     } else {
-                        Some(first)
+                        None
                     }
                 } else {
-                    None
-                };
-                if let Some(cam) = target_cam
-                    && !cam.is_empty()
-                    && !allowed_set.iter().any(|a| a == cam || a == "*")
-                {
-                    state.log_hub.push_nginx(&method, &path, 403);
-                    return (
+                    Some(first)
+                }
+            } else {
+                None
+            };
+            if let Some(cam) = target_cam
+                && !cam.is_empty()
+                && !allowed_set.iter().any(|a| a == cam || a == "*")
+            {
+                state.log_hub.push_nginx(&method, &path, 403);
+                return (
                         StatusCode::FORBIDDEN,
                         Json(json!({ "message": format!("Camera '{cam}' is not permitted for this user") })),
                     )
                         .into_response();
-                }
             }
         }
     }
-    let resp = next.run(req).await;
+
+    let mut active_clip_mask: Option<Value> = None;
+    if !active_masks.is_empty()
+        && (path == "/recordings"
+            || path.starts_with("/recordings/")
+            || path.starts_with("/exports/share_clip_")
+            || path == "/clips"
+            || path.starts_with("/clips/"))
+    {
+        match resolve_static_media_camera_with_keys(&state, &path, &camera_keys) {
+            Some(cam) => {
+                if let Some(mask) = active_masks.get(&cam) {
+                    let path_lc = path.to_ascii_lowercase();
+                    let is_clip_image = path.starts_with("/clips/")
+                        && !path.starts_with("/clips/faces/")
+                        && (path_lc.ends_with(".jpg")
+                            || path_lc.ends_with(".jpeg")
+                            || path_lc.ends_with(".webp")
+                            || path_lc.ends_with(".png"));
+                    if !is_clip_image {
+                        state.log_hub.push_nginx(&method, &path, 404);
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    active_clip_mask = Some(mask.clone());
+                }
+            }
+            None => {
+                state.log_hub.push_nginx(&method, &path, 404);
+                return StatusCode::NOT_FOUND.into_response();
+            }
+        }
+    }
+
+    if active_clip_mask.is_some() {
+        req.headers_mut().remove(header::RANGE);
+        req.headers_mut().remove(header::IF_RANGE);
+        req.headers_mut().remove(header::IF_NONE_MATCH);
+        req.headers_mut().remove(header::IF_MODIFIED_SINCE);
+    }
+
+    let mut resp = next.run(req).await;
+    if let Some(mask) = active_clip_mask {
+        if method == "HEAD" {
+            resp.headers_mut().remove(header::ETAG);
+            resp.headers_mut().remove(header::LAST_MODIFIED);
+        } else if resp.status() == StatusCode::OK || resp.status() == StatusCode::PARTIAL_CONTENT {
+            let prefer_jpeg = {
+                let p_lc = path.to_ascii_lowercase();
+                p_lc.ends_with(".jpg") || p_lc.ends_with(".jpeg")
+            };
+            if let Ok(raw_bytes) = axum::body::to_bytes(resp.into_body(), 32 * 1024 * 1024).await {
+                let (redacted_bytes, mime) = crate::redact_image_bytes_with_privacy_mask_async(
+                    raw_bytes.to_vec(),
+                    Some(mask),
+                    prefer_jpeg,
+                )
+                .await;
+                resp = ([(header::CONTENT_TYPE, mime)], redacted_bytes).into_response();
+            } else {
+                resp = StatusCode::NOT_FOUND.into_response();
+            }
+        }
+    }
     if !path.starts_with("/api/logs") && !path.starts_with("/assets-v2/") {
         state
             .log_hub

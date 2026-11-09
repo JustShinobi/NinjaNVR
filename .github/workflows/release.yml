@@ -69,17 +69,25 @@ jobs:
     steps:
       - name: Resolve target release tag and channel
         id: resolve
+        env:
+          CUT_TAG: ${{ needs.cut-release.outputs.tag_name }}
+          CUT_CHANNEL: ${{ needs.cut-release.outputs.channel_tag }}
+          INPUT_PUBLISH_TAG: ${{ inputs.publish_tag }}
         run: |
-          if [ -n "${{ needs.cut-release.outputs.tag_name }}" ]; then
-            TAG="${{ needs.cut-release.outputs.tag_name }}"
-            CHANNEL="${{ needs.cut-release.outputs.channel_tag }}"
+          if [ -n "${CUT_TAG}" ]; then
+            TAG="${CUT_TAG}"
+            CHANNEL="${CUT_CHANNEL}"
           else
-            TAG="${{ inputs.publish_tag }}"
+            TAG="${INPUT_PUBLISH_TAG}"
             if [[ "${TAG}" == *-* ]]; then
               CHANNEL="dev"
             else
               CHANNEL="latest"
             fi
+          fi
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "Invalid release tag format: ${TAG}" >&2
+            exit 1
           fi
           echo "Resolved release tag: ${TAG} (channel: ${CHANNEL})"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
