@@ -1,160 +1,149 @@
-# <img src="web-v2/public/favicon.svg" width="32" height="32" align="top" alt="NinjaNVR Icon" /> NinjaNVR
+# <img src="web-v2/public/favicon.svg" width="32" height="32" align="top" alt="" /> NinjaNVR
 
-**Next-gen AI Network Video Recorder and operator console written in Rust — with built-in face & plate recognition, interactive CAD floorplan, multi-camera sync playback, and a local AI training studio.**
+NinjaNVR is a self-hosted network video recorder with a Rust backend and a React console. It records camera streams, detects and tracks objects locally, and brings live video, recordings, alerts, and camera controls into one interface.
 
 [![CI](https://github.com/JustShinobi/NinjaNVR/actions/workflows/ci.yml/badge.svg)](https://github.com/JustShinobi/NinjaNVR/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/JustShinobi/NinjaNVR?include_prereleases&label=release)](https://github.com/JustShinobi/NinjaNVR/releases)
 [![Container](https://img.shields.io/badge/ghcr.io-justshinobi%2Fninjanvr-blue?logo=docker)](https://github.com/JustShinobi/NinjaNVR/pkgs/container/ninjanvr)
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
 
-[Why NinjaNVR?](#why-ninjanvr) · [Key Features](#key-features) · [Console Showcase](#console-showcase) · [Quickstart](#quickstart) · [Hardware Support](#hardware--accelerator-support) · [Architecture](#under-the-hood-architecture)
+[Quickstart](#quickstart) · [Features](#features) · [Recent additions](#recent-additions) · [Hardware](#hardware) · [Build from source](#build-from-source)
 
 <p align="center">
-  <img src="docs/public/assets/hero-showcase.gif" alt="NinjaNVR Operator Console Showcase — Live Matrix, CAD Floorplan, Forensic Triage, and Local AI Dataset Studio" width="100%" />
+  <img src="docs/public/assets/hero-showcase.gif" alt="NinjaNVR live view, floorplan, event review, and dataset editor" width="100%" />
 </p>
 
-**NinjaNVR** replaces sprawling multi-process Python scripts, gigabytes of `/dev/shm` shared memory, and paid cloud model subscriptions with a single native Rust engine and a modern React 19 operator console (`web-v2`).
-
-On a standard 4-camera setup (1080p/4K continuous recording + 720p AI detection at 5 FPS), NinjaNVR uses **65–95 MiB of RAM** and **~3–4% of a modern x86_64 CPU**—with **no dedicated USB accelerator required**.
-
----
-
-## Why NinjaNVR?
-
-Most open-source NVRs were designed around multi-process IPC queues, temporary RAM disks, and generic 80-class academic datasets. NinjaNVR was engineered from the ground up to eliminate those operational bottlenecks:
-
-| Capability | Traditional Python / IPC NVRs | NinjaNVR |
-| :--- | :--- | :--- |
-| **Runtime & Memory (4 Cams)** | Multi-process Python (`1.5 GiB – 4.0 GiB+` RAM) | **Single Rust binary (`65 MiB – 95 MiB` RAM)** |
-| **Disk & Memory Staging** | Requires custom `/dev/shm` sizing and `/tmp/cache` SSD wear | **Zero `/dev/shm`**: in-process memory ring + direct 10s MP4 disk writes |
-| **CPU Efficiency** | High idle load without dedicated USB/PCIe accelerators | **`< 4%` CPU on standard x86_64** (SIMD motion gates AI in `< 0.15 ms/frame`) |
-| **AI Model Fine-Tuning** | Paid cloud subscription required to train or manage datasets | **100% Free & Local**: built-in Dataset Studio, auto-labeler, and hot-reload |
-| **Detection Taxonomy** | Generic 80-class COCO (*giraffe, toothbrush, zebra*) | **Security-first 15-class taxonomy** (`person`, `face`, `car`, `license_plate`, `package`...) |
-| **False-Positive Suppression** | Manual threshold tweaking and constant config restarts | **Perceptual `dhash64` memory** + optional **Vision AI Judge** (Ollama / OpenAI / Gemini) |
-| **Live Reconfiguration** | Editing YAML requires full container restart (recording blackout) | **Runtime GUI & Model Hot-Reload** with zero recording downtime |
-| **Enterprise & Home Auth** | Basic local user or external reverse-proxy workarounds | **Native OIDC / SSO**, per-camera RBAC, API tokens, and camera VLAN proxy |
-
----
-
-## Console Showcase
-
-| Live Matrix, Zones & State ROIs | Interactive CAD Floorplan & Live FOV Cones |
-| :---: | :---: |
-| [<img src="docs/public/assets/live-matrix.png" alt="Live Matrix & Vectors" width="100%" />](docs/public/assets/live-matrix.png) | [<img src="docs/public/assets/floorplan-cad.png" alt="Interactive CAD Floorplan Studio" width="100%" />](docs/public/assets/floorplan-cad.png) |
-| **Forensic Review, Face/LPR & "Explain Alert"** | **Local AI Dataset Studio & Model Hot-Reload** |
-| [<img src="docs/public/assets/review-forensic.png" alt="Forensic Review & Explain Alert" width="100%" />](docs/public/assets/review-forensic.png) | [<img src="docs/public/assets/ai-studio.png" alt="Active Learning AI Dataset Studio" width="100%" />](docs/public/assets/ai-studio.png) |
-
----
-
-## Key Features
-
-### 1. Operator Console & Multi-Camera Playback (`web-v2`)
-* **Adaptive Live Matrix (Up to 100+ Cameras):** Low-latency WebRTC/MSE streaming, camera groups, per-camera rotation (`0°/90° Corridor/180°/270°`), interactive digital zoom/pan, **ONVIF PTZ HUD with Autotracking**, and **WebRTC Push-to-Talk** two-way audio.
-* **Interactive CAD Floorplan Studio:** Draw metric floorplans (`m`) with walls, doors, and windows; position cameras with live directional FOV cones that pulse in real time during active detections.
-* **Spotlight & 4-Cam Lockstep Sync:** Client-side dynamic "Birdseye" view that automatically promotes active cameras with zero server CPU transcoding, plus frame-synchronized 4-camera VOD playback.
-* **60 FPS Canvas Timeline & Keyboard Triage:** High-DPI 24-hour scrubber with acoustic dBFS waveform tracks, offline gap indicators, hover previews, single-frame stepping (`< 1f / 1f >`), and keyboard shortcuts (`J/K` step, `R` mark reviewed, `E` export).
-* **Daily Brief & Dual-Theme Engine:** Catch up on an entire night in seconds with accelerated sequential alert playback, rendered on calibrated **Dark**, **Daylight/Light**, and **High-Contrast** monitor surfaces.
-
-### 2. Multi-Layer Security AI (100% Local)
-* **Object Tracking & Directional Tripwires:** 2-stage `ByteTrack` Kalman tracking with polygon zone inertia, loitering timers, stationary object classification, and directional `A↔B` virtual line-crossing tripwires.
-* **Local Face Recognition & LPR / ANPR:** Enroll known individuals into the local Face Gallery (`sub_labels` + unknown-person alerts) and recognize vehicle license plates with multi-frame voting and regex validation.
-* **State ROIs (Open / Closed Monitoring):** Monitor fixed regions (garage doors, gates, loading bays) with hysteresis and automatic anomaly alerts when left open past a timeout.
-* **"Explain Alert" Forensic Inspector:** Inspect the exact trigger frame, confidence score, bounding-box area %, aspect ratio, and zone rule that promoted a track.
-* **False-Positive Memory & Vision AI Judge:** Dismiss a false alarm once to suppress matching spatial/perceptual `dhash64` signatures, or let a local/cloud VLM (`Ollama`, `Gemini`, `OpenAI`) verify ambiguous borderline detections before alerting.
-* **Night IR, Spider Filter & Tamper Guard:** Automatic day/night IR profile switching, transient insect/spider-web flash suppression, OSD clock auto-masking, and blind-feed/tamper detection.
-
-### 3. Built-In Dataset Studio & Model Factory (No Cloud Paywall)
-* **One-Click Triage-to-Dataset:** Promote real events as *True Positives* or *Hard Negatives* directly from the Review queue.
-* **AI Auto-Labeler & Bounding-Box Editor:** Annotate frames in the browser and curate balanced train/validation splits across day and night conditions.
-* **Zero-Downtime Model Hot-Reload:** Upload or switch OpenVINO/ONNX models (`SSDLite`, `YOLOv5/v8/v10/v11`, `YOLOX`, or the 15-class NinjaNVR Security model) live without restarting the NVR.
-
-### 4. Resilient Storage, Security & Integrations
-* **Zero-Transcode Recording & Hybrid Streams:** Writes `-c:v copy` 10-second MP4 segments directly to disk. Supports continuous 24/7 low-bitrate substream recording with automatic main-stream promotion during active events.
-* **Hot-to-Cold Tiering & Cold Compaction:** Automatically migrate older recordings from fast NVMe/SSD (`hot_dir`) to high-capacity HDD/NAS (`cold_dir`), with optional background H.264/HEVC re-compaction, disk quotas (`max_size_gb` / `min_free_gb`), and real-time offsite alert backup.
-* **Degraded Mount Guard:** If a secondary recording disk or NAS drops offline, the Live Wall and AI detection stay online and recover automatically when the mount returns.
-* **Home Assistant, MQTT/MQTTS & MCP Ready:** Full MQTT discovery (`ARMED`, `HOME`, `DISARMED` security profiles, live counts, and snapshots), Prometheus `/api/metrics`, Multi-Node NVR Federation, and native **MCP / LLM context endpoints** for AI assistants.
-* **Zero-Trust Ready:** Local PBKDF2-SHA256 auth, **OpenID Connect (OIDC)** SSO, Trusted-Proxy ForwardAuth, per-camera RBAC, expiring HMAC-signed shareable clip links, burned-in privacy masks, and an authenticated reverse proxy for cameras on isolated VLANs.
-
----
+The NVR runs on your own hardware. Object detection uses OpenVINO or ONNX Runtime; recordings and event data stay on local storage unless you configure backups or external integrations. Optional image verification and dataset annotation can use Ollama, OpenAI, or Gemini.
 
 ## Quickstart
 
-### Run with Docker (`ghcr.io`)
+From a checkout of this repository, copy the [example configuration](config/config.example.yml) and replace the camera addresses and credentials:
+
+```bash
+mkdir -p config-local storage
+cp config/config.example.yml config-local/config.yml
+```
+
+The example uses separate streams for detection and recording. Update both `go2rtc.streams` entries for your camera; the `127.0.0.1:8554` addresses under `cameras` refer to the restreamer inside the container.
 
 ```bash
 docker run -d \
   --name ninjanvr \
   --restart unless-stopped \
   -p 8971:8971 \
-  -p 5000:5000 \
   -p 8554:8554 \
   -p 8555:8555/tcp \
   -p 8555:8555/udp \
-  -v /path/to/config:/config \
-  -v /path/to/storage:/media/ninjanvr \
+  -v "$PWD/config-local:/config" \
+  -v "$PWD/storage:/media/ninjanvr" \
   ghcr.io/justshinobi/ninjanvr:latest
 ```
 
+Open `https://localhost:8971`. The server generates a TLS certificate when none is configured. The `latest` image follows stable releases; `dev` follows pre-releases from the development branch.
+
 | Port | Purpose |
 | :--- | :--- |
-| `8971/tcp` | **HTTPS Operator Console (`web-v2`)** and authenticated API |
-| `5000/tcp` | Internal HTTP API & container healthcheck (`/api/version`) |
-| `8554/tcp` | RTSP restreaming (`go2rtc`) |
-| `8555/tcp+udp` | Low-latency WebRTC media & Push-to-Talk backchannel |
+| `8971/tcp` | HTTPS console and authenticated API |
+| `5000/tcp` | Internal HTTP API and container health checks; not published above |
+| `8554/tcp` | go2rtc RTSP restreaming |
+| `8555/tcp+udp` | WebRTC media |
 
----
+Configuration and the SQLite database persist in `/config`; recordings persist in `/media/ninjanvr`. See [authentication](docs/operations/security-and-auth.md) for local accounts, OIDC, proxy authentication, and API tokens.
 
-## Hardware & Accelerator Support
+## Features
 
-NinjaNVR ships with a **Dual-Backend Inference Engine**: **Intel OpenVINO (`2026.4.1`)** is bundled out of the box, and **ONNX Runtime (`libonnxruntime.so`)** can be dynamically loaded for NVIDIA/AMD GPUs.
+### Live view and playback
 
-| Hardware / Accelerator | Backend & Config | Status | Notes |
-| :--- | :--- | :--- | :--- |
-| **x86_64 CPU (Intel & AMD)** | `type: openvino`<br>`device: CPU` | **Supported (Default)** | Uses AVX2 / AVX-512 / VNNI. Because SIMD motion detection gates inference, 4 cameras at 5 FPS typically use `< 4%` CPU with no discrete accelerator. |
-| **NVIDIA GPU (CUDA / TensorRT)** | `type: onnxruntime`<br>`device: CUDA` or `TensorRT` | **Supported** | Dynamically loads `libonnxruntime.so` with `/dev/nvidia0` passthrough; falls back to CPU automatically if unavailable. |
-| **AMD GPU (ROCm)** | `type: onnxruntime`<br>`device: ROCM` | **Supported** | Dynamically loads `libonnxruntime.so` with `/dev/kfd` + `/dev/dri` passthrough; falls back to CPU automatically. |
-| **Intel iGPU / Arc** | `type: openvino`<br>`device: GPU` | **Experimental** | Bundled plugin. Requires `/dev/dri` passthrough and OpenCL ICD runtime drivers. |
-| **Intel Core Ultra NPU** | `type: openvino`<br>`device: NPU` | **Experimental** | Bundled plugin. Requires `/dev/accel` passthrough and Linux NPU driver support. |
-| **ARM64 (`aarch64`)** | Source build | **Community** | Compiles from source on ARM64 Linux; prebuilt `ghcr.io` images currently target `x86_64` (`linux/amd64`). |
+- Camera groups and a paginated matrix, Spotlight for active cameras, and a floorplan view with camera positions and fields of view.
+- WebRTC and MSE live video, digital zoom and pan, camera rotation, PTZ presets, and two-way audio on compatible cameras.
+- A recording timeline with event markers, audio levels, offline gaps, frame stepping, and synchronized playback of up to four cameras.
+- Review and Explore filters, saved searches, operator notes, daily alert playback, and MP4 exports with optional audio removal.
+- Dark, light, and high-contrast display settings, plus layouts for desktop and phone screens.
 
-* **Any RTSP / ONVIF Camera:** Supports H.264 and H.265 cameras via RTSP, RTSPS, ONVIF, RTMP, HTTP-FLV, and MJPEG (`go2rtc 1.9.15` + `FFmpeg 8.1.2`).
+### Detection and alert rules
 
----
+- Motion-gated object detection with ByteTrack tracking, stationary-object handling, polygon zones, loitering rules, and directional line crossings.
+- Local face gallery and license plate recognition, including face assignment across selected events and registration of detected plates.
+- State regions for open/closed monitoring, day/night detection profiles, camera tamper detection, and motion and privacy masks.
+- An alert inspector showing the triggering frame, detection score, object geometry, and zone rule. False-positive signatures can suppress recurring matches; an optional Vision AI Judge can check detections with a vision model.
+- Runtime camera, detection, recording, and alert switches, with Armed, Home, and Disarmed profiles available through the console, API, and MQTT.
 
-## Under the Hood: Architecture
+### Datasets and models
 
-For engineers evaluating how NinjaNVR achieves its resource profile:
+- Send events to Dataset Studio, edit bounding boxes, and curate positive and negative samples.
+- Annotate samples with a configured vision model, run batches with progress and cancellation, and distinguish AI verification from manual review.
+- Upload and deploy detector models without restarting the server. The console reports the model actually loaded, deployment outcome, and measured inference latency.
+- Prepare datasets and train or fine-tune the 15-class security model with the [training scripts](scripts/ai). Training requires a separate Python environment and its model-training dependencies.
 
-* **In-Process Zero-Copy Frame Ring (`Arc<YuvFrame>`):** Decoded substream frames remain in process memory instead of being serialized across `/dev/shm` POSIX shared memory or Python multiprocessing pipes.
-* **Sub-Millisecond SIMD Motion Gate (`< 0.15 ms/frame`):** A custom planar YUV420p engine applies a 3×3 Gaussian blur, EMA contrast cap, and Connected-Component Labeling (CCL) to wake the neural detector only on relevant motion contours.
-* **Pure-Rust ISO-BMFF fMP4 & HLS VOD Engine:** Continuous 10-second MP4 segments are remuxed on the fly into fragmented MP4 (`init-v1-a1.mp4` + `seg-N-v1-a1.m4s`) and `master.m3u8` streams directly in Rust—without spawning per-viewer FFmpeg transcoders or `ffprobe` subprocesses.
+### Storage and access
 
-### Workspace Layout
+- Record streams into 10-second MP4 segments without video transcoding. Hybrid recording keeps a substream continuously and switches to the main stream for events.
+- Retention by age and disk quota, hot-to-cold storage migration, optional cold compaction, and alert clip backups.
+- Continue live view and detection when a recording mount becomes unavailable, then recover recording when storage returns.
+- Local authentication, OIDC, trusted-proxy authentication, roles with per-camera access, scoped API tokens, and expiring clip links with revocation controls.
+- Home Assistant MQTT discovery, MQTT over TLS, Prometheus metrics, multi-instance federation, and AI context/MCP query endpoints.
+
+## Recent additions
+
+Recent development has focused on camera operation, configuration, and the review workflow:
+
+- **Camera hardware controls:** protocol-specific discovery and controls for supported Tapo, Dahua/Intelbras, Hikvision, Reolink, Axis, and generic ONVIF devices. Available controls depend on the camera's reported capabilities and firmware: PTZ, presets, day/night mode, lighting, image adjustments, speaker volume, and reboot.
+- **Camera alarms:** manual speaker siren playback on supported Tapo and Dahua/Intelbras cameras, plus automatic triggers from selected zones and directional lines. Tapo speaker access requires the TP-Link account password in addition to the local camera credentials. See [camera configuration](docs/configuration/cameras.md) and [alarm rules](docs/configuration/detection.md).
+- **Diagnostics and recovery:** camera diagnostic logs, ONVIF PullPoint events, syslog and scheduled-maintenance controls where supported, and a reboot watchdog for repeated RTSP stalls.
+- **Areas, lines, and masks:** the editor groups tools by purpose, preserves coordinates across viewport sizes, and applies saved zones, masks, and motion settings without a server restart.
+- **Live and mobile layouts:** compact camera tiles with a details sheet, a collapsible desktop header, and phone layouts across live view, playback, Review, and Explore.
+- **Snapshots and review:** full-resolution snapshot downloads with privacy masks applied, event-strip frame previews, batch face assignment, and automatic annotation when adding events to a dataset.
+
+See the [commit history](https://github.com/JustShinobi/NinjaNVR/commits/dev/) for development changes and [releases](https://github.com/JustShinobi/NinjaNVR/releases) for published versions.
+
+## Screenshots
+
+| Live view | Floorplan editor |
+| :---: | :---: |
+| [![Live camera matrix](docs/public/assets/live-matrix.png)](docs/public/assets/live-matrix.png) | [![Floorplan with walls and camera positions](docs/public/assets/floorplan-cad.png)](docs/public/assets/floorplan-cad.png) |
+| Event review | Dataset Studio |
+| [![Event review and alert inspector](docs/public/assets/review-forensic.png)](docs/public/assets/review-forensic.png) | [![Dataset annotation and model tools](docs/public/assets/ai-studio.png)](docs/public/assets/ai-studio.png) |
+
+## Hardware
+
+The container bundles OpenVINO and an SSDLite MobileNetV2 model for CPU detection. A dedicated accelerator is optional. Resource use depends on stream resolution, codecs, detection rate, model, and camera activity.
+
+| Hardware | Backend | Requirements |
+| :--- | :--- | :--- |
+| Intel or AMD x86_64 CPU | `openvino`, device `CPU` | Default container setup |
+| Intel iGPU / Arc | `openvino`, device `GPU` | Experimental; `/dev/dri` access and compatible OpenCL drivers |
+| Intel NPU | `openvino`, device `NPU` | Experimental; `/dev/accel` access and compatible Linux drivers |
+| NVIDIA or AMD GPU | `onnxruntime` | Supply `libonnxruntime.so`, the matching execution provider and drivers, and device access; not bundled in the default image |
+| ARM64 | Source build | No prebuilt ARM64 container image; inference runtime must match the platform |
+
+Camera streaming uses go2rtc and FFmpeg. Codec playback and two-way audio support depend on the camera, stream configuration, and browser. Registering a protocol family does not imply that every model exposes every hardware control.
+
+## Architecture
+
+The Rust process handles configuration, detection, tracking, persistence, and the HTTP API. It supervises go2rtc for restreaming and uses FFmpeg for media input and operations such as exports and compaction. The browser runs the React 19 console in `web-v2/`.
+
+Decoded detection frames stay in an in-process frame ring. A YUV420p motion detector gates object inference. Recorded MP4 segments are remuxed into fragmented MP4/HLS in Rust for playback.
 
 ```text
 crates/
-  ninjanvr-config/    YAML configuration parser, credential scrubber, go2rtc supervisor
-  ninjanvr-db/        SQLite WAL storage, RBAC, false-positive signatures, and PBKDF2-SHA256 auth
-  ninjanvr-media/     10s MP4 segment recorder, hot/cold tiering, cold compaction, MP4 clip exporter
-  ninjanvr-vision/    Planar YUV420p SIMD motion detector, IR/tamper checks, State ROIs, privacy masks
-  ninjanvr-infer/     Dual-backend OpenVINO + ONNX Runtime C FFI engine, Face/LPR & multi-arch YOLO decoders
-  ninjanvr-track/     2-stage ByteTrack Kalman tracker, stationary heuristics, polygon zones, tripwires
-  ninjanvr-vod/       Pure-Rust ISO-BMFF fMP4 HLS VOD remuxer with VBR & hybrid-stream discontinuity support
-  ninjanvr-comms/     Real-time WebSocket (/ws) state hub and MQTT / MQTTS (TLS + mTLS) publisher
-  ninjanvr-server/    Axum HTTP (:5000) & TLS (:8971) server, OIDC/JWT gate, GenAI judge, Federation & MCP APIs
-web-v2/               NinjaNVR Console (React 19 + TypeScript + Vite)
+  ninjanvr-config/    YAML configuration and go2rtc supervision
+  ninjanvr-db/        SQLite persistence and local authentication
+  ninjanvr-media/     Recording, retention, storage tiers, and exports
+  ninjanvr-vision/    Motion detection and image processing
+  ninjanvr-infer/     OpenVINO and ONNX Runtime inference, face and plate recognition
+  ninjanvr-track/     Object tracking, zones, and line crossings
+  ninjanvr-vod/       MP4/HLS playback remuxing
+  ninjanvr-comms/     WebSocket updates and MQTT
+  ninjanvr-server/    HTTP/TLS API, camera drivers, and pipeline orchestration
+web-v2/               React and TypeScript console
+scripts/ai/           Dataset preparation and model training
 ```
 
-### Migrating Existing YAML Configurations
+Existing `cameras:` and `go2rtc:` YAML blocks can be reused when migrating. Check storage paths, detector settings, and model paths against the [example configuration](config/config.example.yml).
 
-NinjaNVR maintains backwards-compatible parsing for standard `cameras:` and `go2rtc:` YAML blocks so you can migrate existing camera definitions quickly:
+## Build from source
 
-1. **Storage & Database Paths:** Mount your recording volume at `/media/ninjanvr` (SQLite database defaults to `/config/ninjanvr.db`; MQTT topic prefix defaults to `ninjanvr`).
-2. **Detector Config:** Set your detector in `config.yml` to `type: openvino` (`device: CPU`, `GPU`, or `NPU`) or `type: onnxruntime` (`device: CUDA`, `TensorRT`, or `ROCM`). The default `SSDLite MobileNetV2` FP16 model is pre-installed at `/openvino-model/ssdlite_mobilenet_v2.xml`.
-
-### Build from Source
-
-Requires Rust `1.88+` (Edition 2024), Bun `1.1+`, `pkg-config`, `libssl-dev`, `libsqlite3-dev`, `cmake`, and `clang`.
+Requires Rust 1.89 or newer, Bun, `pkg-config`, OpenSSL and SQLite development libraries, CMake, and Clang. Install FFmpeg and go2rtc for camera operation, and a compatible OpenVINO or ONNX Runtime library for inference; these runtime dependencies are included or configured separately by the [Dockerfile](Dockerfile).
 
 ```bash
 git clone https://github.com/JustShinobi/NinjaNVR.git
@@ -166,10 +155,10 @@ make build
 ./target/release/ninjanvr --config ./config/config.example.yml
 ```
 
----
+The example's `/openvino-model/` paths refer to assets in the container. For a source build, update them to your installed model and label map before running.
 
-## Contributing & License
+## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and commit conventions. Run `make verify` before opening a pull request.
+Pull requests target `dev`. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and commit conventions, and run `make verify` before opening a pull request.
 
 Licensed under the [MIT License](LICENSE).
