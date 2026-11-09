@@ -486,6 +486,7 @@ async fn wait_for_shutdown_signal() {
 
 #[tokio::main(worker_threads = 4)]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -575,7 +576,11 @@ async fn main() -> Result<()> {
     let san_hosts = sanitize_san_hosts(&raw_san_hosts);
     let go2rtc_supervisor = state.go2rtc_supervisor.clone();
     let camera_metrics = state.camera_metrics.clone();
-    let app_http = build_router_with_auth(state.clone(), false);
+    let enforce_http_auth = std::env::var("NINJANVR_HTTP_ENFORCE_AUTH")
+        .or_else(|_| std::env::var("NINJANVR_ENFORCE_HTTP_AUTH"))
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let app_http = build_router_with_auth(state.clone(), enforce_http_auth);
     let app_https = build_router_with_auth(state, true);
     let (shutdown_tx, mut http_shutdown_rx) = watch::channel(false);
 

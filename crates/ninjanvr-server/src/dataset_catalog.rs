@@ -107,6 +107,7 @@ impl VisionAiTransport for ReqwestVisionAiTransport {
         req: &VisionAiProviderRequest,
         timeout: Duration,
     ) -> Result<Value, String> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -1874,7 +1875,15 @@ pub async fn discover_genai_models(genai: &GenAiConfig) -> Result<Vec<String>> {
     Ok(models)
 }
 
-pub async fn api_genai_models_get(Query(query): Query<GenAiValidateRequest>) -> Response {
+pub async fn api_genai_models_get(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Query(query): Query<GenAiValidateRequest>,
+) -> Response {
+    if let Err(err_resp) = crate::authorize_admin_read(&state, &jar, &headers).await {
+        return err_resp;
+    }
     let _ = query.validate;
     Json(json!([])).into_response()
 }

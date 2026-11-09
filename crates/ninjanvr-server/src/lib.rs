@@ -1062,9 +1062,12 @@ async fn api_profiles(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn api_users(State(state): State<AppState>) -> Json<Value> {
+async fn api_users(State(state): State<AppState>, jar: CookieJar, headers: HeaderMap) -> Response {
+    if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
+        return err_resp;
+    }
     let users = state.db.list_users().unwrap_or_default();
-    Json(Value::Array(users))
+    Json(Value::Array(users)).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1083,19 +1086,13 @@ fn default_admin_role() -> String {
 
 async fn api_user_create(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     Json(body): Json<CreateUserBody>,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers, &uri) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-            })),
-        )
-            .into_response();
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
     }
     if body.password.len() > 1024 {
         return (
@@ -1160,20 +1157,14 @@ pub struct UpdateUserPasswordBody {
 
 async fn api_user_password(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     AxumPath(username): AxumPath<String>,
     Json(body): Json<UpdateUserPasswordBody>,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers, &uri) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-            })),
-        )
-            .into_response();
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
     }
     if body.password.len() > 1024 {
         return (
@@ -1255,20 +1246,14 @@ pub struct UpdateUserCamerasBody {
 
 async fn api_user_role(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     AxumPath(username): AxumPath<String>,
     Json(body): Json<UpdateUserRoleBody>,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers, &uri) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-            })),
-        )
-            .into_response();
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
     }
     if let Some(ref cams) = body.allowed_cameras
         && (cams.len() > 4096
@@ -1330,20 +1315,14 @@ async fn api_user_role(
 
 async fn api_user_cameras(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     AxumPath(username): AxumPath<String>,
     Json(body): Json<UpdateUserCamerasBody>,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers, &uri) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-            })),
-        )
-            .into_response();
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
     }
     match state
         .db
@@ -1375,19 +1354,13 @@ async fn api_user_cameras(
 
 async fn api_user_delete(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     AxumPath(username): AxumPath<String>,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers, &uri) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-            })),
-        )
-            .into_response();
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
     }
     match state.db.delete_user(&username) {
         Ok(true) => {
@@ -1438,26 +1411,27 @@ fn default_token_scope() -> String {
     "read_only".to_string()
 }
 
-async fn api_tokens_list(State(state): State<AppState>) -> Json<Value> {
+async fn api_tokens_list(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
+        return err_resp;
+    }
     let tokens = state.db.list_api_tokens().unwrap_or_default();
-    Json(Value::Array(tokens))
+    Json(Value::Array(tokens)).into_response()
 }
 
 async fn api_token_create(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     Json(body): Json<CreateApiTokenBody>,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers, &uri) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-            })),
-        )
-            .into_response();
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
     }
     let trimmed_name = body.name.trim();
     if trimmed_name.is_empty()
@@ -1507,19 +1481,13 @@ async fn api_token_create(
 
 async fn api_token_delete(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers, &uri) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-            })),
-        )
-            .into_response();
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
     }
     let token_name = state.db.list_api_tokens().ok().and_then(|tokens| {
         tokens.into_iter().find_map(|item| {
@@ -1937,29 +1905,31 @@ async fn api_config(
     Json(api_cfg)
 }
 
-async fn api_config_raw(State(state): State<AppState>) -> Json<Value> {
+async fn api_config_raw(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
+        return err_resp;
+    }
     let cfg = state.config.read().await;
     Json(Value::String(scrub_raw_yaml_secrets_strict(
         &cfg.raw_yaml,
         &cfg,
     )))
+    .into_response()
 }
 
 async fn api_config_save(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers, &uri) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-            })),
-        )
-            .into_response();
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
     }
     if body.len() > 1_048_576 {
         return (
@@ -2032,19 +2002,13 @@ async fn api_config_save(
 
 async fn api_config_structured(
     State(state): State<AppState>,
+    jar: CookieJar,
     uri: Uri,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if !verify_cookie_csrf_origin(&headers, &uri) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-            })),
-        )
-            .into_response();
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
     }
     let commit_res = tokio::spawn(async move {
         let _commit_guard = state.config_coordinator.lock_commit().await;
@@ -2105,8 +2069,16 @@ async fn api_config_structured(
     }
 }
 
-async fn api_config_set() -> Json<Value> {
-    Json(json!({ "success": true, "message": "Config updated" }))
+async fn api_config_set(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
+    }
+    Json(json!({ "success": true, "message": "Config updated" })).into_response()
 }
 
 fn build_detector_catalog_value(state: &AppState) -> Value {
@@ -2163,8 +2135,16 @@ async fn api_ffmpeg_presets() -> Json<Value> {
     }))
 }
 
-async fn api_restart() -> Json<Value> {
-    Json(json!({ "success": true, "message": "Restart acknowledged" }))
+async fn api_restart(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
+        return err_resp;
+    }
+    Json(json!({ "success": true, "message": "Restart acknowledged" })).into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2177,9 +2157,14 @@ pub struct LogsQueryParams {
 
 async fn api_service_logs(
     State(state): State<AppState>,
+    jar: CookieJar,
+    headers: HeaderMap,
     AxumPath(service): AxumPath<String>,
     Query(q): Query<LogsQueryParams>,
 ) -> Response {
+    if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
+        return err_resp;
+    }
     if q.download == Some(true) {
         let (_, lines) = state.log_hub.query_lines(&service, None, None);
         let body = format!("{}\n", lines.join("\n"));
@@ -2981,8 +2966,15 @@ async fn api_debug_reprocess(
         )
             .into_response();
     }
-    if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
-        return err_resp;
+    if !caller_can_mutate(&state, &jar, &headers, true).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Admin role required"
+            })),
+        )
+            .into_response();
     }
     if !is_safe_go2rtc_stream_name(&body.camera) {
         return (
@@ -3545,6 +3537,16 @@ async fn api_debug_lpr_simulate(
         )
             .into_response();
     }
+    if !caller_can_mutate(&state, &jar, &headers, true).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Admin role required"
+            })),
+        )
+            .into_response();
+    }
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     let (camera, lpr_cfg) = {
         let cfg = state.config.read().await;
@@ -3896,6 +3898,13 @@ async fn api_camera_proxy_root(
         )
             .into_response();
     }
+    if !caller_can_mutate(&state, &jar, &headers, true).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Admin role required" })),
+        )
+            .into_response();
+    }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
         && !allowed.iter().any(|a| a == &camera || a == "*")
     {
@@ -3921,6 +3930,13 @@ async fn api_notifications_test(
                 "success": false,
                 "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
             })),
+        )
+            .into_response();
+    }
+    if !caller_can_mutate(&state, &jar, &headers, true).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Admin role required" })),
         )
             .into_response();
     }
@@ -3981,7 +3997,14 @@ async fn api_federation_nodes(
     State(state): State<AppState>,
     jar: CookieJar,
     headers: HeaderMap,
-) -> Json<Value> {
+) -> Response {
+    if !caller_can_mutate(&state, &jar, &headers, true).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Admin role required" })),
+        )
+            .into_response();
+    }
     let allowed = caller_allowed_cameras(&state, &jar, &headers).await;
     let (mut local_cams, peers) = {
         let cfg = state.config.read().await;
@@ -4002,6 +4025,7 @@ async fn api_federation_nodes(
         "cameras": local_cams
     })];
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::none())
@@ -4060,12 +4084,13 @@ async fn api_federation_nodes(
         }));
     }
 
-    Json(json!({ "nodes": nodes }))
+    Json(json!({ "nodes": nodes })).into_response()
 }
 
 async fn api_federation_proxy(
     State(state): State<AppState>,
     method: axum::http::Method,
+    jar: CookieJar,
     headers: HeaderMap,
     AxumPath((node, subpath)): AxumPath<(String, String)>,
     uri: Uri,
@@ -4079,6 +4104,28 @@ async fn api_federation_proxy(
             Json(json!({
                 "success": false,
                 "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
+            })),
+        )
+            .into_response();
+    }
+    if !caller_can_mutate(&state, &jar, &headers, true).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Admin role required"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
+        && !allowed.iter().any(|a| a == "*")
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Admin role required"
             })),
         )
             .into_response();
@@ -4155,6 +4202,7 @@ async fn api_federation_proxy(
         target_url.push_str(q);
     }
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -4228,6 +4276,13 @@ async fn api_camera_proxy_subpath(
                 "success": false,
                 "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
             })),
+        )
+            .into_response();
+    }
+    if !caller_can_mutate(&state, &jar, &headers, true).await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "success": false, "message": "Admin role required" })),
         )
             .into_response();
     }
@@ -4311,6 +4366,7 @@ async fn handle_camera_webui_proxy(
         target_url.push_str(q);
     }
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(4))
         .redirect(reqwest::redirect::Policy::none())
@@ -14448,6 +14504,7 @@ pub async fn new_app_state(
     media_dir: PathBuf,
     spawn_go2rtc: bool,
 ) -> Result<AppState> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cfg = NinjaConfig::load(config_path)?;
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("/config"));
     restore_persistent_clips_mirrors(&media_dir, config_dir);

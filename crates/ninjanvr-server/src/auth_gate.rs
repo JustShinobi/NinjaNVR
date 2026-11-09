@@ -206,6 +206,16 @@ impl AuthSessionGate {
     }
 
     #[allow(clippy::result_large_err)]
+    pub async fn authorize_admin_read(
+        &self,
+        state: &AppState,
+        jar: &CookieJar,
+        headers: &HeaderMap,
+    ) -> Result<CallerPrincipal, Response> {
+        authorize_admin_read(state, jar, headers).await
+    }
+
+    #[allow(clippy::result_large_err)]
     pub async fn authorize_mutation(
         &self,
         state: &AppState,
@@ -216,6 +226,17 @@ impl AuthSessionGate {
         target: AccessTarget<'_>,
     ) -> Result<CallerPrincipal, Response> {
         authorize_mutation(state, jar, uri, headers, require_admin, target).await
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn authorize_global_admin_mutation(
+        &self,
+        state: &AppState,
+        jar: &CookieJar,
+        uri: &Uri,
+        headers: &HeaderMap,
+    ) -> Result<CallerPrincipal, Response> {
+        authorize_global_admin_mutation(state, jar, uri, headers).await
     }
 }
 
@@ -281,6 +302,41 @@ pub enum AccessTarget<'a> {
     DatasetSampleId(&'a str),
 }
 
+/// Returns `true` when `ip` belongs to loopback, RFC1918 private, link-local,
+/// RFC 6598 CGNAT (`100.64.0.0/10`), or IPv6 Unique Local (`fc00::/7`) address space.
+pub fn is_internal_peer_ip(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || (oct[0] == 100 && (oct[1] & 0b1100_0000) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            v6.is_loopback() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Returns `true` when an `x-peer-ip` header is present and resolves to a non-internal
+/// (public internet or malformed) IP address, requiring explicit authentication even on
+/// the internal HTTP router.
+pub fn is_external_public_peer_ip(headers: &HeaderMap) -> bool {
+    let Some(raw) = headers.get("x-peer-ip").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    match trimmed.parse::<std::net::IpAddr>() {
+        Ok(ip) => !is_internal_peer_ip(ip),
+        Err(_) => true,
+    }
+}
+
 /// Authenticates a read caller and resolves their effective camera scope (restricting
 /// `"metrics"` tokens to `Some(Vec::new())`).
 #[allow(clippy::result_large_err)]
@@ -312,7 +368,8 @@ pub async fn authenticate_read(
     }
     let has_supplied_credentials = headers.contains_key(header::AUTHORIZATION)
         || jar.get(&cfg.auth.cookie_name).is_some()
-        || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some());
+        || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some())
+        || is_external_public_peer_ip(headers);
     if has_supplied_credentials {
         Err((
             StatusCode::UNAUTHORIZED,
@@ -326,6 +383,27 @@ pub async fn authenticate_read(
             allowed_cameras: None,
         })
     }
+}
+
+/// Enforces that a read caller on an admin-only endpoint holds the unrestricted `admin` role.
+#[allow(clippy::result_large_err)]
+pub async fn authorize_admin_read(
+    state: &AppState,
+    jar: &CookieJar,
+    headers: &HeaderMap,
+) -> Result<CallerPrincipal, Response> {
+    let principal = authenticate_read(state, jar, headers).await?;
+    if !principal.is_admin() || principal.camera_scope().is_restricted() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Admin role required"
+            })),
+        )
+            .into_response());
+    }
+    Ok(principal)
 }
 
 /// Verifies CSRF origin, mutation role / admin requirement, and target camera access
@@ -361,7 +439,8 @@ pub async fn authorize_mutation(
         } else {
             let has_creds = headers.contains_key(header::AUTHORIZATION)
                 || jar.get(&cfg.auth.cookie_name).is_some()
-                || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some());
+                || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some())
+                || is_external_public_peer_ip(headers);
             if !has_creds {
                 CallerPrincipal {
                     username: "admin".to_string(),
@@ -495,6 +574,30 @@ pub async fn authorize_mutation(
         }
     }
 
+    Ok(principal)
+}
+
+/// Verifies CSRF origin and requires an unrestricted (`allowed_cameras` is `None` or `"*"`)
+/// `admin` role for system-wide configuration, user, and API token mutations.
+#[allow(clippy::result_large_err)]
+pub async fn authorize_global_admin_mutation(
+    state: &AppState,
+    jar: &CookieJar,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Result<CallerPrincipal, Response> {
+    let principal =
+        authorize_mutation(state, jar, uri, headers, true, AccessTarget::Global).await?;
+    if principal.camera_scope().is_restricted() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "success": false,
+                "message": "Admin role required"
+            })),
+        )
+            .into_response());
+    }
     Ok(principal)
 }
 
@@ -668,7 +771,8 @@ pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
 pub fn is_protected_path(path: &str) -> bool {
     if matches!(
         path,
-        "/api/login"
+        "/api/version"
+            | "/api/login"
             | "/api/logout"
             | "/api/auth/first_time_login"
             | "/api/auth/providers"
@@ -1067,7 +1171,7 @@ pub async fn auth_gate_middleware(
         )
             .into_response();
     }
-    if enforce_auth && is_protected_path(&path) {
+    if (enforce_auth || is_external_public_peer_ip(req.headers())) && is_protected_path(&path) {
         let auth_cfg = state.config.read().await.auth.clone();
         if auth_cfg.enabled {
             let Some((user, role)) =
@@ -1821,6 +1925,7 @@ pub async fn api_auth_oidc_login(
 
     // Discover authorization_endpoint or fall back to standard /authorize
     let mut auth_endpoint = format!("{issuer}/authorize");
+    let _ = rustls::crypto::ring::default_provider().install_default();
     if let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::none())
@@ -2005,6 +2110,8 @@ pub async fn api_auth_oidc_callback(
     let mut token_endpoint = format!("{issuer}/oauth/v2/token");
     let mut userinfo_endpoint = format!("{issuer}/oidc/v1/userinfo");
     let mut jwks_endpoint: Option<String> = None;
+    let mut disc_loaded = false;
+    let _ = rustls::crypto::ring::default_provider().install_default();
     if let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -2014,59 +2121,80 @@ pub async fn api_auth_oidc_callback(
             .get(format!("{issuer}/.well-known/openid-configuration"))
             .send()
             .await
-            && resp.status().is_success()
-            && let Ok(disc_bytes) = read_upstream_body_bounded(resp, 256 * 1024).await
-            && let Ok(disc) = serde_json::from_slice::<Value>(&disc_bytes)
         {
-            if let Some(disc_iss) = disc.get("issuer")
-                && !disc_iss
-                    .as_str()
-                    .is_some_and(|s| s.trim().trim_end_matches('/') == issuer.as_str())
-            {
+            if resp.status() != StatusCode::NOT_FOUND && !resp.status().is_success() {
                 return (
                     StatusCode::UNAUTHORIZED,
-                    Json(json!({ "message": "OIDC discovery issuer mismatch" })),
+                    Json(json!({ "message": "OIDC discovery endpoint returned error status" })),
                 )
                     .into_response();
             }
-            if let Some(ep_val) = disc.get("token_endpoint") {
-                let Some(ep) = ep_val
-                    .as_str()
-                    .filter(|ep| is_valid_oidc_discovered_endpoint(ep, &issuer))
-                else {
+            if resp.status().is_success() {
+                let Ok(disc_bytes) = read_upstream_body_bounded(resp, 256 * 1024).await else {
                     return (
                         StatusCode::UNAUTHORIZED,
-                        Json(json!({ "message": "Invalid or disallowed OIDC token_endpoint" })),
+                        Json(json!({ "message": "Invalid OIDC discovery payload" })),
                     )
                         .into_response();
                 };
-                token_endpoint = ep.trim().to_string();
-            }
-            if let Some(uep_val) = disc.get("userinfo_endpoint") {
-                let Some(uep) = uep_val
-                    .as_str()
-                    .filter(|uep| is_valid_oidc_discovered_endpoint(uep, &issuer))
-                else {
+                let Ok(disc) = serde_json::from_slice::<Value>(&disc_bytes) else {
                     return (
                         StatusCode::UNAUTHORIZED,
-                        Json(json!({ "message": "Invalid or disallowed OIDC userinfo_endpoint" })),
+                        Json(json!({ "message": "Malformed OIDC discovery JSON" })),
                     )
                         .into_response();
                 };
-                userinfo_endpoint = uep.trim().to_string();
-            }
-            if let Some(jep_val) = disc.get("jwks_uri") {
-                let Some(jep) = jep_val
-                    .as_str()
-                    .filter(|jep| is_valid_oidc_discovered_endpoint(jep, &issuer))
-                else {
+                disc_loaded = true;
+                if let Some(disc_iss) = disc.get("issuer")
+                    && !disc_iss
+                        .as_str()
+                        .is_some_and(|s| s.trim().trim_end_matches('/') == issuer.as_str())
+                {
                     return (
                         StatusCode::UNAUTHORIZED,
-                        Json(json!({ "message": "Invalid or disallowed OIDC jwks_uri" })),
+                        Json(json!({ "message": "OIDC discovery issuer mismatch" })),
                     )
                         .into_response();
-                };
-                jwks_endpoint = Some(jep.trim().to_string());
+                }
+                if let Some(ep_val) = disc.get("token_endpoint") {
+                    let Some(ep) = ep_val
+                        .as_str()
+                        .filter(|ep| is_valid_oidc_discovered_endpoint(ep, &issuer))
+                    else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Invalid or disallowed OIDC token_endpoint" })),
+                        )
+                            .into_response();
+                    };
+                    token_endpoint = ep.trim().to_string();
+                }
+                if let Some(uep_val) = disc.get("userinfo_endpoint") {
+                    let Some(uep) = uep_val
+                        .as_str()
+                        .filter(|uep| is_valid_oidc_discovered_endpoint(uep, &issuer))
+                    else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Invalid or disallowed OIDC userinfo_endpoint" })),
+                        )
+                            .into_response();
+                    };
+                    userinfo_endpoint = uep.trim().to_string();
+                }
+                if let Some(jep_val) = disc.get("jwks_uri") {
+                    let Some(jep) = jep_val
+                        .as_str()
+                        .filter(|jep| is_valid_oidc_discovered_endpoint(jep, &issuer))
+                    else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Invalid or disallowed OIDC jwks_uri" })),
+                        )
+                            .into_response();
+                    };
+                    jwks_endpoint = Some(jep.trim().to_string());
+                }
             }
         }
 
@@ -2150,6 +2278,13 @@ pub async fn api_auth_oidc_callback(
                         )
                             .into_response();
                     };
+                    let Ok(jwt_hdr) = jsonwebtoken::decode_header(id_token) else {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Unsupported OIDC ID token algorithm" })),
+                        )
+                            .into_response();
+                    };
                     if let Some(ref jwks_url) = jwks_endpoint {
                         let Ok(jwks_resp) = client.get(jwks_url).send().await else {
                             return (
@@ -2180,13 +2315,6 @@ pub async fn api_auth_oidc_callback(
                             return (
                                 StatusCode::UNAUTHORIZED,
                                 Json(json!({ "message": "Malformed OIDC JWKS JSON" })),
-                            )
-                                .into_response();
-                        };
-                        let Ok(jwt_hdr) = jsonwebtoken::decode_header(id_token) else {
-                            return (
-                                StatusCode::UNAUTHORIZED,
-                                Json(json!({ "message": "Unsupported OIDC ID token algorithm" })),
                             )
                                 .into_response();
                         };
@@ -2246,6 +2374,12 @@ pub async fn api_auth_oidc_callback(
                             )
                                 .into_response();
                         }
+                    } else if disc_loaded {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "OIDC discovery document missing required jwks_uri for asymmetric ID token" })),
+                        )
+                            .into_response();
                     }
                     let Ok(payload_bytes) =
                         base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1])
@@ -3059,7 +3193,8 @@ pub async fn caller_allowed_cameras(
     }
     let has_supplied_credentials = headers.contains_key(header::AUTHORIZATION)
         || jar.get(&cfg.auth.cookie_name).is_some()
-        || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some());
+        || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some())
+        || is_external_public_peer_ip(headers);
     if cfg.auth.enabled && has_supplied_credentials {
         Some(Vec::new())
     } else {
@@ -3139,7 +3274,8 @@ pub async fn caller_can_mutate(
     }
     let has_creds = headers.contains_key(header::AUTHORIZATION)
         || jar.get(&cfg.auth.cookie_name).is_some()
-        || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some());
+        || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some())
+        || is_external_public_peer_ip(headers);
     if !has_creds {
         return true;
     }

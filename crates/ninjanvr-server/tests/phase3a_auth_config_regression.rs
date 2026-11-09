@@ -1159,6 +1159,17 @@ async fn phase3a_cycle2_oidc_jwks_yaml_block_scrub_ssrf_userinfo_and_proxy_harde
                         }))
                         .into_response();
                     }
+                    if mode == "disc_missing_jwks_rs256" {
+                        return Json(json!({
+                            "issuer": iss,
+                            "token_endpoint": format!("{iss}/oauth/v2/token"),
+                            "userinfo_endpoint": format!("{iss}/oidc/v1/userinfo")
+                        }))
+                        .into_response();
+                    }
+                    if mode == "disc_500" {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
                     Json(json!({
                         "issuer": iss,
                         "token_endpoint": format!("{iss}/oauth/v2/token"),
@@ -1221,6 +1232,17 @@ async fn phase3a_cycle2_oidc_jwks_yaml_block_scrub_ssrf_userinfo_and_proxy_harde
                         }
                         "ui_only_missing_sub" => {
                             Json(json!({ "access_token": "tok_only_ui" })).into_response()
+                        }
+                        "disc_missing_jwks_rs256" => {
+                            let h = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                .encode(r#"{"alg":"RS256","typ":"JWT"}"#);
+                            let p = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                                json!({"sub":"alice","iss":iss,"aud":"nvr-client","exp":exp})
+                                    .to_string()
+                                    .as_bytes(),
+                            );
+                            Json(json!({ "id_token": format!("{h}.{p}.forged_sig") }))
+                                .into_response()
                         }
                         "jwks_valid" => {
                             let ok_tok = jsonwebtoken::encode(
@@ -1323,6 +1345,8 @@ version: 0.18-0
         "jwks_bad_sig",
         "disc_bad_issuer",
         "disc_ssrf_jwks",
+        "disc_missing_jwks_rs256",
+        "disc_500",
         "id_missing_sub",
         "ui_only_missing_sub",
     ] {
@@ -1987,6 +2011,124 @@ version: 0.18-0
         .await
         .unwrap();
     assert_eq!(r_mcp_bad_tok.status(), StatusCode::UNAUTHORIZED);
+
+    // 8. [VULN-001] External public peer IP on direct_app (enforce_auth = false) is rejected with 401 on protected routes,
+    //    while /api/version remains 200 OK for liveness/readiness probes.
+    let r_pub_ver = direct_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/version")
+                .header("x-peer-ip", "203.0.113.45")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_pub_ver.status(), StatusCode::OK);
+
+    for (method, protected_uri) in [
+        ("GET", "/api/users"),
+        ("GET", "/api/tokens"),
+        ("GET", "/api/config"),
+        ("GET", "/api/config/raw"),
+        ("POST", "/api/config/save"),
+        ("POST", "/api/restart"),
+    ] {
+        let r_ext = direct_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(protected_uri)
+                    .header("x-peer-ip", "203.0.113.45")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r_ext.status(),
+            StatusCode::UNAUTHORIZED,
+            "External public peer IP on direct_app must be rejected with 401 on {method} {protected_uri}"
+        );
+    }
+
+    // 9. [VULN-001] Direct handler RBAC on direct_app (enforce_auth = false) blocks non-admin and camera-restricted callers
+    //    across all admin-only read and mutation endpoints.
+    let viewer_bearer = format!(
+        "Bearer {}",
+        mint_test_jwt(&state.jwt_secret, "viewer_u", "viewer", Some("*"))
+    );
+    let operator_bearer = format!(
+        "Bearer {}",
+        mint_test_jwt(&state.jwt_secret, "op_u", "operator", Some("*"))
+    );
+    for (method, admin_uri, body_str) in [
+        ("GET", "/api/users", ""),
+        (
+            "POST",
+            "/api/users",
+            r#"{"username":"x","password":"password1234","role":"admin"}"#,
+        ),
+        (
+            "PUT",
+            "/api/users/admin/password",
+            r#"{"password":"password1234"}"#,
+        ),
+        ("PUT", "/api/users/admin/role", r#"{"role":"viewer"}"#),
+        (
+            "PUT",
+            "/api/users/admin/cameras",
+            r#"{"allowed_cameras":"front_door"}"#,
+        ),
+        ("DELETE", "/api/users/admin", ""),
+        ("GET", "/api/tokens", ""),
+        ("POST", "/api/tokens", r#"{"name":"t1","scope":"full"}"#),
+        ("DELETE", "/api/tokens/tok_1", ""),
+        ("GET", "/api/config/raw", ""),
+        ("POST", "/api/config/save", "cameras: {}\n"),
+        ("POST", "/api/config/structured", r#"{}"#),
+        ("PUT", "/api/config/set", ""),
+        ("POST", "/api/restart", ""),
+        ("GET", "/api/logs/ninjanvr", ""),
+        ("GET", "/api/genai/models", ""),
+        (
+            "POST",
+            "/api/debug/lpr-simulate",
+            r#"{"camera":"front_door","plate":"BRA2E19"}"#,
+        ),
+        (
+            "POST",
+            "/api/debug/reprocess",
+            r#"{"camera":"front_door","start_time":1000.0,"end_time":1010.0}"#,
+        ),
+        ("POST", "/api/notifications/test", ""),
+        ("GET", "/api/camera-proxy/front_door", ""),
+        ("GET", "/api/federation/nodes", ""),
+        ("GET", "/api/federation/valid_peer/stats", ""),
+    ] {
+        for caller_auth in [&viewer_bearer, &operator_bearer] {
+            let r_direct = direct_app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(admin_uri)
+                        .header(header::AUTHORIZATION, caller_auth)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body_str))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r_direct.status(),
+                StatusCode::FORBIDDEN,
+                "Non-admin caller on direct_app must receive 403 FORBIDDEN on {method} {admin_uri}"
+            );
+        }
+    }
 
     upstream_task.abort();
     let _ = std::fs::remove_dir_all(&tmp_dir);
