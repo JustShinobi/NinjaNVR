@@ -41,6 +41,7 @@ pub const GENAI_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PRIVACY_MASK_DEPTH: usize = 16;
 
 pub fn build_snapshot_http_client() -> Option<reqwest::Client> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     reqwest::Client::builder()
         .timeout(Duration::from_millis(1500))
         .redirect(reqwest::redirect::Policy::none())
@@ -3592,6 +3593,10 @@ mod tests {
         assert_eq!(lpr_ev["data"]["recognized_license_plate"], json!("ABC1D23"));
         assert_eq!(lpr_ev["sub_label"], json!("Family SUV"));
         assert!(lpr_ev["data"]["license_plate_box"].is_array());
+        assert!(
+            build_snapshot_http_client().is_some(),
+            "build_snapshot_http_client must install rustls provider and succeed"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
