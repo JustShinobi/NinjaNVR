@@ -338,7 +338,7 @@ fn make_full_box(box_type: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Ve
     out
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct ParsedSample {
     offset: usize,
     size: u32,

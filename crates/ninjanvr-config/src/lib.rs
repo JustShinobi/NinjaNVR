@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
-const O_NOFOLLOW_FLAG: i32 = 0o100000;
+pub const O_NOFOLLOW_FLAG: i32 = 0o100000;
 #[cfg(all(
     target_os = "linux",
     not(any(target_arch = "arm", target_arch = "aarch64"))
 ))]
-const O_NOFOLLOW_FLAG: i32 = 0o400000;
+pub const O_NOFOLLOW_FLAG: i32 = 0o400000;
 #[cfg(any(
     target_os = "macos",
     target_os = "ios",
@@ -22,7 +22,7 @@ const O_NOFOLLOW_FLAG: i32 = 0o400000;
     target_os = "openbsd",
     target_os = "netbsd"
 ))]
-const O_NOFOLLOW_FLAG: i32 = 0x0100;
+pub const O_NOFOLLOW_FLAG: i32 = 0x0100;
 #[cfg(all(
     unix,
     not(any(
@@ -34,7 +34,59 @@ const O_NOFOLLOW_FLAG: i32 = 0x0100;
         target_os = "netbsd"
     ))
 ))]
-const O_NOFOLLOW_FLAG: i32 = 0;
+pub const O_NOFOLLOW_FLAG: i32 = 0;
+
+/// Opens a regular file without following symlinks and verifies that the opened descriptor
+/// matches the pre-open `lstat` device and inode on Unix platforms.
+pub fn open_regular_file_nofollow(
+    path: &Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let lmeta = std::fs::symlink_metadata(path)?;
+    if !lmeta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW_FLAG);
+    }
+    let file = opts.open(path)?;
+    let fd_meta = file.metadata()?;
+    if !fd_meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "opened descriptor is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if fd_meta.dev() != lmeta.dev() || fd_meta.ino() != lmeta.ino() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file inode changed during open",
+            ));
+        }
+    }
+    Ok((file, fd_meta))
+}
+
+/// Creates a new regular file exclusively (`O_CREAT | O_EXCL | O_NOFOLLOW`) without following symlinks.
+pub fn create_new_file_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(O_NOFOLLOW_FLAG);
+    }
+    opts.open(path)
+}
 
 static GO2RTC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -854,7 +906,7 @@ impl Default for DetectConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct StationaryConfig {
     #[serde(default = "default_stationary_interval")]
     pub interval: u32,
@@ -1140,7 +1192,7 @@ impl Default for RecordConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RecordDaysConfig {
     #[serde(default = "default_retain_days")]
     pub days: f64,
@@ -1158,7 +1210,7 @@ impl Default for RecordDaysConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct RecordZeroDaysConfig {
     #[serde(default)]
     pub days: f64,
@@ -1243,7 +1295,7 @@ pub enum SnapshotSelectionPolicy {
     BestAttribute,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SnapshotsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,

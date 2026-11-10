@@ -9,88 +9,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::{NaiveDateTime, TimeZone, Utc};
-use ninjanvr_config::{AudioConfig, NinjaConfig};
+use ninjanvr_config::{
+    AudioConfig, NinjaConfig, O_NOFOLLOW_FLAG, create_new_file_nofollow, open_regular_file_nofollow,
+};
 use ninjanvr_db::{EventDto, NinjaDatabase, RecordingRow, ReviewItemDto, strip_media_root};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-
-#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
-const O_NOFOLLOW_FLAG: i32 = 0o100000;
-#[cfg(all(
-    target_os = "linux",
-    not(any(target_arch = "arm", target_arch = "aarch64"))
-))]
-const O_NOFOLLOW_FLAG: i32 = 0o400000;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
-const O_NOFOLLOW_FLAG: i32 = 0x0100;
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))
-))]
-const O_NOFOLLOW_FLAG: i32 = 0;
-
-fn open_regular_file_nofollow(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
-    let lmeta = std::fs::symlink_metadata(path)?;
-    if !lmeta.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(O_NOFOLLOW_FLAG);
-    }
-    let file = opts.open(path)?;
-    let fd_meta = file.metadata()?;
-    if !fd_meta.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "opened descriptor is not a regular file",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if fd_meta.dev() != lmeta.dev() || fd_meta.ino() != lmeta.ino() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "file inode changed during open",
-            ));
-        }
-    }
-    Ok((file, fd_meta))
-}
-
-fn create_new_file_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(O_NOFOLLOW_FLAG);
-    }
-    opts.open(path)
-}
 
 fn copy_file_via_nofollow(src: &Path, dst_new: &Path) -> std::io::Result<u64> {
     let (mut src_file, _) = open_regular_file_nofollow(src)?;

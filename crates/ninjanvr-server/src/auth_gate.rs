@@ -687,33 +687,6 @@ pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
     {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        #[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
-        const O_NOFOLLOW_FLAG: i32 = 0o100000;
-        #[cfg(all(
-            target_os = "linux",
-            not(any(target_arch = "arm", target_arch = "aarch64"))
-        ))]
-        const O_NOFOLLOW_FLAG: i32 = 0o400000;
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd"
-        ))]
-        const O_NOFOLLOW_FLAG: i32 = 0x0100;
-        #[cfg(all(
-            unix,
-            not(any(
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "freebsd",
-                target_os = "openbsd",
-                target_os = "netbsd"
-            ))
-        ))]
-        const O_NOFOLLOW_FLAG: i32 = 0;
 
         let persist_res = (|| -> std::io::Result<()> {
             if std::fs::symlink_metadata(&secret_path)
@@ -728,7 +701,7 @@ pub fn load_or_create_jwt_secret(config_dir: &Path) -> String {
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .custom_flags(O_NOFOLLOW_FLAG)
+                .custom_flags(ninjanvr_config::O_NOFOLLOW_FLAG)
                 .open(&tmp_path)?;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             file.write_all(secret.as_bytes())?;

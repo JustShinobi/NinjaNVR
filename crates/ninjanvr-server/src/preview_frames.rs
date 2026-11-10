@@ -27,7 +27,7 @@ const PREVIEW_KEEPALIVE_SECS: f64 = 30.0;
 /// While something is happening: at most 1 frame/s (2 frame/s with a moving
 /// vehicle, which crosses the frame quickly). While idle: one frame every
 /// 30 s so a timeline never has long blank stretches.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct PreviewFrameSampler {
     last_output: Option<f64>,
 }

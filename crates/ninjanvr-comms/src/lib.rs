@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ninjanvr_config::{MqttConfig, is_safe_tls_path};
+use ninjanvr_config::{MqttConfig, O_NOFOLLOW_FLAG, is_safe_tls_path};
 use rumqttc::{
     AsyncClient, Event as MqttEvent, LastWill, MqttOptions, Packet, QoS, TlsConfiguration,
     Transport,
@@ -14,34 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
-
-#[cfg(all(target_os = "linux", any(target_arch = "arm", target_arch = "aarch64")))]
-const O_NOFOLLOW_FLAG: i32 = 0o100000;
-#[cfg(all(
-    target_os = "linux",
-    not(any(target_arch = "arm", target_arch = "aarch64"))
-))]
-const O_NOFOLLOW_FLAG: i32 = 0o400000;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd"
-))]
-const O_NOFOLLOW_FLAG: i32 = 0x0100;
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ))
-))]
-const O_NOFOLLOW_FLAG: i32 = 0;
 
 static PROFILE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 

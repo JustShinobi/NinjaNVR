@@ -65,7 +65,7 @@ pub struct TrackedObject {
     pub inferred_sub_label: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct ZonePresenceState {
     consecutive_in_frames: u32,
     first_entered_ts: f64,

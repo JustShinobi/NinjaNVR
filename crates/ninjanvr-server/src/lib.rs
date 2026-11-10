@@ -11226,7 +11226,7 @@ fn go2rtc_stream_has_native_backchannel(
     false
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
 pub struct HardwareQueryParams {
     pub timeout_ms: Option<u64>,
 }
