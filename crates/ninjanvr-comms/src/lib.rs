@@ -1851,7 +1851,7 @@ cameras:
             "disarmed"
         );
         let hub3 = CommsHub::new();
-        hub3.set_profile_persist_path(profile_path.clone());
+        hub3.set_profile_persist_path(profile_path);
         assert_eq!(hub3.get_active_profile(), "disarmed");
         assert_eq!(hub3.set_active_profile("   "), "armed");
 
@@ -2323,7 +2323,7 @@ cameras:
             std::os::unix::fs::symlink(&victim, &profile_path).unwrap();
 
             let hub_sym_read = CommsHub::new();
-            hub_sym_read.set_profile_persist_path(profile_path.clone());
+            hub_sym_read.set_profile_persist_path(profile_path);
             assert_eq!(
                 hub_sym_read.get_active_profile(),
                 "armed",
@@ -2381,10 +2381,7 @@ cameras:
         // 1. Initial persistence of default profile ("armed") inside a Tokio runtime
         assert_eq!(hub.set_active_profile("armed"), "armed");
         for _ in 0..400 {
-            if std::fs::read_to_string(&profile_path)
-                .map(|s| s.trim() == "armed")
-                .unwrap_or(false)
-            {
+            if std::fs::read_to_string(&profile_path).is_ok_and(|s| s.trim() == "armed") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2416,10 +2413,7 @@ cameras:
         assert_eq!(hub.set_active_profile("home"), "home");
         assert_eq!(hub.set_active_profile("off"), "disarmed");
         for _ in 0..400 {
-            if std::fs::read_to_string(&profile_path)
-                .map(|s| s.trim() == "disarmed")
-                .unwrap_or(false)
-            {
+            if std::fs::read_to_string(&profile_path).is_ok_and(|s| s.trim() == "disarmed") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

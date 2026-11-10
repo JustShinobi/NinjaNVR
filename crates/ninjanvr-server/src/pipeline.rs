@@ -556,8 +556,7 @@ pub type SharedLatestYuvFrames = Arc<RwLock<HashMap<String, YuvFrame>>>;
 fn unix_now_f64() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+        .map_or(0.0, |d| d.as_secs_f64())
 }
 
 fn random_suffix() -> String {
@@ -1407,7 +1406,8 @@ impl VisionPipeline {
     /// Evaluates a YUV420p frame for camera tamper / occlusion hysteresis (`tamper_threshold_frames`
     /// consecutive blind/flat frames) and updates `CommsHub`, `LogBufferHub`, and SQLite `reviewsegment`.
     /// Returns `true` when the camera is currently in an active tamper state.
-    #[allow(clippy::too_many_arguments)]
+    // Frame-loop evaluation passing borrowed frame buffer and mutable hysteresis counter directly
+    #[expect(clippy::too_many_arguments)]
     pub async fn evaluate_camera_tamper(
         &self,
         camera: &str,
@@ -1481,7 +1481,8 @@ impl VisionPipeline {
     /// Evaluates all configured `state_rois` on a camera frame (respecting `interval_sec`,
     /// motion-settle triggers, and `hysteresis`), publishes transitions over MQTT and `/ws`,
     /// and emits a `ReviewSegment` alert when an `anomaly_state` persists `>= anomaly_timeout_sec`.
-    #[allow(clippy::too_many_arguments)]
+    // Frame-loop ROI state evaluation passing borrowed frame buffer, motion boxes, and monitor state directly
+    #[expect(clippy::too_many_arguments)]
     pub async fn evaluate_camera_roi_states(
         &self,
         camera: &str,
@@ -1762,13 +1763,11 @@ impl VisionPipeline {
             let sup_alerts =
                 is_camera_alert_suppressed_in_profile(&cfg_guard, &active_profile, camera);
             let prof_cfg = lookup_profile_override(&cfg_guard, &active_profile);
-            let sup_rec = prof_cfg
-                .map(|p| {
-                    p.disabled_record_cameras
-                        .iter()
-                        .any(|c| c == camera || c == "*")
-                })
-                .unwrap_or(false);
+            let sup_rec = prof_cfg.is_some_and(|p| {
+                p.disabled_record_cameras
+                    .iter()
+                    .any(|c| c == camera || c == "*")
+            });
             (
                 sup_alerts,
                 sup_rec,
@@ -1793,8 +1792,7 @@ impl VisionPipeline {
                         .attributes
                         .iter()
                         .find(|a| a.label.eq_ignore_ascii_case("license_plate"))
-                        .map(|a| a.score)
-                        .unwrap_or(trk.score);
+                        .map_or(trk.score, |a| a.score);
                     self.detector.record_lpr_track_read(
                         &trk.id,
                         ninjanvr_infer::OcrPlateRead::new(cand.clone(), read_score),
@@ -3184,8 +3182,7 @@ mod tests {
         assert!(ws_msgs1.iter().any(|m| {
             m["topic"] == "events"
                 && serde_json::from_str::<Value>(m["payload"].as_str().unwrap_or("{}"))
-                    .map(|p| p["type"] == "new" && p["after"]["id"] == trk.id)
-                    .unwrap_or(false)
+                    .is_ok_and(|p| p["type"] == "new" && p["after"]["id"] == trk.id)
         }));
         let timeline1 = pipeline
             .db
@@ -3232,8 +3229,7 @@ mod tests {
         assert!(ws_msgs2.iter().any(|m| {
             m["topic"] == "events"
                 && serde_json::from_str::<Value>(m["payload"].as_str().unwrap_or("{}"))
-                    .map(|p| p["type"] == "update")
-                    .unwrap_or(false)
+                    .is_ok_and(|p| p["type"] == "update")
         }));
 
         // Verify BestInZone rejects snapshot overwrite when object leaves zone, whereas BestOverall accepts it
@@ -3351,14 +3347,12 @@ mod tests {
         assert!(ws_msgs_end.iter().any(|m| {
             m["topic"] == "events"
                 && serde_json::from_str::<Value>(m["payload"].as_str().unwrap_or("{}"))
-                    .map(|p| p["type"] == "end" && p["after"]["id"] == trk.id)
-                    .unwrap_or(false)
+                    .is_ok_and(|p| p["type"] == "end" && p["after"]["id"] == trk.id)
         }));
         assert!(ws_msgs_end.iter().any(|m| {
             m["topic"] == "reviews"
                 && serde_json::from_str::<Value>(m["payload"].as_str().unwrap_or("{}"))
-                    .map(|p| p["type"] == "end" && p["after"]["id"] == rev_id)
-                    .unwrap_or(false)
+                    .is_ok_and(|p| p["type"] == "end" && p["after"]["id"] == rev_id)
         }));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -4801,8 +4795,9 @@ cameras:
             ws_msgs.iter().any(|m| {
                 m["topic"] == "siren"
                     && serde_json::from_str::<Value>(m["payload"].as_str().unwrap_or("{}"))
-                        .map(|p| p["camera"] == "escritorio" && p["trigger"] == "line:cantinho")
-                        .unwrap_or(false)
+                        .is_ok_and(|p| {
+                            p["camera"] == "escritorio" && p["trigger"] == "line:cantinho"
+                        })
             }),
             "crossing a line with siren=true must publish a 'siren' event"
         );

@@ -629,7 +629,7 @@ impl MseStreamHub {
             sub.burst = caches
                 .get(stream_key)
                 .and_then(|c| c.snapshot_fresh_burst(MAX_GOP_CACHE_AGE));
-            sub.last_seq = sub.burst.as_ref().map(|b| b.last_seq).unwrap_or(0);
+            sub.last_seq = sub.burst.as_ref().map_or(0, |b| b.last_seq);
         }
 
         Some(sub)
@@ -659,14 +659,11 @@ async fn run_upstream_worker(
     loop {
         let should_run = {
             let mut sessions = hub.sessions.write().await;
-            let active = sessions
-                .get(&stream)
-                .map(|s| {
-                    s.persistent
-                        || s.active_clients.load(Ordering::SeqCst) > 0
-                        || Instant::now() < s.expires_at
-                })
-                .unwrap_or(false);
+            let active = sessions.get(&stream).is_some_and(|s| {
+                s.persistent
+                    || s.active_clients.load(Ordering::SeqCst) > 0
+                    || Instant::now() < s.expires_at
+            });
             if !active {
                 sessions.remove(&stream);
             }

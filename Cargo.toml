@@ -22,10 +22,19 @@ authors = ["NinjaNVR Contributors"]
 
 [workspace.lints.rust]
 unused_must_use = "deny"
+nonstandard_style = { level = "deny", priority = -1 }
+future_incompatible = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 missing_safety_doc = "deny"
+redundant_clone = "deny"
+clone_on_copy = "deny"
+needless_collect = "deny"
+manual_ok_or = "deny"
+map_unwrap_or = "deny"
+result_large_err = "deny"
+type_complexity = "deny"
 
 [workspace.dependencies]
 anyhow = "1.0"

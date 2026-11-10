@@ -230,9 +230,7 @@ pub fn build_media_playlist_with_resolutions(
         };
         let cur_rate = safe_size / dur;
 
-        let time_gap = prev_end
-            .map(|pe| (seg.start_time - pe).abs() > 1.5)
-            .unwrap_or(false);
+        let time_gap = prev_end.is_some_and(|pe| (seg.start_time - pe).abs() > 1.5);
         let res_changed = match (prev_res, cur_res) {
             (Some(pr), Some(cr)) => pr != cr,
             _ => false,
@@ -449,8 +447,7 @@ fn parse_tracks_from_moov(
                         && s.duration > 0
                         && s.offset
                             .checked_add(s.size as usize)
-                            .map(|end| end <= file_len)
-                            .unwrap_or(false)
+                            .is_some_and(|end| end <= file_len)
                 });
                 let soun_bytes: Option<usize> = t
                     .samples
@@ -467,8 +464,7 @@ fn parse_tracks_from_moov(
                     s.size > 0
                         && s.offset
                             .checked_add(s.size as usize)
-                            .map(|end| end <= file_len)
-                            .unwrap_or(false)
+                            .is_some_and(|end| end <= file_len)
                 });
                 if t.samples.is_empty() {
                     continue;
@@ -1163,9 +1159,8 @@ pub fn is_fmp4_sync_fragment(buf: &[u8]) -> bool {
             continue;
         }
         let traf_boxes = iter_boxes(b.payload);
-        let (track_id, default_flags) = find_box(&traf_boxes, b"tfhd")
-            .map(parse_tfhd_track_and_default_flags)
-            .unwrap_or((None, None));
+        let (track_id, default_flags) =
+            find_box(&traf_boxes, b"tfhd").map_or((None, None), parse_tfhd_track_and_default_flags);
         if matches!(track_id, Some(id) if id != 1) {
             continue;
         }

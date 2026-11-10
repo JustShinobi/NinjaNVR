@@ -116,10 +116,7 @@ impl ActiveReviewState {
             self.dirty = true;
         }
         if let Some(sc) = enriched.effective_sub_label_score
-            && self
-                .sub_label_score
-                .map(|prev_sc| sc > prev_sc)
-                .unwrap_or(true)
+            && self.sub_label_score.is_none_or(|prev_sc| sc > prev_sc)
         {
             self.sub_label_score = Some(sc);
             self.dirty = true;
@@ -308,7 +305,7 @@ pub fn enrich_tracked_object(input: TrackEnrichmentInput<'_>) -> EnrichedTrackMe
     let frame = input.frame;
 
     let is_new = prev.is_none();
-    let prev_zones: &[String] = prev.map(|p| p.zones.as_slice()).unwrap_or(&[]);
+    let prev_zones: &[String] = prev.map_or(&[], |p| p.zones.as_slice());
     let newly_entered_zones: Vec<String> = trk
         .entered_zones
         .iter()
@@ -316,15 +313,14 @@ pub fn enrich_tracked_object(input: TrackEnrichmentInput<'_>) -> EnrichedTrackMe
         .cloned()
         .collect();
 
-    let prev_best_score = prev.map(|p| p.best_score).unwrap_or(0.0);
+    let prev_best_score = prev.map_or(0.0, |p| p.best_score);
     let best_score = if input.is_ended {
-        prev.map(|s| s.best_score.max(trk.top_score))
-            .unwrap_or(trk.top_score)
+        prev.map_or(trk.top_score, |s| s.best_score.max(trk.top_score))
     } else {
         prev_best_score.max(trk.score)
     };
 
-    let prev_best_attr_quality = prev.map(|p| p.best_attribute_score).unwrap_or(0.0);
+    let prev_best_attr_quality = prev.map_or(0.0, |p| p.best_attribute_score);
     let attr_q_from_boxes = trk
         .attributes
         .iter()
@@ -342,14 +338,11 @@ pub fn enrich_tracked_object(input: TrackEnrichmentInput<'_>) -> EnrichedTrackMe
     };
     let best_attr_score = prev_best_attr_quality.max(new_attr_quality);
 
-    let is_better_score = prev
-        .map(|p| trk.score > p.best_score + 0.05)
-        .unwrap_or(true);
+    let is_better_score = prev.is_none_or(|p| trk.score > p.best_score + 0.05);
     let is_better_attr = (prev_best_attr_quality <= 0.0 && new_attr_quality > 0.0)
         || new_attr_quality > prev_best_attr_quality + 0.02;
-    let state_changed = prev
-        .map(|p| p.zones != trk.entered_zones || p.stationary != trk.stationary)
-        .unwrap_or(false);
+    let state_changed =
+        prev.is_some_and(|p| p.zones != trk.entered_zones || p.stationary != trk.stationary);
 
     let recognized_license_plate = input.lpr_consensus.map(|c| c.plate.clone());
     let mut effective_sub_label = input
@@ -373,13 +366,14 @@ pub fn enrich_tracked_object(input: TrackEnrichmentInput<'_>) -> EnrichedTrackMe
         effective_sub_label_score = Some(matched_score);
     }
 
-    let attrs_changed = prev
-        .map(|p| {
+    let attrs_changed = prev.map_or(
+        !merged_attributes.is_empty() || effective_sub_label.is_some(),
+        |p| {
             p.sub_label != effective_sub_label
                 || p.sub_label_score != effective_sub_label_score
                 || p.detected_attributes != merged_attributes
-        })
-        .unwrap_or(!merged_attributes.is_empty() || effective_sub_label.is_some());
+        },
+    );
 
     let norm_box = trk.bbox.to_normalized(frame.width, frame.height);
     let norm_reg = trk.region.to_normalized(frame.width, frame.height);
@@ -719,13 +713,11 @@ pub fn is_camera_alert_suppressed_in_profile(
     camera: &str,
 ) -> bool {
     let prof_cfg = lookup_profile_override(cfg, active_profile);
-    prof_cfg
-        .map(|p| {
-            p.disabled_alerts_cameras
-                .iter()
-                .any(|c| c == camera || c == "*")
-        })
-        .unwrap_or(false)
+    prof_cfg.is_some_and(|p| {
+        p.disabled_alerts_cameras
+            .iter()
+            .any(|c| c == camera || c == "*")
+    })
 }
 
 pub fn compute_track_severity_for_profile(

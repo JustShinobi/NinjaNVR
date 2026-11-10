@@ -388,7 +388,7 @@ pub fn validate_genai_base_url(raw: &str) -> Result<(), String> {
     {
         return Err("Disallowed or invalid GenAI base_url".to_string());
     }
-    let after_scheme = trimmed.split_once("://").map(|(_, r)| r).unwrap_or("");
+    let after_scheme = trimmed.split_once("://").map_or("", |(_, r)| r);
     let authority = after_scheme
         .split(['/', '?', '#'])
         .next()
@@ -1239,9 +1239,10 @@ fn redact_sample_bytes_once(
     }
 
     // Active privacy masks: decode to RGB (or fail closed to matte tactical dark) and redact once.
-    let mut rgb = image::load_from_memory(raw_image_bytes)
-        .map(|img| img.to_rgb8())
-        .unwrap_or_else(|_| RgbImage::from_pixel(64, 36, Rgb([12, 14, 18])));
+    let mut rgb = image::load_from_memory(raw_image_bytes).map_or_else(
+        |_| RgbImage::from_pixel(64, 36, Rgb([12, 14, 18])),
+        |img| img.to_rgb8(),
+    );
 
     match build_mask_config_value(masks) {
         Some(mask_val) => {
@@ -1960,12 +1961,7 @@ pub async fn api_genai_models_post(
     };
     let base_url_matches_saved = match req.base_url.as_deref().map(str::trim) {
         None => true,
-        Some("") => saved
-            .base_url
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty(),
+        Some("") => saved.base_url.as_deref().map_or("", str::trim).is_empty(),
         Some(b) => Some(b) == saved.base_url.as_deref().map(str::trim),
     };
     let effective = build_effective_genai_config(&saved, &req);
@@ -2213,8 +2209,7 @@ pub async fn verify_event_with_genai_components(
         parse_ai_judge_json_verdict(&resp_json).map_err(|e| anyhow::anyhow!(e))?;
     let verified_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+        .map_or(0.0, |d| d.as_secs_f64());
 
     let verification = json!({
         "is_true_positive": is_true_positive,
@@ -2657,8 +2652,7 @@ pub async fn create_dataset_sample_from_event_with_config(
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+        .map_or(0.0, |d| d.as_secs_f64());
 
     let dto = DatasetSampleDto {
         id: sample_id.clone(),

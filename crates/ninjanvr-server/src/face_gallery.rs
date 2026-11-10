@@ -381,7 +381,8 @@ impl FaceIdentityCatalog {
 
     /// Resolves `raw_sub_label` against enrolled face profiles (preserving canonical case),
     /// updates `event_id` in `db`, and optionally enrolls `enroll_sample_bytes` into the gallery.
-    #[allow(clippy::too_many_arguments)]
+    // Narrow dependency injection (db, detector, media_dir) keeps unit tests deterministic without AppState
+    #[expect(clippy::too_many_arguments)]
     pub fn assign_event_sub_label(
         &self,
         db: &NinjaDatabase,
@@ -401,8 +402,7 @@ impl FaceIdentityCatalog {
                 profiles
                     .iter()
                     .find(|p| p.name.eq_ignore_ascii_case(s))
-                    .map(|p| p.name.clone())
-                    .unwrap_or_else(|| s.to_string())
+                    .map_or_else(|| s.to_string(), |p| p.name.clone())
             });
         let updated = db
             .set_event_sub_label_with_score(event_id, canonical.as_deref(), score)
@@ -427,7 +427,8 @@ impl FaceIdentityCatalog {
     /// Enrolls a face profile sample, mirrors the sample into `clips/faces/<profile>/`,
     /// optionally assigns the canonical profile name to `event_to_assign`, and optionally
     /// backfills historical person events.
-    #[allow(clippy::too_many_arguments)]
+    // Narrow dependency injection (db, detector, media_dir) keeps unit tests deterministic without AppState
+    #[expect(clippy::too_many_arguments)]
     pub fn enroll_profile(
         &self,
         db: &NinjaDatabase,
@@ -446,10 +447,9 @@ impl FaceIdentityCatalog {
         let matched_profile = profiles
             .iter()
             .find(|p| p.name.eq_ignore_ascii_case(clean_name));
-        let canonical_name = matched_profile
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| clean_name.to_string());
-        let sample_count = matched_profile.map(|p| p.sample_count).unwrap_or(1);
+        let canonical_name =
+            matched_profile.map_or_else(|| clean_name.to_string(), |p| p.name.clone());
+        let sample_count = matched_profile.map_or(1, |p| p.sample_count);
 
         mirror_face_sample_to_clips(media_dir, &canonical_name, &saved_path);
 
@@ -547,7 +547,7 @@ impl FaceIdentityCatalog {
             }
             profiles.retain_mut(|p| {
                 p.sample_files.retain(|fname| {
-                    let stem = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname);
+                    let stem = fname.rsplit_once('.').map_or(fname.as_str(), |(s, _)| s);
                     match db.get_event(stem) {
                         Ok(Some(ev)) => ev["camera"]
                             .as_str()
@@ -824,8 +824,7 @@ pub async fn api_face_enroll(
             let stripped = b64
                 .trim()
                 .split_once(";base64,")
-                .map(|(_, data)| data)
-                .unwrap_or_else(|| b64.trim());
+                .map_or_else(|| b64.trim(), |(_, data)| data);
             base64::engine::general_purpose::STANDARD
                 .decode(stripped)
                 .unwrap_or_else(|_| stripped.as_bytes().to_vec())

@@ -291,8 +291,7 @@ pub fn new_activity_ledger() -> SharedActivityLedger {
 fn unix_now_f64() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+        .map_or(0.0, |d| d.as_secs_f64())
 }
 
 fn random_suffix() -> String {
@@ -1729,10 +1728,7 @@ impl RecordingEngine {
         }
         let record_allowed = {
             let ledger = self.activity_ledger.read().await;
-            ledger
-                .get(camera)
-                .map(|r| r.is_record_enabled())
-                .unwrap_or(true)
+            ledger.get(camera).is_none_or(|r| r.is_record_enabled())
         };
 
         struct StagedSegmentProbe {
@@ -1792,10 +1788,9 @@ impl RecordingEngine {
 
         let (motion, objects, regions, ledger_dbfs) = {
             let ledger = self.activity_ledger.read().await;
-            ledger
-                .get(camera)
-                .map(|ring| ring.aggregate_range_with_audio(start_time, end_time))
-                .unwrap_or((0, 0, 0, 0))
+            ledger.get(camera).map_or((0, 0, 0, 0), |ring| {
+                ring.aggregate_range_with_audio(start_time, end_time)
+            })
         };
         let dbfs = if ledger_dbfs != 0 {
             ledger_dbfs
@@ -1813,16 +1808,16 @@ impl RecordingEngine {
 
         let audio_cfg = {
             let cfg = self.config.read().await;
-            cfg.cameras
-                .get(camera)
-                .map(|c| {
+            cfg.cameras.get(camera).map_or_else(
+                || cfg.audio.clone(),
+                |c| {
                     if c.audio.enabled {
                         c.audio.clone()
                     } else {
                         cfg.audio.clone()
                     }
-                })
-                .unwrap_or_else(|| cfg.audio.clone())
+                },
+            )
         };
 
         let db_ref = self.db.clone();
@@ -2321,8 +2316,7 @@ impl RecordingEngine {
                             .stderr(Stdio::null())
                             .kill_on_drop(true);
                         let mut status = cmd.status().await;
-                        if !status.as_ref().map(|s| s.success()).unwrap_or(false)
-                            && compact_hwaccel != "none"
+                        if !status.as_ref().is_ok_and(|s| s.success()) && compact_hwaccel != "none"
                         {
                             let fallback_args = build_cold_compaction_ffmpeg_args(
                                 &disk_path,
@@ -2341,7 +2335,7 @@ impl RecordingEngine {
                                 .kill_on_drop(true);
                             status = fb_cmd.status().await;
                         }
-                        let ff_success = status.map(|s| s.success()).unwrap_or(false);
+                        let ff_success = status.is_ok_and(|s| s.success());
                         let db_fin = self.db.clone();
                         let tmp_out_fin = tmp_out.clone();
                         let _ = tokio::task::spawn_blocking(move || {
@@ -2354,8 +2348,7 @@ impl RecordingEngine {
                                 && new_meta.len() < orig_len
                                 && probe_mp4_duration_fast(&tmp_out_fin).is_some()
                                 && std::fs::symlink_metadata(&disk_path)
-                                    .map(|m| m.file_type().is_file())
-                                    .unwrap_or(false)
+                                    .is_ok_and(|m| m.file_type().is_file())
                             {
                                 if std::fs::rename(&tmp_out_fin, &disk_path).is_ok() {
                                     final_mb = ((new_meta.len() as f64) / (1024.0 * 1024.0)
@@ -2401,8 +2394,7 @@ impl RecordingEngine {
                             {
                                 effective_global_max_mb = Some(
                                     effective_global_max_mb
-                                        .map(|m| m.min(allowed_mb))
-                                        .unwrap_or(allowed_mb),
+                                        .map_or(allowed_mb, |m| m.min(allowed_mb)),
                                 );
                             }
                         }
@@ -2508,12 +2500,10 @@ impl RecordingEngine {
         }
         let rec_root = self.media_dir.join("recordings");
         let in_hot = std::fs::canonicalize(&rec_root)
-            .map(|r| canon_parent.starts_with(&r) && canon_file.starts_with(&r))
-            .unwrap_or(false);
+            .is_ok_and(|r| canon_parent.starts_with(&r) && canon_file.starts_with(&r));
         let in_cold = cold_dir
             .and_then(|c| std::fs::canonicalize(c).ok())
-            .map(|c| canon_parent.starts_with(&c) && canon_file.starts_with(&c))
-            .unwrap_or(false);
+            .is_some_and(|c| canon_parent.starts_with(&c) && canon_file.starts_with(&c));
         if in_hot || in_cold {
             Some(canon_file)
         } else {
@@ -2582,8 +2572,7 @@ impl RecordingEngine {
         };
         let in_allowed_subdir = ["clips", "exports", "previews"].into_iter().any(|sub| {
             std::fs::canonicalize(self.media_dir.join(sub))
-                .map(|canon_sub| canon_parent.starts_with(&canon_sub))
-                .unwrap_or(false)
+                .is_ok_and(|canon_sub| canon_parent.starts_with(&canon_sub))
         });
         if !in_allowed_subdir {
             return false;
@@ -2650,10 +2639,7 @@ impl RecordingEngine {
                     clips_dir.join(format!("share_redacted_{safe_id}.webp")),
                     clips_dir.join(format!("share_clip_{safe_id}.webp")),
                 ] {
-                    if std::fs::symlink_metadata(&path)
-                        .map(|m| m.file_type().is_file())
-                        .unwrap_or(false)
-                    {
+                    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
                         let _ = std::fs::remove_file(path);
                     }
                 }
@@ -2719,12 +2705,10 @@ impl RecordingEngine {
                             }
                             let start_ts = segs
                                 .first()
-                                .map(|s| s.start_time.max(hour_start))
-                                .unwrap_or(hour_start);
+                                .map_or(hour_start, |s| s.start_time.max(hour_start));
                             let end_ts = segs
                                 .last()
-                                .map(|s| s.end_time.min(hour_end))
-                                .unwrap_or(hour_end.min(now));
+                                .map_or(hour_end.min(now), |s| s.end_time.min(hour_end));
                             let duration = (end_ts - start_ts).max(1.0);
 
                             if std::fs::create_dir_all(&preview_dir_prep).is_err() {
@@ -2739,7 +2723,7 @@ impl RecordingEngine {
                                     return None;
                                 }
                                 if let Ok(mtime) = meta.modified()
-                                    && mtime.elapsed().map(|d| d.as_secs() < 900).unwrap_or(false)
+                                    && mtime.elapsed().is_ok_and(|d| d.as_secs() < 900)
                                 {
                                     return None;
                                 }
@@ -2753,8 +2737,7 @@ impl RecordingEngine {
                                     PathBuf::from(&seg.path)
                                 };
                                 if std::fs::symlink_metadata(&local_path)
-                                    .map(|m| m.file_type().is_file())
-                                    .unwrap_or(false)
+                                    .is_ok_and(|m| m.file_type().is_file())
                                     && let (Some(root_canon), Ok(seg_canon)) =
                                         (&canon_media_dir, std::fs::canonicalize(&local_path))
                                     && seg_canon.starts_with(root_canon)
@@ -2819,7 +2802,7 @@ impl RecordingEngine {
                     .stderr(Stdio::null())
                     .kill_on_drop(true);
                     let status = cmd.status().await;
-                    let ff_ok = status.map(|s| s.success()).unwrap_or(false);
+                    let ff_ok = status.is_ok_and(|s| s.success());
                     let db_fin = self.db.clone();
                     let cam_fin = camera.clone();
                     let list_fin = list_file.clone();
@@ -2828,8 +2811,7 @@ impl RecordingEngine {
                         let _ = std::fs::remove_file(&list_fin);
                         if ff_ok
                             && std::fs::symlink_metadata(&tmp_out_fin)
-                                .map(|m| m.file_type().is_file() && m.len() > 0)
-                                .unwrap_or(false)
+                                .is_ok_and(|m| m.file_type().is_file() && m.len() > 0)
                             && std::fs::rename(&tmp_out_fin, &out_file).is_ok()
                         {
                             let id = format!("{cam_fin}_{hour_start_i64}");
@@ -2983,10 +2965,7 @@ pub fn migrate_hot_segments_to_cold(
                 );
                 continue;
             }
-            if std::fs::symlink_metadata(&dst_path)
-                .map(|m| !m.file_type().is_file())
-                .unwrap_or(false)
-            {
+            if std::fs::symlink_metadata(&dst_path).is_ok_and(|m| !m.file_type().is_file()) {
                 warn!(
                     "Skipping tier migration for non-regular destination {}",
                     dst_path.display()
@@ -3023,22 +3002,19 @@ pub fn migrate_hot_segments_to_cold(
                 return Ok(migrated);
             }
             if db.update_recording_path(&id, &new_db_path)? {
-                if std::fs::symlink_metadata(&src_path)
-                    .map(|m| {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::MetadataExt;
-                            m.file_type().is_file()
-                                && m.dev() == src_meta.dev()
-                                && m.ino() == src_meta.ino()
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            m.file_type().is_file()
-                        }
-                    })
-                    .unwrap_or(false)
-                {
+                if std::fs::symlink_metadata(&src_path).is_ok_and(|m| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        m.file_type().is_file()
+                            && m.dev() == src_meta.dev()
+                            && m.ino() == src_meta.ino()
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        m.file_type().is_file()
+                    }
+                }) {
                     let _ = std::fs::remove_file(&src_path);
                     prune_empty_parent_dirs(&src_path, &hot_rec_root);
                 }
@@ -3089,7 +3065,8 @@ pub fn build_alert_backup_paths(
 
 /// Automatically exports/copies a high-severity Alert clip and its best snapshot
 /// into a secondary/offsite directory `target_dir/<YYYY-MM-DD>/<camera>_<ts_ms>_<label>.mp4`.
-#[allow(clippy::too_many_arguments)]
+// Internal media pipeline helper passing distinct FFmpeg/segment parameters directly
+#[expect(clippy::too_many_arguments)]
 pub async fn backup_alert_clip(
     db: &NinjaDatabase,
     media_dir: &Path,
@@ -3207,7 +3184,7 @@ pub async fn backup_alert_clip(
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let remux_ok = cmd.status().await.map(|st| st.success()).unwrap_or(false);
+        let remux_ok = cmd.status().await.is_ok_and(|st| st.success());
         !remux_ok
     } else {
         false
@@ -3224,8 +3201,7 @@ pub async fn backup_alert_clip(
         if existing_paths.len() > 1 {
             let valid_tmp = !remux_needed_fallback
                 && std::fs::symlink_metadata(&tmp_mp4_fin)
-                    .map(|m| m.file_type().is_file() && m.len() > 0)
-                    .unwrap_or(false);
+                    .is_ok_and(|m| m.file_type().is_file() && m.len() > 0);
             if valid_tmp {
                 std::fs::rename(&tmp_mp4_fin, &out_mp4_fin).with_context(|| {
                     format!(
@@ -3613,7 +3589,8 @@ pub async fn build_mp4_export(
 
 /// Concatenates recording segments in `[start, end]` into a single MP4 export file,
 /// optionally stripping the audio track when `include_audio` is `false`.
-#[allow(clippy::too_many_arguments)]
+// Internal media pipeline helper passing distinct FFmpeg/segment parameters directly
+#[expect(clippy::too_many_arguments)]
 pub async fn build_mp4_export_with_options(
     db: &NinjaDatabase,
     media_dir: &Path,
@@ -3640,7 +3617,8 @@ pub async fn build_mp4_export_with_options(
 
 /// Concatenates recording segments in `[start, end]` into a single MP4 export file,
 /// optionally stripping audio and redacting `privacy_mask` regions via FFmpeg `drawbox`.
-#[allow(clippy::too_many_arguments)]
+// Internal media pipeline helper passing distinct FFmpeg/segment parameters directly
+#[expect(clippy::too_many_arguments)]
 pub async fn build_mp4_export_with_privacy(
     db: &NinjaDatabase,
     media_dir: &Path,
@@ -3718,7 +3696,8 @@ pub fn build_export_temp_paths(
     (tmp_out_file, list_file)
 }
 
-#[allow(clippy::too_many_arguments)]
+// Internal media pipeline helper passing distinct FFmpeg/segment parameters directly
+#[expect(clippy::too_many_arguments)]
 async fn build_mp4_export_inner(
     db: &NinjaDatabase,
     media_dir: &Path,
@@ -3824,9 +3803,7 @@ async fn build_mp4_export_inner(
                 } else {
                     PathBuf::from(&seg.path)
                 };
-                if std::fs::symlink_metadata(&local_path)
-                    .map(|m| m.file_type().is_file())
-                    .unwrap_or(false)
+                if std::fs::symlink_metadata(&local_path).is_ok_and(|m| m.file_type().is_file())
                     && let (Some(root_canon), Ok(seg_canon)) =
                         (&canon_media_dir, std::fs::canonicalize(&local_path))
                     && seg_canon.starts_with(root_canon)
@@ -3860,9 +3837,7 @@ async fn build_mp4_export_inner(
         .await
         .context("export preparation task panicked")??;
 
-    let trim_offset = first_seg_start
-        .map(|s0| (start_time - s0).max(0.0))
-        .unwrap_or(0.0);
+    let trim_offset = first_seg_start.map_or(0.0, |s0| (start_time - s0).max(0.0));
     let target_dur = (end_time - start_time).clamp(3.0, 86_400.0);
 
     let ffmpeg_bin = resolve_ffmpeg_bin();
@@ -3881,7 +3856,7 @@ async fn build_mp4_export_inner(
         .kill_on_drop(true);
     let status = cmd.args(&ffmpeg_args).status().await;
 
-    let ff_ok = status.map(|s| s.success()).unwrap_or(false);
+    let ff_ok = status.is_ok_and(|s| s.success());
     let mask_configured = privacy_mask_is_configured(privacy_mask);
     let list_file_v = list_file.clone();
     let tmp_out_v = tmp_out_file.clone();
@@ -3896,8 +3871,7 @@ async fn build_mp4_export_inner(
         }
         let valid_tmp = ff_ok
             && std::fs::symlink_metadata(&tmp_out_v)
-                .map(|m| m.file_type().is_file() && m.len() >= 1024)
-                .unwrap_or(false);
+                .is_ok_and(|m| m.file_type().is_file() && m.len() >= 1024);
         if !valid_tmp {
             let _ = std::fs::remove_file(&tmp_out_v);
             if mask_configured {
@@ -3965,7 +3939,7 @@ async fn build_mp4_export_inner(
         .status()
         .await;
 
-    let thumb_ok = thumb_status.map(|s| s.success()).unwrap_or(false);
+    let thumb_ok = thumb_status.is_ok_and(|s| s.success());
     let db_fin = db.clone();
     let exp_id_fin = export_id.to_string();
     let cam_fin = camera.to_string();

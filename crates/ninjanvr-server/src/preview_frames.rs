@@ -191,8 +191,7 @@ impl PreviewFrameStore {
     pub fn contains(&self, camera: &str, ts_ms: u64) -> bool {
         self.index
             .read()
-            .map(|idx| idx.get(camera).is_some_and(|set| set.contains(&ts_ms)))
-            .unwrap_or(false)
+            .is_ok_and(|idx| idx.get(camera).is_some_and(|set| set.contains(&ts_ms)))
     }
 
     /// Frame timestamps within `[start_ms, end_ms]`, spread to at most `limit`.

@@ -1018,10 +1018,7 @@ pub fn resolve_static_media_camera_with_keys(
             return Some(parts[1].to_string());
         }
         if parts.first() == Some(&"dataset") && parts.len() == 2 {
-            let sample_id = parts[1]
-                .rsplit_once('.')
-                .map(|(s, _)| s)
-                .unwrap_or(parts[1]);
+            let sample_id = parts[1].rsplit_once('.').map_or(parts[1], |(s, _)| s);
             if let Ok(Some(sample)) = state.db.get_dataset_sample(sample_id)
                 && !sample.camera.trim().is_empty()
             {
@@ -1030,10 +1027,7 @@ pub fn resolve_static_media_camera_with_keys(
             return None;
         }
         if parts.first() == Some(&"faces") && parts.len() == 3 {
-            let sample_id = parts[2]
-                .rsplit_once('.')
-                .map(|(s, _)| s)
-                .unwrap_or(parts[2]);
+            let sample_id = parts[2].rsplit_once('.').map_or(parts[2], |(s, _)| s);
             if let Ok(Some(ev)) = state.db.get_event(sample_id)
                 && let Some(cam) = ev["camera"].as_str().filter(|s| !s.trim().is_empty())
             {
@@ -1082,10 +1076,7 @@ pub fn resolve_static_media_camera_with_keys(
             return None;
         }
         if parts.len() == 1 {
-            let raw_stem = parts[0]
-                .rsplit_once('.')
-                .map(|(s, _)| s)
-                .unwrap_or(parts[0]);
+            let raw_stem = parts[0].rsplit_once('.').map_or(parts[0], |(s, _)| s);
             let (is_share_artifact, stem) = strip_share_artifact_prefix(raw_stem);
             if !is_share_artifact
                 && let Some(latest_cam) = stem.strip_prefix("latest_").filter(|s| !s.is_empty())
@@ -3557,8 +3548,7 @@ pub(crate) fn extract_url_scheme_and_host(raw: &str) -> Option<(&str, &str)> {
         .trim();
     let host = raw_authority
         .rsplit_once('@')
-        .map(|(_, hp)| hp.trim())
-        .unwrap_or(raw_authority);
+        .map_or(raw_authority, |(_, hp)| hp.trim());
     if !is_valid_host_header_token(host) {
         return None;
     }

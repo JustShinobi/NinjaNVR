@@ -505,7 +505,8 @@ impl CameraDriverRuntime {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    // Direct scalar PTZ pan/tilt/zoom coordinates and step bounds
+    #[expect(clippy::too_many_arguments)]
     pub fn compute_soft_preset_delta(
         &self,
         cur_pan: f64,
@@ -1638,7 +1639,7 @@ pub fn is_safe_onvif_endpoint_url(raw: &str) -> bool {
     if !lower.starts_with("http://") && !lower.starts_with("https://") {
         return false;
     }
-    let after_scheme = trimmed.split_once("://").map(|(_, r)| r).unwrap_or("");
+    let after_scheme = trimmed.split_once("://").map_or("", |(_, r)| r);
     let raw_authority = after_scheme.split('/').next().unwrap_or("").trim();
     if raw_authority.is_empty() || raw_authority.contains('@') {
         return false;
@@ -1764,7 +1765,7 @@ pub fn resolve_onvif_ptz_endpoint(onvif: &ninjanvr_config::OnvifCameraConfig) ->
     let candidate =
         if host_lc_scheme.starts_with("http://") || host_lc_scheme.starts_with("https://") {
             let trimmed = host_raw.trim_end_matches('/');
-            let after_scheme = trimmed.split_once("://").map(|(_, r)| r).unwrap_or("");
+            let after_scheme = trimmed.split_once("://").map_or("", |(_, r)| r);
             if after_scheme.contains('/') {
                 trimmed.to_string()
             } else {
@@ -2211,10 +2212,7 @@ fn find_closing_xml_tag_offset(xml_after_open: &str, local_name: &str) -> Option
         let inner_tag = xml_after_open[tag_start + 1..tag_start + gt_rel].trim();
         if let Some(after_slash) = inner_tag.strip_prefix('/') {
             let raw_tag = after_slash.trim();
-            let candidate_local = raw_tag
-                .rsplit_once(':')
-                .map(|(_, l)| l.trim())
-                .unwrap_or(raw_tag);
+            let candidate_local = raw_tag.rsplit_once(':').map_or(raw_tag, |(_, l)| l.trim());
             if candidate_local.eq_ignore_ascii_case(local_name)
                 && !raw_tag.contains('<')
                 && !raw_tag.contains('/')
@@ -2229,10 +2227,7 @@ fn find_closing_xml_tag_offset(xml_after_open: &str, local_name: &str) -> Option
             && !inner_tag.ends_with('/')
         {
             let tag_token = inner_tag.split_whitespace().next().unwrap_or("");
-            let candidate_local = tag_token
-                .rsplit_once(':')
-                .map(|(_, l)| l)
-                .unwrap_or(tag_token);
+            let candidate_local = tag_token.rsplit_once(':').map_or(tag_token, |(_, l)| l);
             if candidate_local.eq_ignore_ascii_case(local_name) {
                 depth = depth.saturating_add(1);
             }
@@ -2265,10 +2260,7 @@ pub fn extract_xml_element_text<'a>(xml: &'a str, local_name: &str) -> Option<&'
         let header = &xml[tag_start + 1..tag_end];
         let tag_token = header.split_whitespace().next().unwrap_or("");
         let tag_clean = tag_token.trim_end_matches('/');
-        let candidate_local = tag_clean
-            .rsplit_once(':')
-            .map(|(_, l)| l)
-            .unwrap_or(tag_clean);
+        let candidate_local = tag_clean.rsplit_once(':').map_or(tag_clean, |(_, l)| l);
         if candidate_local.eq_ignore_ascii_case(local_name) && !header.ends_with('/') {
             let content_start = tag_end + 1;
             let Some((close_rel, close_end_rel)) =
@@ -2327,8 +2319,7 @@ pub fn parse_onvif_presets_xml(xml: &str) -> Vec<OnvifPresetItem> {
         let local_name = tag_token
             .trim_end_matches('/')
             .rsplit_once(':')
-            .map(|(_, l)| l)
-            .unwrap_or(tag_token.trim_end_matches('/'));
+            .map_or(tag_token.trim_end_matches('/'), |(_, l)| l);
         if local_name.eq_ignore_ascii_case("Preset") && !header.starts_with('/') {
             let token_opt = extract_xml_attr(header, "token").map(str::trim);
             if header.ends_with('/') {
@@ -2392,8 +2383,7 @@ pub fn parse_onvif_status_xml(xml: &str) -> OnvifPtzStatus {
         let local_name = tag_token
             .trim_end_matches('/')
             .rsplit_once(':')
-            .map(|(_, l)| l)
-            .unwrap_or(tag_token.trim_end_matches('/'));
+            .map_or(tag_token.trim_end_matches('/'), |(_, l)| l);
         if local_name.eq_ignore_ascii_case("PanTilt") {
             if let Some(x_str) = extract_xml_attr(header, "x") {
                 pan = parse_onvif_float(x_str, -1.0, 1.0, 0.0);
@@ -2784,7 +2774,7 @@ pub fn format_camera_http_base(host: &str, default_port: u16) -> String {
     let trimmed = host.trim().trim_end_matches('/');
     let lc = trimmed.to_ascii_lowercase();
     if lc.starts_with("http://") || lc.starts_with("https://") {
-        let after_scheme = trimmed.split_once("://").map(|(_, r)| r).unwrap_or("");
+        let after_scheme = trimmed.split_once("://").map_or("", |(_, r)| r);
         if let Some(slash_idx) = after_scheme.find('/') {
             trimmed[..trimmed.len() - (after_scheme.len() - slash_idx)].to_string()
         } else {
@@ -2840,13 +2830,13 @@ pub async fn send_http_digest_request(
     }
 
     let is_audio_post = url.contains("/cgi-bin/audio.cgi") && url.contains("action=postAudio");
-    let authority_key = url
-        .split_once("://")
-        .map(|(sch, rest)| {
+    let authority_key = url.split_once("://").map_or_else(
+        || base_without_query.to_string(),
+        |(sch, rest)| {
             let auth = rest.split('/').next().unwrap_or(rest);
             format!("{sch}://{auth}")
-        })
-        .unwrap_or_else(|| base_without_query.to_string());
+        },
+    );
 
     let build_req = |auth_header: Option<String>, include_body: bool| {
         let mut r = client
@@ -3818,7 +3808,8 @@ pub async fn send_tapo_streamd_alaw_audio(
 /// Routes 8 kHz G.711 A-law (`PCMA`) payloads to either:
 /// - **TP-Link Tapo (`tapo`)**: TCP port `8800` `Streamd` (`POST /stream` + MPEG-TS `audio/mp2t`) using `cloud_password`
 /// - **Intelbras / Dahua (`dahua_cgi`)**: HTTP Digest `POST /cgi-bin/audio.cgi?action=postAudio&httptype=singlepart&channel=1`
-#[allow(clippy::too_many_arguments)]
+// Protocol-agnostic audio backchannel dispatch accepting resolved connection and payload parameters
+#[expect(clippy::too_many_arguments)]
 pub async fn send_camera_talkback_or_siren_alaw(
     client: &reqwest::Client,
     runtime: &CameraDriverRuntime,
@@ -3946,9 +3937,7 @@ pub fn parse_onvif_pull_messages_xml(xml: &str) -> (Option<String>, Vec<String>)
             break;
         };
         let block = &xml[start..start + close_rel];
-        let topic = extract_xml_element_text(block, "Topic")
-            .map(str::trim)
-            .unwrap_or("Event");
+        let topic = extract_xml_element_text(block, "Topic").map_or("Event", str::trim);
         let mut kv_parts = Vec::new();
         let mut sc = 0usize;
         while let Some(s_rel) = block[sc..].find("SimpleItem") {

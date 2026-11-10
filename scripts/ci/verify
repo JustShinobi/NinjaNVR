@@ -9,7 +9,7 @@ cd -- "$repo_root"
 ./scripts/ci/check-privacy
 ./scripts/ci/check-semver
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace
 bun run --cwd web typecheck
 bun run --cwd web test

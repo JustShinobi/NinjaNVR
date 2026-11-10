@@ -451,8 +451,7 @@ impl ByteTracker {
             let (req_inertia, req_loiter) = cfg
                 .zones
                 .get(zname)
-                .map(|zc| (zc.inertia.max(1), zc.loitering_time as f64))
-                .unwrap_or((1, 0.0));
+                .map_or((1, 0.0), |zc| (zc.inertia.max(1), zc.loitering_time as f64));
             if in_raw {
                 let st = track_zone_map.entry(zname.clone()).or_default();
                 if st.consecutive_in_frames == 0
@@ -578,18 +577,13 @@ impl ByteTracker {
             if self.is_detection_masked_or_filtered(&det, cfg) {
                 continue;
             }
-            let raw_high_thresh = cfg
-                .objects
-                .filters
-                .get(&det.label)
-                .map(|f| {
-                    if self.night_mode {
-                        f.night_threshold.unwrap_or(f.threshold)
-                    } else {
-                        f.threshold
-                    }
-                })
-                .unwrap_or(0.7);
+            let raw_high_thresh = cfg.objects.filters.get(&det.label).map_or(0.7, |f| {
+                if self.night_mode {
+                    f.night_threshold.unwrap_or(f.threshold)
+                } else {
+                    f.threshold
+                }
+            });
             let high_thresh = if raw_high_thresh.is_finite() {
                 raw_high_thresh
             } else {
@@ -800,8 +794,7 @@ impl ByteTracker {
                 .objects
                 .filters
                 .get(&det.label)
-                .map(|f| (f.min_score, f.threshold))
-                .unwrap_or((0.5, 0.7));
+                .map_or((0.5, 0.7), |f| (f.min_score, f.threshold));
             let min_score_cfg = if raw_min_score_cfg.is_finite() {
                 raw_min_score_cfg
             } else {
@@ -982,8 +975,7 @@ impl ByteTracker {
             .objects
             .filters
             .get(&det.label)
-            .map(|f| (f.min_score, f.threshold))
-            .unwrap_or((0.5, 0.7));
+            .map_or((0.5, 0.7), |f| (f.min_score, f.threshold));
         let min_score_cfg = if raw_min_score_cfg.is_finite() {
             raw_min_score_cfg
         } else {
@@ -1228,7 +1220,8 @@ pub fn is_delivery_logo_label(label: &str) -> bool {
 
 /// Evaluates whether a newly observed detection frame should replace the active event's snapshot
 /// according to the camera's configured `SnapshotSelectionPolicy` and child attribute quality.
-#[allow(clippy::too_many_arguments)]
+// Hot-path scalar and slice arguments avoid allocating an intermediate struct per frame
+#[expect(clippy::too_many_arguments)]
 pub fn should_replace_snapshot(
     policy: SnapshotSelectionPolicy,
     is_first_snapshot: bool,

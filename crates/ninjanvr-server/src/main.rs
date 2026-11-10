@@ -90,7 +90,7 @@ fn is_valid_san_dns_name(s: &str) -> bool {
 /// Normalizes and filters configured `tls.san_hosts` entries so malformed URLs, ports,
 /// or control characters in `config.yml` cannot crash TLS startup or poison valid SAN entries.
 pub fn sanitize_san_hosts(raw_sans: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     for raw in raw_sans {
         let mut s = raw.trim();
         if s.as_bytes()
@@ -142,11 +142,7 @@ pub fn sanitize_san_hosts(raw_sans: &[String]) -> Vec<String> {
             continue;
         }
         let is_valid = s.parse::<IpAddr>().is_ok() || is_valid_san_dns_name(s);
-        if is_valid
-            && !out
-                .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(s))
-        {
+        if is_valid && !out.iter().any(|existing| existing.eq_ignore_ascii_case(s)) {
             out.push(s.to_string());
         }
     }
@@ -549,9 +545,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let spawn_go2rtc = std::env::var("NINJANVR_DISABLE_GO2RTC")
-        .map(|v| v != "1")
-        .unwrap_or(true);
+    let spawn_go2rtc = !std::env::var("NINJANVR_DISABLE_GO2RTC").is_ok_and(|v| v == "1");
 
     info!(
         "Starting NinjaNVR (config={}, web_dir={}, media_dir={})",
@@ -576,8 +570,7 @@ async fn main() -> Result<()> {
     let camera_metrics = state.camera_metrics.clone();
     let enforce_http_auth = std::env::var("NINJANVR_HTTP_ENFORCE_AUTH")
         .or_else(|_| std::env::var("NINJANVR_ENFORCE_HTTP_AUTH"))
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let app_http = build_router_with_auth(state.clone(), enforce_http_auth);
     let app_https = build_router_with_auth(state, true);
     let (shutdown_tx, mut http_shutdown_rx) = watch::channel(false);

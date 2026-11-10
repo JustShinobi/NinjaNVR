@@ -119,6 +119,13 @@ pub fn normalize_dataset_verifier(requested: Option<&str>) -> &'static str {
     }
 }
 
+/// `(deleted_count, removed_thumb_paths)` or `Err(forbidden_camera)` when scoped access rejects a row.
+pub type ScopedReviewDeleteResult = std::result::Result<(u64, Vec<Option<String>>), String>;
+
+/// Deleted `(event_id, camera, removed_thumb_path)` tuples, or `Err(forbidden_camera)` when scoped access rejects a row.
+pub type ScopedEventDeleteResult =
+    std::result::Result<Vec<(String, String, Option<String>)>, String>;
+
 #[derive(Clone)]
 pub struct NinjaDatabase {
     conn: Arc<Mutex<Connection>>,
@@ -2104,12 +2111,11 @@ impl NinjaDatabase {
         Ok(count as usize)
     }
 
-    #[allow(clippy::type_complexity)]
     pub fn delete_reviews_scoped(
         &self,
         ids: &[String],
         scope: &CameraScope,
-    ) -> Result<Result<(u64, Vec<Option<String>>), String>> {
+    ) -> Result<ScopedReviewDeleteResult> {
         if ids.is_empty() {
             return Ok(Ok((0, Vec::new())));
         }
@@ -3864,12 +3870,11 @@ impl NinjaDatabase {
         Ok(deleted.len())
     }
 
-    #[allow(clippy::type_complexity)]
     pub fn delete_events_bulk_scoped(
         &self,
         ids: &[String],
         scope: &CameraScope,
-    ) -> Result<Result<Vec<(String, String, Option<String>)>, String>> {
+    ) -> Result<ScopedEventDeleteResult> {
         if ids.is_empty() {
             return Ok(Ok(Vec::new()));
         }
@@ -4965,7 +4970,8 @@ impl NinjaDatabase {
         }))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    // Direct SQL column mapping for share_links row insertion
+    #[expect(clippy::too_many_arguments)]
     pub fn insert_share_link(
         &self,
         id: &str,
@@ -4981,7 +4987,8 @@ impl NinjaDatabase {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    // Direct SQL column mapping for share_links row insertion with optional max_views
+    #[expect(clippy::too_many_arguments)]
     pub fn insert_share_link_with_options(
         &self,
         id: &str,
@@ -5470,8 +5477,7 @@ impl NinjaDatabase {
         let rows = stmt.query_map(params![camera, after, before], |r| {
             let raw_path: String = r.get(1)?;
             let src = strip_media_root(&raw_path)
-                .map(|rel| format!("/{rel}"))
-                .unwrap_or_else(|| raw_path.clone());
+                .map_or_else(|| raw_path.clone(), |rel| format!("/{rel}"));
             Ok(json!({
                 "camera": r.get::<_, String>(0)?,
                 "src": src,
@@ -6226,9 +6232,8 @@ pub fn summarize_dataset_samples(samples: &[DatasetSampleDto]) -> Value {
         *by_camera.entry(s.camera.clone()).or_insert(0) += 1;
         total_annotations += s.annotations.len();
         for ann in &s.annotations {
-            let cls_name = security_class_label(ann.class_id)
-                .map(String::from)
-                .unwrap_or_else(|| ann.label.clone());
+            let cls_name =
+                security_class_label(ann.class_id).map_or_else(|| ann.label.clone(), String::from);
             *by_class.entry(cls_name).or_insert(0) += 1;
         }
     }

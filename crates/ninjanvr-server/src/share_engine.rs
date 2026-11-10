@@ -165,11 +165,11 @@ impl FakeShareClipTranscoder {
     }
 
     pub fn redaction_count(&self) -> usize {
-        self.redactions.lock().map(|g| g.len()).unwrap_or(0)
+        self.redactions.lock().map_or(0, |g| g.len())
     }
 
     pub fn audio_strip_count(&self) -> usize {
-        self.audio_strips.lock().map(|g| g.len()).unwrap_or(0)
+        self.audio_strips.lock().map_or(0, |g| g.len())
     }
 
     pub fn recorded_redactions(&self) -> Vec<RecordedRedactionCall> {
@@ -574,8 +574,7 @@ impl ShareLinkEngine {
             tokio::task::spawn_blocking(move || {
                 if is_regular_non_symlink_file(&red_p) {
                     let hash_matches = read_non_symlink_string(&mh_p)
-                        .map(|existing_hash| existing_hash.trim() == exp_hash)
-                        .unwrap_or(false);
+                        .is_some_and(|existing_hash| existing_hash.trim() == exp_hash);
                     !hash_matches
                         || is_cached_share_artifact_stale(&red_p, std::slice::from_ref(&src_p))
                         || transcoder.has_audio_track(&red_p)
@@ -1410,8 +1409,9 @@ pub async fn api_share_create(
     let created_by = {
         let cfg = state.config.read().await;
         let auth_enabled = cfg.auth.enabled;
-        extract_authenticated_user_with_cfg(&state, &jar, &headers, &cfg.auth)
-            .map(|(u, _)| {
+        extract_authenticated_user_with_cfg(&state, &jar, &headers, &cfg.auth).map_or_else(
+            || "admin".to_string(),
+            |(u, _)| {
                 if u.starts_with("token:") || u.starts_with("ext:") {
                     u
                 } else if let Ok(Some(db_u)) = state.db.get_user(&u) {
@@ -1421,8 +1421,8 @@ pub async fn api_share_create(
                 } else {
                     format!("ext:{}", u.to_ascii_lowercase())
                 }
-            })
-            .unwrap_or_else(|| "admin".to_string())
+            },
+        )
     };
     if let Err(err) = state.db.insert_share_link_with_options(
         &jti,
@@ -1692,11 +1692,7 @@ pub fn verify_share_jti_with_view_mode(
     if let Some(created_by) = link["created_by"].as_str()
         && !created_by.is_empty()
     {
-        let auth_enabled = state
-            .config
-            .try_read()
-            .map(|cfg| cfg.auth.enabled)
-            .unwrap_or(true);
+        let auth_enabled = state.config.try_read().map_or(true, |cfg| cfg.auth.enabled);
         let revoke_invalid_creator_jti = |reason: &'static str, force_db_revoke: bool| {
             let mut db_revoke_failed = false;
             if (force_db_revoke || created_by != "admin")
@@ -1989,7 +1985,8 @@ pub(crate) fn build_share_video_head_placeholder_response(headers: &HeaderMap) -
         .into_response()
 }
 
-#[allow(clippy::too_many_arguments)]
+// Atomic share access accounting across session, byte-range continuation, and stream cursor state
+#[expect(clippy::too_many_arguments)]
 pub fn record_share_access_or_gone(
     state: &AppState,
     payload: &ShareTokenPayload,
@@ -2335,11 +2332,14 @@ pub async fn share_player_page(
     let sid = format!("{:032x}", rand::random::<u128>());
     let ts_label = clip_ts
         .and_then(|ts| chrono::DateTime::from_timestamp(ts as i64, 0))
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| "Timestamp recorded in clip".to_string());
-    let exp_label = chrono::DateTime::from_timestamp(payload.exp as i64, 0)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| payload.exp.to_string());
+        .map_or_else(
+            || "Timestamp recorded in clip".to_string(),
+            |dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        );
+    let exp_label = chrono::DateTime::from_timestamp(payload.exp as i64, 0).map_or_else(
+        || payload.exp.to_string(),
+        |dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+    );
     let html = format!(
         r#"<!doctype html>
 <html lang="en" style="color-scheme:dark;background:#070a0f;color:#e2e8f0;font-family:system-ui,sans-serif">
@@ -2417,8 +2417,7 @@ pub fn serve_mp4_bytes_with_range(bytes: Vec<u8>, headers: &HeaderMap) -> Respon
         }
         let end = end_opt
             .and_then(|e| usize::try_from(e).ok())
-            .map(|e| e.min(total - 1))
-            .unwrap_or(total - 1);
+            .map_or(total - 1, |e| e.min(total - 1));
         let slice = bytes[start..=end].to_vec();
         let content_range = format!("bytes {start}-{end}/{total}");
         return (
@@ -2502,7 +2501,7 @@ pub async fn serve_mp4_file_with_range(disk_path: &Path, headers: &HeaderMap) ->
                     .into_response(),
             );
         }
-        let end = end_opt.map(|e| e.min(total - 1)).unwrap_or(total - 1);
+        let end = end_opt.map_or(total - 1, |e| e.min(total - 1));
         file.seek(std::io::SeekFrom::Start(start)).await.ok()?;
         let slice_len = end - start + 1;
         let reader = file.take(slice_len);
@@ -2855,7 +2854,7 @@ pub fn cleanup_camera_share_clip_artifacts_in_range(
         if kind != "event" && kind != "review" {
             continue;
         }
-        let link_cam = link["camera"].as_str().map(str::trim).unwrap_or("");
+        let link_cam = link["camera"].as_str().map_or("", str::trim);
         if !link_cam.is_empty() && link_cam != cam_trimmed {
             continue;
         }
@@ -3988,8 +3987,7 @@ pub async fn share_video_mp4(
                         tokio::task::spawn_blocking(move || {
                             if is_regular_non_symlink_file(&red_p) {
                                 let hash_matches = read_non_symlink_string(&mh_p)
-                                    .map(|existing_hash| existing_hash.trim() == exp_hash)
-                                    .unwrap_or(false);
+                                    .is_some_and(|existing_hash| existing_hash.trim() == exp_hash);
                                 !hash_matches
                                     || is_cached_share_artifact_stale(&red_p, &recs_p)
                                     || share_mp4_file_has_audio_track(&red_p)
@@ -4356,7 +4354,7 @@ cameras:
 
         let mismatched_cam_payload = ShareTokenPayload {
             cam: Some("backyard".to_string()),
-            ..payload.clone()
+            ..payload
         };
         assert_eq!(
             verify_share_jti(&state, &mismatched_cam_payload, now)
@@ -4462,7 +4460,7 @@ cameras:
             !count_view_chunk1,
             "follow-up range after bytes=0-1 probe must not consume another view"
         );
-        let resp_chunk1 = serve_mp4_bytes_with_range(sample_mp4.clone(), &h_chunk1);
+        let resp_chunk1 = serve_mp4_bytes_with_range(sample_mp4, &h_chunk1);
         let resp_chunk1 = record_share_access_or_gone(
             &state,
             &payload,

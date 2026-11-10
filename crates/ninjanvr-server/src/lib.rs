@@ -421,8 +421,7 @@ fn default_true() -> bool {
 pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 pub(crate) fn open_regular_non_symlink_readonly(
@@ -1746,8 +1745,7 @@ fn scrub_raw_yaml_secrets_strict(raw_yaml: &str, cfg: &NinjaConfig) -> String {
         }
         let after_list = trimmed_start
             .strip_prefix("- ")
-            .map(|s| s.trim_start())
-            .unwrap_or(trimmed_start);
+            .map_or(trimmed_start, |s| s.trim_start());
         let prefix_len = line_body.len() - after_list.len();
         let leading_prefix = &line_body[..prefix_len];
         if let Some((raw_k, raw_v)) = after_list.split_once(':')
@@ -2512,19 +2510,22 @@ async fn build_ai_context_digest(
         }
         let m = metrics_map.get(cam_name);
         let rt_flags = state.comms.get_camera_flags(cam_name);
-        let fps = m.map(|x| x.camera_fps).unwrap_or(if cam_cfg.enabled {
-            cam_cfg.detect.fps as f64
-        } else {
-            0.0
-        });
+        let fps = m.map_or(
+            if cam_cfg.enabled {
+                cam_cfg.detect.fps as f64
+            } else {
+                0.0
+            },
+            |x| x.camera_fps,
+        );
         cameras_health.insert(
             cam_name.clone(),
             json!({
                 "enabled": rt_flags.enabled,
                 "online": fps > 0.0 || cam_cfg.enabled,
                 "fps": fps,
-                "detection_fps": m.map(|x| x.detection_fps).unwrap_or(0.0),
-                "night_mode": m.map(|x| x.night_mode).unwrap_or(false),
+                "detection_fps": m.map_or(0.0, |x| x.detection_fps),
+                "night_mode": m.is_some_and(|x| x.night_mode),
                 "detect": rt_flags.detect,
                 "record": rt_flags.record,
                 "alerts": rt_flags.alerts
@@ -3471,10 +3472,7 @@ fn is_safe_federation_peer_base_url(raw_url: &str) -> bool {
     let Some((_, host_port)) = extract_url_scheme_and_host(trimmed) else {
         return false;
     };
-    let host_port_no_auth = host_port
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(host_port);
+    let host_port_no_auth = host_port.rsplit_once('@').map_or(host_port, |(_, h)| h);
     let host = bare_hostname(host_port_no_auth)
         .trim()
         .trim_end_matches('.');
@@ -3653,8 +3651,8 @@ async fn api_debug_lpr_simulate(
             .as_ref()
             .and_then(|c| c.sub_label.clone())
             .or_else(|| ninjanvr_infer::lookup_known_plate(&norm_plate, &eff_lpr_cfg.known_plates));
-        let votes = consensus.as_ref().map(|c| c.votes).unwrap_or(3);
-        let consensus_conf = consensus.as_ref().map(|c| c.confidence).unwrap_or(score);
+        let votes = consensus.as_ref().map_or(3, |c| c.votes);
+        let consensus_conf = consensus.as_ref().map_or(score, |c| c.confidence);
 
         // Generate synthetic 640x360 vehicle + Mercosul plate frame and write snapshot/review artifacts
         let clean_img = render_synthetic_mercosul_vehicle_frame(&norm_plate);
@@ -4525,14 +4523,17 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
 
         for (cam_name, cam_cfg) in &cfg.cameras {
             let m = metrics_map.get(cam_name);
-            let fps = m.map(|x| x.camera_fps).unwrap_or(if cam_cfg.enabled {
-                cam_cfg.detect.fps as f64
-            } else {
-                0.0
-            });
-            let det_fps = m.map(|x| x.detection_fps).unwrap_or(0.0);
-            let cam_pid = m.map(|x| x.pid).unwrap_or(pid);
-            let night_mode = m.map(|x| x.night_mode).unwrap_or(false);
+            let fps = m.map_or(
+                if cam_cfg.enabled {
+                    cam_cfg.detect.fps as f64
+                } else {
+                    0.0
+                },
+                |x| x.camera_fps,
+            );
+            let det_fps = m.map_or(0.0, |x| x.detection_fps);
+            let cam_pid = m.map_or(pid, |x| x.pid);
+            let night_mode = m.is_some_and(|x| x.night_mode);
             let last_frame_ts = m
                 .map(|x| x.last_frame_ts)
                 .filter(|&ts| ts > 0.0)
@@ -4545,8 +4546,7 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
                         .ok()
                         .and_then(|meta| meta.modified().ok())
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs_f64())
-                        .unwrap_or(0.0)
+                        .map_or(0.0, |d| d.as_secs_f64())
                 });
             let (ff_cpu, _) = if cam_pid != pid {
                 state.cpu_tracker.sample_pid(cam_pid, 1.8, 4.5)
@@ -4721,7 +4721,7 @@ async fn compute_stats_snapshot(state: &AppState) -> Value {
             .max_size_gb
             .or(cfg.record.alerts.retain.max_size_gb)
             .map(|g| g * 1024.0);
-        let effective_pool_mb = global_quota_mb.map(|q| q.min(free_mb)).unwrap_or(free_mb);
+        let effective_pool_mb = global_quota_mb.map_or(free_mb, |q| q.min(free_mb));
         let estimated_retention_days = if total_bw_mb_hr > 0.1 {
             ((effective_pool_mb / (total_bw_mb_hr * 24.0)) * 10.0).round() / 10.0
         } else {
@@ -5992,8 +5992,7 @@ async fn api_events_explore(
         .auth_gate
         .authenticate_read(&state, &jar, &headers)
         .await
-        .map(|p| p.camera_scope())
-        .unwrap_or_else(|_| CameraScope::Allowed(Vec::new()));
+        .map_or_else(|_| CameraScope::Allowed(Vec::new()), |p| p.camera_scope());
     let mut events = state
         .db
         .query_events_explore_scoped(limit as i64, &scope)
@@ -6011,8 +6010,7 @@ async fn api_events_summary(
         .auth_gate
         .authenticate_read(&state, &jar, &headers)
         .await
-        .map(|p| p.camera_scope())
-        .unwrap_or_else(|_| CameraScope::Allowed(Vec::new()));
+        .map_or_else(|_| CameraScope::Allowed(Vec::new()), |p| p.camera_scope());
     let summary = state
         .db
         .query_events_summary_scoped(&scope)
@@ -6371,7 +6369,7 @@ async fn api_event_false_positive(
                 .into_response();
         }
     }
-    let fp = body.map(|b| b.0.false_positive).unwrap_or(true);
+    let fp = body.is_none_or(|b| b.0.false_positive);
     if let Err(err) = state.db.set_event_false_positive(&id, fp) {
         warn!("Failed to set event '{id}' false_positive={fp}: {err}");
         return (
@@ -6498,10 +6496,7 @@ pub struct ModelUploadPayload {
 
 fn decode_base64_or_raw(input: &str) -> Vec<u8> {
     let trimmed = input.trim();
-    let payload = trimmed
-        .split_once(";base64,")
-        .map(|(_, b)| b)
-        .unwrap_or(trimmed);
+    let payload = trimmed.split_once(";base64,").map_or(trimmed, |(_, b)| b);
     base64::engine::general_purpose::STANDARD
         .decode(payload)
         .unwrap_or_else(|_| trimmed.as_bytes().to_vec())
@@ -6849,8 +6844,7 @@ async fn api_detector_model_upload(
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty() && is_safe_id(s))
-            .map(String::from)
-            .unwrap_or_else(|| format!("{stem}.bin"));
+            .map_or_else(|| format!("{stem}.bin"), String::from);
         if let Err(err) =
             atomic_write_within_media_subdir(&state.media_dir, "models", &w_name, w_bytes).await
         {
@@ -7708,10 +7702,7 @@ fn is_valid_rtsp_probe_url(raw: &str) -> bool {
     if authority.is_empty() {
         return false;
     }
-    let host_port = authority
-        .rsplit_once('@')
-        .map(|(_, hp)| hp)
-        .unwrap_or(authority);
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
     let (host, port) = if let Some(after_bracket) = host_port.strip_prefix('[') {
         let Some((ipv6_part, rest)) = after_bracket.split_once(']') else {
             return false;
@@ -7876,11 +7867,9 @@ async fn api_streams_probe(
         String::new()
     };
 
-    let (det_w, det_h, det_fps) = cfg
-        .cameras
-        .get(cam_name)
-        .map(|c| (c.detect.width, c.detect.height, c.detect.fps))
-        .unwrap_or((1280, 720, 5));
+    let (det_w, det_h, det_fps) = cfg.cameras.get(cam_name).map_or((1280, 720, 5), |c| {
+        (c.detect.width, c.detect.height, c.detect.fps)
+    });
     drop(cfg);
 
     if resolved_url.is_empty() {
@@ -8063,11 +8052,9 @@ async fn api_ffprobe(
 
     let cam_name = requested_cam.unwrap_or("sala");
     let cfg = state.config.read().await;
-    let (det_w, det_h, det_fps) = cfg
-        .cameras
-        .get(cam_name)
-        .map(|c| (c.detect.width, c.detect.height, c.detect.fps))
-        .unwrap_or((1280, 720, 5));
+    let (det_w, det_h, det_fps) = cfg.cameras.get(cam_name).map_or((1280, 720, 5), |c| {
+        (c.detect.width, c.detect.height, c.detect.fps)
+    });
 
     Json(json!([
         {
@@ -8498,8 +8485,7 @@ async fn api_exports(
         .auth_gate
         .authenticate_read(&state, &jar, &headers)
         .await
-        .map(|p| p.allowed_cameras)
-        .unwrap_or_else(|_| Some(Vec::new()));
+        .map_or_else(|_| Some(Vec::new()), |p| p.allowed_cameras);
     if let Some(allowed) = allowed
         && !allowed.iter().any(|a| a == "*")
     {
@@ -8654,8 +8640,7 @@ async fn api_cases(
         .auth_gate
         .authenticate_read(&state, &jar, &headers)
         .await
-        .map(|p| p.allowed_cameras)
-        .unwrap_or_else(|_| Some(Vec::new()));
+        .map_or_else(|_| Some(Vec::new()), |p| p.allowed_cameras);
     if let Some(allowed) = allowed {
         cases.retain(|c| case_value_is_permitted_for_allowed_cameras(&state, c, &allowed));
     }
@@ -8730,14 +8715,16 @@ async fn api_case_create(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            format!(
-                "case_{}_{:08x}",
-                chrono::Utc::now().timestamp_millis(),
-                rand::random::<u32>()
-            )
-        });
+        .map_or_else(
+            || {
+                format!(
+                    "case_{}_{:08x}",
+                    chrono::Utc::now().timestamp_millis(),
+                    rand::random::<u32>()
+                )
+            },
+            str::to_string,
+        );
     if !is_safe_id(&case_id)
         || case_id.len() > 128
         || name.len() > 512
@@ -9553,8 +9540,7 @@ async fn api_preview_thumbnail(
     let camera = configured_cam.unwrap_or_else(|| {
         after_prefix
             .rsplit_once('-')
-            .map(|(c, _)| c)
-            .unwrap_or(after_prefix)
+            .map_or(after_prefix, |(c, _)| c)
             .to_string()
     });
     if camera.is_empty() || !is_safe_id(&camera) {
@@ -9896,10 +9882,9 @@ async fn api_camera_ptz_info(
     let (cam_opt, active_preset, creds, ptz_endpoint_opt) = {
         let cfg = state.config.read().await;
         let cam = cfg.cameras.get(&camera).cloned();
-        let creds = cam
-            .as_ref()
-            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
-            .unwrap_or((None, None));
+        let creds = cam.as_ref().map_or((None, None), |c| {
+            resolve_effective_onvif_credentials(&cfg, &camera, c)
+        });
         let ep_opt = cam.as_ref().and_then(|c| {
             resolve_effective_ptz_endpoint(&state.camera_driver_runtime, &cfg, &camera, c)
         });
@@ -10151,10 +10136,9 @@ async fn api_camera_ptz_move(
     let (cam_opt, creds, ptz_endpoint_opt) = {
         let cfg = state.config.read().await;
         let cam = cfg.cameras.get(&camera).cloned();
-        let creds = cam
-            .as_ref()
-            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
-            .unwrap_or((None, None));
+        let creds = cam.as_ref().map_or((None, None), |c| {
+            resolve_effective_onvif_credentials(&cfg, &camera, c)
+        });
         let ep_opt = cam.as_ref().and_then(|c| {
             resolve_effective_ptz_endpoint(&state.camera_driver_runtime, &cfg, &camera, c)
         });
@@ -10314,10 +10298,9 @@ async fn api_camera_ptz_stop(
     let (cam_opt, creds, ptz_endpoint_opt) = {
         let cfg = state.config.read().await;
         let cam = cfg.cameras.get(&camera).cloned();
-        let creds = cam
-            .as_ref()
-            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
-            .unwrap_or((None, None));
+        let creds = cam.as_ref().map_or((None, None), |c| {
+            resolve_effective_onvif_credentials(&cfg, &camera, c)
+        });
         let ep_opt = cam.as_ref().and_then(|c| {
             resolve_effective_ptz_endpoint(&state.camera_driver_runtime, &cfg, &camera, c)
         });
@@ -10458,10 +10441,9 @@ async fn api_camera_ptz_preset(
     let (cam_opt, creds, ptz_endpoint_opt) = {
         let cfg = state.config.read().await;
         let cam = cfg.cameras.get(&camera).cloned();
-        let creds = cam
-            .as_ref()
-            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
-            .unwrap_or((None, None));
+        let creds = cam.as_ref().map_or((None, None), |c| {
+            resolve_effective_onvif_credentials(&cfg, &camera, c)
+        });
         let ep_opt = cam.as_ref().and_then(|c| {
             resolve_effective_ptz_endpoint(&state.camera_driver_runtime, &cfg, &camera, c)
         });
@@ -10627,8 +10609,7 @@ async fn api_camera_ptz_preset(
                     f64::from(soft.zoom),
                     0.0,
                 )
-                .map(|(x, y, z)| (x as f32, y as f32, z as f32))
-                .unwrap_or((0.0, 0.0, 0.0));
+                .map_or((0.0, 0.0, 0.0), |(x, y, z)| (x as f32, y as f32, z as f32));
                 let rel_soap = build_onvif_relative_move_soap(
                     &resolved_prof,
                     dx,
@@ -10766,10 +10747,9 @@ async fn api_camera_ptz_preset_save(
     let (cam_opt, creds, ptz_endpoint_opt) = {
         let cfg = state.config.read().await;
         let cam = cfg.cameras.get(&camera).cloned();
-        let creds = cam
-            .as_ref()
-            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
-            .unwrap_or((None, None));
+        let creds = cam.as_ref().map_or((None, None), |c| {
+            resolve_effective_onvif_credentials(&cfg, &camera, c)
+        });
         let ep_opt = cam.as_ref().and_then(|c| {
             resolve_effective_ptz_endpoint(&state.camera_driver_runtime, &cfg, &camera, c)
         });
@@ -11065,10 +11045,9 @@ async fn api_camera_ptz_preset_delete(
     let (cam_opt, creds, ptz_endpoint_opt) = {
         let cfg = state.config.read().await;
         let cam = cfg.cameras.get(&camera).cloned();
-        let creds = cam
-            .as_ref()
-            .map(|c| resolve_effective_onvif_credentials(&cfg, &camera, c))
-            .unwrap_or((None, None));
+        let creds = cam.as_ref().map_or((None, None), |c| {
+            resolve_effective_onvif_credentials(&cfg, &camera, c)
+        });
         let ep_opt = cam.as_ref().and_then(|c| {
             resolve_effective_ptz_endpoint(&state.camera_driver_runtime, &cfg, &camera, c)
         });
@@ -12841,8 +12820,7 @@ async fn api_camera_latest_frame(
         .read()
         .await
         .get(&camera)
-        .map(|m| m.last_frame_ts)
-        .unwrap_or(0.0);
+        .map_or(0.0, |m| m.last_frame_ts);
 
     let ts_hdr = header::HeaderName::from_static("x-last-frame-timestamp");
 
@@ -13057,8 +13035,7 @@ async fn api_camera_latest_frame(
                     .modified()
                     .ok()
                     .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or_else(unix_now)
+                    .map_or_else(unix_now, |d| d.as_secs())
             };
             if let Some(ref mask) = priv_for_disk
                 && mask_active
@@ -14413,14 +14390,13 @@ pub fn generate_self_signed_tls_config_with_sans(
         let raw = host.trim();
         let after_scheme = raw
             .split_once("://")
-            .map(|(_, r)| r)
-            .unwrap_or(raw)
+            .map_or(raw, |(_, r)| r)
             .split(['/', '?', '#', '\\'])
             .next()
             .unwrap_or("")
             .trim();
         let cleaned = if let Some(bracketed) = after_scheme.strip_prefix('[') {
-            bracketed.split_once(']').map(|(ip, _)| ip).unwrap_or("")
+            bracketed.split_once(']').map_or("", |(ip, _)| ip)
         } else if let Some((h, p)) = after_scheme.rsplit_once(':')
             && !h.contains(':')
             && p.chars().all(|c| c.is_ascii_digit())

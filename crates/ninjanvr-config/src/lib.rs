@@ -3786,8 +3786,7 @@ impl NinjaConfig {
             } else if next_mqtt
                 .password
                 .as_deref()
-                .map(|p| p.trim().is_empty() || p.trim() == "***" || p.trim() == "*")
-                .unwrap_or(true)
+                .is_none_or(|p| p.trim().is_empty() || p.trim() == "***" || p.trim() == "*")
             {
                 next_mqtt.password = prev_pass;
             }
@@ -3902,8 +3901,7 @@ impl NinjaConfig {
             } else if next_genai
                 .api_key
                 .as_deref()
-                .map(|k| k.trim().is_empty() || k.trim() == "***" || k.trim() == "*")
-                .unwrap_or(true)
+                .is_none_or(|k| k.trim().is_empty() || k.trim() == "***" || k.trim() == "*")
             {
                 next_genai.api_key = prev_key;
             }
@@ -4155,8 +4153,7 @@ impl NinjaConfig {
                     .onvif
                     .password
                     .as_deref()
-                    .map(|p| p.trim().is_empty() || p.trim() == "***" || p.trim() == "*")
-                    .unwrap_or(true)
+                    .is_none_or(|p| p.trim().is_empty() || p.trim() == "***" || p.trim() == "*")
                 {
                     cam.onvif.password = prev_onvif_pass;
                 }
@@ -4217,8 +4214,7 @@ impl NinjaConfig {
                     .hardware
                     .cloud_password
                     .as_deref()
-                    .map(|p| p.trim().is_empty() || p.trim() == "***" || p.trim() == "*")
-                    .unwrap_or(true)
+                    .is_none_or(|p| p.trim().is_empty() || p.trim() == "***" || p.trim() == "*")
                 {
                     cam.hardware.cloud_password = prev_cloud_pass;
                 }
@@ -5053,8 +5049,7 @@ pub fn is_disallowed_go2rtc_producer(raw: &str) -> bool {
         }
         let (lhs, rhs) = frag_lc
             .split_once('=')
-            .map(|(k, v)| (k.trim(), v.trim_start()))
-            .unwrap_or(("", frag_lc.as_str()));
+            .map_or(("", frag_lc.as_str()), |(k, v)| (k.trim(), v.trim_start()));
         if matches!(lhs, "input" | "params" | "raw" | "backchannel")
             || has_disallowed_scheme(frag_lc.as_str())
             || has_disallowed_scheme(rhs)
@@ -6116,16 +6111,13 @@ fn scrub_all_urls_in_text(raw: &str) -> String {
         let after_sep = scheme_sep + 3;
         let line_end = raw[after_sep..]
             .find(['\r', '\n'])
-            .map(|i| after_sep + i)
-            .unwrap_or(raw.len());
+            .map_or(raw.len(), |i| after_sep + i);
         let ws_or_line_end = raw[after_sep..line_end]
             .find(char::is_whitespace)
-            .map(|i| after_sep + i)
-            .unwrap_or(line_end);
+            .map_or(line_end, |i| after_sep + i);
         let slash_in_token = raw[after_sep..ws_or_line_end]
             .find('/')
-            .map(|i| after_sep + i)
-            .unwrap_or(ws_or_line_end);
+            .map_or(ws_or_line_end, |i| after_sep + i);
         let last_at_before_slash = raw[after_sep..slash_in_token]
             .rfind('@')
             .map(|i| after_sep + i);
