@@ -4,6 +4,80 @@ All notable changes to **NinjaNVR** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-11-10
+
+### Features
+- **server,web,docs:** add tapo streamd siren playback and zone/line alarm triggers (`587ea5c`)
+- **web:** refine phone layout across live, playback, review and explore (`325453d`)
+- **web:** declutter live camera tiles with details sheet and compact viewport layout (`97b0e27`)
+- **server:** add full-resolution privacy-masked camera snapshot download endpoint (`91fafba`)
+- **server,web:** add camera diagnostic logs, pullpoint events, and syslog/automaintain controls (`533dc72`)
+- **server,docs:** add modularity guardrails and auto-reboot watchdog on rtsp stall (`9560635`)
+- **server,web:** add capability-gated camera hardware controls and digest onvif/cgi support (`063d9cd`)
+- **web:** unify face assign and enroll flow with 1-click chips and batch assignment (`2a0e02e`)
+- **web:** redesign zones, masks and motion studio by operator intent (`55af1c6`)
+- **server:** apply saved zones, masks and motion settings without restart (`61be04c`)
+- **dataset:** auto-annotate sample with vision ai on from-event creation (`ff20ddb`)
+- **web:** redesign ai dataset studio flow (`5ece392`)
+- **server:** track ai vs manual dataset verification provenance (`45ef031`)
+- **dataset-studio:** add live batch auto-annotate progress bar, eta, and stop control (`67b268b`)
+- **explore:** auto-trigger teacher vision ai annotation when adding event to dataset (`9b4bc08`)
+- **web:** refine live matrix hud, event strip and export clip flow (`39869e0`)
+- **server:** serve review flipbook frames for the live event strip (`a37a932`)
+- **web:** group settings by scope and standardize controls across sections (`f1dbb14`)
+- **web:** standardize settings scope badges, subnav, and UX controls in AI filters tab (`4d27eb0`)
+
+### Performance
+- **server:** eliminate large auth Result err, track clone, and protocol unwraps (`8997fa8`)
+
+### Bug Fixes
+- **server:** install rustls ring provider before building snapshot http client (`9044cd9`)
+- **web:** collapse the desktop header instead of scrolling it sideways (`10964a6`)
+- **web:** repair settings toggles and keep form fields inside their cards (`7c39ef7`)
+- **web:** keep drawn zones and lines where the operator clicks (`d78e0db`)
+- **server,web:** prevent mse stream offline state and camera probe storms on load (`e274082`)
+- **server:** prefer protocol-native onvif profile tokens during hardware probe (`7204a02`)
+- **server:** close embedded camera http connections and ignore zero onvif error code (`2f97cc5`)
+- **web:** show measured detector latency instead of placeholder values (`fbdc4bf`)
+- **infer,server:** report real primary detector inference latency (`d20ae6a`)
+- **web:** show detector deploy outcome and the model actually running (`ca4b69b`)
+- **server:** persist deployed detector model and report whether it loaded (`14059d1`)
+- **comms:** avoid slow fsync stall in async profile persistence test on ci runners (`0a889f0`)
+- **web:** apply batch face assignment across all checked items and update list badges (`ecc4741`)
+- **web:** fill sample queue column and correct filter counts (`f56d1db`)
+- **web:** preload flipbook frames sequentially per event card (`068ae50`)
+- **server:** capture live preview frames in the vision pipeline (`5f7638b`)
+- **web:** preload flipbook frames one at a time per event card (`20f2e76`)
+- **server:** bound review frame extraction to stop live strip oom kills (`7a73101`)
+- **web:** preserve oidc/proxy/peer yaml sections and harden player/url/store bounds (`22db508`)
+- **media:** preserve synthetic non-iso payload handling in mp4_file_has_audio_track (`9b06655`)
+- **vision:** clamp oversized crops, f64 roi bounds, and edge mask probes (`194b750`)
+- **infer:** memoize lpr regex node evaluation to prevent nested quantifier redos (`49bc40e`)
+- **vision:** guard odd/zero YUV dimensions, polygon masks, and ROI state timers (`afdeb38`)
+- **vod:** bound fMP4 sample tables, prevent spin loops and overflows, and validate segment paths (`c93a45a`)
+- **ci:** disable oci provenance index and preserve untagged ghcr child manifests (`4473504`)
+- **config:** block inline go2rtc command producers and unsafe labelmap paths (`0094154`)
+- **config:** scrub onvif/webui urls, restore raw yaml secrets, and harden ssrf host filter (`7d590ab`)
+- **web,server:** auto-reconnect live MSE streams after pod rollouts and network drops (`a17d6f8`)
+- **web:** validate share public URL origin and refresh list on invalid URL (`c5ffde9`)
+- **db,media:** add share link last_accessed_at touch and harden retention cleanup paths (`e4cc16a`)
+- **web:** guard concurrent share link creation and revocation in exports (`e2846d4`)
+- **share:** protect recently accessed share link artifacts during retention cleanup (`38f5e03`)
+- **web:** refresh share link state before copy and clean up revoked rotation state (`c1514c9`)
+
+### Security & Hardening
+- **server:** 26 security, bounds, and lifecycle hardening fixes (`fcc0588`..`8f6130f`)
+- **auth:** enforce handler rbac, external peer ip guard and fail-closed oidc jwks (`ddf42e1`)
+- **web:** 11 security, bounds, and lifecycle hardening fixes (`c095221`..`9bcb931`)
+- **media:** 5 security, bounds, and lifecycle hardening fixes (`7d193bb`..`8f3950a`)
+- **core:** harden utf8 slicing, vision roi bounds, mqtt cancel safety, and config io (`64f38e0`)
+- **db:** 5 security, bounds, and lifecycle hardening fixes (`b669cee`..`3f6fb3a`)
+- **config:** 4 security, bounds, and lifecycle hardening fixes (`607aa65`..`035b078`)
+- **ai:** harden face crop matching, xywh dataset boxes, and persistent clips mirrors (`835e135`)
+- **infer:** 3 security, bounds, and lifecycle hardening fixes (`4a4660a`..`c909390`)
+- **track:** 2 security, bounds, and lifecycle hardening fixes (`adce2ab`..`8cd0750`)
+- **share:** harden creator and camera share revocation, active check, and moov cap (`fe3200f`)
+
 ## [2.1.9] - 2026-11-04
 
 ### Features
