@@ -1186,8 +1186,7 @@ impl AiDetectorEngine {
                         p.is_file()
                             && p.file_name()
                                 .and_then(|n| n.to_str())
-                                .map(|n| n.starts_with("libonnxruntime.so."))
-                                .unwrap_or(false)
+                                .is_some_and(|n| n.starts_with("libonnxruntime.so."))
                     })
                     .collect();
                 Self::sort_versioned_so_paths(&mut versioned);
@@ -1259,8 +1258,7 @@ impl AiDetectorEngine {
                 bail!("dlopen({}) failed: {msg}", lib_path.display());
             }
 
-            let sym_name = CString::new("OrtGetApiBase").unwrap();
-            let ptr = libc::dlsym(handle, sym_name.as_ptr());
+            let ptr = libc::dlsym(handle, c"OrtGetApiBase".as_ptr());
             if ptr.is_null() {
                 bail!("missing symbol OrtGetApiBase in {}", lib_path.display());
             }
@@ -1382,8 +1380,8 @@ impl AiDetectorEngine {
                 env: std::ptr::null_mut(),
                 vtable,
                 _lib_handle: handle,
-                input_name: CString::new("images").unwrap(),
-                output_name: CString::new("output0").unwrap(),
+                input_name: c"images".to_owned(),
+                output_name: c"output0".to_owned(),
                 input_is_u8: false,
                 in_f32_buf: Vec::new(),
                 in_u8_buf: Vec::new(),
@@ -1391,8 +1389,7 @@ impl AiDetectorEngine {
                 out_floats: 84 * 8400,
             };
 
-            let log_id = CString::new("ninjanvr").unwrap();
-            let env_st = create_env(2, log_id.as_ptr(), &mut ctx.env);
+            let env_st = create_env(2, c"ninjanvr".as_ptr(), &mut ctx.env);
             if !env_st.is_null() {
                 ctx.env = std::ptr::null_mut();
                 check_status(env_st, "CreateEnv")?;
@@ -1426,14 +1423,11 @@ impl AiDetectorEngine {
             let req_upper = device.to_ascii_uppercase();
             if req_upper.starts_with("CUDA") || req_upper == "TENSORRT" || req_upper == "ROCM" {
                 let session_opts = ctx.session_opts;
-                let try_ep = |sym: &str, dev_node_ok: bool| -> bool {
+                let try_ep = |sym: &CStr, dev_node_ok: bool| -> bool {
                     if !dev_node_ok || handle.is_null() {
                         return false;
                     }
-                    let Ok(c_ep) = CString::new(sym) else {
-                        return false;
-                    };
-                    let ep_ptr = libc::dlsym(handle, c_ep.as_ptr());
+                    let ep_ptr = libc::dlsym(handle, sym.as_ptr());
                     if ep_ptr.is_null() {
                         return false;
                     }
@@ -1451,9 +1445,9 @@ impl AiDetectorEngine {
                     Path::new("/dev/nvidia0").exists() || Path::new("/dev/nvidiactl").exists();
                 let rocm_ok = Path::new("/dev/kfd").exists();
                 if req_upper == "TENSORRT" {
-                    if try_ep("OrtSessionOptionsAppendExecutionProvider_TensorRT", nv_ok) {
+                    if try_ep(c"OrtSessionOptionsAppendExecutionProvider_TensorRT", nv_ok) {
                         actual_device = "TensorRT".to_string();
-                    } else if try_ep("OrtSessionOptionsAppendExecutionProvider_CUDA", nv_ok) {
+                    } else if try_ep(c"OrtSessionOptionsAppendExecutionProvider_CUDA", nv_ok) {
                         warn!("TensorRT provider unavailable; falling back to CUDA");
                         actual_device = "CUDA".to_string();
                     } else {
@@ -1463,13 +1457,13 @@ impl AiDetectorEngine {
                         actual_device = "CPU".to_string();
                     }
                 } else if req_upper == "ROCM" {
-                    if !try_ep("OrtSessionOptionsAppendExecutionProvider_ROCM", rocm_ok) {
+                    if !try_ep(c"OrtSessionOptionsAppendExecutionProvider_ROCM", rocm_ok) {
                         warn!(
                             "Requested ONNX Runtime provider '{device}' not available; falling back to CPU"
                         );
                         actual_device = "CPU".to_string();
                     }
-                } else if !try_ep("OrtSessionOptionsAppendExecutionProvider_CUDA", nv_ok) {
+                } else if !try_ep(c"OrtSessionOptionsAppendExecutionProvider_CUDA", nv_ok) {
                     warn!(
                         "Requested ONNX Runtime provider '{device}' not available; falling back to CPU"
                     );
@@ -1513,7 +1507,7 @@ impl AiDetectorEngine {
                 check_status(in_name_st, "SessionGetInputName")?;
             }
             ctx.input_name = if in_name_ptr.is_null() {
-                CString::new("images").unwrap()
+                c"images".to_owned()
             } else {
                 let owned = CStr::from_ptr(in_name_ptr).to_owned();
                 free_ort_str(in_name_ptr);
@@ -1527,7 +1521,7 @@ impl AiDetectorEngine {
                 check_status(out_name_st, "SessionGetOutputName")?;
             }
             ctx.output_name = if out_name_ptr.is_null() {
-                CString::new("output0").unwrap()
+                c"output0".to_owned()
             } else {
                 let owned = CStr::from_ptr(out_name_ptr).to_owned();
                 free_ort_str(out_name_ptr);
@@ -1624,8 +1618,7 @@ impl AiDetectorEngine {
                         p.is_file()
                             && p.file_name()
                                 .and_then(|n| n.to_str())
-                                .map(|n| n.starts_with("libopenvino_c.so."))
-                                .unwrap_or(false)
+                                .is_some_and(|n| n.starts_with("libopenvino_c.so."))
                     })
                     .collect();
                 Self::sort_versioned_so_paths(&mut versioned);
@@ -1663,14 +1656,11 @@ impl AiDetectorEngine {
             let mut matches: Vec<PathBuf> = files
                 .iter()
                 .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| {
-                            n == prefix
-                                || (n.starts_with(prefix)
-                                    && n.as_bytes().get(prefix.len()) == Some(&b'.'))
-                        })
-                        .unwrap_or(false)
+                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        n == prefix
+                            || (n.starts_with(prefix)
+                                && n.as_bytes().get(prefix.len()) == Some(&b'.'))
+                    })
                 })
                 .cloned()
                 .collect();
@@ -1885,20 +1875,18 @@ impl AiDetectorEngine {
             }
 
             macro_rules! load_sym {
-                ($name:literal, $ty:ty) => {{
-                    let sym_name = CString::new($name).unwrap();
-                    let ptr = libc::dlsym(handle, sym_name.as_ptr());
+                ($sym:literal, $ty:ty) => {{
+                    let ptr = libc::dlsym(handle, $sym.as_ptr());
                     if ptr.is_null() {
-                        bail!("missing symbol {} in libopenvino_c", $name);
+                        bail!("missing symbol {} in libopenvino_c", $sym.to_string_lossy());
                     }
                     std::mem::transmute::<*mut c_void, $ty>(ptr)
                 }};
             }
 
             macro_rules! load_opt_sym {
-                ($name:literal, $ty:ty) => {{
-                    let sym_name = CString::new($name).unwrap();
-                    let ptr = libc::dlsym(handle, sym_name.as_ptr());
+                ($sym:literal, $ty:ty) => {{
+                    let ptr = libc::dlsym(handle, $sym.as_ptr());
                     if ptr.is_null() {
                         None
                     } else {
@@ -1908,27 +1896,27 @@ impl AiDetectorEngine {
             }
 
             let fns = OvCFunctionTable {
-                core_create: load_sym!("ov_core_create", OvCoreCreateFn),
-                compile_model: load_sym!("ov_core_compile_model_from_file", OvCoreCompileModelFn),
+                core_create: load_sym!(c"ov_core_create", OvCoreCreateFn),
+                compile_model: load_sym!(c"ov_core_compile_model_from_file", OvCoreCompileModelFn),
                 create_infer_req: load_sym!(
-                    "ov_compiled_model_create_infer_request",
+                    c"ov_compiled_model_create_infer_request",
                     OvCompiledModelCreateInferReqFn
                 ),
                 get_in_tensor: load_sym!(
-                    "ov_infer_request_get_input_tensor",
+                    c"ov_infer_request_get_input_tensor",
                     OvInferReqGetTensorFn
                 ),
                 get_out_tensor: load_sym!(
-                    "ov_infer_request_get_output_tensor",
+                    c"ov_infer_request_get_output_tensor",
                     OvInferReqGetTensorFn
                 ),
-                infer_fn: load_sym!("ov_infer_request_infer", OvInferReqInferFn),
-                tensor_data: load_sym!("ov_tensor_data", OvTensorDataFn),
-                tensor_byte_size: load_sym!("ov_tensor_get_byte_size", OvTensorGetByteSizeFn),
-                tensor_free: load_opt_sym!("ov_tensor_free", OvFreeFn),
-                infer_req_free: load_opt_sym!("ov_infer_request_free", OvFreeFn),
-                compiled_model_free: load_opt_sym!("ov_compiled_model_free", OvFreeFn),
-                core_free: load_opt_sym!("ov_core_free", OvFreeFn),
+                infer_fn: load_sym!(c"ov_infer_request_infer", OvInferReqInferFn),
+                tensor_data: load_sym!(c"ov_tensor_data", OvTensorDataFn),
+                tensor_byte_size: load_sym!(c"ov_tensor_get_byte_size", OvTensorGetByteSizeFn),
+                tensor_free: load_opt_sym!(c"ov_tensor_free", OvFreeFn),
+                infer_req_free: load_opt_sym!(c"ov_infer_request_free", OvFreeFn),
+                compiled_model_free: load_opt_sym!(c"ov_compiled_model_free", OvFreeFn),
+                core_free: load_opt_sym!(c"ov_core_free", OvFreeFn),
             };
 
             Self::init_ov_context_from_fns(handle, fns, &model_path, device)
@@ -3186,15 +3174,12 @@ pub fn sanitize_face_profile_name(raw: &str) -> Option<String> {
 }
 
 fn is_real_directory(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_dir())
-        .unwrap_or(false)
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
 }
 
 fn is_real_bounded_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_file() && m.len() <= MAX_FACE_SAMPLE_BYTES)
-        .unwrap_or(false)
+        .is_ok_and(|m| m.file_type().is_file() && m.len() <= MAX_FACE_SAMPLE_BYTES)
 }
 
 fn read_bounded_face_sample_file(
@@ -3324,13 +3309,12 @@ impl FaceGallery {
                     is_real_bounded_file(p)
                         && p.extension()
                             .and_then(|ext| ext.to_str())
-                            .map(|ext| {
+                            .is_some_and(|ext| {
                                 matches!(
                                     ext.to_ascii_lowercase().as_str(),
                                     "jpg" | "jpeg" | "webp" | "png" | "bin"
                                 )
                             })
-                            .unwrap_or(false)
                 })
                 .collect();
             file_paths.sort();
@@ -3622,8 +3606,7 @@ impl FaceGallery {
                 .filter(|m| m.file_type().is_dir())
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_secs());
             out.push(EnrolledFaceProfile {
                 name: name.clone(),
                 sample_count: embs.len(),
@@ -3869,8 +3852,10 @@ fn parse_regex_node(chars: &[char], pos: &mut usize, depth: usize) -> RegexNode 
         *pos += 1;
         branches.push(parse_regex_sequence(chars, pos, depth));
     }
-    if branches.len() == 1 {
-        branches.pop().unwrap()
+    if branches.len() == 1
+        && let Some(single) = branches.pop()
+    {
+        single
     } else {
         RegexNode::Alternation(branches)
     }
@@ -4345,10 +4330,12 @@ pub fn vote_license_plate_reads(
                 entry.0 += w;
                 entry.1 += 1;
             }
-            let (best_ch, (best_weight, best_count)) = char_votes
+            let Some((best_ch, (best_weight, best_count))) = char_votes
                 .into_iter()
                 .max_by(|a, b| a.1.0.total_cmp(&b.1.0).then_with(|| a.1.1.cmp(&b.1.1)))
-                .unwrap();
+            else {
+                continue;
+            };
             voted_plate.push(best_ch);
             pos_conf_sum += best_weight / (best_count.max(1) as f32);
         }
