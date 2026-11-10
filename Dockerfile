@@ -5,7 +5,7 @@ WORKDIR /src/web
 COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY web ./
-RUN bun run typecheck && bun run build
+RUN bun run typecheck && bun run test && bun run build
 
 FROM rust:1-trixie AS builder
 

@@ -68,7 +68,7 @@ def validate_message(raw_message: str, source_label: str = "commit") -> list[str
             "  Expected Conventional Commit with scope: <type>(<scope>): <description>\n"
             f"  Allowed types: {', '.join(ALLOWED_TYPES)}\n"
             "  Scope format: lowercase alphanumeric, '-', '_', or ',' (e.g. feat(web): ..., fix(vision): ...)\n"
-            "  SemVer impact: feat/fix/perf increment the next release version in ./scripts/ci/cut-release."
+            "  SemVer impact: breaking (!) -> major, feat -> minor, fix/perf -> patch in ./scripts/ci/cut-release."
         )
         return errors
 

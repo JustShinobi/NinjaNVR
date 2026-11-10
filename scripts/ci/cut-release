@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
 Two-Track SemVer Release & Changelog Generator for NinjaNVR:
-- On `dev` branch (default): cuts incremental Pre-Releases (`vX.Y.Z-rc.N`),
-  updates version manifests so runtime telemetry reports `-rc.N`, and creates
-  a GitHub Pre-Release without touching `CHANGELOG.md`.
-- On `main` branch (stable): condenses all commits since the last stable release
-  (`vX.Y.Z`) into `CHANGELOG.md`, updates version manifests to `X.Y.Z`, creates
-  the official `Latest` GitHub Release, and syncs `main` back into `dev`.
+- On `dev` branch (default): cuts incremental Pre-Releases (`vX.Y.Z-rc.N`)
+  targeting the next SemVer version (`MAJOR.MINOR.PATCH`), and creates a
+  GitHub Pre-Release highlighting the incremental delta since the previous
+  tag (`last_any_tag..HEAD`) plus a collapsed cumulative summary since the
+  last stable release (`last_stable_tag..HEAD`), without touching `CHANGELOG.md`.
+- On `main` branch (stable): condenses user-facing commits since the last stable
+  release (`vX.Y.Z`) into `CHANGELOG.md`, updates version manifests to `X.Y.Z`,
+  creates the official `Latest` GitHub Release, prunes superseded `-rc.*` tags,
+  and syncs `main` back into `dev`.
 """
 
+from dataclasses import dataclass
 import datetime
 import json
 import os
@@ -19,7 +23,20 @@ from pathlib import Path
 
 STABLE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 RC_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-rc\.(\d+)$")
+CONVENTIONAL_RE = re.compile(r"^([a-z]+)(?:\(([^)]+)\))?(!)?:\s+(.+)$")
+BREAKING_FOOTER_RE = re.compile(r"(?m)^BREAKING[ -]CHANGE:\s+")
 MAX_RC_TAGS_TO_KEEP = 10
+LEGACY_WEB_SCOPES = {"web-v2", "ui-v2", "ui"}
+
+
+@dataclass(frozen=True)
+class CommitEntry:
+    sha: str
+    subject: str
+    commit_type: str
+    scope: str
+    description: str
+    is_breaking: bool
 
 
 def run(cmd: list[str], check: bool = True) -> str:
@@ -52,65 +69,249 @@ def get_latest_stable_tag(tags: list[str]) -> tuple[str, int, int, int]:
     return (tag, maj, min_, pat)
 
 
-def collect_commits(rev_range: str) -> list[tuple[str, str]]:
-    raw = run(["git", "log", rev_range, "--no-merges", "--pretty=format:%h|%s"], check=False)
-    commits = []
-    for ln in raw.splitlines():
-        if not ln.strip():
+def normalize_scope(raw_scope: str | None) -> str:
+    if not raw_scope:
+        return ""
+    parts: list[str] = []
+    for token in raw_scope.split(","):
+        cleaned = token.strip()
+        if not cleaned:
             continue
-        sha, subj = ln.split("|", 1)
-        if subj.startswith("chore(release):"):
+        mapped = "web" if cleaned in LEGACY_WEB_SCOPES else cleaned
+        if mapped not in parts:
+            parts.append(mapped)
+    return ",".join(parts)
+
+
+def parse_commit(sha: str, subject: str, body: str = "") -> CommitEntry:
+    m = CONVENTIONAL_RE.match(subject)
+    has_footer_breaking = bool(BREAKING_FOOTER_RE.search(body)) or "[major]" in subject.lower()
+    if not m:
+        return CommitEntry(
+            sha=sha,
+            subject=subject,
+            commit_type="other",
+            scope="",
+            description=subject,
+            is_breaking=has_footer_breaking,
+        )
+    commit_type, raw_scope, bang, description = m.groups()
+    return CommitEntry(
+        sha=sha,
+        subject=subject,
+        commit_type=commit_type,
+        scope=normalize_scope(raw_scope),
+        description=description.strip(),
+        is_breaking=bool(bang) or has_footer_breaking,
+    )
+
+
+def collect_commits(rev_range: str) -> list[CommitEntry]:
+    raw = run(
+        ["git", "log", rev_range, "--no-merges", "--pretty=format:%h%x1f%s%x1f%b%x1e"],
+        check=False,
+    )
+    commits: list[CommitEntry] = []
+    for record in raw.split("\x1e"):
+        record = record.strip()
+        if not record:
             continue
-        commits.append((sha, subj))
+        fields = record.split("\x1f")
+        if len(fields) < 2:
+            continue
+        sha = fields[0].strip()
+        subj = fields[1].strip()
+        body = fields[2].strip() if len(fields) > 2 else ""
+        if not sha or not subj:
+            continue
+        if subj.startswith("chore(release):") or "[skip release]" in subj:
+            continue
+        commits.append(parse_commit(sha, subj, body))
     return commits
 
 
 def compute_next_stable_version(
-    major: int, minor: int, patch: int, commits: list[tuple[str, str]]
+    major: int, minor: int, patch: int, commits: list[CommitEntry]
 ) -> str:
     """
-    Cumulative Decimal SemVer by feat/fix/perf (0.9.9 -> 1.0.0, 1.0.9 -> 1.1.0):
-    Each feat/fix/perf commit since the last stable release increments the decimal
-    version by +0.0.1 (minimum +1 step when a release contains only chore/docs/ci).
+    Standard Semantic Versioning (SemVer 2.0.0) over the release window:
+    - Breaking change (`<type>(<scope>)!:`, `BREAKING CHANGE:`, or `[major]`) -> MAJOR bump
+      (or MINOR bump while major == 0).
+    - Feature (`feat(...)` or `[minor]`) -> MINOR bump (`major.minor+1.0`).
+    - Fix, performance, or maintenance (`fix`, `perf`, etc.) -> PATCH bump (`major.minor.patch+1`).
     """
-    value_commits = [
-        (sha, s)
-        for sha, s in commits
-        if re.match(r"^(feat|fix|perf)(\([^)]+\))?!?\s*:", s)
-    ]
-    steps = max(1, len(value_commits))
-    base_val = (major * 100) + (minor * 10) + patch
-    next_val = base_val + steps
-    next_major = next_val // 100
-    next_minor = (next_val % 100) // 10
-    next_patch = next_val % 10
-    return f"{next_major}.{next_minor}.{next_patch}"
+    has_breaking = any(c.is_breaking for c in commits)
+    has_feat = any(c.commit_type == "feat" or "[minor]" in c.subject.lower() for c in commits)
+
+    if has_breaking:
+        if major == 0:
+            return f"0.{minor + 1}.0"
+        return f"{major + 1}.0.0"
+    if has_feat:
+        return f"{major}.{minor + 1}.0"
+    return f"{major}.{minor}.{patch + 1}"
 
 
-def format_release_notes(commits: list[tuple[str, str]]) -> tuple[list[str], str]:
-    feats, fixes, perfs, others = [], [], [], []
-    for sha, subj in commits:
-        entry = f"- {subj} (`{sha}`)"
-        if subj.startswith("feat"):
-            feats.append(entry)
-        elif subj.startswith("fix"):
-            fixes.append(entry)
-        elif subj.startswith("perf"):
-            perfs.append(entry)
+def format_commit_bullet(c: CommitEntry) -> str:
+    if c.scope:
+        return f"- **{c.scope}:** {c.description} (`{c.sha}`)"
+    return f"- {c.description} (`{c.sha}`)"
+
+
+HARDEN_PREFIXES = ("harden ", "enforce ", "endurecer ")
+
+
+def is_hardening_commit(c: CommitEntry) -> bool:
+    if c.is_breaking or c.commit_type != "fix":
+        return False
+    desc_lower = c.description.lower()
+    return desc_lower.startswith(HARDEN_PREFIXES)
+
+
+def summarize_hardening_by_scope(hardening_commits: list[CommitEntry]) -> list[str]:
+    grouped: dict[str, list[CommitEntry]] = {}
+    for c in hardening_commits:
+        primary_scope = (c.scope.split(",", 1)[0] if c.scope else "core").strip() or "core"
+        grouped.setdefault(primary_scope, []).append(c)
+
+    lines: list[str] = []
+    for scope, items in grouped.items():
+        if len(items) == 1:
+            lines.append(format_commit_bullet(items[0]))
         else:
-            others.append(entry)
+            latest_sha = items[0].sha
+            oldest_sha = items[-1].sha
+            lines.append(
+                f"- **{scope}:** {len(items)} security, bounds, and lifecycle hardening fixes "
+                f"(`{oldest_sha}`..`{latest_sha}`)"
+            )
+    return lines
 
+
+def categorize_commits(
+    commits: list[CommitEntry],
+) -> tuple[list[str], list[str], list[str], list[str], list[CommitEntry], list[str]]:
+    breaking, feats, perfs, fixes, hardening, internal = [], [], [], [], [], []
+    for c in commits:
+        bullet = format_commit_bullet(c)
+        if c.is_breaking:
+            breaking.append(bullet)
+        elif c.commit_type == "feat":
+            feats.append(bullet)
+        elif c.commit_type == "perf":
+            perfs.append(bullet)
+        elif is_hardening_commit(c):
+            hardening.append(c)
+        elif c.commit_type in ("fix", "revert"):
+            fixes.append(bullet)
+        else:
+            internal.append(bullet)
+    return breaking, feats, perfs, fixes, hardening, internal
+
+
+def format_release_notes(
+    commits: list[CommitEntry],
+    *,
+    include_internal_section: bool = False,
+    collapse_internal: bool = False,
+    condense_hardening: bool = True,
+) -> tuple[list[str], str]:
+    breaking, feats, perfs, fixes, hardening, internal = categorize_commits(commits)
     body_lines: list[str] = []
+
+    if breaking:
+        body_lines.extend(["### Breaking Changes", *breaking, ""])
     if feats:
         body_lines.extend(["### Features", *feats, ""])
-    if fixes:
-        body_lines.extend(["### Bug Fixes", *fixes, ""])
     if perfs:
         body_lines.extend(["### Performance", *perfs, ""])
-    if others:
-        body_lines.extend(["### Documentation & Maintenance", *others, ""])
+
+    if hardening and not condense_hardening:
+        combined_fixes = [*fixes, *(format_commit_bullet(c) for c in hardening)]
+    else:
+        combined_fixes = fixes
+
+    if combined_fixes:
+        body_lines.extend(["### Bug Fixes", *combined_fixes, ""])
+
+    if hardening and condense_hardening:
+        if len(hardening) <= 4:
+            harden_lines = [format_commit_bullet(c) for c in hardening]
+        else:
+            harden_lines = summarize_hardening_by_scope(hardening)
+        body_lines.extend(["### Security & Hardening", *harden_lines, ""])
+
+    has_user_facing = bool(breaking or feats or perfs or combined_fixes or hardening)
+
+    if internal:
+        if include_internal_section or not has_user_facing:
+            body_lines.extend(["### Maintenance", *internal, ""])
+        elif collapse_internal:
+            detailed_audit = [
+                *(format_commit_bullet(c) for c in hardening if len(hardening) > 4),
+                *internal,
+            ]
+            body_lines.extend(
+                [
+                    "<details>",
+                    f"<summary>Internal, Audit & Maintenance ({len(detailed_audit)} commit{'s' if len(detailed_audit) != 1 else ''})</summary>",
+                    "",
+                    *detailed_audit,
+                    "",
+                    "</details>",
+                    "",
+                ]
+            )
 
     return body_lines, "\n".join(body_lines).strip()
+
+
+def format_prerelease_notes(
+    next_tag: str,
+    target_stable_version: str,
+    last_any_tag: str,
+    last_stable_tag: str,
+    incremental_commits: list[CommitEntry],
+    commits_since_stable: list[CommitEntry],
+) -> str:
+    _, delta_notes = format_release_notes(
+        incremental_commits,
+        include_internal_section=True,
+        collapse_internal=False,
+        condense_hardening=False,
+    )
+    sections: list[str] = [
+        f"## Changes in `{next_tag}` (since `{last_any_tag}`)",
+        "",
+        delta_notes,
+    ]
+
+    if last_any_tag != last_stable_tag and len(commits_since_stable) > len(incremental_commits):
+        breaking, feats, perfs, fixes, hardening, _ = categorize_commits(commits_since_stable)
+        user_facing_count = len(breaking) + len(feats) + len(perfs) + len(fixes) + len(hardening)
+        _, cumulative_notes = format_release_notes(
+            commits_since_stable,
+            include_internal_section=False,
+            collapse_internal=False,
+            condense_hardening=True,
+        )
+        sections.extend(
+            [
+                "",
+                "<details>",
+                (
+                    f"<summary>Cumulative changes staged for <code>v{target_stable_version}</code> "
+                    f"since <code>{last_stable_tag}</code> "
+                    f"({user_facing_count} user-facing, {len(commits_since_stable)} total commits)</summary>"
+                ),
+                "",
+                cumulative_notes,
+                "",
+                "</details>",
+            ]
+        )
+
+    return "\n".join(sections).strip()
 
 
 def update_version_manifests(next_version: str) -> list[str]:
@@ -146,6 +347,30 @@ def update_version_manifests(next_version: str) -> list[str]:
         modified.append(json_file)
 
     return modified
+
+
+def get_rc_tags_to_prune(next_tag: str, is_prerelease: bool) -> list[str]:
+    if not is_prerelease:
+        merged_out = run(
+            ["git", "tag", "-l", "v*-rc.*", "--merged", "HEAD", "--sort=creatordate"],
+            check=False,
+        )
+        return [
+            t.strip()
+            for t in merged_out.splitlines()
+            if t.strip() and t.strip() != next_tag and RC_TAG_RE.match(t.strip())
+        ]
+
+    ordered_out = run(["git", "tag", "-l", "v*-rc.*", "--sort=creatordate"], check=False)
+    ordered_rcs = [
+        t.strip()
+        for t in ordered_out.splitlines()
+        if t.strip() and RC_TAG_RE.match(t.strip())
+    ]
+    if next_tag not in ordered_rcs and RC_TAG_RE.match(next_tag):
+        ordered_rcs.append(next_tag)
+    superseded = ordered_rcs[:-MAX_RC_TAGS_TO_KEEP]
+    return [t for t in superseded if t != next_tag]
 
 
 def main() -> int:
@@ -188,9 +413,14 @@ def main() -> int:
         next_tag = f"v{next_version}"
         print(f"[dev pre-release] Cutting {next_tag} (commits since {last_any_tag}: {len(incremental_commits)})")
 
-        # Include all cumulative commits since the last stable release (`last_stable_tag..HEAD`)
-        # so each -rc.* pre-release shows the complete set of changes for the upcoming stable version.
-        _, release_notes = format_release_notes(commits_since_stable)
+        release_notes = format_prerelease_notes(
+            next_tag=next_tag,
+            target_stable_version=target_stable_version,
+            last_any_tag=last_any_tag,
+            last_stable_tag=last_stable_tag,
+            incremental_commits=incremental_commits,
+            commits_since_stable=commits_since_stable,
+        )
         run(["git", "config", "user.name", "github-actions[bot]"])
         run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
         run(["git", "tag", "-a", next_tag, "-m", f"chore(release): {next_tag}"])
@@ -203,10 +433,19 @@ def main() -> int:
         )
 
         files_to_stage = update_version_manifests(next_version)
-        body_lines, release_notes = format_release_notes(commits_since_stable)
+        changelog_lines, _ = format_release_notes(
+            commits_since_stable,
+            include_internal_section=False,
+            collapse_internal=False,
+        )
+        _, release_notes = format_release_notes(
+            commits_since_stable,
+            include_internal_section=False,
+            collapse_internal=True,
+        )
 
         today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-        section_lines = [f"## [{next_version}] - {today}", "", *body_lines]
+        section_lines = [f"## [{next_version}] - {today}", "", *changelog_lines]
         new_section = "\n".join(section_lines).rstrip() + "\n\n"
 
         changelog_path = Path("CHANGELOG.md")
@@ -237,22 +476,10 @@ def main() -> int:
         gh_cmd.append("--latest")
     run(gh_cmd)
 
-    # Keep the latest MAX_RC_TAGS_TO_KEEP (10) -rc.* pre-releases and tags; prune older ones.
-    seen_rc_tags = set(all_tags)
-    if "-rc." in next_tag:
-        seen_rc_tags.add(next_tag)
-    rc_candidates: list[tuple[int, int, int, int, str]] = []
-    for t in seen_rc_tags:
-        m = RC_TAG_RE.match(t)
-        if m:
-            rc_candidates.append(
-                (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), t)
-            )
-    rc_candidates.sort()
-    superseded_rcs = [item[4] for item in rc_candidates[:-MAX_RC_TAGS_TO_KEEP]]
+    superseded_rcs = get_rc_tags_to_prune(next_tag, is_prerelease)
     for old_rc in superseded_rcs:
         print(
-            f"Pruning old pre-release and tag (keeping latest {MAX_RC_TAGS_TO_KEEP} RCs): {old_rc}"
+            f"Pruning superseded pre-release and tag (keeping latest {MAX_RC_TAGS_TO_KEEP} RCs): {old_rc}"
         )
         subprocess.run(
             ["gh", "release", "delete", old_rc, "--cleanup-tag", "--yes"],

@@ -55,6 +55,7 @@ jobs:
         run: |
           bun install --cwd web --frozen-lockfile
           bun run --cwd web typecheck
+          bun run --cwd web test
           bun run --cwd web build
 
       - name: Install Rust toolchain
