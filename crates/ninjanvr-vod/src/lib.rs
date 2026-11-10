@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+//! Pure-Rust ISO-BMFF (`ftyp`/`moov`/`moof`/`mdat`) parser and fMP4 HLS VOD playlist
+//! and segment remuxer.
 
 use std::path::{Component, Path};
 
@@ -129,6 +131,16 @@ pub fn probe_mp4_resolution(mp4_path: &Path) -> Option<(u32, u32)> {
 }
 
 /// Generates an HLS master playlist (`master.m3u8`).
+///
+/// # Examples
+///
+/// ```
+/// use ninjanvr_vod::build_master_playlist;
+///
+/// let m3u8 = build_master_playlist();
+/// assert!(m3u8.starts_with("#EXTM3U\n"));
+/// assert!(m3u8.contains("index-v1-a1.m3u8"));
+/// ```
 pub fn build_master_playlist() -> String {
     [
         "#EXTM3U",

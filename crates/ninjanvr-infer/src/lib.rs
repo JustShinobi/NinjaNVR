@@ -1,3 +1,9 @@
+//! Object detection, face embedding, and license-plate OCR inference engine supporting
+//! OpenVINO (`libopenvino_c`) and ONNX Runtime (`libonnxruntime`) C-API backends.
+//!
+//! All `unsafe` FFI blocks are confined to this crate and guarded by runtime null-pointer,
+//! dimension, alignment, and buffer-size checks.
+
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -54,6 +60,15 @@ pub struct DetectorRuntimeCatalog {
 
 /// Computes the standard multi-scale anchor count for stride-(8, 16, 32) YOLO heads:
 /// `(W/8)*(H/8) + (W/16)*(H/16) + (W/32)*(H/32)` (e.g., `2100` at `320x320`, `8400` at `640x640`, `3549` at `416x416`).
+///
+/// # Examples
+///
+/// ```
+/// use ninjanvr_infer::expected_yolo_anchors;
+///
+/// assert_eq!(expected_yolo_anchors(320, 320), 2100);
+/// assert_eq!(expected_yolo_anchors(640, 640), 8400);
+/// ```
 pub fn expected_yolo_anchors(model_w: u32, model_h: u32) -> usize {
     let w = model_w as usize;
     let h = model_h as usize;

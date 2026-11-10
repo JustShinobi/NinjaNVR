@@ -1,5 +1,10 @@
 #![recursion_limit = "512"]
 #![cfg_attr(not(test), forbid(unsafe_code))]
+//! YAML configuration schema, credential scrubbing/restoration, SSRF/path-traversal
+//! validation, and `go2rtc` process supervision for NinjaNVR.
+//!
+//! Preserves backwards compatibility with legacy `config.yml` schemas while enforcing
+//! `O_NOFOLLOW` descriptor checks on configuration and secret reads/writes.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

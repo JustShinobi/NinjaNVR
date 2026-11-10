@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+//! Pure-Rust computer vision primitives: YUV420p motion detection, CLAHE contrast
+//! enhancement, polygonal zone/mask evaluation, dHash64 perceptual hashing, camera
+//! tamper detection, and JPEG/WebP snapshot encoding.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -20,6 +23,17 @@ pub struct BoundingBox {
 }
 
 impl BoundingBox {
+    /// Creates a normalized bounding box ensuring `x_min <= x_max` and `y_min <= y_max`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ninjanvr_vision::BoundingBox;
+    ///
+    /// let b = BoundingBox::new(100, 80, 20, 40);
+    /// assert_eq!((b.x_min, b.y_min, b.x_max, b.y_max), (20, 40, 100, 80));
+    /// assert_eq!(b.area(), 80 * 40);
+    /// ```
     pub fn new(x_min: u32, y_min: u32, x_max: u32, y_max: u32) -> Self {
         Self {
             x_min: x_min.min(x_max),
@@ -89,6 +103,18 @@ impl BoundingBox {
         }
     }
 
+    /// Computes the Intersection-over-Union (`[0.0..=1.0]`) between two bounding boxes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ninjanvr_vision::BoundingBox;
+    ///
+    /// let a = BoundingBox::new(0, 0, 10, 10);
+    /// let b = BoundingBox::new(10, 10, 20, 20);
+    /// assert_eq!(a.iou(&a), 1.0);
+    /// assert_eq!(a.iou(&b), 0.0);
+    /// ```
     pub fn iou(&self, other: &Self) -> f32 {
         let ix1 = self.x_min.max(other.x_min);
         let iy1 = self.y_min.max(other.y_min);

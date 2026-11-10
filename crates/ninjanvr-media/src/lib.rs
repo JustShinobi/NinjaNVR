@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+//! MP4 segment recording supervision, YUV420p/audio substream ingestion, tiered storage
+//! retention cleanup, cold HEVC compaction, and privacy-masked clip export.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};

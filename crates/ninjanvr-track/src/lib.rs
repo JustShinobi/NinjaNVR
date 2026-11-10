@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+//! Multi-object ByteTrack association, constant-velocity Kalman filtering, stationary
+//! object classification, tripwire line-crossing, and polygonal zone/mask evaluation.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1214,6 +1216,18 @@ pub fn is_vehicle_label(label: &str) -> bool {
     )
 }
 
+/// Returns `true` when an attribute label represents a delivery carrier logo rather than
+/// a structural child attribute (`"face"` or `"license_plate"`).
+///
+/// # Examples
+///
+/// ```
+/// use ninjanvr_track::is_delivery_logo_label;
+///
+/// assert!(is_delivery_logo_label("amazon"));
+/// assert!(!is_delivery_logo_label("face"));
+/// assert!(!is_delivery_logo_label("license_plate"));
+/// ```
 pub fn is_delivery_logo_label(label: &str) -> bool {
     !label.eq_ignore_ascii_case("face") && !label.eq_ignore_ascii_case("license_plate")
 }

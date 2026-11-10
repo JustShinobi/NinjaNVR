@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+//! Real-time WebSocket (`/ws`) broadcast hub, MQTT broker client, Home Assistant
+//! MQTT auto-discovery publisher, and camera activity/log ring buffers.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1858,9 +1860,8 @@ cameras:
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
-    #[tokio::test]
-    async fn activity_ledger_evicts_ring_buffer_and_log_buffer_hub_filters_services() {
-        // 1. ActivityLedger ring-buffer capacity eviction and window eviction
+    #[test]
+    fn activity_ledger_evicts_ring_buffer_and_stale_window_samples() {
         let ledger = ActivityLedger::with_capacity(3);
         ledger.record_sample_with_audio("front_door", 1000.0, 10, 1, 1, -45);
         ledger.record_sample_with_audio("front_door", 1001.0, 20, 2, 1, -30);
@@ -1888,8 +1889,10 @@ cameras:
             ledger.aggregate_range("front_door", 1390.0, 1410.0),
             (5, 0, 1)
         );
+    }
 
-        // 2. LogBufferHub push_ninjanvr, push_go2rtc, push_nginx, capacity eviction, and service filtering
+    #[tokio::test]
+    async fn log_buffer_hub_bounds_capacity_and_filters_disallowed_services() {
         let log_hub = LogBufferHub::with_capacity(3);
         let mut log_rx = log_hub.subscribe();
 

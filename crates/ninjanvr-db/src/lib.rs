@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+//! SQLite persistence, schema migrations, PBKDF2-SHA256 user authentication,
+//! API bearer token verification, camera-scoped RBAC queries, and guest share-link storage.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -35,6 +37,18 @@ pub const NINJANVR_SECURITY_CLASSES: [&str; 15] = [
     "umbrella",
 ];
 
+/// Maps a case-insensitive security class label (normalizing spaces and hyphens to `_`)
+/// to its canonical 0..15 index in [`NINJANVR_SECURITY_CLASSES`].
+///
+/// # Examples
+///
+/// ```
+/// use ninjanvr_db::{security_class_id, security_class_label};
+///
+/// assert_eq!(security_class_id("License-Plate"), Some(7));
+/// assert_eq!(security_class_label(7), Some("license_plate"));
+/// assert_eq!(security_class_id("unknown_object"), None);
+/// ```
 pub fn security_class_id(label: &str) -> Option<usize> {
     let normalized = label.trim().to_ascii_lowercase().replace([' ', '-'], "_");
     NINJANVR_SECURITY_CLASSES
@@ -42,10 +56,23 @@ pub fn security_class_id(label: &str) -> Option<usize> {
         .position(|&c| c == normalized)
 }
 
+/// Returns the canonical class label for `class_id` in [`NINJANVR_SECURITY_CLASSES`].
 pub fn security_class_label(class_id: usize) -> Option<&'static str> {
     NINJANVR_SECURITY_CLASSES.get(class_id).copied()
 }
 
+/// Deterministically assigns a dataset sample ID to `"train"` (80%) or `"val"` (20%)
+/// using 64-bit FNV-1a hashing.
+///
+/// # Examples
+///
+/// ```
+/// use ninjanvr_db::deterministic_dataset_split;
+///
+/// let split = deterministic_dataset_split("ds_sample_001");
+/// assert!(split == "train" || split == "val");
+/// assert_eq!(split, deterministic_dataset_split("ds_sample_001"));
+/// ```
 pub fn deterministic_dataset_split(id: &str) -> &'static str {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in id.as_bytes() {

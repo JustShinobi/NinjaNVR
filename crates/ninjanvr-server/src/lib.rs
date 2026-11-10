@@ -1,5 +1,7 @@
 #![recursion_limit = "512"]
 #![forbid(unsafe_code)]
+//! Axum HTTP/TLS operator server, REST/WebSocket API routes, declarative camera
+//! protocol drivers, MSE fMP4 live streaming hub, and vision pipeline orchestration.
 
 pub mod auth_gate;
 pub mod camera_protocols;
