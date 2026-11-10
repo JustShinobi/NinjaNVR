@@ -429,39 +429,7 @@ pub(crate) fn unix_now() -> u64 {
 pub(crate) fn open_regular_non_symlink_readonly(
     path: &Path,
 ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
-    let lmeta = std::fs::symlink_metadata(path)?;
-    if !lmeta.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "target is not a regular file",
-        ));
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(nix::libc::O_NOFOLLOW);
-    }
-    let file = opts.open(path)?;
-    let fmeta = file.metadata()?;
-    if !fmeta.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "opened descriptor is not a regular file",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if lmeta.dev() != fmeta.dev() || lmeta.ino() != fmeta.ino() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "file inode changed during open",
-            ));
-        }
-    }
-    Ok((file, fmeta))
+    ninjanvr_config::open_regular_file_nofollow(path)
 }
 
 pub(crate) fn read_bounded_non_symlink_bytes_sync(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
@@ -10566,72 +10534,24 @@ async fn api_camera_ptz_preset(
             }))
             .into_response()
         }
-        Err((_, ref err_msg))
-            if is_onvif_action_not_supported_error(err_msg) || soft_opt.is_some() =>
-        {
+        Err(_) if soft_opt.is_some() => {
             // Soft-preset fallback for cameras (like Intelbras iME-360-C) where ONVIF GotoPreset is not implemented
-            if let Some(soft) = soft_opt {
-                let (resolved_prof, cur_status) = match fetch_ptz_status_with_profile_discovery(
-                    &state,
-                    &camera,
-                    &endpoint,
-                    &profile_token,
-                    body.profile_token.is_none(),
-                    (user, pass),
-                    timeout,
-                )
-                .await
-                {
-                    Ok(pair) => pair,
-                    Err((st, e)) => {
-                        state
-                            .ptz_active_presets
-                            .write()
-                            .await
-                            .insert(camera.clone(), None);
-                        return (
-                            st,
-                            Json(json!({
-                                "success": false,
-                                "camera": camera,
-                                "operation": "GotoPreset",
-                                "error": e,
-                                "active_preset": Value::Null
-                            })),
-                        )
-                            .into_response();
-                    }
-                };
-                let (dx, dy, dz) = compute_soft_preset_relative_delta(
-                    f64::from(cur_status.pan),
-                    f64::from(cur_status.tilt),
-                    f64::from(cur_status.zoom),
-                    f64::from(soft.pan),
-                    f64::from(soft.tilt),
-                    f64::from(soft.zoom),
-                    0.0,
-                )
-                .map_or((0.0, 0.0, 0.0), |(x, y, z)| (x as f32, y as f32, z as f32));
-                let rel_soap = build_onvif_relative_move_soap(
-                    &resolved_prof,
-                    dx,
-                    dy,
-                    dz,
-                    body.speed,
-                    user,
-                    pass,
-                );
-                if let Err((st, e)) = send_onvif_soap_request(
-                    &state.http_client,
-                    &endpoint,
-                    "RelativeMove",
-                    rel_soap,
-                    user,
-                    pass,
-                    timeout,
-                )
-                .await
-                {
+            let Some(soft) = soft_opt else {
+                unreachable!("guarded by soft_opt.is_some()");
+            };
+            let (resolved_prof, cur_status) = match fetch_ptz_status_with_profile_discovery(
+                &state,
+                &camera,
+                &endpoint,
+                &profile_token,
+                body.profile_token.is_none(),
+                (user, pass),
+                timeout,
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err((st, e)) => {
                     state
                         .ptz_active_presets
                         .write()
@@ -10649,38 +10569,61 @@ async fn api_camera_ptz_preset(
                     )
                         .into_response();
                 }
+            };
+            let (dx, dy, dz) = compute_soft_preset_relative_delta(
+                f64::from(cur_status.pan),
+                f64::from(cur_status.tilt),
+                f64::from(cur_status.zoom),
+                f64::from(soft.pan),
+                f64::from(soft.tilt),
+                f64::from(soft.zoom),
+                0.0,
+            )
+            .map_or((0.0, 0.0, 0.0), |(x, y, z)| (x as f32, y as f32, z as f32));
+            let rel_soap =
+                build_onvif_relative_move_soap(&resolved_prof, dx, dy, dz, body.speed, user, pass);
+            if let Err((st, e)) = send_onvif_soap_request(
+                &state.http_client,
+                &endpoint,
+                "RelativeMove",
+                rel_soap,
+                user,
+                pass,
+                timeout,
+            )
+            .await
+            {
                 state
                     .ptz_active_presets
                     .write()
                     .await
-                    .insert(camera.clone(), Some(preset_token.to_string()));
-                return Json(json!({
-                    "success": true,
-                    "camera": camera,
-                    "operation": "GotoPreset",
-                    "preset": preset_token,
-                    "active_preset": preset_token,
-                    "source": "soft_preset"
-                }))
-                .into_response();
+                    .insert(camera.clone(), None);
+                return (
+                    st,
+                    Json(json!({
+                        "success": false,
+                        "camera": camera,
+                        "operation": "GotoPreset",
+                        "error": e,
+                        "active_preset": Value::Null
+                    })),
+                )
+                    .into_response();
             }
-            let (status, err_msg) = goto_res.unwrap_err();
             state
                 .ptz_active_presets
                 .write()
                 .await
-                .insert(camera.clone(), None);
-            (
-                status,
-                Json(json!({
-                    "success": false,
-                    "camera": camera,
-                    "operation": "GotoPreset",
-                    "error": err_msg,
-                    "active_preset": Value::Null
-                })),
-            )
-                .into_response()
+                .insert(camera.clone(), Some(preset_token.to_string()));
+            Json(json!({
+                "success": true,
+                "camera": camera,
+                "operation": "GotoPreset",
+                "preset": preset_token,
+                "active_preset": preset_token,
+                "source": "soft_preset"
+            }))
+            .into_response()
         }
         Err((status, err_msg)) => {
             state

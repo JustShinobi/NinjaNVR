@@ -1211,7 +1211,7 @@ pub async fn api_share_revoke(
             .into_response();
     }
     if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     let Some(link) = state.db.get_share_link(&id).ok().flatten() else {
         return (
@@ -1364,7 +1364,7 @@ pub async fn api_share_create(
             .into_response();
     }
     if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     let kind = if body.kind.eq_ignore_ascii_case("review") {
         "review".to_string()

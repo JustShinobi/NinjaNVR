@@ -40,6 +40,8 @@ pub const O_NOFOLLOW_FLAG: i32 = 0x0100;
     ))
 ))]
 pub const O_NOFOLLOW_FLAG: i32 = 0;
+#[cfg(not(unix))]
+pub const O_NOFOLLOW_FLAG: i32 = 0;
 
 /// Opens a regular file without following symlinks and verifies that the opened descriptor
 /// matches the pre-open `lstat` device and inode on Unix platforms.
@@ -3868,10 +3870,10 @@ impl NinjaConfig {
             let next_model: ModelConfig =
                 serde_json::from_value(merged_model).context("invalid model config")?;
             if !is_safe_labelmap_path(Path::new(&next_model.labelmap_path)) {
-                anyhow::bail!("invalid model.labelmap_path");
+                return Err(ConfigValidationError::InvalidPathField("model.labelmap_path").into());
             }
             if !is_safe_model_path(Path::new(&next_model.path)) {
-                anyhow::bail!("invalid model.path");
+                return Err(ConfigValidationError::InvalidPathField("model.path").into());
             }
             self.model = next_model;
         }
@@ -3893,10 +3895,18 @@ impl NinjaConfig {
                     }
                     if let Some(ref m) = det.model {
                         if !is_safe_labelmap_path(Path::new(&m.labelmap_path)) {
-                            anyhow::bail!("invalid detector model.labelmap_path in '{det_name}'");
+                            return Err(ConfigValidationError::InvalidDetectorPath {
+                                detector: det_name.clone(),
+                                field: "model.labelmap_path",
+                            }
+                            .into());
                         }
                         if !is_safe_model_path(Path::new(&m.path)) {
-                            anyhow::bail!("invalid detector model.path in '{det_name}'");
+                            return Err(ConfigValidationError::InvalidDetectorPath {
+                                detector: det_name.clone(),
+                                field: "model.path",
+                            }
+                            .into());
                         }
                     }
                 }
@@ -3948,7 +3958,9 @@ impl NinjaConfig {
             let next_face: FaceRecognitionConfig =
                 serde_json::from_value(merged_face).context("invalid face_recognition config")?;
             if !is_safe_model_path(&next_face.model_path) {
-                anyhow::bail!("invalid face_recognition.model_path");
+                return Err(
+                    ConfigValidationError::InvalidPathField("face_recognition.model_path").into(),
+                );
             }
             self.face_recognition = next_face;
         }
@@ -3974,12 +3986,14 @@ impl NinjaConfig {
             if let Some(ref p) = next_lpr.detector_model_path
                 && !is_safe_model_path(p)
             {
-                anyhow::bail!("invalid lpr.detector_model_path");
+                return Err(
+                    ConfigValidationError::InvalidPathField("lpr.detector_model_path").into(),
+                );
             }
             if let Some(ref p) = next_lpr.ocr_model_path
                 && !is_safe_model_path(p)
             {
-                anyhow::bail!("invalid lpr.ocr_model_path");
+                return Err(ConfigValidationError::InvalidPathField("lpr.ocr_model_path").into());
             }
             self.lpr = next_lpr;
         }
@@ -4787,12 +4801,14 @@ fn merge_json_values(base: &mut Value, patch: &Value, replace_map_keys: &[&str])
     }
 }
 
-fn validate_config_file_paths(cfg: &NinjaConfig) -> Result<()> {
+fn validate_config_file_paths(cfg: &NinjaConfig) -> std::result::Result<(), ConfigValidationError> {
     if !is_safe_labelmap_path(Path::new(&cfg.model.labelmap_path)) {
-        return Err(ConfigValidationError::InvalidPathField("model.labelmap_path").into());
+        return Err(ConfigValidationError::InvalidPathField(
+            "model.labelmap_path",
+        ));
     }
     if !is_safe_model_path(Path::new(&cfg.model.path)) {
-        return Err(ConfigValidationError::InvalidPathField("model.path").into());
+        return Err(ConfigValidationError::InvalidPathField("model.path"));
     }
     for (det_name, det) in &cfg.detectors {
         if let Some(ref m) = det.model {
@@ -4800,50 +4816,56 @@ fn validate_config_file_paths(cfg: &NinjaConfig) -> Result<()> {
                 return Err(ConfigValidationError::InvalidDetectorPath {
                     detector: det_name.clone(),
                     field: "model.labelmap_path",
-                }
-                .into());
+                });
             }
             if !is_safe_model_path(Path::new(&m.path)) {
                 return Err(ConfigValidationError::InvalidDetectorPath {
                     detector: det_name.clone(),
                     field: "model.path",
-                }
-                .into());
+                });
             }
         }
     }
     if !is_safe_model_path(&cfg.face_recognition.model_path) {
-        return Err(ConfigValidationError::InvalidPathField("face_recognition.model_path").into());
+        return Err(ConfigValidationError::InvalidPathField(
+            "face_recognition.model_path",
+        ));
     }
     if let Some(ref p) = cfg.lpr.detector_model_path
         && !is_safe_model_path(p)
     {
-        return Err(ConfigValidationError::InvalidPathField("lpr.detector_model_path").into());
+        return Err(ConfigValidationError::InvalidPathField(
+            "lpr.detector_model_path",
+        ));
     }
     if let Some(ref p) = cfg.lpr.ocr_model_path
         && !is_safe_model_path(p)
     {
-        return Err(ConfigValidationError::InvalidPathField("lpr.ocr_model_path").into());
+        return Err(ConfigValidationError::InvalidPathField(
+            "lpr.ocr_model_path",
+        ));
     }
     validate_mqtt_tls_paths(&cfg.mqtt)?;
     Ok(())
 }
 
-fn validate_mqtt_tls_paths(mqtt: &MqttConfig) -> Result<()> {
+fn validate_mqtt_tls_paths(mqtt: &MqttConfig) -> std::result::Result<(), ConfigValidationError> {
     if let Some(ref p) = mqtt.tls_ca_certs
         && !is_safe_tls_path(p)
     {
-        return Err(ConfigValidationError::InvalidTlsPath("mqtt.tls_ca_certs").into());
+        return Err(ConfigValidationError::InvalidTlsPath("mqtt.tls_ca_certs"));
     }
     if let Some(ref p) = mqtt.tls_client_cert
         && !is_safe_tls_path(p)
     {
-        return Err(ConfigValidationError::InvalidTlsPath("mqtt.tls_client_cert").into());
+        return Err(ConfigValidationError::InvalidTlsPath(
+            "mqtt.tls_client_cert",
+        ));
     }
     if let Some(ref p) = mqtt.tls_client_key
         && !is_safe_tls_path(p)
     {
-        return Err(ConfigValidationError::InvalidTlsPath("mqtt.tls_client_key").into());
+        return Err(ConfigValidationError::InvalidTlsPath("mqtt.tls_client_key"));
     }
     Ok(())
 }

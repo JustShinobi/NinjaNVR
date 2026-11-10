@@ -271,6 +271,14 @@ impl AuthRejection {
     }
 }
 
+impl std::fmt::Display for AuthRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for AuthRejection {}
+
 impl IntoResponse for AuthRejection {
     fn into_response(self) -> Response {
         (
@@ -3445,23 +3453,17 @@ pub async fn verify_caller_can_mutate(
     state: &AppState,
     jar: &CookieJar,
     headers: &HeaderMap,
-) -> Option<Response> {
-    let auth_cfg = state.config.read().await.auth.clone();
-    if auth_cfg.enabled
-        && let Some((_, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &auth_cfg)
+) -> Option<AuthRejection> {
+    let cfg = state.config.read().await;
+    if cfg.auth.enabled
+        && let Some((_, role)) = extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)
     {
         let role_lc = role.trim().to_ascii_lowercase();
         if matches!(role_lc.as_str(), "viewer" | "read_only" | "metrics") {
-            return Some(
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "success": false,
-                        "message": "Insufficient role for mutation"
-                    })),
-                )
-                    .into_response(),
-            );
+            return Some(AuthRejection::new(
+                StatusCode::FORBIDDEN,
+                "Insufficient role for mutation",
+            ));
         }
     }
     None
@@ -3473,52 +3475,34 @@ pub async fn verify_camera_mutation_access(
     uri: &Uri,
     headers: &HeaderMap,
     camera: &str,
-) -> Option<Response> {
+) -> Option<AuthRejection> {
     if !verify_cookie_csrf_origin(headers, uri) {
-        return Some(
-            (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "success": false,
-                    "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-                })),
-            )
-                .into_response(),
-        );
+        return Some(AuthRejection::new(
+            StatusCode::FORBIDDEN,
+            "Cross-origin cookie request rejected (Origin/Host mismatch)",
+        ));
     }
-    let auth_cfg = state.config.read().await.auth.clone();
-    if auth_cfg.enabled
+    let cfg = state.config.read().await;
+    if cfg.auth.enabled
         && let Some((user, role)) =
-            extract_authenticated_user_with_cfg(state, jar, headers, &auth_cfg)
+            extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)
     {
         let role_lc = role.to_ascii_lowercase();
         if matches!(role_lc.as_str(), "viewer" | "read_only" | "metrics") {
-            return Some(
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "success": false,
-                        "message": "Insufficient role for camera mutation"
-                    })),
-                )
-                    .into_response(),
-            );
+            return Some(AuthRejection::new(
+                StatusCode::FORBIDDEN,
+                "Insufficient role for camera mutation",
+            ));
         }
         if role_lc != "admin"
             && let Some(allowed) =
-                resolve_user_allowed_cameras(state, jar, headers, &auth_cfg, &user, &role)
+                resolve_user_allowed_cameras(state, jar, headers, &cfg.auth, &user, &role)
             && !allowed.iter().any(|a| a == camera || a == "*")
         {
-            return Some(
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "success": false,
-                        "message": format!("Camera '{camera}' is not permitted for this user")
-                    })),
-                )
-                    .into_response(),
-            );
+            return Some(AuthRejection::with_message(
+                StatusCode::FORBIDDEN,
+                format!("Camera '{camera}' is not permitted for this user"),
+            ));
         }
     }
     None

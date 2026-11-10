@@ -1743,8 +1743,6 @@ impl AiDetectorEngine {
             }
 
             let c_model = path_to_cstring(model_path)?;
-            let c_prop_key = CString::new("INFERENCE_NUM_THREADS")?;
-            let c_prop_val = CString::new("1")?;
             let mut actual_device = device.to_string();
             let core = ctx.core;
             let compile_model = fns.compile_model;
@@ -1761,8 +1759,8 @@ impl AiDetectorEngine {
                     c_dev.as_ptr(),
                     2,
                     out_model,
-                    c_prop_key.as_ptr(),
-                    c_prop_val.as_ptr(),
+                    c"INFERENCE_NUM_THREADS".as_ptr(),
+                    c"1".as_ptr(),
                 );
                 if rc1 == 0 && !(*out_model).is_null() {
                     return true;

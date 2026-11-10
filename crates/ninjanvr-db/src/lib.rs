@@ -178,6 +178,8 @@ pub enum DbValidationError {
     InvalidTokenScope,
     #[error("An API token with name '{0}' already exists")]
     TokenAlreadyExists(String),
+    #[error("Share link timestamps must be finite")]
+    NonFiniteShareTimestamps,
 }
 
 #[derive(Clone)]
@@ -5055,7 +5057,7 @@ impl NinjaDatabase {
         max_views: Option<u64>,
     ) -> Result<Value> {
         if !created_at.is_finite() || !expires_at.is_finite() {
-            anyhow::bail!("Share link timestamps must be finite");
+            return Err(DbValidationError::NonFiniteShareTimestamps.into());
         }
         let max_views_i64 = max_views.map(|v| v.min(i64::MAX as u64) as i64);
         let conn = self.lock_conn();

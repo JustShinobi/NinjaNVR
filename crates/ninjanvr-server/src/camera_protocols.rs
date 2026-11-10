@@ -286,11 +286,11 @@ impl CameraDriverRuntime {
     }
 
     pub fn get_profile(&self, camera: &str, endpoint: &str) -> Option<String> {
-        self.inner
-            .discovered_profiles
-            .read()
-            .ok()
-            .and_then(|g| g.get(&(camera.to_string(), endpoint.to_string())).cloned())
+        self.inner.discovered_profiles.read().ok().and_then(|g| {
+            g.iter().find_map(|((cam, ep), prof)| {
+                (cam == camera && ep == endpoint).then(|| prof.clone())
+            })
+        })
     }
 
     pub fn set_profile(&self, camera: &str, endpoint: &str, profile: &str) {
@@ -381,6 +381,9 @@ impl CameraDriverRuntime {
 
     pub fn set_tapo_streamd_port(&self, camera: &str, port: u16) {
         if let Ok(mut g) = self.inner.tapo_streamd_ports.write() {
+            if g.len() >= 128 && !g.contains_key(camera) {
+                g.clear();
+            }
             g.insert(camera.to_string(), port);
         }
     }
