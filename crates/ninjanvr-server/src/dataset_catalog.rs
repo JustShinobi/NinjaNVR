@@ -1882,7 +1882,7 @@ pub async fn api_genai_models_get(
     Query(query): Query<GenAiValidateRequest>,
 ) -> Response {
     if let Err(err_resp) = crate::authorize_admin_read(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     let _ = query.validate;
     Json(json!([])).into_response()
@@ -2806,7 +2806,7 @@ pub async fn api_dataset_sample_from_event(
         )
         .await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     let (kind, override_anns, auto_annotate) = match body {
         Some(Json(b)) => (
@@ -2915,7 +2915,7 @@ pub async fn api_dataset_sample_update(
         )
         .await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     match state.db.update_dataset_sample_annotations(
         &id,
@@ -2958,7 +2958,7 @@ pub async fn api_dataset_sample_delete(
         )
         .await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     let sample_opt = state.db.get_dataset_sample(&id).ok().flatten();
     if let Some(sample) = sample_opt {
@@ -3239,7 +3239,7 @@ pub async fn api_dataset_sample_auto_annotate(
         )
         .await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     match auto_annotate_dataset_sample(&state, &id).await {
         Ok(updated) => Json(sample_dto_to_response_json(&updated)).into_response(),

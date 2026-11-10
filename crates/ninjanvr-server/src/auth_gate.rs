@@ -96,7 +96,7 @@ impl AuthSessionGate {
         let mut guard = self
             .login_attempts
             .lock()
-            .expect("login rate limiter poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         let key = (scope_key.to_string(), user_key.to_ascii_lowercase());
         if let Some((count, first_inst)) = guard.get(&key).copied() {
             if now.duration_since(first_inst) >= LOGIN_LOCKOUT_WINDOW {
@@ -113,7 +113,7 @@ impl AuthSessionGate {
         let mut guard = self
             .login_attempts
             .lock()
-            .expect("login rate limiter poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         let key = (scope_key.to_string(), user_key.to_ascii_lowercase());
         if !guard.contains_key(&key) && guard.len() >= 1024 {
             guard.retain(|_, (_, inst)| now.duration_since(*inst) < LOGIN_LOCKOUT_WINDOW);
@@ -150,7 +150,7 @@ impl AuthSessionGate {
         let mut guard = self
             .login_attempts
             .lock()
-            .expect("login rate limiter poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         guard.remove(&(scope_key.to_string(), user_key.to_ascii_lowercase()));
     }
 
@@ -164,7 +164,7 @@ impl AuthSessionGate {
         let mut guard = self
             .oidc_pending_states
             .lock()
-            .expect("oidc pending states mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         guard.retain(|_, entry| now.duration_since(entry.created_at) < OIDC_PENDING_STATE_TTL);
         if guard.len() >= MAX_OIDC_PENDING_STATES
             && !guard.contains_key(&state_key)
@@ -190,32 +190,29 @@ impl AuthSessionGate {
         let mut guard = self
             .oidc_pending_states
             .lock()
-            .expect("oidc pending states mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         guard.retain(|_, entry| now.duration_since(entry.created_at) < OIDC_PENDING_STATE_TTL);
         guard.remove(state_key)
     }
 
-    #[allow(clippy::result_large_err)]
     pub async fn authenticate_read(
         &self,
         state: &AppState,
         jar: &CookieJar,
         headers: &HeaderMap,
-    ) -> Result<CallerPrincipal, Response> {
+    ) -> Result<CallerPrincipal, AuthRejection> {
         authenticate_read(state, jar, headers).await
     }
 
-    #[allow(clippy::result_large_err)]
     pub async fn authorize_admin_read(
         &self,
         state: &AppState,
         jar: &CookieJar,
         headers: &HeaderMap,
-    ) -> Result<CallerPrincipal, Response> {
+    ) -> Result<CallerPrincipal, AuthRejection> {
         authorize_admin_read(state, jar, headers).await
     }
 
-    #[allow(clippy::result_large_err)]
     pub async fn authorize_mutation(
         &self,
         state: &AppState,
@@ -224,19 +221,66 @@ impl AuthSessionGate {
         headers: &HeaderMap,
         require_admin: bool,
         target: AccessTarget<'_>,
-    ) -> Result<CallerPrincipal, Response> {
+    ) -> Result<CallerPrincipal, AuthRejection> {
         authorize_mutation(state, jar, uri, headers, require_admin, target).await
     }
 
-    #[allow(clippy::result_large_err)]
     pub async fn authorize_global_admin_mutation(
         &self,
         state: &AppState,
         jar: &CookieJar,
         uri: &Uri,
         headers: &HeaderMap,
-    ) -> Result<CallerPrincipal, Response> {
+    ) -> Result<CallerPrincipal, AuthRejection> {
         authorize_global_admin_mutation(state, jar, uri, headers).await
+    }
+}
+
+/// Lightweight authentication/authorization rejection that defers HTTP [`Response`] construction
+/// until converted via [`IntoResponse`], keeping `Result<CallerPrincipal, AuthRejection>` compact on the stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthRejection {
+    status: StatusCode,
+    message: std::borrow::Cow<'static, str>,
+}
+
+impl AuthRejection {
+    pub const fn new(status: StatusCode, message: &'static str) -> Self {
+        Self {
+            status,
+            message: std::borrow::Cow::Borrowed(message),
+        }
+    }
+
+    pub fn with_message(
+        status: StatusCode,
+        message: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    pub const fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl IntoResponse for AuthRejection {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({
+                "success": false,
+                "message": self.message,
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -339,12 +383,11 @@ pub fn is_external_public_peer_ip(headers: &HeaderMap) -> bool {
 
 /// Authenticates a read caller and resolves their effective camera scope (restricting
 /// `"metrics"` tokens to `Some(Vec::new())`).
-#[allow(clippy::result_large_err)]
 pub async fn authenticate_read(
     state: &AppState,
     jar: &CookieJar,
     headers: &HeaderMap,
-) -> Result<CallerPrincipal, Response> {
+) -> Result<CallerPrincipal, AuthRejection> {
     let cfg = state.config.read().await;
     if !cfg.auth.enabled {
         return Ok(CallerPrincipal {
@@ -371,11 +414,7 @@ pub async fn authenticate_read(
         || (cfg.auth.proxy.enabled && extract_trusted_proxy_peer_ip(headers).is_some())
         || is_external_public_peer_ip(headers);
     if has_supplied_credentials {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "success": false, "message": "Unauthorized" })),
-        )
-            .into_response())
+        Err(AuthRejection::new(StatusCode::UNAUTHORIZED, "Unauthorized"))
     } else {
         Ok(CallerPrincipal {
             username: "admin".to_string(),
@@ -386,29 +425,23 @@ pub async fn authenticate_read(
 }
 
 /// Enforces that a read caller on an admin-only endpoint holds the unrestricted `admin` role.
-#[allow(clippy::result_large_err)]
 pub async fn authorize_admin_read(
     state: &AppState,
     jar: &CookieJar,
     headers: &HeaderMap,
-) -> Result<CallerPrincipal, Response> {
+) -> Result<CallerPrincipal, AuthRejection> {
     let principal = authenticate_read(state, jar, headers).await?;
     if !principal.is_admin() || principal.camera_scope().is_restricted() {
-        return Err((
+        return Err(AuthRejection::new(
             StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Admin role required"
-            })),
-        )
-            .into_response());
+            "Admin role required",
+        ));
     }
     Ok(principal)
 }
 
 /// Verifies CSRF origin, mutation role / admin requirement, and target camera access
 /// (`Global`, `Camera`, `EventId`, `ReviewId`, or `DatasetSampleId`) in one call.
-#[allow(clippy::result_large_err)]
 pub async fn authorize_mutation(
     state: &AppState,
     jar: &CookieJar,
@@ -416,16 +449,12 @@ pub async fn authorize_mutation(
     headers: &HeaderMap,
     require_admin: bool,
     target: AccessTarget<'_>,
-) -> Result<CallerPrincipal, Response> {
+) -> Result<CallerPrincipal, AuthRejection> {
     if !verify_cookie_csrf_origin(headers, uri) {
-        return Err((
+        return Err(AuthRejection::new(
             StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Cross-origin cookie request rejected (Origin/Host mismatch)"
-            })),
-        )
-            .into_response());
+            "Cross-origin cookie request rejected (Origin/Host mismatch)",
+        ));
     }
 
     let principal = {
@@ -451,18 +480,14 @@ pub async fn authorize_mutation(
                 let Some((user, role)) =
                     extract_authenticated_user_with_cfg(state, jar, headers, &cfg.auth)
                 else {
-                    return Err((
+                    return Err(AuthRejection::new(
                         StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "success": false,
-                            "message": if require_admin {
-                                "Admin role required"
-                            } else {
-                                "Insufficient role for mutation"
-                            }
-                        })),
-                    )
-                        .into_response());
+                        if require_admin {
+                            "Admin role required"
+                        } else {
+                            "Insufficient role for mutation"
+                        },
+                    ));
                 };
                 let allowed_cameras = if role.trim().eq_ignore_ascii_case("metrics") {
                     Some(Vec::new())
@@ -479,26 +504,21 @@ pub async fn authorize_mutation(
     };
 
     if !principal.can_mutate() {
-        return Err((
+        return Err(AuthRejection::new(
             StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": if require_admin {
-                    "Admin role required"
-                } else {
-                    "Insufficient role for mutation"
-                }
-            })),
-        )
-            .into_response());
+            if require_admin {
+                "Admin role required"
+            } else {
+                "Insufficient role for mutation"
+            },
+        ));
     }
 
     if require_admin && !principal.is_admin() {
-        return Err((
+        return Err(AuthRejection::new(
             StatusCode::FORBIDDEN,
-            Json(json!({ "success": false, "message": "Admin role required" })),
-        )
-            .into_response());
+            "Admin role required",
+        ));
     }
 
     if principal.camera_scope().is_restricted() {
@@ -506,14 +526,10 @@ pub async fn authorize_mutation(
             AccessTarget::Global => {}
             AccessTarget::Camera(cam) => {
                 if !principal.allows_camera(cam) {
-                    return Err((
+                    return Err(AuthRejection::with_message(
                         StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "success": false,
-                            "message": format!("Camera '{cam}' is not permitted for this user")
-                        })),
-                    )
-                        .into_response());
+                        format!("Camera '{cam}' is not permitted for this user"),
+                    ));
                 }
             }
             AccessTarget::EventId(event_id) => {
@@ -525,14 +541,10 @@ pub async fn authorize_mutation(
                     .and_then(|ev| ev["camera"].as_str().map(|c| principal.allows_camera(c)))
                     .unwrap_or(false);
                 if !permitted {
-                    return Err((
+                    return Err(AuthRejection::new(
                         StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "success": false,
-                            "message": "Camera is not permitted for this user"
-                        })),
-                    )
-                        .into_response());
+                        "Camera is not permitted for this user",
+                    ));
                 }
             }
             AccessTarget::ReviewId(review_id) => {
@@ -543,14 +555,10 @@ pub async fn authorize_mutation(
                     .flatten()
                     .is_some_and(|r| principal.allows_camera(&r.camera));
                 if !permitted {
-                    return Err((
+                    return Err(AuthRejection::new(
                         StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "success": false,
-                            "message": "Camera is not permitted for this user"
-                        })),
-                    )
-                        .into_response());
+                        "Camera is not permitted for this user",
+                    ));
                 }
             }
             AccessTarget::DatasetSampleId(sample_id) => {
@@ -561,14 +569,10 @@ pub async fn authorize_mutation(
                     .flatten()
                     .is_some_and(|s| principal.allows_camera(&s.camera));
                 if !permitted {
-                    return Err((
+                    return Err(AuthRejection::new(
                         StatusCode::FORBIDDEN,
-                        Json(json!({
-                            "success": false,
-                            "message": "Camera is not permitted for this user"
-                        })),
-                    )
-                        .into_response());
+                        "Camera is not permitted for this user",
+                    ));
                 }
             }
         }
@@ -579,24 +583,19 @@ pub async fn authorize_mutation(
 
 /// Verifies CSRF origin and requires an unrestricted (`allowed_cameras` is `None` or `"*"`)
 /// `admin` role for system-wide configuration, user, and API token mutations.
-#[allow(clippy::result_large_err)]
 pub async fn authorize_global_admin_mutation(
     state: &AppState,
     jar: &CookieJar,
     uri: &Uri,
     headers: &HeaderMap,
-) -> Result<CallerPrincipal, Response> {
+) -> Result<CallerPrincipal, AuthRejection> {
     let principal =
         authorize_mutation(state, jar, uri, headers, true, AccessTarget::Global).await?;
     if principal.camera_scope().is_restricted() {
-        return Err((
+        return Err(AuthRejection::new(
             StatusCode::FORBIDDEN,
-            Json(json!({
-                "success": false,
-                "message": "Admin role required"
-            })),
-        )
-            .into_response());
+            "Admin role required",
+        ));
     }
     Ok(principal)
 }

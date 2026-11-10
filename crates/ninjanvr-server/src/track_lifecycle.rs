@@ -276,13 +276,10 @@ impl EnrichedTrackMetadata {
         if suppressed_fp || !alerts_enabled {
             return "detection";
         }
-        let mut trk_for_sev = trk.clone();
-        if trk_for_sev.inferred_sub_label.is_none() {
-            trk_for_sev.inferred_sub_label = self.effective_sub_label.clone();
-        }
-        compute_track_severity_for_profile(
+        compute_track_severity_for_profile_with_sub_label(
             cam_cfg,
-            &trk_for_sev,
+            trk,
+            self.effective_sub_label.as_deref(),
             active_profile,
             camera_suppressed_in_profile,
         )
@@ -395,7 +392,7 @@ pub fn enrich_tracked_object(input: TrackEnrichmentInput<'_>) -> EnrichedTrackMe
     };
 
     let dominant_color_tag =
-        classify_dominant_color_tag(&frame.data, frame.width, frame.height, trk.bbox).to_string();
+        classify_dominant_color_tag(&frame.data, frame.width, frame.height, trk.bbox);
     let mut attribute_tags = vec![dominant_color_tag.clone()];
     for a in &merged_attributes {
         if !attribute_tags.contains(&a.label) {
@@ -424,16 +421,13 @@ pub fn enrich_tracked_object(input: TrackEnrichmentInput<'_>) -> EnrichedTrackMe
             }
         });
 
-    let mut trk_for_sev = trk.clone();
-    if trk_for_sev.inferred_sub_label.is_none() {
-        trk_for_sev.inferred_sub_label = effective_sub_label.clone();
-    }
     let severity = if input.suppressed_fp || !input.alerts_enabled {
         "detection"
     } else {
-        compute_track_severity_for_profile(
+        compute_track_severity_for_profile_with_sub_label(
             input.cam_cfg,
-            &trk_for_sev,
+            trk,
+            effective_sub_label.as_deref(),
             input.active_profile,
             input.camera_suppressed_in_profile,
         )
@@ -593,7 +587,9 @@ where
     rev.dirty = true;
 
     if rev.detections.is_empty() {
-        let removed_rev = active_review.take().expect("active_review was Some");
+        let Some(removed_rev) = active_review.take() else {
+            return ReviewFalsePositiveTransition::Unchanged;
+        };
         let closed_dto = removed_rev.to_dto(camera, Some(now));
         let before_dto = removed_rev
             .prev_dto
@@ -738,16 +734,40 @@ pub fn compute_track_severity_for_profile(
     active_profile: &str,
     camera_suppressed_in_profile: bool,
 ) -> &'static str {
+    compute_track_severity_for_profile_with_sub_label(
+        cam_cfg,
+        trk,
+        None,
+        active_profile,
+        camera_suppressed_in_profile,
+    )
+}
+
+pub fn compute_track_severity_for_profile_with_sub_label(
+    cam_cfg: &CameraConfig,
+    trk: &TrackedObject,
+    fallback_sub_label: Option<&str>,
+    active_profile: &str,
+    camera_suppressed_in_profile: bool,
+) -> &'static str {
     if active_profile == "disarmed"
         || camera_suppressed_in_profile
         || (active_profile == "home" && cam_cfg.indoor)
     {
         return "detection";
     }
-    compute_track_severity(cam_cfg, trk)
+    compute_track_severity_with_sub_label(cam_cfg, trk, fallback_sub_label)
 }
 
 pub fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'static str {
+    compute_track_severity_with_sub_label(cam_cfg, trk, None)
+}
+
+pub fn compute_track_severity_with_sub_label(
+    cam_cfg: &CameraConfig,
+    trk: &TrackedObject,
+    fallback_sub_label: Option<&str>,
+) -> &'static str {
     if !cam_cfg.review.alerts.enabled
         || !cam_cfg.review.alerts.labels.contains(&trk.label)
         || (!cam_cfg.review.alerts.required_zones.is_empty()
@@ -759,8 +779,10 @@ pub fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'
         return "detection";
     }
 
+    let effective_sub = trk.inferred_sub_label.as_deref().or(fallback_sub_label);
+
     if !cam_cfg.review.alerts.exclude_sub_labels.is_empty()
-        && let Some(ref sub) = trk.inferred_sub_label
+        && let Some(sub) = effective_sub
         && cam_cfg
             .review
             .alerts
@@ -772,7 +794,7 @@ pub fn compute_track_severity(cam_cfg: &CameraConfig, trk: &TrackedObject) -> &'
     }
 
     if !cam_cfg.review.alerts.sub_labels.is_empty() {
-        let matched_allowed = trk.inferred_sub_label.as_ref().is_some_and(|sub| {
+        let matched_allowed = effective_sub.is_some_and(|sub| {
             cam_cfg
                 .review
                 .alerts

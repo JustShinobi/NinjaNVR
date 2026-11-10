@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::http::{StatusCode, header};
@@ -37,154 +37,168 @@ pub struct CameraProtocolSpec {
     pub pan_tilt_only_default: bool,
 }
 
+pub const TAPO_PROTOCOL_SPEC: CameraProtocolSpec = CameraProtocolSpec {
+    id: "tapo",
+    display_name: "TP-Link Tapo (ONVIF :2020 + Tapo Backchannel)",
+    aliases: &["tp-link", "tplink", "tapo_onvif", "tapo_klap"],
+    default_onvif_port: 2020,
+    default_http_port: 443,
+    rtsp_path_markers: &["/stream1", "/stream2"],
+    manufacturer_markers: &["tp-link", "tplink"],
+    model_markers: &["tapo"],
+    ptz_service_path: "/onvif/service",
+    // Tapo C200/C210/C220 ONVIF on port 2020 does not implement ONVIF Imaging service
+    imaging_endpoints: &[],
+    preferred_profile_tokens: &["profile_1", "Profile_1", "Profile000"],
+    preferred_video_source_tokens: &["raw_vs1", "VideoSource000", "00000"],
+    native_substream_template: Some("rtsp://*:*@{host}:554/stream2#transport=tcp#timeout=10"),
+    default_talkback_mode: None,
+    supports_dahua_cgi: false,
+    supports_onvif_system_log: false,
+    supports_onvif_pull_events: true,
+    pan_tilt_only_default: true,
+};
+
+pub const DAHUA_CGI_PROTOCOL_SPEC: CameraProtocolSpec = CameraProtocolSpec {
+    id: "dahua_cgi",
+    display_name: "Intelbras / Dahua / Amcrest / Imou (ONVIF + HTTP Digest CGI)",
+    aliases: &["intelbras", "dahua", "amcrest", "imou", "mibo"],
+    default_onvif_port: 80,
+    default_http_port: 80,
+    rtsp_path_markers: &["/cam/realmonitor"],
+    manufacturer_markers: &["intelbras", "dahua", "amcrest", "imou"],
+    model_markers: &["ime-", "im3", "im4", "im5", "mibo", "ipc-"],
+    ptz_service_path: "/onvif/ptz_service",
+    imaging_endpoints: &["/onvif/imaging_service", "/onvif/service"],
+    preferred_profile_tokens: &["Profile000", "profile_1", "Profile_1"],
+    preferred_video_source_tokens: &["VideoSource000", "00000", "raw_vs1"],
+    native_substream_template: Some(
+        "rtsp://*:*@{host}:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif#transport=tcp#timeout=10",
+    ),
+    default_talkback_mode: Some("cgi_alaw"),
+    supports_dahua_cgi: true,
+    supports_onvif_system_log: false,
+    supports_onvif_pull_events: false,
+    pan_tilt_only_default: true,
+};
+
+pub const HIKVISION_ISAPI_PROTOCOL_SPEC: CameraProtocolSpec = CameraProtocolSpec {
+    id: "hikvision_isapi",
+    display_name: "Hikvision / HiLook / Annke (ONVIF + ISAPI)",
+    aliases: &["hikvision", "isapi", "hilook", "annke", "ezviz"],
+    default_onvif_port: 80,
+    default_http_port: 80,
+    rtsp_path_markers: &["/streaming/channels/", "/h264/ch1/"],
+    manufacturer_markers: &["hikvision", "hilook", "annke", "ezviz"],
+    model_markers: &["ds-2cd", "ds-2de"],
+    ptz_service_path: "/onvif/ptz_service",
+    imaging_endpoints: &["/onvif/imaging_service", "/onvif/service"],
+    preferred_profile_tokens: &["Profile_1", "Profile000", "profile_1"],
+    preferred_video_source_tokens: &["VideoSource_1", "VideoSource000", "raw_vs1"],
+    native_substream_template: Some(
+        "rtsp://*:*@{host}:554/Streaming/Channels/102#transport=tcp#timeout=10",
+    ),
+    default_talkback_mode: None,
+    supports_dahua_cgi: false,
+    supports_onvif_system_log: true,
+    supports_onvif_pull_events: true,
+    pan_tilt_only_default: false,
+};
+
+pub const REOLINK_PROTOCOL_SPEC: CameraProtocolSpec = CameraProtocolSpec {
+    id: "reolink",
+    display_name: "Reolink (ONVIF + RTMP/RTSP)",
+    aliases: &["reolink_cgi", "baichuan"],
+    default_onvif_port: 8000,
+    default_http_port: 80,
+    rtsp_path_markers: &["/h264preview_", "/h265preview_"],
+    manufacturer_markers: &["reolink"],
+    model_markers: &["rlc-", "e1 "],
+    ptz_service_path: "/onvif/ptz_service",
+    imaging_endpoints: &["/onvif/imaging_service", "/onvif/service"],
+    preferred_profile_tokens: &["000", "Profile000", "profile_1"],
+    preferred_video_source_tokens: &["000", "VideoSource000", "raw_vs1"],
+    native_substream_template: Some(
+        "rtsp://*:*@{host}:554/h264Preview_01_sub#transport=tcp#timeout=10",
+    ),
+    default_talkback_mode: None,
+    supports_dahua_cgi: false,
+    supports_onvif_system_log: true,
+    supports_onvif_pull_events: true,
+    pan_tilt_only_default: false,
+};
+
+pub const AXIS_VAPIX_PROTOCOL_SPEC: CameraProtocolSpec = CameraProtocolSpec {
+    id: "axis_vapix",
+    display_name: "Axis VAPIX / ONVIF",
+    aliases: &["axis", "vapix"],
+    default_onvif_port: 80,
+    default_http_port: 80,
+    rtsp_path_markers: &["/axis-media/media.amp"],
+    manufacturer_markers: &["axis"],
+    model_markers: &["axis "],
+    ptz_service_path: "/onvif/ptz_service",
+    imaging_endpoints: &["/onvif/imaging_service", "/onvif/service"],
+    preferred_profile_tokens: &["profile_1", "Profile000", "Profile_1"],
+    preferred_video_source_tokens: &["VideoSource000", "0", "raw_vs1"],
+    native_substream_template: None,
+    default_talkback_mode: None,
+    supports_dahua_cgi: false,
+    supports_onvif_system_log: true,
+    supports_onvif_pull_events: true,
+    pan_tilt_only_default: false,
+};
+
+pub const ONVIF_PROTOCOL_SPEC: CameraProtocolSpec = CameraProtocolSpec {
+    id: "onvif",
+    display_name: "Standard ONVIF Profile S / T",
+    aliases: &["onvif_s", "onvif_t", "generic_onvif"],
+    default_onvif_port: 80,
+    default_http_port: 80,
+    rtsp_path_markers: &[],
+    manufacturer_markers: &[],
+    model_markers: &[],
+    ptz_service_path: "/onvif/ptz_service",
+    imaging_endpoints: &["/onvif/imaging_service", "/onvif/service"],
+    preferred_profile_tokens: &["Profile000", "profile_1", "Profile_1"],
+    preferred_video_source_tokens: &["VideoSource000", "00000", "raw_vs1"],
+    native_substream_template: None,
+    default_talkback_mode: None,
+    supports_dahua_cgi: false,
+    supports_onvif_system_log: true,
+    supports_onvif_pull_events: true,
+    pan_tilt_only_default: false,
+};
+
+pub const RTSP_ONLY_PROTOCOL_SPEC: CameraProtocolSpec = CameraProtocolSpec {
+    id: "rtsp_only",
+    display_name: "RTSP Only (No Hardware Control)",
+    aliases: &["rtsp", "none"],
+    default_onvif_port: 80,
+    default_http_port: 80,
+    rtsp_path_markers: &[],
+    manufacturer_markers: &[],
+    model_markers: &[],
+    ptz_service_path: "/onvif/ptz_service",
+    imaging_endpoints: &[],
+    preferred_profile_tokens: &["Profile000", "profile_1"],
+    preferred_video_source_tokens: &["VideoSource000", "raw_vs1"],
+    native_substream_template: None,
+    default_talkback_mode: None,
+    supports_dahua_cgi: false,
+    supports_onvif_system_log: false,
+    supports_onvif_pull_events: false,
+    pan_tilt_only_default: false,
+};
+
 pub const CAMERA_PROTOCOL_REGISTRY: &[CameraProtocolSpec] = &[
-    CameraProtocolSpec {
-        id: "tapo",
-        display_name: "TP-Link Tapo (ONVIF :2020 + Tapo Backchannel)",
-        aliases: &["tp-link", "tplink", "tapo_onvif", "tapo_klap"],
-        default_onvif_port: 2020,
-        default_http_port: 443,
-        rtsp_path_markers: &["/stream1", "/stream2"],
-        manufacturer_markers: &["tp-link", "tplink"],
-        model_markers: &["tapo"],
-        ptz_service_path: "/onvif/service",
-        // Tapo C200/C210/C220 ONVIF on port 2020 does not implement ONVIF Imaging service
-        imaging_endpoints: &[],
-        preferred_profile_tokens: &["profile_1", "Profile_1", "Profile000"],
-        preferred_video_source_tokens: &["raw_vs1", "VideoSource000", "00000"],
-        native_substream_template: Some("rtsp://*:*@{host}:554/stream2#transport=tcp#timeout=10"),
-        default_talkback_mode: None,
-        supports_dahua_cgi: false,
-        supports_onvif_system_log: false,
-        supports_onvif_pull_events: true,
-        pan_tilt_only_default: true,
-    },
-    CameraProtocolSpec {
-        id: "dahua_cgi",
-        display_name: "Intelbras / Dahua / Amcrest / Imou (ONVIF + HTTP Digest CGI)",
-        aliases: &["intelbras", "dahua", "amcrest", "imou", "mibo"],
-        default_onvif_port: 80,
-        default_http_port: 80,
-        rtsp_path_markers: &["/cam/realmonitor"],
-        manufacturer_markers: &["intelbras", "dahua", "amcrest", "imou"],
-        model_markers: &["ime-", "im3", "im4", "im5", "mibo", "ipc-"],
-        ptz_service_path: "/onvif/ptz_service",
-        imaging_endpoints: &["/onvif/imaging_service", "/onvif/service"],
-        preferred_profile_tokens: &["Profile000", "profile_1", "Profile_1"],
-        preferred_video_source_tokens: &["VideoSource000", "00000", "raw_vs1"],
-        native_substream_template: Some(
-            "rtsp://*:*@{host}:554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif#transport=tcp#timeout=10",
-        ),
-        default_talkback_mode: Some("cgi_alaw"),
-        supports_dahua_cgi: true,
-        supports_onvif_system_log: false,
-        supports_onvif_pull_events: false,
-        pan_tilt_only_default: true,
-    },
-    CameraProtocolSpec {
-        id: "hikvision_isapi",
-        display_name: "Hikvision / HiLook / Annke (ONVIF + ISAPI)",
-        aliases: &["hikvision", "isapi", "hilook", "annke", "ezviz"],
-        default_onvif_port: 80,
-        default_http_port: 80,
-        rtsp_path_markers: &["/streaming/channels/", "/h264/ch1/"],
-        manufacturer_markers: &["hikvision", "hilook", "annke", "ezviz"],
-        model_markers: &["ds-2cd", "ds-2de"],
-        ptz_service_path: "/onvif/ptz_service",
-        imaging_endpoints: &["/onvif/imaging_service", "/onvif/service"],
-        preferred_profile_tokens: &["Profile_1", "Profile000", "profile_1"],
-        preferred_video_source_tokens: &["VideoSource_1", "VideoSource000", "raw_vs1"],
-        native_substream_template: Some(
-            "rtsp://*:*@{host}:554/Streaming/Channels/102#transport=tcp#timeout=10",
-        ),
-        default_talkback_mode: None,
-        supports_dahua_cgi: false,
-        supports_onvif_system_log: true,
-        supports_onvif_pull_events: true,
-        pan_tilt_only_default: false,
-    },
-    CameraProtocolSpec {
-        id: "reolink",
-        display_name: "Reolink (ONVIF + RTMP/RTSP)",
-        aliases: &["reolink_cgi", "baichuan"],
-        default_onvif_port: 8000,
-        default_http_port: 80,
-        rtsp_path_markers: &["/h264preview_", "/h265preview_"],
-        manufacturer_markers: &["reolink"],
-        model_markers: &["rlc-", "e1 "],
-        ptz_service_path: "/onvif/ptz_service",
-        imaging_endpoints: &["/onvif/imaging_service", "/onvif/service"],
-        preferred_profile_tokens: &["000", "Profile000", "profile_1"],
-        preferred_video_source_tokens: &["000", "VideoSource000", "raw_vs1"],
-        native_substream_template: Some(
-            "rtsp://*:*@{host}:554/h264Preview_01_sub#transport=tcp#timeout=10",
-        ),
-        default_talkback_mode: None,
-        supports_dahua_cgi: false,
-        supports_onvif_system_log: true,
-        supports_onvif_pull_events: true,
-        pan_tilt_only_default: false,
-    },
-    CameraProtocolSpec {
-        id: "axis_vapix",
-        display_name: "Axis VAPIX / ONVIF",
-        aliases: &["axis", "vapix"],
-        default_onvif_port: 80,
-        default_http_port: 80,
-        rtsp_path_markers: &["/axis-media/media.amp"],
-        manufacturer_markers: &["axis"],
-        model_markers: &["axis "],
-        ptz_service_path: "/onvif/ptz_service",
-        imaging_endpoints: &["/onvif/imaging_service", "/onvif/service"],
-        preferred_profile_tokens: &["profile_1", "Profile000", "Profile_1"],
-        preferred_video_source_tokens: &["VideoSource000", "0", "raw_vs1"],
-        native_substream_template: None,
-        default_talkback_mode: None,
-        supports_dahua_cgi: false,
-        supports_onvif_system_log: true,
-        supports_onvif_pull_events: true,
-        pan_tilt_only_default: false,
-    },
-    CameraProtocolSpec {
-        id: "onvif",
-        display_name: "Standard ONVIF Profile S / T",
-        aliases: &["onvif_s", "onvif_t", "generic_onvif"],
-        default_onvif_port: 80,
-        default_http_port: 80,
-        rtsp_path_markers: &[],
-        manufacturer_markers: &[],
-        model_markers: &[],
-        ptz_service_path: "/onvif/ptz_service",
-        imaging_endpoints: &["/onvif/imaging_service", "/onvif/service"],
-        preferred_profile_tokens: &["Profile000", "profile_1", "Profile_1"],
-        preferred_video_source_tokens: &["VideoSource000", "00000", "raw_vs1"],
-        native_substream_template: None,
-        default_talkback_mode: None,
-        supports_dahua_cgi: false,
-        supports_onvif_system_log: true,
-        supports_onvif_pull_events: true,
-        pan_tilt_only_default: false,
-    },
-    CameraProtocolSpec {
-        id: "rtsp_only",
-        display_name: "RTSP Only (No Hardware Control)",
-        aliases: &["rtsp", "none"],
-        default_onvif_port: 80,
-        default_http_port: 80,
-        rtsp_path_markers: &[],
-        manufacturer_markers: &[],
-        model_markers: &[],
-        ptz_service_path: "/onvif/ptz_service",
-        imaging_endpoints: &[],
-        preferred_profile_tokens: &["Profile000", "profile_1"],
-        preferred_video_source_tokens: &["VideoSource000", "raw_vs1"],
-        native_substream_template: None,
-        default_talkback_mode: None,
-        supports_dahua_cgi: false,
-        supports_onvif_system_log: false,
-        supports_onvif_pull_events: false,
-        pan_tilt_only_default: false,
-    },
+    TAPO_PROTOCOL_SPEC,
+    DAHUA_CGI_PROTOCOL_SPEC,
+    HIKVISION_ISAPI_PROTOCOL_SPEC,
+    REOLINK_PROTOCOL_SPEC,
+    AXIS_VAPIX_PROTOCOL_SPEC,
+    ONVIF_PROTOCOL_SPEC,
+    RTSP_ONLY_PROTOCOL_SPEC,
 ];
 
 pub fn find_protocol_spec_by_id_or_alias(raw: &str) -> Option<&'static CameraProtocolSpec> {
@@ -228,15 +242,15 @@ pub fn infer_protocol_spec_from_device_or_hints(
         }
     }
     if is_tapo_hint {
-        return find_protocol_spec_by_id_or_alias("tapo").unwrap();
+        return &TAPO_PROTOCOL_SPEC;
     }
     if dahua_cgi_ok || is_dahua_hint {
-        return find_protocol_spec_by_id_or_alias("dahua_cgi").unwrap();
+        return &DAHUA_CGI_PROTOCOL_SPEC;
     }
     if online {
-        find_protocol_spec_by_id_or_alias("onvif").unwrap()
+        &ONVIF_PROTOCOL_SPEC
     } else {
-        find_protocol_spec_by_id_or_alias("rtsp_only").unwrap()
+        &RTSP_ONLY_PROTOCOL_SPEC
     }
 }
 
@@ -248,17 +262,22 @@ pub fn format_substream_url_for_protocol(
         .map(|tpl| tpl.replace("{host}", clean_host))
 }
 
+#[derive(Debug, Default)]
+struct CameraDriverRuntimeInner {
+    discovered_profiles: RwLock<HashMap<(String, String), String>>,
+    discovered_video_sources: RwLock<HashMap<String, String>>,
+    discovered_protocols: RwLock<HashMap<String, String>>,
+    digest_challenges: Mutex<HashMap<String, String>>,
+    siren_cooldown_until: Mutex<HashMap<String, f64>>,
+    tapo_streamd_ports: RwLock<HashMap<String, u16>>,
+}
+
 /// `AppState`-scoped runtime cache for discovered camera ONVIF tokens, protocol families,
 /// and HTTP Digest challenge nonces. Replaces process-global `LazyLock` singletons so each
 /// server instance and test harness has isolated, invalidatable state.
 #[derive(Debug, Clone, Default)]
 pub struct CameraDriverRuntime {
-    discovered_profiles: Arc<Mutex<HashMap<(String, String), String>>>,
-    discovered_video_sources: Arc<Mutex<HashMap<String, String>>>,
-    discovered_protocols: Arc<Mutex<HashMap<String, String>>>,
-    digest_challenges: Arc<Mutex<HashMap<String, String>>>,
-    siren_cooldown_until: Arc<Mutex<HashMap<String, f64>>>,
-    tapo_streamd_ports: Arc<Mutex<HashMap<String, u16>>>,
+    inner: Arc<CameraDriverRuntimeInner>,
 }
 
 impl CameraDriverRuntime {
@@ -267,14 +286,15 @@ impl CameraDriverRuntime {
     }
 
     pub fn get_profile(&self, camera: &str, endpoint: &str) -> Option<String> {
-        self.discovered_profiles
-            .lock()
+        self.inner
+            .discovered_profiles
+            .read()
             .ok()
             .and_then(|g| g.get(&(camera.to_string(), endpoint.to_string())).cloned())
     }
 
     pub fn set_profile(&self, camera: &str, endpoint: &str, profile: &str) {
-        if let Ok(mut g) = self.discovered_profiles.lock() {
+        if let Ok(mut g) = self.inner.discovered_profiles.write() {
             let key = (camera.to_string(), endpoint.to_string());
             if g.len() >= 128 && !g.contains_key(&key) {
                 g.clear();
@@ -284,14 +304,15 @@ impl CameraDriverRuntime {
     }
 
     pub fn get_video_source(&self, camera: &str) -> Option<String> {
-        self.discovered_video_sources
-            .lock()
+        self.inner
+            .discovered_video_sources
+            .read()
             .ok()
             .and_then(|g| g.get(camera).cloned())
     }
 
     pub fn set_video_source(&self, camera: &str, vs_token: &str) {
-        if let Ok(mut g) = self.discovered_video_sources.lock() {
+        if let Ok(mut g) = self.inner.discovered_video_sources.write() {
             if g.len() >= 128 && !g.contains_key(camera) {
                 g.clear();
             }
@@ -300,14 +321,15 @@ impl CameraDriverRuntime {
     }
 
     pub fn get_protocol(&self, camera: &str) -> Option<String> {
-        self.discovered_protocols
-            .lock()
+        self.inner
+            .discovered_protocols
+            .read()
             .ok()
             .and_then(|g| g.get(camera).cloned())
     }
 
     pub fn set_protocol(&self, camera: &str, protocol: &str) {
-        if let Ok(mut g) = self.discovered_protocols.lock() {
+        if let Ok(mut g) = self.inner.discovered_protocols.write() {
             if g.len() >= 128 && !g.contains_key(camera) {
                 g.clear();
             }
@@ -316,14 +338,15 @@ impl CameraDriverRuntime {
     }
 
     pub fn get_digest_challenge(&self, authority_key: &str) -> Option<String> {
-        self.digest_challenges
+        self.inner
+            .digest_challenges
             .lock()
             .ok()
             .and_then(|g| g.get(authority_key).cloned())
     }
 
     pub fn set_digest_challenge(&self, authority_key: &str, www_authenticate: &str) {
-        if let Ok(mut g) = self.digest_challenges.lock() {
+        if let Ok(mut g) = self.inner.digest_challenges.lock() {
             if g.len() >= 128 && !g.contains_key(authority_key) {
                 g.clear();
             }
@@ -332,7 +355,7 @@ impl CameraDriverRuntime {
     }
 
     pub fn try_claim_siren_trigger(&self, camera: &str, now_sec: f64, cooldown_sec: f64) -> bool {
-        let Ok(mut g) = self.siren_cooldown_until.lock() else {
+        let Ok(mut g) = self.inner.siren_cooldown_until.lock() else {
             return false;
         };
         if let Some(&until) = g.get(camera)
@@ -348,39 +371,40 @@ impl CameraDriverRuntime {
     }
 
     pub fn get_tapo_streamd_port(&self, camera: &str) -> u16 {
-        self.tapo_streamd_ports
-            .lock()
+        self.inner
+            .tapo_streamd_ports
+            .read()
             .ok()
             .and_then(|g| g.get(camera).copied())
             .unwrap_or(8800)
     }
 
     pub fn set_tapo_streamd_port(&self, camera: &str, port: u16) {
-        if let Ok(mut g) = self.tapo_streamd_ports.lock() {
+        if let Ok(mut g) = self.inner.tapo_streamd_ports.write() {
             g.insert(camera.to_string(), port);
         }
     }
 
     pub fn invalidate_camera(&self, camera: &str) {
-        if let Ok(mut g) = self.discovered_profiles.lock() {
+        if let Ok(mut g) = self.inner.discovered_profiles.write() {
             g.retain(|(cam, _), _| cam != camera);
         }
-        if let Ok(mut g) = self.discovered_video_sources.lock() {
+        if let Ok(mut g) = self.inner.discovered_video_sources.write() {
             g.remove(camera);
         }
-        if let Ok(mut g) = self.discovered_protocols.lock() {
+        if let Ok(mut g) = self.inner.discovered_protocols.write() {
             g.remove(camera);
         }
-        if let Ok(mut g) = self.siren_cooldown_until.lock() {
+        if let Ok(mut g) = self.inner.siren_cooldown_until.lock() {
             g.remove(camera);
         }
-        if let Ok(mut g) = self.tapo_streamd_ports.lock() {
+        if let Ok(mut g) = self.inner.tapo_streamd_ports.write() {
             g.remove(camera);
         }
     }
 
     pub fn get_any_profile(&self, camera: &str) -> Option<String> {
-        self.discovered_profiles.lock().ok().and_then(|g| {
+        self.inner.discovered_profiles.read().ok().and_then(|g| {
             g.iter()
                 .find_map(|((cam, _), prof)| (cam == camera).then(|| prof.clone()))
         })
@@ -1077,17 +1101,17 @@ pub fn resolve_camera_probe_target(
     } else if let Some(rtsp_spec) = rtsp_matched_spec {
         rtsp_spec
     } else if is_tapo_hint {
-        find_protocol_spec_by_id_or_alias("tapo").unwrap()
+        &TAPO_PROTOCOL_SPEC
     } else if is_dahua_hint {
-        find_protocol_spec_by_id_or_alias("dahua_cgi").unwrap()
+        &DAHUA_CGI_PROTOCOL_SPEC
     } else if let Some(exp) = explicit_spec {
         exp
     } else if let Some(cached) = cached_spec {
         cached
     } else if host.is_some() {
-        find_protocol_spec_by_id_or_alias("onvif").unwrap()
+        &ONVIF_PROTOCOL_SPEC
     } else {
-        find_protocol_spec_by_id_or_alias("rtsp_only").unwrap()
+        &RTSP_ONLY_PROTOCOL_SPEC
     };
 
     let onvif_port = if cam_cfg.onvif.port != 80 && cam_cfg.onvif.port != 0 {

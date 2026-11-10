@@ -169,7 +169,7 @@ impl LogBufferHub {
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect();
         {
-            let mut guard = self.buffers.lock().expect("log mutex poisoned");
+            let mut guard = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
             if guard.len() >= 16 && !guard.contains_key(service) {
                 return;
             }
@@ -188,7 +188,7 @@ impl LogBufferHub {
         start: Option<i64>,
         end: Option<i64>,
     ) -> (usize, Vec<String>) {
-        let guard = self.buffers.lock().expect("log mutex poisoned");
+        let guard = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let Some(q) = guard.get(service) else {
             return (0, Vec::new());
         };
@@ -262,7 +262,7 @@ impl ProcCpuTracker {
         let mem_pct = (((rss_bytes as f64) / (mem_limit as f64)) * 100.0).clamp(0.5, 95.0);
 
         let now = Instant::now();
-        let mut guard = self.prev_ticks.lock().expect("cpu tracker mutex poisoned");
+        let mut guard = self.prev_ticks.lock().unwrap_or_else(|e| e.into_inner());
         if guard.len() >= 256 && !guard.contains_key(&pid) {
             guard.retain(|_, (_, inst, _)| now.duration_since(*inst).as_secs() < 600);
             if guard.len() >= 256 {
@@ -295,10 +295,7 @@ impl ProcCpuTracker {
     /// Computes exact CPU% spent inside OpenVINO inference (`cumulative_infer_us` delta).
     pub fn sample_infer_cpu(&self, cumulative_us: u64, fallback_cpu: f64) -> f64 {
         let now = Instant::now();
-        let mut guard = self
-            .prev_infer
-            .lock()
-            .expect("infer tracker mutex poisoned");
+        let mut guard = self.prev_infer.lock().unwrap_or_else(|e| e.into_inner());
         let pct = if let Some((prev_us, prev_inst, prev_ema)) = *guard {
             let dt_us = now.duration_since(prev_inst).as_micros() as f64;
             if dt_us >= 2_000_000.0 && cumulative_us >= prev_us {
@@ -1064,7 +1061,7 @@ async fn api_profiles(State(state): State<AppState>) -> Json<Value> {
 
 async fn api_users(State(state): State<AppState>, jar: CookieJar, headers: HeaderMap) -> Response {
     if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     let users = state.db.list_users().unwrap_or_default();
     Json(Value::Array(users)).into_response()
@@ -1092,7 +1089,7 @@ async fn api_user_create(
     Json(body): Json<CreateUserBody>,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     if body.password.len() > 1024 {
         return (
@@ -1164,7 +1161,7 @@ async fn api_user_password(
     Json(body): Json<UpdateUserPasswordBody>,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     if body.password.len() > 1024 {
         return (
@@ -1253,7 +1250,7 @@ async fn api_user_role(
     Json(body): Json<UpdateUserRoleBody>,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     if let Some(ref cams) = body.allowed_cameras
         && (cams.len() > 4096
@@ -1322,7 +1319,7 @@ async fn api_user_cameras(
     Json(body): Json<UpdateUserCamerasBody>,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     match state
         .db
@@ -1360,7 +1357,7 @@ async fn api_user_delete(
     AxumPath(username): AxumPath<String>,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     match state.db.delete_user(&username) {
         Ok(true) => {
@@ -1417,7 +1414,7 @@ async fn api_tokens_list(
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     let tokens = state.db.list_api_tokens().unwrap_or_default();
     Json(Value::Array(tokens)).into_response()
@@ -1431,7 +1428,7 @@ async fn api_token_create(
     Json(body): Json<CreateApiTokenBody>,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     let trimmed_name = body.name.trim();
     if trimmed_name.is_empty()
@@ -1487,7 +1484,7 @@ async fn api_token_delete(
     AxumPath(id): AxumPath<String>,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     let token_name = state.db.list_api_tokens().ok().and_then(|tokens| {
         tokens.into_iter().find_map(|item| {
@@ -1911,7 +1908,7 @@ async fn api_config_raw(
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     let cfg = state.config.read().await;
     Json(Value::String(scrub_raw_yaml_secrets_strict(
@@ -1929,7 +1926,7 @@ async fn api_config_save(
     body: String,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     if body.len() > 1_048_576 {
         return (
@@ -2008,7 +2005,7 @@ async fn api_config_structured(
     Json(body): Json<Value>,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     let commit_res = tokio::spawn(async move {
         let _commit_guard = state.config_coordinator.lock_commit().await;
@@ -2076,7 +2073,7 @@ async fn api_config_set(
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     Json(json!({ "success": true, "message": "Config updated" })).into_response()
 }
@@ -2142,7 +2139,7 @@ async fn api_restart(
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authorize_global_admin_mutation(&state, &jar, &uri, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     Json(json!({ "success": true, "message": "Restart acknowledged" })).into_response()
 }
@@ -2163,7 +2160,7 @@ async fn api_service_logs(
     Query(q): Query<LogsQueryParams>,
 ) -> Response {
     if let Err(err_resp) = authorize_admin_read(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     if q.download == Some(true) {
         let (_, lines) = state.log_hub.query_lines(&service, None, None);
@@ -5822,7 +5819,7 @@ async fn api_review_delete(
         )
         .await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     if let Err(err) = state.db.delete_reviews(std::slice::from_ref(&id)) {
         warn!("Failed to delete review '{id}': {err}");
@@ -5882,7 +5879,7 @@ async fn api_reviews_delete(
         .await
     {
         Ok(p) => p,
-        Err(err_resp) => return err_resp,
+        Err(err_resp) => return err_resp.into_response(),
     };
     let scope = principal.camera_scope();
     let state_for_del = state.clone();
@@ -6069,7 +6066,7 @@ async fn api_event_delete(
         )
         .await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     let ev_cam = state
         .db
@@ -6149,7 +6146,7 @@ async fn api_events_bulk_delete(
         .await
     {
         Ok(p) => p,
-        Err(err_resp) => return err_resp,
+        Err(err_resp) => return err_resp.into_response(),
     };
     let scope = principal.camera_scope();
     let state_for_del = state.clone();
@@ -6449,7 +6446,7 @@ async fn api_delete_false_positive_signature(
         .await
     {
         Ok(p) => p,
-        Err(err_resp) => return err_resp,
+        Err(err_resp) => return err_resp.into_response(),
     };
     let scope = principal.camera_scope();
     match state.db.delete_false_positive_signature_scoped(id, &scope) {
@@ -8694,7 +8691,7 @@ async fn api_case_create(
             .into_response();
     }
     if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     if body.is_empty() {
         return Json(json!({ "success": true })).into_response();
@@ -8907,7 +8904,7 @@ async fn api_export_create(
             .into_response();
     }
     if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
         && !allowed.iter().any(|a| a == &camera || a == "*")
@@ -9190,7 +9187,7 @@ async fn api_export_rename(
             .into_response();
     }
     if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     if let Some(allowed) = caller_allowed_cameras(&state, &jar, &headers).await
         && !allowed.iter().any(|a| a == "*")
@@ -10149,7 +10146,7 @@ async fn api_camera_ptz_move(
     if let Some(err_resp) =
         verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     let (cam_opt, creds, ptz_endpoint_opt) = {
         let cfg = state.config.read().await;
@@ -10306,7 +10303,7 @@ async fn api_camera_ptz_stop(
     if let Some(err_resp) =
         verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     let body: PtzStopBody = if body_bytes.is_empty() {
         PtzStopBody::default()
@@ -10444,7 +10441,7 @@ async fn api_camera_ptz_preset(
     if let Some(err_resp) =
         verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     let preset_token = body.preset.trim();
     if preset_token.is_empty()
@@ -10734,7 +10731,7 @@ async fn api_camera_ptz_preset_save(
     if let Some(err_resp) =
         verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     let preset_name = body.name.trim();
     if preset_name.is_empty()
@@ -11005,7 +11002,7 @@ async fn api_camera_ptz_preset_delete(
     if let Some(err_resp) =
         verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     let clean_tok = token.trim();
     if clean_tok.is_empty() || clean_tok.len() > 128 || clean_tok.chars().any(|c| c.is_control()) {
@@ -11834,7 +11831,7 @@ async fn api_camera_hardware_set(
     if let Some(err_resp) =
         verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
 
     if (body.apply_suggested_onvif == Some(true)
@@ -12455,7 +12452,7 @@ async fn api_camera_audio_talkback(
     if let Some(err_resp) =
         verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     if body_bytes.is_empty() || body_bytes.len() > MAX_TALKBACK_AUDIO_BYTES {
         return (
@@ -12690,7 +12687,7 @@ async fn api_camera_state_set(
     if let Some(err_resp) =
         verify_camera_mutation_access(&state, &jar, &uri, &headers, &camera).await
     {
-        return err_resp;
+        return err_resp.into_response();
     }
     let cam_configured = state.config.read().await.cameras.contains_key(&camera);
     if !cam_configured {
@@ -13190,7 +13187,7 @@ async fn api_go2rtc_stream_prewarm(
             .into_response();
     }
     if let Some(err_resp) = verify_caller_can_mutate(&state, &jar, &headers).await {
-        return err_resp;
+        return err_resp.into_response();
     }
     if !is_safe_go2rtc_stream_name(&stream) {
         return (
@@ -13841,11 +13838,6 @@ async fn ws_go2rtc_proxy(
             bridge_go2rtc_ws_with_mode(client_ws, state, query, is_webrtc_ws)
         })
         .into_response()
-}
-
-#[allow(dead_code)]
-async fn bridge_go2rtc_ws(client_ws: WebSocket, state: AppState, query: String) {
-    bridge_go2rtc_ws_with_mode(client_ws, state, query, false).await;
 }
 
 async fn send_client_ws_bounded(
@@ -14815,11 +14807,10 @@ pub async fn new_app_state(
     let web_dir = if web_dir.join("dist").join("index.html").exists() {
         web_dir.join("dist")
     } else if !web_dir.join("index.html").exists()
-        && web_dir
-            .parent()
-            .is_some_and(|p| p.join("web").join("index.html").exists())
+        && let Some(parent) = web_dir.parent()
+        && parent.join("web").join("index.html").exists()
     {
-        web_dir.parent().unwrap().join("web")
+        parent.join("web")
     } else {
         web_dir
     };
