@@ -1,5 +1,5 @@
 name: Bug Report
-description: Report a bug in NinjaNVR server, vision/AI pipeline, VOD playback, or Console v2
+description: Report a bug in NinjaNVR server, vision/AI pipeline, VOD playback, or web console
 title: "[Bug]: "
 labels: ["bug"]
 body:
@@ -12,7 +12,7 @@ body:
     attributes:
       label: Component
       options:
-        - NinjaNVR Console v2 (web-v2)
+        - NinjaNVR Console (web)
         - Server & API (ninjanvr-server / ninjanvr-comms)
         - Media & VOD Remuxer (ninjanvr-media / ninjanvr-vod)
         - Vision, AI Inference & Tracking (ninjanvr-vision / ninjanvr-infer / ninjanvr-track)

@@ -15,4 +15,4 @@
 
 - [ ] PR title follows [Conventional Commits](https://www.conventionalcommits.org/) (`feat(scope): ...`, `fix(scope): ...`)
 - [ ] `make verify` (`./scripts/ci/verify`) passes locally with zero warnings
-- [ ] No private domains, internal IPs, credentials, or `web-v2/dist/` build artifacts are included
+- [ ] No private domains, internal IPs, credentials, or `web/dist/` build artifacts are included

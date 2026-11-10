@@ -1,4 +1,4 @@
-# <img src="web-v2/public/favicon.svg" width="32" height="32" align="top" alt="" /> NinjaNVR
+# <img src="web/public/favicon.svg" width="32" height="32" align="top" alt="" /> NinjaNVR
 
 NinjaNVR is a self-hosted network video recorder with a Rust backend and a React console. It records camera streams, detects and tracks objects locally, and brings live video, recordings, alerts, and camera controls into one interface.
 
@@ -120,7 +120,7 @@ Camera streaming uses go2rtc and FFmpeg. Codec playback and two-way audio suppor
 
 ## Architecture
 
-The Rust process handles configuration, detection, tracking, persistence, and the HTTP API. It supervises go2rtc for restreaming and uses FFmpeg for media input and operations such as exports and compaction. The browser runs the React 19 console in `web-v2/`.
+The Rust process handles configuration, detection, tracking, persistence, and the HTTP API. It supervises go2rtc for restreaming and uses FFmpeg for media input and operations such as exports and compaction. The browser runs the React 19 console in `web/`.
 
 Decoded detection frames stay in an in-process frame ring. A YUV420p motion detector gates object inference. Recorded MP4 segments are remuxed into fragmented MP4/HLS in Rust for playback.
 
@@ -135,7 +135,7 @@ crates/
   ninjanvr-vod/       MP4/HLS playback remuxing
   ninjanvr-comms/     WebSocket updates and MQTT
   ninjanvr-server/    HTTP/TLS API, camera drivers, and pipeline orchestration
-web-v2/               React and TypeScript console
+web/                  React and TypeScript console
 scripts/ai/           Dataset preparation and model training
 ```
 
@@ -149,7 +149,7 @@ Requires Rust 1.89 or newer, Bun, `pkg-config`, OpenSSL and SQLite development l
 git clone https://github.com/JustShinobi/NinjaNVR.git
 cd NinjaNVR
 
-bun install --cwd web-v2 --frozen-lockfile
+bun install --cwd web --frozen-lockfile
 make build
 
 ./target/release/ninjanvr --config ./config/config.example.yml

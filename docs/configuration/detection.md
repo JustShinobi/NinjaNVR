@@ -48,7 +48,7 @@ Quando `siren: true` está habilitado em uma **Zona** ou **Linha**:
 
 ---
 
-## 4. Configuração pelo Console UI (`web-v2`)
+## 4. Configuração pelo Console Web
 
 1. **Habilitar a Sirene na Câmera:**
    - Em **Configurações ➔ Câmeras & Streams**, selecione a câmera:

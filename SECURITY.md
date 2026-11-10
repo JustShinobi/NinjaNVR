@@ -21,7 +21,7 @@ Please **do not** report security vulnerabilities through public GitHub issues.
 
 Instead, please use [GitHub Private Vulnerability Reporting](https://github.com/JustShinobi/NinjaNVR/security/advisories/new) on this repository. Include:
 
-1. A description of the vulnerability and affected crate/component (`ninjanvr-server`, `ninjanvr-vod`, `web-v2`, etc.).
+1. A description of the vulnerability and affected crate/component (`ninjanvr-server`, `ninjanvr-vod`, `web`, etc.).
 2. Steps to reproduce or a proof-of-concept request/configuration.
 3. Potential impact and any suggested mitigation.
 
